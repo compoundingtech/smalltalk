@@ -22,6 +22,8 @@ pub struct Extras {
     pub bodies: BTreeMap<String, (String, Option<String>, String)>,
     pub live: bool,
     pub offline: Option<String>,
+    /// Why the live stream to st is being replaced while st itself answers.
+    pub degraded: Option<String>,
     /// Why a window has not loaded though st was asked (its source is not ready, or refused),
     /// until it loads: the screen says so instead of showing a spinner forever.
     pub window_errors: BTreeMap<String, String>,
@@ -161,6 +163,12 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         .iter()
         .filter(|(name, _)| loaded_windows.iter().any(|(window, loaded)| *loaded && window == &name.as_str()))
         .map(|(name, why)| format!("{name}: {why}"))
+        .chain(
+            extras
+                .degraded
+                .iter()
+                .map(|why| format!("live stream: {why} · st answers, reconnecting")),
+        )
         .collect();
     World {
         person: person.to_owned(),
@@ -1165,6 +1173,21 @@ mod tests {
     }
 
     #[test]
+    fn both_delivery_sentences_are_sts_notes_not_the_persons_words() {
+        for note in [
+            "The person reads replies in st, not in the agent's session.",
+            "Answer the person in this conversation; people have no inbox, so do not reply with st.",
+        ] {
+            let delivery = format!("<smalltalk-message id=\"e6\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/e6\">\nis this a watcher?\n</smalltalk-message>\n{note}");
+            let bodies = from_harness(true, &delivery, &BTreeSet::new());
+            assert!(
+                matches!(&bodies[..], [Body::Mail { body, .. }] if body == "is this a watcher?"),
+                "{note}: {bodies:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_channel_delivery_carrying_an_envelope_is_that_mail_not_a_line() {
         // The Claude channel's delivery: st's envelope, then the delivery notes after it.
         let delivery = "<channel source=\"plugin:st3-channel:st3\" from=\"person/example\" messageId=\"message/c3\">\n<smalltalk-message id=\"c3\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/c3\">\nhow is it going?\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session.\n</channel>";
@@ -1613,6 +1636,39 @@ mod tests {
             truncated: false,
             sync: None,
         }
+    }
+
+    #[test]
+    fn a_stream_being_replaced_while_st_answers_is_never_called_offline() {
+        let model = Model::default();
+        let offline = Extras {
+            offline: Some("st stopped answering".into()),
+            ..Extras::default()
+        };
+        assert!(matches!(
+            world(&model, "person/avery", &offline).link,
+            Link::Offline(_)
+        ));
+        // st answered a fresh request: the link is being reopened, not down.
+        let degraded = Extras {
+            degraded: Some("st stopped answering".into()),
+            ..Extras::default()
+        };
+        assert!(matches!(
+            world(&model, "person/avery", &degraded).link,
+            Link::Connecting
+        ));
+        let live_degraded = Extras {
+            live: true,
+            degraded: Some("st closed the connection".into()),
+            ..Extras::default()
+        };
+        let live = world(&model, "person/avery", &live_degraded);
+        assert!(matches!(live.link, Link::Live));
+        assert_eq!(
+            live.stale,
+            ["live stream: st closed the connection · st answers, reconnecting"]
+        );
     }
 
     #[test]

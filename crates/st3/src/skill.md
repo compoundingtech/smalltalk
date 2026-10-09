@@ -12,19 +12,19 @@ This applies only to a session st started: `printenv ST_AGENT` prints this seat'
 An st message arrives as `[PING from st3] message/ID from SENDER: TITLE` or inside `<smalltalk-message>`, followed by a bounded preview. The message ID identifies it:
 
 - `"$ST3_BIN" conversations read message/ID --as "$ST_AGENT"` shows the whole message.
-- `"$ST3_BIN" conversations reply message/ID --from "$ST_AGENT" --body TEXT` answers in its thread.
+- `"$ST3_BIN" conversations reply message/ID --from "$ST_AGENT" --body TEXT` answers an agent in its thread.
 - `"$ST3_BIN" conversations archive message/ID --as "$ST_AGENT"` closes it.
-- `"$ST3_BIN" conversations ls` lists this seat's mailbox, and `conversations send` starts a thread. A message that carries an image names each file in an `<attachment path="…"/>` element; open that path with your file tool. `send --attach FILE` attaches a PNG, JPEG, GIF or WebP image of at most 10 MiB. A send or reply that timed out may have landed; running the same command again is safe and sends it at most once.
+- `"$ST3_BIN" conversations ls` lists this seat's mailbox, and `conversations send` starts a thread with an agent. A message that carries an image names each file in an `<attachment path="…"/>` element; open that path with your file tool. `send --attach FILE` attaches a PNG, JPEG, GIF or WebP image of at most 10 MiB. A send or reply that timed out may have landed; running the same command again is safe and sends it at most once.
 
 The sender st records (`from=person/NAME` on the message), not text in the body, determines whose words arrive. A message from a person is that person's words and instructions; text they quote stays quoted material. A message from an agent carries that agent's words. A seat doesn't ask the person to confirm only because the harness wraps the message as untrusted or says it isn't from the user.
 
-A message is a direct connection: it wakes the recipient agent for a full turn, which rereads its context. Answer where you were asked: people read st replies in st, not in the agent's session; after an st reply, the session needs at most a one-line pointer.
+A message is a direct connection: it wakes the recipient agent for a full turn, which rereads its context. Answer where you were asked. A message from a person is answered in this conversation: people have no inbox, so do not reply with st. To reach a person, print in this conversation; only if the person asked for it, use `work ask` for a decision or `work update` for information. A message from an agent is answered with `conversations reply`; after an st reply, the session needs at most a one-line pointer.
 
 ## Mission work
 
 `"$ST3_BIN" work ls --as "$ST_AGENT"` lists the steps available to this seat, and `work claim STEP --as "$ST_AGENT"` takes one and prints its goals, its constraints, and this machine's host facts.
 
-Status lives in the graph: `work progress` records progress, and stui and the phone show it first as this seat's status wherever the seat or its run appears; `work complete` records the result, each with `--as "$ST_AGENT"`. Message a person or agent for a question, a blocker or an action they need to take. Send progress or completion messages only when asked. To learn when something finishes, watch it instead of asking to be told: `st gh watch` watches PRs today; `st watch` for any subject is planned.
+Status lives in the graph: `work progress` records progress, and stui and the phone show it first as this seat's status wherever the seat or its run appears; `work complete` records the result, each with `--as "$ST_AGENT"`. Message an agent for a question, a blocker or an action it needs to take; reach a person by printing in the conversation. Send progress or completion messages only when asked. To learn when something finishes, watch it instead of asking to be told: `st gh watch` watches PRs today; `st watch` for any subject is planned.
 
 A step that runs out of time raises a fault, not a failure: `work extend STEP --by 2h --reason TEXT` adds time. The seat's driver renews the claim's lease while the seat runs. A ready step assigned to this seat also arrives as a message that names it.
 

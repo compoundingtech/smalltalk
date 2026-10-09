@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Reconcile current person asks without reading settled ask history",
+  "replay": {"status": "none", "detail": "No claim replay or projection fold changes. Candidate selection starts from existing raw ready/pending step rows, exactly the states the existing cancellation loop evaluates. Legacy ask migration still runs first; each surviving candidate keeps its same-transaction raw status recheck and current ownership/attempt/generation/declaration checks."},
+  "schema": {"status": "none", "detail": "Uses the existing step_runs_open_index and claims subject/kind lookup. No new table, index, trigger or numeric schema version change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No daemon API, client, wire, authority, admission, ordering or idempotency contract change. A store with only settled asks avoids a redundant writer transaction; current stale asks still receive the existing native cancellation."},
+  "downtime": {"status": "none", "detail": "No additional startup migration or service interruption beyond the ordinary binary swap."},
+  "manual": {"status": "none", "detail": "No manual migration, identity change or configuration is needed."},
+  "recovery": {"status": "none", "detail": "Swapping back restores the broader candidate reads. No durable claims or projection state are rewritten by installing this reader change."}
+}

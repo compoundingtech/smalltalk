@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Clarify that the reader-cache 1 GiB service-cap example is not the installation default",
+  "replay": {"status": "none", "detail": "Documentation clarification only; no replay change."},
+  "schema": {"status": "none", "detail": "No schema or index change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordination change."},
+  "compatibility": {"status": "none", "detail": "No client or protocol change."},
+  "downtime": {"status": "none", "detail": "No runtime or restart behavior change."},
+  "manual": {"status": "changed", "detail": "Clarification of reader-cache-eight-mib.json: its 1 GiB service cap is an illustrative memory-constrained case, not the deployed service limit or module default. The Home Manager module defaults memoryMax to 8G, and installations override it. At a configured 6 GiB cap, the 1568 MiB doctor planning envelope is below the cap by 4576 MiB; that planning margin is not a guarantee of RSS or burst safety. The proposed default remains 8 MiB per reader with about 1 GiB nominal targets at 128 retained idle readers. Check the actual service limit before choosing a cache override."},
+  "recovery": {"status": "none", "detail": "No persistent state or recovery change."}
+}

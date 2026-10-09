@@ -994,9 +994,11 @@ fn ping_id(line: &str) -> Option<&str> {
         .filter(|id| id.starts_with("message/"))
 }
 
-/// The lines st adds beside a delivery for the agent (st-drivers `ding`): where the person reads
-/// replies, and that a message was dictated.
+/// The lines st adds beside a delivery for the agent (st-drivers `ding`): how to answer the
+/// person, and that a message was dictated. The earlier sentence stays recognized for agents that
+/// still carry it in their history.
 const ST_DELIVERY_NOTES: &[&str] = &[
+    "Answer the person in this conversation; people have no inbox, so do not reply with st.",
     "The person reads replies in st, not in the agent's session.",
     "(dictated by voice; it may contain transcription mistakes)",
 ];

@@ -4,9 +4,12 @@ mod glass_heads;
 mod arrangements;
 #[cfg(test)]
 mod arrangements_tests;
+#[cfg(test)]
+mod authored_pull_requests_tests;
 mod glasses;
 pub(crate) mod mailbox_wakes;
 mod mailbox_changes;
+mod mailbox_lease;
 #[cfg(test)]
 mod message_send_tests;
 pub mod owned_sets;
@@ -17,6 +20,9 @@ mod github_workflow_failures;
 pub(crate) mod message_subscriptions;
 mod rollouts;
 mod seat_status;
+mod card_fold;
+#[cfg(test)]
+mod card_fold_tests;
 #[cfg(test)]
 mod roster_controls;
 pub(crate) mod step_labels;
@@ -114,6 +120,9 @@ mod attention_snapshot;
 pub(crate) mod attention_ivm;
 mod backup;
 mod checkpoint_rules;
+mod mission_eligibility;
+pub(crate) use mission_eligibility::MISSING_AGENT_CONDITION;
+mod revision_seats;
 pub(crate) mod delegation;
 mod limits;
 mod person_work;
@@ -141,6 +150,7 @@ mod unread_mail;
 mod agent_messages;
 pub mod agent_view;
 mod conversation_reads;
+mod usage_period;
 mod runtime;
 #[cfg(test)]
 mod tombstones_tests;
@@ -215,10 +225,6 @@ WHERE kind IN ('mission-run.state','step-run.state','work.failed')
 CREATE INDEX IF NOT EXISTS claims_terminal_capability_hash_index
 ON claims(json_extract(body, '$.fields.capability_hash'), store_index)
 WHERE kind='custom.client.terminal-attached';
--- The period usage report reads response rollups only: 8,700 of the 90,000 harness.usage claims
--- on a real store (the rest are context occupancy and session totals, written every few seconds).
-CREATE INDEX IF NOT EXISTS claims_usage_rollup_index ON claims(store_index)
-WHERE kind='harness.usage' AND json_extract(body,'$.fields.semantics')='response_rollup';
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -276,6 +282,14 @@ WHERE kind='subscription.mission-started';
 CREATE INDEX IF NOT EXISTS claims_subscription_mission_resource_index
 ON claims(json_extract(body, '$.fields.mission'), json_extract(body, '$.fields.resource'))
 WHERE kind='subscription.mission-requested';
+-- Authored PR ownership is looked up by URL or repository/number. Keep ordinary observed
+-- resources out of both indexes; the lookup unions two seeks before canonical ordering.
+CREATE INDEX IF NOT EXISTS claims_authored_pull_request_url_index
+ON claims(json_extract(body, '$.fields.facts.url'))
+WHERE kind='resource.observed' AND subject LIKE 'resource/mission-run/%/pull-request';
+CREATE INDEX IF NOT EXISTS claims_authored_pull_request_number_index
+ON claims(json_extract(body, '$.fields.facts.repository'), json_extract(body, '$.fields.facts.number'))
+WHERE kind='resource.observed' AND subject LIKE 'resource/mission-run/%/pull-request';
 CREATE INDEX IF NOT EXISTS claims_subscription_deferred_request_index
 ON claims(subject, json_extract(body, '$.fields.request'), store_index)
 WHERE kind='subscription.mission-deferred';
@@ -602,6 +616,29 @@ CREATE TABLE IF NOT EXISTS local_mailbox_bindings (
     incarnation TEXT NOT NULL,
     epoch INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS local_mailbox_argv_bindings (
+    token TEXT PRIMARY KEY,
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    member TEXT NOT NULL
+);
+-- Authenticated process/session custody, independent of the connection binding.
+CREATE TABLE IF NOT EXISTS local_mailbox_leases (
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    session TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    pid INTEGER NOT NULL,
+    process_token TEXT NOT NULL,
+    token TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(subject, component)
+);
 CREATE TABLE IF NOT EXISTS local_work_lease_renewals (
     subject TEXT PRIMARY KEY,
     attempt INTEGER NOT NULL,
@@ -906,6 +943,12 @@ pub(crate) struct SubjectCache {
 
 const AGENT_CARD_STATUS_LIMIT: usize = 4096;
 
+/// A roster head: its cut, every agent's refs, the first cards in order, and when published.
+pub(crate) type PublishedRosterHead = (u64, Arc<Vec<Value>>, Vec<Value>, u128);
+
+/// How long a roster refresh request may go unanswered before the daemon warns about it.
+const AGENT_ROSTER_OVERDUE_MS: u64 = 30_000;
+
 /// One subject's reduction, read at snapshot `read_at`, so it holds from there on.
 struct StatusEntry {
     read_at: u64,
@@ -941,7 +984,10 @@ fn subject_head_at(connection: &Connection, subject: &str, store_index: u64) -> 
 
 /// Whether a current view at `store_index` leaves out runtime `subject`: exactly when its
 /// reduction there would place it in history. `owners` says whether a declared runtime's owning
-/// run and generation may decide it; the snapshot reduction reads them from their claims.
+/// run and generation may decide it; the snapshot reduction reads them from their claims. The
+/// roster reads many runtimes at once ([`Store::runtime_view_entries`]); this one-runtime read
+/// is what its parity tests compare it with.
+#[cfg(test)]
 fn runtime_view_entry(
     connection: &Connection,
     subject: &str,
@@ -949,12 +995,6 @@ fn runtime_view_entry(
     owners: bool,
 ) -> Result<ViewEntry> {
     let head = subject_head_at(connection, subject, store_index)?;
-    let entry = |history| ViewEntry {
-        head,
-        history,
-        declared: false,
-        owners: Vec::new(),
-    };
     // A folded status can be live only when some claim carries a live status, and a declaration
     // is one of these claims, so a runtime with none of them is stopped or undeclared: history.
     let candidate = connection
@@ -963,21 +1003,54 @@ fn runtime_view_entry(
                            WHERE subject=?1 AND store_index<=?2 AND {CURRENT_VIEW_CLAIM})"
         ))?
         .query_row(params![subject, store_index], |row| row.get::<_, bool>(0))?;
+    runtime_view_entry_from(
+        connection,
+        subject,
+        store_index,
+        owners,
+        head,
+        candidate,
+        &mut || desired_row_at(connection, subject, Some(store_index)),
+        &mut |of| latest_actual_at(connection, of, Some(store_index)),
+        &mut |owner| subject_head_at(connection, owner, store_index),
+    )
+}
+
+/// [`runtime_view_entry`] from a runtime's head and whether it has a current-view claim. Its
+/// declaration, the actual states of it and its owners, and its owners' heads are read through
+/// the closures, only as the answer needs them.
+#[allow(clippy::too_many_arguments)]
+fn runtime_view_entry_from(
+    connection: &Connection,
+    subject: &str,
+    store_index: u64,
+    owners: bool,
+    head: u64,
+    candidate: bool,
+    desired: &mut dyn FnMut() -> Result<Option<DesiredRow>>,
+    actual: &mut dyn FnMut(&str) -> Result<Option<Value>>,
+    owner_head: &mut dyn FnMut(&str) -> Result<u64>,
+) -> Result<ViewEntry> {
+    let entry = |history| ViewEntry {
+        head,
+        history,
+        declared: false,
+        owners: Vec::new(),
+    };
     if !candidate {
         return Ok(entry(true));
     }
-    let status = |connection: &Connection| -> Result<Option<String>> {
-        Ok(latest_actual_at(connection, subject, Some(store_index))?
+    let status = |actual: Option<Value>| -> Option<String> {
+        actual
             .as_ref()
             .and_then(|value| value.get("fields").unwrap_or(value).get("status"))
             .and_then(Value::as_str)
-            .map(str::to_owned))
+            .map(str::to_owned)
     };
     let stopped = |status: Option<&str>| matches!(status, Some("stopped" | "absent" | "exited"));
-    let desired = desired_row_at(connection, subject, Some(store_index))?;
-    let Some(desired) = desired else {
+    let Some(desired) = desired()? else {
         // Undeclared: current only while its status is live.
-        let status = status(connection)?;
+        let status = status(actual(subject)?);
         return Ok(entry(status.is_none() || stopped(status.as_deref())));
     };
     if !owners {
@@ -995,10 +1068,11 @@ fn runtime_view_entry(
         desired.owner_generation.as_deref(),
         None,
         Some(store_index),
+        actual,
     )?;
     // A stop declaration leaves a stopped runtime in history; no other declaration reads status.
     let history = annotation.layer != "current"
-        || (desired.kind == "stop" && stopped(status(connection)?.as_deref()));
+        || (desired.kind == "stop" && stopped(status(actual(subject)?).as_deref()));
     let owners = desired
         .owner_run
         .iter()
@@ -1007,7 +1081,7 @@ fn runtime_view_entry(
         .collect::<Vec<_>>();
     let mut head = head;
     for owner in &owners {
-        head = head.max(subject_head_at(connection, owner, store_index)?);
+        head = head.max(owner_head(owner)?);
     }
     Ok(ViewEntry {
         head,
@@ -1147,7 +1221,8 @@ fn subject_status_at_with_mode(
                 Vec::new()
             } else {
                 connection.prepare_cached(&canonical_sql(
-                    "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2
+                    "SELECT id FROM claims INDEXED BY claims_subject_accepted_index
+                     WHERE subject=?1 AND store_index<=?2
                      ORDER BY CANONICAL_DESC(claims) LIMIT 1",
                 ))?.query_row(params![subject, at_index.unwrap_or(i64::MAX as u64)], |row| row.get::<_, String>(0))
                     .optional()?.into_iter().collect()
@@ -1155,19 +1230,70 @@ fn subject_status_at_with_mode(
             (None, claims, Vec::new())
         }
     };
+    if owner_filter.is_some_and(|run| {
+        desired.as_ref().and_then(|row| row.owner_run.as_deref()) != Some(run)
+    }) {
+        return Ok(None);
+    }
+    let unknown_claim = has_unknown_claim_at(connection, subject, at_index)?;
+    let inputs = SubjectStatusInputs {
+        desired,
+        member,
+        actual,
+        actual_source: (actual_claim, actual_origin, actual_origin_conflict),
+        harness,
+        claims,
+        conflicts,
+        unknown_claim,
+    };
+    assemble_subject_status(
+        connection, subject, at_index, inputs,
+        &mut |owner| latest_actual_at(connection, owner, at_index),
+    ).map(Some)
+}
+
+/// What one subject's status reduction reads at a snapshot: read for one subject by
+/// [`subject_status_at_with_mode`], or for many at once by the agent card fold.
+struct SubjectStatusInputs {
+    desired: Option<DesiredRow>,
+    member: Option<crate::model::MemberSpec>,
+    actual: Option<Value>,
+    /// The selected actual claim, its origin, and whether rival origins leave it indeterminate.
+    actual_source: (Option<String>, Option<String>, bool),
+    harness: Option<crate::model::CurrentHarnessView>,
+    claims: Vec<String>,
+    conflicts: Vec<String>,
+    unknown_claim: Option<String>,
+}
+
+/// The status and planned action [`SubjectStatusInputs`] reduce to. A snapshot's owning run
+/// and generation states are read through `owner_actual`.
+fn assemble_subject_status(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    inputs: SubjectStatusInputs,
+    owner_actual: &mut dyn FnMut(&str) -> Result<Option<Value>>,
+) -> Result<(SubjectStatus, Option<PlannedAction>)> {
+    let SubjectStatusInputs {
+        desired,
+        member,
+        actual,
+        actual_source: (actual_claim, actual_origin, actual_origin_conflict),
+        harness,
+        claims,
+        conflicts,
+        unknown_claim,
+    } = inputs;
     let kind = desired.as_ref().map(|row| row.kind.clone());
     let owner_run = desired.as_ref().and_then(|row| row.owner_run.clone());
     let owner_generation = desired
         .as_ref()
         .and_then(|row| row.owner_generation.clone());
-    if owner_filter.is_some_and(|run| owner_run.as_deref() != Some(run)) {
-        return Ok(None);
-    }
     let status = actual
         .as_ref()
         .and_then(|value| value.get("status"))
         .and_then(Value::as_str);
-    let unknown_claim = has_unknown_claim_at(connection, subject, at_index)?;
     let reachability = if unknown_claim.is_some() || actual_origin_conflict {
         "indeterminate".to_owned()
     } else {
@@ -1208,6 +1334,7 @@ fn subject_status_at_with_mode(
         owner_generation.as_deref(),
         actual.as_ref(),
         at_index,
+        owner_actual,
     )?;
     let action = (projection.layer == "current")
         .then_some(gap.as_ref())
@@ -1243,7 +1370,7 @@ fn subject_status_at_with_mode(
         .as_ref()
         .map(crate::graph::agent_under)
         .unwrap_or_default();
-    Ok(Some((
+    Ok((
         SubjectStatus {
             subject: subject.to_owned(),
             kind,
@@ -1264,7 +1391,7 @@ fn subject_status_at_with_mode(
             projection,
         },
         action,
-    )))
+    ))
 }
 
 /// A step as a person reads it in a list: which mission, which step, and what it is for.
@@ -2076,6 +2203,7 @@ pub(crate) fn watch_ended_tx(
     subject: &str,
     watch: &crate::model::WatchSpec,
 ) -> Result<Option<Value>, St3Error> {
+    smallclaims::touched::note_read(|| subject.to_owned());
     let since = watch.since_unix_ms.to_string();
     let mut statement = connection
         .prepare_cached(
@@ -2532,6 +2660,18 @@ fn new_mentions(prior: Option<&(Value, u128)>, facts: &Value) -> Vec<Value> {
 /// The mission runs that published a `resource/mission-run/RUN/pull-request` naming this pull
 /// request, by URL or by repository and number, at the same head when both name one. An
 /// authoring mission publishes that resource when it opens the pull request.
+const AUTHORING_PULL_REQUEST_RUNS_QUERY: &str =
+    "SELECT subject, body FROM claims WHERE id IN (
+         SELECT id FROM claims WHERE kind='resource.observed'
+           AND subject LIKE 'resource/mission-run/%/pull-request'
+           AND json_extract(body, '$.fields.facts.url')=?1
+         UNION
+         SELECT id FROM claims WHERE kind='resource.observed'
+           AND subject LIKE 'resource/mission-run/%/pull-request'
+           AND json_extract(body, '$.fields.facts.repository')=?2
+           AND json_extract(body, '$.fields.facts.number')=?3
+     ) ORDER BY CANONICAL_ASC(claims)";
+
 fn authoring_pull_request_runs_tx(
     connection: &Connection,
     facts: &Value,
@@ -2543,14 +2683,11 @@ fn authoring_pull_request_runs_tx(
         return Ok(Vec::new());
     }
     let head = facts.get("head_sha").and_then(Value::as_str);
-    let mut statement = connection.prepare(&canonical_sql(
-        "SELECT subject, body FROM claims WHERE kind='resource.observed'
-         AND subject LIKE 'resource/mission-run/%/pull-request'
-         AND (json_extract(body, '$.fields.facts.url')=?1
-           OR (json_extract(body, '$.fields.facts.repository')=?2
-               AND json_extract(body, '$.fields.facts.number')=?3))
-         ORDER BY CANONICAL_ASC(claims)",
-    ))?;
+    // An OR can scan the whole partial index. UNION locates matching claim IDs with one
+    // expression-index seek per identity, deduplicates dual matches, then orders only those
+    // claims with the same canonical order as the original query.
+    let mut statement =
+        connection.prepare_cached(&canonical_sql(AUTHORING_PULL_REQUEST_RUNS_QUERY))?;
     let candidates = statement
         .query_map(params![url, repository, number], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -2748,6 +2885,16 @@ impl Store {
         through: u64,
         previous: &[Value],
     ) -> Result<Option<AgentResourcesDelta>> {
+        Ok(self.agent_resources_delta(after, through, previous)?.ok())
+    }
+
+    /// The cards claims between two cuts change, or why that cannot be told card by card.
+    fn agent_resources_delta(
+        &self,
+        after: u64,
+        through: u64,
+        previous: &[Value],
+    ) -> Result<std::result::Result<AgentResourcesDelta, String>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(
             "SELECT subject, kind, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
@@ -2759,8 +2906,16 @@ impl Store {
                 row.get::<_, Option<String>>(2)?))
         })? {
             let (subject, kind, actor) = row?;
+            // A card reads claims about its agent, the runs, generations and steps that own or
+            // queue agents, and messages; work activity is read by actor on step claims. A
+            // claim about any other subject, of any kind, changes no card.
+            if !["agent/", "mission-run/", "run-generation/", "step-run/", "message/"]
+                .iter().any(|prefix| subject.starts_with(prefix))
+            {
+                continue;
+            }
             if self.smalltalk.claim_registry().claim(&kind).is_none() {
-                return Ok(None);
+                return Ok(Err(format!("unregistered {kind}")));
             }
             if subject.starts_with("agent/") {
                 // All registered agent claims can affect the subject's actual reduction or
@@ -2810,25 +2965,15 @@ impl Store {
                 // pending-delivery blocker, including replies through message ancestors.
                 // Receipts lack endpoints, so use the same message projection blockers read.
                 let Some(message) = self.message(&subject)? else {
-                    return Ok(None);
+                    return Ok(Err(format!("{kind} without its message")));
                 };
                 delta.subjects.extend([message.from, message.to].into_iter()
                     .filter(|party| party.starts_with("agent/")));
                 continue;
             }
-            // These projections touch neither card reductions nor queue/label inputs. Keep
-            // the subject guards: a claim on an agent also changes its fallback revision.
-            let irrelevant = match kind.as_str() {
-                "daemon.diagnostic" | "daemon.started" => subject.starts_with("daemon/"),
-                "glass.upserted" | "glass.deleted" => subject.starts_with("glass/"),
-                "arrangement.edited" => subject.starts_with("arrangement/"),
-                "fleet.invite-created" | "fleet.invite-redeemed" | "fleet.invite-revoked" => subject.starts_with("fleet-invite/"),
-                "fleet.member-admitted" | "fleet.member-endpoints" | "fleet.member-left" | "fleet.member-removed" => subject.starts_with("host/"),
-                _ => false,
-            };
-            if !irrelevant {
-                return Ok(None);
-            }
+            // Any other claim about a card input subject: refold conservatively.
+            let namespace = subject.split('/').next().unwrap_or_default();
+            return Ok(Err(format!("{kind} on {namespace}/")));
         }
         if !owners.is_empty() {
             // Existing cards carry their historical ownership; current declarations also
@@ -2847,7 +2992,7 @@ impl Store {
             delta.subjects.extend(statement.query_map([owners], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<BTreeSet<_>>>()?);
         }
-        Ok(Some(delta))
+        Ok(Ok(delta))
     }
 
     /// An allow-list for shallow refs, narrower than card-local invalidation: runtime status
@@ -2890,6 +3035,11 @@ impl Store {
             .unwrap_or_default())
     }
 
+    /// Never waits; multi-gate readers release unrelated guards before queuing on a miss.
+    pub(crate) fn try_admit_agent_resources(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.smalltalk.agent_resources_admission.clone().try_lock_owned().ok()
+    }
+
     /// One physical roster reader across HTTP pages and differently authorized WS windows.
     /// Waiting happens before SQLite snapshot acquisition, so followers pin no old WAL mark.
     pub(crate) async fn admit_agent_resources(&self) -> tokio::sync::OwnedMutexGuard<()> {
@@ -2904,6 +3054,18 @@ impl Store {
     #[cfg(test)]
     pub(crate) fn agent_resources_builds_for_test(&self) -> usize {
         self.smalltalk.agent_resources_builds.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn count_refolded_cards_for_test(&self, cards: usize) {
+        self.smalltalk.agent_resources_refolded_cards.fetch_add(cards, std::sync::atomic::Ordering::Relaxed);
+        self.smalltalk.agent_resources_largest_fold.fetch_max(cards, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The most cards one projection call folded since the store opened.
+    #[cfg(test)]
+    pub(crate) fn agent_resources_largest_fold_for_test(&self) -> usize {
+        self.smalltalk.agent_resources_largest_fold.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -2926,6 +3088,210 @@ impl Store {
             .expect("agent resources cache poisoned").iter().rev()
             .find(|entry| entry.index == index && !entry.history && entry.covered.is_none())
             .and_then(|entry| entry.valid_until_unix_ms)
+    }
+
+    /// Register the one task that keeps the complete roster published, and return its wake.
+    /// `None` when one is already registered.
+    pub(crate) fn start_agent_roster_refresher(&self) -> Option<Arc<tokio::sync::Notify>> {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        self.smalltalk.agent_roster_refresh.set(Arc::clone(&wake)).ok()?;
+        Some(wake)
+    }
+
+    /// `None` when a complete roster at `index` takes folding at most `bound` cards: the
+    /// newest rows, complete or partial, say which cards changed since, and together with the
+    /// agents they do not cover yet those are no more than `bound`. Otherwise why not. Read in
+    /// the snapshot that folds.
+    pub(crate) fn agent_roster_unbounded_because(
+        &self,
+        index: u64,
+        history: bool,
+        bound: usize,
+    ) -> Result<Option<String>> {
+        let previous = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| entry.history == history && entry.index <= index)
+            .max_by_key(|entry| (entry.index, entry.local)).cloned();
+        // Without rows to start from, every agent is missing: a small roster, or an empty
+        // one, still completes in one bounded fold.
+        let (changed, membership) = match &previous {
+            None => (0, true),
+            Some(previous) if previous.index == index => (0, false),
+            Some(previous) => match self.agent_resources_delta(previous.index, index, &previous.items)? {
+                Ok(delta) => (delta.subjects.len(), delta.membership),
+                Err(reason) => return Ok(Some(reason)),
+            },
+        };
+        // Complete rows whose membership no claim moved miss no agent: skip listing them all.
+        if previous.as_ref().is_some_and(|previous| previous.covered.is_none()) && !membership {
+            return Ok((changed > bound).then(|| "cards changed".to_owned()));
+        }
+        let connection = self.readers.get();
+        let names = connection.prepare_cached(RANGE_SUBJECTS)?
+            .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let names = if history { names } else {
+            self.current_view_candidates(&connection, names, index, true)?
+        };
+        drop(connection);
+        let folded = previous.iter().flat_map(|previous| previous.items.iter())
+            .filter_map(|item| item["id"].as_str()).collect::<HashSet<_>>();
+        let missing = names.iter().filter(|name| !folded.contains(name.as_str())).count();
+        Ok((changed.saturating_add(missing) > bound).then(|| {
+            if missing > changed { "cards missing" } else { "cards changed" }.to_owned()
+        }))
+    }
+
+    /// Count one roster assembled in chunks because no short fold could complete it, by why.
+    pub(crate) fn note_agent_roster_chunked(&self, reason: &str) {
+        crate::performance::record_request("roster/chunked-assembly", None, std::time::Duration::ZERO);
+        *self.smalltalk.agent_roster_chunked.lock().expect("roster counts poisoned")
+            .entry(reason.to_owned()).or_default() += 1;
+    }
+
+    /// How many rosters were assembled in chunks, by why: each folded every card again.
+    pub fn agent_roster_chunked_assemblies(&self) -> BTreeMap<String, u64> {
+        self.smalltalk.agent_roster_chunked.lock().expect("roster counts poisoned").clone()
+    }
+
+    /// Whether the newest complete roster already is the one at `index`: same graph cut,
+    /// same local activity, and no queue deadline passed since. A refresh would fold nothing.
+    pub(crate) fn agent_roster_current(&self, index: u64, history: bool) -> Result<bool> {
+        let local = roster_local_frontier(&self.readers.get(), index)?;
+        let now = now_ms();
+        Ok(self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .any(|entry| entry.history == history && entry.covered.is_none()
+                && entry.index == index && entry.local == local
+                && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)))
+    }
+
+    /// Whether a refresher keeps the roster published, so readers must never fold it.
+    pub(crate) fn agent_roster_refresher_running(&self) -> bool {
+        self.smalltalk.agent_roster_refresh.get().is_some()
+    }
+
+    /// Ask the refresher, if one runs, to publish the roster at the newest cut. Requests made
+    /// while it folds coalesce into one more refresh.
+    pub(crate) fn request_agent_roster_refresh(&self) {
+        if let Some(wake) = self.smalltalk.agent_roster_refresh.get() {
+            let _ = self.smalltalk.agent_roster_requested_at.compare_exchange(
+                0, now_ms() as u64, std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            wake.notify_one();
+        }
+    }
+
+    /// Ask the refresher, if one runs, to also publish the history roster.
+    pub(crate) fn request_agent_roster_history(&self) {
+        self.smalltalk.agent_roster_history_wanted.store(true, std::sync::atomic::Ordering::Release);
+        self.request_agent_roster_refresh();
+    }
+
+    /// Whether a reader asked for the history roster since the last time this was taken.
+    pub(crate) fn take_agent_roster_history_request(&self) -> bool {
+        self.smalltalk.agent_roster_history_wanted.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Run one refresh, answering the requests made before it began only if it publishes.
+    pub(crate) fn answer_agent_roster_requests<T>(&self, refresh: impl FnOnce() -> Result<T>) -> Result<T> {
+        let requested = &self.smalltalk.agent_roster_requested_at;
+        let pending = requested.swap(0, std::sync::atomic::Ordering::AcqRel);
+        let result = refresh();
+        if result.is_err() && pending != 0 {
+            // Still unanswered: keep the oldest request time unless a newer request is waiting.
+            let _ = requested.compare_exchange(0, pending, std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed);
+        }
+        if result.is_ok() {
+            self.smalltalk.agent_roster_overdue_warned.store(false, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+
+    /// Say once when a refresh request has gone unanswered so long that the refresher must be
+    /// slow, failing or stopped. Readers keep serving the newest publication, which carries its
+    /// own cut and publication time, rather than refusing rows that exist.
+    fn warn_if_agent_roster_overdue(&self) {
+        let requested = self.smalltalk.agent_roster_requested_at.load(std::sync::atomic::Ordering::Acquire);
+        let waited = (now_ms() as u64).saturating_sub(requested);
+        if requested != 0 && waited > AGENT_ROSTER_OVERDUE_MS
+            && !self.smalltalk.agent_roster_overdue_warned.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            eprintln!("st3: WARN an agents roster refresh asked for {} s ago is still unanswered; \
+                serving the newest published roster", waited / 1000);
+        }
+    }
+
+    /// The newest complete current roster published at or before `index`, with its own graph
+    /// index, while a refresher keeps advancing it. A reader serves these rows under that
+    /// index's snapshot, never under its own newer one, and wakes the refresher. Without a
+    /// refresher there is none: readers then fold exactly their own cut, as before.
+    pub(crate) fn published_agent_roster(
+        &self,
+        index: u64,
+        history: bool,
+    ) -> Option<(u64, Arc<Vec<Value>>, u128)> {
+        self.smalltalk.agent_roster_refresh.get()?;
+        self.warn_if_agent_roster_overdue();
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
+            .max_by_key(|entry| (entry.index, entry.local))
+            .map(|entry| (entry.index, Arc::clone(&entry.items), entry.published_at_unix_ms))
+    }
+
+    /// The complete roster published at exactly `cut`, for a page continuing from a first page
+    /// served at that cut, with when it was published.
+    pub(crate) fn published_agent_roster_at(
+        &self,
+        cut: u64,
+        history: bool,
+    ) -> Option<(Arc<Vec<Value>>, u128)> {
+        self.smalltalk.agent_roster_refresh.get()?;
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index == cut)
+            .max_by_key(|entry| entry.local)
+            .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms))
+    }
+
+    /// When no complete roster is published yet: the newest current refs at or before `index`
+    /// (membership, order and queue metadata of every agent) and the cards of their first
+    /// `count` agents, all at that one cut. The refresher publishes this head first as the
+    /// daemon starts, so a window or first page need not wait for every card to fold.
+    pub(crate) fn published_agent_roster_head(
+        &self,
+        index: u64,
+        count: usize,
+    ) -> Option<PublishedRosterHead> {
+        self.smalltalk.agent_roster_refresh.get()?;
+        self.warn_if_agent_roster_overdue();
+        let (cut, refs) = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned").iter()
+            .filter(|entry| !entry.history && entry.index <= index)
+            .max_by_key(|entry| entry.index)
+            .map(|entry| (entry.index, Arc::clone(&entry.items)))?;
+        let cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        let head = cache.iter().filter(|entry| entry.index == cut && !entry.history)
+            .find_map(|entry| {
+                let cards = entry.items.iter()
+                    .filter_map(|card| Some((card["id"].as_str()?, card)))
+                    .collect::<HashMap<_, _>>();
+                refs.iter().take(count)
+                    .map(|reference| cards.get(reference["id"].as_str()?).map(|card| (*card).clone()))
+                    .collect::<Option<Vec<_>>>()
+                    .map(|head| (head, entry.published_at_unix_ms))
+            })?;
+        Some((cut, refs, head.0, head.1))
+    }
+
+    /// Follows the revision of complete current roster publications: it rises with every one,
+    /// including a replacement at the same graph index after local activity or a deadline.
+    pub(crate) fn subscribe_agent_roster(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.smalltalk.agent_roster_published.subscribe()
     }
 
     /// Queue selection changes at lease expiry even when the claim frontier is unchanged.
@@ -2980,6 +3346,7 @@ impl Store {
             .expect("agent page refs cache poisoned");
         cache.push_back(runtime::AgentResourcesEntry {
             index, local: 0, history, covered: None, valid_until_unix_ms, items: Arc::clone(&items),
+            published_at_unix_ms: now,
         });
         let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
         drop(cache);
@@ -2996,15 +3363,37 @@ impl Store {
         selected: Option<&BTreeSet<String>>,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        self.cached_agent_resources_folding(index, history, selected, false, build)
+    }
+
+    /// [`Self::cached_agent_resources_for`] for one chunk of a roster assembled in short folds:
+    /// it refolds only the `selected` agents. Changed cards outside them leave the published
+    /// rows' coverage and fold with their own chunk, so one call folds at most `selected`.
+    pub(crate) fn cached_agent_resources_chunk(
+        &self,
+        index: u64,
+        history: bool,
+        selected: &BTreeSet<String>,
+        build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
+        self.cached_agent_resources_folding(index, history, Some(selected), true, build)
+    }
+
+    fn cached_agent_resources_folding(
+        &self,
+        index: u64,
+        history: bool,
+        selected: Option<&BTreeSet<String>>,
+        chunk: bool,
+        build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
+    ) -> Result<Vec<Value>> {
         // Cold presentation reads current desired/queue tables even for historical status
         // cuts. Do not reuse rows from an older physical projection for those requests.
         if index < current_index(&self.readers.get())? {
             let mut items = crate::performance::task("roster/card-projection",
                 || build(selected.map(|names| (names, &[][..]))))?;
             #[cfg(test)]
-            self.smalltalk.agent_resources_refolded_cards.fetch_add(
-                items.len(), std::sync::atomic::Ordering::Relaxed,
-            );
+            self.count_refolded_cards_for_test(items.len());
             items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                 .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
             return Ok(items);
@@ -3073,7 +3462,13 @@ impl Store {
                     changed.extend(statement.query_map(params![previous.local, local, index],
                         |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<BTreeSet<_>>>()?);
                 }
-                let covered = match (&previous.covered, selected) {
+                // A chunk treats complete rows as covering exactly the agents they hold.
+                let previous_covered: Option<BTreeSet<String>> = match &previous.covered {
+                    None if chunk => Some(previous.items.iter()
+                        .filter_map(|item| item["id"].as_str().map(str::to_owned)).collect()),
+                    covered => covered.clone(),
+                };
+                let mut covered: Option<BTreeSet<String>> = match (&previous_covered, selected) {
                     (None, _) => None,
                     (Some(covered), Some(names)) => {
                         changed.retain(|name| covered.contains(name));
@@ -3115,27 +3510,36 @@ impl Store {
                 } else {
                     previous.valid_until_unix_ms
                 };
+                // A chunk defers changed cards outside it: they leave the coverage and the rows.
+                let mut deferred = BTreeSet::new();
+                if chunk && let (Some(names), Some(covered)) = (selected, covered.as_mut()) {
+                    deferred = changed.difference(names).cloned().collect::<BTreeSet<_>>();
+                    changed.retain(|name| names.contains(name));
+                    covered.retain(|name| !deferred.contains(name));
+                }
                 // Coverage gaps join `changed`, so an empty set means no card this cut can see
                 // moved at all: the previous rows already are this cut's projection, and the
                 // heartbeat or fleet-only claim between two reads costs no clone, sort or build.
-                if changed.is_empty() {
+                if changed.is_empty() && deferred.is_empty() {
                     return Ok(runtime::AgentResourcesEntry {
                         index, local, history, covered,
                         valid_until_unix_ms,
                         items: Arc::clone(&previous.items),
+                        published_at_unix_ms: now_ms(),
                     });
                 }
                 #[cfg(test)]
                 self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut items = previous.items.iter()
-                    .filter(|item| !changed.contains(item["id"].as_str().unwrap_or_default()))
+                    .filter(|item| {
+                        let id = item["id"].as_str().unwrap_or_default();
+                        !changed.contains(id) && !deferred.contains(id)
+                    })
                     .cloned().collect::<Vec<_>>();
                 let rebuilt = crate::performance::task("roster/card-projection",
                     || build(Some((&changed, queue_metadata.as_deref().unwrap_or(&previous.items)))))?;
                 #[cfg(test)]
-                self.smalltalk.agent_resources_refolded_cards.fetch_add(
-                    rebuilt.len(), std::sync::atomic::Ordering::Relaxed,
-                );
+                self.count_refolded_cards_for_test(rebuilt.len());
                 items.extend(rebuilt);
                 items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
@@ -3143,6 +3547,7 @@ impl Store {
                     index, local, history, covered,
                     valid_until_unix_ms,
                     items: Arc::new(items),
+                    published_at_unix_ms: now_ms(),
                 })
             }
             None => {
@@ -3151,15 +3556,14 @@ impl Store {
                 let mut items = crate::performance::task("roster/card-projection",
                     || build(selected.map(|names| (names, &[][..]))))?;
                 #[cfg(test)]
-                self.smalltalk.agent_resources_refolded_cards.fetch_add(
-                    items.len(), std::sync::atomic::Ordering::Relaxed,
-                );
+                self.count_refolded_cards_for_test(items.len());
                 items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
                 Ok(runtime::AgentResourcesEntry {
                     index, local, history, covered: selected.cloned(),
                     valid_until_unix_ms: self.agent_queue_valid_until(now)?,
                     items: Arc::new(items),
+                    published_at_unix_ms: now_ms(),
                 })
             }
         }
@@ -3171,6 +3575,7 @@ impl Store {
         let published = cache.iter().filter(valid).find(|entry| {
             agent_resources_entry_hits(entry, now, index, local, history, selected)
         }).map(|entry| Arc::clone(&entry.items));
+        let complete = entry.covered.is_none();
         let items = if let Some(published) = published { published } else {
             cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
             let items = Arc::clone(&entry.items);
@@ -3179,6 +3584,9 @@ impl Store {
             items
         };
         drop(cache);
+        if complete {
+            self.smalltalk.agent_roster_published.send_modify(|revision| *revision += 1);
+        }
         Ok(select(&items))
     }
 
@@ -3193,6 +3601,16 @@ impl Store {
         history: bool,
         selected: Option<&BTreeSet<String>>,
     ) -> Result<Option<Arc<Vec<Value>>>> {
+        Ok(self.agent_resources_published_at(index, history, selected)?.map(|(items, _)| items))
+    }
+
+    /// [`Self::agent_resources_cached_at`], with when the rows were published.
+    pub(crate) fn agent_resources_published_at(
+        &self,
+        index: u64,
+        history: bool,
+        selected: Option<&BTreeSet<String>>,
+    ) -> Result<Option<(Arc<Vec<Value>>, u128)>> {
         if index < current_index(&self.readers.get())? {
             return Ok(None);
         }
@@ -3204,7 +3622,7 @@ impl Store {
             .expect("agent resources cache poisoned");
         let hit = cache.iter()
             .find(|entry| agent_resources_entry_hits(entry, now, index, local, history, selected))
-            .map(|entry| Arc::clone(&entry.items));
+            .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms));
         drop(cache);
         Ok(hit.map(|hit| crate::performance::task("roster/cache-hit", || hit)))
     }
@@ -4271,6 +4689,8 @@ impl Store {
                 "deadline_at_unix_ms": deadline_at_unix_ms,
             }
         });
+        let mut body = body;
+        add_run_report_fields(&mut body, &mission, None, false);
         append_receipt_claim_tx(
             &transaction,
             &self.origin,
@@ -5983,6 +6403,15 @@ impl Store {
                 .map_err(internal)?;
             }
         }
+        revision_seats::carry_completed_agents_tx(
+            &transaction,
+            &self.origin,
+            &current,
+            mission,
+            &compatible,
+            &generation_subject,
+            None,
+        )?;
         cancel_descendant_mission_runs_tx(
             &transaction,
             &self.origin,
@@ -7923,15 +8352,41 @@ impl Store {
                         ));
                     }
                 };
+                // Most renewals only extend the local operational lease. Publish an
+                // anchor before the last replicated expiry is within five minutes, so
+                // another replica never sees a normally renewed lease as expired.
+                let quiet_renewal = action == "renew"
+                    && request.summary.is_none()
+                    && request.reason.is_none()
+                    && request.evidence.is_empty();
+                let last_replicated_expiry = if quiet_renewal {
+                    transaction
+                        .query_row(
+                            &canonical_sql("SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
+                             FROM claims WHERE subject=?1
+                               AND kind IN ('work.claimed','work.renewed','work.progress')
+                             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                            [&subject],
+                            |row| row.get::<_, Option<u64>>(0),
+                        )
+                        .optional()
+                        .map_err(internal)?
+                        .flatten()
+                        .map(u128::from)
+                } else {
+                    None
+                };
+                let publish = !quiet_renewal
+                    || last_replicated_expiry.is_none_or(|expiry| expiry <= now.saturating_add(300_000));
                 let readiness_epoch = current
                     .readiness_epoch
                     .saturating_add(u32::from(status == "ready" && current.status != "ready"));
                 transaction
                     .execute(
                         "UPDATE step_runs SET status=?2, worker_reported=?3, lease_owner=?4, lease_incarnation=?5,
-                                lease_expires_at_unix_ms=?6, blocked_reason=?7, readiness_epoch=?8,
+                                lease_expires_at_unix_ms=?6, blocked_reason=CASE WHEN ?10 THEN ?7 ELSE blocked_reason END, readiness_epoch=?8,
                                 updated_at_unix_ms=?9 WHERE subject=?1",
-                        params![subject, status, worker_reported, claimant, claim_incarnation, claim_expiry.map(|value| value.to_string()), request.reason, readiness_epoch, now.to_string()],
+                        params![subject, status, worker_reported, claimant, claim_incarnation, claim_expiry.map(|value| value.to_string()), request.reason, readiness_epoch, now.to_string(), publish],
                     )
                     .map_err(internal)?;
                 renew_nested_ancestor_leases_tx(
@@ -7969,32 +8424,6 @@ impl Store {
                     "extend" => "work.extended",
                     _ => unreachable!("the work action was validated above"),
                 };
-                // Most renewals only extend the local operational lease. Publish an
-                // anchor before the last replicated expiry is within five minutes, so
-                // another replica never sees a normally renewed lease as expired.
-                let quiet_renewal = action == "renew"
-                    && request.summary.is_none()
-                    && request.reason.is_none()
-                    && request.evidence.is_empty();
-                let last_replicated_expiry = if quiet_renewal {
-                    transaction
-                        .query_row(
-                            &canonical_sql("SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
-                             FROM claims WHERE subject=?1
-                               AND kind IN ('work.claimed','work.renewed','work.progress')
-                             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
-                            [&subject],
-                            |row| row.get::<_, Option<u64>>(0),
-                        )
-                        .optional()
-                        .map_err(internal)?
-                        .flatten()
-                        .map(u128::from)
-                } else {
-                    None
-                };
-                let publish = !quiet_renewal
-                    || last_replicated_expiry.is_none_or(|expiry| expiry <= now.saturating_add(300_000));
                 if publish {
                     append_receipt_claim_tx(
                         transaction,
@@ -9815,7 +10244,8 @@ impl Store {
         }
         self.graph.ensure_principal_key(input.actor.as_deref().unwrap())?;
         let signature = serde_json::to_string(signature).map_err(internal)?;
-        append_claim_with_signature(&self.graph, input, None, None, None, None, Some(&signature))
+        append_claim_with_commit_context(&self.graph, input, None, None, None, None,
+            ClaimCommitContext { signature: Some(&signature), ..Default::default() })
     }
 
     pub(crate) fn append_claim_outcome(
@@ -10102,7 +10532,8 @@ impl Store {
     /// Delete local observations older than `older_than_unix_ms`, and all but the newest
     /// `max_per_subject_kind` of each subject and kind. The newest observation of each
     /// subject and kind stays. Deletes run in short transactions of at most `chunk` rows, so
-    /// a crash leaves a consistent table that the next pass finishes.
+    /// a crash leaves a consistent table that the next pass finishes. Each chunk borrows the
+    /// background writer so queued foreground requests can run between chunks.
     pub fn trim_local_observations(
         &self,
         older_than_unix_ms: u128,
@@ -10118,7 +10549,7 @@ impl Store {
         // rank every row of the table with a window function inside the writer's hold, every
         // chunk of every pass, even when nothing was due.
         loop {
-            let connection = self.connection.write();
+            let connection = self.connection.write_background();
             let removed = connection.execute(
                 "DELETE FROM local_observations WHERE id IN (
                     SELECT id FROM local_observations AS old
@@ -10156,7 +10587,7 @@ impl Store {
         };
         for (subject, kind) in over_cap {
             loop {
-                let connection = self.connection.write();
+                let connection = self.connection.write_background();
                 // The newest id past the cap: rank `cap + 1` from the newest.
                 let boundary: Option<i64> = connection
                     .query_row(
@@ -10187,12 +10618,13 @@ impl Store {
     }
 
     /// Forget the responses counted before `older_than_unix_ms`, in short transactions of at
-    /// most `chunk` rows. Ingest refuses responses that old, so none can be counted twice.
+    /// most `chunk` rows using background writer loans. Ingest refuses responses that old, so
+    /// none can be counted twice.
     pub fn trim_usage_responses(&self, older_than_unix_ms: u128, chunk: usize) -> Result<usize> {
         let chunk = chunk.max(1).min(i64::MAX as usize) as i64;
         let mut deleted = 0;
         loop {
-            let connection = self.connection.write();
+            let connection = self.connection.write_background();
             let removed = connection.execute(
                 "DELETE FROM local_usage_responses WHERE rowid IN (
                     SELECT rowid FROM local_usage_responses WHERE observed_at_unix_ms < ?1 LIMIT ?2
@@ -10792,60 +11224,74 @@ impl Store {
         &self, connection: &Connection, subject: &str, store_index: u64,
         newest: bool, mode: SubjectStatusMode,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
-        {
-            let cache = self
-                .smalltalk
-                .subject_cache
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let entries = match mode {
-                SubjectStatusMode::Full => &cache.statuses,
-                SubjectStatusMode::AgentCard => &cache.card_statuses,
-            };
-            if let Some(entry) = entries.get(subject)
-                .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
-            {
-                return Ok((entry.status.clone(), entry.action.clone()));
-            }
+        if let Some(kept) = self.kept_subject_status(subject, store_index, mode) {
+            return Ok(kept);
         }
         let (status, action) = subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
             .expect("a reduction without an owner filter always has a status");
         if newest {
-            let mut cache = self
-                .smalltalk
-                .subject_cache
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            // Keep it only if no later snapshot was applied meanwhile.
-            if cache.through == store_index {
-                let owners = status
-                    .owner_run
-                    .iter()
-                    .chain(status.projection.owner_generation.iter())
-                    .cloned()
-                    .collect();
-                let entries = match mode {
-                    SubjectStatusMode::Full => &mut cache.statuses,
-                    SubjectStatusMode::AgentCard => &mut cache.card_statuses,
-                };
-                // At capacity, a cold summary remains correct and uncached. Invalidation
-                // frees slots; no growing history map or full-status cache warming is needed.
-                if matches!(mode, SubjectStatusMode::AgentCard)
-                    && entries.len() >= AGENT_CARD_STATUS_LIMIT && !entries.contains_key(subject) {
-                    return Ok((status, action));
-                }
-                entries.insert(
-                    subject.to_owned(),
-                    StatusEntry {
-                        read_at: store_index,
-                        owners,
-                        status: status.clone(),
-                        action: action.clone(),
-                    },
-                );
-            }
+            self.keep_subject_status(subject, store_index, mode, &status, &action);
         }
         Ok((status, action))
+    }
+
+    /// `subject`'s kept status reduction, if one holds at `store_index`.
+    fn kept_subject_status(
+        &self, subject: &str, store_index: u64, mode: SubjectStatusMode,
+    ) -> Option<(SubjectStatus, Option<PlannedAction>)> {
+        let cache = self
+            .smalltalk
+            .subject_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entries = match mode {
+            SubjectStatusMode::Full => &cache.statuses,
+            SubjectStatusMode::AgentCard => &cache.card_statuses,
+        };
+        entries.get(subject)
+            .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
+            .map(|entry| (entry.status.clone(), entry.action.clone()))
+    }
+
+    /// Keep a reduction read at the newest applied snapshot, `store_index`.
+    fn keep_subject_status(
+        &self, subject: &str, store_index: u64, mode: SubjectStatusMode,
+        status: &SubjectStatus, action: &Option<PlannedAction>,
+    ) {
+        let mut cache = self
+            .smalltalk
+            .subject_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // Keep it only if no later snapshot was applied meanwhile.
+        if cache.through != store_index {
+            return;
+        }
+        let owners = status
+            .owner_run
+            .iter()
+            .chain(status.projection.owner_generation.iter())
+            .cloned()
+            .collect();
+        let entries = match mode {
+            SubjectStatusMode::Full => &mut cache.statuses,
+            SubjectStatusMode::AgentCard => &mut cache.card_statuses,
+        };
+        // At capacity, a cold summary remains correct and uncached. Invalidation
+        // frees slots; no growing history map or full-status cache warming is needed.
+        if matches!(mode, SubjectStatusMode::AgentCard)
+            && entries.len() >= AGENT_CARD_STATUS_LIMIT && !entries.contains_key(subject) {
+            return;
+        }
+        entries.insert(
+            subject.to_owned(),
+            StatusEntry {
+                read_at: store_index,
+                owners,
+                status: status.clone(),
+                action: action.clone(),
+            },
+        );
     }
 
     /// Of `subjects`, those a current view can show at `store_index`. A runtime that nothing
@@ -10861,41 +11307,66 @@ impl Store {
         store_index: u64,
         owners: bool,
     ) -> Result<BTreeSet<String>> {
+        let mut reads = card_fold::CardReads::new(store_index);
+        self.current_view_candidates_with(connection, subjects, store_index, owners, &mut reads)
+    }
+
+    /// [`Self::current_view_candidates`], reading the runtimes it has no answer for a chunk at
+    /// a time into `reads`.
+    fn current_view_candidates_with(
+        &self,
+        connection: &Connection,
+        subjects: BTreeSet<String>,
+        store_index: u64,
+        owners: bool,
+        reads: &mut card_fold::CardReads,
+    ) -> Result<BTreeSet<String>> {
         let newest = self.advance_subject_cache(connection, store_index)?;
         let mut candidates = BTreeSet::new();
-        for subject in subjects {
-            if !runtime_subject(&subject) {
-                candidates.insert(subject);
-                continue;
-            }
-            // Without the owner checks, only an answer that used no declaration applies.
-            let known = self
+        let mut unknown = Vec::new();
+        {
+            let cache = self
                 .smalltalk
                 .subject_cache
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .views
-                .get(&subject)
-                .filter(|entry| entry.head <= store_index && (owners || !entry.declared))
-                .map(|entry| entry.history);
-            let history = match known {
-                Some(history) => history,
-                None => {
-                    let entry = runtime_view_entry(connection, &subject, store_index, owners)?;
-                    let history = entry.history;
-                    if newest && owners {
-                        let mut cache = self
-                            .smalltalk
-                            .subject_cache
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner);
-                        if cache.through == store_index {
-                            cache.views.insert(subject.clone(), entry);
-                        }
-                    }
-                    history
+                .unwrap_or_else(PoisonError::into_inner);
+            for subject in subjects {
+                if !runtime_subject(&subject) {
+                    candidates.insert(subject);
+                    continue;
                 }
-            };
+                // Without the owner checks, only an answer that used no declaration applies.
+                let known = cache
+                    .views
+                    .get(&subject)
+                    .filter(|entry| entry.head <= store_index && (owners || !entry.declared))
+                    .map(|entry| entry.history);
+                match known {
+                    Some(false) => {
+                        candidates.insert(subject);
+                    }
+                    Some(true) => {}
+                    None => unknown.push(subject),
+                }
+            }
+        }
+        let mut entries =
+            self.runtime_view_entries(connection, &unknown, store_index, owners, reads)?;
+        for subject in unknown {
+            let entry = entries
+                .remove(&subject)
+                .expect("every runtime read has a view entry");
+            let history = entry.history;
+            if newest && owners {
+                let mut cache = self
+                    .smalltalk
+                    .subject_cache
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if cache.through == store_index {
+                    cache.views.insert(subject.clone(), entry);
+                }
+            }
             if !history {
                 candidates.insert(subject);
             }
@@ -10926,15 +11397,32 @@ impl Store {
                 .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<BTreeSet<_>>>()?,
         };
+        // The view and status passes share what they read of each subject.
+        let mut reads = card_fold::CardReads::new(index);
         let names = if history { names } else {
-            self.current_view_candidates(&connection, names, index, true)?
+            self.current_view_candidates_with(&connection, names, index, true, &mut reads)?
         };
         let newest = self.advance_subject_cache(&connection, index)?;
+        let mode = SubjectStatusMode::AgentCard;
+        let mut kept = HashMap::new();
+        let mut missing = Vec::new();
+        for name in &names {
+            match self.kept_subject_status(name, index, mode) {
+                Some((status, _)) => {
+                    kept.insert(name.clone(), status);
+                }
+                None => missing.push(name.clone()),
+            }
+        }
+        for (name, (status, action)) in self.agent_card_statuses(&connection, &missing, index, &mut reads)? {
+            if newest {
+                self.keep_subject_status(&name, index, mode, &status, &action);
+            }
+            kept.insert(name, status);
+        }
         let mut subjects = Vec::with_capacity(names.len());
         for name in names {
-            let (status, _) = self.cached_subject_status_with_mode(
-                &connection, &name, index, newest, SubjectStatusMode::AgentCard,
-            )?;
+            let status = kept.remove(&name).expect("every name has a status");
             if history || status.projection.layer == "current" {
                 subjects.push(status);
             }
@@ -10973,63 +11461,73 @@ impl Store {
         store_index: u64,
         include_history: bool,
     ) -> Result<StatusResponse> {
-        let subjects = if include_history {
-            subjects
-        } else {
-            self.current_view_candidates(&self.readers.get(), subjects, store_index, true)?
-        };
-        if subjects.len() <= 64 {
-            return self.status_at_view_for_names(
-                None,
-                None,
-                Some(store_index),
-                include_history,
-                Some(subjects),
-            );
-        }
-        // Divide a large bounded projection across a few threads, each reading its slice on its
-        // own connection at the same store index, then merge in subject order.
-        let subjects = subjects.into_iter().collect::<Vec<_>>();
-        let chunk_size = subjects.len().div_ceil(STATUS_WORKERS);
-        let profile = crate::profile::current();
-        let read_budget = smallclaims::read_budget::current();
-        let parts = std::thread::scope(|scope| {
-            subjects
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
-                    let profile = profile.clone();
-                    let read_budget = read_budget.clone();
-                    scope.spawn(move || {
-                        let _entered = crate::profile::enter(profile.as_ref());
-                        let read = || self.status_at_view_for_names(
+        self.readers.request_read(|| {
+            let subjects = if include_history {
+                subjects
+            } else {
+                self.current_view_candidates(&self.readers.get(), subjects, store_index, true)?
+            };
+            if subjects.len() <= 64 {
+                return self.status_at_view_for_names(
+                    None, None, Some(store_index), include_history, Some(subjects),
+                );
+            }
+            // The caller keeps its loan and reduces the LAST slice on it, so a full
+            // four-way split uses three extra permits and no extra connection for the
+            // parent. Other slices must never wait for admission: when a permit is
+            // unavailable they also reduce inline on that same loan. Slices stay in
+            // subject order regardless of which ones execute in parallel.
+            enum Part<'scope> {
+                Worker(std::thread::ScopedJoinHandle<'scope, Result<StatusResponse>>),
+                Inline(Result<StatusResponse>),
+            }
+            let subjects = subjects.into_iter().collect::<Vec<_>>();
+            let chunk_size = subjects.len().div_ceil(STATUS_WORKERS);
+            let profile = crate::profile::current();
+            let read_budget = smallclaims::read_budget::current();
+            let parts = std::thread::scope(|scope| {
+                subjects
+                    .chunks(chunk_size)
+                    .enumerate()
+                    .map(|(position, chunk)| {
+                        let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
+                        let read = move || self.status_at_view_for_names(
                             None, None, Some(store_index), include_history, Some(names),
                         );
-                        if let Some(budget) = read_budget {
-                            smallclaims::read_budget::with(Some(budget), || {
-                                self.readers.request_read(read)?
-                            })
+                        let last = position + 1 == subjects.len().div_ceil(chunk_size);
+                        if !last && let Some(permit) = self.readers.try_admit_read() {
+                            let profile = profile.clone();
+                            let read_budget = read_budget.clone();
+                            Part::Worker(scope.spawn(move || {
+                                let _entered = crate::profile::enter(profile.as_ref());
+                                smallclaims::read_budget::with(read_budget, || {
+                                    self.readers.request_read_with_permit(permit, read)?
+                                })
+                            }))
                         } else {
-                            read()
+                            Part::Inline(read())
                         }
                     })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|worker| worker.join().expect("status projection worker panicked"))
-                .collect::<Vec<_>>()
-        });
-        let mut merged = StatusResponse {
-            store_index,
-            subjects: Vec::new(),
-            pending_actions: Vec::new(),
-        };
-        for part in parts {
-            let part = part?;
-            merged.subjects.extend(part.subjects);
-            merged.pending_actions.extend(part.pending_actions);
-        }
-        Ok(merged)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .map(|part| match part {
+                        Part::Worker(worker) => worker.join().expect("status projection worker panicked"),
+                        Part::Inline(result) => result,
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let mut merged = StatusResponse {
+                store_index,
+                subjects: Vec::new(),
+                pending_actions: Vec::new(),
+            };
+            for part in parts {
+                let part = part?;
+                merged.subjects.extend(part.subjects);
+                merged.pending_actions.extend(part.pending_actions);
+            }
+            Ok(merged)
+        })?
     }
 
     fn status_at_view(
@@ -11688,6 +12186,7 @@ impl Store {
     }
 
     pub fn desired_subjects_for_owner_step(&self, owner_step: &str) -> Result<Vec<DesiredSubject>> {
+        smallclaims::touched::note_read(|| format!("owned-step:{owner_step}"));
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
@@ -11736,6 +12235,9 @@ impl Store {
         &self,
         owner_steps: &[String],
     ) -> Result<Vec<DesiredSubject>> {
+        for owner_step in owner_steps {
+            smallclaims::touched::note_read(|| format!("owned-step:{owner_step}"));
+        }
         if owner_steps.is_empty() {
             return Ok(Vec::new());
         }
@@ -12200,11 +12702,7 @@ impl Store {
 
     pub fn unread_mail_count_before(&self, before_unix_ms: u128) -> Result<u64> {
         smallclaims::touched::note_read(|| "kind:message.sent".to_owned());
-        if PINNED_READER.with(|slot| {
-            slot.borrow()
-                .as_ref()
-                .is_some_and(|(pool, _)| *pool == self.readers.key())
-        }) {
+        if self.readers.has_pinned_reader() {
             return unread_mail::count_in_snapshot(&self.readers.get(), before_unix_ms);
         }
         let mut connection = self.connection.write();
@@ -12565,24 +13063,31 @@ impl Store {
         at_index: u64,
     ) -> Result<BTreeMap<String, String>> {
         let connection = self.readers.get();
+        // Each subject's newest member reconcile decision, for 256 subjects per statement.
         let mut statement = connection.prepare_cached(
-            "SELECT body FROM claims WHERE subject=?1 AND kind='runtime.reconcile-decision'
-               AND store_index<=?2 AND json_extract(body, '$.fields.key')='member-reconcile'
-             ORDER BY store_index DESC LIMIT 1",
+            "SELECT subjects.value,
+                    (SELECT body FROM claims WHERE subject=subjects.value
+                       AND kind='runtime.reconcile-decision' AND store_index<=?2
+                       AND json_extract(body, '$.fields.key')='member-reconcile'
+                     ORDER BY store_index DESC LIMIT 1)
+             FROM json_each(?1) subjects",
         )?;
+        let mut decisions = Vec::new();
+        for chunk in subjects.chunks(256) {
+            for row in statement.query_map(params![serde_json::to_string(chunk)?, at_index], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })? {
+                let (subject, body) = row?;
+                decisions.extend(body.map(|body| (subject, body)));
+            }
+        }
         let mut faults = BTreeMap::new();
-        for subject in subjects {
-            let Some(body) = statement
-                .query_row(params![subject, at_index], |row| row.get::<_, String>(0))
-                .optional()?
-            else {
-                continue;
-            };
+        for (subject, body) in decisions {
             let body: Value = serde_json::from_str(&body)?;
             let fields = body.get("fields").unwrap_or(&body);
             if fields.get("decision").and_then(Value::as_str) == Some("member-fault") {
                 faults.insert(
-                    subject.clone(),
+                    subject,
                     fields
                         .get("reason")
                         .and_then(Value::as_str)
@@ -15246,6 +15751,21 @@ impl Store {
         since_ms: u64,
         until_ms: u64,
     ) -> Result<(Vec<Value>, Vec<agent_messages::DailyUsage>)> {
+        self.read_snapshot(|_| {
+            let mut boundaries = BTreeSet::from([since_ms, until_ms]);
+            for (since, until) in agent_messages::windows(since_ms, until_ms) {
+                boundaries.extend([since, until]);
+            }
+            let rows = usage_period::boundary_rows(&self.readers.get(), &boundaries)?;
+            Self::usage_period_data_from_rows(rows.into_iter().map(Ok), since_ms, until_ms)
+        })
+    }
+
+    fn usage_period_data_from_rows(
+        rows: impl IntoIterator<Item = rusqlite::Result<(String, u64, String)>>,
+        since_ms: u64,
+        until_ms: u64,
+    ) -> Result<(Vec<Value>, Vec<agent_messages::DailyUsage>)> {
         #[derive(Clone, Default)]
         struct Snapshot {
             at: u64,
@@ -15259,20 +15779,6 @@ impl Store {
             at: u64,
             buckets: [u64; USAGE_BUCKETS.len()],
         }
-        let connection = self.readers.get();
-        let mut statement = connection.prepare(&canonical_sql(
-            "SELECT subject, store_index, body FROM claims INDEXED BY claims_usage_rollup_index
-             WHERE kind='harness.usage'
-             AND json_extract(body, '$.fields.semantics')='response_rollup'
-             ORDER BY CANONICAL_ASC(claims)",
-        ))?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, u64>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
         type Key = (String, String, String, String, String, String, String);
         let mut days = agent_messages::windows(since_ms, until_ms)
             .into_iter()
@@ -15924,11 +16430,67 @@ impl Store {
         &self,
         request: &crate::mailbox::Fence,
     ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_lease(request, None)
+    }
+
+    pub(crate) fn bind_mailbox_with_lease(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_lease_checked(request, authority, &|| Ok(()))
+    }
+
+    /// Recheck captured physical custody under the writer, before any capability mutation.
+    pub(crate) fn bind_mailbox_with_lease_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_admission_checked(request, authority, None, validate)
+    }
+
+    /// Explicit argv-only transports retain their legacy protocol, never provider custody.
+    pub(crate) fn bind_argv_mailbox_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        member: &crate::model::MemberSpec,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
+        self.bind_mailbox_with_admission_checked(request, None, Some(member), validate)
+    }
+
+    fn bind_mailbox_with_admission_checked(
+        &self,
+        request: &crate::mailbox::Fence,
+        authority: Option<&crate::mailbox::Authority>,
+        argv_member: Option<&crate::model::MemberSpec>,
+        validate: &dyn Fn() -> Result<(), St3Error>,
+    ) -> Result<crate::mailbox::Fence, St3Error> {
         let mut connection = self.connection.write();
         let tx = connection.transaction().map_err(internal)?;
         check_mailbox_incarnation(&tx, request)?;
+        if let Some(member) = argv_member {
+            mailbox_lease::check_argv_declaration(&tx, request, member, &self.origin)?;
+        }
+        validate()?;
+        if let Some(authority) = authority {
+            mailbox_lease::refuse_argv_native_adoption(&tx, request)?;
+            mailbox_lease::check_declaration(&tx, request, authority, &self.origin)?;
+            mailbox_lease::admit(&tx, request, authority)?;
+        }
         if request.epoch != 0 {
-            check_mailbox_fence(&tx, request)?;
+            check_mailbox_fence(&tx, request, &self.origin)?;
+            if let Some(authority) = authority {
+                mailbox_lease::record(&tx, request, authority)?;
+            }
+            if let Some(member) = argv_member {
+                mailbox_lease::record_argv_binding(&tx, request, member)?;
+            }
+            if authority.is_some() || argv_member.is_some() {
+                tx.commit().map_err(internal)?;
+            }
             return Ok(request.clone());
         }
         if request.token.is_empty() || request.token.len() > 128 {
@@ -15957,9 +16519,21 @@ impl Store {
             }
             bound.epoch = epoch;
             // Retired tokens cannot allocate another epoch and retake their successor's mailbox.
-            check_mailbox_fence(&tx, &bound)?;
+            check_mailbox_fence(&tx, &bound, &self.origin)?;
+            if let Some(authority) = authority {
+                mailbox_lease::record(&tx, &bound, authority)?;
+            }
+            if let Some(member) = argv_member {
+                mailbox_lease::record_argv_binding(&tx, &bound, member)?;
+            }
+            if authority.is_some() || argv_member.is_some() {
+                tx.commit().map_err(internal)?;
+            }
             return Ok(bound);
         }
+        // A revoked argv capability must not be recreated even if its binding row
+        // was removed; its durable authenticated designation remains terminal.
+        mailbox_lease::refuse_argv_native_adoption(&tx, request)?;
         let previous: Option<u64> = tx
             .query_row(
                 "SELECT epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
@@ -15987,6 +16561,12 @@ impl Store {
         tx.execute("INSERT INTO local_mailbox_owners VALUES (?1,?2,?3,?4)
             ON CONFLICT(subject,component) DO UPDATE SET incarnation=excluded.incarnation, epoch=excluded.epoch",
             params![bound.subject, bound.component, bound.incarnation, bound.epoch]).map_err(internal)?;
+        if let Some(authority) = authority {
+            mailbox_lease::record(&tx, &bound, authority)?;
+        }
+        if let Some(member) = argv_member {
+            mailbox_lease::record_argv_binding(&tx, &bound, member)?;
+        }
         tx.commit().map_err(internal)?;
         if let Some(wakes) = self.smalltalk.mailbox_wakes.get() {
             wakes.owner_changed(&bound.subject, &bound.component);
@@ -15995,7 +16575,7 @@ impl Store {
     }
 
     pub(crate) fn check_mailbox(&self, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
-        check_mailbox_fence(&self.readers.get(), fence)
+        check_mailbox_fence(&self.readers.get(), fence, &self.origin)
     }
 
     /// First observation of the current boot, including its index to distinguish messages
@@ -16726,6 +17306,8 @@ fn prepare_mission_run_declaration(
                 || stored_values != creation.inputs
                 || mode != &creation.mode
                 || mission_run_after_tx(connection, run_id)? != creation.after
+                || mission_run_report_tx(connection, run_id)?
+                    != requested_run_report(connection, creation)?
             {
                 blockers.push(format!(
                     "mission run `{}` already exists with different creation fields",
@@ -17226,6 +17808,12 @@ fn create_declared_mission_run_tx(
     if let Some(after) = &creation.after {
         body["fields"]["after"] = json!(after);
     }
+    add_run_report_fields(
+        &mut body,
+        &mission,
+        creation.report_to.as_deref(),
+        creation.report_completed,
+    );
     let run_claim = append_claim_tx(
         transaction,
         origin,
@@ -17294,6 +17882,51 @@ fn awaited_mission_run_tx(connection: &Connection, run: &str) -> Result<Option<S
             |row| row.get(0),
         )
         .optional()?)
+}
+
+/// Who a new declaration of an existing run asks it to report to, resolved against the mission
+/// revision the run started from, so that it compares with what the creation claim stored.
+fn requested_run_report(
+    connection: &Connection,
+    creation: &crate::model::MissionRunCreation,
+) -> Result<Option<(String, bool)>, St3Error> {
+    let mission = connection
+        .query_row(
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![creation.mission, creation.revision],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .map(|body| serde_json::from_str::<MissionSpec>(&body))
+        .transpose()
+        .map_err(internal)?;
+    Ok(mission.and_then(|mission| {
+        resolved_run_report(
+            &mission,
+            creation.report_to.as_deref(),
+            creation.report_completed,
+        )
+    }))
+}
+
+/// Who a run reports to and whether it also reports completion, as its creation claim recorded
+/// them.
+fn mission_run_report_tx(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<(String, bool)>, St3Error> {
+    connection
+        .query_row(
+            "SELECT json_extract(body, '$.fields.report_to'),
+                    COALESCE(json_extract(body, '$.fields.report_completed'), 0)
+             FROM claims WHERE subject=?1 AND kind='mission-run.created' LIMIT 1",
+            [format!("mission-run/{run_id}")],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()
+        .map(|row| row.and_then(|(report_to, completed)| Some((report_to?, completed))))
+        .map_err(internal)
 }
 
 fn mission_run_after_tx(connection: &Connection, run_id: &str) -> Result<Option<String>, St3Error> {
@@ -17587,6 +18220,15 @@ fn adopt_declared_mission_revision_tx(
             claim_ids.push(claim.id);
         }
     }
+    claim_ids.extend(revision_seats::carry_completed_agents_tx(
+        transaction,
+        origin,
+        &current,
+        &next,
+        &compatible,
+        &generation_subject,
+        Some(batch_id),
+    )?);
     cancel_descendant_mission_runs_tx(
         transaction,
         origin,
@@ -18315,6 +18957,12 @@ fn desired_row_at(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    select_desired_row(rows)
+}
+
+/// The selected declaration of a subject's `(id, body, predecessors)` declaration claims in
+/// canonical order: the highest revision among the leaves no later declaration replaced.
+fn select_desired_row(rows: Vec<(String, String, String)>) -> Result<Option<DesiredRow>> {
     let referenced = rows
         .iter()
         .flat_map(|(_, _, predecessors)| {
@@ -20256,9 +20904,11 @@ fn has_unknown_claim_at(
     let kinds = statement
         .query_map(params![subject, through], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(kinds
-        .into_iter()
-        .find(|kind| !known_replicated_claim_kind(kind)))
+    Ok(first_unknown_kind(kinds))
+}
+
+fn first_unknown_kind(kinds: impl IntoIterator<Item = String>) -> Option<String> {
+    kinds.into_iter().find(|kind| !known_replicated_claim_kind(kind))
 }
 
 fn validate_message_transition(
@@ -20958,14 +21608,34 @@ fn selected_actual_source_at(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let rows = rows
+        .iter()
+        .map(|(id, kind, origin, body)| (id.as_str(), kind.as_str(), origin.as_str(), body))
+        .collect::<Vec<_>>();
+    let Some((selected_id, selected_origin, rivals)) = select_actual_source(&rows, desired_host)
+    else {
+        return Ok((None, None, false));
+    };
+    // Another host's observation conflicts unless the selected claim descends from it. Only then
+    // does the walk need the subject's whole causal history, harness reports included.
+    let rivals = rivals.iter().map(String::as_str).collect::<Vec<_>>();
+    let runtime_conflict = !rivals.is_empty()
+        && !subject_descends_from_all(connection, subject, at_index, &selected_id, &rivals)?;
+    Ok((Some(selected_id), Some(selected_origin), runtime_conflict))
+}
+
+/// The selected actual-state claim of `(id, kind, origin, runtime body)` rows in canonical
+/// order, its origin, and the rival observations it must descend from to hold alone.
+fn select_actual_source(
+    rows: &[(&str, &str, &str, &Value)],
+    desired_host: Option<&str>,
+) -> Option<(String, String, Vec<String>)> {
     let selected = rows
         .iter()
         .rev()
-        .find(|(_, kind, _, _)| kind == "runtime.observed")
+        .find(|(_, kind, _, _)| *kind == "runtime.observed")
         .or_else(|| rows.last());
-    let Some((selected_id, _, selected_origin, selected_body)) = selected else {
-        return Ok((None, None, false));
-    };
+    let &(selected_id, _, selected_origin, selected_body) = selected?;
     // An origin's newer runtime observation supersedes its older observations. In particular,
     // its stop must retire its earlier running claim even when the new owner's intent follows
     // the desired-state branch rather than descending from that runtime branch.
@@ -20974,11 +21644,11 @@ fn selected_actual_source_at(
         .iter()
         .rev()
         .filter(|(_, kind, origin, _)| {
-            kind == "runtime.observed" && observed_origins.insert(origin.as_str())
+            *kind == "runtime.observed" && observed_origins.insert(*origin)
         })
         .filter(|(id, _, origin, body)| {
-            id != selected_id
-                && origin != selected_origin
+            *id != selected_id
+                && *origin != selected_origin
                 && !nonowner_terminal_observation(
                     desired_host,
                     selected_origin,
@@ -20987,17 +21657,9 @@ fn selected_actual_source_at(
                     body,
                 )
         })
-        .map(|(id, _, _, _)| id.as_str())
+        .map(|(id, _, _, _)| (*id).to_owned())
         .collect::<Vec<_>>();
-    // Another host's observation conflicts unless the selected claim descends from it. Only then
-    // does the walk need the subject's whole causal history, harness reports included.
-    let runtime_conflict = !rivals.is_empty()
-        && !subject_descends_from_all(connection, subject, at_index, selected_id, &rivals)?;
-    Ok((
-        Some(selected_id.clone()),
-        Some(selected_origin.clone()),
-        runtime_conflict,
-    ))
+    Some((selected_id.to_owned(), selected_origin.to_owned(), rivals))
 }
 
 /// Whether claim `descendant` of `subject` descends from every claim of `ancestors`, walking the
@@ -21103,17 +21765,40 @@ fn latest_actual_at(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    if rows.is_empty() {
+    fold_latest_actual(rows)
+}
+
+/// A subject's actual state from its actual-state claims, `(kind, body)` in canonical order.
+fn fold_latest_actual(
+    rows: impl IntoIterator<Item = (String, String)>,
+) -> Result<Option<Value>> {
+    let rows = rows
+        .into_iter()
+        .map(|(kind, body)| Ok((kind, serde_json::from_str::<Value>(&body)?)))
+        .collect::<Result<Vec<_>>>()?;
+    fold_latest_values(rows)
+}
+
+/// [`fold_latest_actual`] of claims already parsed, `(kind, body)` in canonical order. It takes
+/// the bodies, so each field moves into the folded state instead of being copied.
+fn fold_latest_values(rows: impl IntoIterator<Item = (String, Value)>) -> Result<Option<Value>> {
+    let mut rows = rows.into_iter().peekable();
+    if rows.peek().is_none() {
         return Ok(None);
     }
     let mut merged = serde_json::Map::new();
     let registry = st3_schema::registry();
-    for (kind, body) in rows {
-        let value: Value = serde_json::from_str(&body)?;
-        let source = value.get("fields").unwrap_or(&value);
-        if let Some(fields) = source.as_object() {
+    for (kind, value) in rows {
+        let source = match value {
+            Value::Object(mut body) => match body.remove("fields") {
+                Some(fields) => fields,
+                None => Value::Object(body),
+            },
+            other => other,
+        };
+        if let Value::Object(fields) = source {
             if kind == "resource.observed" {
-                resources::merge_observation(&mut merged, fields);
+                resources::merge_observation(&mut merged, &fields);
                 continue;
             }
             if registry
@@ -21129,7 +21814,7 @@ fn latest_actual_at(
                 }
             }
             for (key, value) in fields {
-                merged.insert(key.clone(), value.clone());
+                merged.insert(key, value);
             }
         }
     }
@@ -21409,8 +22094,10 @@ fn mailbox_owner_key(
 fn check_mailbox_fence(
     connection: &Connection,
     fence: &crate::mailbox::Fence,
+    host: &str,
 ) -> Result<(), St3Error> {
     check_mailbox_incarnation(connection, fence)?;
+    mailbox_lease::check_lease_fence(connection, fence, host)?;
     let owner: Option<(String, u64)> = connection
         .prepare_cached(
             "SELECT owner.incarnation, owner.epoch FROM local_mailbox_owners owner
@@ -24000,6 +24687,8 @@ fn repair_impossible_run_tx(
     Ok(claim_ids)
 }
 
+/// A subject's operational annotation. At a snapshot, its owning run's and generation's states
+/// are read through `owner_actual`.
 #[allow(clippy::too_many_arguments)]
 fn operational_annotation(
     connection: &Connection,
@@ -24010,6 +24699,7 @@ fn operational_annotation(
     owner_generation: Option<&str>,
     actual: Option<&Value>,
     at_index: Option<u64>,
+    owner_actual: &mut dyn FnMut(&str) -> Result<Option<Value>>,
 ) -> Result<OperationalAnnotation> {
     let fields = actual.map(|value| value.get("fields").unwrap_or(value));
     let status = fields
@@ -24033,7 +24723,7 @@ fn operational_annotation(
 
     if let Some(owner_run) = owner_run {
         let (run_status, current_generation, mode) = if at_index.is_some() {
-            let owner = latest_actual_at(connection, owner_run, at_index)?;
+            let owner = owner_actual(owner_run)?;
             let fields = owner
                 .as_ref()
                 .map(|value| value.get("fields").unwrap_or(value));
@@ -24073,7 +24763,7 @@ fn operational_annotation(
         }
         if let Some(owner_generation) = owner_generation {
             let generation_status = if at_index.is_some() {
-                let generation = latest_actual_at(connection, owner_generation, at_index)?;
+                let generation = owner_actual(owner_generation)?;
                 generation
                     .as_ref()
                     .map(|value| value.get("fields").unwrap_or(value))
@@ -24136,6 +24826,45 @@ pub(crate) const GATE_BROKEN_CONDITION: &str = "gate-broken";
 /// The earliest end that still counts as recent.
 pub(crate) fn recently_ended_since() -> u128 {
     now_ms().saturating_sub(RECENTLY_ENDED_MS)
+}
+
+/// Who a run reports to and whether it also reports completion: the agent whoever started the
+/// run named, else the mission's own `report-to`, and completion if either asked and there is
+/// someone to tell. `None` when nobody is named.
+fn resolved_run_report(
+    mission: &MissionSpec,
+    report_to: Option<&str>,
+    report_completed: bool,
+) -> Option<(String, bool)> {
+    let report_to = report_to.or(mission.report_to.as_deref())?;
+    Some((
+        report_to.to_owned(),
+        report_completed || mission.report_completed,
+    ))
+}
+
+/// Record on a run's creation claim who hears of its failure, cancellation or stall. A run with
+/// nobody to tell carries no report fields at all, so nothing about it changes.
+fn add_run_report_fields(
+    body: &mut Value,
+    mission: &MissionSpec,
+    report_to: Option<&str>,
+    report_completed: bool,
+) {
+    let Some((report_to, completed)) = resolved_run_report(mission, report_to, report_completed)
+    else {
+        return;
+    };
+    let fields = &mut body["fields"];
+    fields["report_to"] = json!(report_to);
+    fields["stalled_after_ms"] = json!(
+        mission
+            .stalled_after_ms
+            .unwrap_or(crate::mission::DEFAULT_STALLED_AFTER_MS)
+    );
+    if completed {
+        fields["report_completed"] = json!(true);
+    }
 }
 
 fn insert_mission_deadline_tx(
@@ -36583,6 +37312,93 @@ mission "card-owner" state="ready" {
     }
 
     #[test]
+    fn bound_one_nested_large_status_reuses_its_snapshot_reader() {
+        let store = Arc::new(smallclaims::sqlite::with_read_limit_for_test(
+            1, || Store::open_memory("node").unwrap(),
+        ));
+        let names = (0..80).map(|n| format!("agent/admitted/seat-{n:03}"))
+            .collect::<BTreeSet<_>>();
+        for name in &names {
+            observe_runtime(&store, name, "running", "incarnation");
+        }
+        let budget = smallclaims::read_budget::ReadBudget::new(
+            "/nested-status", std::time::Duration::from_secs(15),
+        );
+        let worker_budget = budget.clone();
+        let worker_store = store.clone();
+        let expected = names.iter().cloned().collect::<Vec<_>>();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = smallclaims::read_budget::with(Some(worker_budget), || {
+                worker_store.readers.request_read(|| {
+                    worker_store.read_snapshot(|cut| {
+                        worker_store.readers.request_read(|| {
+                            worker_store.status_for_subject_names_at(names, cut, true)
+                        })?
+                    })
+                })?
+            });
+            done.send(result).unwrap();
+        });
+        let completed = finished.recv_timeout(std::time::Duration::from_secs(5));
+        if completed.is_err() {
+            budget.cancel();
+        }
+        let result = completed.expect("bound-one nested status fanout deadlocked").unwrap();
+        worker.join().unwrap();
+        assert_eq!(result.subjects.iter().map(|subject| subject.subject.clone())
+            .collect::<Vec<_>>(), expected);
+        assert_eq!(store.readers.usage().peak, 1);
+        assert_eq!(store.readers.usage().idle, 1);
+        assert!(!budget.expired());
+    }
+
+    #[test]
+    fn admitted_status_fanout_and_inline_reduction_have_identical_values_and_digests() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("status.sqlite3");
+        let inline = smallclaims::sqlite::with_read_limit_for_test(
+            1, || Store::open(&path, "node").unwrap(),
+        );
+        let names = (0..80).map(|n| format!("agent/admitted/seat-{n:03}"))
+            .collect::<BTreeSet<_>>();
+        for name in &names {
+            observe_runtime(&inline, name, "stopped", "old");
+            observe_runtime(&inline, name, "running", "current");
+        }
+        // Two fresh pools over the same real claims keep provenance and accepted times
+        // identical, making the entire serialized result (not a normalized subset) comparable.
+        let parallel = smallclaims::sqlite::with_read_limit_for_test(
+            32, || Store::open(&path, "node").unwrap(),
+        );
+        let cut = inline.index().unwrap();
+        assert_eq!(parallel.index().unwrap(), cut);
+        for history in [false, true] {
+            let values = [&inline, &parallel].map(|store| {
+                let budget = smallclaims::read_budget::ReadBudget::new(
+                    "/admitted-status", std::time::Duration::from_secs(15),
+                );
+                let result = smallclaims::read_budget::with(Some(budget), || {
+                    store.readers.request_read(|| {
+                        store.status_for_subject_names_at(names.clone(), cut, history)
+                    })
+                }).unwrap().unwrap();
+                assert_eq!(result.subjects.len(), names.len());
+                assert!(result.subjects.windows(2).all(|pair| pair[0].subject < pair[1].subject));
+                serde_json::to_value(result).unwrap()
+            });
+            assert_eq!(values[0], values[1]);
+            let digests = values.map(|value| {
+                hex::encode(Sha256::digest(serde_json::to_vec(&value).unwrap()))
+            });
+            assert_eq!(digests[0], digests[1]);
+        }
+        assert_eq!(inline.readers.usage().peak, 1);
+        assert!(parallel.readers.usage().peak > 1);
+        assert!(parallel.readers.usage().peak <= 32);
+    }
+
+    #[test]
     fn current_runtime_views_reduce_what_they_show_not_every_runtime_ever_held() {
         let store = Store::open_memory("node").unwrap();
         observe_runtime(&store, "agent/bench/live", "running", "live-1");
@@ -39873,6 +40689,50 @@ version 2
         );
     }
 
+    #[test]
+    fn quiet_renewals_preserve_the_shared_step_reason_and_projection_digest() {
+        for working in [false, true] {
+            let (controller, worker, step) = replicated_step_pair();
+            let request = |reason: Option<&str>, key: &str| WorkRequest {
+                actor: Some("agent/worker.one".into()),
+                incarnation: Some("worker-generation".into()),
+                summary: None, reason: reason.map(str::to_owned), evidence: Vec::new(),
+                idempotency_key: key.into(),
+            };
+            worker.work_action(&step, "claim", &request(Some("durable claim reason"), "reason-claim")).unwrap();
+            if working {
+                worker.work_action(&step, "progress", &request(Some("durable progress reason"), "reason-progress")).unwrap();
+            }
+            receive_and_project(&controller, "worker", &exchange_from(&worker, &controller.replication_inventory().unwrap()));
+            let before = worker.step_run(&step).unwrap().unwrap();
+            let snapshot = worker.replication_snapshot().unwrap();
+            let claims_before = worker.claims_for(&step, Some("work.renewed")).unwrap().len();
+            // Use the ordinary clock and the existing renewal cadence: this stays inside
+            // the five-minute replicated anchor margin and changes no production deadline.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let renewed = worker.work_action(&step, "renew", &request(None, "reason-quiet-renew")).unwrap();
+            assert!(renewed.claim_expires_at_unix_ms > before.claim_expires_at_unix_ms);
+            assert_eq!(renewed.blocked_reason, before.blocked_reason);
+            assert_eq!(worker.claims_for(&step, Some("work.renewed")).unwrap().len(), claims_before);
+            let after = worker.replication_snapshot().unwrap();
+            assert_eq!(after.authority_digest, snapshot.authority_digest);
+            assert_eq!(after.projection_digests, snapshot.projection_digests);
+            assert_eq!(after.projection_digests, controller.replication_snapshot().unwrap().projection_digests);
+            worker.replay_replication_graph().unwrap();
+            let replayed = worker.step_run(&step).unwrap().unwrap();
+            assert_eq!(replayed.blocked_reason, before.blocked_reason);
+            assert_eq!(replayed.claim_expires_at_unix_ms, renewed.claim_expires_at_unix_ms);
+            assert_eq!(worker.replication_snapshot().unwrap().projection_digests, after.projection_digests);
+            // A published renewal still updates the shared reason through its durable claim.
+            let published = worker.work_action(&step, "renew", &request(Some("new durable reason"), "reason-published-renew")).unwrap();
+            assert_eq!(published.blocked_reason.as_deref(), Some("new durable reason"));
+            assert_eq!(worker.claims_for(&step, Some("work.renewed")).unwrap().len(), claims_before + 1);
+            receive_and_project(&controller, "worker", &exchange_from(&worker, &controller.replication_inventory().unwrap()));
+            assert_eq!(controller.step_run(&step).unwrap().unwrap().blocked_reason, published.blocked_reason);
+            assert_eq!(worker.replication_snapshot().unwrap().projection_digests, controller.replication_snapshot().unwrap().projection_digests);
+        }
+    }
+
     /// A seat's own lease renewals, and the lane, runtime-action and intake claims its node writes,
     /// were projected when they were written. Every one of them used to make the next peer
     /// exchange replay the whole graph while holding the store's only writer. The exchange now
@@ -40231,6 +41091,118 @@ version 2
             "record.repaired",
         ] {
             assert!(!Store::simple_replication_kind(kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_run_started_with_a_reporter_records_it_and_an_unset_run_records_nothing() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let plain = publish_mission(
+            &store,
+            "version 2\nmission \"plain\" state=\"ready\" { concurrent-runs; goal \"Plain.\"; step \"work\" { agentless } }",
+            "publish-plain",
+        );
+        let watched = publish_mission(
+            &store,
+            "version 2\nmission \"watched\" state=\"ready\" report-to=\"agent/ops/mission-reporter\" stalled-after=\"15m\" { concurrent-runs; goal \"Watched.\"; step \"work\" { agentless } }",
+            "publish-watched",
+        );
+        let declare = |run: &str, mission: &MissionSpec, extra: &str| {
+            let source = format!(
+                "version 2\nmission-run {run:?} {{\n  mission \"mission/{}@{}\"\n  workspace {:?}\n  requester \"person/operator\"\n{extra}}}\n",
+                mission.id,
+                mission.revision,
+                workspace.path().display().to_string(),
+            );
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let preview = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            (intent, preview)
+        };
+        let start = |run: &str, mission: &MissionSpec, extra: &str| {
+            let (intent, preview) = declare(run, mission, extra);
+            assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+            store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("start-{run}"),
+                    Some("person/operator"),
+                )
+                .unwrap();
+            store
+                .latest_claim(&format!("mission-run/{run}"), Some("mission-run.created"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]
+                .clone()
+        };
+
+        let unset = start("plain/1", &plain, "");
+        for field in ["report_to", "stalled_after_ms", "report_completed"] {
+            assert!(unset.get(field).is_none(), "{field}");
+        }
+        // Whoever starts a run names the reporter, and the default limit applies.
+        let named = start(
+            "plain/2",
+            &plain,
+            "  report-to \"agent/ops/starter\"\n  report-completed \"true\"\n",
+        );
+        assert_eq!(named["report_to"], "agent/ops/starter");
+        assert_eq!(named["stalled_after_ms"], 30 * 60_000);
+        assert_eq!(named["report_completed"], true);
+        // The mission's own reporter and limit apply when the start names none.
+        let inherited = start("watched/1", &watched, "");
+        assert_eq!(inherited["report_to"], "agent/ops/mission-reporter");
+        assert_eq!(inherited["stalled_after_ms"], 15 * 60_000);
+        assert!(inherited.get("report_completed").is_none());
+        // The start's reporter replaces the mission's.
+        let replaced = start("watched/2", &watched, "  report-to \"agent/ops/starter\"\n");
+        assert_eq!(replaced["report_to"], "agent/ops/starter");
+        assert_eq!(replaced["stalled_after_ms"], 15 * 60_000);
+
+        // Declaring the same run again with different reporting is not a retry: the stored
+        // creation claim would be left unchanged while the operator is told it was accepted.
+        let different = "mission run `mission-run/plain/2` already exists with different creation fields";
+        for (what, extra) in [
+            ("another reporter", "  report-to \"agent/ops/other\"\n  report-completed \"true\"\n"),
+            ("no reporting at all", ""),
+            ("the reporter alone, dropping completion", "  report-to \"agent/ops/starter\"\n"),
+        ] {
+            let (_, changed) = declare("plain/2", &plain, extra);
+            assert_eq!(changed.blockers, [different], "{what}");
+        }
+        // Adding completion to a run that was started without it is not a retry either.
+        let (_, added) = declare(
+            "watched/2",
+            &watched,
+            "  report-to \"agent/ops/starter\"\n  report-completed \"true\"\n",
+        );
+        assert_eq!(
+            added.blockers,
+            ["mission run `mission-run/watched/2` already exists with different creation fields"]
+        );
+        // The exact declarations, and one that leaves the mission's own reporter to apply, are.
+        for (run, mission, extra) in [
+            (
+                "plain/2",
+                &plain,
+                "  report-to \"agent/ops/starter\"\n  report-completed \"true\"\n",
+            ),
+            ("watched/1", &watched, ""),
+            ("watched/2", &watched, "  report-to \"agent/ops/starter\"\n"),
+            ("plain/1", &plain, ""),
+        ] {
+            let (_, same) = declare(run, mission, extra);
+            assert!(same.blockers.is_empty(), "{run}: {:?}", same.blockers);
         }
     }
 
@@ -54208,17 +55180,25 @@ fn append_claim_with_subject_fences(
     expected_subjects: Option<&BTreeMap<String, String>>,
     observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
-    append_claim_with_signature(graph, input, fence, event_runtime, expected_subjects, observer_completion, None)
+    append_claim_with_commit_context(graph, input, fence, event_runtime, expected_subjects, observer_completion, Default::default())
 }
 
-fn append_claim_with_signature(
+type ClaimAdmission<'a> = dyn Fn(&Connection) -> Result<(), St3Error> + Sync + 'a;
+
+#[derive(Default)]
+struct ClaimCommitContext<'a> {
+    admission: Option<&'a ClaimAdmission<'a>>,
+    signature: Option<&'a str>,
+}
+
+fn append_claim_with_commit_context(
     graph: &GraphStore,
     input: &ClaimInput,
     fence: Option<&crate::mailbox::Fence>,
     event_runtime: Option<&str>,
     expected_subjects: Option<&BTreeMap<String, String>>,
     observer_completion: Option<(&str, &str, &(dyn Fn() -> bool + Sync))>,
-    signature: Option<&str>,
+    context: ClaimCommitContext<'_>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
     if local_retention(&input.kind)
@@ -54234,10 +55214,11 @@ fn append_claim_with_signature(
     // batch commits.
     graph.connection
         .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
+            if let Some(admission) = context.admission { admission(transaction)?; }
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
             }
-            if let Some(signature) = signature {
+            if let Some(signature) = context.signature {
                 transaction.execute(
                     "INSERT OR REPLACE INTO expected_claim_signatures(subject,kind,actor,signature) VALUES (?1,?2,?3,?4)",
                     params![input.subject,input.kind,input.actor,signature],
@@ -54246,7 +55227,7 @@ fn append_claim_with_signature(
             let outcome = (|| {
             check_harness_event_runtime(transaction, &input.subject, event_runtime)?;
             let settled_receipt = if let Some(fence) = fence {
-                check_mailbox_fence(transaction, fence)?;
+                check_mailbox_fence(transaction, fence, &graph.origin)?;
                 let index = transaction.query_row(
                     "SELECT MIN(store_index) FROM claims WHERE subject=?1 AND subject LIKE 'message/%'",
                     [&input.subject], |row| row.get::<_, Option<u64>>(0),
@@ -54490,7 +55471,7 @@ fn append_claim_with_signature(
             if let Some((subject, revision, current)) = observer_completion {
                 check_observer_completion(transaction, subject, revision, Some(current))?;
             }
-            if signature.is_some() {
+            if context.signature.is_some() {
                 // An idempotent repeat does not append/consume a signature. Remove its
                 // temporary expectation before commit; any failure rolls it back with the message.
                 transaction.execute(

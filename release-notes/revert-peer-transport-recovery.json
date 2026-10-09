@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Revert the recent-peer signed retry after adverse matched load results",
+  "replay": {
+    "status": "none",
+    "detail": "Restores the replication worker from before #1871. No graph replay, admission-format change or stored recovery credit is introduced or reversed."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, schema version or migration changes. The reverted recovery credit and authentication snapshots were process-local memory."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digest, or coordinated member upgrade changes. Existing membership, overload and Fabric refusal policies are restored with the prior worker."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Removes the one early signed HTTP retry credit added by #1871 and restores the preceding retry timing and worker phases. Existing wire/client contracts remain unchanged; mixed builds can differ in recent-peer recovery timing. The original recovery feature release fragment is retained as historical metadata."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "Recent authenticated peer recovery again follows the prior quiet backoff and successful-HEAD deadline policy, without the early signed attempt. The original 10000 ms delivery oracle is not relaxed. This revert has not established deployed latency, restart-to-API, restart-to-health or load improvement."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Normal binary upgrade applies; no additional configuration, store manipulation, fleet coordination or manual replay is required."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Reverts merged #1871 because its corrected matched comparison worsened steady synthetic SEND p99 by 12.34% and daemon cores by 1.81%, with both connect budgets still missed. That comparison does not establish a production ACK effect or historical recovery cause. No database rollback, schema reversal or service restart is part of this source change."
+  }
+}

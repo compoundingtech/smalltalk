@@ -6,6 +6,8 @@ in [`schemas`](schemas) and [`fixtures`](fixtures) are the normative wire exampl
 clients consume the same JSON; no client parses CLI output, Markdown, KDL, claim envelopes, or
 harness transcript files.
 
+Proposed changes extensions (not implemented): [per-turn files, patches, and branch Changes scope](turn-diff-design.md).
+
 The reusable Rust package is [`crates/st3-client`](../../../crates/st3-client) and supports both the
 local Unix socket and authenticated paired HTTP over Tailscale or optional Fabric. The Swift package is
 [`clients/swift/St3Client`](../../../clients/swift/St3Client). The Expo TypeScript client is
@@ -109,6 +111,15 @@ mutation queue, push notification service, cached graph authority, or multi-mast
 ordinary requests without a paired bearer credential, except for pairing completion. The socket
 paths can be set with `socket` and `client_gateway_socket` in `config.toml`, or with `--socket` and
 `--client-gateway-socket` for a foreground daemon. They must never name the same path.
+
+Without an explicit `--client-gateway-socket`, a private `st up --state-dir DIR` derives its
+gateway as `DIR/st3-client.sock`, even when `--socket` is also supplied. With only `--socket`,
+the gateway is `st3-client.sock` beside that socket. If this derived path equals the shared
+default gateway (including symlinked ancestors above directories not yet created), startup
+refuses before creating daemon state. Missing path suffixes normalize `.` and `..` after
+resolving existing symlinks. Pass `--client-gateway-socket` to select the private gateway
+explicitly.
+Default startup without either private flag is unchanged.
 
 For a direct tailnet connection, forward a TCP listener bound to the host's Tailscale IP to
 `st3-client.sock`. Pair the phone with `http://TAILSCALE_IP:PORT`. Tailscale encrypts the link;
@@ -449,6 +460,10 @@ and `rates_usd_per_million_tokens` (`input`, `output`, `cache_read`, `cache_writ
 omit undisclosed table identity and rates; unpriced entries name the attempted table and omit
 rates. Entries on rollups are cumulative; period reads subtract the matching baseline entry.
 Different versions, sources and effective rates remain separate within the same rollup slot.
+Period reads seek the last cumulative snapshot at the period and daily boundaries using a
+partial series/timestamp index. They read at most one selected snapshot per series and boundary;
+equal observed timestamps retain the canonical replicated tie-breaker. The boundary seeks share
+one SQLite snapshot, so a concurrent publication cannot mix baselines and totals.
 Historical claims without these fields remain readable; absent provenance or session binding
 is unknown. After an upgrade, provenance covers only responses priced by the upgraded writer;
 its bucket sums can therefore be smaller than the row's totals. Per-response rounding means
@@ -686,10 +701,13 @@ fields are:
 The authenticated session supplies actor and scopes. `actor`, `credential`, and fleet secrets are
 invalid request fields. Repeating the same key, action ID, type and parameters returns the
 original result; a refreshed fence does not change the action's idempotency identity. A different
-action under that key returns `idempotency-conflict`. Receipts from older daemons still accept the
-exact original request. A snapshot fence proves the host and an index no newer than the current
-store; unrelated commits do not stale an action. Stale generation, subject revision, incarnation,
-preview or terminal screen fences return `stale-fence` without a partial mutation.
+action under that key returns `idempotency-conflict`. A receipt or terminal attachment storing
+only the legacy full-request digest also returns HTTP 409 `idempotency-conflict`, even for
+an exact replay; it never executes the action again. Inspect the original committed outcome
+before deliberately submitting a new action with a fresh key. A snapshot fence proves the host
+and an index no newer than the current store; unrelated commits do not stale an action.
+Stale generation, subject revision, incarnation, preview or terminal screen fences return
+`stale-fence` without a partial mutation.
 Multi-subject actions commit atomically or have no effect.
 
 New completed local response receipts last at least **7 days**. Clients must never reuse a
@@ -1608,6 +1626,21 @@ updates use the existing agents collection stream, including clock-driven stalen
 Same-state observations remain local except for a freshness publication at most once a minute.
 That publication preserves `since` and does not add a history transition. Freshness uses the
 source observation time, so replaying old evidence cannot make a stale seat current.
+
+## Agents list freshness
+
+`GET /v1/client/agents` and the `agents` collection stream answer from the roster the daemon's
+background refresher last published; no read folds the roster itself. Each page or frame names
+that roster's own cut in its `snapshot` (`store_index`, `created_at`) and when it was folded
+(`published_at`). That cut can be older than the request, by about a second plus one fold.
+
+A first page answers at once. A client that must see what was written before its request
+passes `fresh=true`: the daemon waits up to two seconds for a roster at least as new as the
+request before answering. `st agents ls` and `st agents tree` ask for it; Rust exposes
+`agents_list_fresh`. While no roster is published yet, a read answers a retryable 503 (the
+stream sends `resync`) and the refresher is asked for one. A continuation reads the roster
+published at its first page's cut; once that roster is gone it answers `page-cursor-expired`.
+A stream rereads when a newer roster is published.
 
 ## Exact terminal lookup
 

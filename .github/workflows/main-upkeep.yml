@@ -66,7 +66,7 @@ jobs:
     name: warm-tests
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -267,7 +267,7 @@ jobs:
     name: warm-clippy
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -446,7 +446,7 @@ jobs:
     name: warm-fleet-compat
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -625,7 +625,7 @@ jobs:
     name: warm-genie
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -772,7 +772,7 @@ jobs:
     name: warm-isolation-vm
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120
@@ -951,7 +951,7 @@ jobs:
     name: warm-typescript
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 10
@@ -992,7 +992,7 @@ jobs:
     name: perf-cost
     runs-on:
       [
-        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1,
+        "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}",
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 120

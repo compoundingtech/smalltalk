@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep messaging fault fixture sockets within the PTY path budget on runners with long temporary paths",
+  "replay": {"status": "none", "detail": "Test fixture setup only; no claim replay or rebuild."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No authority or claim rule change."},
+  "compatibility": {"status": "none", "detail": "Linux test fixture state and sockets use a private guardian-owned directory under /tmp. Binary scratch and evidence locations are unchanged."},
+  "downtime": {"status": "none", "detail": "No production runtime change."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Existing guardian process reaping, private-root cleanup and keep behavior are unchanged."}
+}

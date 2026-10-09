@@ -277,12 +277,18 @@ public struct OwnedSetResource: Codable, Sendable, Identifiable {
     enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", claim, receipt, visibility, blockers, membersStatus = "members_status", commitStatus = "commit_status" }
 }
 public struct SummaryMachines: Codable, Sendable { public let connected, indirect, offline: UInt64 }
+public struct SummaryAgentsAsOf: Codable, Sendable {
+    public let storeIndex: UInt64
+    public let publishedAt: String
+    enum CodingKeys: String, CodingKey { case storeIndex = "store_index", publishedAt = "published_at" }
+}
 public struct SummaryResource: Codable, Sendable, Identifiable {
     public let id, kind, revision, updatedAt: String
     public let personID: String?
     public let needsYou, workingAgents, activeMissions: UInt64
     public let machines: SummaryMachines
-    enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", personID = "person_id", needsYou = "needs_you", workingAgents = "working_agents", activeMissions = "active_missions", machines }
+    public let agentsAsOf: SummaryAgentsAsOf?
+    enum CodingKeys: String, CodingKey { case id, kind, revision, updatedAt = "updated_at", personID = "person_id", needsYou = "needs_you", workingAgents = "working_agents", activeMissions = "active_missions", machines, agentsAsOf = "agents_as_of" }
 }
 public enum Resource: Codable, Sendable, Identifiable {
     case summary(SummaryResource)

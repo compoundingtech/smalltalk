@@ -90,7 +90,7 @@ check("priority cannot bypass the fork boundary", idle, PR_LABELS='["ci-priority
 check("unrelated labels preserve normal routing", idle, "ci1", PR_LABELS='["area:ci"]')
 check("malformed labels preserve normal routing", idle, "ci1", PR_LABELS='invalid')
 
-check("priority merge group uses the urgent pool", [], "ci1-priority", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_LABEL_RESPONSE='["ci-priority"]')
+check("priority merge group cannot queue behind priority PRs", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_LABEL_RESPONSE='["ci-priority"]')
 check("ordinary merge group retains reserved merge capacity", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_LABEL_RESPONSE='["area:ci"]')
 check("merge-label API failure retains reserved capacity", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/gh-readonly-queue/main/pr-42-" + "a"*40, API_EXIT="1")
 check("malformed queue ref never requests a PR", [], "ci1-merge", EVENT="merge_group", GH_REPO_TOKEN="stand-in", QUEUE_REF="refs/heads/unrelated")
@@ -111,22 +111,23 @@ check("reserved workers never count as extra general capacity", [{'runners': [ru
 check("status lookup failure preserves priority primary", four, 'ci1-priority', PR_LABELS='["ci-priority"]', API_EXIT='1')
 check("invalid status response preserves merge primary", four, 'ci1-merge', EVENT='merge_group', API_RESPONSE='not JSON')
 
-# Supporting jobs must never spend ordinary CI work on priority/merge capacity.
+# Supporting PR jobs must never spend ordinary work on priority/merge capacity.
 import re
 blocks = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow.split("\njobs:\n", 1)[1]))
 for job in ("linux-clippy", "linux-fleet-compat", "genie-freshness", "typescript-client", "isolation-vm", "perf-cost"):
     assert "outputs.ci1" not in blocks[job], (job, "supporting job consumes reserved cores")
-    assert ";job.priority=1" in blocks[job], (job, "one class prevents perpetual benchmark starvation")
+    assert "github.event_name == 'merge_group' && 1 || 2" in blocks[job], (job, "merge groups must precede queued PRs")
     assert "github.run-id=" in blocks[job], (job, "prevent cross-run assignment")
     if job in ("genie-freshness", "typescript-client", "isolation-vm"):
-        assert "namespace-profile-linux-x86-64;job.priority=1;github.run-id=" in blocks[job], (job, "profile controls must be inline")
+        assert "namespace-profile-linux-x86-64;job.priority={1};github.run-id=" in blocks[job], (job, "profile controls must be inline")
         assert "namespace-features:" not in blocks[job], (job, "separate feature labels are unsupported with profiles")
     else:
         assert "namespace-features:github.run-id=" in blocks[job], (job, "shape labels need a separate features label")
 for job, output in [('linux-tests-shard-2', 'ci1_secondary'), ('mail-redelivery-canaries', 'ci1_mail')]:
     assert f'outputs.{output} ||' in blocks[job], (job, 'extra jobs need their own idle-slot output')
     assert not re.search(r'outputs\.ci1\b', blocks[job]), (job, 'extra jobs must never take the primary reserved lane')
-    assert 'job.priority=1' in blocks[job] and 'github.run-id={0}' in blocks[job], (job, 'Namespace fallback must retain priority and run affinity')
+    assert 'job.priority={1}' in blocks[job] and 'github.run-id={0}' in blocks[job], (job, 'Namespace fallback must evaluate priority and run affinity')
+    assert "github.event_name == 'merge_group' && 1 || 2" in blocks[job], job
 assert "outputs.ci1" in blocks["linux-tests"], "primary shard must retain reserved routing"
 canaries = blocks['mail-redelivery-canaries']
 assert 'needs: [pick-runner, linux-test-build]' in canaries and 'needs: [linux-tests]' not in canaries, "canaries must run beside both test shards after the shared build"
@@ -147,10 +148,10 @@ assert 'Keep valid same-source build outputs' in blocks['linux-test-build'], 'sh
 assert 'CI_TEST_PARTITION' not in canaries, "every required canary must run"
 assert 'mail_redelivery' not in blocks['linux-tests'] and 'scripts/ci-mail-redelivery-canaries' not in blocks['linux-tests'], "canaries cannot serialize the primary shard"
 assert 'needs.mail-redelivery-canaries.result' in blocks['linux-gate'], "failures and skips must still fail the Linux gate"
-assert "job.priority=1" in blocks["linux-tests"] and "github.run-id={0}" in blocks["linux-tests"], "same class for Namespace fallback with an evaluated run id"
+assert "job.priority={1}" in blocks["linux-tests"] and "github.run-id={0}" in blocks["linux-tests"], "event priority and evaluated run id in Namespace fallback"
 for path in ("perf.yml", "main-upkeep.yml", "public-repo.yml", "release-daily.yml", "release-portable.yml", "release-smalltalk.yml"):
     generated = (ROOT / ".github/workflows" / path).read_text()
-    assert ";job.priority=1" in generated, (path, "Linux optional work must share the class")
+    assert ";job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}" in generated, (path, "non-merge Linux work keeps the second class")
     assert "github.run-id=" in generated, (path, "avoid nondeterministic runner pickup")
     assert ";job.priority=10" not in generated, path
 for path in ("public-repo.yml", "release-daily.yml", "release-portable.yml", "release-smalltalk.yml", "macos.yml"):
@@ -164,6 +165,27 @@ assert 'CI_TEST_PARTITION: "hash:2/2"' in blocks["linux-tests-shard-2"]
 for job in ("linux-tests", "linux-tests-shard-2"):
     assert 'CI_TEST_THREADS: "8"' in blocks[job], "bound each shard's test concurrency"
 assert "vars.CI1_MIN_IDLE || '1'" in picker, "use an idle general slot without requiring the entire pool"
+
+# Evaluate the generated runs-on expressions, not a second copy of the routing rule.
+def route(job, event, profile='', picked='', merge_ci1=''):
+    expression = blocks[job].split('runs-on: ', 1)[1].splitlines()[0].strip().removeprefix('${{').removesuffix('}}').strip()
+    expression = re.sub(r'needs\.pick-runner\.outputs\.ci1(?:_secondary|_mail)?', repr(picked), expression)
+    expression = expression.replace('github.event_name', repr(event)).replace('github.run_id', '123').replace('vars.CI_MERGE_NAMESPACE_PROFILE', repr(profile)).replace('vars.CI_MERGE_CI1', repr(merge_ci1))
+    return eval(expression.replace('&&', ' and ').replace('||', ' or '), {'__builtins__': {}}, {'fromJSON': json.loads, 'format': lambda template, *args: template.format(*args)})
+
+for job in ('linux-test-build', 'linux-clippy', 'linux-fleet-compat', 'genie-freshness', 'typescript-client', 'isolation-vm', 'linux-tests', 'linux-tests-shard-2', 'mail-redelivery-canaries'):
+    assert route(job, 'merge_group', merge_ci1='on') == ['ci1-merge'], job
+    assert route(job, 'merge_group', 'queue-reserved', '["ci1"]', merge_ci1='on') == ['ci1-merge'], (job, 'configured reservation overrides picked general slots')
+    assert route(job, 'merge_group', 'queue-reserved') == ['namespace-profile-queue-reserved;job.priority=1;github.run-id=123'], job
+    merge_fallback = route(job, 'merge_group')
+    assert 'job.priority=1' in merge_fallback[0] and any('github.run-id=123' in label for label in merge_fallback), job
+    for event in ('pull_request', 'workflow_dispatch'):
+        ordinary = route(job, event)
+        assert ordinary == route(job, event, 'queue-reserved', merge_ci1='on'), (job, 'PRs cannot consume reserved profile')
+        assert 'job.priority=2' in ordinary[0], (job, 'queued PRs follow merge groups')
+    if job in ('linux-test-build', 'linux-tests', 'linux-tests-shard-2', 'mail-redelivery-canaries'):
+        assert route(job, 'merge_group', 'queue-reserved', '["ci1-merge"]') == ['ci1-merge'], (job, 'retain picked ci1 lane')
+print('passed: all merge jobs use provisioned ci1 or Namespace reserve; PRs cannot; unset switches preserve shapes and affinity')
 
 # Exercise the actual generated step predicates, including restoring ordinary behavior.
 cache_conditions = re.findall(
