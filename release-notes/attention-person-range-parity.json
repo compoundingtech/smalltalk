@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Match opt-in person attention membership to the current native lowercase assignee range",
+  "replay": {
+    "status": "none",
+    "detail": "Normal Store open and production attention reads retain their existing computation. No production replay or backfill is introduced. Explicit unpublished operator installation uses bounded source and maintenance pages."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "The opt-in person operator uses the lowercase assignee range index and a new person-fences.v3 fingerprint. An older disposable operator lifetime cannot certify the new definition. No numeric Store schema transition or production installation is introduced."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule, shared projection digest or fleet coordination change. These disposable operator tables are not activated in production by this change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Native production selection, public attention IDs, actions, recorded episodes and clock wrappers remain unchanged. Legacy uppercase PERSON assignments were already absent from the native reader; the opt-in operator now agrees."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or production startup work is introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing installations require no manual action. Shared runtime integration and complete source certification are required before any future activation."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Production remains on the existing full reader. Opt-in family output is disposable and never authoritative; unavailable or unflushed families reject reads rather than replaying from a GET or returning partial Ready output. Real Store lifecycle controls verify persisted identity across reopen and retain the primitive registry fence after checkpoint deletion; replacement certification remains installer-owned."
+  }
+}

@@ -14,7 +14,7 @@ fn a_claude_seat_runs_with_no_st2_on_the_machine() {
     use std::path::PathBuf;
     use std::process::Command;
 
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let in_ci = std::env::var_os("CI_RUN_ID").is_some();
     let path = std::env::var_os("PATH").unwrap_or_default();
     let on_path =
@@ -38,7 +38,7 @@ fn a_claude_seat_runs_with_no_st2_on_the_machine() {
             "python3",
         ])
         .arg(repo.join("scripts/st3-no-st2-eval/run"))
-        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
+        .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
         .output()
         .expect("run the no-st2 seat eval");

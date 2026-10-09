@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "The weekly limits policy can exempt accounts and harnesses, and the daemon reads its [limits] config again on every pass",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or stored history changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema, version or stored data changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "config.toml [limits] accepts the optional exempt_accounts and exempt_harnesses lists; an older build rejects a config that names them. st usage prints an EXEMPT line and marks exempt accounts, and st --json usage adds an exempt flag to each limit and a limits_policy object. Both are additive."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or startup migration is required. The limits policy now reads [limits] on every two-minute pass, so later edits apply without a restart."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No action is required. Operators may replace a hand-made keep list for an account with exempt_accounts."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Only configuration reading changes; reverting restores the one-time read at daemon start."
+  }
+}

@@ -133,6 +133,7 @@ impl ServiceSpec {
 }
 
 pub fn install(mut config: Config) -> Result<()> {
+    crate::node_identity::resolve(&mut config)?;
     #[cfg(target_os = "linux")]
     anyhow::ensure!(
         st_runtime::isolation_mode() != st_runtime::Isolation::DegradedDetached,
@@ -1046,6 +1047,7 @@ mod tests {
             github: crate::config::GithubConfig::default(),
             checkpoint: crate::config::CheckpointConfig::default(),
             limits: crate::config::LimitsConfig::default(),
+            reconcile: crate::config::ReconcileConfig::default(),
             fleet: None,
         };
         let spec = ServiceSpec::new("/usr/bin/st3", config, 1024)?;

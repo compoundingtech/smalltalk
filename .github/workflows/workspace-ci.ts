@@ -1,4 +1,4 @@
-import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave } from './build-snapshot.ts'
+import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave, optionalQueueCacheSave } from './build-snapshot.ts'
 import {
   defaultActionlintConfig,
   effectUtilsBinaryCaches,
@@ -7,7 +7,10 @@ import {
 } from '../../repos/effect-utils/genie/external.ts'
 
 // Profiles require controls inline; namespace-features labels apply only to shape labels.
-export const linuxRunnerProfile = 'namespace-profile-linux-x86-64;job.priority=1'
+// Namespace serves queued merge-group jobs before PR, optional and manual jobs.
+// This orders waiting jobs; it does not preempt active jobs or reserve a runner.
+const linuxJobPriority = "${{ github.event_name == 'merge_group' && 1 || 2 }}"
+export const linuxRunnerProfile = `namespace-profile-linux-x86-64;job.priority=${linuxJobPriority}`
 export const macosRunnerProfile = 'namespace-profile-macos-arm64'
 export const linuxRunner = [`${linuxRunnerProfile};github.run-id=\${{ github.run_id }}`] as const
 /**
@@ -17,9 +20,9 @@ export const linuxRunner = [`${linuxRunnerProfile};github.run-id=\${{ github.run
  * got runners at once.
  */
 const linuxStageShape = 'nscloud-ubuntu-24.04-amd64-8x16-with-features'
-/** All Linux Namespace work shares one class: older benchmarks cannot be overtaken forever. */
+/** All non-merge Linux work retains one class; merge groups have the first queue class. */
 export const linuxStageRunner = [
-  `${linuxStageShape};job.priority=1`,
+  `${linuxStageShape};job.priority=${linuxJobPriority}`,
   'namespace-features:github.run-id=${{ github.run_id }}',
 ] as const
 export const macosRunner = [`${macosRunnerProfile};github.run-id=\${{ github.run_id }}`] as const
@@ -70,8 +73,6 @@ export const pickRunnerJob = {
         REPOSITORY: '${{ github.repository }}',
         HEAD_REPOSITORY: '${{ github.event.pull_request.head.repo.full_name }}',
         PR_LABELS: '${{ toJSON(github.event.pull_request.labels.*.name) }}',
-        QUEUE_REF: '${{ github.event.merge_group.head_ref }}',
-        GH_REPO_TOKEN: '${{ github.token }}',
         OWNER: '${{ github.repository_owner }}',
         NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1MinIdle}' }}`,
       },
@@ -95,17 +96,10 @@ if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_
   printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\\n' >> "$GITHUB_STEP_SUMMARY"
 fi
 if [ "$EVENT" = merge_group ]; then
-  label=ci1-merge
-  # A queue entry for an urgent PR uses the priority pool too, including when its PR checks passed.
-  if [ -n "$GH_REPO_TOKEN" ] && [[ "$QUEUE_REF" =~ ^refs/heads/gh-readonly-queue/main/pr-([0-9]+)-[0-9a-f]{40}$ ]]; then
-    queue_pr=\${BASH_REMATCH[1]}
-    if labels=$(GH_TOKEN="$GH_REPO_TOKEN" timeout 20s gh api "repos/$REPOSITORY/pulls/$queue_pr" --jq '.labels | map(.name)' 2>/dev/null) && jq -e 'index("ci-priority") != null' <<< "$labels" >/dev/null 2>&1; then
-      label=ci1-priority
-    fi
-  fi
-  primary "$label"
-  echo "merge queue: reserved $label runners"
-  printf 'Runner: **ci1** (%s, reserved merge-queue capacity)\\n' "$label" >> "$GITHUB_STEP_SUMMARY"
+  # Merge groups never borrow the PR priority lane: it can have PR work ahead of them.
+  primary ci1-merge
+  echo "merge queue: reserved ci1-merge runners"
+  printf 'Runner: **ci1** (ci1-merge, reserved merge-queue capacity)\\n' >> "$GITHUB_STEP_SUMMARY"
 fi
 [ -n "$GH_TOKEN" ] || namespace "no runner status token"
 [[ "$NEED" =~ ^[1-9][0-9]*$ ]] || namespace "invalid minimum idle runner count"
@@ -143,34 +137,42 @@ done`,
   ],
 } as const
 
+// Enable only after Ops confirms the dedicated ci1 pool is provisioned. This
+// override comes before the general-slot picker so every merge job uses the reserve.
+const mergeCi1Labels = `github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]'`
 const pickedOr = (namespaceLabels: string, output = 'ci1') =>
-  `\${{ fromJSON(needs.${pickRunnerJobId}.outputs.${output} || ${namespaceLabels}) }}`
+  `\${{ fromJSON(${mergeCi1Labels} || needs.${pickRunnerJobId}.outputs.${output} || ${namespaceLabels}) }}`
 
-// Same priority for required, optional and manual jobs. Run affinity makes Namespace's
-// scheduled order deterministic; a newer required run cannot steal an older benchmark's runner.
+// Keep run affinity within each event class. Merge groups take the first Namespace
+// queue class; optional/manual and PR work retain the same second class.
+// Set this repository variable only after a runner administrator has provisioned
+// the profile with the existing image/cache and left it capacity outside the PR pool.
+// An unset variable retains the existing shapes with merge-first queue ordering.
+const namespaceLabels = (labels: readonly string[]) =>
+  `github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('${JSON.stringify(labels).replaceAll('${{ github.run_id }}', '{0}').replaceAll(linuxJobPriority, '{1}')}', github.run_id, github.event_name == 'merge_group' && 1 || 2)`
 /** `runs-on` for a stage job: picked ci1, else the shared Namespace queue class. */
 export const linuxStageRunsOn = pickedOr(
-  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  namespaceLabels(linuxStageRunner),
 )
 
-/** Extra test jobs can consume only general ci1 slots, never the primary's reserved label. */
+/** Extra jobs use idle general slots unless all merge work is routed to the provisioned reserve. */
 export const secondaryStageRunsOn = pickedOr(
-  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  namespaceLabels(linuxStageRunner),
   'ci1_secondary',
 )
 export const mailStageRunsOn = pickedOr(
-  `format('${JSON.stringify(linuxStageRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  namespaceLabels(linuxStageRunner),
   'ci1_mail',
 )
 
 /** `runs-on` for a Linux profile job: picked ci1, else the shared Namespace queue class. */
 export const linuxRunsOn = pickedOr(
-  `format('${JSON.stringify(linuxRunner).replaceAll('${{ github.run_id }}', '{0}')}', github.run_id)`,
+  namespaceLabels(linuxRunner),
 )
 
-/** Other supporting jobs stay on Namespace rather than spending the test runners. */
-export const supportingLinuxRunsOn = linuxRunner
-export const supportingStageRunsOn = linuxStageRunner
+/** Supporting jobs use Namespace unless the merge-only ci1 reservation is enabled. */
+export const supportingLinuxRunsOn = `\${{ fromJSON(${mergeCi1Labels} || ${namespaceLabels(linuxRunner)}) }}`
+export const supportingStageRunsOn = `\${{ fromJSON(${mergeCi1Labels} || ${namespaceLabels(linuxStageRunner)}) }}`
 
 /** A job that needs `pick-runner` still runs when it was skipped (ci1 off). */
 export const afterPickRunner = { needs: [pickRunnerJobId], if: '${{ !cancelled() }}' } as const
@@ -277,6 +279,30 @@ done`,
   nixDevelopStep({ name: 'Install matching rendered hooks', command: ['bash', 'scripts/ci-install-built-hooks'] }),
 ]
 
+/** Archive consumers restore tools/fixtures, never Cargo targets or another job's build snapshot. */
+export const testArchiveConsumerSetup = [
+  { name: "Require the shared test producer to succeed",
+    env: { PRODUCER_RESULT: "${{ needs.linux-test-build.result }}" },
+    run: '[ "$PRODUCER_RESULT" = success ] || { echo "::error::shared test producer failed or was skipped"; exit 1; }' },
+  ...commonSetupSteps.filter((step: any) => step.id !== 'cargo-cache'
+    && step !== buildSnapshotRestore && step !== buildSnapshotPrepare),
+  ...testBuildSteps.slice(0, 2),
+  {
+    name: 'Download this run attempt’s successful test build',
+    uses: 'actions/download-artifact@v4',
+    with: {
+      'artifact-ids': '${{ needs.linux-test-build.outputs.artifact-id }}',
+      'merge-multiple': true,
+      path: '${{ runner.temp }}/ci-test-archives',
+    },
+  },
+  { ...nixDevelopStep({ name: 'Verify source, hashes and extract test archives',
+    command: ['python3', 'scripts/ci-test-archive', 'consume'] }),
+    env: { CI_TEST_ARCHIVE_MANIFEST_SHA256: '${{ needs.linux-test-build.outputs.manifest-sha256 }}',
+      CI_TEST_ARCHIVE_PRODUCER_ATTEMPT: '${{ needs.linux-test-build.outputs.producer-attempt }}' } },
+  testBuildSteps[3],
+]
+
 /** Everything a job that runs the workspace tests needs. */
 export const workspacePreparationSteps = [...commonSetupSteps, ...testBuildSteps]
 
@@ -324,7 +350,7 @@ export const linuxStageJob = ({
     ...after,
     {
       name: 'Save Nix outputs to the local Nix cache',
-      if: "success() && env.CI_LOCAL_CACHES != '1'",
+      if: `success() && env.CI_LOCAL_CACHES != '1' && ${optionalQueueCacheSave}`,
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
     ...saveMainDependencyCaches(setup),

@@ -1,8 +1,12 @@
+#[macro_use]
+#[path = "../../../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 use st3_client::*;
 use std::path::{Path, PathBuf};
 
 fn fixture(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let path = PathBuf::from(test_env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/st3/client-v0/fixtures")
         .join(name);
     std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()))
@@ -521,4 +525,16 @@ fn a_kind_this_client_does_not_know_reads_as_unknown_and_the_page_still_reads() 
         }))
         .is_err()
     );
+}
+
+#[test]
+fn relay_omission_fixture_round_trips_without_inventing_nonnullable_fields() {
+    let bytes = fixture("timeline-relay-omission.json");
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let typed: Envelope<TimelinePage> = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(serde_json::to_value(&typed).unwrap(), raw);
+    let changes = serde_json::json!({"kind":"conversation-changes", "session_id":raw["value"]["session_id"],
+        "items":raw["value"]["items"], "next_cursor":"conversation-cursor/relay/next"});
+    let typed: ConversationChanges = serde_json::from_value(changes.clone()).unwrap();
+    assert_eq!(serde_json::to_value(typed).unwrap(), changes);
 }

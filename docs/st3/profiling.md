@@ -4,6 +4,27 @@ A daemon that answers slowly is usually waiting, not computing: for the store's 
 one of its read connections, or for SQLite. The daemon can account for its own time so that a slow
 request names what it waited for and who held it.
 
+`GET /v1/client/request-latency` reports completed response-envelope timings without enabling
+profiling. Its `routes` array retains mixed route totals (`scope: "route"`) and adds independent
+`scope: "work-action"` rows for POST claim, renew, progress, complete, fail, release and extend.
+An action row has a static route such as `/v1/work/renew/{*subject}`, `method: "POST"` and
+`action: "renew"`; it retains no subject, body or token. Action samples are subsets of the mixed
+route totals, so do not add counts across scopes. The seven action buckets are independent of the
+256 general-route limit.
+
+Each row's `count` is its completed-response count since this process started, including error
+responses. Percentiles use its last at most 512 completions (`recent_count`), in whole milliseconds.
+Renew and claim have separate counts and percentile samples. `duration_scope: "response-envelope"`
+includes handler queueing, request work, durable admission and envelope serialization; it does not
+subtract writer wait or report only a hierarchy component. This is server completion time, not
+network delivery time. Abandoned and still-running requests have no sample. Existing long-poll
+route durations include deliberate waiting.
+
+For a deployed latency receipt, retain the process/source identity and before/after count delta.
+A low-volume tail can include requests from before the measurement window, and a restart resets
+these in-memory counters. The endpoint alone supplies no queue-versus-work breakdown; the phase
+profiling below supplies that context separately.
+
 Person-ask reconciliation checks for retained `work.person-asked` claims on a read connection
 after importing legacy asks. When there are none, it skips the writer queue so an empty stage
 does not delay the rest of the reconcile pass behind unrelated writes. When asks exist, their
@@ -106,11 +127,31 @@ session, person, and mode binding, expiry, and owner/incarnation checks remain u
 
 ## Read connections and SQLite allocation
 
-Reads take an idle connection or open another when all retained connections are busy. The
-pool retains up to 128 idle connections by default; `SMALLCLAIMS_MAX_IDLE_READ_CONNECTIONS`
-overrides that retention ceiling. It does not cap concurrent connections or make reads wait
-for an available slot. Nested reads and pinned snapshots keep their existing behavior.
-Each reader requests a fixed 2 MiB page-cache target by default. Set
+Top-level API read queries admit before opening a connection or pinning a snapshot.
+Waiting for reader capacity holds no cache, roster, or socket gate; waiting for those gates
+holds no reader capacity. Each pool admits at most 32 top-level workers by default. Set
+`SMALLCLAIMS_MAX_READ_WORKERS` in the **daemon's** environment to a positive integer to
+override this count; zero, invalid, or values beyond Tokio's semaphore capacity use 32.
+The value is read once per process. Queued reads observe their existing cancellation and
+deadline budgets without opening a reader. An upgraded stream's query is admitted without
+adding a deadline policy; waiting for events or socket/window admission holds no reader.
+Collections retain their FIFO reader grant into the physical query instead of discarding
+it and racing a new try-acquire. Other gates are tried without waiting; contention releases
+capacity and unrelated gates before waiting for the contended gate.
+Same-pool nested reads reuse their loan, including pinned snapshots. Cross-pool nested
+reads never wait for the inner pool's capacity while holding an outer loan or snapshot:
+they try spare capacity, otherwise use an unadmitted nested loan. Status fanout tries
+extra capacity without waiting, then reduces inline on the parent's reader if none is free.
+
+After admission, reads take an idle connection or open another when all retained connections
+are busy. The pool still retains up to 128 idle connections by default;
+`SMALLCLAIMS_MAX_IDLE_READ_CONNECTIONS` overrides only that retention ceiling. Admission
+does not change page-cache targets, statement caching, or the allocator. Legacy raw pool
+checkout, non-API background reads, and the cross-pool nested fallback remain ungated:
+32 is a top-level worker-admission bound, not a global physical connection count or a
+process memory limit.
+
+Each reader requests a fixed 8 MiB page-cache target by default. Set
 `SMALLCLAIMS_READ_CACHE_KIB` in the **daemon's** environment to override it in KiB; positive
 integers through 2,147,483,647 are accepted, and invalid or zero values use the default.
 The value is read once per process. Retention still defaults to 128, preserving schema and
@@ -142,8 +183,120 @@ every subject's status read into a scan of its historical JSON bodies. The opera
 TEXT affinity is removed in that join so SQLite can seek the JSON-expression index.
 
 The agent-card cache holds its mutex only while selecting or publishing immutable cached
-rows, not while building cards. A request's SQLite snapshot therefore does not wait at that
-mutex behind another request's disk reads.
+rows, not while building cards. HTTP agent pages and WS roster windows first probe read-only
+caches inside a fresh, authorized SQLite snapshot. An exact, lease-valid warm hit bypasses the
+store-wide roster admission even while an unrelated cold reader holds it. A miss releases its
+snapshot before awaiting admission, then opens a new snapshot and rechecks authority and caches.
+Cold HTTP first pages build shallow refs and selected cards under one admission and one snapshot;
+warm first pages need neither admission nor a second snapshot. The existing same-key WS window
+admission remains in place for authority fencing. The cold worker retains store admission through
+completion even if its caller disconnects, so waiting followers pin no old WAL read mark.
+
+Eight immutable graph-index/local-frontier/history cuts are retained. HTTP pages lazily fill missing subjects into
+the same projection used by the complete WS roster, without reducing unrelated cards. Local
+agent observations and registered agent claims update only their subject's card. Run and generation
+changes refresh owned cards and diff roster membership; step/work changes map owners, assignees,
+claimants and activity actors. Queue-affecting claims refresh fleet queue selection and selected
+labels once, then compare all queue fields per card before refolding. Message sends refresh their
+agent endpoints because they contribute to activity timestamps. All message lifecycle receipts
+also refresh projected agent parties: draining rollout blockers read the message's delivery state,
+including ancestors of eligible replies. Receipt claims need not contain endpoint fields.
+Daemon diagnostics, glasses, arrangements and fleet-only claims reuse the cards. Unknown kinds and
+unclassified structural changes conservatively cold-build. Authorization is checked before reuse,
+and local delivery presence stays a per-read overlay rather than graph-cached authority.
+
+The reuse allowlist includes transitive rollout, suspension, fault and placement dependencies:
+
+| Claims | Card read | Delta mapping |
+| --- | --- | --- |
+| `message.sent` | activity and rollout delivery blockers | projected agent sender/recipient |
+| `message.staged`, `message.delivered`, `message.read`, `message.closed` | rollout delivery blockers and eligible reply ancestry | projected agent sender/recipient; cold if no message projection exists |
+| `daemon.diagnostic`, `daemon.started` | none; diagnostic reports are separate from agent reconcile faults | empty, guarded to daemon subjects |
+| `glass.upserted`, `glass.deleted` | none; glass projection is not a card or blocker input | empty, guarded to glass subjects |
+| `arrangement.edited` | none; arrangement projection is not a card or blocker input | empty, guarded to arrangement subjects |
+| `fleet.invite-created`, `fleet.invite-redeemed`, `fleet.invite-revoked` | none | empty, guarded to invitation subjects |
+| `fleet.member-admitted`, `fleet.member-endpoints`, `fleet.member-left`, `fleet.member-removed` | none; host metadata is declaration-derived and placement fences do not read peer liveness | empty, guarded to host subjects |
+
+Shared cards are built only from current, independently time-fenced queue metadata. A
+pagination continuation applies its frozen ordering/host/queue refs to the response clone
+after reading the shared cards; frozen pagination cuts must never seed the shared projection.
+The shallow HTTP membership/order/queue refs have the same bounded graph-cut retention.
+Warm pages reuse those refs rather than scanning all fleet work. An explicit allow-list of
+existing-agent harness observations and daemon diagnostics leaves them valid; every other
+claim rebuilds them. Runtime status can move an undeclared or stopped agent into history,
+so even an existing agent's `runtime.observed` rebuilds shallow refs.
+Both shallow refs and the full-card projection expire at the earliest current-generation
+work-lease deadline. Expired work becomes ready (or disappears from a revision-draining queue)
+without a new claim. Full-card refreshes retain expired rows only as diff sources, never as warm
+hits: `roster/queue-diff` scans queue selection and labels once and refolds only cards whose queue
+fields changed. It also refreshes the next deadline. Shallow refs still rebuild after expiry.
+Safe card-local advances carry the prior deadline forward. Shallow-ref warm hits add no SQL;
+full-card probes
+read the relevant local frontier before selecting cached rows. The outer shared agents
+WS window inherits the same fence, so it cannot hide an expired full-card projection.
+HTTP reads see expiry immediately; live WS subscribers see the transition on the next
+existing 30-second authority/freshness tick. That existing live-stream bound is unchanged.
+
+Historical status cuts read queue and declaration presentation from the caller's current SQLite
+projection, just as cold cards do. When the requested graph index precedes that physical
+projection's frontier, full-card reads bypass shared cached rows and cold-build selected coverage;
+they do not borrow stale queue fields from an earlier physical snapshot.
+
+The isolated 60-agent, six-mission, 60-step fixture counts canonical claim kinds and local samples:
+`cargo test -p st3 --lib agent_roster_typical_claim_kind_baseline -- --nocapture`.
+Its frozen pre-incremental classification distinguishes the old cold fallback from the current
+selected-card build count. Full JSON parity, including queues, todos and usage, is checked by
+`agent_roster_seeded_claim_sequences_match_cold_json` with reproducible proptest sequences,
+both history modes, selected coverage, historical cuts and injected-clock lease expiry.
+The ignored `agent_roster_one_step_claim_fixture_timing` reports cold/incremental wall times and
+the number of refolded cards after one work claim; run it explicitly with `--ignored --nocapture`.
+These debug-profile fixtures are not deployed latency or loaded-host benchmarks.
+
+The relevant local-observation frontier is the largest agent `harness.timeline` row ID visible
+inside the same SQLite snapshot with `after_store_index` at or before the requested graph cut,
+or zero when none exists. A partial covering index, `local_observations_roster_frontier_index`,
+contains only those rows. The reverse lookup skips newer heartbeat rows entirely, without
+assuming row IDs and graph indices are monotonic; an old cut still steps over newer agent
+timeline rows in the index. Existing stores create the index automatically on their next open,
+without a schema-version bump or replay migration. Initial creation took 0.171 seconds on
+an offline 1.78 GB store copy with 161,048 local observations (118,115 indexed agent timeline
+rows), using SQLite 3.53.3. The 8,701-row synthetic fixture took 0.516 ms; these isolated
+index-creation timings do not measure end-to-end startup or predict other stores.
+Heartbeat-only `harness.observed`, local telemetry and non-agent timeline appends leave cached
+cards reusable. Every agent timeline entry type advances the frontier, including usage entries,
+because managed-session recency reads the latest timeline row even when last activity does not.
+Replicated status and usage changes retain their graph-index invalidation. A same-index local
+content transcript append misses the read-only getter
+and updates the affected card's `last_activity_at` when rebuilt for both HTTP and WS; ignoring
+timeline rows here would make a shared warm roster instant but stale. Read-only getters never
+build, require selected-subject coverage, and pin immutable rows without filtering or cloning them.
+
+Cache relevance does not filter the existing `changed()` notification signal. Local
+heartbeat and timeline publications still wake every existing event subscriber; a heartbeat
+can then reuse the roster rows, while timeline activity misses and refreshes them. The normal
+`agent_roster_cache_reuse_preserves_changed_for_existing_subscribers` regression checks both
+publications with two subscribers.
+
+The performance report exposes each roster stage under bounded task labels:
+`roster/admission-wait` (waiting for the shared admission or an in-flight build),
+`roster/frontier-read`, `roster/cache-hit`, `roster/build` (incremental advance or cold build),
+`roster/card-projection` (refolding changed cards) and `agent_work_queues`.
+
+The focused 70-agent, 20-session fixture reports card-status, usage, repeated-projection and
+incremental-update costs with `cargo test -p st3 --lib agent_roster_snapshot_fixture_timing --
+--ignored --nocapture`. It is a serial fixture micro-measure, not a load benchmark. CI's
+`perf-load` workload holds concurrent agents WS subscribers and measures first-snapshot
+latency against the roster's 300 ms budget.
+
+Normal tests include a small cached-versus-uncached roster comparison before and after local
+timeline activity, in both history modes. Run the heartbeat-only fixture with
+`cargo test -p st3 --lib agent_roster_heartbeat_only_local_stream_hit_rate -- --nocapture`:
+it prints append/probe/hit counts, hit rate and elapsed time, requires every heartbeat probe to
+reuse the same immutable rows, and requires a subsequent timeline append to miss before rebuild.
+The normal warm HTTP fixture
+`warm_agent_http_page_bypasses_unrelated_cold_roster_admission` holds store admission while reading
+a cached first page and prints its elapsed time. These are deterministic cache/admission
+regressions with diagnostic timings, not production latency guarantees.
 
 Every five seconds a dedicated native thread attempts a passive WAL checkpoint outside the
 writer queue. Once every frame is backfilled, it attempts `TRUNCATE` with zero busy timeout.
@@ -157,20 +310,34 @@ shutdown does not wait for a long backfill.
 `st doctor` reports open, idle and active reader counts, peak open readers, total connections
 opened since startup, the configured cache target, and summed current reader targets without
 requiring SQLite MEMSTATUS. These are targets, not measured allocations: SQLite schema,
-prepared statements, query results and allocator overhead are additional. Reader checkout
-remains non-waiting; **burst concurrency is unbounded**. Bounded admission must first resolve
-cross-thread pinned snapshot dependencies (#1381).
+prepared statements, query results and allocator overhead are additional. The report names
+the configured API read-worker admission bound. Raw reader checkout remains non-waiting;
+background reads and retained idle connections can exceed the admitted-worker count.
 
 The doctor planning envelope uses the larger of current open readers and idle retention,
 multiplied by the per-reader target, plus the writer's 32 MiB target and a 512 MiB reserve for
-schema/statements, projections, tasks and allocator overhead. At defaults this is 800 MiB,
-leaving 224 MiB beyond that reserve under a 1 GiB service cap. The reserve is a planning
-allowance, not an enforced limit or a guarantee for every graph or workload. On Linux, doctor
+schema/statements, projections, tasks and allocator overhead. At defaults this is 1,568 MiB:
+1 GiB for 128 retained reader caches, 32 MiB for the writer and the 512 MiB reserve.
+The 1 GiB cap used in diagnostic examples is illustrative, not the service default:
+the Home Manager module defaults `memoryMax` to `"8G"` and installations can override it.
+For an installation limited to 1 GiB, set `SMALLCLAIMS_READ_CACHE_KIB=2048` to restore
+the 800 MiB planning envelope, or adjust its service limit.
+The reserve is a planning allowance, not an enforced limit or a guarantee for every graph
+or workload. On Linux, doctor
 locates the daemon's own cgroup v2 mount and checks `memory.max` and `memory.events` in that
 cgroup and its visible ancestors. It warns when the tightest limit is below the planning
 envelope, any `max` counter records pressure, or the files cannot be inspected. Ancestor
 counters include other descendants; historical hits do not prove a current OOM. On other
 platforms it reports that cgroup diagnostics are Linux-only.
+
+Checkpoint application and proof completion make one best-effort allocator-reclamation
+attempt on Linux with glibc (`malloc_trim(0)`). Nested entrypoints defer that one call until
+the outer operation has dropped its temporary inputs and SQLite guards. Successful,
+reader-mismatch, and error completions share the cleanup; skipped agreement/proof work
+does not trigger it. There is no periodic trim, idle-WAL hook, or ordinary API-read hook.
+Other targets use a no-op. This releases only unused glibc pages, not live SQLite caches
+or retained application data, and is not a process-memory cap. The call may contend with
+concurrent allocator activity; compare its duration as well as post-operation RSS.
 
 Reproduce reader-cache multiplication with invented data and the bundled SQLite artifact:
 

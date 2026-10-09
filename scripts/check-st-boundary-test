@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Mutation proofs: each forbidden surface must fail the same guard used by CI/evals."""
 from pathlib import Path
+import os
 import sqlite3
 import subprocess
 import sys
@@ -25,20 +26,54 @@ class BoundaryCheck(unittest.TestCase):
             (crate / "src/lib.rs").write_text("pub fn fixture() {}\n")
             (crate / "Cargo.toml").write_text(f'[package]\nname="{name}"\nversion="0.1.0"\nedition="2024"\n')
         (self.root / "Cargo.toml").write_text('[workspace]\nresolver="3"\nmembers=["crates/*"]\n')
+        # This dependency-free workspace needs no restored registry, compiler
+        # cache or runner Cargo configuration. Keep the pinned Cargo/toolchain.
+        self.cargo_env = {
+            **os.environ,
+            "CARGO_HOME": str(self.root / "cargo-home"),
+            "RUSTC_WRAPPER": "",
+            "RUSTC_WORKSPACE_WRAPPER": "",
+        }
         # Keep CLI's --locked contract even for a synthetic workspace.
-        subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=self.root, check=True,
-                       capture_output=True)
+        result = subprocess.run(["cargo", "generate-lockfile", "--offline"], cwd=self.root,
+                                env=self.cargo_env, capture_output=True, text=True)
+        if result.returncode:
+            print(f"boundary fixture lockfile setup failed (cargo generate-lockfile --offline, "
+                  f"exit {result.returncode}):", file=sys.stderr)
+            print(result.stderr, file=sys.stderr, end="")
+            result.check_returncode()
         for directory in ("state", "home", "pty"):
             (self.root / directory).mkdir()
         self.processes = [(123, "/bin/st driver claude", ["ST_AGENT=agent/example/worker"])]
 
     def check_sources(self):
         return subprocess.run([sys.executable, str(HERE / "check-st-boundary"), "--root", str(self.root)],
-                              capture_output=True, text=True)
+                              env=self.cargo_env, capture_output=True, text=True)
 
     def test_neutral_workspace_passes_cli(self):
         self.assertEqual(self.check_sources().returncode, 0)
         self.assertEqual(list(fresh_seat_findings(self.root, self.processes)), [])
+
+    def test_runner_compiler_wrappers_do_not_affect_fixture_metadata(self):
+        environment = {**os.environ, "RUSTC_WRAPPER": "/missing/cache-wrapper",
+                       "RUSTC_WORKSPACE_WRAPPER": "/missing/workspace-wrapper"}
+        result = subprocess.run(
+            [sys.executable, __file__, "BoundaryCheck.test_neutral_workspace_passes_cli"],
+            env=environment, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_lockfile_setup_failure_prints_cargo_stderr(self):
+        commands = self.root / "commands"
+        commands.mkdir()
+        cargo = commands / "cargo"
+        cargo.write_text('#!/bin/sh\necho "fixture cargo failure detail" >&2\nexit 101\n')
+        cargo.chmod(0o755)
+        environment = {**os.environ, "PATH": str(commands) + os.pathsep + os.environ["PATH"]}
+        result = subprocess.run(
+            [sys.executable, __file__, "BoundaryCheck.test_neutral_workspace_passes_cli"],
+            env=environment, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fixture cargo failure detail", result.stderr)
 
     def test_each_product_import_fails_cli(self):
         for crate in ("st3", "stui"):

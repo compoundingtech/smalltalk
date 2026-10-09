@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Refresh only affected roster cards after common claims and work-lease expiry",
+  "replay": {"status": "none", "detail": "Only disposable roster projection caches change. Existing graph replay and recovery behavior are unchanged."},
+  "schema": {"status": "none", "detail": "No table, index, stored row format, or schema-version changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules, digests, or coordinated member upgrade requirements change."},
+  "compatibility": {"status": "none", "detail": "Roster card responses retain their existing fields, membership, history, selected-coverage and local-observation fences. Common agent and work claims refresh the cards that read them. Message lifecycle changes refresh projected agent parties so draining rollout delivery blockers remain equal to a cold projection, even when receipt claims omit endpoints. Queue-affecting changes and lease deadlines refresh queue selection and labels once and refold only cards whose queue fields change. Unknown and unclassified structural claims still require a cold projection."},
+  "downtime": {"status": "none", "detail": "No migration or additional upgrade downtime is introduced beyond the ordinary process restart."},
+  "manual": {"status": "none", "detail": "No new installation, configuration, or state conversion steps are required."},
+  "recovery": {"status": "none", "detail": "Roster caches are disposable and rebuild after restart. An older binary can read the unchanged graph and projections without rollback conversion."}
+}

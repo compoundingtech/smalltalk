@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Archive consumers fail closed on source, attempt, tool or artifact mismatches."""
+import copy
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import sys
+import tempfile
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parent.parent
+loader = importlib.machinery.SourceFileLoader('archive', str(ROOT / 'scripts/ci-test-archive'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+with tempfile.TemporaryDirectory() as tmp:
+    directory = Path(tmp)
+    for name in module.FILES:
+        (directory / name).write_bytes(name.encode())
+    current = dict(source='a' * 40, tree='b' * 40, run='123', attempt='2', platform='x86_64',
+                   nextest='same nextest', rustc='same rustc', recipe='same recipe', paths='same paths')
+    manifest = dict(version=1, standalone_model=True, identity=current, workspace='/producer/source',
+                    files={name: module.digest(directory / name) for name in module.FILES})
+    module.verify(manifest, current, directory, "2")
+    inherited = copy.deepcopy(manifest)
+    inherited['identity']['attempt'] = '1'
+    module.verify(inherited, current, directory, '1')
+    for expected in ('0', '3', 'unknown', '2'):
+        try:
+            module.verify(inherited, current, directory, expected)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('unbound inherited attempt accepted')
+    variants = []
+    for key in current:
+        wrong = copy.deepcopy(manifest)
+        wrong['identity'][key] = 'different'
+        variants.append(wrong)
+    for change in [dict(standalone_model=False), dict(version=2), dict(workspace='relative'), dict(files={}),
+                   dict(files={**manifest['files'], 'extra.tar.zst': 'extra'}),
+                   dict(files={**manifest['files'], module.FILES[0]: 'bad digest'})]:
+        variants.append({**manifest, **change})
+    for wrong in variants:
+        try:
+            module.verify(wrong, current, directory, "2")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('mismatched archive accepted')
+    (directory / module.FILES[0]).unlink()
+    try:
+        module.verify(manifest, current, directory, "2")
+    except FileNotFoundError:
+        pass
+    else:
+        raise AssertionError('missing archive accepted')
+print('Archive identity controls passed: source/tree/run/attempt/platform/tools/recipes, manifest version, both groups, hashes and missing bytes')
+
+# Exercise the actual build/consume entry points with a fake nextest, never a compiler/test binary.
+import os
+import subprocess
+with tempfile.TemporaryDirectory() as tmp:
+    scratch = Path(tmp)
+    bin_dir = scratch / 'bin'
+    bin_dir.mkdir()
+    cargo = bin_dir / 'cargo'
+    cargo.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with open(os.environ['CALLS'], 'a') as stream: stream.write(json.dumps(args) + '\\n')
+if args == ['nextest', '--version']:
+    print('cargo-nextest fixture')
+elif args[:2] == ['nextest', 'archive']:
+    Path(args[args.index('--archive-file') + 1]).write_bytes(json.dumps(args).encode())
+elif args[:1] == ['test']:
+    print('test result: ok. 1 passed')
+elif args[:1] == ['tree']:
+    print('standalone model -> std')
+elif args[:1] == ['build']:
+    binary = Path(os.environ['RUNNER_TEMP']) / 'production-st3'
+    binary.write_text('#!/bin/sh\\nexit 0\\n')
+    binary.chmod(0o755)
+    print(json.dumps({'reason': 'compiler-artifact', 'target': {'name': 'st3'}, 'executable': str(binary), 'features': [], 'profile': {'test': False}}))
+elif args[:2] == ['nextest', 'list']:
+    target = Path(args[args.index('--extract-to') + 1]) / 'target'
+    (target / 'nextest').mkdir(parents=True)
+    for name in ('binaries-metadata', 'cargo-metadata'):
+        (target / 'nextest' / (name + '.json')).write_text('{}')
+    (target / 'debug').mkdir()
+    hooks = target / 'debug/st2'
+    hooks.write_text('#!/bin/sh\\nexit 0\\n')
+    hooks.chmod(0o755)
+else:
+    sys.exit('unexpected build or test command: ' + repr(args))
+''')
+    cargo.chmod(0o755)
+    bash = bin_dir / 'bash'
+    bash.write_text("#!/usr/bin/env python3\nimport json, os, sys\nassert sys.argv[1:] == ['scripts/ci-linux', 'conversation-model']\nwith open(os.environ['CALLS'], 'a') as stream: stream.write(json.dumps(['bash', *sys.argv[1:]]) + '\\n')\n")
+    bash.chmod(0o755)
+    rustc = bin_dir / 'rustc'
+    rustc.write_text('#!/bin/sh\necho fixture-rustc\n')
+    rustc.chmod(0o755)
+    calls, env_file, outputs = (scratch / name for name in ('calls', 'env', 'outputs'))
+    sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    environment = {**os.environ, 'PATH': f"{bin_dir}:{os.environ['PATH']}", 'RUNNER_TEMP': str(scratch),
+                   'GITHUB_RUN_ID': '123', 'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_SHA': sha,
+                   'GITHUB_ENV': str(env_file), 'GITHUB_OUTPUT': str(outputs), 'CALLS': str(calls)}
+    subprocess.run([sys.executable, 'scripts/ci-test-archive', 'build'], cwd=ROOT, env=environment, check=True, capture_output=True)
+    commands = [__import__('json').loads(line) for line in calls.read_text().splitlines()]
+    groups = [command for command in commands if 'archive' in command]
+    assert ['bash', 'scripts/ci-linux', 'conversation-model'] in commands
+    assert len(groups) == 2 and '--workspace' in groups[0] and groups[0][groups[0].index('--exclude') + 1] == 'st2'
+    assert groups[1][groups[1].index('-p') + 1] == 'st2' and all(target in groups[1] for target in ('integration', 'agent_resource', 'driver_expansion'))
+    produced = dict(line.split('=', 1) for line in outputs.read_text().splitlines())
+    environment['CI_TEST_ARCHIVE_MANIFEST_SHA256'] = produced['manifest-sha256']
+    environment['CI_TEST_ARCHIVE_PRODUCER_ATTEMPT'] = produced['producer-attempt']
+    (scratch / 'ci-test-archives/sekrets-st3').chmod(0o644)
+    environment['GITHUB_RUN_ATTEMPT'] = '3'  # failed-only rerun inherits this exact attempt-2 producer
+    subprocess.run([sys.executable, 'scripts/ci-test-archive', 'consume'], cwd=ROOT, env=environment, check=True, capture_output=True)
+    assert os.access(scratch / 'ci-test-archives/sekrets-st3', os.X_OK)
+    exported = dict(line.split('=', 1) for line in env_file.read_text().splitlines())
+    assert exported['CI_TEST_WORKSPACE'] == str(ROOT) and exported['CI_TEST_BUILD_WORKSPACE'] == str(ROOT)
+    assert exported['CI_TEST_HOOKS_BINARY'].endswith('/st2/target/debug/st2')
+    before = calls.read_text()
+    environment['CI_TEST_ARCHIVE_MANIFEST_SHA256'] = '0' * 64
+    failed = subprocess.run([sys.executable, 'scripts/ci-test-archive', 'consume'], cwd=ROOT, env=environment, capture_output=True)
+    assert failed.returncode != 0 and 'manifest differs' in failed.stderr.decode()
+    commands_after = calls.read_text()[len(before):]
+    assert 'archive' not in commands_after and 'list' not in commands_after, 'reject before extracting or rebuilding'
+print('Archive entry-point controls passed: original two groups, exact manifest, extraction/env export, tamper rejection before extraction; fake nextest only')

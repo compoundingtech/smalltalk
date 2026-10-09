@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Selected integration targets build this matching executable before tests start.
 set -euo pipefail
+if [[ -n "${CI_TEST_HOOKS_BINARY:-}" ]]; then
+  test -x "$CI_TEST_HOOKS_BINARY"
+  exec "$CI_TEST_HOOKS_BINARY" hooks install
+fi
 target=$(cargo metadata --locked --no-deps --format-version 1 | jq -er .target_directory)
 test -x "$target/debug/st2"
 "$target/debug/st2" hooks install

@@ -22,6 +22,40 @@ function watch() {
 const subscribed = socket => socket.sent.filter(command => command.kind === 'subscribe').map(command => command.id);
 
 {
+  // A pending source keeps its delivered rows and says they are stale. Ready changes
+  // recover on the held subscription, canceling the pending resubscription timer.
+  const { client, sockets } = fakeClient();
+  const { seen, handlers } = watch();
+  const feed = new Feed(client, handlers, new ForegroundGate('active'), () => 'action/test', [100], 40);
+  await settle();
+  const socket = sockets[0];
+  socket.frame({ kind: 'snapshot', id: 'agents', collection: 'agents', snapshot: snapshot(1), items: [agent('agent/amber'), agent('agent/blue')], order: ['agent/amber', 'agent/blue'], has_more: false });
+  const before = socket.sent.length;
+  const pending = { kind: 'resync', id: 'agents', collection: 'agents', code: 'internal', message: 'collection source is unavailable; held rows are stale until readiness returns', retryable: true };
+  socket.frame(pending);
+  socket.frame(pending);
+  assert.deepEqual(seen.windows.agents.ids, ['agent/amber', 'agent/blue'], 'resync preserves the last delivered rows');
+  assert.equal(seen.errors.length, 0, 'a moment of unavailability is not reported yet');
+  await settle(60);
+  assert.equal(seen.errors.length, 1, 'one issue per unavailable interval, once it lasted');
+  assert.match(seen.errors[0], /agents: .*held rows are stale/);
+  socket.frame({ kind: 'changes', id: 'agents', collection: 'agents', snapshot: snapshot(2), upserts: [agent('agent/coral')], removes: ['agent/amber'], order: ['agent/coral', 'agent/blue'], has_more: false });
+  assert.deepEqual(seen.windows.agents.ids, ['agent/coral', 'agent/blue']);
+  await settle(170);
+  assert.equal(socket.sent.length, before, 'Ready changes cancel resubscription');
+  socket.frame(pending);
+  await settle(60);
+  assert.equal(seen.errors.length, 2, 'a later unavailable interval is reported again');
+  // A blip a write causes (unavailable, then changes at once) is never reported.
+  socket.frame({ kind: 'changes', id: 'agents', collection: 'agents', snapshot: snapshot(3), upserts: [agent('agent/coral')], removes: [], order: ['agent/coral', 'agent/blue'], has_more: false });
+  socket.frame(pending);
+  socket.frame({ kind: 'changes', id: 'agents', collection: 'agents', snapshot: snapshot(4), upserts: [agent('agent/coral')], removes: [], order: ['agent/coral', 'agent/blue'], has_more: false });
+  await settle(60);
+  assert.equal(seen.errors.length, 2, 'a blip that recovered at once says nothing');
+  feed.close();
+}
+
+{
   // Snapshot then changes produce ordered lists; a removal leaves the window.
   const { client, sockets } = fakeClient();
   const { seen, handlers } = watch();
@@ -242,3 +276,62 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
 assert.equal(shouldProbe(1_000, 5_000), false);
 assert.equal(shouldProbe(1_000, 10_999), false);
 assert.equal(shouldProbe(1_000, 11_000), true);
+
+{
+  // The missions window is followed only when asked: not subscribed at the start, subscribed when a
+  // missions screen shows, and left (its rows dropped) when none does.
+  const { client, sockets } = fakeClient();
+  const { seen, handlers } = watch();
+  const stopped = [];
+  const feed = new Feed(client, { ...handlers, onWindowStopped: name => stopped.push(name) }, new ForegroundGate('active'), () => 'action/test', [100], 1000, false);
+  await settle();
+  const socket = sockets[0];
+  assert.ok(!subscribed(socket).includes('missions'), 'not followed at the start');
+  assert.ok(subscribed(socket).includes('agents') && subscribed(socket).includes('attention'));
+  feed.setMissions(true);
+  assert.ok(subscribed(socket).includes('missions'), 'followed once a missions screen shows');
+  feed.setMissions(false);
+  assert.ok(socket.sent.some(command => command.kind === 'unsubscribe' && command.id === 'missions'), 'left when none shows');
+  assert.deepEqual(stopped, ['missions']);
+  feed.setMissions(false);
+  assert.deepEqual(stopped, ['missions'], 'leaving twice says nothing more');
+  // Frames already on their way when it was left change nothing: no rows, no retry, no error.
+  const sent = socket.sent.length;
+  socket.frame({ kind: 'snapshot', id: 'missions', collection: 'missions', snapshot: snapshot(9), items: [mission('mission/late')], order: ['mission/late'], has_more: false });
+  socket.frame({ kind: 'changes', id: 'missions', collection: 'missions', snapshot: snapshot(10), upserts: [mission('mission/later')], removes: [], order: ['mission/later'], has_more: false });
+  socket.frame({ kind: 'resync', id: 'missions', collection: 'missions', code: 'internal', message: 'collection source is unavailable', retryable: true });
+  socket.frame({ kind: 'error', id: 'missions', code: 'internal', message: 'the window failed', retryable: true });
+  await settle(1100);
+  assert.equal(seen.windows.missions, undefined, 'a late missions frame brings no rows back');
+  assert.equal(seen.errors.length, 0, 'and no error');
+  assert.equal(socket.sent.length, sent, 'and is not subscribed again');
+  feed.close();
+}
+
+{
+  // Screens ask and give back; the window stays for a grace period after the last one leaves.
+  const { client, sockets } = fakeClient();
+  const { handlers } = watch();
+  const stopped = [];
+  const feed = new Feed(client, { ...handlers, onWindowStopped: name => stopped.push(name) }, new ForegroundGate('active'), () => 'action/test', [100], 1000, false, 40);
+  await settle();
+  const socket = sockets[0];
+  const first = feed.watchMissions();
+  const second = feed.watchMissions();
+  assert.equal(subscribed(socket).filter(id => id === 'missions').length, 1, 'subscribed once for two screens');
+  first();
+  first();
+  await settle(80);
+  assert.deepEqual(stopped, [], 'one screen still shows missions');
+  second();
+  await settle(10);
+  assert.deepEqual(stopped, [], 'kept through the grace period');
+  const again = feed.watchMissions();
+  await settle(80);
+  assert.deepEqual(stopped, [], 'asked again within the grace: still followed');
+  again();
+  await settle(80);
+  assert.deepEqual(stopped, ['missions'], 'left once the grace ended');
+  feed.close();
+}
+

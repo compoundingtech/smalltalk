@@ -6,7 +6,7 @@ use st3::model::{ClaimInput, MissionRunRequest};
 use st3::store::Store;
 
 fn fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/operational-state")
+    Path::new(test_env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/operational-state")
 }
 
 fn fixture(name: &str) -> Value {
@@ -81,7 +81,7 @@ fn regression_fixture_set_is_small_complete_and_deterministic() {
 #[test]
 fn every_screen_model_has_one_cli_renderer_and_required_rendering_state() {
     let path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/st3/operational-state/screens.json");
+        Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../docs/st3/operational-state/screens.json");
     let contract: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let required = BTreeSet::from([
         "now",
@@ -120,7 +120,7 @@ fn every_screen_model_has_one_cli_renderer_and_required_rendering_state() {
 
 #[test]
 fn command_inventory_resolves_every_baseline_command_to_a_complete_purpose() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let path = Path::new(test_env!("CARGO_MANIFEST_DIR"))
         .join("../../docs/st3/operational-state/cli-commands.json");
     let contract: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
     let purposes = contract["purposes"].as_object().unwrap();

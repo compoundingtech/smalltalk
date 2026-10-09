@@ -2,12 +2,26 @@
 //! Cancellation is cooperative: SQLite reads use progress handlers and Rust folds check
 //! the budget between items. It does not preempt an individual filesystem call or parse.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::sync::Arc;
 
 thread_local! {
     static STORE: RefCell<Option<Arc<super::Store>>> = const { RefCell::new(None) };
+    // The router runs its handler on a blocking worker already. Submitting its synchronous
+    // store work again wastes a second pool slot and can wait behind unrelated blocking work.
+    static IN_HANDLER: Cell<bool> = const { Cell::new(false) };
+}
+
+fn with_handler<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            IN_HANDLER.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(IN_HANDLER.with(|slot| slot.replace(true)));
+    work()
 }
 
 fn with_store<T>(store: Option<Arc<super::Store>>, work: impl FnOnce() -> T) -> T {
@@ -98,8 +112,7 @@ fn deadline(request: &Request<Body>) -> Option<Duration> {
     if let Some(wait_ms) = wait_ms {
         return Some(ORDINARY + Duration::from_millis(wait_ms));
     }
-    if forwarded
-        || export
+    if export
         || path.starts_with("/v1/internal/replication/checkpoint")
         || path == "/v1/checkpoint/plan"
         || path == "/v1/checkpoint/status"
@@ -112,7 +125,8 @@ fn deadline(request: &Request<Body>) -> Option<Duration> {
 }
 
 fn long_poll_route(route: &str) -> bool {
-    route == "/v1/events"
+    route == crate::peer::CLIENT_READ_FORWARD_PATH
+        || route == "/v1/events"
         || route == "/v1/events/page"
         || route == "/v1/client/events"
         || (route.starts_with("/v1/client/conversations/") && route.ends_with("/changes"))
@@ -152,12 +166,84 @@ impl<F> Drop for Budgeted<F> {
     }
 }
 
+fn forwarded_deadline(operation: &crate::peer::ClientReadOperation) -> Option<Duration> {
+    // This transport also carries terminal actions: cancelling their acknowledgement
+    // would turn a completed mutation into an apparently failed read.
+    use crate::peer::ClientReadOperation;
+    match operation {
+        ClientReadOperation::TerminalControl { .. } => None,
+        ClientReadOperation::ConversationChanges { .. }
+        | ClientReadOperation::TerminalScreenChange { .. } => Some(ORDINARY + operation.wait()),
+        ClientReadOperation::ConversationContent { .. }
+        | ClientReadOperation::Timeline { .. }
+        | ClientReadOperation::TerminalScreen { .. }
+        | ClientReadOperation::SeatSnapshot { .. }
+        | ClientReadOperation::AgentWorkspace { .. }
+        | ClientReadOperation::Blob { .. }
+        | ClientReadOperation::Messages { .. } => Some(ORDINARY),
+    }
+}
+
+fn timeout_response(state: &AppState, path: &str) -> Response {
+    let error = json!({"code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}});
+    let request_id = super::new_request_id();
+    let value = if path.starts_with("/v1/client/") {
+        super::client_error_envelope(StatusCode::GATEWAY_TIMEOUT, &error, &request_id)
+    } else {
+        json!({"api_version":"st3.v1", "request_id":request_id,
+            "snapshot_host":state.node,
+            "store_index":state.store.index().unwrap_or_default(),
+            "code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}})
+    };
+    (StatusCode::GATEWAY_TIMEOUT, Json(value)).into_response()
+}
+
+#[track_caller]
+fn body_timeout_response(state: &AppState) -> Response {
+    // Static route and phase only: never include the forwarded JSON or credentials.
+    eprintln!(
+        "st3: read cancelled route={:?} phase=request-body callsite={} deadline_elapsed=true",
+        crate::peer::CLIENT_READ_FORWARD_PATH,
+        std::panic::Location::caller(),
+    );
+    timeout_response(state, crate::peer::CLIENT_READ_FORWARD_PATH)
+}
+
 pub(super) async fn envelope(
     state: (AppState, ClientTransportBoundary),
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(duration) = deadline(&request) else {
+    let started = std::time::Instant::now();
+    let mut duration = deadline(&request);
+    if request.method() == Method::POST
+        && request.uri().path() == crate::peer::CLIENT_READ_FORWARD_PATH
+    {
+        // The operation is in a bounded JSON body, not the URI. Include receiving
+        // it in the same budget, then return identical bytes to the normal extractor.
+        let (parts, body) = request.into_parts();
+        let bytes = match tokio::time::timeout(ORDINARY, axum::body::to_bytes(body, 16_384)).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => {
+                use std::error::Error;
+                let status = if error
+                    .source()
+                    .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+                {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return status.into_response();
+            }
+            Err(_) => return body_timeout_response(&state.0),
+        };
+        if let Ok(forwarded) = serde_json::from_slice::<crate::peer::ClientReadRequest>(&bytes) {
+            duration = forwarded_deadline(&forwarded.request);
+        }
+        request = Request::from_parts(parts, Body::from(bytes));
+    }
+    let Some(duration) = duration.map(|limit| limit.saturating_sub(started.elapsed())) else {
         return super::response_envelope_unbounded(axum::extract::State(state), request, next)
             .await;
     };
@@ -185,17 +271,7 @@ pub(super) async fn envelope(
         _ => {
             budget.cancel();
             let _ = budget.check();
-            let error = json!({"code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}});
-            let request_id = super::new_request_id();
-            let value = if path.starts_with("/v1/client/") {
-                super::client_error_envelope(StatusCode::GATEWAY_TIMEOUT, &error, &request_id)
-            } else {
-                json!({"api_version":"st3.v1", "request_id":request_id,
-                    "snapshot_host":timeout_state.node,
-                    "store_index":timeout_state.store.index().unwrap_or_default(),
-                    "code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}})
-            };
-            (StatusCode::GATEWAY_TIMEOUT, Json(value)).into_response()
+            timeout_response(&timeout_state, &path)
         }
     }
 }
@@ -203,6 +279,7 @@ pub(super) async fn envelope(
 #[derive(Debug)]
 pub(super) enum WorkError {
     Join(tokio::task::JoinError),
+    Panic,
     Deadline(crate::model::St3Error),
     Store(crate::model::St3Error),
 }
@@ -211,11 +288,101 @@ impl std::fmt::Display for WorkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Join(error) => error.fmt(f),
+            Self::Panic => f.write_str("blocking work panicked"),
             Self::Deadline(error) | Self::Store(error) => error.fmt(f),
         }
     }
 }
 impl std::error::Error for WorkError {}
+
+fn admission_error(error: anyhow::Error) -> WorkError {
+    let typed = smallclaims::error::typed(error);
+    if typed.code == "read-deadline" {
+        WorkError::Deadline(typed)
+    } else {
+        WorkError::Store(typed)
+    }
+}
+
+/// Admit and loan the handler's reader freshly for each poll of its future. Admission is
+/// asynchronous and happens before any store lock; a poll that stays pending — an event
+/// wait, a WebSocket upgrade, or a window/roster permit — returns its loan and permit, so
+/// waits hold no reader on either runtime and cannot starve other read workers. Long-poll
+/// handlers and unbudgeted upgrades never take this loan: their actual queries use their
+/// own explicit scopes.
+pub(super) async fn handler<F>(future: F) -> Response
+where
+    F: Future<Output = Response>,
+{
+    let admission_budget = read_budget::current();
+    let scoped_store = if admission_budget
+        .as_ref()
+        .is_some_and(|budget| !long_poll_route(budget.route()))
+    {
+        STORE.with(|slot| slot.borrow().clone())
+    } else {
+        None
+    };
+    let Some(store) = scoped_store else {
+        return future.await;
+    };
+    let mut future = std::pin::pin!(future);
+    let mut admission = std::pin::pin!(store.readers.admit_read(admission_budget.clone()));
+    std::future::poll_fn(|cx| {
+        if smallclaims::sqlite::thread_holds_reader() {
+            if store.readers.has_request_reader() {
+                return future.as_mut().poll(cx);
+            }
+            return store.readers.request_read(|| future.as_mut().poll(cx))
+                .unwrap_or_else(|error| Poll::Ready(ApiError::internal(error).into_response()));
+        }
+        let admitted = match admission.as_mut().poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(permit)) => permit,
+            Poll::Ready(Err(error)) => {
+                return Poll::Ready(ApiError::internal(error).into_response());
+            }
+        };
+        // Reset the stack-pinned admission future for the next handler poll. The current
+        // poll's loan publishes its returned connection before its permit wakes a waiter.
+        admission.set(store.readers.admit_read(admission_budget.clone()));
+        store
+            .readers
+            .request_read_with_permit(admitted, || future.as_mut().poll(cx))
+            .unwrap_or_else(|error| Poll::Ready(ApiError::internal(error).into_response()))
+    })
+    .await
+}
+
+/// One store-reading worker started outside the request envelope, typically after a
+/// WebSocket upgrade. It takes the same reader admission as an HTTP read worker, but
+/// keeps the upgraded stream's existing policy: no read budget or deadline is imposed,
+/// and dropping the returned future releases a still-pending admission. Same-thread
+/// nested callers run inline: same-pool loans are reused, and another pool is tried without waiting.
+pub(super) async fn store_read<T, F>(store: &Arc<super::Store>, work: F) -> Result<T, WorkError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    if smallclaims::sqlite::thread_holds_reader() {
+        return store.readers.request_read(work).map_err(admission_error);
+    }
+    let permit = store
+        .readers
+        .admit_read(None)
+        .await
+        .map_err(|error| WorkError::Store(smallclaims::error::typed(error)))?;
+    let store = store.clone();
+    let run = move || {
+        store
+            .readers
+            .request_read_with_permit(permit, work)
+            .map_err(|error| WorkError::Store(smallclaims::error::typed(error)))
+    };
+    tokio::task::spawn_blocking(run)
+        .await
+        .map_err(WorkError::Join)?
+}
 
 /// Propagate the read budget to every nested blocking task in the API. This wrapper has
 /// no effect on writes or on stream work started after the request's upgrade completes.
@@ -234,7 +401,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    spawn(work, false)
+    spawn(move || with_handler(work), false)
 }
 
 #[track_caller]
@@ -252,32 +419,19 @@ where
     });
     let worker_budget = budget.clone();
     let store = STORE.with(|slot| slot.borrow().clone());
-    let task = tokio::task::spawn_blocking(move || {
-        with_store(store.clone(), || {
-            read_budget::with(worker_budget.clone(), || {
-                if let Some(budget) = &worker_budget {
-                    budget.check().map_err(WorkError::Deadline)?;
-                }
-                let result = if worker_budget.is_some() {
-                    match &store {
-                        Some(store) => store
-                            .readers
-                            .request_read(work)
-                            .map_err(|error| WorkError::Store(smallclaims::error::typed(error)))?,
-                        None => work(),
-                    }
-                } else {
-                    work()
-                };
-                if let Some(budget) = &worker_budget {
-                    budget.check().map_err(WorkError::Deadline)?;
-                }
-                Ok(result)
-            })
-        })
-    });
-    // Capture the guard before returning the future: dropping an unpolled future
-    // must cancel the already submitted blocking task as well.
+    let multithread = matches!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread
+    );
+    let reentrant = store.as_ref().is_some_and(|store| store.readers.has_request_reader());
+    let cross_pool = query && store.is_some() && !reentrant
+        && smallclaims::sqlite::thread_holds_reader();
+    // Handlers never own a whole-request reader: `handler` admits per poll, and their
+    // nested queries take query admission themselves. Only explicit query work admits here.
+    let loan = budget.is_some() && query;
+    let admission_store = store.clone().filter(|_| loan);
+    let admission_budget = budget.clone();
+    // Capture cancellation before executing an inline operation, including a panic.
     struct Cancel(Option<ReadBudget>);
     impl Drop for Cancel {
         fn drop(&mut self) {
@@ -287,11 +441,87 @@ where
         }
     }
     let cancel = Cancel(budget.clone());
+    let profile = query.then(crate::profile::current).flatten();
+    let queued = profile.as_ref().map(|op| op.wall_span("blocking/queue"));
+    let run = move |permit: Option<smallclaims::sqlite::ReadPermit>| {
+        drop(queued);
+        let _work = profile.as_ref().map(|op| op.wall_span("blocking/work"));
+        with_store(store.clone(), || {
+            read_budget::with(worker_budget.clone(), || {
+                if let Some(budget) = &worker_budget {
+                    budget.check().map_err(WorkError::Deadline)?;
+                }
+                let result = match (&store, permit) {
+                    (Some(store), Some(permit)) => store
+                        .readers
+                        .request_read_with_permit(permit, work)
+                        .map_err(|error| WorkError::Store(smallclaims::error::typed(error)))?,
+                    (Some(store), None) if loan => store
+                        .readers
+                        .request_read(work)
+                        .map_err(|error| WorkError::Store(smallclaims::error::typed(error)))?,
+                    _ => work(),
+                };
+                if let Some(budget) = &worker_budget {
+                    budget.check().map_err(WorkError::Deadline)?;
+                }
+                Ok(result)
+            })
+        })
+    };
+    enum Task<T> {
+        Inline(Result<T, WorkError>),
+        Spawned(tokio::task::JoinHandle<Result<T, WorkError>>),
+    }
+    // The marker is installed only by spawn_handler, never on an async runtime worker.
+    // Handlers loan their reader per poll, so nested wrappers on that thread reuse the
+    // loan inline; a spawned child admits its own permit without holding the parent's.
+    // Both paths retain the same read budget, reader lease and committed mutation result,
+    // and each call keeps its panic boundary for best-effort callers and error cleanup.
+    let inline = cross_pool || (multithread && (IN_HANDLER.with(Cell::get) || reentrant));
+    let task = if inline {
+        // Leave the handler's block_on context while executing synchronous callbacks. Some
+        // callbacks enter a runtime themselves (for example a forwarded conversation read).
+        // A current-thread handler instead releases its poll-scoped loan before a child runs.
+        Task::Inline(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if multithread {
+                    tokio::task::block_in_place(|| run(None))
+                } else {
+                    // A different pool cannot queue while a synchronous outer loan is held.
+                    run(None)
+                }
+            }))
+            .unwrap_or(Err(WorkError::Panic)),
+        )
+    } else if let Some(store) = admission_store {
+        // Start eagerly, as before: dropping even an unpolled waiter cancels queued/running
+        // work. Admission itself is asynchronous and happens before opening a connection or
+        // entering the blocking callback's snapshot, writer, cache or roster locks.
+        Task::Spawned(tokio::spawn(async move {
+            let permit = store
+                .readers
+                .admit_read(admission_budget)
+                .await
+                .map_err(admission_error)?;
+            tokio::task::spawn_blocking(move || run(Some(permit)))
+                .await
+                .map_err(WorkError::Join)?
+        }))
+    } else {
+        Task::Spawned(tokio::task::spawn_blocking(move || run(None)))
+    };
     async move {
         let _cancel = cancel;
+        let completed = async move {
+            match task {
+                Task::Inline(result) => result,
+                Task::Spawned(task) => task.await.map_err(WorkError::Join)?,
+            }
+        };
         if let Some(budget) = budget {
-            let result = match tokio::time::timeout(budget.remaining(), task).await {
-                Ok(result) => result.map_err(WorkError::Join)?,
+            let result = match tokio::time::timeout(budget.remaining(), completed).await {
+                Ok(result) => result,
                 Err(_) => {
                     budget.cancel();
                     Err(WorkError::Deadline(budget.check().unwrap_err()))
@@ -302,7 +532,7 @@ where
             budget.check().map_err(WorkError::Deadline)?;
             result
         } else {
-            task.await.map_err(WorkError::Join)?
+            completed.await
         }
     }
 }
@@ -340,7 +570,7 @@ pub(super) fn error(error: &WorkError) -> Option<ApiError> {
             message: error.message.clone(),
             details: error.details.clone(),
         })),
-        WorkError::Join(_) => None,
+        WorkError::Join(_) | WorkError::Panic => None,
     }
 }
 
@@ -348,6 +578,508 @@ pub(super) fn error(error: &WorkError) -> Option<ApiError> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn bounded_state(root: &std::path::Path, limit: usize) -> AppState {
+        smallclaims::sqlite::with_read_limit_for_test(limit, || super::super::tests::state(root))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sixty_api_clients_share_the_configured_reader_bound() {
+        use axum::{Router, middleware::from_fn_with_state, routing::get};
+        use tower::ServiceExt;
+        const CLIENTS: usize = 60;
+        const LIMIT: usize = 32;
+        let root = tempfile::tempdir().unwrap();
+        let state = bounded_state(root.path(), LIMIT);
+        let store = state.store.clone();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::watch::channel(false);
+        let app = Router::new()
+            .route("/v1/client/admission-probe", get({
+                let (active, peak) = (active.clone(), peak.clone());
+                move || {
+                    let (store, active, peak, entered, mut released) = (
+                        store.clone(), active.clone(), peak.clone(), entered.clone(), released.clone(),
+                    );
+                    async move {
+                        let value = spawn_blocking(move || {
+                            assert!(store.readers.has_request_reader());
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            entered.send(()).unwrap();
+                            tokio::runtime::Handle::current()
+                                .block_on(released.wait_for(|released| *released))
+                                .unwrap();
+                            let value = store.readers.get().query_row(
+                                "SELECT COUNT(*) FROM claims", [], |row| row.get::<_, u64>(0),
+                            ).unwrap();
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            value
+                        }).await.unwrap();
+                        Json(json!({"claims": value}))
+                    }
+                }
+            }))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let start = Arc::new(tokio::sync::Barrier::new(CLIENTS + 1));
+        let mut clients = Vec::new();
+        for _ in 0..CLIENTS {
+            let (app, start) = (app.clone(), start.clone());
+            clients.push(tokio::spawn(async move {
+                start.wait().await;
+                app.oneshot(request(Method::GET, "/v1/client/admission-probe")).await.unwrap()
+            }));
+        }
+        start.wait().await;
+        let saturated = tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..LIMIT {
+                entries.recv().await.unwrap();
+            }
+        }).await;
+        // Release even if saturation failed, so no blocked callbacks survive an assertion.
+        release.send(true).unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            for client in clients {
+                assert_eq!(client.await.unwrap().status(), StatusCode::OK);
+            }
+        }).await;
+        saturated.expect("the admitted batch did not start");
+        completed.expect("the API burst did not complete");
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(peak.load(Ordering::SeqCst), LIMIT);
+        assert!(state.store.readers.usage().peak <= LIMIT);
+        assert_eq!(state.store.readers.usage().open, state.store.readers.usage().idle);
+    }
+
+    #[tokio::test]
+    async fn current_thread_handlers_release_their_parent_loan_before_a_nested_worker() {
+        use axum::{Router, middleware::from_fn_with_state, routing::get};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = bounded_state(root.path(), 1);
+        let store = state.store.clone();
+        let app = Router::new()
+            .route("/v1/nested", get(move || {
+                let store = store.clone();
+                async move {
+                    assert!(IN_HANDLER.with(Cell::get));
+                    assert!(store.readers.has_request_reader());
+                    let value = spawn_blocking(move || {
+                        assert!(store.readers.has_request_reader());
+                        // Keep the existing current-thread callback runtime contract.
+                        tokio::runtime::Handle::current().block_on(async {});
+                        store.readers.get().query_row("SELECT 42", [], |row| row.get::<_, u64>(0))
+                            .unwrap()
+                    }).await.unwrap();
+                    Json(json!({"answer": value}))
+                }
+            }))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let response = tokio::time::timeout(
+            Duration::from_secs(5), app.oneshot(request(Method::GET, "/v1/nested")),
+        ).await.expect("a current-thread nested worker deadlocked").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["value"]["answer"], 42);
+        assert_eq!(state.store.readers.usage().peak, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_event_long_poll_releases_its_reader_while_waiting_at_bound_one() {
+        use axum::{Router, extract::{Query, State}, middleware::from_fn_with_state, routing::get};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = bounded_state(root.path(), 1);
+        let (waiting, mut waits) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/v1/events/page", get({
+                let state = state.clone();
+                move || {
+                    let (state, waiting) = (state.clone(), waiting.clone());
+                    async move {
+                        let work = super::super::events_page(State(state.clone()), Query(
+                            super::super::EventQuery {
+                                after: 0, subject: None, owner_run: None, wait: Some(true),
+                                timeout_ms: Some(30_000), limit: Some(10),
+                            },
+                        ));
+                        let mut work = std::pin::pin!(work);
+                        let mut notified = false;
+                        std::future::poll_fn(|cx| {
+                            let poll = work.as_mut().poll(cx);
+                            // Nested queries execute inline on this multithread handler.
+                            // Its first Pending is the real event-notification wait.
+                            if poll.is_pending() && !notified {
+                                assert!(!state.store.readers.has_request_reader());
+                                waiting.send(()).unwrap();
+                                notified = true;
+                            }
+                            poll
+                        }).await
+                    }
+                }
+            }))
+            .route("/v1/probe", get({
+                let store = state.store.clone();
+                move || {
+                    let store = store.clone();
+                    async move {
+                        assert!(store.readers.has_request_reader());
+                        let value = store.readers.get()
+                            .query_row("SELECT 42", [], |row| row.get::<_, u64>(0)).unwrap();
+                        Json(json!({"answer": value}))
+                    }
+                }
+            }))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let poll_app = app.clone();
+        let poll = tokio::spawn(async move {
+            poll_app.oneshot(request(Method::GET, "/v1/events/page?wait=true")).await.unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(5), waits.recv()).await
+            .expect("the event handler did not reach its wait").unwrap();
+        let unrelated = tokio::time::timeout(
+            Duration::from_secs(5), app.oneshot(request(Method::GET, "/v1/probe")),
+        ).await;
+        state.store.append_claim(&crate::model::ClaimInput {
+            subject: "agent/admission-wake".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({
+                "status": "running", "runtime_id": "admission-wake", "incarnation_id": "one",
+            })).unwrap(), evidence: Vec::new(),
+            expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        super::super::signal_visible_change(&state);
+        let response = tokio::time::timeout(Duration::from_secs(5), poll).await
+            .expect("the event did not wake the long poll").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(unrelated.expect("the waiting poll retained admission").unwrap().status(), StatusCode::OK);
+        assert_eq!(state.store.readers.usage().peak, 1);
+        assert_eq!(state.store.readers.usage().idle, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upgraded_socket_reads_take_admission_and_reentrant_loans_inline() {
+        let root = tempfile::tempdir().unwrap();
+        let state = bounded_state(root.path(), 1);
+        let store = state.store.clone();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, mut release_rx) = tokio::sync::watch::channel(false);
+        let holder = store.clone();
+        let first = tokio::spawn(async move {
+            let admission_store = holder.clone();
+            store_read(&admission_store, move || {
+            started.send(()).unwrap();
+            tokio::runtime::Handle::current()
+                .block_on(release_rx.wait_for(|released| *released))
+                .unwrap();
+            // A nested socket read on this worker reuses the loan without a second permit.
+            let nested = tokio::runtime::Handle::current()
+                .block_on(store_read(&holder, || 5))
+                .unwrap();
+            assert_eq!(nested, 5);
+            assert_eq!(holder.readers.usage().open, 1);
+            7
+            }).await
+        });
+        started_rx.await.unwrap();
+        assert_eq!(store.readers.usage().open, 1);
+        let queued_store = store.clone();
+        let queued = tokio::spawn(async move { store_read(&queued_store, || 9).await });
+        tokio::task::yield_now().await;
+        // The queued read holds no reader while waiting for admission.
+        assert_eq!(store.readers.usage().open, 1);
+        release_tx.send(true).unwrap();
+        let results = tokio::time::timeout(Duration::from_secs(5), async {
+            (first.await.unwrap().unwrap(), queued.await.unwrap().unwrap())
+        })
+        .await
+        .expect("upgraded-socket reads did not finish");
+        assert_eq!(results, (7, 9));
+        assert_eq!(store.readers.usage().peak, 1);
+        assert_eq!(store.readers.usage().idle, 1);
+    }
+
+    #[test]
+    fn opposite_cross_pool_async_queries_do_not_queue_under_outer_loans() {
+        for multithread in [false, true] {
+            let mut builder = if multithread {
+                tokio::runtime::Builder::new_multi_thread()
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+            };
+            builder.enable_all();
+            if multithread {
+                builder.worker_threads(2);
+            }
+            let runtime = builder.build().unwrap();
+            let first = Arc::new(smallclaims::sqlite::with_read_limit_for_test(1, ||
+                super::super::Store::open_memory("first")).unwrap());
+            let second = Arc::new(smallclaims::sqlite::with_read_limit_for_test(1, ||
+                super::super::Store::open_memory("second")).unwrap());
+            let held = Arc::new(std::sync::Barrier::new(2));
+            let (finished, completed) = std::sync::mpsc::channel();
+            let workers = [(first.clone(), second.clone()), (second.clone(), first.clone())]
+                .map(|(outer, inner)| {
+                let held = held.clone();
+                let finished = finished.clone();
+                let handle = runtime.handle().clone();
+                std::thread::spawn(move || {
+                    let result = outer.readers.request_read(|| {
+                        held.wait();
+                        let query_store = inner.clone();
+                        let value = handle.block_on(store_read(&inner, move ||
+                            query_store.readers.get().query_row("SELECT 7", [], |row| row.get::<_, u64>(0))
+                        )).unwrap().unwrap();
+                        assert_eq!(value, 7);
+                        // Both outer loans still own their sole permits for the budgeted
+                        // query helper as well as the unbudgeted upgraded-stream helper.
+                        held.wait();
+                        let query_store = inner.clone();
+                        let value = with_store(Some(inner.clone()), || read_budget::with(
+                            Some(ReadBudget::new("/cross-pool", ORDINARY)),
+                            || handle.block_on(async move {
+                                spawn_blocking(move ||
+                                    query_store.readers.get().query_row("SELECT 9", [], |row| row.get::<_, u64>(0))
+                                ).await
+                            }),
+                        )).unwrap().unwrap();
+                        assert_eq!(value, 9);
+                    });
+                    finished.send(result).unwrap();
+                })
+            });
+            drop(finished);
+            for _ in 0..2 {
+                completed.recv_timeout(Duration::from_secs(10))
+                    .expect("a nested cross-pool API query waited on an outer loan").unwrap();
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert!(first.readers.try_admit_read().is_some());
+            assert!(second.readers.try_admit_read().is_some());
+        }
+    }
+
+    /// An ordinary (non-long-poll) route that stays pending holds no reader: its poll
+    /// permit and loan drop at the await, so the only configured slot stays usable.
+    async fn ordinary_pending_holds_no_reader(nested_worker: bool) {
+        use axum::{Router, middleware::from_fn_with_state, routing::get};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = bounded_state(root.path(), 1);
+        let store = state.store.clone();
+        let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let app = Router::new()
+            .route("/v1/client/ordinary", get(move || {
+                let (store, entered_tx, mut release_rx) = (store.clone(), entered_tx.clone(), release_rx.clone());
+                async move {
+                    assert!(IN_HANDLER.with(Cell::get));
+                    assert!(store.readers.has_request_reader());
+                    entered_tx.send(()).unwrap();
+                    // The whole-request await: no reader may survive into it.
+                    release_rx.changed().await.unwrap();
+                    if nested_worker {
+                        let answer = spawn_blocking(move || {
+                            assert!(store.readers.has_request_reader());
+                            store.readers.get()
+                                .query_row("SELECT 7", [], |row| row.get::<_, u64>(0)).unwrap()
+                        }).await.unwrap();
+                        return Json(json!({"answer": answer}));
+                    }
+                    Json(json!({"answer": 1}))
+                }
+            }))
+            .route("/v1/probe", get({
+                let store = state.store.clone();
+                move || {
+                    let store = store.clone();
+                    async move {
+                        assert!(store.readers.has_request_reader());
+                        let value = store.readers.get()
+                            .query_row("SELECT 42", [], |row| row.get::<_, u64>(0)).unwrap();
+                        Json(json!({"answer": value}))
+                    }
+                }
+            }))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let pending_app = app.clone();
+        let pending = tokio::spawn(async move {
+            pending_app.oneshot(request(Method::GET, "/v1/client/ordinary")).await.unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.recv()).await
+            .expect("the ordinary handler did not start").unwrap();
+        // The pending wait released the whole-request reader: the loan's connection is
+        // back in the pool and the unrelated read takes the same single slot.
+        let unrelated = tokio::time::timeout(
+            Duration::from_secs(5), app.oneshot(request(Method::GET, "/v1/probe")),
+        ).await;
+        release_tx.send(true).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), pending).await
+            .expect("the ordinary handler did not resume").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let expected = if nested_worker { 7 } else { 1 };
+        assert_eq!(body["value"]["answer"], expected);
+        assert_eq!(unrelated.expect("the pending ordinary handler held its reader")
+            .unwrap().status(), StatusCode::OK);
+        assert_eq!(state.store.readers.usage().peak, 1);
+        assert_eq!(state.store.readers.usage().idle, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_ordinary_handler_holds_no_reader_on_a_multithread_runtime() {
+        ordinary_pending_holds_no_reader(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pending_ordinary_handler_holds_no_reader_and_keeps_nested_workers_on_a_current_thread_runtime() {
+        ordinary_pending_holds_no_reader(true).await;
+    }
+
+    #[test]
+    fn a_handler_write_ack_does_not_wait_for_a_second_blocking_pool_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            super::super::Store::open(&directory.path().join("claims.sqlite3"), "blocking-test")
+                .unwrap(),
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (entered, occupied) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let released_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let blocker = tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            });
+            occupied.await.unwrap();
+            // One pool slot is busy with unrelated work; the handler uses the other.
+            // Release it independently so the old nested-submission control fails cleanly,
+            // rather than deadlocking or leaving a background worker after an assertion.
+            let release_flag = released_flag.clone();
+            let releaser = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(350));
+                release_flag.store(true, Ordering::SeqCst);
+                release.send(()).unwrap();
+            });
+            let writing = store.clone();
+            let result = spawn_handler(move || {
+                tokio::runtime::Handle::current().block_on(super::super::blocking_action(move || {
+                    // A synchronous callback may need to wait for an async service itself.
+                    tokio::runtime::Handle::current().block_on(async {});
+                    writing.connection.batched(|transaction| {
+                        transaction.execute(
+                            "INSERT INTO meta(key,value) VALUES('blocking-ack','committed')", [],
+                        ).map_err(|error| crate::model::St3Error::new("internal", error.to_string()))?;
+                        Ok(())
+                    }).map_err(|error| crate::model::St3Error::new("internal", error))?
+                }))
+            }).await;
+            let acknowledged_before_release = !released_flag.load(Ordering::SeqCst);
+            releaser.join().unwrap();
+            blocker.await.unwrap();
+            result.unwrap().unwrap();
+            let value: String = store.readers.get().query_row(
+                "SELECT value FROM meta WHERE key='blocking-ack'", [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(value, "committed");
+            assert!(acknowledged_before_release, "write ACK waited for the unrelated pool slot");
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn an_inline_read_keeps_its_deadline_without_cancelling_a_later_write() {
+        let result = spawn_handler(|| {
+            let handle = tokio::runtime::Handle::current();
+            let read = read_budget::with(Some(ReadBudget::new("/expired", Duration::ZERO)), || {
+                spawn_blocking(|| panic!("an expired read must not run"))
+            });
+            assert!(matches!(handle.block_on(read), Err(WorkError::Deadline(_))));
+            handle.block_on(spawn_blocking(|| 42))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn inline_panics_keep_the_nested_error_boundary_and_handler_cleanup() {
+        let result = spawn_handler(|| {
+            let handle = tokio::runtime::Handle::current();
+            let failure = handle.block_on(spawn_blocking(|| panic!("nested callback")));
+            assert!(matches!(failure, Err(WorkError::Panic)));
+            assert!(error(failure.as_ref().unwrap_err()).is_none());
+            // This code must still execute, just like the old JoinError path.
+            handle.block_on(spawn_blocking(|| 42))
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn real_envelope_keeps_best_effort_nested_panics_out_of_the_screen_response() {
+        use axum::{Json, Router, middleware::from_fn_with_state, routing::get};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let app = Router::new()
+            .route(
+                "/v1/client/terminal/test/screen",
+                get(|| async {
+                    assert!(IN_HANDLER.with(Cell::get));
+                    // terminal_facts uses this same .await.ok().flatten() contract.
+                    let facts: Option<serde_json::Value> =
+                        spawn_blocking(|| -> Option<serde_json::Value> {
+                            panic!("best effort stats callback");
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+                    Json(serde_json::json!({"screen": "available", "facts": facts}))
+                }),
+            )
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let response = app
+            .oneshot(request(Method::GET, "/v1/client/terminal/test/screen"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(envelope["value"]["screen"], "available");
+        assert!(envelope["value"]["facts"].is_null());
+    }
 
     fn request(method: Method, path: &str) -> Request<Body> {
         Request::builder()
@@ -403,6 +1135,428 @@ mod tests {
         assert_eq!(
             deadline(&request(Method::POST, "/v1/internal/replication/receive")),
             None
+        );
+    }
+
+    #[test]
+    fn forwarded_reads_use_operation_budgets_and_terminal_actions_keep_acknowledgements() {
+        use crate::peer::ClientReadOperation;
+        let read = ClientReadOperation::Timeline {
+            session_id: "invented".into(),
+            limit: 20,
+            cursor: None,
+        };
+        assert_eq!(
+            deadline(&request(
+                Method::POST,
+                crate::peer::CLIENT_READ_FORWARD_PATH
+            )),
+            Some(ORDINARY)
+        );
+        assert_eq!(forwarded_deadline(&read), Some(ORDINARY));
+        for wait_ms in [0, 100, 10_000, u64::MAX] {
+            let read = ClientReadOperation::ConversationChanges {
+                session_id: "invented".into(),
+                after: None,
+                wait_ms,
+            };
+            assert_eq!(
+                forwarded_deadline(&read),
+                Some(ORDINARY + Duration::from_millis(wait_ms.min(10_000)))
+            );
+            let screen = ClientReadOperation::TerminalScreenChange {
+                terminal_id: "invented".into(),
+                after_revision: "before".into(),
+                wait_ms,
+                facts: false,
+            };
+            assert_eq!(forwarded_deadline(&screen), forwarded_deadline(&read));
+        }
+        let action = ClientReadOperation::TerminalControl {
+            action_id: "invented".into(),
+            idempotency_key: "invented".into(),
+            action_type: "close".into(),
+            terminal_id: "invented".into(),
+            runtime_incarnation: "invented".into(),
+            expected_sequence: 0,
+            parameters: json!({}),
+        };
+        assert_eq!(forwarded_deadline(&action), None);
+        // Heal-next is a mutating protocol step (readmission/replay), not an ordinary read.
+        assert_eq!(
+            deadline(&request(Method::POST, "/v1/internal/replication/heal/next")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_long_poll_queries_cannot_spend_the_envelopes_wait_budget() {
+        let parent = ReadBudget::new(
+            crate::peer::CLIENT_READ_FORWARD_PATH,
+            ORDINARY + Duration::from_secs(10),
+        );
+        let work = read_budget::with(Some(parent.clone()), || {
+            spawn_blocking(|| read_budget::current().unwrap().remaining())
+        });
+        assert!(work.await.unwrap() <= ORDINARY);
+        assert!(parent.remaining() > ORDINARY);
+        assert!(!parent.expired());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_long_poll_keeps_its_allowed_wait_in_the_envelope() {
+        use axum::{Router, middleware::from_fn_with_state, routing::post};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let signals = Arc::new(std::sync::Mutex::new(Some((started_tx, finish_rx))));
+        let app = Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(move || {
+                    let signals = signals.clone();
+                    async move {
+                        let (started, finish) = signals.lock().unwrap().take().unwrap();
+                        let _ = started.send(());
+                        finish.await.unwrap();
+                        Json(json!({"items": []}))
+                    }
+                }),
+            )
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&crate::peer::ClientReadRequest {
+                    authority_actor: "person/fixture".into(),
+                    relay: None,
+                    request: crate::peer::ClientReadOperation::ConversationChanges {
+                        session_id: "invented".into(),
+                        after: None,
+                        wait_ms: 10_000,
+                    },
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = tokio::spawn(app.oneshot(request));
+        started_rx.await.unwrap();
+        tokio::time::advance(ORDINARY + Duration::from_secs(1)).await;
+        assert!(!response.is_finished());
+        finish_tx.send(()).unwrap();
+        assert_eq!(response.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_read_timeout_drops_the_actual_handler_future() {
+        use axum::{Router, middleware::from_fn_with_state, routing::post};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let signals = Arc::new(std::sync::Mutex::new(Some((started_tx, dropped_tx))));
+        let app = Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(move || {
+                    let signals = signals.clone();
+                    async move {
+                        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+                        impl Drop for Dropped {
+                            fn drop(&mut self) {
+                                if let Some(tx) = self.0.take() {
+                                    let _ = tx.send(());
+                                }
+                            }
+                        }
+                        let (started, dropped) = signals.lock().unwrap().take().unwrap();
+                        let _guard = Dropped(Some(dropped));
+                        let _ = started.send(());
+                        std::future::pending::<Response>().await
+                    }
+                }),
+            )
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&crate::peer::ClientReadRequest {
+                    authority_actor: "person/fixture".into(),
+                    relay: None,
+                    request: crate::peer::ClientReadOperation::Timeline {
+                        session_id: "invented".into(),
+                        limit: 20,
+                        cursor: None,
+                    },
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = tokio::spawn(app.oneshot(request));
+        started_rx.await.unwrap();
+        tokio::time::advance(ORDINARY + Duration::from_secs(1)).await;
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_terminal_action_is_not_cut_by_the_read_deadline() {
+        use axum::{Router, middleware::from_fn_with_state, routing::post};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let signals = Arc::new(std::sync::Mutex::new(Some((started_tx, finish_rx))));
+        let app = Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(move || {
+                    let signals = signals.clone();
+                    async move {
+                        let (started, finish) = signals.lock().unwrap().take().unwrap();
+                        let _ = started.send(());
+                        finish.await.unwrap();
+                        Json(json!({"acknowledged": true}))
+                    }
+                }),
+            )
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&crate::peer::ClientReadRequest {
+                    authority_actor: "person/fixture".into(),
+                    relay: None,
+                    request: crate::peer::ClientReadOperation::TerminalControl {
+                        action_id: "invented".into(),
+                        idempotency_key: "invented".into(),
+                        action_type: "close".into(),
+                        terminal_id: "invented".into(),
+                        runtime_incarnation: "invented".into(),
+                        expected_sequence: 0,
+                        parameters: json!({}),
+                    },
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = tokio::spawn(app.oneshot(request));
+        started_rx.await.unwrap();
+        tokio::time::advance(ORDINARY + Duration::from_secs(1)).await;
+        assert!(!response.is_finished());
+        finish_tx.send(()).unwrap();
+        assert_eq!(response.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    fn forwarded_app(state: AppState) -> axum::Router {
+        use axum::{
+            Router, extract::DefaultBodyLimit, middleware::from_fn_with_state, routing::post,
+        };
+        Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(super::super::forward_client_read).layer(DefaultBodyLimit::max(16_384)),
+            )
+            .with_state(state.clone())
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ))
+    }
+
+    #[tokio::test]
+    async fn forwarded_real_handler_rejects_oversized_and_malformed_bodies() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let app = forwarded_app(super::super::tests::state(root.path()));
+        for (body, expected) in [
+            ("x".repeat(16_385), StatusCode::PAYLOAD_TOO_LARGE),
+            ("{".into(), StatusCode::BAD_REQUEST),
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_real_handler_preserves_long_poll_wait_through_a_signed_peer() {
+        use crate::peer::{
+            ClientReadOperation, ClientReadRequest, ClientReadRoute, ClientRelay, FleetAuth,
+        };
+        use axum::{Router, routing::post};
+        use std::os::unix::fs::PermissionsExt;
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join("fleet-secret");
+        std::fs::write(&secret, [5_u8; 32]).unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let auth = FleetAuth::test("fleet-test", &[5; 32]);
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+        let seen = Arc::new(std::sync::Mutex::new(Some(seen_tx)));
+        let peer = Router::new().route(
+            "/v1/peer/client-read",
+            post(move |body: axum::body::Bytes| {
+                let auth = auth.clone();
+                let seen = seen.clone();
+                async move {
+                    let received: ClientReadRequest = serde_json::from_slice(&body).unwrap();
+                    seen.lock().unwrap().take().unwrap().send(received).unwrap();
+                    // Allowed owner wait plus ordinary work exceeds the 15-second query
+                    // budget, but fits in the forwarding envelope's 25-second budget.
+                    tokio::time::sleep(ORDINARY + Duration::from_secs(1)).await;
+                    let answer = serde_json::to_vec(&crate::model::ApiResponse {
+                        api_version: "st3.v1".into(),
+                        request_id: "invented".into(),
+                        snapshot_host: "far".into(),
+                        store_index: 0,
+                        value: json!({"items": []}),
+                    })
+                    .unwrap();
+                    let headers = auth
+                        .response_headers_for(
+                            "/v1/peer/client-read",
+                            "far",
+                            &answer,
+                            &FleetAuth::body_digest(&body),
+                        )
+                        .unwrap();
+                    let mut response = (StatusCode::OK, answer).into_response();
+                    response.headers_mut().insert(
+                        "content-type",
+                        axum::http::HeaderValue::from_static("application/json"),
+                    );
+                    response.headers_mut().extend(headers);
+                    response
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, peer).await.unwrap() });
+        let mut state = super::super::tests::state(root.path());
+        state.node = "middle".into();
+        state.client_relay = ClientRelay::from_config(&crate::config::Config {
+            node: "middle".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![crate::config::PeerConfig {
+                name: "far".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&ClientReadRequest {
+                    authority_actor: "person/fixture".into(),
+                    relay: Some(ClientReadRoute {
+                        target: "host/far".into(),
+                        path: vec!["near".into()],
+                        hops_left: 3,
+                    }),
+                    request: ClientReadOperation::ConversationChanges {
+                        session_id: "invented".into(),
+                        after: None,
+                        wait_ms: 10_000,
+                    },
+                })
+                .unwrap(),
+            ))
+            .unwrap();
+        let started = std::time::Instant::now();
+        let response = forwarded_app(state).oneshot(request).await.unwrap();
+        server.abort();
+        let _ = server.await;
+        let seen = seen_rx.await.unwrap();
+        assert_eq!(seen.authority_actor, "person/fixture");
+        assert!(
+            seen.relay.is_none(),
+            "the last hop reaches the owner directly"
+        );
+        assert!(matches!(
+            seen.request,
+            ClientReadOperation::ConversationChanges {
+                wait_ms: 10_000,
+                ..
+            }
+        ));
+        assert!(started.elapsed() >= ORDINARY);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 16_384)
+            .await
+            .unwrap();
+        let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(answer["value"]["items"], json!([]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_request_body_wait_has_the_ordinary_deadline() {
+        use axum::{Router, middleware::from_fn_with_state, routing::post};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let app = Router::new()
+            .route(
+                crate::peer::CLIENT_READ_FORWARD_PATH,
+                post(|| async { StatusCode::OK }),
+            )
+            .layer(from_fn_with_state(
+                (state, ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let stream = futures_util::stream::once(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<Result<axum::body::Bytes, std::io::Error>>().await
+        });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(crate::peer::CLIENT_READ_FORWARD_PATH)
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let response = tokio::spawn(app.oneshot(request));
+        started_rx.await.unwrap();
+        tokio::time::advance(ORDINARY + Duration::from_secs(1)).await;
+        assert_eq!(
+            response.await.unwrap().unwrap().status(),
+            StatusCode::GATEWAY_TIMEOUT
         );
     }
 
@@ -756,28 +1910,18 @@ mod tests {
         read_budget::with(Some(budget), || {
             first.readers.request_read(|| {
                 first.read_snapshot(|outer| {
-                    let first_key = first.readers.key();
                     second.readers.request_read(|| {
                         second.read_snapshot(|_| {
-                            assert!(
-                                smallclaims::sqlite::PINNED_READER.with(|slot| slot
-                                    .borrow()
-                                    .as_ref()
-                                    .unwrap()
-                                    .0
-                                    == second.readers.key())
-                            );
+                            // Membership is per pool: the inner pin is on top while the
+                            // outer store's pin stays registered below it.
+                            assert!(second.readers.has_pinned_reader());
+                            assert!(first.readers.has_pinned_reader());
                             Ok(())
                         })
                     })??;
-                    assert!(
-                        smallclaims::sqlite::PINNED_READER.with(|slot| slot
-                            .borrow()
-                            .as_ref()
-                            .unwrap()
-                            .0
-                            == first_key)
-                    );
+                    // The inner pin popped; only the outer store's pin remains.
+                    assert!(first.readers.has_pinned_reader());
+                    assert!(!second.readers.has_pinned_reader());
                     first.read_snapshot(|again| {
                         assert_eq!(again, outer);
                         Ok(())
@@ -787,7 +1931,8 @@ mod tests {
         })
         .unwrap()
         .unwrap();
-        assert!(smallclaims::sqlite::PINNED_READER.with(|slot| slot.borrow().is_none()));
+        assert!(!first.readers.has_pinned_reader());
+        assert!(!second.readers.has_pinned_reader());
         assert!(first.readers.get().is_autocommit());
         assert!(second.readers.get().is_autocommit());
     }

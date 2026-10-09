@@ -313,6 +313,10 @@ fn parse_intent_with_owner(
     let normalized = json!({ "version": 2, "declarations": normalized_nodes });
     let source_hash = hash_json(&normalized);
     Ok(NormalizedIntent {
+        direct_message_registrations: declarations.iter()
+            .filter(|node| !allow_execution_root && public_message_subscription(node))
+            .map(|node| namespaced("subscription", &one_string_with_children(node).expect("validated subscription")))
+            .collect(),
         schema: "st3.v1".into(),
         source_hash,
         subjects: context.subjects,
@@ -420,6 +424,7 @@ fn parse_desired_node(
             .is_some();
     if !context.allow_execution_root
         && !owned_terminal
+        && !public_message_subscription(node)
         && matches!(
             kind,
             "exec" | "pty" | "lane" | "observer" | "subscription"
@@ -450,6 +455,26 @@ fn parse_desired_node(
     }
 }
 
+/// Public registration may attach a simple message delivery to an existing observer.
+/// Observer/recipient existence and actor authority are checked at preview/publication.
+/// Execution, batching, missions and new observers stay on their existing runtime routes.
+fn public_message_subscription(node: &KdlNode) -> bool {
+    if node.name().value() != "subscription" { return false }
+    let Some(body) = node.children() else { return false };
+    if body.nodes().iter().any(|child| !matches!(child.name().value(), "observer" | "on" | "to" | "delivery")) {
+        return false;
+    }
+    if body.nodes().iter().filter(|child| child.name().value() == "on").count() != 1
+        || !body.nodes().iter().find(|child| child.name().value() == "on")
+        .is_some_and(|field| field.children().is_none()
+            && one_string(field).ok().as_deref() == Some(crate::resource::github_workflows::PERFORMANCE_FAILURES_FIELD)) {
+        return false;
+    }
+    body.nodes().iter().find(|child| child.name().value() == "delivery")
+        .is_some_and(|delivery| delivery.children().is_none()
+            && one_string(delivery).ok().as_deref() == Some("message"))
+}
+
 fn parse_mission_run_declaration(
     node: &KdlNode,
     context: &mut ParseContext,
@@ -473,6 +498,8 @@ fn parse_mission_run_declaration(
             "mode",
             "input",
             "after",
+            "report-to",
+            "report-completed",
             "revision",
             "reset",
             "cancellation",
@@ -483,7 +510,14 @@ fn parse_mission_run_declaration(
     let has_creation = body.nodes().iter().any(|child| {
         matches!(
             child.name().value(),
-            "mission" | "workspace" | "requester" | "mode" | "input" | "after"
+            "mission"
+                | "workspace"
+                | "requester"
+                | "mode"
+                | "input"
+                | "after"
+                | "report-to"
+                | "report-completed"
         )
     });
     let creation = if has_creation {
@@ -545,6 +579,26 @@ fn parse_mission_run_declaration(
                 ));
             }
         }
+        let report_to = child_string(body, "report-to")?;
+        if let Some(report_to) = &report_to {
+            crate::mission::validate_report_to(report_to)?;
+        }
+        let report_completed = match child_string(body, "report-completed")?.as_deref() {
+            None => false,
+            Some("true") => true,
+            Some(other) => {
+                return Err(St3Error::new(
+                    "invalid-report-completed",
+                    format!("`report-completed` is `true` when present, not `{other}`"),
+                ));
+            }
+        };
+        if report_completed && report_to.is_none() {
+            return Err(St3Error::new(
+                "report-without-recipient",
+                format!("mission run `{subject}` sets `report-completed` but no `report-to` agent"),
+            ));
+        }
         Some(MissionRunCreation {
             mission,
             revision,
@@ -553,6 +607,8 @@ fn parse_mission_run_declaration(
             inputs,
             mode,
             after,
+            report_to,
+            report_completed,
         })
     } else {
         None
@@ -5526,7 +5582,7 @@ agent "dotfiles/steward" {
 
     #[test]
     fn every_st3_eval_uses_the_current_graph_grammar() {
-        let evals = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let evals = std::path::Path::new(test_env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("evals/st3");
         let mut parsed = 0;
@@ -5560,7 +5616,7 @@ agent "dotfiles/steward" {
 
     #[test]
     fn work_wake_revision_fixtures_use_the_current_graph_grammar() {
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let fixtures = std::path::Path::new(test_env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("evals/st3/work-wake-reliability/fixtures");
         for name in ["revisable-v1.kdl", "revisable-v2.kdl", "revisable-v3.kdl"] {

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Paired transaction prepare and finalize hooks distinguish managed source capture from earlier raw commits",
+  "replay": {"status": "none", "detail": "No historical capture adoption or automatic recovery/backfill."},
+  "schema": {"status": "none", "detail": "The foundation adds no tables or capture triggers; markers and gap state belong to the source adapter."},
+  "rules": {"status": "none", "detail": "Admission, canonical ordering, authority and checkpoint rules remain unchanged."},
+  "compatibility": {"status": "changed", "detail": "Managed WriterGuard transaction begin methods return anyhow::Result to retain prepare failure causes. Finalizer-only installation remains a no-op-prepare convenience."},
+  "downtime": {"status": "none", "detail": "No production adapter activation or restart."},
+  "manual": {"status": "changed", "detail": "Library-only paired hook installation is opt-in. A future source adapter must check preexisting gaps and clear its own managed-scope marker; this PR installs no adapter."},
+  "recovery": {"status": "changed", "detail": "Library prepare failures roll back their SQL and skip source/finalize work. Earlier raw commits are not finalized by these hooks; adapter-specific fencing and recovery remain unimplemented here."}
+}

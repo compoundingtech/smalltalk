@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Resolve the local st2 host directly through the operating system instead of spawning a PATH hostname executable",
+  "replay": {"status": "none", "detail": "No claim replay or stored history changes."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."},
+  "compatibility": {"status": "changed", "detail": "Local host detection uses the kernel hostname and retains short-hostname normalization and the localhost fallback. A hostname executable supplied through PATH no longer overrides the detected host."},
+  "downtime": {"status": "none", "detail": "No additional service interruption or startup migration is required."},
+  "manual": {"status": "none", "detail": "No action is required for catalogs using the machine's actual short hostname. PATH-based hostname overrides are no longer supported."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or new rollback restrictions; reverting restores executable-based host detection."}
+}

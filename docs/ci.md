@@ -94,12 +94,38 @@ failure, cancellation or skipping either shard fails the gate. Each shard retain
 durations in its logs, and the primary saves `ci-logs/test-partitions.json` with the tested SHA
 and all three inventories.
 
-Both shards keep their own checkouts and builds because many tests embed build-time source and
-executable paths. Namespace's second shard restores the same main-seeded Cargo and Nix cache
-keys as the primary. Moving portable archives between runners remains a follow-up after those
-tests support relocation. Building selected targets before installing hooks removes the earlier
-standalone `cargo run -p st2` build. Local and macOS runs use the complete selection unless
-`CI_TEST_PARTITION` is explicitly set to `hash:1/2` or `hash:2/2`.
+The Linux `linux-test-build` job compiles the existing two selected Cargo groups once and
+publishes nextest archives. Both shards, the zero-retry mail job and isolation VM require that
+successful producer and download its exact artifact ID. They check the manifest SHA, source/tree,
+run, the successful producer attempt, architecture, nextest/rustc versions and each archive digest before extracting.
+A failed-jobs-only rerun can inherit the earlier successful producer output; its attempt and
+manifest remain explicitly pinned, with the same run/source/tree/tool identities required. Cargo
+target caches remain on the producer; consumers restore only runtime/Nix fixtures. The producer also runs the unchanged standalone conversation-model tests (including doctests)
+and dependency boundary, and builds the gateway binary with its standalone production features.
+Its Cargo JSON and binary hash are retained alongside the archives; the VM does not substitute
+the workspace-unified test binary. A failed producer explicitly fails consumer checks and the gate.
+
+Tests resolve archived executables through nextest's runtime binary paths. A source guard rejects raw compiled binary, manifest and temporary-directory lookups in test code.
+Manifest/fixture paths
+map each compiled package beneath the recorded producer root to the consumer checkout, including
+library fixtures launched by another package. Outside archives the original compiled path remains
+the fallback. Archive mode rejects missing or mismatched roots/binaries. Tests, assertions,
+partitions, retries, eight test threads, real VM checks and required contexts are unchanged.
+Local and macOS runs still use the existing build selection unless `CI_TEST_PARTITION` is set.
+
+New test files and paths are checked automatically by `genie-freshness` on each PR and
+merge group. A guard failure names each file and line and points its author to `test_env!`
+and these repair instructions; it does not allow the raw path through.
+If `genie-freshness` reports `unrelocated test paths: FILE:LINE`, replace the raw test path
+at that location with `test_env!("CARGO_BIN_EXE_st3-fixture")`,
+`test_env!("CARGO_MANIFEST_DIR")` or `test_env!("CARGO_TARGET_TMPDIR")`, as appropriate.
+Use `test_env!("CARGO_MANIFEST_DIR", "/relative/fixture")` instead of a `concat!` fixture
+path, and `test_bin!("st3-fixture")` instead of `cargo_bin!`. The integration test root and
+test-enabled libraries already import `scripts/ci-test-paths.rs`; a separate test target
+must import that helper with `#[macro_use]` and a `#[path = "..."]` relative to its source
+file. Keep the original fixture, executable, arguments and assertions. Run
+`python3 scripts/check-ci-test-paths` and the affected test before pushing. Apply the same
+fix if a merge group finds a raw path introduced by another PR; do not bypass the guard.
 
 Main upkeep probes the exact Cargo and Nix cache keys for each stage before provisioning Nix
 or restoring build archives. When both entries exist it stops after the probes. A miss is flagged
@@ -419,6 +445,15 @@ with its own `/tmp`, and nothing the job started outlives it. The runner names a
 cache, use that Cargo home, and Cargo keeps its intermediate build files in a per-runner build
 directory, while sccache shares compiled crates between all runners and the Nix store is the
 machine's own. The machine's configuration lives in the private network repository.
+In GitHub Actions, both Rust dev shells use `scripts/ci-rustc-wrapper`: sccache's response-I/O
+fallback is enabled. A separate read-only `sccache --dist-status` preflight is bounded
+to 15 seconds (five seconds to finish terminating it). A recognized preflight startup
+error or timeout disables caching for the rest of that job with a warning, before any
+compiler request is submitted. Signal statuses are preserved. Once compilation starts,
+the wrapper executes sccache directly and never retries based on its stderr; the actual
+cache/compiler result is authoritative, and cache statistics are optional.
+The boundary guard's dependency-free synthetic workspace uses
+a fresh Cargo home and no compiler wrappers, stays offline, and prints Cargo stderr on failure.
 Cargo builds use the host's four-job limit. Workspace test shards explicitly use eight test
 threads, with the host's 14 GiB per-job memory limit. The repository variable `CI1_MIN_IDLE`
 can override admission; keep it at four when preserving CPU capacity for reserved lanes.
@@ -472,18 +507,24 @@ second: harness events, mailbox pages, claims, desired state, delivery holds, re
 renewals, status and work reads, and a person's reads), with the reconciler running and 30
 concurrent seat event long-polls. Quiet polls have a 31-second budget for their intentional
 30-second wait; mailbox WebSockets require authenticated native drivers and are excluded.
+The client usage endpoint has a dedicated 0.5-request/second scenario with a 300 ms p99 budget.
+Generated usage history contains cumulative response rollups for long-lived standing sessions
+with stable attribution, so this scenario exercises many observations per series and period
+baselines and totals rather than an empty report or one series per observation.
 It fails when
-a request's p99 or the daemon's CPU passes its budget, or is more than 20% worse than the worst of
-main's last five reports: one run's p99 on a shared runner can be twice the next run's, so a
-regression is what passes several. Each run downloads the newest five real reports from successful
+a request's p99 or the daemon's CPU passes its absolute budget, or exceeds twice the worst of
+main's last five reports and the corresponding slack below. The relative factor is 2x for both
+route p99 and average daemon CPU; every absolute budget still applies independently, including
+the 300 ms roster budgets and 2-core CPU ceiling. The wider relative tolerance accommodates
+variation on shared runners; a passing historical comparison does not establish a paired effect
+or attribute a difference to runner noise. Each run downloads the newest five real reports from successful
 main runs' `perf-load-logs` artifacts. PR runs never supply baselines. Relative latency comparisons start once five
 main reports exist; until then every path still checks its absolute p99 budget and every request
 error fails. CPU compares as soon as one main report exists, because it averages the whole run.
 Relative latency tolerates 5 ms of noise, or 50 ms when either path has fewer than 50 samples:
 those sparse p99s are effectively observed maxima. This bounded tolerance still catches large
 regressions on rare paths. CPU tolerates 0.05 cores. A PR without a main baseline fails as P0;
-a main bootstrap may check only absolute budgets and errors. The workload and its budgets are
-unchanged.
+a main bootstrap may check only absolute budgets and errors.
 
 Performance uses the small `.#perf` Nix shell and the opt-in `perf_load` test target (feature
 `perf-load`), which imports the same `daemon_load` and `daemon_bench` modules without compiling
@@ -768,3 +809,5 @@ Use the PR Checks tab or `gh run view RUN_ID --log-failed`. The Linux job upload
 even on failure. Inspect each stage's log and timing, the selected suite and checked merge SHA.
 A passing retry is a flaky outcome in the nextest log. A queued Namespace job with no runner
 is infrastructure readiness, not a successful check; the merge queue keeps the entry waiting.
+
+During an outage, `CI_OUTAGE_FAST_QUEUE=on` skips optional Nix-cache saves and same-source build-snapshot publication on merge-group runs. Required checks, cache restores, the producer test archive, logs, cache coverage and PR/main cache publication continue. Set the variable back to `off` when Speed ends the outage; an unset variable also preserves normal publication. The temporary ruleset build concurrency is six; restore its prior value of two at outage end without changing the other ruleset fields.

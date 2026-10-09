@@ -95,8 +95,13 @@ function defaultTerminalSocket(url: string, protocols: string[], headers: Record
 }
 
 export class ClientError extends Error {
-    constructor(public readonly response: ErrorEnvelope, public readonly status: number) {
+    public readonly response: ErrorEnvelope;
+    public readonly status: number;
+
+    constructor(response: ErrorEnvelope, status: number) {
         super(response.message);
+        this.response = response;
+        this.status = status;
         this.name = 'ClientError';
     }
 }

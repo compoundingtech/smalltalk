@@ -4,6 +4,34 @@ use super::*;
 use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::person_request::{StructuredRequest, answer_summary};
 
+#[cfg(test)]
+mod reconcile_candidates_tests;
+
+// Only ready/pending raw steps can be cancelled by reconcile_person_asks. Start from the
+// existing open-step index so completed ask history costs no candidate reads. The explicit
+// NOT IN repeats that index's predicate; CROSS JOIN keeps the sparse steps as the outer loop.
+const HAS_PERSON_ASKS_FOR_RECONCILE: &str =
+    "SELECT EXISTS(SELECT 1 FROM step_runs INDEXED BY step_runs_open_index CROSS JOIN claims
+     WHERE step_runs.status NOT IN ('completed','failed','cancelled')
+       AND step_runs.status IN ('ready','pending')
+       AND claims.subject=step_runs.subject AND claims.kind='work.person-asked')";
+const PERSON_ASKS_FOR_RECONCILE: &str =
+    "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
+            claims.origin, claims.actor, claims.body, claims.predecessors, claims.accepted_at_unix_ms
+     FROM step_runs INDEXED BY step_runs_open_index CROSS JOIN claims
+     WHERE step_runs.status NOT IN ('completed','failed','cancelled')
+       AND step_runs.status IN ('ready','pending')
+       AND claims.subject=step_runs.subject AND claims.kind='work.person-asked'
+     ORDER BY CANONICAL_ASC(claims)";
+
+fn person_asks_for_reconcile(connection: &Connection) -> Result<Vec<ClaimRecord>> {
+    connection
+        .prepare_cached(&canonical_sql(PERSON_ASKS_FOR_RECONCILE))?
+        .query_map([], claim_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 /// The ask's structured request in canonical form, or null for a free-text ask.
 fn canonical_request(input: &PersonAskRequest) -> Result<Value, St3Error> {
     input
@@ -724,7 +752,7 @@ impl Store {
         let has_asks: bool = {
             let connection = self.readers.get();
             connection
-                .prepare_cached("SELECT EXISTS(SELECT 1 FROM claims WHERE kind='work.person-asked')")?
+                .prepare_cached(HAS_PERSON_ASKS_FOR_RECONCILE)?
                 .query_row([], |row| row.get(0))?
         };
         if !has_asks {
@@ -732,11 +760,11 @@ impl Store {
             return Ok(migrated);
         }
         self.connection.batched(|tx| -> Result<bool> {
-            let mut query = tx.prepare(&canonical_sql("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
-                FROM claims WHERE kind='work.person-asked' ORDER BY CANONICAL_ASC(claims)"))?;
-            let asks = query.query_map([], claim_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let asks = person_asks_for_reconcile(tx)?;
             let mut changed = migrated;
             for ask in asks {
+                // A previous candidate may have cancelled this same subject. Recheck the raw
+                // status inside this transaction; the joined candidate list is not authority.
                 let Some(view) = step(tx, &ask.subject)? else { continue };
                 if matches!(view.status.as_str(), "ready" | "pending") && !current(tx, &ask, now_ms())? {
                     let claim = append_claim_tx(tx, &self.origin, &ask.subject, "work.person-cancelled", Some("daemon/runtime"),

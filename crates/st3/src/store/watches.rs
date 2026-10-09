@@ -9,6 +9,22 @@ use crate::model::ObserverSpec;
 const ENDED_SHOWN_FOR_MS: u128 = 24 * 60 * 60 * 1000;
 
 impl Store {
+    /// The complete declaration union consumed by watch maintenance, including remote
+    /// subscriptions and observers. Read it only after selecting the stage: a pass-start
+    /// roster can predate changes the preceding stages wrote and the change feed observed.
+    pub(crate) fn github_watch_declarations(&self) -> Result<Vec<DesiredSubject>> {
+        smallclaims::touched::note_read(|| "kind:intent.desired".into());
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+             FROM desired WHERE kind IN ('observer', 'subscription') ORDER BY subject",
+        )?;
+        statement
+            .query_map([], desired_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Declare a seat's watch on one thread, from now, and the repository's standing observer when
     /// it is not running. Watching a thread the seat already watches keeps that watch and takes
     /// the new deadline; watching one whose watch ended begins a new watch.
@@ -489,6 +505,47 @@ impl Store {
     ) -> Result<Option<String>, St3Error> {
         let connection = self.readers.get();
         github_post_agent_tx(&connection, locator, kind, id)
+    }
+
+    /// Background one-identity maintenance. The read captures an exact head, then releases
+    /// its snapshot before publication. Admission rechecks custody and own-post attribution
+    /// in the claim's existing savepoint; concurrent delivery cannot be overwritten.
+    pub(crate) fn close_mailbox_own_post_wake(
+        &self,
+        fence: &crate::mailbox::Fence,
+        subject: &str,
+    ) -> Result<bool, St3Error> {
+        let candidate = self.read_snapshot(|_| -> Result<_> {
+            let Some(message) = self.message(subject)? else { return Ok(None); };
+            if message.to != fence.subject || !matches!(message.status.as_str(), "sent" | "staged") {
+                return Ok(None);
+            }
+            let Some((locator, kind, id)) = github_watch::named_object(&message) else { return Ok(None); };
+            if self.github_post_agent(&locator, &kind, id)?.as_deref() != Some(&fence.subject) {
+                return Ok(None);
+            }
+            Ok(Some((locator, kind, id, self.latest_claim_id(subject)?)))
+        }).map_err(internal)?;
+        let Some((locator, kind, id, head)) = candidate else { return Ok(false); };
+        let admission = |connection: &Connection| {
+            check_mailbox_fence(connection, fence, &self.origin)?;
+            if github_post_agent_tx(connection, &locator, &kind, id)?.as_deref() != Some(&fence.subject) {
+                return Err(St3Error::new("stale-subject", "own-post attribution changed"));
+            }
+            Ok(())
+        };
+        let input = ClaimInput {
+            subject: subject.into(),
+            kind: "message.closed".into(),
+            actor: Some("daemon/runtime".into()),
+            fields: BTreeMap::from([("status".into(), json!("closed"))]),
+            evidence: Vec::new(),
+            expected_subject: Some(head),
+            idempotency_key: Some(format!("message-closed:{subject}")),
+        };
+        append_claim_with_commit_context(&self.graph, &input, None, None, None, None,
+            ClaimCommitContext { admission: Some(&admission), ..Default::default() })
+            .map(|(_, changed)| changed)
     }
 
     /// Withdraw each undelivered wake of a seat about a comment or review it recorded as its own,

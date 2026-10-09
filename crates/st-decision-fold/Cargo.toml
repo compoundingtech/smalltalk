@@ -1,0 +1,9 @@
+[package]
+name = "st-decision-fold"
+version = "0.1.0"
+edition = "2024"
+description = "Pure decision record grammar, validation, and state fold."
+license = "MIT"
+
+[dependencies]
+thiserror = "2"

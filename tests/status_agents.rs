@@ -200,7 +200,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
         "retirement is declaration state, not a replacement presence value"
     );
 
-    let json = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let json = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
         .args(["--host", "h", "--json", "--enrich"])
@@ -227,7 +227,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     assert_eq!(rows[1]["status"], "busy");
     assert_eq!(rows[1]["retired"], true);
 
-    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let selected = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
         .args(["--host", "h", "--identity", "h.live", "--json"])
@@ -242,7 +242,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
     assert_eq!(selected.as_array().unwrap().len(), 1);
     assert_eq!(selected[0]["identity"], "h.live");
 
-    let absent = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let absent = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
         .args(["--host", "h", "--identity", "h.missing", "--json"])
@@ -254,7 +254,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
             .contains("expected exactly one Agent Spec with identity `h.missing`, found 0")
     );
 
-    let filtered_out = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let filtered_out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
         .args([
@@ -274,7 +274,7 @@ fn roster_json_and_human_output_distinguish_retirement_from_presence() {
             .contains("Agent Spec `h.live` does not match status `busy`")
     );
 
-    let human = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let human = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
         .args(["--host", "h"])
@@ -315,7 +315,7 @@ fn roster_json_appends_agent_id_address_and_nullable_bus_address() {
         &retired_agent_kdl("retired", "h"),
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
         .args(["--host", "h", "--json"])
@@ -402,7 +402,7 @@ fn exact_identity_rejects_duplicates_before_status_filtering() {
     )
     .unwrap();
 
-    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let selected = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
         .args([
@@ -430,7 +430,7 @@ fn exact_identity_rejects_incomplete_catalog_discovery() {
     write(root, "valid/worker.kdl", &agent_kdl("worker", "h"));
     write(root, "h/worker/agent.kdl", "this is malformed KDL {");
 
-    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let selected = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
         .args(["--host", "h", "--identity", "h.worker", "--json"])
@@ -443,7 +443,7 @@ fn exact_identity_rejects_incomplete_catalog_discovery() {
     );
     assert!(stderr.contains("h/worker/agent.kdl"));
 
-    let ordinary = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let ordinary = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
         .args(["--host", "h", "--json"])
@@ -470,7 +470,7 @@ fn exact_identity_rejects_incomplete_catalog_traversal() {
         return;
     }
 
-    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let selected = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
         .args(["--host", "h", "--identity", "h.worker", "--json"])
@@ -508,7 +508,7 @@ agent "two" {
 "#,
     );
 
-    let selected = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let selected = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("agents")
         .arg(root)
         .args(["--host", "h", "--identity", "h.two", "--json"])
@@ -597,7 +597,7 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
     assert!(!context.stale);
 
     for form in [vec!["--json"], vec!["--json", "--enrich"]] {
-        let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .arg("agents")
             .arg(root)
             .args(["--host", "example-linux"])
@@ -623,7 +623,7 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
     }
 
     let human = |root: &Path| {
-        let out = Command::new(env!("CARGO_BIN_EXE_st2"))
+        let out = Command::new(test_env!("CARGO_BIN_EXE_st2"))
             .arg("agents")
             .arg(root)
             .args(["--host", "example-linux"])
@@ -683,7 +683,7 @@ fn status_cli_writes_and_reads_the_version_1_record() {
     write(root, "h/worker/agent.kdl", &agent_kdl("worker", "h"));
     let before = st2::message::now_ms();
 
-    let set = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let set = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["status", "h.worker", "--set", "busy", "--root"])
         .arg(root)
         .args(["--host", "h"])
@@ -709,7 +709,7 @@ fn status_cli_writes_and_reads_the_version_1_record() {
     assert!((before..=after).contains(&timestamp));
     assert!(raw.ends_with('\n'));
 
-    let get = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let get = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args(["status", "h.worker", "--root"])
         .arg(root)
         .args(["--host", "h"])

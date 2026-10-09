@@ -37,9 +37,13 @@ libc = "0.2"
 libghostty-vt = "=0.2.1"
 libghostty-vt-sys = { version = "=0.2.1", features = ["pkg-config"] }
 notify = "8"
-pty-client = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
-pty-core = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
-pty-terminal = { git = "https://github.com/compoundingtech/pty", rev = "b9d02f3468b718ceff27031e0b9cb38de3bb6b1c" }
+opentelemetry = "0.30"
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-json", "reqwest-blocking-client", "internal-logs", "logs"] }
+opentelemetry_sdk = { version = "0.30", features = ["spec_unstable_metrics_views", "logs"] }
+opentelemetry-appender-tracing = { version = "0.30", features = ["experimental_use_tracing_span_context"] }
+pty-client = { git = "https://github.com/compoundingtech/pty", rev = "1ae8c187301034d2b343b6ec638f2b74c009f92e" }
+pty-core = { git = "https://github.com/compoundingtech/pty", rev = "1ae8c187301034d2b343b6ec638f2b74c009f92e" }
+pty-terminal = { git = "https://github.com/compoundingtech/pty", rev = "1ae8c187301034d2b343b6ec638f2b74c009f92e" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 ring = "0.17"
 rusqlite = { version = "0.32", features = ["bundled", "trace", "functions"] }
@@ -49,6 +53,7 @@ sha2 = "0.10"
 smallclaims = { path = "../smallclaims" }
 st-runtime = { path = "../st-runtime" }
 st3-client = { path = "../st3-client" }
+st3-ui-model = { path = "../st3-ui-model" }
 st3-conversation-ui = { path = "../st3-conversation-ui", features = ["ratatui"] }
 st3-schema = { path = "../st3-schema" }
 st-drivers = { path = "../st-drivers" }
@@ -57,11 +62,12 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.27"
 toml = "0.9"
 tracing = "0.1"
+tracing-opentelemetry = "0.31"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "registry", "std"] }
 tower = { version = "0.5", features = ["util"] }
 tar = "0.4"
 urlencoding = "2"
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["v4", "v7"] }
 walkdir = "2"
 
 [dev-dependencies]
@@ -77,6 +83,10 @@ proptest = "1"
 
 [[example]]
 name = "reader_cache"
+required-features = ["test-support"]
+
+[[example]]
+name = "collection_fixture"
 required-features = ["test-support"]
 
 [[bin]]

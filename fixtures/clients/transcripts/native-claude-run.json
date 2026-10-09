@@ -989,7 +989,7 @@
   "type": "content",
   "body": {
    "media_type": "text/plain",
-   "text": "[unrecognized claude entry `future-kind`]\n{\"raw\":{\"type\":\"future-kind\"}}",
+   "text": "[unrecognized codex record `future-kind`]\n{\"raw\":{\"type\":\"future-kind\"}}",
    "attachment_id": null,
    "blocks": [
     {
@@ -1005,7 +1005,7 @@
     {
      "id": "native-153/source",
      "kind": "source_record",
-     "source_type": "claude",
+     "source_type": "codex",
      "visibility": "internal",
      "payload": {
       "raw": {
@@ -1246,6 +1246,228 @@
      "payload": {
       "raw": {
        "type": "turn_context"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-180",
+  "sequence": 180,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:40.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude attachment `instructions`]\n{\"raw\":{\"type\":\"instructions\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-180/0",
+     "kind": "unknown",
+     "source_type": "instructions",
+     "payload": {
+      "raw": {
+       "type": "instructions"
+      }
+     }
+    },
+    {
+     "id": "native-180/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "instructions"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-181",
+  "sequence": 181,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:40.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude attachment `session_context`]\n{\"raw\":{\"type\":\"session_context\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-181/0",
+     "kind": "unknown",
+     "source_type": "session_context",
+     "payload": {
+      "raw": {
+       "type": "session_context"
+      }
+     }
+    },
+    {
+     "id": "native-181/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "session_context"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-182",
+  "sequence": 182,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:40.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude attachment `credential_org`]\n{\"raw\":{\"type\":\"credential_org\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-182/0",
+     "kind": "unknown",
+     "source_type": "credential_org",
+     "payload": {
+      "raw": {
+       "type": "credential_org"
+      }
+     }
+    },
+    {
+     "id": "native-182/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "credential_org"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-183",
+  "sequence": 183,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:40.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude attachment `prompt_snapshot`]\n{\"raw\":{\"type\":\"prompt_snapshot\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-183/0",
+     "kind": "unknown",
+     "source_type": "prompt_snapshot",
+     "payload": {
+      "raw": {
+       "type": "prompt_snapshot"
+      }
+     }
+    },
+    {
+     "id": "native-183/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "prompt_snapshot"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-184",
+  "sequence": 184,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:40.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude attachment `deferred_tools_delta`]\n{\"raw\":{\"type\":\"deferred_tools_delta\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-184/0",
+     "kind": "unknown",
+     "source_type": "deferred_tools_delta",
+     "payload": {
+      "raw": {
+       "type": "deferred_tools_delta"
+      }
+     }
+    },
+    {
+     "id": "native-184/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "deferred_tools_delta"
+      }
+     }
+    }
+   ]
+  }
+ },
+ {
+  "id": "timeline-entry/native-185",
+  "sequence": 185,
+  "revision": 1,
+  "timestamp": "2026-10-07T06:31:40.000Z",
+  "role": "system",
+  "final": true,
+  "type": "content",
+  "body": {
+   "media_type": "text/plain",
+   "text": "[unrecognized claude attachment `mcp_instructions_delta`]\n{\"raw\":{\"type\":\"mcp_instructions_delta\"}}",
+   "attachment_id": null,
+   "blocks": [
+    {
+     "id": "native-185/0",
+     "kind": "unknown",
+     "source_type": "mcp_instructions_delta",
+     "payload": {
+      "raw": {
+       "type": "mcp_instructions_delta"
+      }
+     }
+    },
+    {
+     "id": "native-185/source",
+     "kind": "source_record",
+     "source_type": "claude",
+     "visibility": "internal",
+     "payload": {
+      "raw": {
+       "type": "mcp_instructions_delta"
       }
      }
     }

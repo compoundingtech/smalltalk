@@ -2,7 +2,7 @@
 # Run one Linux gate stage inside the pinned devShell: tests, clippy, or fleet-compat.
 # Each stage is its own GitHub Actions job on its own runner; `linux-gate` requires all three.
 set -euo pipefail
-stage=${1:?usage: scripts/ci-linux tests|clippy|fleet-compat|mail-redelivery-canaries}
+stage=${1:?usage: scripts/ci-linux tests|clippy|fleet-compat|mail-redelivery-canaries|conversation-model}
 # Logs stay outside the checkout: the public-content test scans untracked files.
 logs="$RUNNER_TEMP/ci-logs"
 mkdir -p "$logs"
@@ -65,6 +65,7 @@ conversation_model() {
 }
 
 # Guard current products before any stage can report success.
+python3 scripts/ci-rustc-wrapper-test
 python3 scripts/check-st-boundary-test
 python3 scripts/check-st-boundary
 
@@ -82,9 +83,10 @@ case "$stage" in
   tests) {
     # The standalone feature check is independent of the workspace's unified test build.
     # Only shard 1 (or an unpartitioned local run) needs to perform it.
-    if [[ "${CI_TEST_PARTITION:-}" != hash:2/2 ]]; then conversation_model || exit $?; fi
+    if [[ -z "${CI_TEST_EXTRACTED:-}" && "${CI_TEST_PARTITION:-}" != hash:2/2 ]]; then conversation_model || exit $?; fi
     bash scripts/ci-nextest run --test-threads "${CI_TEST_THREADS:-${CI_LOCAL_TEST_THREADS:-$(nproc)}}" --status-level pass
   } 2>&1 | tee "$logs/$stage.log" || status=$? ;;
+  conversation-model) conversation_model 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   clippy) clippy_and_codegen 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   fleet-compat) fleet_compat 2>&1 | tee "$logs/$stage.log" || status=$? ;;
   mail-redelivery-canaries) python3 scripts/ci-mail-redelivery-canaries 2>&1 | tee "$logs/$stage.log" || status=$? ;;

@@ -12,7 +12,7 @@ fn executable(path: &Path, body: &str) {
 
 fn clean_path() -> tempfile::TempDir {
     let bin = tempfile::tempdir().unwrap();
-    symlink(env!("CARGO_BIN_EXE_st2"), bin.path().join("st2")).unwrap();
+    symlink(test_env!("CARGO_BIN_EXE_st2"), bin.path().join("st2")).unwrap();
     let git = real_git::on_path(&std::env::var_os("PATH").unwrap())
         .expect("the native authoring guide requires git on PATH");
     symlink(git, bin.path().join("git")).unwrap();
@@ -69,7 +69,7 @@ fn clean_path_executes_the_maintained_native_authoring_guide() {
     fs::create_dir_all(&codex_workspace).unwrap();
     fs::create_dir_all(&claude_workspace).unwrap();
 
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = Path::new(test_env!("CARGO_MANIFEST_DIR"));
     let codex = fs::read_to_string(manifest.join("examples/native/agent-codex.kdl"))
         .unwrap()
         .replace("<identity>", "codex")
@@ -276,7 +276,7 @@ fn clean_path_supports_help_validate_env_and_doctor() {
         assert!(!bin.path().join(absent).exists());
     }
 
-    let help = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let help = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("--help")
         .env("PATH", bin.path())
         .output()
@@ -310,7 +310,7 @@ fn clean_path_supports_help_validate_env_and_doctor() {
     assert!(!Path::new("completions").exists());
     assert!(!Path::new("man").exists());
 
-    let validate = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let validate = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("validate")
         .arg("--catalog")
         .arg(&catalog)
@@ -323,7 +323,7 @@ fn clean_path_supports_help_validate_env_and_doctor() {
         String::from_utf8_lossy(&validate.stdout)
     );
 
-    let env = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let env = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("env")
         .arg("--catalog")
         .arg(&catalog)
@@ -346,7 +346,7 @@ fn clean_path_supports_help_validate_env_and_doctor() {
         format!("{}\n", owner.id()),
     )
     .unwrap();
-    let missing = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let missing = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("doctor")
         .arg("--catalog")
         .arg(&doctor_catalog)
@@ -367,7 +367,7 @@ fn clean_path_supports_help_validate_env_and_doctor() {
     );
 
     fs::write(doctor_agent.parent().unwrap().join("status"), "offline\n").unwrap();
-    let offline = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let offline = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .arg("doctor")
         .arg("--catalog")
         .arg(&doctor_catalog)

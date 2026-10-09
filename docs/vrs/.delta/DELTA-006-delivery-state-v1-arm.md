@@ -33,31 +33,54 @@ Requirements therefore need no change. What needs recording is that a piece of
 the implementation is deliberately temporary, with the observation that ends
 it.
 
-## Implementation
-
-`src/migrations/delivery_state/` owns the whole boundary: `mod.rs` (the entry
-point, the ownership filter, the legacy filename), `codex_v1.rs`, and
-`opencode_v1.rs` (one retired wire struct each, plus the meaning of its
-labels — Codex's `accepted` was a typed in-turn receipt and grades to
-`consumed`, OpenCode's was a storage read-back and grades to `persisted`).
+`crates/st-drivers/src/migrations/delivery_state/` owns the whole boundary:
+`mod.rs` (entry point, ownership filter, legacy filename, recovery and
+resolution-signal logic), `codex_v1.rs`, and `opencode_v1.rs` (one retired wire
+struct each, plus the meaning of its labels — Codex's `accepted` was a typed
+in-turn receipt and grades to `consumed`, OpenCode's was a storage read-back and
+grades to `persisted`; see
+`crates/st-drivers/src/migrations/delivery_state/codex_v1.rs:72` and
+`opencode_v1.rs:72`).
 
 Canonical code gains one version-free field, `Attestation{Observed, Asserted}`
 on `Entry`: whether this build graded the phase or another authority asserted
-it. It changes no decision — no `Retention`, `RetryDecision`, or transport
-arm reads it. What holds a carried-forward attempt is its `Phase` measured
-against the harness `Profile`: no profile proves `Attempted`, and `Ledger::seed`
-refuses an asserted phase its profile cannot prove at all, so the safety
-property is delivered by the phase, not by the label. The field is there so the
-fleet can *see* an unobserved phase — it is clause 2 of the Resolution Signal
-below — which makes it trigger instrumentation for this arm, not a permanent
-concept. It is deleted **with** the arm.
+it (`crates/st-drivers/src/delivery_ledger.rs:160-162`). It changes no
+`Retention`, `RetryDecision`, or transport decision; the phase is what keeps
+carried-forward attempts from being re-sent. The field makes the unobserved
+phase countable for clause 2 of the Resolution Signal, so it is trigger
+instrumentation, not a permanent concept.
 
-Deletion is `git rm -r src/migrations`, replacing the seam arm with `Ok(())`,
-and removing the instrumentation the trigger needed: `Entry.attestation` and
-`Attestation`, `delivery_ledger::asserted_entries`,
-`migrations::delivery_state::resolution_signal`, and the `st2 doctor` row that
-prints it. What remains is byte-for-byte a first run on a fresh seat. Measured
-cost of the boundary deletion itself: one compile error, at the seam.
+## Deletion-readiness audit (2026-10-07)
+
+**The signal requires two zero counts per admitted host for seven consecutive
+days:** (1) no pre-ledger `delivery-state.json` in the Codex/OpenCode state dirs,
+and (2) no ledger entry carrying an `Asserted` phase. The counts are emitted by
+`resolution_signal` (`crates/st-drivers/src/migrations/delivery_state/mod.rs:107-143`),
+which checks the legacy path and calls `delivery_ledger::asserted_entries`;
+the latter reads and parses ledgers and counts asserted entries without
+consuming them (`crates/st-drivers/src/delivery_ledger.rs:670-692`). Its
+behavior is pinned for both clauses and read-only repeat measurement in
+`mod.rs:288-334`. `st2 doctor` reports the per-seat advisory only while either
+count is nonzero (`src/main.rs:1140-1162`).
+
+**Deletion is not safe now.** The audit found no fleet observations, no
+seven-day all-admitted-host silence evidence, and no ratified decision that
+retires the pre-ledger release as a supported rollback target; the latter is an
+explicit additional prerequisite in this record below. Code inspection proves
+the local no-old-record case is a no-op (`mod.rs:73-105`, test at
+`mod.rs:269-285`), but does not establish absence of old records fleet-wide.
+`Ledger::open` still calls `recover` on `NotFound`
+(`crates/st-drivers/src/delivery_ledger.rs:265-284`), so deleting the arm now
+could discard evidence of an in-flight attempt and permit a duplicate delivery.
+Do not delete the migration code until both signal clauses and the rollback
+decision prerequisite are evidenced.
+
+When ready, deletion is `git rm -r crates/st-drivers/src/migrations`, replacing
+the seam arm with `Ok(())`, and removing the now-unneeded `Entry.attestation`
+and `Attestation`, `delivery_ledger::asserted_entries`,
+`migrations::delivery_state::resolution_signal`, and doctor row. The recorded
+scope says this leaves first-run behavior; this audit does not execute that
+deletion.
 
 ## Direction
 
@@ -72,7 +95,8 @@ when both are zero. The trigger resolves when that line is absent from
 `migrations::delivery_state::resolution_signal`, pinned by
 `migrations::delivery_state::tests::the_resolution_signal_counts_each_clause_without_consuming_it`;
 measuring is read-only, so a diagnostic cannot make the record it counts
-disappear.
+disappear. Implementation evidence: `src/main.rs:1140-1162` and
+`crates/st-drivers/src/migrations/delivery_state/mod.rs:107-143`.
 
 The two clauses, and the equivalent commands for a host with no `st2` on PATH:
 

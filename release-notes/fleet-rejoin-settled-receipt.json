@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep the settled fleet comparison in the rejoin divergence fixture",
+  "replay": { "status": "none", "detail": "Only an integration test changes; replay behavior is unchanged." },
+  "schema": { "status": "none", "detail": "No database schema or migrations change." },
+  "rules": { "status": "none", "detail": "No checkpoint rules or fleet coordination behavior change." },
+  "compatibility": { "status": "none", "detail": "No CLI, client, or protocol contract changes." },
+  "downtime": { "status": "none", "detail": "No runtime change or interruption is required." },
+  "manual": { "status": "none", "detail": "No installation or configuration steps are required." },
+  "recovery": { "status": "none", "detail": "No recovery behavior changes." }
+}

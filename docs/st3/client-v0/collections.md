@@ -7,6 +7,11 @@ The optional `collections` capability version 1 advertises this bound; older
 daemons omit it and accept eight. Clients reserve their existing conversation
 and terminal slots before adding optional windows on older daemons.
 
+The server sends a WebSocket protocol ping every eight seconds and answers client
+pings with the same payload. These frames do not read collection windows. A send
+that cannot complete within eight seconds closes the socket; reconnect and apply
+the new authoritative snapshot.
+
 Send one JSON command per subscription:
 
 ```json
@@ -75,9 +80,16 @@ without blocking command admission or unrelated ready frames.
 An `error` frame reports a permanent refusal and ends that subscription. A
 `resync` frame with `retryable: true` reports a temporary read failure; the server
 keeps the subscription and retries after its reread interval, including when the
-first snapshot failed. A followed conversation's `resync` also carries the failure's
-`code` and `message`, such as `remote-unavailable` while the owner's host cannot be
-reached, so a client still showing its last copy can say that copy is stale. Clients may resubscribe with the same ID to request a
+first snapshot failed. Once admitted, an opening remote conversation subscription
+may start retries for `remote-unavailable` during the three seconds after its first
+failed opening read, with 250 ms between attempts. This bounds when retries start,
+not when outage diagnostics arrive. An in-flight retry keeps the normal peer RPC
+deadline: a stalled retry can wait about 15 seconds before reporting `resync`, even
+after the retry-start window has closed. A slow successful page is not canceled by
+that window. A persistent outage still reports `resync`; other refusals and
+established conversations do not use this grace.
+A followed conversation's `resync` also carries the failure's `code` and `message`,
+so a client still showing its last copy can say that copy is stale. Clients may resubscribe with the same ID to request a
 fresh snapshot. If the socket closes, including during a daemon
 restart, open a new socket and subscribe again; the new snapshot is authoritative.
 Each socket subscribes to store changes before taking its first snapshot, so a
@@ -121,8 +133,9 @@ joined in. The first `conversation` frame carries `id`, `collection` (`conversat
 carry `replace: false` and the entries that changed since; an entry revised in place arrives
 again with its new revision. When too much changed for one frame, or a change can no longer be
 replayed, the newest page arrives again with `replace: true`. An `error` frame ends that
-subscription only, for example while the owning host is unreachable. After a dropped socket,
-subscribe again on the new one.
+subscription only, for example when a session is absent or access is forbidden.
+When an owner read fails, retryable `resync` retains the admitted subscription.
+After a dropped socket, subscribe again on the new one.
 
 `has_more` describes history before the replacement window, not whether a delta has more
 changes. Delta frames omit it: absence means preserve the last known availability, never
@@ -134,3 +147,38 @@ the session's start is reached, later live deltas do not reopen older-history pa
 
 `st missions ls --watch`, `st attention ls --watch`, `st agents ls --watch`,
 and `st work ls --watch` consume this same transport.
+
+## Summary
+
+A daemon that advertises the `summary` capability version 1 accepts
+`{"kind":"subscribe","id":"top-bar","collection":"summary","limit":1}`.
+A person session uses its own authority; an agent may select `person` using the
+same access rules as attention. This is one row, `summary/current`, with
+`kind: "summary"`, `person_id`, `needs_you`, `working_agents`, `active_missions`,
+and `machines: {connected, indirect, offline}`. Normal snapshot/changes/order
+frames apply, with `has_more: false`. There is no new HTTP list or get route.
+
+These are complete current source counts, independent of any list's page size.
+`needs_you` counts open Home items (human gates, launch/revision approvals,
+person requests and updates, agent requests, custom requests and harness
+prompts), excluding messages and faults. Local snoozes and closed rows remain
+client-owned. `working_agents` uses running/working presentation, excluding
+faults and stale delivery. `active_missions` uses the shared mission words
+working, queued, decision, stalled, unstaffed and unclaimed, excluding system
+missions. Human gates use the selected person's unresolved attention membership.
+Machines use direct/gateway connectivity, otherwise the newest transport or
+agent activity strictly less than five minutes old, otherwise offline.
+
+Native counts use the existing authorized snapshot and collection clock. Lean
+mission inputs reuse the shared mission word calculation, omit card history and
+provenance, and are shared across activity updates. Cached inputs expire at lease, future-request
+and recent-outcome boundaries and reject backward clock reuse. Agent cards reuse the native
+keyed roster cache; live delivery overlays are checked on every read. Authority
+is revalidated before counting, including private person selection. Read failures
+send the existing `resync`/`error` frames, never inferred zero counts. Clients keep compatibility
+behavior on older daemons. The source may move to the shared IVM reactor later
+without changing this contract.
+Equal count membership produces no upsert, including agent progress/usage
+updates and another person's attention changes. Core list/filter/get behavior
+is unchanged. Summary freshness is carried by its snapshot fence; equal counts
+retain their prior row timestamp so an unchanged count emits no delta.

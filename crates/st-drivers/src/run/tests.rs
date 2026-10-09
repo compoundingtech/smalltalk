@@ -1254,7 +1254,7 @@ fn write_notify_chain_profile(catalog: &Path) {
     let resolver_dir = catalog.join("resolvers");
     std::fs::create_dir_all(&resolver_dir).unwrap();
     std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        Path::new(test_env!("CARGO_MANIFEST_DIR"))
             .join("../agent-spec/tests/fixtures/demo_resolver.wasm"),
         resolver_dir.join("goal.wasm"),
     )
@@ -3549,6 +3549,17 @@ fn detect_host_returns_a_nonempty_short_name() {
     let h = detect_host();
     assert!(!h.is_empty());
     assert!(!h.contains('.'), "short name only, got {h}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn detect_host_matches_kernel_hostname() {
+    let full = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+    let short = full.trim().split('.').next().unwrap();
+    let expected = if short.is_empty() { "localhost" } else { short };
+    let host = detect_host();
+    assert!(!host.is_empty());
+    assert_eq!(host, expected);
 }
 
 #[test]

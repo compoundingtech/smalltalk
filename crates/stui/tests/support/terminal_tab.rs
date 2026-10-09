@@ -6,14 +6,23 @@ use std::path::PathBuf;
 
 #[test]
 fn terminal_tab_protocols() {
+    check_terminal_tab_probe("--check");
+}
+
+#[test]
+fn terminal_tab_action_publication() {
+    check_terminal_tab_probe("--check-action-publication");
+}
+
+fn check_terminal_tab_probe(check: &str) {
     let output = std::process::Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
+        .arg(test_env!(
+            "CARGO_MANIFEST_DIR",
             "/tests/terminal_tab_probe.py"
         ))
         .arg("--worker")
         .arg(std::env::current_exe().unwrap())
-        .arg("--check")
+        .arg(check)
         .env_remove("ST_AGENT")
         .output()
         .expect("python3 is required by the PTY probe (provided by CI)");

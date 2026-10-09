@@ -1,3 +1,7 @@
+#[macro_use]
+#[path = "../scripts/ci-test-paths.rs"]
+mod ci_test_paths;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -344,7 +348,7 @@ fn public_host_flag_cannot_override_detected_event_authority() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
             catalog.path().to_str().unwrap(),
@@ -385,7 +389,7 @@ fn established_logical_host_alias_admits_owner_local_cli_ingress() {
     .unwrap();
     event::publish_owner_binding_for_test(catalog.path(), "berlin").unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
             catalog.path().to_str().unwrap(),
@@ -1483,7 +1487,7 @@ fn event_emit_cli_cannot_claim_the_supervisor_resync_stream() {
     let catalog = tempfile::tempdir().unwrap();
     let agent = declare_agent(catalog.path(), "\"running\"", "");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let output = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
             catalog.path().to_str().unwrap(),
@@ -1520,7 +1524,7 @@ fn event_emit_cli_cannot_claim_the_supervisor_resync_stream() {
 fn event_emit_cli_returns_a_stable_json_receipt_and_ding_marks_the_record() {
     let catalog = tempfile::tempdir().unwrap();
     let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_st2"))
+    let mut child = Command::new(test_env!("CARGO_BIN_EXE_st2"))
         .args([
             "--catalog",
             catalog.path().to_str().unwrap(),

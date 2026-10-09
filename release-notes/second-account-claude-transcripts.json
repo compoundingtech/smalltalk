@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A Claude seat on any account has its conversation shown: st reads the transcript path Claude gave the SessionStart hook, and also searches declared accounts' login directories, instead of looking only under ~/.claude",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, stored data or transcript change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Published schema, operations and contract digest are unchanged. The session binding file gains an optional transcript_path field."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change. A recorded path counts only if it is absolute, names this session's file, and is a regular file, not a link."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "An older daemon ignores the new optional transcript_path field. A newer daemon reads older bindings that lack it and finds a seat on a declared account through that account's login directory. A seat already running on an undeclared account whose binding has no path shows its conversation again after its next restart."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; no data conversion or extra startup work. The extra account search runs only when the usual places miss."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, durable payload or initialization changes."
+  }
+}

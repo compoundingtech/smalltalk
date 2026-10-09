@@ -369,6 +369,24 @@ mission "proof" state="ready" {
         )
     }
 
+    fn launch_as(&self, incarnation: &str) {
+        let runtime = self.runtime.clone();
+        let incarnation = incarnation.to_owned();
+        *self.runtime.before_observe_exec.lock().unwrap() = Some(Box::new(move || {
+            let runtime_id = runtime.starts.lock().unwrap().last().unwrap().clone();
+            runtime.execs.lock().unwrap().insert(
+                runtime_id.clone(),
+                RuntimeObservation {
+                    runtime_id,
+                    terminal: false,
+                    status: "running".into(),
+                    exit_code: None,
+                    incarnation_id: Some(incarnation),
+                },
+            );
+        }));
+    }
+
     fn running(&self) {
         let runtime_id = self.runtime.starts.lock().unwrap().last().unwrap().clone();
         self.runtime.execs.lock().unwrap().insert(
@@ -541,6 +559,673 @@ fn mechanical_gate_tracks_its_request_deadline_before_the_next_poll() {
             .unwrap()
             .unwrap();
         assert_eq!(result.body["fields"]["value"]["answer"], "broken");
+    }
+}
+
+#[test]
+fn mechanical_gate_uses_an_on_time_exit_after_a_delayed_pass() {
+    for receipt_at in [0, 20, 49] {
+        for (reported_code, runtime_code, answer) in [
+            (0, None, "pass"),
+            (1, None, "not-yet"),
+            (2, None, "broken"),
+            (0, Some(0), "pass"),
+            (1, Some(1), "not-yet"),
+        ] {
+            let _clock = Clock::at(START);
+            let fixture = GateFixture::new();
+            fixture.launch_as("runner-one");
+            assert!(matches!(
+                fixture.mechanical().unwrap(),
+                GateOutcome::Pending
+            ));
+            let runner = gate_runners(&fixture.runtime).pop().unwrap();
+            let operation = gate_runner_subject(&runner);
+            fixture
+                .store
+                .set_write_clock_at(START + receipt_at)
+                .unwrap();
+            let completed = fixture
+                .store
+                .append_claim(&ClaimInput {
+                    subject: operation.clone(),
+                    kind: "runtime.observed".into(),
+                    actor: Some(operation.clone()),
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("exited".into())),
+                        ("exit_code".into(), Value::from(reported_code)),
+                        ("exit_signal".into(), Value::Null),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            assert_eq!(completed.accepted_at_unix_ms, START + receipt_at);
+            exit_gate_runner(&fixture.runtime, &runner, runtime_code, "completed output");
+            fixture
+                .runtime
+                .execs
+                .lock()
+                .unwrap()
+                .get_mut(&runner.runtime_id)
+                .unwrap()
+                .incarnation_id = Some("runner-one".into());
+            // The 50ms check ended on time; only its reconciliation was delayed.
+            smallclaims::store::set_thread_clock(Some(START + 1_000));
+            fixture.store.set_write_clock_at(START + 1_000).unwrap();
+            let (outcome, due) = smallclaims::touched::record_due(|| fixture.mechanical());
+            let outcome = outcome.unwrap();
+            assert!(match answer {
+                "pass" => matches!(outcome, GateOutcome::Pass),
+                "not-yet" => matches!(outcome, GateOutcome::NotYet),
+                _ => matches!(outcome, GateOutcome::Broken(_)),
+            });
+            assert!(fixture.runtime.kills.lock().unwrap().is_empty());
+            let result = fixture
+                .store
+                .latest_claim(&operation, Some("gate.result"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(gate_check_answer(&result), answer);
+            assert_eq!(result.body["fields"]["value"]["exit_code"], reported_code);
+            assert_eq!(result.body["fields"]["value"]["output"], "completed output");
+            assert!(!gate_result_reason(&result, "missing reason").contains("time limit"));
+            if answer == "not-yet" {
+                assert_eq!(
+                    due,
+                    Some(result.accepted_at_unix_ms + fixture.reconciler.gate_recheck_delay_ms(1))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mechanical_gate_does_not_accept_unproved_or_late_completion() {
+    for case in [
+        "absent",
+        "before-request",
+        "at-deadline",
+        "late",
+        "wrong-actor",
+        "daemon-observation",
+        "wrong-check",
+        "wrong-operation",
+        "running-receipt",
+        "missing-code",
+        "text-code",
+        "signal",
+        "still-running",
+        "contradictory-runtime",
+        "wrong-runtime",
+        "wrong-incarnation",
+        "local-start-wrong-runtime",
+        "multiple-launches",
+        "mixed-launches",
+        "foreign-origin",
+        "foreign-batch-origin",
+        "foreign-request",
+        "repaired-request",
+        "repaired",
+    ] {
+        let _clock = Clock::at(START);
+        let fixture = GateFixture::new();
+        if matches!(
+            case,
+            "wrong-incarnation" | "multiple-launches" | "mixed-launches"
+        ) {
+            fixture.launch_as("old-runner");
+        }
+        assert!(matches!(
+            fixture.mechanical().unwrap(),
+            GateOutcome::Pending
+        ));
+        let runner = gate_runners(&fixture.runtime).pop().unwrap();
+        let operation = gate_runner_subject(&runner);
+        let requested = fixture
+            .store
+            .latest_claim(&operation, Some("gate.requested"))
+            .unwrap()
+            .unwrap();
+        let local_start = fixture
+            .store
+            .observations_for(&operation, "runtime.action.succeeded")
+            .unwrap()
+            .into_iter()
+            .find(|claim| claim.body["fields"]["action"] == "start")
+            .unwrap();
+        assert_eq!(local_start.store_index, requested.store_index);
+        // Explicit reader-only clock-reversal control: local log order must still
+        // contribute incarnation and multiple-start evidence despite the earlier clock.
+        fixture
+            .store
+            .connection
+            .write()
+            .execute(
+                "UPDATE local_observations SET observed_at_unix_ms=?1
+             WHERE subject=?2 AND kind='runtime.action.succeeded'",
+                rusqlite::params![i64::try_from(START - 1).unwrap(), operation],
+            )
+            .unwrap();
+        if case == "local-start-wrong-runtime" {
+            fixture.store.connection.write().execute(
+                "UPDATE local_observations SET body=json_set(body, '$.fields.runtime_id', 'wrong-runtime')
+                 WHERE subject=?1 AND kind='runtime.action.succeeded' AND json_extract(body,'$.fields.action')='start'",
+                [&operation],
+            ).unwrap();
+        }
+        if case != "absent" {
+            let at = match case {
+                "at-deadline" => 50,
+                "late" => 51,
+                _ => 20,
+            };
+            fixture.store.set_write_clock_at(START + at).unwrap();
+            let receipt_subject = match case {
+                "wrong-check" => format!("{operation}/check/2"),
+                "wrong-operation" => format!("{operation}-other"),
+                _ => operation.clone(),
+            };
+            let completed = fixture
+                .store
+                .append_claim(&ClaimInput {
+                    subject: receipt_subject.clone(),
+                    kind: "runtime.observed".into(),
+                    actor: match case {
+                        "wrong-actor" => Some("person/example".into()),
+                        "daemon-observation" => None,
+                        _ => Some(receipt_subject),
+                    },
+                    fields: BTreeMap::from([
+                        (
+                            "status".into(),
+                            Value::String(
+                                if case == "running-receipt" {
+                                    "running"
+                                } else {
+                                    "exited"
+                                }
+                                .into(),
+                            ),
+                        ),
+                        (
+                            "exit_code".into(),
+                            match case {
+                                "missing-code" => Value::Null,
+                                _ => Value::from(0),
+                            },
+                        ),
+                        (
+                            "exit_signal".into(),
+                            if case == "signal" {
+                                Value::from(9)
+                            } else {
+                                Value::Null
+                            },
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            if case == "text-code" {
+                // Admission rejects this type. Mutate only this reader-negative fixture;
+                // it does not assert that a malformed receipt could be admitted.
+                fixture.store.connection.write().execute(
+                    "UPDATE claims SET body=json_set(body, '$.fields.exit_code', '0') WHERE id=?1",
+                    [&completed.id],
+                ).unwrap();
+            }
+            if case == "before-request" {
+                // Isolate original acceptance timing from writer ordering. This intentionally
+                // mutated row is a reader control, not a signed admission fixture.
+                fixture
+                    .store
+                    .connection
+                    .write()
+                    .execute(
+                        "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                        rusqlite::params![(START - 1).to_string(), completed.id],
+                    )
+                    .unwrap();
+            }
+            if matches!(case, "foreign-origin" | "foreign-batch-origin") {
+                // Isolate the reader's claim/batch provenance checks without asserting that
+                // these deliberately inconsistent fixture rows would pass admission.
+                let query = if case == "foreign-origin" {
+                    "UPDATE claims SET origin='other' WHERE id=?1"
+                } else {
+                    "UPDATE batches SET origin='other' WHERE id=(SELECT batch_id FROM claims WHERE id=?1)"
+                };
+                fixture
+                    .store
+                    .connection
+                    .write()
+                    .execute(query, [&completed.id])
+                    .unwrap();
+            }
+            if matches!(case, "repaired" | "repaired-request") {
+                let id = if case == "repaired-request" {
+                    fixture
+                        .store
+                        .latest_claim(&operation, Some("gate.requested"))
+                        .unwrap()
+                        .unwrap()
+                        .id
+                } else {
+                    completed.id
+                };
+                fixture.store.connection.write().execute(
+                    "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,claim_id,updated_at_unix_ms)
+                     VALUES('record/repaired-exit','node',999999,'repaired-exit',0,X'00','repaired',?1,?2)",
+                    rusqlite::params![id, (START + at).to_string()],
+                ).unwrap();
+            }
+        }
+        if case == "foreign-request" {
+            fixture
+                .store
+                .connection
+                .write()
+                .execute(
+                    "UPDATE claims SET origin='other' WHERE subject=?1 AND kind='gate.requested'",
+                    [&operation],
+                )
+                .unwrap();
+        }
+        if case == "multiple-launches" {
+            fixture.store.set_write_clock_at(START + 30).unwrap();
+            fixture
+                .store
+                .append_claim(&ClaimInput {
+                    subject: operation.clone(),
+                    kind: "runtime.action.succeeded".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("action".into(), Value::String("start".into())),
+                        ("incarnation_id".into(), Value::String("new-runner".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        if case == "mixed-launches" {
+            // Actor-bearing SystemLocal claims remain in the replicated graph. Changing
+            // this fixture's actor column models legacy daemon storage only; it is a
+            // mixed-reader control, not legacy-envelope admission qualification.
+            let legacy = fixture
+                .store
+                .append_claim(&ClaimInput {
+                    subject: operation.clone(),
+                    kind: "runtime.action.succeeded".into(),
+                    actor: Some(operation.clone()),
+                    fields: BTreeMap::from([
+                        ("action".into(), Value::String("start".into())),
+                        ("incarnation_id".into(), Value::String("new-runner".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            fixture
+                .store
+                .connection
+                .write()
+                .execute("UPDATE claims SET actor=NULL WHERE id=?1", [&legacy.id])
+                .unwrap();
+            // Check ambiguity in the reader itself: a later runtime-incarnation
+            // mismatch must not be the reason this mixed-source case times out.
+            assert!(
+                fixture
+                    .store
+                    .mechanical_gate_exit_receipt(&requested)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        if case == "still-running" {
+            fixture.running();
+        } else {
+            exit_gate_runner(
+                &fixture.runtime,
+                &runner,
+                Some(if case == "contradictory-runtime" {
+                    137
+                } else {
+                    0
+                }),
+                "completed output",
+            );
+            if case == "wrong-runtime" {
+                fixture
+                    .runtime
+                    .execs
+                    .lock()
+                    .unwrap()
+                    .get_mut(&runner.runtime_id)
+                    .unwrap()
+                    .runtime_id = "another-check".into();
+            }
+            if case == "multiple-launches" {
+                fixture
+                    .runtime
+                    .execs
+                    .lock()
+                    .unwrap()
+                    .get_mut(&runner.runtime_id)
+                    .unwrap()
+                    .incarnation_id = Some("new-runner".into());
+            }
+        }
+        smallclaims::store::set_thread_clock(Some(START + 1_000));
+        fixture.store.set_write_clock_at(START + 1_000).unwrap();
+        assert!(
+            matches!(fixture.mechanical().unwrap(), GateOutcome::Broken(_)),
+            "{case}"
+        );
+        assert_eq!(
+            fixture.runtime.kills.lock().unwrap().len(),
+            usize::from(case == "still-running"),
+            "{case}"
+        );
+        let result = fixture
+            .store
+            .latest_claim(&operation, Some("gate.result"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(gate_check_answer(&result), "broken", "{case}");
+        assert!(
+            gate_result_reason(&result, "missing reason").contains("time limit"),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn mechanical_gate_accepts_an_exit_reported_before_start_success() {
+    let _clock = Clock::at(START);
+    let fixture = GateFixture::new();
+    let runtime = fixture.runtime.clone();
+    let store = fixture.store.clone();
+    *fixture.runtime.before_observe_exec.lock().unwrap() = Some(Box::new(move || {
+        let runner = gate_runners(&runtime).pop().unwrap();
+        let operation = gate_runner_subject(&runner);
+        store
+            .append_claim(&ClaimInput {
+                subject: operation.clone(),
+                kind: "runtime.observed".into(),
+                actor: Some(operation),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("exited".into())),
+                    ("exit_code".into(), Value::from(1)),
+                    ("exit_signal".into(), Value::Null),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        exit_gate_runner(&runtime, &runner, None, "fast exit");
+    }));
+    assert!(matches!(
+        fixture.mechanical().unwrap(),
+        GateOutcome::Pending
+    ));
+    let runner = gate_runners(&fixture.runtime).pop().unwrap();
+    let operation = gate_runner_subject(&runner);
+    let requested = fixture
+        .store
+        .latest_claim(&operation, Some("gate.requested"))
+        .unwrap()
+        .unwrap();
+    let (completed, incarnation) = fixture
+        .store
+        .mechanical_gate_exit_receipt(&requested)
+        .unwrap()
+        .unwrap();
+    let launch = fixture
+        .store
+        .observations_for(&operation, "runtime.action.succeeded")
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.body["fields"]["action"] == "start")
+        .unwrap();
+    // A local start row sorts after the claim named by its after_store_index. It does
+    // not consume another graph index, so this equality proves the intended fast order.
+    assert_eq!(completed.store_index, launch.store_index);
+    assert!(launch.id.starts_with("local-observation/"));
+    assert_eq!(incarnation, Some(format!("{}-one", runner.runtime_id)));
+    smallclaims::store::set_thread_clock(Some(START + 1_000));
+    fixture.store.set_write_clock_at(START + 1_000).unwrap();
+    assert!(matches!(fixture.mechanical().unwrap(), GateOutcome::NotYet));
+    assert!(fixture.runtime.kills.lock().unwrap().is_empty());
+}
+
+#[test]
+fn mechanical_gate_reader_excludes_local_starts_before_the_request() {
+    let _clock = Clock::at(START);
+    let fixture = GateFixture::new();
+    let operation = gate_result_subject(
+        &fixture.stage,
+        "deadline",
+        &serde_json::json!({
+            "type": "mechanical", "command": "sleep 60", "host": "node",
+            "workspace": fixture.workspace.path().to_str().unwrap(),
+            "environment": {}, "time_limit_ms": 50,
+        }),
+    )
+    .unwrap();
+    let old = fixture
+        .store
+        .append_claim(&ClaimInput {
+            subject: operation.clone(),
+            kind: "runtime.action.succeeded".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("action".into(), Value::String("start".into())),
+                (
+                    "incarnation_id".into(),
+                    Value::String("older-runner".into()),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    fixture.launch_as("current-runner");
+    fixture.mechanical().unwrap();
+    let requested = fixture
+        .store
+        .latest_claim(&operation, Some("gate.requested"))
+        .unwrap()
+        .unwrap();
+    assert!(old.store_index < requested.store_index);
+    fixture
+        .store
+        .append_claim(&ClaimInput {
+            subject: operation.clone(),
+            kind: "runtime.observed".into(),
+            actor: Some(operation),
+            fields: BTreeMap::from([
+                ("status".into(), Value::String("exited".into())),
+                ("exit_code".into(), Value::from(0)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    // A deliberately actor-bearing local start is not a daemon launch receipt.
+    // This column mutation is only a reader control; actor-bearing SystemLocal
+    // input normally goes into claims, as the mixed-launch control demonstrates.
+    let extra = fixture
+        .store
+        .append_claim(&ClaimInput {
+            subject: requested.subject.clone(),
+            kind: "runtime.action.succeeded".into(),
+            actor: None,
+            fields: BTreeMap::from([
+                ("action".into(), Value::String("start".into())),
+                (
+                    "incarnation_id".into(),
+                    Value::String("unrelated-runner".into()),
+                ),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    fixture
+        .store
+        .connection
+        .write()
+        .execute(
+            "UPDATE local_observations SET actor='person/example' WHERE id=?1",
+            [extra.id.rsplit('/').next().unwrap()],
+        )
+        .unwrap();
+    let (_, incarnation) = fixture
+        .store
+        .mechanical_gate_exit_receipt(&requested)
+        .unwrap()
+        .unwrap();
+    assert_eq!(incarnation.as_deref(), Some("current-runner"));
+}
+
+#[test]
+fn mechanical_gate_reader_rejects_old_writer_history_inserted_late() {
+    let _clock = Clock::at(START);
+    let fixture = GateFixture::new();
+    let operation = gate_result_subject(
+        &fixture.stage,
+        "deadline",
+        &serde_json::json!({
+            "type": "mechanical", "command": "sleep 60", "host": "node",
+            "workspace": fixture.workspace.path().to_str().unwrap(),
+            "environment": {}, "time_limit_ms": 50,
+        }),
+    )
+    .unwrap();
+    let exit = || ClaimInput {
+        subject: operation.clone(),
+        kind: "runtime.observed".into(),
+        actor: Some(operation.clone()),
+        fields: BTreeMap::from([
+            ("status".into(), Value::String("exited".into())),
+            ("exit_code".into(), Value::from(0)),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: None,
+    };
+    let old = fixture.store.append_claim(&exit()).unwrap();
+    assert!(matches!(
+        fixture.mechanical().unwrap(),
+        GateOutcome::Pending
+    ));
+    let requested = fixture
+        .store
+        .latest_claim(&operation, Some("gate.requested"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.accepted_at_unix_ms, requested.accepted_at_unix_ms);
+    assert!(old.store_index < requested.store_index);
+    // Emulate re-insertion of admitted old writer history without changing its original
+    // signed batch/sequence. A later local index cannot make it follow this request.
+    let late_index = fixture.store.index().unwrap() + 1;
+    fixture
+        .store
+        .connection
+        .write()
+        .execute(
+            "UPDATE claims SET store_index=?1 WHERE id=?2",
+            rusqlite::params![late_index, old.id],
+        )
+        .unwrap();
+    assert!(late_index > requested.store_index);
+    assert!(
+        fixture
+            .store
+            .mechanical_gate_exit_receipt(&requested)
+            .unwrap()
+            .is_none()
+    );
+    let current = fixture.store.append_claim(&exit()).unwrap();
+    let (completed, _) = fixture
+        .store
+        .mechanical_gate_exit_receipt(&requested)
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.id, current.id);
+    assert_eq!(completed.accepted_at_unix_ms, requested.accepted_at_unix_ms);
+}
+
+#[test]
+fn mechanical_gate_reader_orders_positions_within_one_writer_batch() {
+    for position in [0, 2] {
+        let _clock = Clock::at(START);
+        let fixture = GateFixture::new();
+        fixture.mechanical().unwrap();
+        let runner = gate_runners(&fixture.runtime).pop().unwrap();
+        let operation = gate_runner_subject(&runner);
+        let requested = fixture
+            .store
+            .latest_claim(&operation, Some("gate.requested"))
+            .unwrap()
+            .unwrap();
+        let completed = fixture
+            .store
+            .append_claim(&ClaimInput {
+                subject: operation.clone(),
+                kind: "runtime.observed".into(),
+                actor: Some(operation),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("exited".into())),
+                    ("exit_code".into(), Value::from(0)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        // Reader-only metadata fixture: isolate canonical replica position within a single
+        // batch. This does not assert admission of a synthetic mixed-actor envelope.
+        let connection = fixture.store.connection.write();
+        connection
+            .execute(
+                "UPDATE claims SET batch_id=?1 WHERE id=?2",
+                rusqlite::params![requested.batch_id, completed.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM replica_records WHERE claim_id IN (?1,?2)",
+                rusqlite::params![requested.id, completed.id],
+            )
+            .unwrap();
+        for (id, slot) in [(&requested.id, 1), (&completed.id, position)] {
+            connection.execute(
+                "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,claim_id,updated_at_unix_ms)
+                 VALUES(?1,'node',999999,'position-fixture',?2,X'00','valid',?3,?4)",
+                rusqlite::params![format!("record/position-{slot}"),slot,id,START.to_string()],
+            ).unwrap();
+        }
+        drop(connection);
+        let found = fixture
+            .store
+            .mechanical_gate_exit_receipt(&requested)
+            .unwrap();
+        assert_eq!(found.is_some(), position > 1);
+        if let Some((receipt, _)) = found {
+            assert_eq!(receipt.id, completed.id);
+        }
     }
 }
 

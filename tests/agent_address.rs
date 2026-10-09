@@ -25,7 +25,7 @@ fn declaration(identity: &str, host: &str, managed_by: &str, extra: &str) -> Str
 }
 
 fn run(root: &Path, args: &[&str], actor: Option<&str>) -> Output {
-    let mut process = Command::new(env!("CARGO_BIN_EXE_st2"));
+    let mut process = Command::new(test_env!("CARGO_BIN_EXE_st2"));
     process
         .args(["--catalog", root.to_str().unwrap()])
         .args(args)

@@ -911,6 +911,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("pull_requests", array()),
                 ("issues", array()),
                 ("repository_id", integer()),
+                ("main_performance_failures", array()),
                 ("github_http_requests_since_start", integer()),
             ],
         ),
@@ -2571,6 +2572,9 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("parent_step_run", reference()),
             ("default_selector", object()),
             ("after", reference()),
+            ("report_to", reference()),
+            ("stalled_after_ms", integer()),
+            ("report_completed", boolean()),
         ],
         "mission-run.state" => &[
             ("status", string()),

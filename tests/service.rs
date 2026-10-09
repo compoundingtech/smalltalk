@@ -6,7 +6,7 @@
 //! the unit-rendering logic itself is exhaustively covered by `src/service.rs` unit tests.
 
 fn st2() -> std::process::Command {
-    std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
+    std::process::Command::new(test_env!("CARGO_BIN_EXE_st2"))
 }
 
 #[test]
@@ -55,7 +55,7 @@ fn render_unit_uses_invoked_executable_and_residency_without_installing() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    let exe = std::fs::canonicalize(env!("CARGO_BIN_EXE_st2")).unwrap();
+    let exe = std::fs::canonicalize(test_env!("CARGO_BIN_EXE_st2")).unwrap();
     let catalog = catalog.canonicalize().unwrap();
     assert!(
         stdout.contains(&format!(

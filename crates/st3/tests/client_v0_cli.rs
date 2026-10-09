@@ -75,7 +75,7 @@ async fn devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secre
         let config = config.clone();
         tokio::task::spawn_blocking(move || {
             let mut command =
-                st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"));
+                st3::test_support::command(test_bin!("st3-fixture"));
             let mut child = command
                 .env("XDG_CONFIG_HOME", config)
                 .args(args)
@@ -301,7 +301,7 @@ async fn run_cli_human(socket: &Path, args: &[&str]) -> Output {
 }
 
 async fn run_cli_mode(socket: &Path, json: bool, args: &[&str]) -> Output {
-    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
+    let binary = test_bin!("st3-fixture").to_path_buf();
     let socket = socket.to_path_buf();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
@@ -323,7 +323,7 @@ async fn run_cli_mode(socket: &Path, json: bool, args: &[&str]) -> Output {
 }
 
 async fn run_cli_with_agent_env(socket: &Path, agent: &str, args: &[&str]) -> Output {
-    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
+    let binary = test_bin!("st3-fixture").to_path_buf();
     let socket = socket.to_path_buf();
     let agent = agent.to_owned();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
@@ -364,7 +364,7 @@ fn person_admission_exception_is_local_reversible_and_never_spawns_the_producer(
     std::fs::write(&producer, format!("#!/bin/sh\nprintf called > '{}'\nexit 1\n", marker.display())).unwrap();
     std::fs::set_permissions(&producer, std::fs::Permissions::from_mode(0o700)).unwrap();
     let run = |action: &str, agent: bool| {
-        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"));
+        let mut command = std::process::Command::new(test_bin!("st3"));
         command.env_remove("ST_AGENT").env_remove("ST_MISSION_RUN")
             .arg("--json").args(["admission", action, "omp", "--binary"])
             .arg(&producer).arg("--state-dir").arg(root.path().join("state"));
@@ -676,6 +676,8 @@ async fn a_stale_seat_publishing_last_cannot_lower_usage_or_disable_the_limits_p
             &st3::store::LimitsPolicy {
                 stop_at_weekly_percent: 95,
                 keep: Default::default(),
+                exempt_accounts: Default::default(),
+                exempt_harnesses: Default::default(),
                 notify: "agent/example/operations".into(),
                 fresh_ms: 3_600_000,
             },
@@ -785,6 +787,8 @@ async fn usage_hides_legacy_unknowns_preserves_account_identity_and_stops_at_95_
             &st3::store::LimitsPolicy {
                 stop_at_weekly_percent: 95,
                 keep: Default::default(),
+                exempt_accounts: Default::default(),
+                exempt_harnesses: Default::default(),
                 notify: "agent/example/operations".into(),
                 fresh_ms: 3_600_000,
             },
@@ -870,6 +874,8 @@ async fn weekly_usage_survives_a_member_restart_with_a_partial_harness_report() 
                         &st3::store::LimitsPolicy {
                             stop_at_weekly_percent: 95,
                             keep: Default::default(),
+                            exempt_accounts: Default::default(),
+                            exempt_harnesses: Default::default(),
                             notify: "agent/example/operations".into(),
                             fresh_ms: 3_600_000,
                         },
@@ -1090,6 +1096,60 @@ async fn missions_show_missing_mission_fails_but_published_zero_run_mission_succ
         }
     }
     server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conversation_stage_timings_appear_in_performance_report() {
+    // Reports retain only the top 20 rows; nextest gives this metrics test its own process.
+    st3::performance::reset_for_test();
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let subject = "agent/conversation-timing";
+    state.store.append_claim(&ClaimInput {
+        subject: subject.into(),
+        kind: "runtime.observed".into(),
+        actor: Some(subject.into()),
+        fields: serde_json::from_value(serde_json::json!({
+            "status": "running", "incarnation_id": "timing-runtime"
+        })).unwrap(),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: None,
+    }).unwrap();
+    let index = state.store.index().unwrap();
+    let served = socket.clone();
+    let app = st3::api::router(state.clone());
+    let server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(tokio::time::Instant::now() < deadline, "isolated API did not start");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let client = st3_client::Client::unix_as(&socket, "person/example");
+    let mut stream = client.collection_stream().await.unwrap();
+    stream.subscribe_conversation("timing", subject).await.unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await.unwrap().unwrap().unwrap();
+    assert_eq!(frame["kind"], "conversation");
+    assert_eq!(frame["id"], "timing");
+    assert_eq!(frame["replace"], true);
+
+    let http = reqwest::Client::builder().unix_socket(socket).build().unwrap();
+    let response = http.get("http://localhost/v1/performance").send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let report: Value = response.json().await.unwrap();
+    let requests = report["value"]["requests"].as_array().unwrap();
+    for label in ["conversation/admission", "conversation/owner", "conversation/first-page"] {
+        let row = requests.iter().find(|row| row["kind"] == label)
+            .unwrap_or_else(|| panic!("missing stage {label}: {report}"));
+        assert!(row["count"].as_u64().unwrap() > 0);
+        assert!(row["total_ms"].as_f64().unwrap() >= 0.0);
+    }
+    assert_eq!(state.store.index().unwrap(), index, "timings must not write graph claims");
+    stream.close().await;
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1324,7 +1384,7 @@ async fn agent_declaration_cli_redacts_environment_unless_explicitly_requested()
 
 #[test]
 fn service_permissions_honors_global_json_flag() {
-    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+    let output = st3::test_support::command(test_bin!("st3-fixture"))
         .args(["--json", "service", "permissions"])
         .output()
         .unwrap();
@@ -2488,7 +2548,7 @@ mission "cli/child" state="ready" {
 }
 
 async fn run_queue_cli(socket: &Path, config_home: &Path, json: bool, args: &[&str]) -> Output {
-    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
+    let binary = test_bin!("st3-fixture").to_path_buf();
     let socket = socket.to_path_buf();
     let config_home = config_home.to_path_buf();
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
@@ -3111,7 +3171,7 @@ async fn run_lane_cli(
     json: bool,
     args: &[&str],
 ) -> Output {
-    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture").to_path_buf();
+    let binary = test_bin!("st3-fixture").to_path_buf();
     let socket = socket.to_path_buf();
     let config_home = config_home.to_path_buf();
     let agent = agent.map(str::to_owned);
@@ -3508,7 +3568,7 @@ mission "example/merge-train" state="ready" {
 #[test]
 fn help_starts_with_examples_and_keeps_plumbing_reachable() {
     let help = |args: &[&str]| {
-        let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+        let output = st3::test_support::command(test_bin!("st3-fixture"))
             .args(args)
             .output()
             .unwrap();
@@ -3547,7 +3607,7 @@ fn help_starts_with_examples_and_keeps_plumbing_reachable() {
         nested.insert(1, "help");
         assert_eq!(help(&flag), help(&nested));
     }
-    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+    let output = st3::test_support::command(test_bin!("st3-fixture"))
         .args(["help", "missing-command"])
         .output()
         .unwrap();

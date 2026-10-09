@@ -265,6 +265,7 @@ impl Store {
                 certificate,
                 seal_rowid,
             }) => {
+                let _completion = super::checkpoint_completion::Completion::outer();
                 let cut = certificate.terms.cut_unix_ms;
                 let verified = |plan: &super::checkpoint::DropPlan| {
                     plan.sealed_digest == certificate.terms.sealed_digest
@@ -389,6 +390,7 @@ impl Store {
         manifest: &CheckpointManifest,
         require_newest: bool,
     ) -> Result<Vec<CheckpointAction>, St3Error> {
+        let _completion = super::checkpoint_completion::Completion::outer();
         self.runtime.checkpoint_preflight().map_err(internal)?;
         let claims = self.checkpoint_claims().map_err(internal)?;
         // Adoption replaces every tombstone this node holds, so only the newest stable
@@ -496,8 +498,9 @@ impl Store {
         state: &str,
     ) -> Result<()> {
         self.runtime.checkpoint_preflight()?;
-        let connection = self.connection.write();
-        connection.execute(
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT INTO checkpoints(id, cut_unix_ms, state, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(id) DO UPDATE SET state=excluded.state,
@@ -509,6 +512,7 @@ impl Store {
                 i64::try_from(now_ms())?
             ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -549,6 +553,7 @@ impl Store {
         exact: bool,
         actions: &mut Vec<CheckpointAction>,
     ) -> Result<()> {
+        let _completion = super::checkpoint_completion::Completion::work();
         self.runtime.checkpoint_preflight()?;
         {
             let mut connection = self.connection.write();
@@ -586,6 +591,7 @@ impl Store {
     /// before the next chunk takes the writer again. Each chunk checks, inside its own
     /// transaction, that the graph did not change; the proof showed it cannot.
     pub fn finish_trim(&self, checkpoint: &str, actions: &mut Vec<CheckpointAction>) -> Result<()> {
+        let _completion = super::checkpoint_completion::Completion::work();
         self.runtime.checkpoint_preflight()?;
         let mut chunks = 0;
         let mut deleted_envelopes = 0;

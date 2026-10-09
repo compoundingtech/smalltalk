@@ -7,7 +7,7 @@
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
     # The runtime, Rust crates and native terminal library share one producer revision.
-    pty.url = "github:compoundingtech/pty/b9d02f3468b718ceff27031e0b9cb38de3bb6b1c";
+    pty.url = "github:compoundingtech/pty/1ae8c187301034d2b343b6ec638f2b74c009f92e";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared CI generators and the `otelite` collector used by release-integration.
     # Re-pin to effect-utils main once the Rust helpers and repo-settings PRs merge.
@@ -31,6 +31,33 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+
+        ciRustcWrapper = pkgs.writeShellApplication {
+          name = "ci-rustc-wrapper";
+          runtimeInputs = [ pkgs.coreutils pkgs.gnugrep ];
+          text = ''
+            export SCCACHE_BIN=${pkgs.sccache}/bin/sccache
+            ${builtins.readFile ./scripts/ci-rustc-wrapper}
+          '';
+        };
+
+        # Reuse the GitHub-archive flake source instead of importCargoLock's git fetcher.
+        # Reject new git sources until they also have an archive-backed input.
+        cargoDeps =
+          (pkgs.rustPlatform.importCargoLock.override {
+            fetchgit =
+              { url, rev, ... }:
+              assert pkgs.lib.assertMsg (url == "https://github.com/compoundingtech/pty")
+                "Cargo git dependency ${url} needs an archive-backed flake input";
+              assert pkgs.lib.assertMsg (rev == pty.rev)
+                "pty flake input (${pty.rev}) and Cargo.lock (${rev}) must pin the same revision";
+              pty.outPath;
+          }) {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "pty-core-0.13.0-rust" = pty.narHash;
+            };
+          };
         hmModuleEval = nixpkgs.lib.evalModules {
           specialArgs = {
             inherit pkgs;
@@ -192,6 +219,9 @@
           "st2-pty-stats-component"
           "--exclude"
           "st2-vista-component"
+          # The standalone decision model has its own hermetic gate.
+          "--exclude"
+          "st-decision-fold"
           # `checks.st3` gates these crates with the runtime inputs their tests need.
           "--exclude"
           "smallclaims"
@@ -220,12 +250,7 @@
           inherit version;
           src = self;
 
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-iUey+Jj6CT+Oqa0bWDGFXubqYBbpzlLUvpZ9CLFisBo=";
-            };
-          };
+          inherit cargoDeps;
 
           # The workspace default members include the st3 crates. This package ships only st2;
           # st3, `st`, stui, and st3-migrate come from the st3 package, so each has one build.
@@ -365,12 +390,7 @@
           '';
           # Stamp st3, its shared driver library, and stui from this declared flake source.
           CLI_BUILD_STAMP = buildStamp;
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-iUey+Jj6CT+Oqa0bWDGFXubqYBbpzlLUvpZ9CLFisBo=";
-            };
-          };
+          inherit cargoDeps;
           cargoBuildFlags = [
             "-p"
             "st3"
@@ -416,6 +436,8 @@
             runHook postCheck
           '';
           ST3_MESSAGING_COMPAT_BIN = "${messagingBaseline}/bin/st3";
+          ST3_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
+          ST3_OTEL_REQUIRE = "1";
           # These two tests put an openpty(3) terminal into raw mode. In the macOS Nix build one
           # fails and the other hangs, so they run on Linux only until they pass on macOS.
           checkFlags = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
@@ -456,6 +478,7 @@
             pkgs.curl
             pkgs.nodejs
             ptyPackage
+            effect-utils.packages.${system}.otelite
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.util-linux pkgs.systemd ]
           # Native session discovery lists processes with ps and lsof on macOS (Linux reads /proc).
@@ -604,12 +627,7 @@
           pname = "st2-provider-components";
           inherit version;
           src = self;
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-iUey+Jj6CT+Oqa0bWDGFXubqYBbpzlLUvpZ9CLFisBo=";
-            };
-          };
+          inherit cargoDeps;
           buildPhase = ''
             runHook preBuild
             cargo build --offline --release --target wasm32-unknown-unknown \
@@ -1135,9 +1153,8 @@
             pkgs.lld
             ptyPackage
             libghosttyVT
-            # Local runs of the OTLP export integration gate
-            # (`cargo test --test integration otel_export::`) need the same collector the
-            # Nix check pins; `ST2_OTELITE_BIN` points at it.
+            # Local st2/st3 OTLP export integration tests use the same collector as Nix checks;
+            # ST2_OTELITE_BIN and ST3_OTELITE_BIN point at it.
             effect-utils.packages.${system}.otelite
             # st3's messaging fault matrix runs the omp channel hook (TypeScript) under the
             # provider stand-in with Node's built-in type stripping, which Node 24 enables.
@@ -1149,7 +1166,13 @@
           # Same collector the Nix gate pins, so a bare
           # `cargo test --test integration otel_export::` in this shell runs against it.
           ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
+          ST3_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
           RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+          shellHook = ''
+            if [ "''${GITHUB_ACTIONS:-}" = true ]; then
+              export RUSTC_WRAPPER=${ciRustcWrapper}/bin/ci-rustc-wrapper
+            fi
+          '';
         };
         # The in-process load test uses a stand-in PTY and needs no collector or harness tools.
         devShells.perf = pkgs.mkShell {
@@ -1166,6 +1189,9 @@
           # build.rs embeds the fixture PATH. Runner-specific directories would invalidate
           # st3's compiler cache even when its sources have not changed.
           shellHook = ''
+            if [ "''${GITHUB_ACTIONS:-}" = true ]; then
+              export RUSTC_WRAPPER=${ciRustcWrapper}/bin/ci-rustc-wrapper
+            fi
             export PATH="$(printf '%s' "$PATH" | tr ':' '\n' | sed -n '\|^/nix/store/|p' | paste -sd:):/usr/bin:/bin"
           '';
         };

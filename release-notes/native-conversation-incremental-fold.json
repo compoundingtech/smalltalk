@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Native conversations are served from an incremental in-memory fold with keyset page cursors, so reading a long OMP, Claude or Codex transcript after an append no longer re-parses its whole window.",
+  "replay": {
+    "status": "none",
+    "detail": "The fold is memory-only and rebuilds from the transcript on first read; no claim replay or projection rebuild is added."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers or migrations change. Conversation content stays volatile and is never stored."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or fleet coordination requirements change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Native timeline continuations become authenticated keyset cursors (page/native/...) bound to a per-process source generation. Cursors issued before a daemon restart, after a transcript replacement or rewrite, or after the transcript's fold is evicted from the in-memory cache (16 transcripts or 96 MiB) return 410 page-cursor-expired, and clients restart from the first page as they already do. The client-v0 schema and entry shapes are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration or recovery wait. The first read of each transcript after a restart pays one cold fold of its window."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action or configuration change is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swapping back to the previous binary is supported; no stored state changes. Outstanding page cursors expire and clients restart pagination."
+  }
+}

@@ -94,6 +94,7 @@ pub async fn run(
         tokio::select! {
             frame = subscription.receiver.recv() => match frame {
                 Some(Frame::Mailbox { messages: next }) => { messages = next; replayed = true; },
+                Some(Frame::Replay { nonce }) => subscription.acknowledge_replay(nonce),
                 Some(Frame::Drain { operation }) => subscription.acknowledge_drain(operation),
                 Some(Frame::Seat { .. }) => {}, // the outer driver owns the PTY title
                 Some(Frame::Fenced { reason }) => anyhow::bail!("{reason}"),
@@ -535,6 +536,48 @@ async fn receipt(
         )
         .await
 }
+/// A user-scoped plugin may be loaded by ordinary Claude sessions outside a seat.
+/// Serve the protocol without paths, daemon access, mailbox fences or readiness observations.
+pub async fn run_idle() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt as _, BufReader};
+    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let mut stdout = tokio::io::stdout();
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let incoming: Value = match serde_json::from_str(&line) {
+            Ok(value) => value,
+            Err(_) => {
+                write(&mut stdout, &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}})).await?;
+                continue;
+            }
+        };
+        let id = &incoming["id"];
+        if id.is_null() {
+            continue;
+        }
+        let result = match incoming["method"].as_str() {
+            Some("initialize") => json!({"protocolVersion":"2025-03-26","capabilities":{},
+                "serverInfo":{"name":"st","version":env!("CARGO_PKG_VERSION")}}),
+            Some("tools/list") => json!({"tools":[]}),
+            Some("resources/list") => json!({"resources":[]}),
+            Some("resources/templates/list") => json!({"resourceTemplates":[]}),
+            Some("prompts/list") => json!({"prompts":[]}),
+            Some("ping") => json!({}),
+            _ => {
+                write(&mut stdout, &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Method not found"}})).await?;
+                continue;
+            }
+        };
+        write(
+            &mut stdout,
+            &json!({"jsonrpc":"2.0","id":id,"result":result}),
+        )
+        .await?;
+    }
+    Ok(())
+}
 async fn write(stdout: &mut tokio::io::Stdout, frame: &Value) -> Result<()> {
     stdout
         .write_all(format!("{}\n", serde_json::to_string(frame)?).as_bytes())
@@ -548,7 +591,8 @@ fn request(line: &str, initialized: &mut bool) -> Result<Option<Value>> {
     let result = match request["method"].as_str() {
         Some("initialize") => {
             json!({"protocolVersion":"2025-03-26","capabilities":{"experimental":{"claude/channel":{}}},
-            "serverInfo":{"name":"st","version":env!("CARGO_PKG_VERSION")}})
+            "serverInfo":{"name":"st","version":env!("CARGO_PKG_VERSION")},
+            "instructions":st_drivers::ding::CHANNEL_INSTRUCTIONS})
         }
         Some("notifications/initialized") => {
             *initialized = true;
@@ -567,6 +611,47 @@ fn request(line: &str, initialized: &mut bool) -> Result<Option<Value>> {
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn scoped_protocol_keeps_channel_capability_and_empty_tool_surface() {
+        let mut initialized = false;
+        let initialize = request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+            &mut initialized,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            initialize["result"]["capabilities"]["experimental"]["claude/channel"],
+            json!({})
+        );
+        assert_eq!(
+            initialize["result"]["instructions"],
+            st_drivers::ding::CHANNEL_INSTRUCTIONS
+        );
+        assert!(
+            initialize["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("people have no inbox, so do not reply with st")
+        );
+        let tools = request(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            &mut initialized,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(tools["result"], json!({"tools":[]}));
+        assert!(
+            request(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                &mut initialized
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(initialized);
+    }
 
     #[test]
     fn claude_receipt_state_accepts_ledgers_written_before_native_acceptance_tracking() {

@@ -13,7 +13,7 @@ fn a_seats_subagents_appear_renew_and_end() {
     use std::path::PathBuf;
     use std::process::Command;
 
-    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo = PathBuf::from(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     let in_ci = std::env::var_os("CI_RUN_ID").is_some();
     let path = std::env::var_os("PATH").unwrap_or_default();
     let on_path =
@@ -37,7 +37,7 @@ fn a_seats_subagents_appear_renew_and_end() {
             "python3",
         ])
         .arg(repo.join("scripts/st3-subagents-eval/run"))
-        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
+        .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg(&evidence)
         .output()
         .expect("run the subagent seat eval");

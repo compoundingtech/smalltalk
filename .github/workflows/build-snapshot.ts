@@ -1,3 +1,6 @@
+/** Outage queue runs consume the shared cache; PR/main runs keep publishing it. */
+export const optionalQueueCacheSave = "(github.event_name != 'merge_group' || vars.CI_OUTAGE_FAST_QUEUE != 'on')"
+
 export const buildSnapshotRestore = {
   id: 'build-snapshot', name: 'Restore the exact-source build snapshot',
   if: "env.CI_LOCAL_CACHES != '1'",
@@ -10,7 +13,7 @@ export const buildSnapshotPrepare = {
 }
 export const buildSnapshotSave = [
   {
-    id: 'build-snapshot-save', name: 'Keep valid same-source build outputs', if: '!cancelled()',
+    id: 'build-snapshot-save', name: 'Keep valid same-source build outputs', if: `!cancelled() && ${optionalQueueCacheSave}`,
     env: { CI_SNAPSHOT_PIPELINE: '${{ github.workflow_sha }}' },
     run: 'python3 "${CI_BUILD_SNAPSHOT_SCRIPT:-scripts/ci-build-snapshot}" pack',
   },

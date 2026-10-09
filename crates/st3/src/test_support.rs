@@ -92,7 +92,7 @@ pub fn supervise_test() -> bool {
             return false;
         }
         let script =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/st3_test_process.py");
+            Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../scripts/st3_test_process.py");
         let output = Command::new("python3")
             .arg(script)
             .args(["--owner", &std::process::id().to_string(), "--"])
@@ -163,4 +163,79 @@ pub(crate) fn pause_startup_replay() {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// Fixture-only barrier AFTER the actual owned provider has exited and its wrapper returned.
+/// The production binary never calls this function; a process environment cannot opt it in.
+#[cfg(feature = "test-support")]
+pub fn hold_provider_completion(outcome: &anyhow::Result<()>) -> anyhow::Result<()> {
+    let Some(root) = std::env::var_os("ST3_FIXTURE_TERMINAL_COMPLETION").map(PathBuf::from) else {
+        return Ok(());
+    };
+    std::fs::write(root.join("provider-return.json"), serde_json::to_vec(&serde_json::json!({
+        "ok": outcome.is_ok(), "error": outcome.as_ref().err().map(|error| format!("{error:#}")),
+    }))?)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !root.join("release-provider").exists() {
+        anyhow::ensure!(std::time::Instant::now() < deadline, "fixture provider release timed out");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+/// Exercise the real Store admission in isolated integration fixtures, without an API bypass
+/// in the installed CLI. This module exists only for test/test-support builds.
+pub fn bind_fixture_mailbox(store: &crate::store::Store, fence: &crate::mailbox::Fence)
+    -> Result<crate::mailbox::Fence, crate::St3Error>
+{
+    store.bind_mailbox(fence)
+}
+
+pub fn check_fixture_mailbox(store: &crate::store::Store, fence: &crate::mailbox::Fence)
+    -> Result<(), crate::St3Error>
+{
+    store.check_mailbox(fence)
+}
+
+#[cfg(feature = "test-support")]
+type MailboxTransportControls = std::sync::Mutex<
+    std::collections::BTreeMap<(usize, String), tokio::sync::watch::Sender<bool>>,
+>;
+
+#[cfg(feature = "test-support")]
+fn mailbox_transports() -> &'static MailboxTransportControls {
+    static CONTROLS: OnceLock<MailboxTransportControls> = OnceLock::new();
+    CONTROLS.get_or_init(Default::default)
+}
+
+/// Process-local transport loss in an invented integration fixture. No API route,
+/// CLI flag or environment variable can select a production seat or activate it.
+#[cfg(feature = "test-support")]
+pub fn hold_fixture_mailbox(store: &std::sync::Arc<crate::store::Store>, subject: &str, held: bool) {
+    assert!(subject.starts_with("agent/eval."), "mailbox loss controls require an invented fixture seat");
+    mailbox_transports().lock().unwrap()
+        .entry((std::sync::Arc::as_ptr(store) as usize, subject.into()))
+        .or_insert_with(|| tokio::sync::watch::channel(false).0).send_replace(held);
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn fixture_mailbox_transport(store: &std::sync::Arc<crate::store::Store>, subject: &str) -> tokio::sync::watch::Receiver<bool> {
+    mailbox_transports().lock().unwrap()
+        .entry((std::sync::Arc::as_ptr(store) as usize, subject.into()))
+        .or_insert_with(|| tokio::sync::watch::channel(false).0).subscribe()
+}
+
+/// Build an explicit already-admitted protocol fixture. Callers own its temporary Store,
+/// socket and synthetic runtime. This adapter preserves kernel peer subject checks and
+/// durable Store fences, but cannot qualify native physical ownership or recovery.
+#[cfg(feature = "test-support")]
+pub fn admitted_mailbox_protocol_router(state: crate::api::AppState) -> axum::Router {
+    crate::api::admitted_mailbox_protocol_router(state)
+}
+
+/// An invented example seat in a caller-owned temporary Store. This supplies only a
+/// synthetic transport identity, not a physical native lease or provider authority.
+#[cfg(feature = "test-support")]
+pub fn synthetic_mailbox_protocol_router(state: crate::api::AppState, subject: &str) -> axum::Router {
+    crate::api::synthetic_mailbox_protocol_router(state, subject)
 }

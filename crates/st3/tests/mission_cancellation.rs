@@ -38,7 +38,7 @@ impl Daemon {
     fn launch(&mut self) {
         let log = File::create(self.root.join("daemon.log")).unwrap();
         self.child = Some(
-            st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+            st3::test_support::command(test_bin!("st3-fixture"))
                 .env_clear()
                 .env("HOME", &self.root)
                     .env(
@@ -81,7 +81,7 @@ impl Daemon {
     }
 
     fn command(&self, args: &[&str]) -> Value {
-        let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+        let output = st3::test_support::command(test_bin!("st3-fixture"))
             .env_clear()
             .env("HOME", &self.root)
             .env("ST3_DAEMON_WAIT", "0")

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Publish complete terminal-probe hide and show actions before the fixture worker consumes them.",
+  "replay": { "status": "none", "detail": "Test fixture publication and controls only; no production or upgrade behavior changes." },
+  "schema": { "status": "none", "detail": "Test fixture publication and controls only; no production or upgrade behavior changes." },
+  "rules": { "status": "none", "detail": "Test fixture publication and controls only; no production or upgrade behavior changes." },
+  "compatibility": { "status": "none", "detail": "Test fixture publication and controls only; no production or upgrade behavior changes." },
+  "downtime": { "status": "none", "detail": "Test fixture publication and controls only; no production or upgrade behavior changes." },
+  "manual": { "status": "none", "detail": "Test fixture publication and controls only; no production or upgrade behavior changes." },
+  "recovery": { "status": "none", "detail": "Test fixture publication and controls only; no production or upgrade behavior changes." }
+}

@@ -87,14 +87,26 @@ const BOOKKEEPING_RECORDS = [
   'event_msg', 'token_usage_record', 'turn_context', 'world_state',
 ];
 
+// A record Claude writes about its own session, in kinds that keep appearing (instructions, session
+// context, prompt snapshots, deferred tools, hook summaries): an attachment, system record or entry
+// no renderer knows by name. Claude's own screen shows none as conversation, so they are
+// bookkeeping as a class (as in st3-conversation-ui).
+const claudeContextRecord = (text: string) => /^\[unrecognized claude (attachment|system|entry) `/.test(text);
+
 // A reasoning step whose text the model did not share is bookkeeping too.
+// omp's `custom` entries that only repeat what the conversation shows: a tool call's start (its call is
+// an entry of its own) and the end of the session. Other custom entries stay visible.
+const OMP_BOOKKEEPING_CUSTOM = ['tool_execution_start', 'session_exit'];
+const ompBookkeeping = (block: Record<string, unknown>) =>
+  str(block.source_type) === 'custom' && OMP_BOOKKEEPING_CUSTOM.includes(str(record(record(block.payload).raw).customType) ?? '');
+
 function isBookkeeping(entry: Entry, filters: readonly DisplayFilter[]): boolean {
   if (!filters.includes('bookkeeping') || entry.type !== 'content') return false;
   const body = record(entry.body);
   const shown = (Array.isArray(body.blocks) ? body.blocks : []).map(record).filter(block => !['internal', 'hidden-by-harness'].includes(str(block.visibility) ?? ''));
   if (!shown.length) return false;
   if (entry.role === 'assistant') return shown.every(block => block.kind === 'reasoning' && !(str(record(block.payload).text) ?? '').trim());
-  if (entry.role === 'system') return shown.every(block => block.kind === 'unknown' && BOOKKEEPING_RECORDS.includes(str(block.source_type) ?? ''));
+  if (entry.role === 'system') return shown.every(block => block.kind === 'unknown' && (BOOKKEEPING_RECORDS.includes(str(block.source_type) ?? '') || ompBookkeeping(block) || claudeContextRecord(str(body.text) ?? '')));
   return false;
 }
 
@@ -204,6 +216,7 @@ export function signatureMark(provenance: unknown): string | undefined {
 
 /** The lines st adds beside a delivery for the agent (st-drivers `ding`). */
 const ST_DELIVERY_NOTES = [
+  'Answer the person in this conversation; people have no inbox, so do not reply with st.',
   "The person reads replies in st, not in the agent's session.",
   '(dictated by voice; it may contain transcription mistakes)',
 ];

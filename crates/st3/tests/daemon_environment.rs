@@ -21,7 +21,7 @@ fn executable(path: &Path, source: &str) {
 fn start_service(root: &Path, home: &Path, state_home: &Path) -> (Service, std::path::PathBuf) {
     let socket = root.join("daemon.sock");
     let log = std::fs::File::create(root.join("daemon.log")).unwrap();
-    let binary = assert_cmd::cargo::cargo_bin!("st3-fixture");
+    let binary = test_bin!("st3-fixture");
     let mut service = Service(
         st3::test_support::command(binary)
             .env_clear()
@@ -55,7 +55,7 @@ fn start_service(root: &Path, home: &Path, state_home: &Path) -> (Service, std::
 }
 
 fn doctor_report(home: &Path, socket: &Path) -> serde_json::Value {
-    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+    let output = st3::test_support::command(test_bin!("st3-fixture"))
         .env_clear()
         .env("HOME", home)
         .arg("--endpoint")
@@ -95,7 +95,7 @@ mission "hermetic" state="ready" {
         .env("ST_AGENT", "agent/fixture/host")
         .args(["--noprofile", "--norc", "-c", "\"$@\"; status=$?; exit \"$status\"", "fixture-parent"])
         .arg(env).args(["-u", "ST_AGENT"])
-        .arg(env!("CARGO_BIN_EXE_st3-fixture"))
+        .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg("--endpoint").arg(&socket)
         .args(["missions", "publish"]).arg(source)
         .args(["--as", "person/pat", "--no-gate-check"])
@@ -122,7 +122,7 @@ fn client_without_runtime_dir_reaches_daemon_with_different_socket() {
     assert!(state_socket.as_os_str().len() > 108);
     assert_eq!(std::fs::read_link(&state_socket).unwrap(), socket);
 
-    let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+    let output = st3::test_support::command(test_bin!("st3-fixture"))
         .env_clear()
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", root.path().join("config"))
@@ -402,7 +402,7 @@ fn a_profile_configured_gate_uses_the_gateway_and_node_identity_without_local_cr
         }
     });
     for expected_code in [0, 3] {
-        let output = st3::test_support::command(assert_cmd::cargo::cargo_bin!("st3-fixture"))
+        let output = st3::test_support::command(test_bin!("st3-fixture"))
             .env_clear().env("HOME", &home).env("PATH", &bin)
             .env("GH_TOKEN", "fixture-local-credential").env("GITHUB_TOKEN", "fixture-secondary")
             .env("ST_SEKRETS_SOCKET", &socket).env("XDG_CONFIG_HOME", root.path().join("config"))

@@ -241,6 +241,24 @@ pub fn read_runtime_state(agent_dir: &Path, runtime: &str) -> Result<Option<Vec<
     Ok((owner.as_deref() == Some(runtime)).then_some(raw))
 }
 
+/// Capture the provider snapshot and its physical runtime binding together. Unlike a
+/// filtered read, this distinguishes a retained predecessor from missing/corrupt authority.
+pub fn read_bound_provider_state(agent_dir: &Path) -> Result<Option<(String, Vec<u8>)>> {
+    let mut connection = open(agent_dir)?;
+    let tx = connection.transaction()?;
+    let raw: Option<Vec<u8>> = tx.query_row(
+        "SELECT body FROM snapshots WHERE kind='harness-state'", [], |row| row.get(0),
+    ).optional()?;
+    let Some(raw) = raw else { return Ok(None); };
+    let state: Value = serde_json::from_slice(&raw)?;
+    let token = state["incarnation"].as_str().filter(|token| !token.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("provider snapshot has no ownership token"))?;
+    let runtime: String = tx.query_row(
+        "SELECT value FROM metadata WHERE key=?1", [format!("provider-runtime:{token}")], |row| row.get(0),
+    )?;
+    Ok(Some((runtime, raw)))
+}
+
 fn current_token(connection: &Connection) -> Result<Option<String>> {
     let raw: Option<Vec<u8>> = connection
         .query_row(
