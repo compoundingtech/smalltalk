@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Omit absent optional fields in relayed conversation frames",
+  "replay": {"status": "none", "detail": "No claim replay or stored message changes."},
+  "schema": {"status": "none", "detail": "The published client-v0 schema remains unchanged. Generated Rust models omit absent non-nullable optional fields instead of serializing them as null."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated upgrade required."},
+  "compatibility": {"status": "none", "detail": "Relayed conversation snapshots and changes conform to the existing collection schema. Present field values are unchanged, and fields explicitly permitting null retain their existing serialization, including message reply_to, pagination cursors and nullable resource fields."},
+  "downtime": {"status": "none", "detail": "No additional startup work or expected interruption."},
+  "manual": {"status": "none", "detail": "No configuration changes or operator actions required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or new rollback restrictions."}
+}

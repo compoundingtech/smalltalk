@@ -35,7 +35,7 @@ pub struct ErrorEnvelope {
     pub code: ErrorCode,
     pub message: String,
     pub retryable: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_after_ms: Option<u64>,
     #[serde(default)]
     pub details: BTreeMap<String, Value>,
@@ -113,17 +113,29 @@ pub struct Limits {
     pub max_event_items: usize,
     pub max_response_bytes: usize,
     pub max_wait_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_glass_body_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_glasses: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_glass_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_glass_nodes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_arrangement_body_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_arrangement_resource_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_arrangements: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_arrangement_name_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_arrangement_key_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_arrangement_operations: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_arrangement_folders: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_arrangement_placements: Option<usize>,
 }
 
@@ -277,7 +289,7 @@ pub struct ResourceHeader {
     pub id: String,
     pub revision: String,
     pub updated_at: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operational: Option<Operational>,
 }
 
@@ -310,27 +322,38 @@ pub struct Attention {
     pub attention_kind: String,
     pub source_id: String,
     pub person_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub requester_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub variant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     pub preview_token: Option<String>,
     pub preview: Option<LaunchPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub what: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub because: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub review_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mission_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mission_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub step_run_id: Option<String>,
     /// A person-step ask's structured request; absent on a free-text ask.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<StructuredRequest>,
     /// Information the person asked for; reading it clears the card.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update: Option<PersonUpdate>,
     /// The mission step waiting on this ask, on an ask a mission step made.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<AttentionBlocked>,
     pub title: String,
     pub detail: String,
@@ -358,7 +381,7 @@ pub struct AttentionBlocked {
 pub struct AttentionTargetState {
     pub id: String,
     pub state: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -384,9 +407,9 @@ pub struct ClientConnection {
     /// The client's own `x-st3-client` name and build; absent when it sent none.
     #[serde(default)]
     pub client: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
     pub member: String,
     /// `local`, `gateway` (a paired device over Tailscale or Fabric) or `tailscale`.
@@ -418,7 +441,7 @@ pub struct UsagePeriod {
     #[serde(default)]
     pub limits: Vec<UsageLimit>,
     /// Daily planning estimate, including useful work; absent on older daemons.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_messages: Option<AgentMessageEstimate>,
 }
 /// Count times receiving-seat allowance, with a fleet fallback. Not causal overhead.
@@ -454,22 +477,22 @@ pub struct AgentMessageDay {
 pub struct UsageLimit {
     pub account: String,
     /// The declared account the measuring seat ran on, when it was bound to one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_ref: Option<String>,
     /// Whether the source named a provider identity or declared account, independent of freshness.
     /// Older servers omit this metadata.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identified: Option<bool>,
     pub driver: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub five_hour_percent: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub five_hour_resets_at_unix_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weekly_percent: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weekly_resets_at_unix_ms: Option<u64>,
     pub measured_at_unix_ms: u64,
     pub measured_by: String,
@@ -480,21 +503,21 @@ pub struct UsageLimit {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsageRow {
     pub agent: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission_run: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_session_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing_provenance: Option<Vec<UsagePricing>>,
     pub total_tokens: u64,
     pub input_tokens: u64,
@@ -520,12 +543,12 @@ pub struct UsagePricingRates {
 /// A price/source contribution, cumulative on claims and differenced on period reads.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsagePricing {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_table_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_table_version: Option<String>,
     pub cost_source: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rates_usd_per_million_tokens: Option<UsagePricingRates>,
     pub total_tokens: u64,
     pub input_tokens: u64,
@@ -701,7 +724,7 @@ pub struct Visualization {
     pub version: String,
     #[serde(default)]
     pub views: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission: Option<String>,
     #[serde(default)]
     pub nodes: Vec<VisualizationNode>,
@@ -722,13 +745,13 @@ pub struct Visualization {
     pub resources: Vec<Value>,
     #[serde(default)]
     pub decisions: Vec<LaunchDecision>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<Value>,
     #[serde(default)]
     pub diffs: Vec<StructuredDiff>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk: Option<Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_progress: Option<Value>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -770,7 +793,7 @@ pub struct Launch {
     pub decisions: Vec<String>,
     #[serde(default)]
     pub approvals: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visualization: Option<Visualization>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -788,9 +811,9 @@ pub struct LaunchVariant {
     #[serde(default)]
     pub diagnostics: Vec<Value>,
     pub preview_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_diff: Option<StructuredDiff>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visualization: Option<Visualization>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -846,13 +869,19 @@ pub struct LaunchApproval {
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsageContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub used_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub window_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub used_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default)]
     pub compactions: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_compaction_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_compaction_trigger: Option<String>,
     pub observed_at_unix_ms: u64,
 }
@@ -864,10 +893,13 @@ pub struct UsageSummary {
     pub cached_tokens: u64,
     #[serde(default)]
     pub cache_write_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     pub incarnation_count: usize,
     pub aggregation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<UsageContext>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -883,10 +915,11 @@ pub struct Mission {
     pub runs: Vec<String>,
     #[serde(default)]
     pub run_details: Vec<MissionRunSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub must_act: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_runs: Option<usize>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_runs: Option<usize>,
     #[serde(default)]
     pub run_counts: BTreeMap<String, u64>,
@@ -902,6 +935,7 @@ pub struct Mission {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MissionRunSummary {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_id: Option<String>,
     pub requester: String,
     pub status: String,
@@ -1015,6 +1049,7 @@ pub struct Work {
     pub assigned_to: Option<String>,
     pub last_progress: Option<String>,
     pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gate_kind: Option<String>,
     pub attempt: u32,
     pub readiness_epoch: u64,
@@ -1069,7 +1104,7 @@ pub struct Agent {
     pub harness_error_state: Option<String>,
     #[serde(default)]
     pub since: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation: Option<String>,
     #[serde(default)]
     pub blocked_on: Option<String>,
@@ -1565,7 +1600,7 @@ pub struct ResourcesPage {
     pub filters: BTreeMap<String, String>,
     pub items: Vec<ResourceObservation>,
     pub page: PageInfo,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncNotice>,
 }
 
@@ -1941,11 +1976,11 @@ pub struct TimelineMessageBody {
     pub message_id: String,
     #[serde(default)]
     pub reply_to: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
@@ -1977,9 +2012,9 @@ pub struct MessageProvenance {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TimelineContentBody {
     pub media_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachment_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<TimelineBlock>,
@@ -2016,7 +2051,7 @@ pub enum TimelineToolStatus {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TimelineStatusBody {
     pub status: TimelineStatus,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<TimelineBlock>,
@@ -2049,35 +2084,35 @@ pub struct TimelineErrorBody {
 pub struct TimelineUsageBody {
     pub semantics: TimelineUsageSemantics,
     pub driver: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_used_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_used_percent: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compactions: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compaction_ms: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_compaction_trigger: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
     pub attribution: TimelineAttribution,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2106,7 +2141,7 @@ pub struct TimelineAttribution {
 pub struct TimelineRedactionBody {
     pub reason: String,
     pub withheld_bytes: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub withheld_items: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<TimelineBlock>,
@@ -2117,7 +2152,7 @@ pub struct TimelineTruncationBody {
     pub reason: String,
     pub omitted_from_sequence: u64,
     pub omitted_to_sequence: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<TimelineBlock>,
@@ -2168,21 +2203,21 @@ pub struct Fence {
     pub snapshot_id: String,
     #[serde(default)]
     pub subject_revisions: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mission_generation: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_definition: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness_epoch: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_incarnation: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_desired_revision: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_sequence: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview_token: Option<String>,
 }
 

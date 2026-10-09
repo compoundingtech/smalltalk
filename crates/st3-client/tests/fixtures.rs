@@ -17,6 +17,62 @@ fn decode<T: serde::de::DeserializeOwned>(name: &str) -> T {
 }
 
 #[test]
+fn optional_model_fields_are_omitted_but_nullable_fields_keep_null() {
+    use serde_json::json;
+
+    fn round_trip<T: serde::de::DeserializeOwned + serde::Serialize>(
+        input: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::to_value(serde_json::from_value::<T>(input).unwrap()).unwrap()
+    }
+
+    assert_eq!(
+        round_trip::<TimelineMessageBody>(json!({"message_id":"message/minimal"})),
+        json!({"message_id":"message/minimal", "reply_to":null}),
+    );
+    assert_eq!(
+        round_trip::<TimelineContentBody>(json!({"media_type":"text/plain", "text":"hello"})),
+        json!({"media_type":"text/plain", "text":"hello"}),
+    );
+    assert_eq!(
+        round_trip::<TimelineStatusBody>(json!({"status":"running"})),
+        json!({"status":"running"}),
+    );
+    assert_eq!(
+        round_trip::<TimelineUsageBody>(json!({
+            "semantics":"response", "driver":"codex", "total_tokens":1,
+            "attribution":{"agent_id":"agent/example"},
+        })),
+        json!({
+            "semantics":"response", "driver":"codex", "total_tokens":1,
+            "attribution":{"agent_id":"agent/example", "mission_run_id":null,
+                "generation_id":null, "step_id":null},
+        }),
+    );
+    assert_eq!(
+        round_trip::<TimelineRedactionBody>(json!({"reason":"private", "withheld_bytes":1})),
+        json!({"reason":"private", "withheld_bytes":1}),
+    );
+    assert_eq!(
+        round_trip::<TimelineTruncationBody>(json!({
+            "reason":"budget", "omitted_from_sequence":1, "omitted_to_sequence":2,
+        })),
+        json!({"reason":"budget", "omitted_from_sequence":1, "omitted_to_sequence":2}),
+    );
+    assert_eq!(
+        round_trip::<PageInfo>(json!({"limit":200, "has_more":false})),
+        json!({"limit":200, "has_more":false, "next_cursor":null, "cursor_expires_at":null}),
+    );
+    assert_eq!(
+        round_trip::<GlassDelete>(json!({})),
+        json!({"base_revision":null}),
+    );
+    let populated = json!({"message_id":"message/full", "reply_to":"message/earlier",
+        "from":"person/example", "to":"agent/example", "title":"Present"});
+    assert_eq!(round_trip::<TimelineMessageBody>(populated.clone()), populated);
+}
+
+#[test]
 fn search_fixture_preserves_result_targets_and_incomplete_history() {
     let search: Envelope<ConversationSearch> = decode("conversation-search.json");
     assert_eq!(search.value.items[0].entry_id, "timeline-entry/note");

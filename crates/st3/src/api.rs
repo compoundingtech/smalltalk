@@ -62,6 +62,8 @@ mod client_blobs;
 mod client_adapters;
 mod client_presence;
 mod client_v0;
+#[cfg(test)]
+pub(crate) use client_v0::assert_collection_frame_conforms;
 mod custom;
 mod delivery_presence;
 pub(crate) mod agent_harness;

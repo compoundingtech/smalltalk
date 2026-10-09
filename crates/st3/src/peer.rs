@@ -3435,6 +3435,47 @@ mod tests {
         let resumed = reconnected.next().await.unwrap().unwrap();
         assert_eq!(resumed.value.items.len(), 1);
         reconnected.close().await;
+        // Owner-native timeline messages can omit every optional message field.
+        let append_minimal = |sequence: u64| {
+            owner.store.append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "harness.timeline".into(),
+                actor: Some(agent.into()),
+                fields: serde_json::from_value(serde_json::json!({
+                    "operation":"append",
+                    "entry_id":format!("timeline-entry/minimal-{sequence}"),
+                    "revision":1, "role":"assistant", "entry_type":"message", "final":true,
+                    "body":{"message_id":format!("message/minimal-{sequence}")},
+                    "driver":"codex", "incarnation_id":incarnation, "sequence":sequence,
+                })).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            owner.event_notify.send_modify(|value| *value += 1);
+        };
+        append_minimal(2);
+        let mut collections = client.collection_stream().await.unwrap();
+        collections.subscribe_conversation("relay-contract", agent).await.unwrap();
+        for replace in [true, false] {
+            let frame = tokio::time::timeout(Duration::from_secs(5), collections.next())
+                .await.unwrap().unwrap().unwrap();
+            crate::api::assert_collection_frame_conforms(&frame);
+            assert_eq!(frame["replace"], replace, "{frame}");
+            let message = frame["items"].as_array().unwrap().iter()
+                .find(|item| item["id"] == if replace {
+                    "timeline-entry/minimal-2"
+                } else {
+                    "timeline-entry/minimal-3"
+                }).unwrap();
+            for field in ["from", "to", "title"] {
+                assert!(message["body"].get(field).is_none(), "{frame}");
+            }
+            // reply_to explicitly permits null in the published schema.
+            assert!(message["body"]["reply_to"].is_null(), "{frame}");
+            if replace {
+                append_minimal(3);
+            }
+        }
+        collections.close().await;
     }
 
     #[tokio::test]

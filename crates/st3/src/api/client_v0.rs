@@ -10412,6 +10412,31 @@ pub(super) async fn action(
 }
 
 #[cfg(test)]
+pub(crate) fn assert_collection_frame_conforms(frame: &Value) {
+    let mut schema: Value = serde_json::from_str(include_str!(
+        "../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
+    ))
+    .unwrap();
+    schema.as_object_mut().unwrap().remove("oneOf");
+    schema["$ref"] = json!("#/$defs/CollectionFrame");
+    let validator = jsonschema::options()
+        .with_draft(jsonschema::Draft::Draft202012)
+        .build(&schema)
+        .unwrap();
+    let errors: Vec<_> = validator
+        .iter_errors(frame)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(errors.is_empty(), "{frame}: {errors:?}");
+    let mut extra = frame.clone();
+    extra["undeclared"] = json!(true);
+    assert!(!validator.is_valid(&extra));
+    let mut bad_retry = frame.clone();
+    bad_retry["retryable"] = json!("yes");
+    assert!(!validator.is_valid(&bad_retry));
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
@@ -10827,29 +10852,6 @@ mission "queue-parity" state="ready" {
         assert_eq!(terminal_error_close_code("stale-incarnation"), 1008);
     }
 
-    fn assert_collection_frame_conforms(frame: &Value) {
-        let mut schema: Value = serde_json::from_str(include_str!(
-            "../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
-        ))
-        .unwrap();
-        schema.as_object_mut().unwrap().remove("oneOf");
-        schema["$ref"] = json!("#/$defs/CollectionFrame");
-        let validator = jsonschema::options()
-            .with_draft(jsonschema::Draft::Draft202012)
-            .build(&schema)
-            .unwrap();
-        let errors: Vec<_> = validator
-            .iter_errors(frame)
-            .map(|error| error.to_string())
-            .collect();
-        assert!(errors.is_empty(), "{frame}: {errors:?}");
-        let mut extra = frame.clone();
-        extra["undeclared"] = json!(true);
-        assert!(!validator.is_valid(&extra));
-        let mut bad_retry = frame.clone();
-        bad_retry["retryable"] = json!("yes");
-        assert!(!validator.is_valid(&bad_retry));
-    }
 
     #[tokio::test]
     async fn agent_roster_warm_ws_read_bypasses_a_cold_builder_admission() {
