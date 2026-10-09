@@ -975,6 +975,18 @@ struct ViewEntry {
     owners: Vec<String>,
 }
 
+#[cfg(test)]
+fn subject_current_revision(connection: &Connection, subject: &str) -> Result<u64> {
+    if !subject.starts_with("agent/") {
+        return Ok(0);
+    }
+    Ok(connection.query_row(
+        "SELECT COALESCE(MAX(local_id),0) FROM latest_values WHERE subject=?1",
+        [subject],
+        |row| row.get(0),
+    )?)
+}
+
 fn subject_current_revisions(connection: &Connection, names: &BTreeSet<String>) -> Result<BTreeMap<String, u64>> {
     let agents = names.iter().filter(|name| name.starts_with("agent/")).collect::<Vec<_>>();
     let mut revisions = BTreeMap::new();
