@@ -489,18 +489,12 @@ impl<'a> SeatChecks<'a> {
     }
 
     /// Whether the previous rows hold a login item for `seat`: any claim about it can change
-    /// that item, its episode or its removal.
+    /// that item, its episode or its removal. A login item names its seat as its source and
+    /// lists every seat it covers in its targets, so a seat sharing another's login counts too.
     fn has_login_item(&mut self, seat: &str) -> bool {
         let previous = self.previous;
         self.login_items
-            .get_or_insert_with(|| {
-                previous
-                    .rows
-                    .iter()
-                    .filter(|row| row["attention_kind"] == "harness-login")
-                    .filter_map(|row| row["source_id"].as_str().map(str::to_owned))
-                    .collect()
-            })
+            .get_or_insert_with(|| login_seats(&previous.rows))
             .contains(seat)
     }
 
@@ -530,6 +524,20 @@ impl<'a> SeatChecks<'a> {
         self.retiring.insert(seat.to_owned(), retiring);
         Ok(retiring)
     }
+}
+
+/// Every seat a login item in `rows` covers: its source and its targets.
+fn login_seats(rows: &[Value]) -> BTreeSet<String> {
+    rows.iter()
+        .filter(|row| row["attention_kind"] == "harness-login")
+        .flat_map(|row| {
+            row["source_id"]
+                .as_str()
+                .into_iter()
+                .chain(row["targets"].as_array().into_iter().flatten().filter_map(Value::as_str))
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 /// Whether `subject`'s current declaration is a stop: only then can a retiring seat's ask read
