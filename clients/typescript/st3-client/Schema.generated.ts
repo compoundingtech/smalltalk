@@ -1788,6 +1788,8 @@ export type SummaryMachinesEncoded = typeof SummaryMachines.Encoded
 /** Complete current source counts, independent of list page limits. One summary/current resource per authorized subscription. Unavailable source coverage sends resync, never inferred zero counts. */
 export const Summary = /*#__PURE__*/ (() => Schema.Struct({
   "active_missions": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself. */
+  "agents_as_of": optionalKey(Schema.Struct({ "published_at": Timestamp, "store_index": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) })).annotate({ description: "The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself." }),
   "id": Id,
   "kind": Schema.Literal("summary"),
   "machines": SummaryMachines,
@@ -1906,6 +1908,8 @@ export const Snapshot = /*#__PURE__*/ (() => Schema.Struct({
   "host_id": HostId,
   "id": SnapshotId,
   "projection_version": Schema.Literal("client-projection.v0"),
+  /** For rows a background refresher prepared, such as the agents roster: when it published them. They reflect `store_index`, and local activity up to this time. */
+  "published_at": optionalKey(Timestamp),
   "store_index": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
 }).annotate({ identifier: "Snapshot", description: "The complete projected state at one local store index and projection version." }))()
 export type Snapshot = typeof Snapshot.Type

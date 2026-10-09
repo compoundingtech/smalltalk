@@ -466,17 +466,44 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(any(path == "/v1/work/cancel-ask" for path, _ in self.monitor.api.posts))
 
     async def test_unavailable_agent_without_reviewer_retains_alert_until_live(self):
+        await self.check_unavailable_agent_without_reviewer()
+
+    async def test_unavailable_warning_observation_excludes_other_stderr_writers(self):
+        await self.check_unavailable_agent_without_reviewer(unrelated_stderr=True)
+
+    async def test_unavailable_warning_observation_rejects_double_emission(self):
+        # Losing the dedup field forces the real warning branch to emit again.
+        # The same assertion used by the ordinary fixture must reject both calls.
+        with self.assertRaisesRegex(AssertionError, r"Called 2 times\."):
+            await self.check_unavailable_agent_without_reviewer(forget_warning=True)
+
+    async def check_unavailable_agent_without_reviewer(self, unrelated_stderr=False, forget_warning=False):
         self.config["alert_agent"] = "agent/operations/amber"
         self.config.pop("reviewer")
         self.restart_monitor()
         self.monitor.api.agent["driver"] = None
         await self.monitor.route(self.target)
         self.monitor.measuring[self.target] -= 61_000_000_000
-        with patch("sys.stderr", new_callable=io.StringIO) as log:
+        warning = ("Alert agent agent/operations/amber is unavailable: no live driver."
+                   " No reviewer is configured; retaining the alert for retry.")
+        # Observe and forward every print from this module, including its actual
+        # stderr destination and flush argument. Other asyncio/logger writers do
+        # not pass through this binding; no emitted probe warning is filtered.
+        with patch.object(probe, "print", create=True, wraps=print) as emitted:
             await self.monitor.route(self.target)
+            self.assertEqual(self.monitor.state["routes"][self.target]["alert_warning"], warning)
+            self.assertEqual(json.loads(self.monitor.path.read_text())["routes"][self.target]["alert_warning"], warning)
+            if unrelated_stderr:
+                print("fixture: unrelated stderr writer one", file=sys.stderr, flush=True)
+                print("fixture: unrelated stderr writer two", file=sys.stderr, flush=True)
+            if forget_warning:
+                self.monitor.state["routes"][self.target].pop("alert_warning")
             await self.monitor.route(self.target)
-        self.assertEqual(len(log.getvalue().splitlines()), 1)
-        self.assertIn("retaining the alert for retry", log.getvalue())
+            emitted.assert_called_once_with(warning, file=sys.stderr, flush=True)
+        route = self.monitor.state["routes"][self.target]
+        self.assertEqual(route["status"], "overdue")
+        self.assertEqual(route["alert_warning"], warning)
+        self.assertEqual(json.loads(self.monitor.path.read_text())["routes"][self.target]["alert_warning"], warning)
         self.assertFalse(self.alert_posts("delivery-probe-alert"))
         self.assertFalse(any(path == "/v1/work/ask" for path, _ in self.monitor.api.posts))
         self.monitor.api.agent = FakeApi().agent

@@ -38,6 +38,13 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def supervised_roots(scratch_parent):
+    # This Linux fixture puts Unix sockets below the guardian root. CI's TMPDIR
+    # can be too long even for the fixed seat name; binary copies stay on scratch.
+    return [("ST3_MESSAGING_ROOT", "mfe-owner-", "/tmp"),
+            ("ST3_MESSAGING_SCRATCH", "mfi-owner-", str(scratch_parent))]
+
+
 async def until(predicate, timeout=30):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -879,8 +886,7 @@ if __name__ == "__main__":
         scratch_parent = args.scratch if args.scratch != args.out.resolve() else args.out.resolve().parent
         scratch_parent.mkdir(parents=True, exist_ok=True)
         raise SystemExit(run_supervised([sys.executable, *sys.orig_argv[1:]],
-            temporary_roots=[("ST3_MESSAGING_ROOT", "mfe-owner-", tempfile.gettempdir()),
-                             ("ST3_MESSAGING_SCRATCH", "mfi-owner-", str(scratch_parent))],
+            temporary_roots=supervised_roots(scratch_parent),
             keep=args.keep))
     args.scratch = Path(os.environ["ST3_MESSAGING_SCRATCH"])
     raise SystemExit(asyncio.run(main(args)))

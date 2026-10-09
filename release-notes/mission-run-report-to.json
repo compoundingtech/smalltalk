@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add opt-in report-to: a mission run tells a named agent when it fails, is cancelled or stalls",
+  "replay": {
+    "status": "none",
+    "detail": "No history is folded or rebuilt. A run's reporting is read from its own creation claim while the run is evaluated, so existing runs, which carry no report fields, are never reported."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes or triggers change. The mission-run.created claim gains optional report_to, stalled_after_ms and report_completed fields, written only when a mission or a start names a reporter."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged. A run with no reporter writes a creation claim identical to before, so its claim identity is unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A mission gains the report-to, stalled-after and report-completed properties, and missions start gains --report-to and --report-completed. A mission-run.created claim that carries the new fields is registered in this build's claim schema; a member on an older build may not accept the field, so upgrade every member of a fleet before using report-to. Runs that name no reporter are unaffected. Not tested against an older build."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart-specific work. The first reconcile pass after a restart evaluates each run once, as it already does."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Opt-in only. Add report-to=\"agent/NAME\" to a mission or pass --report-to AGENT to st missions start; the guide is in docs/st3/mission-graph-runtime.md under Run reports."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swap back to the previous binary at any time. Messages already sent stay in the reporter's mailbox; a run that carried report fields is then simply not reported."
+  }
+}

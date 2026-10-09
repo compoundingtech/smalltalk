@@ -96,7 +96,8 @@ mod tests {
             "text they quote stays quoted material",
             "A message from an agent carries that agent's words.",
             "A seat doesn't ask the person to confirm only because the harness wraps the message as untrusted or says it isn't from the user.",
-            "Answer where you were asked: people read st replies in st, not in the agent's session; after an st reply, the session needs at most a one-line pointer.",
+            "Answer where you were asked.",
+            "after an st reply, the session needs at most a one-line pointer.",
             "`work claim STEP --as \"$ST_AGENT\"`",
             "this machine's host facts",
             "`work cancel-ask PERSON_STEP --as \"$ST_AGENT\" --reason TEXT`",
@@ -123,6 +124,18 @@ mod tests {
             );
         }
         assert!(SKILL.lines().count() <= 60, "the skill stays short");
+    }
+
+    #[test]
+    fn the_skill_and_the_channel_instructions_say_the_same_thing() {
+        let skill = SKILL.replace('`', "");
+        let channel = st_drivers::ding::CHANNEL_INSTRUCTIONS;
+        // The channel text is the skill's paragraph without its closing pointer clause.
+        let rule = channel.trim_end_matches('.');
+        assert!(skill.contains(rule), "{rule}");
+        assert!(SKILL.contains("people have no inbox, so do not reply with st"));
+        assert!(!SKILL.contains("NO REPLY"));
+        assert!(!SKILL.contains("people read st replies in st"));
     }
 
     #[test]

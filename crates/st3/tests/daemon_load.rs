@@ -80,6 +80,15 @@ const ROSTER_SNAPSHOT: &str = "agents roster snapshot";
 const ROSTER_CONNECT_SNAPSHOT: &str = "agents roster connect+snapshot";
 const ROSTER_BUDGET: Duration = Duration::from_millis(300);
 
+/// The statements a cold full roster rebuild may run per agent card. Main ran about 23 per card
+/// on 2026-10-08, reading each agent's inputs one agent at a time; reading them a chunk of
+/// agents at a time, it runs 866 for 3,011 cards (0.29 per card).
+const COLD_ROSTER_STATEMENTS_PER_CARD: f64 = 0.33;
+
+/// Held by each test that measures the whole process, its CPU or its statements, so that one
+/// does not count the other's work when both run in one test process.
+static WHOLE_PROCESS: Mutex<()> = Mutex::new(());
+
 /// One kind of request, how many the busy host served each second, and its p99 budget.
 struct Load {
     name: &'static str,
@@ -143,6 +152,10 @@ struct Report {
     roster_subscribers: usize,
     #[serde(default)]
     roster_change_frames: usize,
+    /// Rosters the daemon folded again card by card during the timed load, by why: each one
+    /// is every card refolded rather than only the changed ones.
+    #[serde(default)]
+    roster_full_folds: BTreeMap<String, u64>,
     #[serde(default)]
     regime: String,
     #[serde(default)]
@@ -185,6 +198,7 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
         println!("skipped: a debug build is too slow to measure; run with cargo test --release");
         return;
     }
+    let _whole_process = WHOLE_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let scale = env_number("ST_LOAD_SCALE", 1.0_f64);
     let seconds = env_number("ST_LOAD_SECONDS", 120_u64);
     let keep = std::env::var_os("ST_BENCH_DIR")
@@ -241,6 +255,80 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
         "the daemon missed {} budgets:\n{}",
         failures.len(),
         failures.join("\n")
+    );
+}
+
+/// CPU the daemon's request and task kinds were charged in its performance window, by kind.
+fn cpu_by_kind() -> BTreeMap<String, f64> {
+    smallclaims::performance::snapshot()["requests"].as_array().into_iter().flatten()
+        .filter_map(|row| Some((row["kind"].as_str()?.to_owned(), row["cpu_ms"].as_f64()?)))
+        .collect()
+}
+
+/// A cold full rebuild of the agents roster on the generated store, alone on a quiet store: the
+/// statements it runs and how long it takes, as a daemon start or a roster refresher's first fold
+/// pays them. Its gates are those of [`the_daemon_keeps_its_budgets_under_a_busy_hosts_load`]:
+///
+/// ```sh
+/// ST_LOAD_GATE=1 TMPDIR=/var/tmp cargo test --release -p st3 --features perf-load \
+///     --test perf_load daemon_load::a_cold_roster_rebuild -- --nocapture
+/// ```
+#[test]
+fn a_cold_roster_rebuild_reads_the_fleet_in_few_statements() {
+    if std::env::var_os("ST_LOAD_GATE").is_none() {
+        println!("skipped: set ST_LOAD_GATE=1 to run the load test");
+        return;
+    }
+    if cfg!(debug_assertions) {
+        println!("skipped: a debug build is too slow to measure; run with cargo test --release");
+        return;
+    }
+    // The statement counter is the process's: the load test must not run meanwhile.
+    let _whole_process = WHOLE_PROCESS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let scale = env_number("ST_LOAD_SCALE", 1.0_f64);
+    let keep = std::env::var_os("ST_BENCH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../../target/st-bench"));
+    std::fs::create_dir_all(&keep).unwrap();
+    let generation = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (source, _) = generation.block_on(generated_stores(&keep, scale));
+    drop(generation);
+    let work = tempfile::tempdir().unwrap();
+    let database = work.path().join("claims.sqlite3");
+    for suffix in ["", "-wal"] {
+        let from = PathBuf::from(format!("{}{suffix}", source.display()));
+        if from.exists() {
+            std::fs::copy(&from, format!("{}{suffix}", database.display())).unwrap();
+        }
+    }
+    let mut rounds = Vec::new();
+    for _ in 0..3 {
+        // A store just opened has no kept reductions, as at a daemon start.
+        let store = Store::open(&database, NODE).unwrap();
+        let index = store.index().unwrap();
+        let before = smallclaims::sqlite::work::total();
+        let started = Instant::now();
+        let cards = st3::api::cold_agent_roster_rebuild(&store, index).unwrap();
+        let elapsed = started.elapsed();
+        let statements = (smallclaims::sqlite::work::total() - before).statements;
+        println!(
+            "cold roster rebuild: {cards} cards, {statements} statements \
+             ({:.1} per card), {:.0} ms",
+            statements as f64 / cards.max(1) as f64,
+            elapsed.as_secs_f64() * 1_000.0
+        );
+        rounds.push((cards, statements));
+    }
+    let (cards, statements) = rounds[rounds.len() - 1];
+    assert!(cards > 0, "the generated store has no agent cards");
+    assert!(
+        statements as f64 <= COLD_ROSTER_STATEMENTS_PER_CARD * cards as f64,
+        "a cold roster rebuild ran {statements} statements for {cards} cards, more than \
+         {COLD_ROSTER_STATEMENTS_PER_CARD} per card"
     );
 }
 
@@ -603,6 +691,12 @@ fn print(report: &Report) {
         "agents roster: {}/{} concurrent subscribers with correct snapshots; {} validated change frames; window limit {}",
         report.roster_subscribers, ROSTER_SUBSCRIBERS, report.roster_change_frames, ROSTER_LIMIT
     );
+    let full_folds = report.roster_full_folds.values().sum::<u64>();
+    println!(
+        "agents roster full refolds: {full_folds} ({:.1}/min) {:?}",
+        full_folds as f64 * 60.0 / report.seconds.max(1.0),
+        report.roster_full_folds
+    );
     println!(
         "{:<28} {:>7} {:>8} {:>8} {:>8} {:>8}",
         "request", "n", "p50 ms", "p99 ms", "max ms", "budget"
@@ -845,6 +939,8 @@ fn run(
     let subjects = {
         let _entered = daemon.enter();
         st3::api::start_operation_report(&state);
+        // As the daemon starts: it folds the roster once and keeps it published.
+        st3::api::start_agent_roster(&state);
         let server_socket = socket.clone();
         daemon.spawn(
             async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
@@ -930,6 +1026,8 @@ fn run(
         assert!(!migration_pending_at_load_start);
     }
     let cpu_before = (process_cpu(), load_cpu(&peer_threads));
+    let full_folds_before = context.store.agent_roster_chunked_assemblies();
+    let cpu_by_kind_before = cpu_by_kind();
     let cursor = context.store.index().unwrap();
     let started = Instant::now();
     load.block_on(async {
@@ -1163,6 +1261,18 @@ fn run(
     });
     let elapsed = started.elapsed().as_secs_f64();
     let cpu_after = (process_cpu(), load_cpu(&peer_threads));
+    let mut cpu_by_kind = cpu_by_kind().into_iter()
+        .map(|(kind, ms)| (ms - cpu_by_kind_before.get(&kind).copied().unwrap_or(0.0), kind))
+        .filter(|(ms, _)| *ms > 0.0)
+        .collect::<Vec<_>>();
+    cpu_by_kind.sort_by(|a, b| b.0.total_cmp(&a.0));
+    println!("daemon CPU during the load by kind (ms, top 12 of the 20 slowest kinds): {}",
+        cpu_by_kind.iter().take(12).map(|(ms, kind)| format!("{kind} {ms:.0}"))
+            .collect::<Vec<_>>().join(", "));
+    let roster_full_folds = context.store.agent_roster_chunked_assemblies().into_iter()
+        .map(|(why, count)| (why.clone(), count - full_folds_before.get(&why).copied().unwrap_or(0)))
+        .filter(|(_, count)| *count > 0)
+        .collect::<BTreeMap<_, _>>();
     let daemon_cpu = (cpu_after.0 - cpu_before.0) - (cpu_after.1 - cpu_before.1);
 
     let migration_pending_at_load_end = context.store.event_payload_migration_pending().unwrap();
@@ -1206,6 +1316,7 @@ fn run(
         long_poll_seats: long_poll_seats.load(Ordering::Relaxed),
         roster_subscribers,
         roster_change_frames: roster_change_frames.load(Ordering::Relaxed),
+        roster_full_folds,
         regime: regime.name().into(),
         actual_ci_checkout: std::env::var("GITHUB_SHA").ok(),
         event_migration,

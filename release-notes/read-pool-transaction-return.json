@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Release unfinished pooled read transactions at physical return and identify live snapshot candidates in WAL diagnostics.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, source admission, authority, projection health or frontier changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, index, trigger or stored data format changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint eligibility, retention or digest changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "ReadPool rolls back unfinished read transactions only when the physical connection returns; failed cleanup closes the connection. Live and nested Store snapshots retain their single cut. Existing abnormal WAL logs gain timestamped pool-specific checkout and known snapshot ages, physical connection and bounded route/budget metadata; unknown transaction age remains null. No successful HTTP response shape changes."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal daemon binary deployment requires a restart; restart duration has not been measured for this change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No live database action, setting change or repair is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent migration. Binary rollback restores the prior reader return behavior and diagnostic fields."
+  }
+}

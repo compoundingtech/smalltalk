@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Serve queued merge-group CI jobs before pull-request jobs",
+  "replay": {
+    "status": "none",
+    "detail": "Workflow runner routing only; no projection or replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, migrations, indexes or schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, writer admission or coordinated member rules changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Member eligibility, runner shapes, shared cache keys, daemon and client protocols are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service deployment or interruption is introduced."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "CI administrators may enable CI_MERGE_CI1=on only after Ops confirms the dedicated ci1-merge pool, existing shared cache and KVM support; all merge jobs then use that pool. Alternatively, set CI_MERGE_NAMESPACE_PROFILE only after provisioning a profile with the existing Linux image, KVM and shared cache and capacity outside the PR pool. Unset switches retain existing shapes with merge-first priority. Existing daemon installations require no action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reverting the workflow routing restores its previous scheduling; no stored data or migration rollback is involved."
+  }
+}

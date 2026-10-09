@@ -1165,6 +1165,21 @@ mod tests {
     }
 
     #[test]
+    fn both_delivery_sentences_are_sts_notes_not_the_persons_words() {
+        for note in [
+            "The person reads replies in st, not in the agent's session.",
+            "Answer the person in this conversation; people have no inbox, so do not reply with st.",
+        ] {
+            let delivery = format!("<smalltalk-message id=\"e6\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/e6\">\nis this a watcher?\n</smalltalk-message>\n{note}");
+            let bodies = from_harness(true, &delivery, &BTreeSet::new());
+            assert!(
+                matches!(&bodies[..], [Body::Mail { body, .. }] if body == "is this a watcher?"),
+                "{note}: {bodies:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_channel_delivery_carrying_an_envelope_is_that_mail_not_a_line() {
         // The Claude channel's delivery: st's envelope, then the delivery notes after it.
         let delivery = "<channel source=\"plugin:st3-channel:st3\" from=\"person/example\" messageId=\"message/c3\">\n<smalltalk-message id=\"c3\" from=\"person/example\" to=\"agent/example/quay\" subject=\"(no subject)\" sha256=\"00\" graph=\"message/c3\">\nhow is it going?\n</smalltalk-message>\nThe person reads replies in st, not in the agent's session.\n</channel>";

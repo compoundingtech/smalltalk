@@ -260,7 +260,7 @@ pub fn otlp_logs(node: &str, batch: &[ClaimRecord]) -> Value {
         .collect::<Vec<_>>();
     json!({
         "resourceLogs": [{
-            "resource": resource(node),
+            "resource": resource(node, DAEMON_SERVICE),
             "scopeLogs": [{
                 "scope": { "name": "st.observations" },
                 "logRecords": records,
@@ -400,7 +400,7 @@ fn otlp_usage_metrics(node: &str, batch: &[ClaimRecord]) -> Option<Value> {
         .map(|(labels, value)| point(labels, None, *value))
         .collect::<Vec<_>>();
     Some(
-        json!({"resourceMetrics": [{"resource": resource(node), "scopeMetrics": [{
+        json!({"resourceMetrics": [{"resource": resource(node, DAEMON_SERVICE), "scopeMetrics": [{
             "scope": {"name": "st"}, "metrics": [
                 {
                     "name": "st_usage_tokens_total", "unit": "{token}",
@@ -417,9 +417,19 @@ fn otlp_usage_metrics(node: &str, batch: &[ClaimRecord]) -> Option<Value> {
     )
 }
 
-fn resource(node: &str) -> Value {
+/// The exporter runs inside the daemon process, so observation logs and usage
+/// counters carry its identity.
+const DAEMON_SERVICE: &str = "st-daemon";
+
+/// Per-invocation hook signals are their own service so hook timing and counts
+/// stay separable from the daemon's observation bookkeeping.
+const HOOK_SERVICE: &str = "st-hook";
+
+fn resource(node: &str, service_name: &str) -> Value {
     json!({"attributes": [
-        attribute("service.name", json!({"stringValue": "st"})),
+        attribute("service.name", json!({"stringValue": service_name})),
+        attribute("service.version", json!({"stringValue": st_drivers::version::machine_version()})),
+        attribute("service.instance.id", json!({"stringValue": crate::otel::service_instance_id()})),
         attribute("host.name", json!({"stringValue": node})),
         attribute("st3.node", json!({"stringValue": node})),
     ]})
@@ -483,7 +493,7 @@ fn otlp_hook_metrics(node: &str, batch: &[ClaimRecord]) -> Option<Value> {
         })
         .collect::<Vec<_>>();
     Some(
-        json!({"resourceMetrics": [{"resource": resource(node), "scopeMetrics": [{
+        json!({"resourceMetrics": [{"resource": resource(node, HOOK_SERVICE), "scopeMetrics": [{
             "scope": {"name": "st"}, "metrics": [{
                 "name": "hook_invocations_total", "unit": "1",
                 "description": "Lifecycle hook invocations applied in-process, by hook and event",
@@ -525,7 +535,7 @@ fn hook_span(observation: &ClaimRecord) -> Option<Value> {
 fn otlp_hook_traces(node: &str, batch: &[ClaimRecord]) -> Option<Value> {
     let spans = batch.iter().filter_map(hook_span).collect::<Vec<_>>();
     (!spans.is_empty()).then(|| json!({"resourceSpans": [{
-        "resource": resource(node), "scopeSpans": [{"scope": {"name": "st.hooks"}, "spans": spans}],
+        "resource": resource(node, HOOK_SERVICE), "scopeSpans": [{"scope": {"name": "st.hooks"}, "spans": spans}],
     }]}))
 }
 
@@ -648,6 +658,24 @@ mod tests {
             .clone()
     }
 
+    fn resource_service_name(request: &Value) -> &str {
+        request["resourceLogs"]
+            .get(0)
+            .or_else(|| request["resourceMetrics"].get(0))
+            .or_else(|| request["resourceSpans"].get(0))
+            .and_then(|resource| {
+                resource["resource"]["attributes"]
+                    .as_array()
+                    .and_then(|attributes| {
+                        attributes
+                            .iter()
+                            .find(|attribute| attribute["key"] == "service.name")
+                            .and_then(|attribute| attribute["value"]["stringValue"].as_str())
+                    })
+            })
+            .unwrap()
+    }
+
     #[test]
     fn a_local_observation_becomes_an_otlp_log_record() {
         let store = Store::open_memory("node-a").unwrap();
@@ -656,7 +684,7 @@ mod tests {
         let request = otlp_logs("node-a", &batch);
         let resource = &request["resourceLogs"][0]["resource"]["attributes"];
         assert!(resource.as_array().unwrap().contains(&json!({
-            "key": "service.name", "value": {"stringValue": "st"}
+            "key": "service.name", "value": {"stringValue": "st-daemon"}
         })));
         assert!(resource.as_array().unwrap().contains(&json!({
             "key": "st3.node", "value": {"stringValue": "node-a"}
@@ -769,11 +797,17 @@ mod tests {
                 "{key}: {attributes:#?}"
             );
         }
-        let metrics = requests
+        let usage_body = requests
             .iter()
             .find(|(_, body)| body.get("resourceMetrics").is_some())
-            .map(|(_, body)| &body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"])
+            .map(|(_, body)| body)
             .unwrap();
+        assert_eq!(
+            resource_service_name(usage_body),
+            "st-daemon",
+            "usage counters are daemon bookkeeping, not per-hook signals"
+        );
+        let metrics = &usage_body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"];
         let cost = metrics
             .as_array()
             .unwrap()
@@ -880,7 +914,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hook_signals_share_one_service_and_do_not_advance_until_every_signal_is_accepted() {
+    async fn hook_signals_carry_the_hook_service_and_do_not_advance_until_every_signal_is_accepted()
+    {
         let (collector, endpoint) = start_collector().await;
         let store = Arc::new(Store::open_memory("node-a").unwrap());
         observe_hook(&store, "PreToolUse");
@@ -916,18 +951,15 @@ mod tests {
             "a partial acceptance can repeat, without dropping a signal"
         );
         for (_, request) in requests.iter() {
-            let resource = request["resourceLogs"]
-                .get(0)
-                .or_else(|| request["resourceMetrics"].get(0))
-                .or_else(|| request["resourceSpans"].get(0))
-                .unwrap();
-            assert!(
-                resource["resource"]["attributes"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!({
-                        "key": "service.name", "value": {"stringValue": "st"},
-                    }))
+            let expected = if request["resourceLogs"].get(0).is_some() {
+                "st-daemon"
+            } else {
+                "st-hook"
+            };
+            assert_eq!(
+                resource_service_name(request),
+                expected,
+                "hook spans and invocation counters carry st-hook; logs stay st-daemon"
             );
         }
         let logs = records(&requests[0].1);

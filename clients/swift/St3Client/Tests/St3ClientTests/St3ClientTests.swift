@@ -184,6 +184,43 @@ final class St3ClientTests: XCTestCase {
         guard case .error = timeline.items[9].body else { return XCTFail("error body lost") }
     }
 
+    func testRelayOmissionFixtureKeepsKnownBodiesAndOptionalValues() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/timeline-relay-omission.json"))
+        let wire = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let value = try XCTUnwrap(wire["value"] as? [String: Any])
+        let items = try XCTUnwrap(value["items"] as? [[String: Any]])
+        // Swift's current closed type enum has no future-record case. Preserve that existing
+        // contract here; the Rust relay and TypeScript controls cover the unknown raw body.
+        let known = items.filter { ($0["type"] as? String) != "future_record" }
+        for item in known {
+            let entry = try JSONDecoder().decode(TimelineEntry.self, from: JSONSerialization.data(withJSONObject: item))
+            let encoded = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(entry)) as? [String: Any])
+            let originalBody = try XCTUnwrap(item["body"] as? [String: Any])
+            let encodedBody = try XCTUnwrap(encoded["body"] as? [String: Any])
+            // The existing Swift usage model does not expose cache_write_tokens or turn_id.
+            // Their wire preservation is tested by the Rust relay and TypeScript consumers;
+            // this check covers values this installed Swift model actually represents.
+            let unmodeled: Set<String>
+            if case .usage = entry.body { unmodeled = ["cache_write_tokens", "turn_id"] }
+            else { unmodeled = [] }
+            // Codable may omit explicitly nullable nils, without inventing absent fields.
+            for (key, original) in originalBody where !(original is NSNull) && key != "attribution" && !unmodeled.contains(key) {
+                XCTAssertEqual(encodedBody[key] as? NSObject, original as? NSObject, key)
+            }
+            for key in encodedBody.keys {
+                XCTAssertNotNil(originalBody[key], "invented field: \(key)")
+            }
+            XCTAssertEqual(encoded["id"] as? String, item["id"] as? String)
+            XCTAssertEqual(encoded["sequence"] as? Int, item["sequence"] as? Int)
+            XCTAssertEqual(encoded["revision"] as? Int, 2)
+        }
+        let minimal = try JSONDecoder().decode(TimelineEntry.self, from: JSONSerialization.data(withJSONObject: known[0]))
+        guard case .message(let body) = minimal.body else { return XCTFail("message body lost") }
+        XCTAssertNil(body.replyTo); XCTAssertNil(body.from); XCTAssertNil(body.to); XCTAssertNil(body.title)
+    }
+
     func testAKindThisClientDoesNotKnowReadsAsUnknown() throws {
         let json = #"{"kind":"example-arrangement","id":"example-arrangement/person/avery/1","revision":"r1","updated_at":"2026-10-04T08:00:00Z","name":"Pinned"}"#
         let resource = try JSONDecoder().decode(Resource.self, from: Data(json.utf8))
