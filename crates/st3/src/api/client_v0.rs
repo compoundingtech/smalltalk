@@ -427,6 +427,33 @@ async fn collection_items_with_windows(
                 } else {
                     None
                 };
+                // A missions window serves the newest published list under that list's own
+                // cut, and never folds the missions it shows.
+                let published_missions = if collection == "missions"
+                    && store.published_missions_list().running()
+                {
+                    let Some(publication) = store.published_missions() else {
+                        store.published_missions_list().request_refresh();
+                        return Ok(Err(super::published_lists::not_ready("missions")));
+                    };
+                    published = Some(publication.cut);
+                    published_at = Some(publication.published_at_unix_ms);
+                    Some(publication)
+                } else {
+                    None
+                };
+                // So does a work window, filtering the published list for its actor.
+                let published_work = if collection == "work" && store.published_work_list().running() {
+                    let Some(publication) = store.published_work() else {
+                        store.published_work_list().request_refresh();
+                        return Ok(Err(super::published_lists::not_ready("work")));
+                    };
+                    published = Some(publication.cut);
+                    published_at = Some(publication.published_at_unix_ms);
+                    Some(publication)
+                } else {
+                    None
+                };
                 let snapshot = match published_at {
                     Some(at) => super::roster_snapshot(&state, published.unwrap_or(index), at),
                     None => client_snapshot_at(&state, index),
@@ -437,6 +464,10 @@ async fn collection_items_with_windows(
                         "summary" => {
                             return Ok((summary::native(&state, &current, &request, &snapshot,
                                 now, windows.as_deref(), commits)?, false));
+                        }
+                        "missions" if published_missions.is_some() => {
+                            let publication = published_missions.as_ref().expect("published missions");
+                            return super::published_lists::mission_window(&publication.rows, limit);
                         }
                         "missions" => {
                             let mut ids =
@@ -475,6 +506,12 @@ async fn collection_items_with_windows(
                                     cards
                                 }
                             }
+                        }
+                        "work" if published_work.is_some() => {
+                            let publication = published_work.as_ref().expect("published work");
+                            return super::published_lists::work_window(
+                                &store, &publication.rows, actor.as_deref(), limit,
+                            );
                         }
                         "work" => client_work_resources(
                             &store,
@@ -2402,7 +2439,17 @@ fn mission_list_cards_at(
     ids: &[String],
     at_unix_ms: u128,
 ) -> anyhow::Result<Vec<Value>> {
-    let attention = store.human_attention_runs()?;
+    mission_list_cards_with(store, ids, at_unix_ms, &store.human_attention_runs()?)
+}
+
+/// [`mission_list_cards_at`] with the runs that wait on a person already read, as the published
+/// missions list keeps them.
+pub(super) fn mission_list_cards_with(
+    store: &Store,
+    ids: &[String],
+    at_unix_ms: u128,
+    attention: &BTreeSet<String>,
+) -> anyhow::Result<Vec<Value>> {
     let definitions = store
         .mission_definitions_for_ids(ids)?
         .into_iter()
@@ -2471,7 +2518,7 @@ fn mission_list_cards_at(
     }).collect()
 }
 
-fn bound_mission_cards(items: &mut Vec<Value>) -> anyhow::Result<bool> {
+pub(super) fn bound_mission_cards(items: &mut Vec<Value>) -> anyhow::Result<bool> {
     // Reserve room for the envelope, continuation cursor and fleet sync notice.
     let budget = CLIENT_MAX_RESPONSE_BYTES.saturating_sub(128_000);
     let mut used = 0;
