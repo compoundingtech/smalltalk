@@ -4409,7 +4409,8 @@ const AGENT_ROSTER_ASSEMBLY_ROUNDS: usize = 3;
 /// the newest rows say which cards changed and at most that many are changed or missing.
 /// Otherwise the cards fold in chunks, each at its own cut, refolding the already folded cards
 /// whose claims changed, and completion is tried again. Readers keep the previous complete
-/// roster meanwhile; if it cannot be assembled, they keep it until its requests are overdue.
+/// roster meanwhile, with its own cut and publication time; if it cannot be assembled, the
+/// refresh fails and is tried again on the next request.
 fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
     if store.read_snapshot(|index| store.agent_roster_current(index, history))? {
         return Ok(());

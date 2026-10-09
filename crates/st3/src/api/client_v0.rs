@@ -11266,6 +11266,10 @@ mission "queue-parity" state="ready" {
                 collection_windows::Windows::attach(&state.store)))
             .await.expect("summary must not wait for the roster admission").unwrap();
         assert_eq!(items[0]["kind"], "summary");
+        // The agent counts name the published roster they came from.
+        let (cut, _, published_at) = state.store.published_agent_roster(state.store.index().unwrap(), false).unwrap();
+        assert_eq!(items[0]["agents_as_of"]["store_index"], cut);
+        assert_eq!(items[0]["agents_as_of"]["published_at"], client_timestamp(published_at));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
