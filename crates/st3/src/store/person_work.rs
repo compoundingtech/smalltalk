@@ -368,11 +368,14 @@ pub(super) fn current(connection: &Connection, ask: &ClaimRecord, as_of: u128) -
             return Ok(false);
         }
     }
-    if let Some(declaration) = fields["requester_declaration"].as_str() {
-        if current_desired_row(connection, requester)?.is_none_or(|row| row.claim_id != declaration)
-        {
-            return Ok(false);
-        }
+    // A top-level seat's ask outlives its restarts and harness changes: only stopping or retiring
+    // the seat (above) or cancelling the ask ends it, so a person never loses it to a restart. A
+    // mission's seat lives and dies with its declaration, and so does its ask.
+    if let Some(declaration) = fields["requester_declaration"].as_str()
+        && !fields["owner_run"].is_null()
+        && current_desired_row(connection, requester)?.is_none_or(|row| row.claim_id != declaration)
+    {
+        return Ok(false);
     }
     if let Some(owner) = fields["owner_run"].as_str() {
         if !run_live(
@@ -768,8 +771,11 @@ impl Store {
                 let Some(view) = step(tx, &ask.subject)? else { continue };
                 if matches!(view.status.as_str(), "ready" | "pending") && !current(tx, &ask, now_ms())? {
                     let claim = append_claim_tx(tx, &self.origin, &ask.subject, "work.person-cancelled", Some("daemon/runtime"),
-                        &json!({"fields": {"attempt": view.attempt, "status": "cancelled", "summary": "the requester, origin or owning run ended", "key": format!("person-owner-ended:{}", ask.id)}}), &[ask.id], None)?;
+                        &json!({"fields": {"attempt": view.attempt, "status": "cancelled", "summary": "the requester, origin or owning run ended", "key": format!("person-owner-ended:{}", ask.id)}}), &[ask.id.clone()], None)?;
                     project(tx, &claim).map_err(anyhow::Error::new)?;
+                    if !is_update(&ask) {
+                        self.tell_ask_ended(tx, &ask)?;
+                    }
                     changed = true;
                 }
             }
@@ -798,29 +804,85 @@ impl Store {
                     "{} did not ask for `{about}`: an update is about the person's own run or step, or their message to you",
                     input.person)));
             }
-            let identity = serde_json::to_string(&(&input.actor, &input.person, &about, &input.idempotency_key)).map_err(internal)?;
+            self.append_update_tx(tx, &input.actor, &input.person, &input.title, &input.reason, &input.idempotency_key, &structured)
+        }).map_err(internal)?
+    }
+
+    /// Nothing an ask waited on disappears silently: when its requester, originating step or
+    /// owning run ends, the requester hears once that the ask is gone, and the person gets one
+    /// update saying so.
+    fn tell_ask_ended(&self, tx: &Transaction<'_>, ask: &ClaimRecord) -> Result<()> {
+        let fields = &ask.body["fields"];
+        let requester = ask.actor.as_deref().unwrap_or_default();
+        let person = fields["person"].as_str().unwrap_or_default();
+        let title = fields["title"].as_str().unwrap_or_default();
+        let why = if !requester.starts_with("daemon/") && !declaration_live(tx, requester)? {
+            format!("{requester} was stopped or retired")
+        } else if fields["origin_step"].is_string() {
+            "the step that asked moved on".to_owned()
+        } else {
+            "the run it belonged to ended".to_owned()
+        };
+        if requester.starts_with("agent/") {
+            let key = format!("st3-ask-ended:{}", ask.id);
+            let message = format!("message/{}", &hex::encode(Sha256::digest(key.as_bytes()))[..16]);
+            let content = format!(
+                "Your ask to {person}, \"{title}\" ({}), was cancelled because {why}. {person} will not answer it. If you still need the answer, ask again with `st work ask`.",
+                ask.subject
+            );
+            append_claim_tx(tx, &self.origin, &message, "message.sent", Some("daemon/runtime"), &json!({"fields": {
+                "from": "daemon/runtime", "to": requester, "content": content, "status": "sent",
+                "title": format!("Ask cancelled: {title}"), "in_reply_to": null,
+                "tags": [format!("st3-ask-ended:{}", ask.subject)]}}), &[ask.id.clone()], None)?;
+        }
+        if person.starts_with("person/") {
+            let update = json!({"version": 1, "type": "update", "about": ask.subject});
+            self.append_update_tx(tx, "daemon/runtime", person,
+                &format!("Cancelled: {title}"),
+                &format!("{requester} asked you \"{title}\". That ask ended because {why}, so nothing waits on your answer now."),
+                &format!("st3-ask-ended:{}", ask.id), &update)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// One update step for `person`, about the work `structured` names.
+    #[allow(clippy::too_many_arguments)]
+    fn append_update_tx(
+        &self,
+        tx: &Transaction<'_>,
+        actor: &str,
+        person: &str,
+        title: &str,
+        reason: &str,
+        idempotency_key: &str,
+        structured: &Value,
+    ) -> Result<StepRunView, St3Error> {
+        let about = structured["about"].as_str().unwrap_or_default();
+        {
+            let identity = serde_json::to_string(&(actor, person, about, idempotency_key)).map_err(internal)?;
             let hash = hex::encode(Sha256::digest(identity.as_bytes()));
             let generation = format!("update-{}", &hash[..32]);
             let subject = format!("step-run/{generation}/update");
             if let Some(existing) = request(tx, &subject).map_err(internal)? {
-                if existing.body["fields"]["title"] != input.title || existing.body["fields"]["reason"] != input.reason
-                    || existing.body["fields"]["request"] != structured {
+                if existing.body["fields"]["title"] != title || existing.body["fields"]["reason"] != reason
+                    || existing.body["fields"]["request"] != *structured {
                     return Err(St3Error::new("idempotency-conflict", "this update key already names another update"));
                 }
                 return step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the update is no longer retained"));
             }
             let mission_id = format!("person-update/{}", &hash[..32]);
-            let kdl = format!("version 2\nmission {mission_id:?} state=\"ready\" {{ goal {:?}; step \"update\" {{ assigned-to {:?}; goal {:?}; }} }}", input.title, input.person, input.reason);
+            let kdl = format!("version 2\nmission {mission_id:?} state=\"ready\" {{ goal {:?}; step \"update\" {{ assigned-to {:?}; goal {:?}; }} }}", title, person, reason);
             let mut intent = crate::graph::parse_internal_intent(&kdl, &self.origin)?;
             let mission = intent.missions.remove(&mission_id).ok_or_else(|| St3Error::new("internal", "the update mission could not be parsed"))?;
-            let claim = append_claim_tx(tx, &self.origin, &subject, "work.person-asked", Some(&input.actor),
+            let claim = append_claim_tx(tx, &self.origin, &subject, "work.person-asked", Some(actor),
                 &with_request(json!({"fields": {"run": format!("mission-run/person-update/{}", &hash[..32]),
-                    "generation": format!("run-generation/{generation}"), "person": input.person, "title": input.title,
-                    "reason": input.reason, "key": input.idempotency_key, "attempt": 1, "status": "ready", "mission_spec": mission}}), &structured),
+                    "generation": format!("run-generation/{generation}"), "person": person, "title": title,
+                    "reason": reason, "key": idempotency_key, "attempt": 1, "status": "ready", "mission_spec": mission}}), structured),
                 &[], None).map_err(claim_append_error)?;
             project(tx, &claim)?;
             step(tx, &subject).map_err(internal)?.ok_or_else(|| St3Error::new("missing-step-run", "the update could not be projected"))
-        }).map_err(internal)?
+        }
     }
 
     fn ask_person_in_new_run(&self, input: &PersonAskRequest) -> Result<StepRunView, St3Error> {
@@ -844,7 +906,10 @@ impl Store {
                 [&input.actor], |row| row.get(0)).map_err(internal)?;
             if active { return Err(St3Error::new("ambiguous-ask-owner", "use --step while you hold claimed work")); }
             let desired = current_desired_row(tx, &input.actor).map_err(internal)?.unwrap();
-            let key = serde_json::to_string(&(&input.actor, name, &desired.owner_run, &desired.owner_generation, &desired.claim_id, &input.idempotency_key)).map_err(internal)?;
+            // A top-level seat's ask survives its re-declaration, so asking again with the same key
+            // after a restart or harness change finds the same ask instead of raising another.
+            let declaration = desired.owner_run.is_some().then_some(&desired.claim_id);
+            let key = serde_json::to_string(&(&input.actor, name, &desired.owner_run, &desired.owner_generation, declaration, &input.idempotency_key)).map_err(internal)?;
             let hash = hex::encode(Sha256::digest(key.as_bytes()));
             let generation = format!("ask-{}", &hash[..32]);
             let subject = format!("step-run/{generation}/ask");
@@ -2383,6 +2448,73 @@ mission "writer-load" state="ready" {
                     .all(|item| item.subject != ask.subject)
             );
         }
+    }
+
+    /// A top-level seat that restarts onto another harness keeps the asks it raised: they stay
+    /// on the person's alerts, and asking again finds the same ask instead of a second one.
+    #[test]
+    fn a_top_level_seats_ask_survives_its_redeclaration_and_ends_only_when_it_stops() {
+        let (store, origin, mut input) = fixture();
+        store
+            .set_step_state(&origin.subject, "completed", None)
+            .unwrap();
+        input.step = None;
+        input.new_run = Some("release-question".into());
+        let ask = store.ask_person(&input).unwrap();
+        let moved = crate::graph::parse_internal_intent("version 2\nagent \"alder.asker\" { workspace \"/tmp\"; command \"false\"; restart always; }", "alder").unwrap();
+        store.apply_internal(&moved, "asker-moves-harness").unwrap();
+        assert!(!store.reconcile_person_asks().unwrap());
+        assert_eq!(store.step_run(&ask.subject).unwrap().unwrap().status, "ready");
+        assert!(
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .iter()
+                .any(|item| item.subject == ask.subject && item.is_alert())
+        );
+        assert_eq!(store.ask_person(&input).unwrap().subject, ask.subject);
+        let stop =
+            crate::graph::parse_internal_intent("version 2\nstop \"agent/alder.asker\"", "alder")
+                .unwrap();
+        store.apply_internal(&stop, "stop-asker").unwrap();
+        assert!(store.reconcile_person_asks().unwrap());
+        assert_eq!(
+            store.step_run(&ask.subject).unwrap().unwrap().status,
+            "cancelled"
+        );
+    }
+
+    /// An ask whose requester ended does not vanish silently: the requester hears once, and the
+    /// person gets one update in place of the alert.
+    #[test]
+    fn an_ask_cancelled_because_its_owner_ended_tells_the_requester_and_the_person_once() {
+        let (store, _origin, input) = fixture();
+        let ask = store.ask_person(&input).unwrap();
+        let stop =
+            crate::graph::parse_internal_intent("version 2\nstop \"agent/alder.asker\"", "alder")
+                .unwrap();
+        store.apply_internal(&stop, "stop-asker").unwrap();
+        assert!(store.reconcile_person_asks().unwrap());
+        assert!(!store.reconcile_person_asks().unwrap());
+        let told = store
+            .messages(Some("agent/alder.asker"), true)
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.from == "daemon/runtime")
+            .filter_map(|message| message.title)
+            .collect::<Vec<_>>();
+        assert_eq!(told, vec!["Ask cancelled: Choose a release date".to_owned()]);
+        let home = store.attention_items(Some("person/avery")).unwrap();
+        assert!(home.iter().all(|item| item.subject != ask.subject));
+        let updates = home
+            .iter()
+            .filter(|item| item.is_update())
+            .map(|item| (item.title.clone(), item.is_alert()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            updates,
+            vec![("Cancelled: Choose a release date".to_owned(), false)]
+        );
     }
 
     #[test]
