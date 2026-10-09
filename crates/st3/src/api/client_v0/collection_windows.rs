@@ -263,6 +263,9 @@ impl Windows {
         (revisions.commits == commits && revisions.index == index).then_some(revisions.values)
     }
 
+    /// Weigh the commits since the last look, once for every socket on this store. Call it only
+    /// from a socket's own blocking worker, never from a request path that holds a read budget:
+    /// a waiter on `weighing` must not hold a reader the weigher needs (#2019's bounded pool).
     pub(super) fn changes(&self, store: &Store) -> anyhow::Result<[u64; 8]> {
         let _weighing = self.weighing.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(revisions) = self.current_changes(store) {
