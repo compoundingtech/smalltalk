@@ -765,6 +765,10 @@ const PROBES: &[Probe] = &[
         "/v1/mission-runs?mission={mission_name}",
     ),
     get(
+        "GET /v1/mission-runs/tree",
+        "/v1/mission-runs/tree?root={run}&limit=50",
+    ),
+    get(
         "GET /v1/mission-overview",
         "/v1/mission-overview?mission={mission_name}",
     ),

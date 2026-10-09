@@ -11,7 +11,8 @@ use tokio::net::UnixListener;
 const SUBJECT: &str = "host/follow-fixture";
 const RUN: &str = "mission-run/example/follow-fixture";
 const RUN_PATH: &str = "/v1/mission-runs/mission-run%2Fexample%2Ffollow-fixture";
-const TREE_PATH: &str = "/v1/mission-runs?root=mission-run%2Fexample%2Ffollow-fixture";
+const TREE_PATH: &str =
+    "/v1/mission-runs/tree?root=mission-run%2Fexample%2Ffollow-fixture&limit=50";
 
 enum Reply {
     Value(Value),
@@ -67,8 +68,7 @@ async fn scripted_cli(args: &[&str], script: Vec<(String, Reply)>) -> Output {
             caller.write_all(&body).await.unwrap();
         }
     });
-    let mut command =
-        st3::test_support::async_command(test_bin!("st3-fixture"));
+    let mut command = st3::test_support::async_command(test_bin!("st3-fixture"));
     command
         .kill_on_drop(true)
         .env("NO_COLOR", "1")
@@ -180,7 +180,12 @@ async fn follow_auth_not_found_and_validation_errors_stop_at_once() {
             if path == RUN_PATH {
                 script.push((
                     TREE_PATH.into(),
-                    Reply::Value(json!([run("running", "normal")])),
+                    Reply::Value(json!({
+                        "runs": [run("running", "normal")],
+                        "has_more": false,
+                        "next_cursor": null,
+                        "frontier": 0,
+                    })),
                 ));
             }
             script.push((path.into(), Reply::Error(status)));

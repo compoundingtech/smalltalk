@@ -2262,6 +2262,16 @@ pub struct MissionRunView {
     pub scheduler_fault: Option<String>,
 }
 
+/// A bounded slice of the root graph for human mission presentation.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MissionRunTreePage {
+    pub runs: Vec<MissionRunView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+    pub frontier: u64,
+}
+
 /// Who set a finished run's outcome, from what, and why.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MissionRunOutcomeView {
