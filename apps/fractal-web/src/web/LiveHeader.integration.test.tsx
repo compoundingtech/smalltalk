@@ -142,6 +142,7 @@ describe('live header parity', () => {
     await act(async () => document.querySelector('[role="menuitemcheckbox"]')?.dispatchEvent(new MouseEvent('click', { bubbles: true })))
   })
   it('retains a disabled resources control with a human refusal reason', async () => {
+    await click('Resources')
     await act(async () => registry.set(resources, unavailable({ reason: 'ungranted', detail: 'raw-denial-code' })))
     expect(button('Resources')?.disabled).toBe(true)
     const reason = document.getElementById(button('Resources')!.getAttribute('aria-describedby')!)

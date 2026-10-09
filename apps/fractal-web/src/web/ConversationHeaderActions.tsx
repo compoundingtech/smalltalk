@@ -9,18 +9,22 @@ import { Icon as CompositionIcon } from '../../../../packages/fractal-ui/src/ass
 import { colorVars as c, typeVars as t, spaceVars as s } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import { compactTime } from '../../../../packages/fractal-ui/src/assistant-ui/sidebar/model.ts'
 import { useDataSource, useNow } from '../data/react.tsx'
-import { unavailable, type Feed } from '../data/source.ts'
+import { unavailable, waiting, type Feed } from '../data/source.ts'
 import { resourceState, resourceTitle, type ResourcePage } from '../resources/agent/model.ts'
 import { systemEventsPreference } from './conversationPreferences.ts'
 
 const unsupportedResources = Atom.make<Feed<ResourcePage>>(unavailable({ reason: 'unsupported', detail: '' }))
+const unopenedResources = Atom.make<Feed<ResourcePage>>(waiting)
 
 /** Native conversation controls, retained from the former ConversationDetail header portal. */
 export const ConversationHeaderActions = ({ agentRef }: { readonly agentRef: string }) => {
   const source = useDataSource()
-  const resources = useAtomValue(source.resources?.byAgent(agentRef) ?? unsupportedResources)
   const [showSystemEvents, setShowSystemEvents] = useAtom(systemEventsPreference)
   const [resourcesOpen, setResourcesOpen] = React.useState(false)
+  // A closed inspector has no read demand. Otherwise each switch starts discovery plus a
+  // resource read and keeps its 15-second poll alive despite showing no resources.
+  const resources = useAtomValue(source.resources === undefined ? unsupportedResources
+    : resourcesOpen ? source.resources.byAgent(agentRef) : unopenedResources)
   const reasonId = React.useId()
   const disabledReason = resources._tag === 'Unavailable'
     ? resources.reason === 'ungranted' ? 'Read access to agent resources has not been granted.'
