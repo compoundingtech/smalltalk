@@ -153,6 +153,11 @@ The surface renders the generated `TerminalScreen` DOM lines/runs; it has no
 JavaScript terminal emulator, client actions, network transport, or PTY ownership.
 The host owns subscriptions, grants, incarnation fences, resize actions and process
 lifecycle. The drawer accepts one `screen` and `connection` per agent, with no tabs.
+`onResize` reports only the trailing cols/rows after container size changes settle
+(frame-coalesced plus a short delay), so a drawer drag yields one host resize. Rows are
+memoized by content and render inputs; keep `palette` and `font` referentially stable so
+unchanged rows skip rendering. A line's `wrapped` flag means it continues the previous
+row, and copied text joins it without a newline.
 `open`, `height` and `onHeight` are controlled. Pointer resizing previews locally
 and commits `onHeight` once on release; keyboard resizing commits immediately.
 Close (including Enter on the resize separator) calls `onDetach` then `onToggle`,

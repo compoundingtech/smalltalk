@@ -30,10 +30,13 @@ export function appendLocalHistory(previous: TerminalScreen | null, next: Termin
   const cap = Math.max(0, Math.floor(limit))
   if (!previous || !next || previous.terminal_id !== next.terminal_id || previous.runtime_incarnation !== next.runtime_incarnation || next.modes.alternate_screen) return { lines: [], truncated: false }
   if (previous.revision === next.revision) return { lines: cap === 0 ? [] : history.lines.slice(-cap), truncated: history.truncated || history.lines.length > cap }
+  const same = (left: TerminalScreen['lines'][number], right: TerminalScreen['lines'][number] | undefined) => right !== undefined && left.text === right.text && JSON.stringify(left.runs) === JSON.stringify(right.runs)
+  // Unchanged content (cursor/mode-only revisions) is not a scroll, even when repeated rows would match a shift.
+  if (previous.lines.length === next.lines.length && previous.lines.every((line, index) => same(line, next.lines[index]))) return { lines: cap === 0 ? [] : history.lines.slice(-cap), truncated: history.truncated || history.lines.length > cap }
   let shifted = 0
   for (let offset = 1; offset < previous.lines.length; offset++) {
     const overlap = previous.lines.length - offset
-    if (overlap <= next.lines.length && previous.lines.slice(offset).every((line, index) => JSON.stringify(line.runs) === JSON.stringify(next.lines[index]?.runs) && line.text === next.lines[index]?.text)) { shifted = offset; break }
+    if (overlap <= next.lines.length && previous.lines.slice(offset).every((line, index) => same(line, next.lines[index]))) { shifted = offset; break }
   }
   const added = previous.lines.slice(0, shifted)
   const all = [...history.lines, ...added]

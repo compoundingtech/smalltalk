@@ -19,10 +19,10 @@ import { colorVars as c, typeVars as t } from './assistant-ui/composition-tokens
 function terminalFixture(start = 0, rows = 4): TerminalScreen {
   return { kind: 'terminal-screen', terminal_id: 'synthetic-terminal', runtime_incarnation: 'synthetic-incarnation', revision: String(start), next_sequence: start, title: 'Synthetic shell', columns: 80, rows, cursor: { row: rows - 1, column: 2, visible: true, blinking: true, style: 'block' }, modes: { alternate_screen: false, application_cursor: true, application_keypad: true, bracketed_paste: true, focus_events: false, mouse_tracking: 'none', mouse_encoding: 'default' }, truncated: false, lines: Array.from({ length: rows }, (_, row) => ({ row, text: `local line ${start + row}`, runs: [{ text: `local line ${start + row}` }], redacted: false, truncated: false })) }
 }
-type Scenario = 'focus' | 'typing' | 'paste' | 'resize' | 'selection' | 'scrollback' | 'palette' | 'pixels' | 'readonly' | 'unavailable' | 'ended' | 'ssr' | 'imports' | 'cursor' | 'drawer' | 'all'
+type Scenario = 'focus' | 'typing' | 'paste' | 'resize' | 'selection' | 'scrollback' | 'palette' | 'pixels' | 'readonly' | 'unavailable' | 'ended' | 'ssr' | 'imports' | 'cursor' | 'drawer' | 'rendercost' | 'all'
 type Args = { scheme: 'dark' | 'light'; scenario: Scenario; defect: boolean }
 function TerminalStory({ scheme, scenario, defect }: Args) {
-  const [screen, setScreen] = React.useState(() => terminalFixture(0, scenario === 'scrollback' ? 200 : 4))
+  const [screen, setScreen] = React.useState(() => terminalFixture(0, scenario === 'scrollback' || scenario === 'rendercost' ? 200 : 4))
   const [input, setInput] = React.useState<string[]>([])
   const [sizes, setSizes] = React.useState<string[]>([])
   const [copy, setCopy] = React.useState('')
@@ -33,14 +33,19 @@ function TerminalStory({ scheme, scenario, defect }: Args) {
   const [detached, setDetached] = React.useState(0)
   const [killed, setKilled] = React.useState(0)
   const handle = React.useRef<TerminalSurfaceHandle>(null)
-  const palette = createTerminalPalette(scheme)
+  const paintCalls = React.useRef(0)
+  const palette = React.useMemo(() => {
+    const base = createTerminalPalette(scheme)
+    return scenario === 'rendercost' ? { ...base, resolve: (color: number | string) => { paintCalls.current++; return base.resolve(color) } } : base
+  }, [scheme, scenario])
   let chosen = screen
   if (scenario === 'selection') chosen = { ...screen, lines: [
-    { row: 0, text: 'A界B', runs: [{ text: 'A' }, { text: '界', cells: 2 }, { text: 'B' }], redacted: false, truncated: false, wrapped: !defect },
-    { row: 1, text: 'tail', runs: [{ text: 'tail' }], redacted: false, truncated: false },
+    { row: 0, text: 'A界B', runs: [{ text: 'A' }, { text: '界', cells: 2 }, { text: 'B' }], redacted: false, truncated: false },
+    { row: 1, text: 'tail', runs: [{ text: 'tail' }], redacted: false, truncated: false, wrapped: !defect },
     { row: 2, text: '', runs: [], redacted: false, truncated: false },
     { row: 3, text: 'end', runs: [{ text: 'end' }], redacted: false, truncated: false },
   ] }
+  if (scenario === 'rendercost') chosen = { ...screen, lines: screen.lines.map(line => ({ ...line, runs: [{ text: line.text.slice(0, 1), fg: 4 }, { text: line.text.slice(1), fg: 2 }] })) }
   if (scenario === 'pixels' || scenario === 'palette') {
     const samples = ['#00ff00', '#7ffe00', '#00ffaa', '#a6e3a1', '#94e2d5', '#00ffff', '#61afef', '#ffffff']
     chosen = { ...screen, rows: 17, lines: [
@@ -55,6 +60,11 @@ function TerminalStory({ scheme, scenario, defect }: Args) {
   return <main data-scheme={scheme} data-defect={defect} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
     <h1 {...stylex.props(styles.heading)}>Terminal · {scenario}</h1><div {...stylex.props(styles.tools)}><button onClick={() => setWidth(value => value === 640 ? 480 : 640)}>Resize container</button><button onClick={() => { for (const start of [199, 398, 597, 796, 995, 1194, 1200]) flushSync(() => setScreen(terminalFixture(start, 200))) }}>Roll 1200 lines</button><button onClick={() => setScreen(value => ({ ...value, revision: value.revision + '-modes', modes: { ...value.modes, application_cursor: false, application_keypad: false, bracketed_paste: false, focus_events: true } }))}>Normal modes</button><button onClick={() => { setCopy(handle.current?.copySelection() || '') }}>Copy selection</button><button onClick={() => handle.current?.clearSelection()}>Clear selection</button><button onClick={() => setOpen(true)}>Reopen</button></div>
     {scenario === 'cursor' && <div {...stylex.props(styles.tools)}>{(['block', 'underline', 'bar'] as const).map(style => <button key={style} onClick={() => setScreen(value => ({ ...value, cursor: { ...value.cursor, style, visible: true } }))}>{style} cursor</button>)}<button onClick={() => setScreen(value => ({ ...value, cursor: { ...value.cursor, visible: false } }))}>Hide cursor</button></div>}
+    {scenario === 'rendercost' && <button data-paint-calls={paintCalls.current} onClick={event => {
+      paintCalls.current = 0
+      flushSync(() => setScreen(value => ({ ...value, revision: value.revision + '-cell', lines: value.lines.map((line, index) => index === 0 || defect ? { ...line, text: 'X' + line.text.slice(1) } : line) })))
+      event.currentTarget.dataset.paintCalls = String(paintCalls.current)
+    }}>Change one cell</button>}
     <div data-terminal-container style={{ width, height: scenario === 'drawer' ? undefined : height }} {...stylex.props(styles.frame)}>{scenario === 'drawer' ? <TerminalDrawer {...props} open={open} height={height} onHeight={setHeight} onToggle={() => setOpen(value => !value)} onDetach={() => { if (!defect) setDetached(value => value + 1) }} onKill={() => setKilled(value => value + 1)} /> : <TerminalSurface {...props} />}</div>
     <div {...stylex.props(styles.feedback)}><div data-input>{JSON.stringify(input)}</div><div data-sizes>{JSON.stringify(sizes)}</div><div data-copy>{copy}</div><div data-recovery>{recovered}</div><div data-detached>{detached}</div><div data-killed>{killed}</div></div>
     {scenario === 'all' && <div {...stylex.props(styles.states)}>{(['connecting', 'reconnecting', 'unavailable', 'ended'] as const).map(state => <TerminalSurface key={state} label={`Terminal · ${state}`} screen={null} readOnly palette={palette} connection={state === 'ended' || state === 'unavailable' ? { state, reason: state === 'ended' ? 'The terminal process has exited.' : 'The terminal host cannot be reached.' } : { state }} onRecover={() => setRecovered(value => value + 1)} />)}</div>}
@@ -98,6 +108,10 @@ export const ResizeFromMetrics: Story = { args: { scenario: 'resize' }, play: as
   await waitFor(() => expect(sizeValues(canvasElement).at(-1)).toBe(measure())); const before = sizeValues(canvasElement).length
   await userEvent.click(canvas.getByRole('button', { name: 'Resize container' })); await waitFor(() => expect(sizeValues(canvasElement).at(-1)).toBe(measure())); await expect(sizeValues(canvasElement)).toHaveLength(before + 1)
   await userEvent.click(canvas.getByRole('button', { name: 'Normal modes' })); await expect(sizeValues(canvasElement)).toHaveLength(before + 1)
+  const container = canvasElement.querySelector<HTMLElement>('[data-terminal-container]')!; const beforeDrag = sizeValues(canvasElement).length
+  for (const width of [510, 540, 570, 600]) { container.style.width = `${width}px`; await new Promise(resolve => setTimeout(resolve, 30)) }
+  await waitFor(() => expect(sizeValues(canvasElement).at(-1)).toBe(measure()))
+  await expect(sizeValues(canvasElement)).toHaveLength(beforeDrag + 1)
 } }
 export const SelectionCopy: Story = { args: { scenario: 'selection' }, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement); const lines = canvasElement.querySelectorAll('[data-terminal-line]'); const range = document.createRange(); range.setStart(lines[0], 0); range.setEnd(lines[1], 1); const selection = document.getSelection()!; selection.removeAllRanges(); selection.addRange(range)
@@ -118,12 +132,20 @@ export const SelectionCopy: Story = { args: { scenario: 'selection' }, play: asy
 } }
 export const ScrollbackCap: Story = { args: { scenario: 'scrollback' }, play: async ({ canvasElement }) => {
   let history = { lines: [] as TerminalScreen['lines'], truncated: false }; let previous = terminalFixture()
+  const repeated = { ...terminalFixture(), lines: terminalFixture().lines.map(line => ({ ...line, text: '', runs: [] })) }
+  await expect(appendLocalHistory(repeated, { ...repeated, revision: 'cursor-only', cursor: { ...repeated.cursor, column: 3 } }, { lines: [], truncated: false }, 1000).lines).toHaveLength(0)
   for (let index = 1; index <= 1200; index++) { const next = terminalFixture(index); history = appendLocalHistory(previous, next, history, 1000); previous = next }
   await expect(history.lines).toHaveLength(1000); await expect(history.lines[0].text).toBe('local line 200'); await expect(history.truncated).toBe(true)
   await expect(appendLocalHistory(previous, terminalFixture(1201), history, 0).lines).toHaveLength(0)
   await userEvent.click(within(canvasElement).getByRole('button', { name: 'Roll 1200 lines' })); await expect(canvasElement.querySelector('[data-local-lines]')).toHaveAttribute('data-local-lines', '1000'); await expect(canvasElement.querySelector('[data-local-lines]')).toHaveAttribute('data-history-truncated', 'true'); await expect(within(canvasElement).getByRole('note')).toHaveTextContent('Local scrollback')
   await expect(canvasElement.querySelector('[data-terminal-line]')).toHaveTextContent('local line 200')
 } }
+export const RenderCost: Story = { args: { scenario: 'rendercost' }, play: async ({ canvasElement }) => {
+  const button = within(canvasElement).getByRole('button', { name: 'Change one cell' })
+  await userEvent.click(button)
+  await expect(button).toHaveAttribute('data-paint-calls', '2')
+} }
+export const RenderCostLight: Story = { ...RenderCost, args: { ...RenderCost.args, scheme: 'light' } }
 export const NoGreenPalette: Story = { args: { scenario: 'palette' }, play: async ({ args }) => {
   const resolve = args.defect ? () => '#00ff00' : (value: number | string) => resolveTerminalColor(value, args.scheme)
   for (let index = 0; index < 256; index++) noGreen(resolve(index))

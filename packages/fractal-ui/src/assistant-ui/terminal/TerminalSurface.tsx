@@ -28,6 +28,8 @@ class Surface extends React.Component<Props, State> {
   input = React.createRef<HTMLTextAreaElement>()
   observer?: ResizeObserver
   lastSize?: { cols: number; rows: number }
+  resizeFrame?: number
+  resizeTimer?: number
   composing = false
   compositionCommit?: string
   handle: TerminalSurfaceHandle = { focus: () => this.input.current?.focus(), copySelection: () => this.copySelection(), clearSelection: () => this.clearSelection(), measure: () => this.measure() }
@@ -39,7 +41,7 @@ class Surface extends React.Component<Props, State> {
   setHandle(ref: Props['handleRef'], value: TerminalSurfaceHandle | null) { if (typeof ref === 'function') ref(value); else if (ref) ref.current = value }
   componentDidMount() {
     this.setHandle(this.props.handleRef, this.handle)
-    this.observer = new ResizeObserver(() => this.reportSize())
+    this.observer = new ResizeObserver(() => this.scheduleReport())
     if (this.root.current) this.observer.observe(this.root.current)
     if (this.root.current) this.root.current.scrollTop = this.root.current.scrollHeight
     this.reportSize()
@@ -53,7 +55,17 @@ class Surface extends React.Component<Props, State> {
     if (previous.font !== this.props.font || previous.onResize !== this.props.onResize || previous.connection.state !== this.props.connection.state) this.reportSize()
     if (pinned && previous.screen !== this.props.screen && this.root.current) this.root.current.scrollTop = this.root.current.scrollHeight
   }
-  componentWillUnmount() { this.observer?.disconnect(); this.setHandle(this.props.handleRef, null) }
+  componentWillUnmount() { this.observer?.disconnect(); this.cancelReport(); this.setHandle(this.props.handleRef, null) }
+  /** Drawer drags produce many observer callbacks; only the trailing size reaches the host. */
+  scheduleReport() {
+    this.cancelReport()
+    this.resizeFrame = requestAnimationFrame(() => { this.resizeFrame = undefined; this.resizeTimer = window.setTimeout(() => { this.resizeTimer = undefined; this.reportSize() }, 80) })
+  }
+  cancelReport() {
+    if (this.resizeFrame !== undefined) cancelAnimationFrame(this.resizeFrame)
+    clearTimeout(this.resizeTimer)
+    this.resizeFrame = this.resizeTimer = undefined
+  }
   measure() {
     const root = this.root.current
     if (!root) return
@@ -77,7 +89,6 @@ class Surface extends React.Component<Props, State> {
     if (!root || !selection || selection.isCollapsed || !root.contains(selection.anchorNode) || !root.contains(selection.focusNode)) return
     const range = selection.getRangeAt(0)
     let result = ''
-    let previousWrapped = false
     let first = true
     for (const line of root.querySelectorAll<HTMLElement>('[data-terminal-line]')) {
       if (!range.intersectsNode(line)) continue
@@ -86,9 +97,9 @@ class Surface extends React.Component<Props, State> {
       if (!line.contains(part.endContainer)) part.setEnd(line, line.childNodes.length)
       const text = part.toString()
       if (!text && (line.textContent || (range.endContainer === line && range.endOffset === 0))) continue
-      result += (!first && !previousWrapped ? '\n' : '') + text
+      // `wrapped` marks a row that continues the previous one.
+      result += (!first && line.dataset.wrapped !== 'true' ? '\n' : '') + text
       first = false
-      previousWrapped = line.dataset.wrapped === 'true'
     }
     return result || undefined
   }
@@ -137,20 +148,27 @@ class Surface extends React.Component<Props, State> {
           }}
           onCompositionEnd={event => { this.composing = false; this.compositionCommit = event.data; this.send(event.data); event.currentTarget.value = '' }} />
         <div data-terminal-output {...stylex.props(styles.output)}>
-          {lines.map((line, index) => <div key={index} data-terminal-line data-wrapped={line.wrapped === true} data-row={line.row} style={{ height: font.lineHeightPx }} {...stylex.props(styles.line)}>{line.runs.map((run, runIndex) => {
-            let fg = run.fg === undefined ? palette.foreground : palette.resolve(run.fg)
-            let bg = run.bg === undefined ? palette.background : palette.resolve(run.bg)
-            if (run.inverse) [fg, bg] = [bg, fg]
-            const paint = { color: fg, backgroundColor: bg, opacity: run.dim ? 0.6 : 1, fontWeight: run.bold ? 700 : 400, fontStyle: run.italic ? 'italic' : 'normal', textDecoration: [run.underline && 'underline', run.strikethrough && 'line-through'].filter(Boolean).join(' ') || 'none', ...(run.cells === undefined ? {} : { display: 'inline-block', width: `${run.cells * font.sizePx * (font.advanceEm ?? 0.6)}px` }) }
-            const safeLink = run.link && /^(https?:|mailto:)/i.test(run.link.uri)
-            return safeLink ? <a key={runIndex} href={run.link!.uri} target="_blank" rel="noreferrer" style={paint} {...stylex.props(styles.link)}>{run.text}</a> : <span key={runIndex} style={paint}>{run.text}</span>
-          })}</div>)}
+          {lines.map((line, index) => <TerminalLineView key={index} line={line} palette={palette} sizePx={font.sizePx} lineHeightPx={font.lineHeightPx} advanceEm={font.advanceEm ?? 0.6} />)}
           {screen?.cursor.visible && this.state.focused && <span aria-hidden="true" data-terminal-cursor={screen.cursor.style} {...stylex.props(styles.cursor, screen.cursor.blinking && styles.blink)} style={{ backgroundColor: palette.cursor, width: screen.cursor.style === 'bar' ? 2 : font.sizePx * (font.advanceEm ?? 0.6), height: screen.cursor.style === 'underline' ? 2 : font.lineHeightPx, top: (this.state.history.lines.length + screen.cursor.row) * font.lineHeightPx + (screen.cursor.style === 'underline' ? font.lineHeightPx - 2 : 0), left: screen.cursor.column * font.sizePx * (font.advanceEm ?? 0.6) }} />}
         </div>
       </div>
     </section>
   }
 }
+type LineProps = { line: TerminalScreen['lines'][number]; palette: TerminalSurfaceProps['palette']; sizePx: number; lineHeightPx: number; advanceEm: number }
+const sameRun = (left: TerminalScreen['lines'][number]['runs'][number], right: TerminalScreen['lines'][number]['runs'][number]) => left.text === right.text && left.cells === right.cells && left.fg === right.fg && left.bg === right.bg && left.bold === right.bold && left.dim === right.dim && left.italic === right.italic && left.underline === right.underline && left.inverse === right.inverse && left.strikethrough === right.strikethrough && left.link?.uri === right.link?.uri
+const sameLine = (left: LineProps, right: LineProps) => left.palette === right.palette && left.sizePx === right.sizePx && left.lineHeightPx === right.lineHeightPx && left.advanceEm === right.advanceEm && (left.line === right.line || (left.line.row === right.line.row && left.line.wrapped === right.line.wrapped && left.line.runs.length === right.line.runs.length && left.line.runs.every((run, index) => sameRun(run, right.line.runs[index]))))
+/** Unchanged rows skip rendering; hosts should keep `palette` referentially stable. */
+const TerminalLineView = React.memo(function TerminalLineView({ line, palette, sizePx, lineHeightPx, advanceEm }: LineProps) {
+  return <div data-terminal-line data-wrapped={line.wrapped === true} data-row={line.row} style={{ height: lineHeightPx }} {...stylex.props(styles.line)}>{line.runs.map((run, runIndex) => {
+    let fg = run.fg === undefined ? palette.foreground : palette.resolve(run.fg)
+    let bg = run.bg === undefined ? palette.background : palette.resolve(run.bg)
+    if (run.inverse) [fg, bg] = [bg, fg]
+    const paint = { color: fg, backgroundColor: bg, opacity: run.dim ? 0.6 : 1, fontWeight: run.bold ? 700 : 400, fontStyle: run.italic ? 'italic' : 'normal', textDecoration: [run.underline && 'underline', run.strikethrough && 'line-through'].filter(Boolean).join(' ') || 'none', ...(run.cells === undefined ? {} : { display: 'inline-block', width: `${run.cells * sizePx * advanceEm}px` }) }
+    const safeLink = run.link && /^(https?:|mailto:)/i.test(run.link.uri)
+    return safeLink ? <a key={runIndex} href={run.link!.uri} target="_blank" rel="noreferrer" style={paint} {...stylex.props(styles.link)}>{run.text}</a> : <span key={runIndex} style={paint}>{run.text}</span>
+  })}</div>
+}, sameLine)
 const styles = stylex.create({
   surface: { display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, minWidth: 0, backgroundColor: surface.terminal },
   notice: { padding: 12, color: c.fgMuted, fontFamily: t.fontSans, fontSize: t.metaSize, display: 'flex', alignItems: 'center', gap: 12 },
