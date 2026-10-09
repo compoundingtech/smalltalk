@@ -6499,7 +6499,7 @@ async fn run_mission_view(
                 ))
                 .await?;
             if args.follow {
-                return follow_mission_run(client, run, 0, json_output).await;
+                return follow_mission_run(client, run, 0, json_output, args.limit).await;
             }
             if json_output {
                 return print_value(&run, true);
@@ -6510,7 +6510,7 @@ async fn run_mission_view(
                 "{}",
                 render_mission_run_page(&run, &page.runs, OutputStyle::stdout(), now)
             );
-            print_mission_tree_continuation(&run, &page);
+            print_mission_tree_continuation(&run, &page, args.limit);
             // A daemon without lanes answers 404; the run itself is still shown.
             if let Ok(lanes) = client
                 .get::<Vec<st3::model::LaneView>>(&format!(
@@ -6985,7 +6985,7 @@ async fn start_mission_run(
     if !json_output {
         print!("{}", cli_help::mission_next_steps(&started));
     }
-    follow_mission_run(client, started, response.store_index, json_output).await
+    follow_mission_run(client, started, response.store_index, json_output, 50).await
 }
 
 fn mission_start_run_id(mission_id: &str, requested: Option<&str>) -> String {
@@ -7139,6 +7139,7 @@ async fn follow_mission_run(
     run: MissionRunView,
     _cursor: u64,
     json_output: bool,
+    limit: usize,
 ) -> Result<()> {
     let interactive = std::io::stdout().is_terminal();
     let _screen = if !json_output && interactive {
@@ -7147,7 +7148,7 @@ async fn follow_mission_run(
         None
     };
     follow_mission_run_to(
-        client, run, json_output, interactive, OutputStyle::stdout(), &mut std::io::stdout(),
+        client, run, json_output, interactive, limit, OutputStyle::stdout(), &mut std::io::stdout(),
     ).await
 }
 
@@ -7156,6 +7157,7 @@ async fn follow_mission_run_to(
     mut run: MissionRunView,
     json_output: bool,
     interactive: bool,
+    limit: usize,
     style: OutputStyle,
     output: &mut impl std::io::Write,
 ) -> Result<()> {
@@ -7166,10 +7168,16 @@ async fn follow_mission_run_to(
         let page = if json_output {
             None
         } else {
-            Some(load_mission_run_tree(client, &run, None, 50).await?)
+            Some(load_mission_run_tree(client, &run, None, limit).await?)
         };
         let summary = if let Some(page) = &page {
-            format!("{}:{}", run.updated_at_unix_ms, mission_run_signature(&page.runs)?)
+            format!(
+                "{}:{}:{:?}:{}",
+                run.updated_at_unix_ms,
+                page.has_more,
+                page.next_cursor,
+                mission_run_signature(&page.runs)?
+            )
         } else {
             String::new()
         };
@@ -7177,8 +7185,8 @@ async fn follow_mission_run_to(
             let mut frame = render_mission_run_page(&run, &page.runs, style, current_unix_ms()?);
             if let Some(cursor) = &page.next_cursor {
                 frame.push_str(&format!(
-                    "\nTREE      More runs follow; st missions show {} --cursor {cursor}\n",
-                    run.subject
+                    "\nTREE      More runs follow; st missions show {} --cursor {cursor} --limit {limit}\n",
+                    run.subject,
                 ));
             }
             write!(
@@ -7236,11 +7244,12 @@ async fn load_mission_run_tree(
 fn print_mission_tree_continuation(
     selected: &MissionRunView,
     page: &st3::model::MissionRunTreePage,
+    limit: usize,
 ) {
     if let Some(cursor) = &page.next_cursor {
         println!(
-            "\nTREE      More runs follow; st missions show {} --cursor {cursor}",
-            selected.subject
+            "\nTREE      More runs follow; st missions show {} --cursor {cursor} --limit {limit}",
+            selected.subject,
         );
     }
 }
