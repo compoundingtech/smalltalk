@@ -1,0 +1,303 @@
+//! The attention list a daemon publishes for collection windows: every person's open attention
+//! rows, folded off the request path by one refresher (`api::start_attention_list`) and served
+//! under the cut they were folded at. One fold serves every person: a window keeps the rows
+//! whose `person_id` it selects. A refresh folds again only when a claim admitted since the
+//! newest publication can change what attention reads, the projection moved under the same
+//! claims, or the clock passed the publication's period; otherwise it republishes the same rows
+//! at the newer cut. Everything here is volatile cache state, cleared by `forget_views`.
+
+use super::*;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// More claims than this between two publications fold again rather than read them all.
+const DELTA_LIMIT: usize = 10_000;
+
+/// Claim kinds that no attention source reads, whatever their subject: harness activity and
+/// usage, messages (attention leaves messages to conversations), transport and workspace
+/// observations, daemon diagnostics, and a person's glasses and arrangements. Work progress and
+/// lease renewals move no step's status, run or ask. These are most of a busy host's claims.
+const UNREAD_KINDS: &[&str] = &[
+    "harness.timeline",
+    "harness.usage",
+    "message.sent",
+    "message.staged",
+    "message.delivered",
+    "message.read",
+    "message.closed",
+    "transport.observed",
+    "workspace.observed",
+    "daemon.diagnostic",
+    "glass.upserted",
+    "glass.deleted",
+    "arrangement.edited",
+    "work.progress",
+    "work.renewed",
+];
+
+/// The rows of one attention fold and the cut they were folded at.
+pub(crate) struct AttentionPublication {
+    /// The graph index the rows were folded at; windows serving them carry this snapshot.
+    pub(crate) cut: u64,
+    /// The graph projection's health row at the cut. Deferred replication projection catches
+    /// up under the same admitted claims, so a different row means the rows may have changed.
+    pub(crate) projection: Option<(String, u64)>,
+    /// The clock the rows were evaluated at: eligibility and grace periods depend on it.
+    pub(crate) evaluated_at_unix_ms: u128,
+    /// When these rows were published, in Unix ms: the list's "as of".
+    pub(crate) published_at_unix_ms: u128,
+    /// Every person's rows, most urgent first, as `client_attention_resources_at` orders them.
+    pub(crate) rows: Arc<Vec<Value>>,
+}
+
+/// The refresher's registration, its requests and the newest publication.
+#[derive(Default)]
+pub(crate) struct AttentionList {
+    refresher: std::sync::OnceLock<Arc<tokio::sync::Notify>>,
+    /// When a window last read one of the refresher's views (attention, glasses, arrangements),
+    /// in Unix ms. The refresher follows commits only while someone reads.
+    read_at: AtomicU64,
+    published: Mutex<Option<Arc<AttentionPublication>>>,
+    /// Counts `forget`s. A refresh that began before one may not publish what it read.
+    forgotten: AtomicU64,
+    /// Counts publications, same cut or not, so streams that read an earlier one reread.
+    revision: tokio::sync::watch::Sender<u64>,
+    /// Folds by cause: the first claim kind that could change attention, `clock`, `projection`,
+    /// `first` or `many`. Republishing the same rows at a newer cut is not a fold.
+    folds: Mutex<BTreeMap<String, u64>>,
+}
+
+impl AttentionList {
+    pub(super) fn forget(&self) {
+        let mut published = self.published.lock().unwrap_or_else(PoisonError::into_inner);
+        self.forgotten.fetch_add(1, AtomicOrdering::AcqRel);
+        let forgotten = published.take().is_some();
+        drop(published);
+        if forgotten {
+            self.revision.send_modify(|revision| *revision += 1);
+        }
+    }
+}
+
+/// Why the newest publication can no longer stand for the rows at a newer cut.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AttentionDelta {
+    /// Nothing attention reads changed: the same rows hold at the newer cut.
+    Unchanged,
+    /// Fold again, and why.
+    Refold(String),
+}
+
+impl Store {
+    /// Register the one task that keeps the attention list published, and return its wake.
+    /// `None` when one is already registered.
+    pub(crate) fn start_attention_list_refresher(&self) -> Option<Arc<tokio::sync::Notify>> {
+        let wake = Arc::new(tokio::sync::Notify::new());
+        self.smalltalk
+            .attention_list
+            .refresher
+            .set(Arc::clone(&wake))
+            .ok()?;
+        Some(wake)
+    }
+
+    /// Whether a refresher keeps the attention list published, so windows never fold it.
+    pub(crate) fn attention_list_refresher_running(&self) -> bool {
+        self.smalltalk.attention_list.refresher.get().is_some()
+    }
+
+    /// Ask the refresher, if one runs, to publish the list at the newest cut. Requests made
+    /// while it folds coalesce into one more refresh.
+    pub(crate) fn request_attention_list_refresh(&self) {
+        if let Some(wake) = self.smalltalk.attention_list.refresher.get() {
+            wake.notify_one();
+        }
+    }
+
+    /// The newest publication, and note that a window read it. A window serves these rows
+    /// under the publication's own cut, never relabelled with its own, even when the window's
+    /// snapshot began before that cut was published.
+    pub(crate) fn published_attention_list(&self) -> Option<Arc<AttentionPublication>> {
+        let list = &self.smalltalk.attention_list;
+        list.refresher.get()?;
+        self.note_published_view_read();
+        list.published
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The newest publication, whatever its cut, for the refresher to start from, and the
+    /// generation to publish under: read it before the snapshot that folds.
+    pub(crate) fn newest_attention_list(&self) -> (u64, Option<Arc<AttentionPublication>>) {
+        let list = &self.smalltalk.attention_list;
+        let published = list.published.lock().unwrap_or_else(PoisonError::into_inner);
+        (list.forgotten.load(AtomicOrdering::Acquire), published.clone())
+    }
+
+    /// Note that a window read one of the refresher's views: it follows commits only while
+    /// windows read them.
+    pub(crate) fn note_published_view_read(&self) {
+        self.smalltalk
+            .attention_list
+            .read_at
+            .store(now_ms() as u64, AtomicOrdering::Release);
+    }
+
+    /// Whether a window read one of the refresher's views within `within_ms`.
+    pub(crate) fn attention_list_read_within(&self, within_ms: u64) -> bool {
+        let read_at = self.smalltalk.attention_list.read_at.load(AtomicOrdering::Acquire);
+        read_at != 0 && (now_ms() as u64).saturating_sub(read_at) <= within_ms
+    }
+
+    /// Swap in a newer publication. A publication never goes back to an older cut. Only
+    /// `changed` rows raise the revision: the same rows at a newer cut give streams nothing to
+    /// reread, and a window that reads later serves them under the newer cut.
+    /// A refresh that began before views were forgotten (`generation` is stale) publishes
+    /// nothing: what it read may no longer hold.
+    pub(crate) fn publish_attention_list(
+        &self,
+        generation: u64,
+        publication: AttentionPublication,
+        changed: bool,
+    ) {
+        let list = &self.smalltalk.attention_list;
+        {
+            let mut published = list.published.lock().unwrap_or_else(PoisonError::into_inner);
+            if list.forgotten.load(AtomicOrdering::Acquire) != generation {
+                return;
+            }
+            if published
+                .as_ref()
+                .is_some_and(|newest| newest.cut > publication.cut)
+            {
+                return;
+            }
+            *published = Some(Arc::new(publication));
+        }
+        if changed {
+            list.revision.send_modify(|revision| *revision += 1);
+        }
+    }
+
+    /// Follows the revision of attention publications, so a stream that read an earlier one
+    /// rereads the newer.
+    pub(crate) fn subscribe_attention_list(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.smalltalk.attention_list.revision.subscribe()
+    }
+
+    /// Count one fold of the whole list, by why.
+    pub(crate) fn note_attention_list_fold(&self, cause: &str) {
+        *self
+            .smalltalk
+            .attention_list
+            .folds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(cause.to_owned())
+            .or_default() += 1;
+    }
+
+    /// How many times the attention list was folded, by why.
+    pub fn attention_list_folds(&self) -> BTreeMap<String, u64> {
+        self.smalltalk
+            .attention_list
+            .folds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The graph projection's health row, read in the snapshot that folds or compares.
+    pub(crate) fn attention_projection_frontier(&self) -> Result<Option<(String, u64)>> {
+        Ok(self
+            .readers
+            .get()
+            .query_row(
+                "SELECT status, last_good_store_index FROM projection_health WHERE aggregate='graph'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<u64>>(1)?.unwrap_or(0))),
+            )
+            .optional()?)
+    }
+
+    /// Whether the rows of `previous` still hold at `index`, read in the snapshot at `index`.
+    /// Only the kinds and subjects of the claims admitted since are read, and for harness
+    /// observations whether their seat was ever asked to log in.
+    pub(crate) fn attention_list_delta(
+        &self,
+        previous: &AttentionPublication,
+        index: u64,
+    ) -> Result<AttentionDelta> {
+        if index < previous.cut {
+            return Ok(AttentionDelta::Refold("older cut".into()));
+        }
+        if self.attention_projection_frontier()? != previous.projection {
+            return Ok(AttentionDelta::Refold("projection".into()));
+        }
+        if index == previous.cut {
+            return Ok(AttentionDelta::Unchanged);
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind FROM claims WHERE store_index>?1 AND store_index<=?2
+             ORDER BY store_index LIMIT ?3",
+        )?;
+        let claims = statement
+            .query_map(
+                params![previous.cut, index, DELTA_LIMIT as u64 + 1],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if claims.len() > DELTA_LIMIT {
+            return Ok(AttentionDelta::Refold("many".into()));
+        }
+        let mut logins = HashMap::<String, bool>::new();
+        for (subject, kind) in claims {
+            if UNREAD_KINDS.contains(&kind.as_str()) {
+                continue;
+            }
+            // Harness observations and diagnostics reach attention only through a harness login
+            // item, and only for a seat with a login-shaped claim: the candidates
+            // `desired_harness_login_candidates` reads. A seat never asked to log in has none
+            // before this claim or after it.
+            if matches!(kind.as_str(), "harness.observed" | "harness.diagnostic") {
+                let candidate = match logins.get(&subject) {
+                    Some(candidate) => *candidate,
+                    None => {
+                        let candidate = harness_login_candidate(&connection, &subject)?;
+                        logins.insert(subject.clone(), candidate);
+                        candidate
+                    }
+                };
+                if !candidate {
+                    continue;
+                }
+            }
+            return Ok(AttentionDelta::Refold(kind));
+        }
+        Ok(AttentionDelta::Unchanged)
+    }
+}
+
+/// Whether `subject` has a claim that makes it a harness login candidate, by the same indexed
+/// predicate `desired_harness_login_candidates` uses.
+fn harness_login_candidate(connection: &Connection, subject: &str) -> Result<bool> {
+    Ok(connection
+        .prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_harness_login_candidate_index
+                 WHERE claims.subject=?1 AND (
+                   (kind='harness.observed' AND (
+                     json_type(body, '$.fields.provider_auth')='false'
+                     OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                         THEN '$.reason' ELSE '$.fields.reason' END)='providerAuth'
+                     OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                         THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
+                   OR (kind='harness.diagnostic'
+                     AND json_extract(body, '$.fields.code')='provider-auth-expired')))",
+        )?
+        .query_row([subject], |row| row.get(0))?)
+}
+
+#[cfg(test)]
+#[path = "attention_list/tests.rs"]
+mod tests;
