@@ -463,20 +463,49 @@ pub(crate) fn find_bound_transcript(
     driver: ExternalDriver,
     native_id: &str,
 ) -> Result<Option<ExternalSession>> {
-    let root = match driver {
-        ExternalDriver::Codex => home.join(".codex/sessions"),
-        ExternalDriver::Claude => home.join(".claude/projects"),
+    find_bound_transcript_with(home, driver, native_id, None, &[])
+}
+
+/// `find_bound_transcript`, also looking where a Claude seat on its own login keeps transcripts.
+/// `hint` is the path Claude gave the SessionStart hook for this very session, which follows the
+/// seat's `CLAUDE_CONFIG_DIR` whatever account it runs on; it counts only if it names this
+/// session's file. `extra_roots` are further `projects` directories to search, such as the logins
+/// of declared accounts, for a seat whose binding recorded no path.
+pub(crate) fn find_bound_transcript_with(
+    home: &Path,
+    driver: ExternalDriver,
+    native_id: &str,
+    hint: Option<&Path>,
+    extra_roots: &[PathBuf],
+) -> Result<Option<ExternalSession>> {
+    let mut roots = match driver {
+        ExternalDriver::Codex => vec![home.join(".codex/sessions")],
+        ExternalDriver::Claude => vec![home.join(".claude/projects")],
         _ => return Ok(None),
     };
+    if driver == ExternalDriver::Claude {
+        roots.extend(extra_roots.iter().cloned());
+    }
     let filename = format!("{native_id}.jsonl");
     // Codex prefixes the session ID with the rollout time: `rollout-<time>-<id>.jsonl`.
     let codex_suffix = format!("-{filename}");
     let mut found: Option<SessionMetadata> = None;
-    for entry in WalkDir::new(root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
+    if driver == ExternalDriver::Claude
+        && let Some(hint) = hint.filter(|hint| {
+            hint.is_absolute()
+                && hint.file_name().and_then(|name| name.to_str()) == Some(filename.as_str())
+                && std::fs::symlink_metadata(hint).is_ok_and(|metadata| metadata.is_file())
+        })
+        && let Ok(Some(metadata)) = read_metadata(driver, hint)
     {
+        found = Some(metadata);
+    }
+    for entry in roots.iter().flat_map(|root| {
+        WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(Result::ok)
+    }) {
         let Some(name) = entry.file_name().to_str() else {
             continue;
         };
@@ -4735,6 +4764,49 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_claude_seat_on_any_account_is_found_by_the_path_claude_gave_its_hook() {
+        let home = tempfile::tempdir().unwrap();
+        let line = |id: &str| {
+            format!(
+                r#"{{"sessionId":"{id}","timestamp":"2026-09-24T00:00:00Z","type":"user","message":{{"content":"hello"}}}}"#
+            )
+        };
+        // Two accounts, neither under ~/.claude, in directories st has never heard of.
+        let first = home.path().join("logins/first/projects/-work");
+        let second = home.path().join("elsewhere/second-login/projects/-work");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("on-first.jsonl"), line("on-first")).unwrap();
+        fs::write(second.join("on-second.jsonl"), line("on-second")).unwrap();
+        let find = |id: &str, hint: Option<&Path>, extra: &[PathBuf]| {
+            find_bound_transcript_with(home.path(), ExternalDriver::Claude, id, hint, extra)
+                .unwrap()
+        };
+        // Without the recorded path or a declared login, the default place misses.
+        assert!(find("on-second", None, &[]).is_none());
+        // The recorded path finds it, whichever account wrote it.
+        let hint = second.join("on-second.jsonl");
+        assert_eq!(
+            find("on-second", Some(&hint), &[]).unwrap().transcript,
+            hint
+        );
+        // A declared account's login directory finds a seat whose binding recorded no path.
+        let extra = [
+            home.path().join("logins/first/projects"),
+            home.path().join("elsewhere/second-login/projects"),
+        ];
+        assert_eq!(find("on-first", None, &extra).unwrap().transcript, first.join("on-first.jsonl"));
+        assert_eq!(find("on-second", None, &extra).unwrap().transcript, hint);
+        // A recorded path never stands in for a different session, a relative path, or a link.
+        assert!(find("on-first", Some(&hint), &[]).is_none());
+        assert!(find("on-second", Some(Path::new("on-second.jsonl")), &[]).is_none());
+        let link = home.path().join("link/on-second.jsonl");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&hint, &link).unwrap();
+        assert!(find("on-second", Some(&link), &[]).is_none());
     }
 
     #[cfg(target_os = "linux")]

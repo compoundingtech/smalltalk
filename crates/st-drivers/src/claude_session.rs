@@ -1345,7 +1345,11 @@ fn observe_payload(
                 .and_then(serde_json::Value::as_str),
         ) {
             if !native_id.is_empty() {
-                if let Err(error) = write_native_session_binding(agent_dir, incarnation, native_id)
+                let transcript_path = payload
+                    .get("transcript_path")
+                    .and_then(serde_json::Value::as_str);
+                if let Err(error) =
+                    write_native_session_binding(agent_dir, incarnation, native_id, transcript_path)
                 {
                     tracing::warn!(
                         "st claude-observe: native session binding write failed: {error:#}"
@@ -1435,17 +1439,24 @@ fn observe_payload(
     writer.observe_unless_ended(observation).map(|_wrote| ())
 }
 
+/// `transcript_path` is the file Claude says holds the session, which follows the seat's own
+/// `CLAUDE_CONFIG_DIR`; st3 reads it so a seat on any account is found without guessing.
 fn write_native_session_binding(
     agent_dir: &Path,
     incarnation: &str,
     native_id: &str,
+    transcript_path: Option<&str>,
 ) -> Result<()> {
+    let mut binding = serde_json::json!({
+        "incarnation": incarnation,
+        "native_session_id": native_id,
+    });
+    if let Some(path) = transcript_path.filter(|path| Path::new(path).is_absolute()) {
+        binding["transcript_path"] = serde_json::Value::String(path.to_owned());
+    }
     harness_state::write_json_atomic(
         &agent_dir.join("claude-native-session"),
-        &serde_json::json!({
-            "incarnation": incarnation,
-            "native_session_id": native_id,
-        }),
+        &binding,
         agent_dir,
         ".claude-native-session",
     )
@@ -2103,13 +2114,38 @@ mod tests {
     #[test]
     fn native_session_binding_is_atomic_and_names_the_exact_provider_incarnation() {
         let root = tempfile::tempdir().unwrap();
-        write_native_session_binding(root.path(), "wrapper-current", "native-current").unwrap();
+        write_native_session_binding(root.path(), "wrapper-current", "native-current", None)
+            .unwrap();
         let binding: serde_json::Value = serde_json::from_slice(
             &std::fs::read(root.path().join("claude-native-session")).unwrap(),
         )
         .unwrap();
         assert_eq!(binding["incarnation"], "wrapper-current");
         assert_eq!(binding["native_session_id"], "native-current");
+        assert!(binding.get("transcript_path").is_none());
+        // A seat on its own account: Claude's path, outside ~/.claude, is kept; a relative one is not.
+        write_native_session_binding(
+            root.path(),
+            "wrapper-current",
+            "native-current",
+            Some("/home/ada/.claude-accounts/second/projects/-work/native-current.jsonl"),
+        )
+        .unwrap();
+        let binding: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("claude-native-session")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            binding["transcript_path"],
+            "/home/ada/.claude-accounts/second/projects/-work/native-current.jsonl"
+        );
+        write_native_session_binding(root.path(), "wrapper-current", "native-current", Some("rel.jsonl"))
+            .unwrap();
+        let binding: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.path().join("claude-native-session")).unwrap(),
+        )
+        .unwrap();
+        assert!(binding.get("transcript_path").is_none());
     }
 
     #[test]
