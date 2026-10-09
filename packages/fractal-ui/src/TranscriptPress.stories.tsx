@@ -5,6 +5,7 @@ import { expect, userEvent, waitFor, within } from 'storybook/test'
 import { Button } from 'react-aria-components'
 import { Transcript, type TranscriptTurn } from './assistant-ui/composition/Transcript'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
+import { EmbraceScrollViewport } from './assistant-ui/EmbraceScrollViewport'
 import type { TextItem, ToolCallItem } from './assistant-ui/embrace-data/model'
 import { workLogTurnFromItems } from './assistant-ui/taste/work-log'
 import { baselineTheme } from './assistant-ui/neutral-theme'
@@ -224,9 +225,68 @@ export const ScrollDuringPress: Story = { play: async ({ canvasElement }) => {
 } }
 export const ScrollDuringPressLight: Story = { ...ScrollDuringPress, args: { scheme: 'light' } }
 
+type InsertSnapshot = 'retained' | 'fresh' | 'shifted'
+const actionRows = Array.from({ length: 40 }, (_, index) => ({ id: `action-${index}`, version: `Row ${index}` }))
+/** App-shaped clickable rows: keys are host ids, never array indexes or decoded object identities. */
+function HostRowsPressStory({ scheme, snapshot }: { scheme: Scheme; snapshot: InsertSnapshot }) {
+  const [rows, setRows] = React.useState(actionRows)
+  const [activated, setActivated] = React.useState('')
+  const insert = () => setRows(previous => {
+    const current = snapshot === 'retained' ? previous : previous.map(row => ({ ...row }))
+    // Stable host ids survive decoding a new snapshot and shifting the pressed row's index.
+    const inserted = Array.from({ length: snapshot === 'shifted' ? 3 : 1 }, (_, index) => ({ id: `inserted-${index}`, version: `Inserted ${index}` }))
+    const at = current.length - 1
+    return [...current.slice(0, at), ...inserted, ...current.slice(at)]
+  })
+  return <main {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
+    <div {...stylex.props(styles.toolbar)}><Button onPress={insert} {...stylex.props(styles.button)}>Insert host rows above</Button><output data-testid="activated-row">{activated}</output></div>
+    <EmbraceScrollViewport items={rows} data-testid="host-row-scroll" {...stylex.props(styles.hostViewport)}>
+      {rows.map((row, index) => <div key={row.id} data-item-id={row.id} data-row-index={index} {...stylex.props(styles.hostRow)}><Button onPress={() => setActivated(row.id)} {...stylex.props(styles.button)}>Activate {row.id}</Button></div>)}
+    </EmbraceScrollViewport>
+  </main>
+}
+const hostInsertPlay: NonNullable<Story['play']> = async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const viewport = canvas.getByTestId('host-row-scroll')
+  await document.fonts.ready
+  await settleFrames()
+  viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -viewport.scrollHeight }))
+  const index = 39
+  const id = `action-${index}`
+  const action = canvas.getByRole('button', { name: `Activate ${id}`, exact: true })
+  const row = action.closest<HTMLElement>('[data-item-id]')!
+  // The failed outbox/action row is last; incoming server rows insert immediately above it.
+  viewport.scrollTop = viewport.scrollHeight
+  await settleFrames()
+  const before = row.getBoundingClientRect().top
+  await expect(row).toHaveAttribute('data-row-index', String(index))
+  const laneBottom = viewport.getBoundingClientRect().bottom
+  const contentHeight = viewport.scrollHeight
+  await pressAcross(action, async () => {
+    await settleFrames()
+    canvas.getByRole('button', { name: 'Insert host rows above' }).click()
+    await waitFor(() => expect(canvas.getByRole('button', { name: 'Activate inserted-0' })).toBeInTheDocument())
+    await settleFrames()
+    await expect(canvas.getByRole('button', { name: `Activate ${id}`, exact: true }), 'host key must preserve the action DOM node').toBe(action)
+    await expect(Number(row.dataset.rowIndex), 'same key must shift index').toBeGreaterThan(index)
+    await expect(viewport.scrollHeight, 'incoming rows must grow the scrollable content').toBeGreaterThan(contentHeight)
+    await expect(Math.abs(viewport.getBoundingClientRect().bottom - laneBottom), 'bounded lane must remain the scroll owner during the press').toBeLessThanOrEqual(1)
+    await expect(Math.abs(row.getBoundingClientRect().top - before), 'original action moved under the held pointer').toBeLessThanOrEqual(1)
+  })
+  await waitFor(() => expect(canvas.getByTestId('activated-row')).toHaveTextContent(id))
+}
+export const HostInsertRetainedRows: Story = { render: args => <HostRowsPressStory scheme={args.scheme} snapshot="retained" />, play: hostInsertPlay }
+export const HostInsertFreshObjects: Story = { render: args => <HostRowsPressStory scheme={args.scheme} snapshot="fresh" />, play: hostInsertPlay }
+export const HostInsertShiftedIndex: Story = { render: args => <HostRowsPressStory scheme={args.scheme} snapshot="shifted" />, play: hostInsertPlay }
+export const HostInsertRetainedRowsLight: Story = { ...HostInsertRetainedRows, args: { scheme: 'light' } }
+export const HostInsertFreshObjectsLight: Story = { ...HostInsertFreshObjects, args: { scheme: 'light' } }
+export const HostInsertShiftedIndexLight: Story = { ...HostInsertShiftedIndex, args: { scheme: 'light' } }
+
 const styles = stylex.create({
   root: { height: '100vh', width: '100%', boxSizing: 'border-box', display: 'flex', flexDirection: 'column', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
   transcript: { flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' },
   toolbar: { display: 'flex', alignItems: 'center', gap: s.md, padding: s.md, flexShrink: 0, fontSize: t.metaSize },
   button: { minHeight: g.controlMd, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
+  hostViewport: { flex: '1 1 0', minHeight: 0, overflowY: 'auto' },
+  hostRow: { minHeight: 72, display: 'flex', alignItems: 'center', paddingInline: s.md },
 })
