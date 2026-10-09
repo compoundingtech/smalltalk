@@ -170,7 +170,7 @@ fn claims_attention_never_reads_republish_the_same_rows_without_a_fold() {
             "agent/alder.asker",
             "harness.observed",
             Some("agent/alder.asker"),
-            json!({"state":"needs-login","incarnation_id":"one","driver":"claude"}),
+            json!({"state":"blocked","reason":"providerAuth","provider_auth":false,"incarnation_id":"one","driver":"claude"}),
         ))
         .unwrap();
     refresh_and_check(&store);
