@@ -274,11 +274,11 @@ fn a_clean_skip_keeps_a_fault_and_a_selected_failure_cannot_publish_recovery() {
     reconciler.incremental.observe(&store).unwrap();
     let reads = reconciler.incremental.reads_of(key);
     reconciler.incremental.evaluated(key, reads, None);
-    let index = store.index();
+    let index = store.index().unwrap();
     reconciler.reconcile_selected_intake("schedule", key, "schedule/cycle-0", true, || {
         panic!("clean skip ran")
     });
-    assert_eq!(store.index(), index);
+    assert_eq!(store.index().unwrap(), index);
     assert!(
         store
             .open_reconcile_faults("away")
@@ -903,14 +903,14 @@ async fn unchanged_provider_failure_without_a_claim_still_selects_the_new_retry_
             .incremental
             .needs("observer:observer/unrelated", now_ms())
     );
-    let before = store.index();
+    let before = store.index().unwrap();
     release.notify_one();
     tokio::time::timeout(Duration::from_secs(2), completion.changed())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(
-        store.index(),
+        store.index().unwrap(),
         before,
         "unchanged failure publishes no new claim"
     );
