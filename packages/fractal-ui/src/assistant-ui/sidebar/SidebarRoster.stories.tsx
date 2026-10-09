@@ -60,6 +60,12 @@ export const HundredAgentRender: Story = { render: () => <RosterRender />, play:
   const root = canvasElement.querySelector<HTMLElement>('[data-roster-perf]')!
   root.dataset.rosterMeasurement = JSON.stringify({ rows: roster.length, start, windowMs: 1500, maxTaskMs, tasks: renderTasks })
   await expect(within(canvasElement).getAllByTestId('taste-agent-row')).toHaveLength(100)
+  // This mixed cohort used to drop row 91's duration scope against a transient wide peer track and never restore it.
+  const retained = canvasElement.querySelector<HTMLElement>('[data-wf-agent-ref="agent/roster-91"] [data-testid="taste-agent-row"]')!
+  const scope = retained.querySelector<HTMLElement>('[data-row-column="time"] [data-line1-drop="scope"]')!
+  await expect(scope.style.display).not.toBe('none')
+  await expect(retained.querySelector<HTMLElement>('[data-row-column="time"]')!.clientWidth).toBeGreaterThanOrEqual(Math.ceil(Number.parseFloat(retained.dataset.rowTimeNatural!)))
+  await expect(retained.querySelector<HTMLElement>('[data-row-column="title-text"]')!.clientWidth).toBeGreaterThanOrEqual(retained.clientWidth * 0.6)
 } }
 const styles = stylex.create({
   root: { height: '100vh', overflowY: 'auto', boxSizing: 'border-box', padding: s.lg, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading },

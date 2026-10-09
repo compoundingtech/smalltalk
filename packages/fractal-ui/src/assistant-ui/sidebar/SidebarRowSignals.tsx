@@ -83,6 +83,71 @@ function fitLine1(scopes: Set<HTMLElement>) {
     for (const drop of drops) writeStyle(drop, 'display', 'none')
     measureAndApplyTracks(cohorts)
   }
+  restoreLine1Fields(cohorts)
+}
+
+/** A simultaneous drop can shrink the cohort track enough to make an earlier drop unnecessary. Try higher-priority fields
+ * first against the settled track, measuring all candidates before writing. Collision pruning reaches a fixed point using
+ * only those measurements: a rejected widest candidate must not lend its unpublished track width to another restoration. */
+function restoreLine1Fields(cohorts: Line1Cohort[]) {
+  for (const kind of ['scope', 'subs', 'tokens']) {
+    const candidates = new Map<Line1Row, HTMLElement>()
+    for (const cohort of cohorts) for (const row of cohort.rows) {
+      const field = row.drops.find(drop => drop.dataset.line1Drop === kind && drop.style.display === 'none')
+      if (field !== undefined) candidates.set(row, field)
+    }
+    if (candidates.size === 0) continue
+    for (const field of candidates.values()) writeStyle(field, 'display', '')
+    const decisions: { row: Line1Row; field: HTMLElement; width: number; keep: boolean }[] = []
+    for (const cohort of cohorts) {
+      const trial = []
+      let ceiling = Number.POSITIVE_INFINITY
+      for (const row of cohort.rows) {
+        const field = candidates.get(row)
+        const bounds = row.content?.getBoundingClientRect()
+        const count = row.count?.getBoundingClientRect()
+        const capacity = row.time.clientWidth + row.title.clientWidth - row.floor
+        const overlap = bounds !== undefined && count !== undefined && count.width > 0 ? count.right + row.gap - bounds.left - 0.5 : Number.NEGATIVE_INFINITY
+        const width = row.content === null ? 0 : Math.max(row.content.scrollWidth, bounds!.width)
+        // Rows with no optional fields left cannot meet the title floor at every cohort width (e.g. a persistent chevron).
+        // They must not prevent another row retaining a field that fits its own floor and does not collide.
+        const hasRetainedField = row.drops.some(drop => drop !== field && drop.style.display !== 'none')
+        if (hasRetainedField && field?.dataset.line1Drop !== 'subs') ceiling = Math.min(ceiling, capacity)
+        if (field !== undefined) trial.push({ row, field, width, capacity, overlap, track: row.time.clientWidth, blocked: false })
+      }
+      let target: number
+      let rejected: boolean
+      do {
+        target = Math.ceil(cohort.widest)
+        for (const candidate of trial) {
+          if (!candidate.blocked && Math.ceil(candidate.width) <= Math.min(ceiling, candidate.capacity)) target = Math.max(target, Math.ceil(candidate.width))
+        }
+        rejected = false
+        for (const candidate of trial) if (!candidate.blocked && candidate.overlap > target - candidate.track) {
+          candidate.blocked = true
+          rejected = true
+        }
+      } while (rejected) // Each iteration rejects at least one candidate; no further DOM reads or layouts.
+      for (const candidate of trial) decisions.push({
+        row: candidate.row, field: candidate.field, width: candidate.width,
+        keep: !candidate.blocked && Math.ceil(candidate.width) <= target && target <= Math.min(candidate.capacity, ceiling),
+      })
+    }
+    for (const { row, field, width, keep } of decisions) {
+      if (!keep) writeStyle(field, 'display', 'none')
+      else row.naturalTime = width
+    }
+    // No geometry reads are needed to publish the accepted widths and track.
+    for (const cohort of cohorts) {
+      cohort.widest = 0
+      for (const row of cohort.rows) {
+        cohort.widest = Math.max(cohort.widest, row.naturalTime)
+        const value = String(row.naturalTime)
+        if (row.row.dataset.rowTimeNatural !== value) row.row.dataset.rowTimeNatural = value
+      }
+      if (cohort.widest > 0) writeStyle(cohort.scope, '--sidebar-metric-track', `${Math.ceil(cohort.widest)}px`)
+    }
+  }
 }
 function measureAndApplyTracks(cohorts: Line1Cohort[]) {
   for (const cohort of cohorts) {
