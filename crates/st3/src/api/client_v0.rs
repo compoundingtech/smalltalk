@@ -803,6 +803,68 @@ async fn conversation_changes_value(
     conversation_changes_local(state, session, session_id, after, wait_ms).await
 }
 
+/// Capture the first page and its replay boundary with one timeline read. The graph and local
+/// frontiers precede the read, so a concurrent append remains replayable after this page.
+async fn conversation_open_value(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    remote: Option<&str>,
+) -> Result<(Value, Value), ApiError> {
+    if remote.is_some() {
+        // Existing owners relay the two public reads. Keep mixed-build relay compatibility.
+        let start = conversation_changes_value(state, session, session_id, remote, None, 0).await?;
+        let page = conversation_page(state, session, session_id, remote).await?;
+        return Ok((start, page));
+    }
+    let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
+    crate::api::read_deadline::spawn_blocking(move || {
+        conversation_open_local(&state, &session, &session_id)
+    }).await.map_err(ApiError::internal)?
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_CONVERSATION_SNAPSHOT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static BEFORE_CONVERSATION_PAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn conversation_open_local(
+    state: &AppState, session: &ClientSession, session_id: &str,
+) -> Result<(Value, Value), ApiError> {
+    // Local rows follow a graph position. Capture their high-water first: a row newer than
+    // the graph cut must never be excluded from both this page and its replay cursor.
+    let local_position = local_latest_position(state)?;
+    let snapshot = new_client_snapshot(state);
+    #[cfg(test)]
+    AFTER_CONVERSATION_SNAPSHOT.with(|pause| {
+        if let Some(pause) = pause.borrow_mut().take() { pause(); }
+    });
+    let mark = ConversationMark::new(state, session_id)?;
+    #[cfg(test)]
+    BEFORE_CONVERSATION_PAGE.with(|pause| {
+        if let Some(pause) = pause.borrow_mut().take() { pause(); }
+    });
+    let page = timeline_value(
+        state, &snapshot, session, session_id,
+        &ClientListQuery { limit: Some(200), ..Default::default() },
+    )?.0;
+    let native = native_latest_sequence(&page);
+    let cursor = conversation_cursor(
+        state, session_id, snapshot.store_index, local_position, native,
+    );
+    remember_cursor(&cursor, mark.transcript_seen);
+    Ok((json!({"next_cursor":cursor}), page))
+}
+
+fn native_latest_sequence(page: &Value) -> u64 {
+    page["items"].as_array().into_iter().flatten()
+        .filter(|item| item["id"].as_str()
+            .is_some_and(|id| id.starts_with("timeline-entry/native-")))
+        .filter_map(|item| item["sequence"].as_u64())
+        .max().unwrap_or(0)
+}
+
 /// Follow one conversation for a collection socket: its newest page, then each change, until
 /// the socket stops listening. A change the server can no longer replay sends the page again.
 fn conversation_stream_error(id: &str, error: &ApiError) -> Value {
@@ -822,24 +884,8 @@ async fn follow_conversation(
     let remote = remote.as_deref();
     let failed = |error: &ApiError| conversation_stream_error(&id, error);
     loop {
-        // The cursor first, so nothing that lands while the page is read is lost.
-        let start = match conversation_changes_value(&state, &session, &session_id, remote, None, 0)
-            .await
-        {
-            Ok(start) => start,
-            Err(error) => {
-                if client_error_retryable(error.status, Some(&error.code)) {
-                    // Say why, so a client showing its last copy can say that copy is stale.
-                    if outbox.send((id.clone(), generation, json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true, "code":error.code, "message":error.message}))).is_err() { return; }
-                    tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
-                    continue;
-                }
-                let _ = outbox.send((id.clone(), generation, failed(&error)));
-                return;
-            }
-        };
-        let page = match conversation_page(&state, &session, &session_id, remote).await {
-            Ok(page) => page,
+        let (start, page) = match conversation_open_value(&state, &session, &session_id, remote).await {
+            Ok(opened) => opened,
             Err(error) => {
                 if client_error_retryable(error.status, Some(&error.code)) {
                     // Say why, so a client showing its last copy can say that copy is stale.
@@ -5143,6 +5189,10 @@ fn timeline_first_page(
     session_id: String,
     query: &ClientListQuery,
 ) -> Result<Json<Value>, ApiError> {
+    #[cfg(test)]
+    if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
+        *rebuilds.entry(session_id.to_owned()).or_default() += 1;
+    }
     let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
         .map_err(ApiError::internal)?;
     let Some((owner, incarnation, _)) = managed else {
@@ -5690,15 +5740,18 @@ fn conversation_read_now_unbounded(
     session_id: &str,
     after: Option<&str>,
 ) -> Result<Value, ApiError> {
-    #[cfg(test)]
-    if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
-        *rebuilds.entry(session_id.to_owned()).or_default() += 1;
-    }
     let snapshot = new_client_snapshot(state);
     let query = ClientListQuery { limit: Some(200), ..Default::default() };
     let page = match conversation_blocks::source(state, session_id) {
         // Replay selects only its newest bounded projection, including for OpenCode.
-        Ok(source) => native_slice_page(state, &snapshot, session, session_id, &query, &source),
+        Ok(source) => {
+            // Native replay bypasses timeline_first_page after the incremental-fold cutover.
+            #[cfg(test)]
+            if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
+                *rebuilds.entry(session_id.to_owned()).or_default() += 1;
+            }
+            native_slice_page(state, &snapshot, session, session_id, &query, &source)
+        },
         Err(_) => timeline_value(state, &snapshot, session, session_id, &query),
     }?.0;
     let all = page["items"]
@@ -5714,13 +5767,7 @@ fn conversation_read_now_unbounded(
         .filter_map(|item| item["sequence"].as_u64());
     let native_latest = native_sequences.clone().max().unwrap_or(0);
     let native_oldest = native_sequences.min();
-    let local_latest = state
-        .store
-        .local_observations_tail(1)
-        .map_err(ApiError::internal)?
-        .first()
-        .and_then(crate::store::local_observation_position)
-        .unwrap_or(0);
+    let local_latest = local_latest_position(state)?;
     let position = after
         .map(|cursor| conversation_position(state, session_id, cursor))
         .transpose()?;
@@ -5925,7 +5972,7 @@ fn issued_transcript(cursor: &str) -> Option<TranscriptSeen> {
     issued_cursors().lock().ok()?.1.get(cursor).copied()
 }
 
-/// How many times each session's timeline was rebuilt for a change read, for the budget test.
+/// First-page builds for initial OPEN and reactive changes, counted by the work-budget tests.
 #[cfg(test)]
 fn timeline_rebuilds() -> &'static std::sync::Mutex<HashMap<String, u64>> {
     static REBUILDS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> =
@@ -5977,43 +6024,15 @@ impl ConversationMark {
     }
 
     fn changed_unbounded(&mut self, state: &AppState) -> Result<bool, ApiError> {
-        let mut changed = false;
         let index = state.store.index().map_err(ApiError::internal)?;
-        if index > self.store_index {
-            let claims = state
-                .store
-                .claims_page(
-                    None,
-                    None,
-                    self.store_index,
-                    index.checked_add(1),
-                    false,
-                    10_000,
-                )
-                .map_err(ApiError::internal)?
-                .claims;
-            // A burst too large to scan is treated as a change.
-            changed |= claims.len() >= 10_000
-                || claims.iter().any(|claim| {
-                    let fields = claim.body.get("fields").unwrap_or(&claim.body);
-                    Some(claim.subject.as_str()) == self.owner.as_deref()
-                        || (claim.kind == "message.sent"
-                            && ["from", "to"].iter().any(|side| {
-                                fields.get(*side).and_then(Value::as_str) == self.owner.as_deref()
-                            }))
-                });
-            self.store_index = index;
-        }
         let local = local_latest_position(state)?;
-        if local > self.local_position {
-            changed |= state
-                .store
-                .local_observations_after(self.local_position, 10_000)
-                .map_err(ApiError::internal)?
-                .iter()
-                .any(|claim| Some(claim.subject.as_str()) == self.owner.as_deref());
-            self.local_position = local;
-        }
+        let mut changed = self.owner.as_deref().map(|owner| {
+            state.store.conversation_changed_at(
+                owner, self.store_index, index, self.local_position, local,
+            )
+        }).transpose().map_err(ApiError::internal)?.unwrap_or(false);
+        self.store_index = index;
+        self.local_position = local;
         let seen = transcript_seen(self.transcript.as_deref());
         if seen != self.transcript_seen {
             changed = true;
@@ -6024,13 +6043,7 @@ impl ConversationMark {
 }
 
 fn local_latest_position(state: &AppState) -> Result<u64, ApiError> {
-    Ok(state
-        .store
-        .local_observations_tail(1)
-        .map_err(ApiError::internal)?
-        .first()
-        .and_then(crate::store::local_observation_position)
-        .unwrap_or(0))
+    state.store.conversation_local_position().map_err(ApiError::internal)
 }
 
 async fn conversation_changes_local(
@@ -15383,6 +15396,149 @@ mission "example/zero-run" state="ready" {
             .unwrap()
             .0;
         assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_open_budget_reads_one_page_then_sends_only_the_appended_native_record() {
+        for lines in [3, 360] {
+            let root = tempfile::tempdir().unwrap();
+            let state = test_state_named(root.path(), &format!("open-budget-{lines}"));
+            let owner = format!("agent/open-budget-{lines}");
+            let incarnation = "123:2026-09-25T15:11:54.870Z";
+            let native = format!("open-native-{lines}");
+            let path = root.path().join("session.jsonl");
+            let message = |index| json!({"type":"message", "id":format!("answer-{index}"),
+                "timestamp":"2026-09-25T15:12:00Z", "message":{"role":"assistant",
+                    "content":[{"type":"text", "text":format!("answer {index} {}", "x".repeat(512))}]}});
+            let mut transcript = format!("{}\n", json!({"type":"session", "id":native,
+                "timestamp":"2026-09-25T15:11:54Z", "cwd":root.path()}));
+            for index in 0..lines { transcript.push_str(&format!("{}\n", message(index))); }
+            std::fs::write(&path, transcript).unwrap();
+            for (kind, fields) in [
+                ("runtime.observed", json!({"status":"running", "runtime_id":"open-runtime", "incarnation_id":incarnation})),
+                ("harness.observed", json!({"state":"idle", "driver":"omp", "incarnation_id":incarnation})),
+                ("harness.session-file", json!({"harness":"omp", "agent":owner, "incarnation_id":incarnation, "session_id":native, "path":path})),
+            ] {
+                state.store.append_claim(&ClaimInput {
+                    subject: owner.clone(), kind: kind.into(), actor: Some(owner.clone()),
+                    fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
+                    expected_subject: None, idempotency_key: None,
+                }).unwrap();
+            }
+            let session_id = managed_session_id(&owner, incarnation);
+            let session = ClientSession::local(Some("person/example")).unwrap();
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let follower = tokio::spawn(follow_conversation(
+                state.clone(), session, "chat".into(), 1, session_id.clone(), None, sender,
+            ));
+            let (_, _, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
+            assert_eq!(frame["replace"], true, "{frame}");
+            assert_collection_frame_conforms(&frame);
+            assert_eq!(frame["items"].as_array().unwrap().len(), (lines * 2).min(200));
+            assert_eq!(frame["has_more"], lines * 2 > 200);
+            assert!(frame_bytes(&frame) <= CLIENT_MAX_RESPONSE_BYTES);
+            let rebuilds = || timeline_rebuilds().lock().unwrap().get(&session_id).copied().unwrap_or(0);
+            assert_eq!(rebuilds(), 1, "OPEN must not fold an empty baseline before its page");
+            // Change the source after the first frame. The next frame is a delta, not a reload.
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, "{}", message(lines)).unwrap();
+            drop(file);
+            signal_changed(&state);
+            let (_, _, delta) = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
+            assert_eq!(delta["replace"], false, "{delta}");
+            assert_eq!(delta["items"].as_array().unwrap().len(), 2, "{delta}");
+            assert!(delta["items"].as_array().unwrap().iter().any(|item|
+                item["body"]["text"].as_str().is_some_and(|text| text.starts_with(&format!("answer {lines} ")))));
+            assert_eq!(rebuilds(), 2);
+            assert_collection_frame_conforms(&delta);
+            follower.abort();
+            let _ = follower.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_open_cursor_replays_a_message_committed_during_the_initial_read() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "open-race");
+        let owner = "agent/open-race";
+        let incarnation = "open-race-runtime:i1";
+        state.store.append_claim(&ClaimInput {
+            subject: owner.into(), kind: "runtime.observed".into(), actor: Some(owner.into()),
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"open-race-runtime", "incarnation_id":incarnation})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let session_id = managed_session_id(owner, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let writer = state.clone();
+        let target = session_id.clone();
+        BEFORE_CONVERSATION_PAGE.with(|pause| {
+            *pause.borrow_mut() = Some(Box::new(move || {
+                writer.store.append_claim(&ClaimInput {
+                    subject: "message/open-race".into(), kind: "message.sent".into(), actor: Some("person/example".into()),
+                    fields: serde_json::from_value(json!({"from":"person/example", "to":owner,
+                        "session_id":target, "status":"sent", "content":"committed during OPEN"})).unwrap(),
+                    evidence: vec![], expected_subject: None, idempotency_key: None,
+                }).unwrap();
+            }));
+        });
+        let (start, page) = conversation_open_local(&state, &session, &session_id).unwrap();
+        assert!(!page["items"].as_array().unwrap().iter().any(|item| item["body"]["text"] == "committed during OPEN"));
+        let delta = conversation_changes_local(&state, &session, &session_id, start["next_cursor"].as_str(), 0).await.unwrap();
+        assert!(delta["items"].as_array().unwrap().iter().any(|item| item["body"]["text"] == "committed during OPEN"), "{delta}");
+    }
+
+    #[tokio::test]
+    async fn conversation_open_replays_local_rows_that_follow_a_newer_graph_cut() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "open-local-frontier");
+        let owner = "agent/open-local-frontier";
+        let incarnation = "local-frontier-runtime:i1";
+        state.store.append_claim(&ClaimInput {
+            subject: owner.into(), kind: "runtime.observed".into(), actor: Some(owner.into()),
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":"local-frontier-runtime", "incarnation_id":incarnation})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let session_id = managed_session_id(owner, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let writer = state.clone();
+        AFTER_CONVERSATION_SNAPSHOT.with(|pause| {
+            *pause.borrow_mut() = Some(Box::new(move || {
+                // The unrelated commit advances the graph, so the following local row is
+                // outside the first page's graph cut, even though the later mark can see it.
+                writer.store.append_claim(&ClaimInput {
+                    subject: "message/unrelated-local-frontier".into(), kind: "message.sent".into(),
+                    actor: Some("person/other".into()),
+                    fields: serde_json::from_value(json!({"from":"person/other", "to":"agent/other",
+                        "status":"sent", "content":"unrelated commit"})).unwrap(),
+                    evidence: vec![], expected_subject: None, idempotency_key: None,
+                }).unwrap();
+                writer.store.append_local_observations_for_test(&[ClaimInput {
+                    subject: owner.into(), kind: "harness.timeline".into(), actor: Some(owner.into()),
+                    fields: serde_json::from_value(json!({"operation":"append",
+                        "entry_id":"timeline-entry/open-local-frontier", "sequence":1,
+                        "revision":1, "role":"assistant", "entry_type":"content", "final":true,
+                        "body":{"media_type":"text/plain", "text":"local row across graph cut"},
+                        "driver":"codex", "incarnation_id":incarnation})).unwrap(),
+                    evidence: vec![], expected_subject: None, idempotency_key: None,
+                }]);
+            }));
+        });
+        let (start, page) = conversation_open_local(&state, &session, &session_id).unwrap();
+        let contains_local = |value: &Value| value["items"].as_array().unwrap().iter()
+            .any(|item| item["id"] == "timeline-entry/open-local-frontier");
+        assert!(!contains_local(&page));
+        let cursor = start["next_cursor"].as_str().unwrap();
+        let (graph, local, native) = conversation_position(&state, &session_id, cursor).unwrap();
+        let latest_local = local_latest_position(&state).unwrap();
+        assert!(latest_local > local);
+        // Control: the former post-snapshot local high-water silently skips this exact row.
+        let skipped = conversation_cursor(&state, &session_id, graph, latest_local, native);
+        remember_cursor(&skipped, issued_transcript(cursor).unwrap());
+        let lost = conversation_changes_local(&state, &session, &session_id, Some(&skipped), 0).await.unwrap();
+        assert!(!contains_local(&lost));
+        let replay = conversation_changes_local(&state, &session, &session_id, Some(cursor), 0).await.unwrap();
+        assert!(contains_local(&replay), "{replay}");
     }
 
     #[tokio::test]

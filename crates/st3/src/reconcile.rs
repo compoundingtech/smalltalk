@@ -1366,6 +1366,38 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// a running watch has none. A mission's subscription to a standing observer, such as an
     /// intake's, keeps it running the same way. Stop each standing observer this host declared
     /// once no running subscription uses it, and look again at the next deadline.
+    fn reconcile_github_watches_stage(&self) {
+        const ITEM: &str = "stage/github-watches";
+        let daemon = format!("daemon/{}", self.host);
+        // Earlier stages may change declarations or end watches. Observe those writes before
+        // selecting; the evaluation then reads a fresh complete roster inside its read record.
+        if let Err(error) = self.incremental.observe(&self.store) {
+            self.isolate(ITEM, &daemon, || Err::<(), _>(error));
+            self.incremental.touch(ITEM);
+            return;
+        }
+        let skip = self.skip_unneeded && !self.incremental.take_full_pass("github-watches", now_ms());
+        if skip && !self.incremental.needs(ITEM, now_ms()) {
+            // Keep the previous reads, due time and fault. No evaluation means no recovery.
+            return;
+        }
+        if self
+            .isolate(ITEM, &daemon, || {
+                self.reconcile_item("github-watches", ITEM, false, || {
+                    // The self-key makes a failed full pass retry without discarding prior reads.
+                    smallclaims::touched::note_read(|| ITEM.into());
+                    smallclaims::touched::note_read(|| "kind:record.repaired".into());
+                    smallclaims::touched::note_read(|| "desired-subject-membership".into());
+                    let desired = self.store.github_watch_declarations()?;
+                    self.reconcile_github_watches(&desired)
+                })
+            })
+            .is_none()
+        {
+            self.incremental.touch(ITEM);
+        }
+    }
+
     pub(crate) fn reconcile_github_watches(&self, desired: &[DesiredSubject]) -> Result<()> {
         let now = now_ms();
         let mut next_deadline: Option<u128> = None;
@@ -1987,6 +2019,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         drop(_runners_span);
         let desired_span = crate::profile::span("pass/desired");
         let mut desired = self.store.desired_subjects()?;
+        // Eval cleanup can delete desired rows without appending a claim. Watch selection must
+        // see those removals through the complete roster this pass already reads, not only the
+        // claim/local-observation feed or the host/authority-filtered active member list.
+        self.incremental.observe_value(
+            "desired-subject-membership",
+            desired
+                .iter()
+                .map(|declaration| declaration.subject.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
         self.incoming_resumes(&desired)?;
         let terminal_owned = self.store.terminal_owned_runtime_subjects()?;
         drop(desired_span);
@@ -2808,9 +2851,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
         self.isolate("stage/faults", &daemon, || self.deliver_faults(&desired));
         self.isolate("stage/subagents", &daemon, || self.end_stale_subagents());
-        self.isolate("stage/github-watches", &daemon, || {
-            self.reconcile_github_watches(&desired)
-        });
+        self.reconcile_github_watches_stage();
         self.file_watchers_used
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -7482,7 +7523,19 @@ impl<R: RuntimeControl> Reconciler<R> {
                             .blocked_reason
                             .as_deref()
                             .is_some_and(|reason| reason.starts_with("step baseline `"));
-                    if view.status == "pending" || assignment_blocked || baseline_blocked {
+                    let ready_missing_agent = view.status == "ready"
+                        && !view.agentless
+                        && view.claimant.is_none()
+                        && !view
+                            .assigned_to
+                            .as_deref()
+                            .is_some_and(|a| a.starts_with("person/"))
+                        && self.ready_step_binding_missing(run, view)?;
+                    if view.status == "pending"
+                        || assignment_blocked
+                        || baseline_blocked
+                        || ready_missing_agent
+                    {
                         if view
                             .not_before_unix_ms
                             .is_some_and(|not_before| not_before > now_ms())
@@ -7746,10 +7799,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
         }
         if run.phase == "normal" {
-            let refreshed = self
-                .store
-                .mission_run(&run.id)?
-                .context("the active mission run disappeared")?;
+            let refreshed = self.store.mission_run_for_reconcile(&run.id)?;
             let normal = refreshed
                 .steps
                 .iter()
@@ -7764,8 +7814,20 @@ impl<R: RuntimeControl> Reconciler<R> {
             let failed = normal
                 .iter()
                 .any(|view| matches!(view.status.as_str(), "failed" | "cancelled"));
+            let missing_agent = normal.iter().find(|view| {
+                view.status == "blocked"
+                    && view
+                        .blocked_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with("no eligible agent is present"))
+            });
+            if let Some(view) = missing_agent {
+                changed |= self.store.record_missing_agent_failure(&refreshed, view)?;
+            }
             let (status, reason) = if advancing {
                 ("running", None)
+            } else if missing_agent.is_some() {
+                ("blocked", Some("the mission has no eligible desired agent"))
             } else if failed {
                 ("blocked", Some("the mission has no available step"))
             } else if mission.completion.is_none() && !changed {
@@ -7778,6 +7840,28 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .set_mission_run_state(&run.id, status, "normal", reason)?;
         }
         Ok(changed)
+    }
+
+    /// Cleanup may have selected a stop while a seat still owns ready work in another run.
+    /// Keep that existing queue alive until ordinary seat retention lets the runtime end.
+    fn ready_step_binding_missing(&self, run: &MissionRunView, step: &StepRunView) -> Result<bool> {
+        for name in step.assigned_to.iter().chain(step.available_to.iter()) {
+            let kind = self.store.selected_desired_kind(name)?;
+            if kind.as_deref() == Some("agent") {
+                return Ok(false);
+            }
+            if kind.as_deref() == Some("stop")
+                && let Some(owner) = self.store.selected_stop_owner_run(name)?
+                && owner != run.subject
+                && self
+                    .store
+                    .seat_work_in_other_runs(name, &owner)?
+                    .contains(&step.subject)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn record_first_readiness_wait(&self, run: &MissionRunView, now: u128) -> Result<()> {
@@ -15764,11 +15848,13 @@ mod tests {
     mod channel_recovery;
     mod differential;
     mod first_readiness_tests;
+    mod github_watch_selection;
     mod incremental_deadlines;
     mod ownership_guard_tests;
     mod pull_request_run_tests;
     mod ready_idle_wake;
     mod ref_watch_tests;
+    mod revision_seat_tests;
     mod rollout_tests;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {

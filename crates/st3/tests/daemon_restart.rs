@@ -45,6 +45,13 @@ impl Daemon {
         self.start_with_binding(false).await;
     }
 
+    /// Protocol/receipt controls with fabricated incarnations and bare channel children.
+    /// Actual physical ownership controls always use the production bound API.
+    async fn start_admitted_protocol(&mut self) {
+        let app = st3::test_support::admitted_mailbox_protocol_router(self.state());
+        self.start_isolated_app(app).await;
+    }
+
     fn state(&self) -> AppState {
         AppState {
             store: self.store.clone(),
@@ -64,10 +71,6 @@ impl Daemon {
 
     // Dropping this runtime also closes upgraded WebSocket connections, just as exiting
     // the daemon does. Aborting only the listener would leave those tasks alive.
-    async fn start_isolated(&mut self) {
-        self.start_isolated_app(st3::api::router(self.state())).await;
-    }
-
     async fn start_isolated_app(&mut self, app: axum::Router) {
         let socket = self.socket.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel();
@@ -334,7 +337,7 @@ async fn native_exit_driver(root: &Path, daemon: &mut Daemon) -> TestSeat {
     let mut command = seat_command(root, &daemon.socket);
     declare_claude(daemon, seat);
     daemon.observe_running(seat, "exit-orchid:one");
-    daemon.start_isolated().await;
+    daemon.start_admitted_protocol().await;
     let provider = r#"
 import os, signal, time
 from pathlib import Path
@@ -481,7 +484,7 @@ async fn native_exit_retries_past_stop_budget_without_signal_and_reports_on_reco
         native_exit_finishes(root, &mut driver, Duration::ZERO).await;
         panic!("driver exited before daemon recovery");
     }
-    daemon.start_isolated().await;
+    daemon.start_admitted_protocol().await;
     native_exit_finishes(root, &mut driver, Duration::from_secs(5)).await;
     let claims = daemon
         .store
@@ -594,7 +597,7 @@ fn declare_claude(daemon: &Daemon, seat: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_quiet_idle_seat_reports_current_after_daemon_restart_without_seat_restart() {
+async fn a_quiet_idle_seat_ages_stale_and_recovers_new_evidence_after_daemon_restart() {
     use sha2::{Digest as _, Sha256};
     use st_drivers::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
 
@@ -606,9 +609,9 @@ async fn a_quiet_idle_seat_reports_current_after_daemon_restart_without_seat_res
     let mut command = seat_command(root, &daemon.socket);
     declare_claude(&daemon, seat);
     daemon.observe_running(seat, incarnation);
-    daemon.start_isolated().await;
+    daemon.start_admitted_protocol().await;
     // A healthy quiet Claude seat includes its initialized delivery channel. The provider
-    // emits no further hook events; the wrapper must keep the owned idle evidence current.
+    // emits no further hook events while the retained idle evidence ages between refreshes.
     let provider = r#"
 import json, os, subprocess, sys, time
 channel = subprocess.Popen(
@@ -653,9 +656,9 @@ time.sleep(300)
         daemon.has_diagnostic(seat, incarnation, "claude-channel-attached")
     })
     .await;
-    // Stand in for this wrapper's Stop hook. The live wrapper must heartbeat that exact
-    // owned idle evidence; no subsequent provider event or test observation is supplied.
-    Writer::new(
+    // Stand in for this wrapper's Stop hook. Retain the same provider ownership for a
+    // genuine transition after the restart; quiet evidence is allowed to become stale.
+    let mut writer = Writer::new(
         &agent_dir,
         "grove/quiet-cedar",
         "claude",
@@ -664,8 +667,8 @@ time.sleep(300)
     .with_ownership(
         owned.evidence_incarnation.unwrap(),
         owned.ownership_sequence.unwrap(),
-    )
-    .observe(Observation::new(
+    );
+    writer.observe(Observation::new(
         Activity::Idle,
         BlockedOn::None,
         InputBuffer::Empty,
@@ -694,7 +697,20 @@ time.sleep(300)
     tokio::time::sleep(Duration::from_secs(95)).await;
     assert_alive(&mut driver, "the quiet driver");
     daemon.store = Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap());
-    daemon.start_isolated().await;
+    daemon.start_admitted_protocol().await;
+    let stale: Value = client.get("/v1/client/agents").await.unwrap();
+    let stale = stale["items"].as_array().unwrap().iter().find(|row| row["id"] == seat).unwrap();
+    assert_eq!(stale["observation"], "stale", "{stale}");
+    assert_eq!(stale["harness_state"], "indeterminate", "{stale}");
+    assert_eq!(stale["operational"]["runtime_incarnation"], incarnation, "{stale}");
+    assert_eq!(stale["delivery"]["transport"], "claude-channel", "{stale}");
+    assert!(daemon.has_diagnostic(seat, incarnation, "claude-channel-attached"));
+    assert_alive(&mut driver, "the same quiet driver after daemon restart");
+    assert_eq!(driver.id(), original_pid);
+    // A provider transition bypasses the five-minute unchanged-evidence guard. Require the
+    // fresh idle record to recover through the restarted daemon without restarting the seat.
+    writer.observe(Observation::new(Activity::Active, BlockedOn::None, InputBuffer::Empty)).unwrap();
+    writer.observe(Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Empty)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(40);
     let recovered = loop {
         let view: Value = client.get("/v1/client/agents").await.unwrap();
@@ -744,7 +760,7 @@ async fn title_failure(pty_session: Option<&str>, expected_session: &str) {
     let mut command = seat_command(root, &daemon.socket);
     declare_claude(&daemon, seat);
     daemon.observe_running(seat, "title-cedar:one");
-    daemon.start_with_binding(true).await;
+    daemon.start_admitted_protocol().await;
     let bin = root.join("bin");
     std::fs::create_dir(&bin).unwrap();
     let pty = bin.join("pty");
@@ -1501,7 +1517,7 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             let mut daemon = Daemon::new(root);
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
             daemon.observe_running(seat, "same-incarnation");
-            daemon.start_with_binding(true).await;
+            daemon.start_admitted_protocol().await;
 
             let socket = daemon.socket.clone();
             daemon.send("message/ready-probe", seat, "READINESS PROBE");
@@ -1602,7 +1618,7 @@ async fn native_read_mail_is_settled_before_and_after_reopening_the_daemon() {
             // A real durable Store reopen discards projection caches as a fresh daemon does.
             daemon.stop().await;
             daemon.store = Arc::new(Store::open(&graph, "restart-node").unwrap());
-            daemon.start_with_binding(true).await;
+            daemon.start_admitted_protocol().await;
             let (channel, _input, received) = open_channel().await;
             daemon.send("message/unread", seat, "UNREAD SIGNAL");
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -1686,7 +1702,7 @@ async fn delivered_unread_mail_stays_in_the_mailbox_after_seat_restart() {
                 "runtime_id": "replay-worker", "incarnation_id": "previous", "status": "exited",
             }));
             daemon.observe_running(seat, "replacement");
-            daemon.start_with_binding(true).await;
+            daemon.start_admitted_protocol().await;
             let mut channel = seat_command(root, &daemon.socket)
                 .env("ST_AGENT", seat)
                 .env("ST3_MAILBOX_TRANSPORT", transport)
@@ -1871,7 +1887,7 @@ async fn claude_idle_staged_mail_recovers_startup_binding_and_both_native_receip
         let root = root.path();
         let mut daemon = Daemon::new(root);
         daemon.observe_running("agent/quartz", "first");
-        daemon.start_with_binding(true).await;
+        daemon.start_admitted_protocol().await;
         let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-first");
         let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-first").await;
         daemon.send("message/idle", "agent/quartz", "QUARTZ IDLE SIGNAL");
@@ -1962,7 +1978,7 @@ async fn claude_staged_mail_receipted_after_restart_is_not_injected_on_second_re
     let root = root.path();
     let mut daemon = Daemon::new(root);
     daemon.observe_running("agent/quartz", "first");
-    daemon.start_with_binding(true).await;
+    daemon.start_admitted_protocol().await;
     let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-first");
     let (channel, _input, received) = fixture.open(root, &daemon, "wrapper-first").await;
     daemon.send("message/restart", "agent/quartz", "QUARTZ RESTART SIGNAL");
@@ -2051,7 +2067,7 @@ async fn claude_preboot_mail_is_held_while_live_receipts_survive_outage() {
         })
         .unwrap();
     daemon.observe_running("agent/quartz", "replacement");
-    daemon.start_with_binding(true).await;
+    daemon.start_admitted_protocol().await;
     let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-replacement");
     let (mut channel, _input, received) = fixture.open(root, &daemon, "wrapper-replacement").await;
     assert!(received.recv_timeout(Duration::from_millis(1200)).is_err());
@@ -2069,7 +2085,7 @@ async fn claude_preboot_mail_is_held_while_live_receipts_survive_outage() {
     );
     tokio::time::sleep(Duration::from_millis(1200)).await;
     assert_alive(&mut channel, "the Claude channel");
-    daemon.start_with_binding(true).await;
+    daemon.start_admitted_protocol().await;
     wait_until(
         "startup receipts after daemon recovery",
         Duration::from_secs(8),
@@ -2130,7 +2146,7 @@ async fn claude_delivered_unread_mail_from_an_old_ledger_is_held_in_a_fresh_sess
             idempotency_key: None,
         })
         .unwrap();
-    daemon.start_with_binding(true).await;
+    daemon.start_admitted_protocol().await;
     let fixture = ClaudeChannelFixture::new(root, &daemon, "wrapper-replacement");
     fixture.append(
         root,

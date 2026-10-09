@@ -6,6 +6,8 @@ in [`schemas`](schemas) and [`fixtures`](fixtures) are the normative wire exampl
 clients consume the same JSON; no client parses CLI output, Markdown, KDL, claim envelopes, or
 harness transcript files.
 
+Proposed changes extensions (not implemented): [per-turn files, patches, and branch Changes scope](turn-diff-design.md).
+
 The reusable Rust package is [`crates/st3-client`](../../../crates/st3-client) and supports both the
 local Unix socket and authenticated paired HTTP over Tailscale or optional Fabric. The Swift package is
 [`clients/swift/St3Client`](../../../clients/swift/St3Client). The Expo TypeScript client is
@@ -441,6 +443,10 @@ and `rates_usd_per_million_tokens` (`input`, `output`, `cache_read`, `cache_writ
 omit undisclosed table identity and rates; unpriced entries name the attempted table and omit
 rates. Entries on rollups are cumulative; period reads subtract the matching baseline entry.
 Different versions, sources and effective rates remain separate within the same rollup slot.
+Period reads seek the last cumulative snapshot at the period and daily boundaries using a
+partial series/timestamp index. They read at most one selected snapshot per series and boundary;
+equal observed timestamps retain the canonical replicated tie-breaker. The boundary seeks share
+one SQLite snapshot, so a concurrent publication cannot mix baselines and totals.
 Historical claims without these fields remain readable; absent provenance or session binding
 is unknown. After an upgrade, provenance covers only responses priced by the upgraded writer;
 its bucket sums can therefore be smaller than the row's totals. Per-response rounding means
