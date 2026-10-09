@@ -1180,7 +1180,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(2)).await;
         crate::mailbox::tests::ready(&state.store, "session-1");
         let peer = NativeDeliveryPeer {
-            start_token: None,
             agent: seat.into(),
             transport,
             pid: 37,
@@ -1314,7 +1313,6 @@ mod tests {
             let store = Store::open(&database, "node").unwrap();
             let seat = "agent/eval.worker";
             let peer = NativeDeliveryPeer {
-                start_token: None,
                 agent: seat.into(),
                 transport,
                 pid: 37,
@@ -1516,7 +1514,6 @@ mod tests {
             }
         }
         let peer = NativeDeliveryPeer {
-            start_token: None,
             agent: seat.into(),
             transport,
             pid: 37,
@@ -1755,7 +1752,6 @@ mod tests {
         );
 
         let peer = NativeDeliveryPeer {
-            start_token: None,
             agent: seat.into(),
             transport: "claude-channel",
             pid: 37,
@@ -1825,7 +1821,6 @@ mod tests {
                 .apply(&intent, &planned.subject_tokens, "seat")
                 .unwrap();
             let peer = NativeDeliveryPeer {
-                start_token: None,
                 agent: "agent/eval.worker".into(),
                 transport,
                 pid: 37,
@@ -3408,7 +3403,6 @@ mod tests {
         let fence = Fence::new("agent/eval.worker", "session-1", "delivery");
         assert!(authorize(&fence, None).is_err());
         let peer = NativeDeliveryPeer {
-            start_token: None,
             agent: "agent/eval.other".into(),
             transport: "omp-channel",
             pid: 37,
