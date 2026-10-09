@@ -1264,12 +1264,19 @@ fn client_request_snapshot(
 }
 
 fn client_snapshot_at(state: &AppState, store_index: u64) -> ClientSnapshot {
-    let created_at = client_timestamp(
+    client_snapshot_with_time(
+        state,
+        store_index,
         state
             .store
             .projection_time_at(store_index)
             .unwrap_or_default(),
-    );
+    )
+}
+
+/// The snapshot at `store_index` when its acceptance time (`projection_time_at`) is already known.
+fn client_snapshot_with_time(state: &AppState, store_index: u64, unix_ms: u128) -> ClientSnapshot {
+    let created_at = client_timestamp(unix_ms);
     let fingerprint = hex::encode(Sha256::digest(
         format!(
             "{CLIENT_PROJECTION_VERSION}:{}:{store_index}:{created_at}",
