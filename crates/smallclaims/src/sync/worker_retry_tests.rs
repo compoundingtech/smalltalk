@@ -2,7 +2,6 @@
 
 use super::*;
 use std::cell::Cell;
-use std::error::Error as _;
 use std::sync::atomic::Ordering;
 
 const URL: &str = "http://127.0.0.1:31001";
