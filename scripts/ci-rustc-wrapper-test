@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Cache transport failures may change speed, never the compiler's verdict."""
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class CacheFallback(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.cache = self.root / "sccache"
+        self.compiler = self.root / "compiler"
+        self.compiler.write_text('#!/usr/bin/env bash\n'
+                                 'echo call >> "$COMPILER_CALLS"\n'
+                                 'printf "%s\\n" "$@" >> "$COMPILER_ARGUMENTS"\n'
+                                 'echo compiler-output\necho "${COMPILER_DIAGNOSTIC:-compiler-diagnostic}" >&2\n'
+                                 'exit "${COMPILER_STATUS:-0}"\n')
+        self.compiler.chmod(0o755)
+        self.env = {**os.environ, "SCCACHE_BIN": str(self.cache), "RUNNER_TEMP": str(self.root),
+                    "COMPILER_CALLS": str(self.root / "compiler-calls"),
+                    "COMPILER_ARGUMENTS": str(self.root / "compiler-arguments")}
+
+    def cache_script(self, source, preflight='exit 0\n'):
+        self.cache.write_text('#!/usr/bin/env bash\n'
+                              'if [[ "$1" == --dist-status ]]; then\n' + preflight +
+                              '\nfi\n' + source)
+        self.cache.chmod(0o755)
+
+    def run_wrapper(self):
+        return subprocess.run(['bash', str(ROOT / 'scripts/ci-rustc-wrapper'), str(self.compiler),
+                               'argument with spaces', '--flag=value'], env=self.env,
+                              capture_output=True, text=True)
+
+    def test_available_cache_keeps_one_compiler_execution(self):
+        self.cache_script('test "$SCCACHE_IGNORE_SERVER_IO_ERROR" = 1 || exit 99\nexec "$@"\n')
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, 'compiler-output\n')
+        self.assertEqual(result.stderr, 'compiler-diagnostic\n')
+        self.assertEqual((self.root / 'compiler-calls').read_text().splitlines(),
+                         ['call'])
+        self.assertEqual((self.root / 'compiler-arguments').read_text().splitlines(),
+                         ['argument with spaces', '--flag=value'])
+        self.assertFalse((self.root / 'ci-sccache-disabled').exists())
+
+    def test_startup_timeout_bypasses_cache_for_remaining_job(self):
+        self.cache_script('echo unexpected-compile >&2\nexit 99\n', preflight=
+                          'echo called >> "$RUNNER_TEMP/cache-calls"\n'
+                          'echo "sccache: error: Timed out waiting for server startup. '
+                          'Maybe the remote service is unreachable?" >&2\nexit 2\n')
+        first, second = self.run_wrapper(), self.run_wrapper()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn('compiling without the cache', first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual((self.root / 'cache-calls').read_text().splitlines(), ['called'])
+        self.assertEqual(len((self.root / 'compiler-calls').read_text().splitlines()), 2)
+        self.assertEqual((self.root / 'compiler-arguments').read_text().splitlines(),
+                         ['argument with spaces', '--flag=value'] * 2)
+
+    def test_backend_failure_uses_compiler_verdict(self):
+        self.cache_script('exit 99\n', preflight=
+                          'echo "sccache: error: Server startup failed: cache connection refused" >&2\nexit 2\n')
+        self.env['COMPILER_STATUS'] = '7'
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 7)
+        self.assertIn('compiler-diagnostic', result.stderr)
+        self.assertEqual(len((self.root / 'compiler-calls').read_text().splitlines()), 1)
+
+    def test_real_compiler_failure_is_not_retried_or_hidden(self):
+        self.cache_script('exec "$@"\n')
+        self.env['COMPILER_STATUS'] = '9'
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 9)
+        self.assertNotIn('compiling without the cache', result.stderr)
+        self.assertEqual(len((self.root / 'compiler-calls').read_text().splitlines()), 1)
+        self.assertFalse((self.root / 'ci-sccache-disabled').exists())
+
+    def test_missing_cache_still_runs_compiler(self):
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('pinned cache executable is unavailable', result.stderr)
+
+    def test_non_cache_failure_stays_failed(self):
+        self.cache_script('exit 99\n', preflight='echo unrelated-error >&2\nexit 8\n')
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 8)
+        self.assertFalse((self.root / 'compiler-calls').exists())
+
+    def test_sccache_response_fallback_runs_compiler_once(self):
+        self.cache_script('test "$SCCACHE_IGNORE_SERVER_IO_ERROR" = 1 || exit 99\n'
+                          'echo "sccache: warning: error reading compile response from server compiling locally instead" >&2\n'
+                          'exec "$@"\n')
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('compiling locally instead', result.stderr)
+        self.assertEqual(len((self.root / 'compiler-calls').read_text().splitlines()), 1)
+        self.assertFalse((self.root / 'ci-sccache-disabled').exists())
+
+    def test_indeterminate_response_is_not_retried(self):
+        self.cache_script('echo "sccache: error: failed to execute compile: unknown response" >&2\nexit 2\n')
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('unknown response', result.stderr)
+        self.assertFalse((self.root / 'compiler-calls').exists())
+        self.assertFalse((self.root / 'ci-sccache-disabled').exists())
+
+    def test_interrupted_attempt_is_not_retried(self):
+        self.cache_script('echo "interrupted cache attempt" >&2\nexit 143\n')
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 143)
+        self.assertFalse((self.root / 'compiler-calls').exists())
+
+    def test_compiler_startup_like_diagnostic_never_retries(self):
+        self.cache_script('exec "$@"\n')
+        self.env['COMPILER_DIAGNOSTIC'] = 'sccache: error: Server startup failed: diagnostic text'
+        for status in (9, 143, 137):
+            with self.subTest(status=status):
+                calls = self.root / 'compiler-calls'
+                calls.write_text('')
+                self.env['COMPILER_STATUS'] = str(status)
+                result = self.run_wrapper()
+                self.assertEqual(result.returncode, status)
+                self.assertIn(self.env['COMPILER_DIAGNOSTIC'], result.stderr)
+                self.assertEqual(calls.read_text().splitlines(), ['call'])
+                self.assertFalse((self.root / 'ci-sccache-disabled').exists())
+
+    def test_compile_phase_startup_prefix_never_selects_bypass(self):
+        self.cache_script('echo "sccache: error: Server startup failed: late failure" >&2\n'
+                          'exit "${CACHE_STATUS:-2}"\n')
+        for status in (2, 143, 137):
+            with self.subTest(status=status):
+                self.env['CACHE_STATUS'] = str(status)
+                result = self.run_wrapper()
+                self.assertEqual(result.returncode, status)
+                self.assertFalse((self.root / 'compiler-calls').exists())
+                self.assertFalse((self.root / 'ci-sccache-disabled').exists())
+
+    def test_preflight_interruption_precedes_prefix_classification(self):
+        self.cache_script('exec "$@"\n', preflight=
+                          'echo "sccache: error: Server startup failed: interrupted" >&2\n'
+                          'exit "${CACHE_STATUS:-143}"\n')
+        for status in (143, 137):
+            with self.subTest(status=status):
+                self.env['CACHE_STATUS'] = str(status)
+                result = self.run_wrapper()
+                self.assertEqual(result.returncode, status)
+                self.assertFalse((self.root / 'compiler-calls').exists())
+                self.assertFalse((self.root / 'ci-sccache-disabled').exists())
+
+    def test_preflight_timeout_uses_one_uncached_compiler(self):
+        self.cache_script('exit 99\n', preflight='exec sleep 30\n')
+        result = self.run_wrapper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('compiling without the cache', result.stderr)
+        self.assertEqual((self.root / 'compiler-calls').read_text().splitlines(), ['call'])
+        self.assertTrue((self.root / 'ci-sccache-disabled').exists())
+
+
+if __name__ == '__main__':
+    unittest.main()

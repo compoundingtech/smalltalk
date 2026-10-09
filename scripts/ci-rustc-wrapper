@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Keep the cache optional without retrying a real compiler failure.
+set -euo pipefail
+cache=${SCCACHE_BIN:?the CI shell must supply its pinned sccache}
+disabled=${RUNNER_TEMP:+$RUNNER_TEMP/ci-sccache-disabled}
+if [[ -n "$disabled" && -f "$disabled" ]]; then
+  exec "$@"
+fi
+
+# sccache handles response-I/O fallback itself. Before submitting any compiler
+# request, use its read-only DistStatus command to connect/start the server.
+# Unlike --show-stats, this command cannot succeed with synthetic empty stats
+# when no server exists. It neither compiles nor resets cache statistics.
+export SCCACHE_IGNORE_SERVER_IO_ERROR=1
+errors=$(mktemp)
+trap 'rm -f "$errors"' EXIT
+status=0
+if [[ -x "$cache" ]]; then
+  timeout --kill-after=5s 15s "$cache" --dist-status > /dev/null 2>"$errors" || status=$?
+else
+  printf 'sccache: error: pinned cache executable is unavailable\n' >"$errors"
+  status=127
+fi
+cat "$errors" >&2
+# Preserve signal/interruption statuses before classifying preflight errors.
+if [[ "$status" -ge 128 ]]; then
+  exit "$status"
+fi
+if [[ "$status" -eq 124 ]] || { [[ "$status" -ne 0 ]] && grep -Eq '^sccache: error: (Timed out waiting for server startup\.|Server startup failed:|pinned cache executable is unavailable$)' "$errors"; }; then
+  # Only this separate command's known startup failure or bounded timeout can
+  # select bypass: no compiler argv was supplied and no compile was submitted.
+  printf '::warning::sccache unavailable; compiling without the cache for this job\n' >&2
+  if [[ -n "$disabled" ]]; then
+    touch "$disabled" || printf '::warning::could not retain cache-bypass marker\n' >&2
+  fi
+  rm -f "$errors"
+  trap - EXIT
+  exec "$@"
+fi
+if [[ "$status" -ne 0 ]]; then
+  exit "$status"
+fi
+rm -f "$errors"
+trap - EXIT
+# After a compile request may have been submitted, never classify its stderr
+# or retry it. The cache/compiler invocation's exact result is authoritative.
+exec "$cache" "$@"
