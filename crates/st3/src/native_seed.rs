@@ -27,7 +27,10 @@ fn receipt(subject: &str, incarnation: &str, outcome: &Outcome) -> ClaimInput {
     .expect("outcome is an object");
     fields.insert("agent".into(), subject.into());
     fields.insert("incarnation".into(), incarnation.into());
-    fields.insert("invocation_id".into(), uuid::Uuid::now_v7().to_string().into());
+    fields.insert(
+        "invocation_id".into(),
+        uuid::Uuid::now_v7().to_string().into(),
+    );
     ClaimInput {
         subject: marker(subject),
         kind: "custom.agent.first-native-launch".into(),
@@ -59,7 +62,9 @@ pub fn omit_seed_for_native_resume(member: &mut crate::model::MemberSpec) {
             crate::suspension::RESUME_ENV,
             crate::suspension::CONTINUE_ENV,
             crate::suspension::CONTINUE_PATH_ENV,
-        ].iter().any(|variable| member.environment.contains_key(*variable))
+        ]
+        .iter()
+        .any(|variable| member.environment.contains_key(*variable))
     {
         return;
     }
@@ -239,18 +244,31 @@ mod tests {
                 &format!("version 2\nagent \"example\" {{ workspace \"/work\"; harness \"omp\" {{ seed \"/seed.jsonl\"; message {message:?} id=\"initial\"; args \"--\" \"--seed\" \"literal\"; }} }}"),
                 "node",
             ).unwrap();
-            let original = intent.subjects.values().find_map(|subject| subject.member.as_ref()).unwrap();
+            let original = intent
+                .subjects
+                .values()
+                .find_map(|subject| subject.member.as_ref())
+                .unwrap();
             let crate::model::LaunchSpec::Argv(original_argv) = &original.launch else {
                 panic!("typed launch expected");
             };
-            let seed_index = original_argv.windows(2).position(|pair| pair == ["--seed", "/seed.jsonl"]).unwrap();
+            let seed_index = original_argv
+                .windows(2)
+                .position(|pair| pair == ["--seed", "/seed.jsonl"])
+                .unwrap();
             let mut expected = original_argv.clone();
             expected.drain(seed_index..seed_index + 2);
-            for variable in [crate::suspension::RESUME_ENV, crate::suspension::CONTINUE_ENV, crate::suspension::CONTINUE_PATH_ENV] {
+            for variable in [
+                crate::suspension::RESUME_ENV,
+                crate::suspension::CONTINUE_ENV,
+                crate::suspension::CONTINUE_PATH_ENV,
+            ] {
                 let mut member = original.clone();
                 member.environment.insert(variable.into(), "native".into());
                 omit_seed_for_native_resume(&mut member);
-                let crate::model::LaunchSpec::Argv(argv) = &member.launch else { unreachable!() };
+                let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+                    unreachable!()
+                };
                 assert_eq!(*argv, expected);
                 assert_eq!(member.environment[variable], "native");
             }
@@ -296,14 +314,35 @@ mod tests {
     fn native_seed_one_seat_operation_cannot_record_a_second_outcome() {
         let store = crate::store::Store::open_memory("node").unwrap();
         let winner = receipt("agent/example", "one", &Outcome::Fresh);
-        let loser = receipt("agent/example", "one", &Outcome::Seeded { session_id: "native".into() });
+        let loser = receipt(
+            "agent/example",
+            "one",
+            &Outcome::Seeded {
+                session_id: "native".into(),
+            },
+        );
         let recorded = store.append_claim(&winner).unwrap();
         if let Ok(replayed) = store.append_claim(&loser) {
             assert_eq!(replayed.id, recorded.id);
-            assert_eq!(replayed.body.pointer("/fields/invocation_id"), winner.fields.get("invocation_id"));
-            assert_ne!(replayed.body.pointer("/fields/invocation_id"), loser.fields.get("invocation_id"));
+            assert_eq!(
+                replayed.body.pointer("/fields/invocation_id"),
+                winner.fields.get("invocation_id")
+            );
+            assert_ne!(
+                replayed.body.pointer("/fields/invocation_id"),
+                loser.fields.get("invocation_id")
+            );
         }
-        assert_eq!(store.claims_for(&marker("agent/example"), Some("custom.agent.first-native-launch")).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .claims_for(
+                    &marker("agent/example"),
+                    Some("custom.agent.first-native-launch")
+                )
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -319,7 +358,10 @@ mod tests {
         assert_eq!(fresh.subject, seeded.subject);
         assert_eq!(fresh.expected_subject, None);
         assert_eq!(fresh.idempotency_key, seeded.idempotency_key);
-        assert_ne!(fresh.fields["invocation_id"], seeded.fields["invocation_id"]);
+        assert_ne!(
+            fresh.fields["invocation_id"],
+            seeded.fields["invocation_id"]
+        );
         assert_eq!(fresh.fields["outcome"], "fresh");
         assert_eq!(seeded.fields["outcome"], "seeded");
     }
