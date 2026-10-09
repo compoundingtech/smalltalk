@@ -287,6 +287,8 @@ fn apply(held: &mut BTreeMap<String, Held>, frame: &Value) {
                 window.rows.insert(item["id"].as_str().unwrap().to_owned(), item.clone());
             }
         }
+        // A temporary read failure keeps the rows the client holds; the window is read again.
+        "resync" => return,
         other => panic!("unexpected {other} frame: {frame}"),
     }
     window.order = ids(&frame["order"]);

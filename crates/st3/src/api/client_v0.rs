@@ -1113,6 +1113,9 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     ping_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut weighed = state.store.index().unwrap_or_default();
     let mut reread_due = BTreeSet::<String>::new();
+    // Whether a commit may have changed the agents roster since its refresher was last asked
+    // to publish. Asking is paced like a reread: before, a stale reread asked for it.
+    let mut roster_wanted = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
     let mut reads = futures_util::stream::FuturesUnordered::new();
     let read_slots = Arc::new(tokio::sync::Semaphore::new(COLLECTION_MAX_SUBSCRIPTIONS));
@@ -1308,9 +1311,13 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 // held, and read it again once the newer one arrives.
                 let (roster_windows, others): (Vec<_>, Vec<_>) = affected.into_iter().partition(|id| roster_refresher
                     && subscriptions.get(id).is_some_and(|s| s.request.collection == "agents"));
-                if !roster_windows.is_empty() { state.store.request_agent_roster_refresh(); }
+                roster_wanted |= !roster_windows.is_empty();
                 reread_due.extend(others);
-                if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                if reread_due.is_empty() && !roster_wanted || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                if std::mem::take(&mut roster_wanted) {
+                    state.store.request_agent_roster_refresh();
+                    last_reread = tokio::time::Instant::now();
+                }
                 refresh.extend(reread_due.iter().cloned());
             }
             result = roster.changed(), if !command_waiting => {
@@ -1333,7 +1340,8 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
                 refresh.extend(reread_due.iter().cloned());
             }
-            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (!reread_due.is_empty() || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
+            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (!reread_due.is_empty() || roster_wanted || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
+                if std::mem::take(&mut roster_wanted) { state.store.request_agent_roster_refresh(); }
                 refresh.extend(reread_due.iter().cloned());
                 refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_some() && s.dirty && s.reading.is_none()).map(|(id, _)| id.clone()));
                 last_reread = tokio::time::Instant::now();
