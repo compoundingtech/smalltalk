@@ -30,7 +30,7 @@ fn authored_pull_request_lookup_indexes_existing_schema_seventeen_on_open() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        17
+        18
     );
     assert_eq!(
         connection
