@@ -114,16 +114,10 @@ pub use smallclaims::store::{
     newest_seals, stable_checkpoints, valid_fleet_node_name, verify_checkpoint_manifest,
 };
 
-fn finish_roster_rebuild(span: Option<&mut opentelemetry::global::BoxedSpan>, cards: usize) {
-    use opentelemetry::trace::Span as _;
-    if let Some(span) = span {
-        span.set_attribute(opentelemetry::KeyValue::new("st.roster.mode", "cold"));
-        span.set_attribute(opentelemetry::KeyValue::new("st.roster.cards", cards as i64));
-        span.end();
-    }
-}
 
 mod accounts;
+mod roster_admission;
+pub(crate) use roster_admission::AdmissionGuard;
 mod adhoc_work;
 mod attention_snapshot;
 pub(crate) use attention_snapshot::{NativePromptState, native_prompt_gone_key};
@@ -3094,6 +3088,18 @@ struct AgentResourcesDelta {
     membership: bool,
 }
 
+enum AgentResourcesChange {
+    Delta(AgentResourcesDelta),
+    Invalidated { reason: &'static str, detail: String },
+}
+
+fn record_roster_counts(changed: usize, covered: usize, refolded: usize) {
+    crate::otel::roster_attribute("st.roster.changed", changed as i64);
+    crate::otel::roster_attribute("st.roster.covered", covered as i64);
+    crate::otel::roster_attribute("st.roster.refolded", refolded as i64);
+    crate::otel::roster_attribute("st.roster.cards", covered as i64);
+}
+
 /// The exact cache-hit contract shared by the building path and the read-only warm pin: one
 /// graph cut, one roster-relevant local frontier, one history mode, a queue lease window that
 /// has not ended, and coverage of every requested subject.
@@ -3210,17 +3216,7 @@ impl Store {
         after: u64,
         through: u64,
         previous: &[Value],
-    ) -> Result<Option<AgentResourcesDelta>> {
-        Ok(self.agent_resources_delta(after, through, previous)?.ok())
-    }
-
-    /// The cards claims between two cuts change, or why that cannot be told card by card.
-    fn agent_resources_delta(
-        &self,
-        after: u64,
-        through: u64,
-        previous: &[Value],
-    ) -> Result<std::result::Result<AgentResourcesDelta, String>> {
+    ) -> Result<AgentResourcesChange> {
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(
             "SELECT subject, kind, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
@@ -3241,7 +3237,9 @@ impl Store {
                 continue;
             }
             if self.smalltalk.claim_registry().claim(&kind).is_none() {
-                return Ok(Err(format!("unregistered {kind}")));
+                return Ok(AgentResourcesChange::Invalidated {
+                    reason: "unknown_kind", detail: format!("unregistered {kind}"),
+                });
             }
             if subject.starts_with("agent/") {
                 // All registered agent claims can affect the subject's actual reduction or
@@ -3291,7 +3289,9 @@ impl Store {
                 // pending-delivery blocker, including replies through message ancestors.
                 // Receipts lack endpoints, so use the same message projection blockers read.
                 let Some(message) = self.message(&subject)? else {
-                    return Ok(Err(format!("{kind} without its message")));
+                    return Ok(AgentResourcesChange::Invalidated {
+                        reason: "missing_message", detail: format!("{kind} without its message"),
+                    });
                 };
                 delta.subjects.extend([message.from, message.to].into_iter()
                     .filter(|party| party.starts_with("agent/")));
@@ -3299,7 +3299,9 @@ impl Store {
             }
             // Any other claim about a card input subject: refold conservatively.
             let namespace = subject.split('/').next().unwrap_or_default();
-            return Ok(Err(format!("{kind} on {namespace}/")));
+            return Ok(AgentResourcesChange::Invalidated {
+                reason: "structural_claim", detail: format!("{kind} on {namespace}/"),
+            });
         }
         if !owners.is_empty() {
             // Existing cards carry their historical ownership; current declarations also
@@ -3318,7 +3320,7 @@ impl Store {
             delta.subjects.extend(statement.query_map([owners], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<BTreeSet<_>>>()?);
         }
-        Ok(Ok(delta))
+        Ok(AgentResourcesChange::Delta(delta))
     }
 
     /// An allow-list for shallow refs, narrower than card-local invalidation: runtime status
@@ -3361,21 +3363,6 @@ impl Store {
             .unwrap_or_default())
     }
 
-    /// Never waits; multi-gate readers release unrelated guards before queuing on a miss.
-    pub(crate) fn try_admit_agent_resources(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        self.smalltalk.agent_resources_admission.clone().try_lock_owned().ok()
-    }
-
-    /// One physical roster reader across HTTP pages and differently authorized WS windows.
-    /// Waiting happens before SQLite snapshot acquisition, so followers pin no old WAL mark.
-    pub(crate) async fn admit_agent_resources(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        let started = std::time::Instant::now();
-        let guard = self.smalltalk.agent_resources_admission.clone().lock_owned().await;
-        // Waiting here is waiting for the shared admission or for another reader's in-flight
-        // build; the holder keeps the admission until its projection is published.
-        crate::performance::record_request("roster/admission-wait", None, started.elapsed());
-        guard
-    }
 
     #[cfg(test)]
     pub(crate) fn agent_resources_builds_for_test(&self) -> usize {
@@ -3443,9 +3430,9 @@ impl Store {
         let (changed, membership) = match &previous {
             None => (0, true),
             Some(previous) if previous.index == index => (0, false),
-            Some(previous) => match self.agent_resources_delta(previous.index, index, &previous.items)? {
-                Ok(delta) => (delta.subjects.len(), delta.membership),
-                Err(reason) => return Ok(Some(reason)),
+            Some(previous) => match self.changed_agent_resources(previous.index, index, &previous.items)? {
+                AgentResourcesChange::Delta(delta) => (delta.subjects.len(), delta.membership),
+                AgentResourcesChange::Invalidated { detail, .. } => return Ok(Some(detail)),
             },
         };
         // Complete rows whose membership no claim moved miss no agent: skip listing them all.
@@ -3521,9 +3508,9 @@ impl Store {
         if cut == index {
             return Ok(true);
         }
-        Ok(match self.agent_resources_delta(cut, index, &items)? {
-            Ok(delta) => delta.subjects.is_empty() && !delta.queues && !delta.membership,
-            Err(_) => false,
+        Ok(match self.changed_agent_resources(cut, index, &items)? {
+            AgentResourcesChange::Delta(delta) => delta.subjects.is_empty() && !delta.queues && !delta.membership,
+            AgentResourcesChange::Invalidated { .. } => false,
         })
     }
 
@@ -3779,7 +3766,7 @@ impl Store {
         // Cold presentation reads current desired/queue tables even for historical status
         // cuts. Do not reuse rows from an older physical projection for those requests.
         if index < current_index(&self.readers.get())? {
-            let mut rebuild = crate::otel::stage_root("st.roster.rebuild", "cold", None);
+            let _rebuild = self.start_roster_rebuild("historical_snapshot", index);
             let mut items = crate::performance::task("roster/card-projection",
                 || build(selected.map(|names| (names, &[][..]))))?;
             #[cfg(test)]
@@ -3787,7 +3774,8 @@ impl Store {
             items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                 .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
             crate::otel::record_roster("cold", items.len());
-            finish_roster_rebuild(rebuild.as_mut(), items.len());
+            record_roster_counts(items.len(), items.len(), items.len());
+            crate::otel::roster_attribute("st.roster.publication_cut", index as i64);
             return Ok(items);
         }
         let now = now_ms();
@@ -3825,16 +3813,29 @@ impl Store {
         drop(cache);
         let entry = crate::performance::task("roster/build",
         || -> Result<runtime::AgentResourcesEntry> {
-        let previous = match previous {
-            Some(entry) if entry.index == index => Some((entry, AgentResourcesDelta::default())),
-            Some(entry) => self.changed_agent_resources(entry.index, index, &entry.items)?
-                .map(|delta| (entry, delta)),
-            None => None,
+        let (previous, invalidation) = match previous {
+            Some(entry) if entry.index == index => (Some((entry, AgentResourcesDelta::default())), "safe_delta"),
+            Some(entry) => match self.changed_agent_resources(entry.index, index, &entry.items)? {
+                AgentResourcesChange::Delta(delta) => (Some((entry, delta)), "safe_delta"),
+                AgentResourcesChange::Invalidated { reason, .. } => (None, reason),
+            },
+            None => (None, "cold"),
         };
         match previous {
             Some((previous, delta)) => {
+                if crate::otel::export_enabled() {
+                let reason = if delta.membership { "membership" }
+                    else if previous.local != local { "local_frontier" }
+                    else if previous.valid_until_unix_ms.is_some_and(|expiry| now >= expiry) { "queue_deadline" }
+                    else if previous.covered.as_ref().is_some_and(|covered| {
+                        selected.is_none_or(|names| !names.is_subset(covered))
+                    }) { "coverage_gap" }
+                    else { "safe_delta" };
+                crate::otel::roster_attribute("st.roster.invalidation", reason);
+                }
                 let mut changed = delta.subjects;
                 if delta.membership {
+                    crate::otel::roster_phase("membership", || -> Result<()> {
                     let connection = self.readers.get();
                     let names = connection.prepare_cached(RANGE_SUBJECTS)?
                         .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
@@ -3848,6 +3849,8 @@ impl Store {
                     let old = previous.items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned))
                         .collect::<BTreeSet<_>>();
                     changed.extend(names.symmetric_difference(&old).cloned());
+                    Ok(())
+                    })?;
                 }
                 if previous.local != local {
                     let connection = self.readers.get();
@@ -3858,13 +3861,14 @@ impl Store {
                     changed.extend(statement.query_map(params![previous.local, local, index],
                         |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<BTreeSet<_>>>()?);
                 }
+                let mut covered = crate::otel::roster_phase("membership", || -> Result<Option<BTreeSet<String>>> {
                 // A chunk treats complete rows as covering exactly the agents they hold.
                 let previous_covered: Option<BTreeSet<String>> = match &previous.covered {
                     None if chunk => Some(previous.items.iter()
                         .filter_map(|item| item["id"].as_str().map(str::to_owned)).collect()),
                     covered => covered.clone(),
                 };
-                let mut covered: Option<BTreeSet<String>> = match (&previous_covered, selected) {
+                Ok(match (&previous_covered, selected) {
                     (None, _) => None,
                     (Some(covered), Some(names)) => {
                         changed.retain(|name| covered.contains(name));
@@ -3882,7 +3886,7 @@ impl Store {
                         changed.extend(names.difference(covered).cloned());
                         None
                     }
-                };
+                }) })?;
                 let refresh_queues = delta.queues
                     || previous.valid_until_unix_ms.is_some_and(|expiry| now >= expiry)
                     || changed.iter().any(|name| !previous.items.iter().any(|item| item["id"].as_str() == Some(name.as_str())));
@@ -3916,6 +3920,7 @@ impl Store {
                 // Coverage gaps join `changed`, so an empty set means no card this cut can see
                 // moved at all: the previous rows already are this cut's projection, and the
                 // heartbeat or fleet-only claim between two reads costs no clone, sort or build.
+                record_roster_counts(changed.len() + deferred.len(), covered.as_ref().map_or(previous.items.len(), BTreeSet::len), 0);
                 if changed.is_empty() && deferred.is_empty() {
                     crate::otel::record_roster("incremental", previous.items.len());
                     return Ok(runtime::AgentResourcesEntry {
@@ -3935,6 +3940,7 @@ impl Store {
                     .cloned().collect::<Vec<_>>();
                 let rebuilt = crate::performance::task("roster/card-projection",
                     || build(Some((&changed, queue_metadata.as_deref().unwrap_or(&previous.items)))))?;
+                record_roster_counts(changed.len() + deferred.len(), covered.as_ref().map_or(items.len() + rebuilt.len(), BTreeSet::len), rebuilt.len());
                 #[cfg(test)]
                 self.count_refolded_cards_for_test(rebuilt.len());
                 items.extend(rebuilt);
@@ -3949,7 +3955,7 @@ impl Store {
                 })
             }
             None => {
-                let mut rebuild = crate::otel::stage_root("st.roster.rebuild", "cold", None);
+                let _rebuild = self.start_roster_rebuild(invalidation, index);
                 #[cfg(test)]
                 self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut items = crate::performance::task("roster/card-projection",
@@ -3959,7 +3965,8 @@ impl Store {
                 items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
                 crate::otel::record_roster("cold", items.len());
-                finish_roster_rebuild(rebuild.as_mut(), items.len());
+                record_roster_counts(items.len(), items.len(), items.len());
+                crate::otel::roster_attribute("st.roster.publication_cut", index as i64);
                 Ok(runtime::AgentResourcesEntry {
                     index, local, history, covered: selected.cloned(),
                     valid_until_unix_ms: self.agent_queue_valid_until(now)?,

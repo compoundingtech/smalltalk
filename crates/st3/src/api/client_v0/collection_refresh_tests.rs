@@ -258,7 +258,7 @@ async fn an_agents_commit_waits_for_the_roster_publication_instead_of_rereading(
     // Let any publication the first read asked for settle, then hold the next refresh back.
     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
     while tokio::time::timeout(Duration::from_millis(200), fixture.socket.next()).await.is_ok() {}
-    let held = state.store.admit_agent_resources().await;
+    let held = state.store.admit_agent_resources("other").await;
     let before = fixture.counts()["agents"];
     append("harness.observed", json!({"state":"working", "driver":"codex", "incarnation_id":"one"}));
     // Reading now would only serve the roster already held.

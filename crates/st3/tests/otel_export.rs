@@ -99,6 +99,28 @@ fn int_attribute(record: &Value, name: &str) -> Option<i64> {
         })
 }
 
+#[cfg(target_os = "linux")]
+fn double_attribute(record: &Value, name: &str) -> Option<f64> {
+    record["attributes"].as_array()?.iter().find_map(|attribute| {
+        if attribute["key"] != name {
+            return None;
+        }
+        let value = &attribute["value"]["doubleValue"];
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn bool_attribute(record: &Value, name: &str) -> Option<bool> {
+    record["attributes"]
+        .as_array()?
+        .iter()
+        .find(|attribute| attribute["key"].as_str() == Some(name))?["value"]["boolValue"]
+        .as_bool()
+}
+
 fn command_roots(traces: &str) -> Vec<(Value, Value)> {
     let mut roots = Vec::new();
     for line in traces.lines() {
@@ -908,8 +930,8 @@ async fn daemon_request_id_and_roster_stages_match_response() {
     // History rosters are published on demand; await that publication before measuring hits.
     daemon.request("GET", "/v1/client/agents?history=true&fresh=true&status=stopped",
         None, STARTUP_BARRIER, None).await;
-    // The refresher publishes rosters independently. HTTP reads serve a published
-    // cut, including after a new claim, and never rebuild on the request's behalf.
+    // Reads serve published cuts, including after a new claim. A fresh history read
+    // waits for the refresher's publication; neither kind folds cards in the request.
     let mut responses = Vec::new();
     for attempt in 0..3 {
         if attempt != 0 {
@@ -919,11 +941,16 @@ async fn daemon_request_id_and_roster_stages_match_response() {
                 "idempotency_key":format!("otel-roster-advance-{attempt}"),
             })), TRACEPARENT, None).await;
         }
-        let (body, bytes) = daemon.request("GET",
-            "/v1/client/agents?history=true&status=stopped", None, TRACEPARENT, None).await;
-        responses.push((body, bytes));
+        for (path, expected_path, expected_fresh) in [
+            ("/v1/client/agents?history=true&status=stopped", "filtered_full", false),
+            ("/v1/client/agents?history=true&fresh=true&status=stopped", "filtered_full", true),
+            ("/v1/client/agents?history=true", "published_complete", false),
+        ] {
+            let (body, bytes) = daemon.request("GET", path, None, TRACEPARENT, None).await;
+            responses.push((body, bytes, expected_path, expected_fresh));
+        }
     }
-    for (body, bytes) in responses {
+    for (body, bytes, expected_path, expected_fresh) in responses {
         let request_id = body["request_id"].as_str().expect("response request_id");
         assert!(request_id.starts_with("request/"), "{body}");
         let rows = body["value"]["items"].as_array().expect("roster page").len();
@@ -940,11 +967,45 @@ async fn daemon_request_id_and_roster_stages_match_response() {
         assert_eq!(int_attribute(&span, "st.roster.cards"), Some(1), "{span}");
         assert_eq!(int_attribute(&span, "st.page.rows"), Some(i64::try_from(rows).unwrap()));
         assert_eq!(int_attribute(&span, "st.page.bytes"), Some(i64::try_from(bytes).unwrap()));
+        // Filtered and ordinary complete pages report the publication actually served.
+        assert_eq!(string_attribute(&span, "st.roster.path"), Some(expected_path), "{span}");
+        let fresh = bool_attribute(&span, "st.roster.fresh_requested").expect("fresh_requested bool");
+        assert_eq!(fresh, expected_fresh, "{span}");
+        let requested = int_attribute(&span, "st.roster.requested_cut").expect("requested_cut integer");
+        let published = int_attribute(&span, "st.roster.publication_cut").expect("publication_cut integer");
+        assert_eq!(Some(published), body["snapshot"]["store_index"].as_i64(), "{span}\n{body}");
+        if fresh {
+            assert!(published >= requested, "fresh read served an older cut: {span}");
+        }
     }
     let spans = daemon.captured_spans(root.path());
-    for rebuild in spans.iter().filter(|span| span["name"] == "st.roster.rebuild") {
+    // The refresher's first publication is a detached cold rebuild; it carries the closed
+    // invalidation reason, bounded counts and synchronous phase wall/CPU time on the root.
+    let rebuilds: Vec<_> = spans.iter().filter(|span| span["name"] == "st.roster.rebuild").collect();
+    assert!(!rebuilds.is_empty(), "published roster requires a rebuild root: {spans:?}");
+    for rebuild in &rebuilds {
         assert_internal_root(rebuild);
         assert_ne!(rebuild["traceId"], TRACE);
+        let reason = string_attribute(rebuild, "st.roster.invalidation").expect("invalidation reason");
+        assert!(matches!(reason, "cold" | "unknown_kind" | "structural_claim" | "missing_message"
+            | "membership" | "local_frontier" | "queue_deadline" | "coverage_gap" | "safe_delta"
+            | "historical_snapshot"), "unbounded invalidation reason: {rebuild}");
+        for count in ["st.roster.changed", "st.roster.covered", "st.roster.refolded"] {
+            assert!(int_attribute(rebuild, count).is_some_and(|value| value >= 0), "{count}: {rebuild}");
+        }
+    }
+    let cold = rebuilds.iter().find(|span| string_attribute(span, "st.roster.invalidation") == Some("cold"))
+        .unwrap_or_else(|| panic!("first publication must be a cold rebuild: {rebuilds:?}"));
+    // The refresher builds publications under admission; the root names that holder.
+    assert_eq!(string_attribute(cold, "st.roster.admission.holder_class"), Some("refresher"), "{cold}");
+    assert!(int_attribute(cold, "st.roster.admission.id").is_some(), "{cold}");
+    assert!(double_attribute(cold, "st.roster.admission.hold_ms").is_some_and(|ms| ms >= 0.0), "{cold}");
+    // The cold card projection always folds status and presents cards.
+    for phase in ["status_fold", "card_presentation"] {
+        for unit in ["wall_ms", "cpu_ms"] {
+            let key = format!("st.roster.phase.{phase}.{unit}");
+            assert!(double_attribute(cold, &key).is_some_and(|ms| ms >= 0.0), "{key}: {cold}");
+        }
     }
     assert!(spans.iter().all(|span| span["parentSpanId"].as_str()
         .is_none_or(|parent| !spans.iter().any(|server| server["traceId"] == TRACE
@@ -1133,4 +1194,247 @@ async fn replication_projection_is_linked_root_only_for_new_data() {
     let projections: Vec<_> = spans.iter().filter(|span| span["name"] == "st.replication.projection").collect();
     assert_eq!(projections.len(), 1, "no projection root for duplicate/heartbeat: {projections:?}");
     assert_upgrade_link(projections[0], &receive);
+}
+
+/// Contention is forced on the real roster admission, not timed: the waiter future is
+/// polled once and must be pending behind the holder before the holder is released.
+/// Export is scoped to this thread's subscriber and in-memory provider, never global.
+#[test]
+fn roster_admission_waiter_links_its_holder() {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing::Instrument as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use futures_util::FutureExt as _;
+
+    fn attribute<'a>(
+        span: &'a opentelemetry_sdk::trace::SpanData,
+        key: &str,
+    ) -> Option<&'a opentelemetry::Value> {
+        span.attributes.iter().find(|kv| kv.key.as_str() == key).map(|kv| &kv.value)
+    }
+    fn int(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<i64> {
+        match attribute(span, key)? {
+            opentelemetry::Value::I64(value) => Some(*value),
+            _ => None,
+        }
+    }
+    fn double(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<f64> {
+        match attribute(span, key)? {
+            opentelemetry::Value::F64(value) => Some(*value),
+            _ => None,
+        }
+    }
+    fn string(span: &opentelemetry_sdk::trace::SpanData, key: &str) -> Option<String> {
+        match attribute(span, key)? {
+            opentelemetry::Value::String(value) => Some(value.as_str().to_owned()),
+            _ => None,
+        }
+    }
+
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("st3-admission-proof")));
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let _export = st3::test_support::roster_export_scope();
+    let store = st3::store::Store::open_memory("otel-admission").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let holder = st3::test_support::admit_fixture_roster(&store, "refresher")
+            .instrument(tracing::info_span!("admission.holder"))
+            .await;
+        let mut waiter = std::pin::pin!(
+            st3::test_support::admit_fixture_roster(&store, "http")
+                .instrument(tracing::info_span!("admission.waiter"))
+        );
+        assert!(
+            futures_util::poll!(waiter.as_mut()).is_pending(),
+            "the waiter must queue behind the held admission"
+        );
+        drop(holder);
+        drop(waiter.await);
+        // Multi-gate try-admit publishes the same holder identity as FIFO admission.
+        let try_span = tracing::info_span!("admission.try_holder");
+        let holder = {
+            let _entered = try_span.enter();
+            st3::test_support::try_admit_fixture_roster(&store, "ws").unwrap()
+        };
+        assert!(st3::test_support::try_admit_fixture_roster(&store, "other").is_none());
+        let mut waiter = std::pin::pin!(
+            st3::test_support::admit_fixture_roster(&store, "http")
+                .instrument(tracing::info_span!("admission.try_waiter"))
+        );
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        drop(holder);
+        drop(waiter.await);
+        drop(try_span);
+        // An incremental refresher has no existing span; timing still identifies its hold.
+        let holder = st3::test_support::admit_fixture_roster(&store, "refresher").await;
+        let mut waiter = std::pin::pin!(
+            st3::test_support::admit_fixture_roster(&store, "ws")
+                .instrument(tracing::info_span!("admission.unlinked_waiter"))
+        );
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        drop(holder);
+        drop(waiter.await);
+
+        // W starts while A owns admission, but hands it to B before W's actual
+        // enqueue. Metadata must be sampled with that enqueue, not at W's start.
+        let holder = st3::test_support::admit_fixture_roster(&store, "other")
+            .instrument(tracing::info_span!("admission.handoff_a"))
+            .await;
+        let successor = std::cell::RefCell::new(None);
+        let mut waiter = std::pin::pin!(
+            st3::test_support::admit_fixture_roster_after_handoff(&store, "ws", || {
+                drop(holder);
+                successor.replace(Some(
+                    st3::test_support::admit_fixture_roster(&store, "http")
+                        .instrument(tracing::info_span!(parent: None, "admission.handoff_b"))
+                        .now_or_never()
+                        .expect("B must acquire the admission just released by A"),
+                ));
+            }).instrument(tracing::info_span!("admission.handoff_waiter"))
+        );
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending(), "W must wait behind B");
+        drop(successor.borrow_mut().take());
+        drop(waiter.await);
+
+        // A released permit belongs to queued B even before B is repolled. Tokio
+        // cannot expose B's identity in that reservation window. W and C must not
+        // blame stale A; canceling reserved B must let W acquire, with C still FIFO.
+        let holder = st3::test_support::admit_fixture_roster(&store, "refresher")
+            .instrument(tracing::info_span!("admission.reservation_a"))
+            .await;
+        let mut successor = Box::pin(
+            st3::test_support::admit_fixture_roster(&store, "http")
+                .instrument(tracing::info_span!("admission.reserved_b"))
+        );
+        assert!(futures_util::poll!(successor.as_mut()).is_pending());
+        let mut canceled = Box::pin(
+            st3::test_support::admit_fixture_roster(&store, "other")
+                .instrument(tracing::info_span!("admission.canceled"))
+        );
+        assert!(futures_util::poll!(canceled.as_mut()).is_pending());
+        drop(canceled);
+        drop(holder);
+        let mut waiter = Box::pin(
+            st3::test_support::admit_fixture_roster(&store, "ws")
+                .instrument(tracing::info_span!("admission.unknown_waiter"))
+        );
+        assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+        let mut tail = Box::pin(
+            st3::test_support::admit_fixture_roster(&store, "other")
+                .instrument(tracing::info_span!("admission.unknown_tail"))
+        );
+        assert!(futures_util::poll!(tail.as_mut()).is_pending());
+        drop(successor);
+        let holder = waiter.await;
+        assert!(futures_util::poll!(tail.as_mut()).is_pending(), "C cannot bypass W");
+        drop(holder);
+        drop(tail.await);
+    });
+    provider.force_flush().unwrap();
+    let spans = exporter.get_finished_spans().unwrap();
+    let named = |name: &str| {
+        spans.iter().find(|span| span.name == name)
+            .unwrap_or_else(|| panic!("missing {name}: {spans:?}"))
+    };
+    let holder = named("admission.holder");
+    let waiter = named("admission.waiter");
+
+    let holder_id = int(holder, "st.roster.admission.id").expect("holder admission id");
+    assert!(double(holder, "st.roster.admission.hold_ms").is_some_and(|ms| ms >= 0.0), "{holder:?}");
+    // Every acquisition begins as a waiter, so its own class is `waiter_class`;
+    // `holder_class` names only a blocking holder and is absent when uncontended.
+    assert_eq!(string(holder, "st.roster.admission.waiter_class").as_deref(), Some("refresher"), "{holder:?}");
+    assert_eq!(string(holder, "st.roster.admission.holder_class"), None, "{holder:?}");
+    assert_eq!(int(holder, "st.roster.admission.holder_id"), None, "uncontended holder: {holder:?}");
+    assert!(holder.links.iter().next().is_none(), "uncontended holder has no link: {holder:?}");
+
+    let waiter_id = int(waiter, "st.roster.admission.id").expect("waiter admission id");
+    assert_ne!(waiter_id, holder_id, "each acquisition has its own id");
+    assert_eq!(int(waiter, "st.roster.admission.holder_id"), Some(holder_id), "{waiter:?}");
+    assert_eq!(string(waiter, "st.roster.admission.waiter_class").as_deref(), Some("http"), "{waiter:?}");
+    assert_eq!(string(waiter, "st.roster.admission.holder_class").as_deref(), Some("refresher"), "{waiter:?}");
+    assert!(double(waiter, "st.roster.admission.wait_ms").is_some_and(|ms| ms >= 0.0), "{waiter:?}");
+    assert!(double(waiter, "st.roster.admission.holder_age_ms").is_some_and(|ms| ms >= 0.0), "{waiter:?}");
+    assert!(double(waiter, "st.roster.admission.hold_ms").is_some_and(|ms| ms >= 0.0), "{waiter:?}");
+
+    let links: Vec<_> = waiter.links.iter().collect();
+    assert_eq!(links.len(), 1, "one link from waiter to holder: {waiter:?}");
+    assert_eq!(links[0].span_context, holder.span_context, "link targets the holder span");
+    assert!(
+        links[0].attributes.iter().any(|kv| kv.key.as_str() == "st.roster.admission.holder_id"
+            && kv.value == opentelemetry::Value::I64(holder_id)),
+        "link carries the holder id: {:?}",
+        links[0]
+    );
+    let unlinked = named("admission.unlinked_waiter");
+    assert_eq!(string(unlinked, "st.roster.admission.waiter_class").as_deref(), Some("ws"));
+    assert_eq!(string(unlinked, "st.roster.admission.holder_class").as_deref(), Some("refresher"));
+    assert!(int(unlinked, "st.roster.admission.holder_id").is_some());
+    assert!(double(unlinked, "st.roster.admission.wait_ms").is_some_and(|ms| ms >= 0.0));
+    assert!(double(unlinked, "st.roster.admission.holder_age_ms").is_some_and(|ms| ms >= 0.0));
+    assert!(unlinked.links.iter().next().is_none(), "no synthetic span or invalid link: {unlinked:?}");
+
+    let try_holder = named("admission.try_holder");
+    let try_waiter = named("admission.try_waiter");
+    let try_id = int(try_holder, "st.roster.admission.id").expect("try-admit holder id");
+    assert_eq!(string(try_holder, "st.roster.admission.waiter_class").as_deref(), Some("ws"));
+    assert_eq!(double(try_holder, "st.roster.admission.wait_ms"), Some(0.0));
+    assert!(double(try_holder, "st.roster.admission.hold_ms").is_some_and(|ms| ms >= 0.0));
+    assert_eq!(int(try_waiter, "st.roster.admission.holder_id"), Some(try_id));
+    assert_eq!(string(try_waiter, "st.roster.admission.holder_class").as_deref(), Some("ws"));
+    assert!(double(try_waiter, "st.roster.admission.holder_age_ms").is_some_and(|ms| ms >= 0.0));
+    let links: Vec<_> = try_waiter.links.iter().collect();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].span_context, try_holder.span_context);
+
+    let handoff_a = named("admission.handoff_a");
+    let handoff_b = named("admission.handoff_b");
+    let handoff_waiter = named("admission.handoff_waiter");
+    let handoff_a_id = int(handoff_a, "st.roster.admission.id").expect("A admission id");
+    let handoff_b_id = int(handoff_b, "st.roster.admission.id").expect("B admission id");
+    assert_ne!(handoff_a_id, handoff_b_id);
+    assert_eq!(int(handoff_waiter, "st.roster.admission.holder_id"), Some(handoff_b_id));
+    assert_ne!(int(handoff_waiter, "st.roster.admission.holder_id"), Some(handoff_a_id));
+    assert_eq!(string(handoff_waiter, "st.roster.admission.holder_class").as_deref(), Some("http"));
+    assert_eq!(string(handoff_waiter, "st.roster.admission.waiter_class").as_deref(), Some("ws"));
+    assert!(double(handoff_waiter, "st.roster.admission.holder_age_ms").is_some_and(|ms| ms >= 0.0));
+    let links: Vec<_> = handoff_waiter.links.iter().collect();
+    assert_eq!(links.len(), 1, "handoff waiter has exactly one blocker link");
+    assert_eq!(links[0].span_context, handoff_b.span_context, "W links B, not stale A");
+    assert_ne!(links[0].span_context, handoff_a.span_context);
+    assert!(links[0].attributes.iter().any(|kv| kv.key.as_str() == "st.roster.admission.holder_id"
+        && kv.value == opentelemetry::Value::I64(handoff_b_id)));
+    for event in handoff_waiter.events.iter().filter(|event| event.name == "st.roster.admission.wait") {
+        assert!(event.attributes.iter().any(|kv| kv.key.as_str() == "st.roster.admission.holder_id"
+            && kv.value == opentelemetry::Value::I64(handoff_b_id)), "{event:?}");
+        assert!(event.attributes.iter().any(|kv| kv.key.as_str() == "st.roster.admission.holder_class"
+            && kv.value == opentelemetry::Value::String("http".into())), "{event:?}");
+    }
+    let unknown = named("admission.unknown_waiter");
+    let unknown_tail = named("admission.unknown_tail");
+    for span in [unknown, unknown_tail] {
+        assert_eq!(string(span, "st.roster.admission.holder_class").as_deref(), Some("unknown"));
+        assert_eq!(int(span, "st.roster.admission.holder_id"), None, "no invented blocker id");
+        assert_eq!(double(span, "st.roster.admission.holder_age_ms"), None, "no invented blocker age");
+        assert!(span.links.iter().next().is_none(), "no guessed blocker context: {span:?}");
+        assert!(double(span, "st.roster.admission.wait_ms").is_some_and(|ms| ms >= 0.0));
+        assert!(double(span, "st.roster.admission.hold_ms").is_some_and(|ms| ms >= 0.0));
+    }
+    assert_eq!(string(unknown, "st.roster.admission.waiter_class").as_deref(), Some("ws"));
+    assert_eq!(string(unknown_tail, "st.roster.admission.waiter_class").as_deref(), Some("other"));
+    // Correlation uses process-local numbers and closed classes only.
+    for span in [holder, waiter, unlinked, handoff_a, handoff_b, handoff_waiter, unknown, unknown_tail] {
+        for kv in span.attributes.iter().filter(|kv| kv.key.as_str().starts_with("st.roster.")) {
+            assert!(
+                !matches!(&kv.value, opentelemetry::Value::String(value)
+                    if !matches!(value.as_str(), "http" | "ws" | "refresher" | "other" | "unknown")),
+                "unbounded roster string attribute: {kv:?}"
+            );
+        }
+    }
 }

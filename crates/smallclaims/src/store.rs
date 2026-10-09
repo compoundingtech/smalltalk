@@ -4939,9 +4939,11 @@ impl Store {
             .connection
             .clone()
             .expect("the pin holds its connection");
+        let timing = crate::sqlite::ReaderTiming::start();
         connection.execute_batch("BEGIN")?;
         // The first read starts the snapshot; every later read in `read` sees the same one.
         let index = current_index(&connection)?;
+        drop(timing);
         live.snapshot_started(&connection);
         crate::sqlite::push_pinned_reader(key, connection);
         pinned.registered = true;

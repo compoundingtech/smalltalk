@@ -511,20 +511,20 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    spawn(work, true)
+    spawn(work, true, None)
 }
 
 #[track_caller]
-pub(super) fn spawn_handler<F, T>(work: F) -> impl Future<Output = Result<T, WorkError>>
+pub(super) fn spawn_handler<F, T>(roster: Option<tracing::Span>, work: F) -> impl Future<Output = Result<T, WorkError>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    spawn(move || with_handler(work), false)
+    spawn(move || with_handler(work), false, roster)
 }
 
 #[track_caller]
-fn spawn<F, T>(work: F, query: bool) -> impl Future<Output = Result<T, WorkError>>
+fn spawn<F, T>(work: F, query: bool, roster: Option<tracing::Span>) -> impl Future<Output = Result<T, WorkError>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -567,6 +567,7 @@ where
     let cancel = Cancel(budget.clone());
     let profile = query.then(crate::profile::current).flatten();
     let queued = profile.as_ref().map(|op| op.wall_span("blocking/queue"));
+    let roster_submitted = roster.as_ref().map(|_| std::time::Instant::now());
     let run = move |permit: Option<smallclaims::sqlite::ReadPermit>,
                     mut diagnostic_queue: Option<crate::relay_trace::Span>| {
         if let Some(span) = &mut diagnostic_queue {
@@ -574,6 +575,8 @@ where
         }
         drop(queued);
         let _work = profile.as_ref().map(|op| op.wall_span("blocking/work"));
+        let _roster_span = roster.as_ref().map(tracing::Span::enter);
+        let roster_work = || {
         crate::relay_trace::blocking(diagnostic, || {
             crate::relay_trace::result(crate::relay_trace::Phase::BlockingWork, || {
                 with_store(store.clone(), || {
@@ -603,6 +606,15 @@ where
                 })
             })
         })
+        };
+        if roster.is_some() {
+            crate::otel::roster_scope(|| {
+                crate::otel::roster_worker_started(roster_submitted);
+                roster_work()
+            })
+        } else {
+            roster_work()
+        }
     };
     let start_queue = move || {
         diagnostic_dispatch
@@ -1343,7 +1355,7 @@ mod tests {
                 release.send(()).unwrap();
             });
             let writing = store.clone();
-            let result = spawn_handler(move || {
+            let result = spawn_handler(None, move || {
                 tokio::runtime::Handle::current().block_on(super::super::blocking_action(move || {
                     // A synchronous callback may need to wait for an async service itself.
                     tokio::runtime::Handle::current().block_on(async {});
@@ -1369,7 +1381,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn an_inline_read_keeps_its_deadline_without_cancelling_a_later_write() {
-        let result = spawn_handler(|| {
+        let result = spawn_handler(None, || {
             let handle = tokio::runtime::Handle::current();
             let read = read_budget::with(Some(ReadBudget::new("/expired", Duration::ZERO)), || {
                 spawn_blocking(|| panic!("an expired read must not run"))
@@ -1385,7 +1397,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn inline_panics_keep_the_nested_error_boundary_and_handler_cleanup() {
-        let result = spawn_handler(|| {
+        let result = spawn_handler(None, || {
             let handle = tokio::runtime::Handle::current();
             let failure = handle.block_on(spawn_blocking(|| panic!("nested callback")));
             assert!(matches!(failure, Err(WorkError::Panic)));

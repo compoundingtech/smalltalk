@@ -1045,6 +1045,39 @@ fn pop_pinned_reader(pool: usize) {
     });
 }
 
+type ReaderTimingObserver = fn(std::time::Duration);
+thread_local! {
+    static READER_TIMING: std::cell::Cell<Option<ReaderTimingObserver>> = const { std::cell::Cell::new(None) };
+}
+
+/// Observe physical acquisition and snapshot establishment only within the caller's scope.
+pub fn with_reader_timing<T>(report: fn(std::time::Duration), work: impl FnOnce() -> T) -> T {
+    struct Restore(Option<ReaderTimingObserver>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READER_TIMING.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(READER_TIMING.with(|slot| slot.replace(Some(report))));
+    work()
+}
+
+pub(crate) struct ReaderTiming(Option<(std::time::Instant, ReaderTimingObserver)>);
+
+impl ReaderTiming {
+    pub(crate) fn start() -> Self {
+        Self(READER_TIMING.with(|slot| slot.get().map(|report| (std::time::Instant::now(), report))))
+    }
+}
+
+impl Drop for ReaderTiming {
+    fn drop(&mut self) {
+        if let Some((started, report)) = self.0 {
+            report(started.elapsed());
+        }
+    }
+}
+
 /// A write from inside `Store::read_snapshot` commits after the snapshot its thread reads, so
 /// the reads that follow it there cannot see it. Nothing writes from a pinned read.
 pub fn debug_assert_no_pinned_read() {
@@ -1136,6 +1169,7 @@ impl ReadPool {
     /// Connection-open failures return immediately; cancellation is checked around acquisition.
     #[track_caller]
     pub fn try_get(&self) -> Result<ReadGuard<'_>> {
+        let _timing = ReaderTiming::start();
         crate::read_budget::check()?;
         let idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner).pop();
         let connection = match idle { Some(connection) => connection, None => self.open_connection()? };
@@ -1342,6 +1376,7 @@ impl ReadPool {
                 _live: None,
             };
         }
+        let _timing = ReaderTiming::start();
         let waiting = crate::profile::enabled().then(std::time::Instant::now);
         let idle = self
             .idle
@@ -1775,6 +1810,28 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roster_reader_timing_is_scoped_and_restored_on_unwind() {
+        thread_local! {
+            static REPORTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        fn report(_: std::time::Duration) {
+            REPORTS.with(|count| count.set(count.get() + 1));
+        }
+        drop(ReaderTiming::start());
+        assert_eq!(REPORTS.with(std::cell::Cell::get), 0);
+        with_reader_timing(report, || {
+            drop(ReaderTiming::start());
+            let panic = std::panic::catch_unwind(|| {
+                with_reader_timing(|_| {}, || panic!("observer scope unwind"));
+            });
+            assert!(panic.is_err());
+            drop(ReaderTiming::start());
+        });
+        drop(ReaderTiming::start());
+        assert_eq!(REPORTS.with(std::cell::Cell::get), 2);
+    }
 
     fn wal_payload_values(connection: &Connection) -> Vec<String> {
         let mut statement = connection

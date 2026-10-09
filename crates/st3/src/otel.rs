@@ -31,7 +31,27 @@ static EXPORT_ENABLED: AtomicBool = AtomicBool::new(false);
 static METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static FIXTURE_EXPORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn fixture_export_scope() -> impl Drop {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FIXTURE_EXPORT.with(|slot| slot.set(self.0));
+        }
+    }
+    Restore(FIXTURE_EXPORT.with(|slot| slot.replace(true)))
+}
 pub fn export_enabled() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if FIXTURE_EXPORT.with(std::cell::Cell::get) {
+        return true;
+    }
     EXPORT_ENABLED.load(Ordering::Relaxed)
 }
 
@@ -85,6 +105,212 @@ pub fn stage_root(
         builder = builder.with_links(vec![opentelemetry::trace::Link::new(link, Vec::new(), 0)]);
     }
     Some(tracer.build_with_context(builder, &opentelemetry::Context::new()))
+}
+
+#[derive(Default)]
+pub(crate) struct RosterAttributes {
+    values: std::collections::BTreeMap<&'static str, opentelemetry::Value>,
+    worker_queue_ms: Option<f64>,
+    reader_acquire_ms: Option<f64>,
+}
+
+thread_local! {
+    static ROSTER_SCOPE: std::cell::RefCell<Option<RosterAttributes>> = const { std::cell::RefCell::new(None) };
+    static COLLECT_ROSTER_WARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Only preparatory warming may collect attributes before its cold publication span exists.
+pub(crate) fn roster_collect_warm<T>(work: impl FnOnce() -> T) -> T {
+    if !export_enabled() {
+        return work();
+    }
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            COLLECT_ROSTER_WARM.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(COLLECT_ROSTER_WARM.with(|slot| slot.replace(true)));
+    roster_scope(work)
+}
+
+/// Move accumulated measurements across a preparatory warm worker or a WS read retry.
+pub(crate) fn seed_roster_attributes(attributes: Option<RosterAttributes>) {
+    if let Some(attributes) = attributes {
+        ROSTER_SCOPE.with(|slot| *slot.borrow_mut() = Some(attributes));
+    }
+}
+
+pub(crate) fn take_roster_attributes() -> Option<RosterAttributes> {
+    if !export_enabled() {
+        return None;
+    }
+    ROSTER_SCOPE.with(|slot| slot.borrow_mut().take())
+}
+
+pub(crate) struct RosterScopeGuard(Option<RosterAttributes>);
+
+impl Drop for RosterScopeGuard {
+    fn drop(&mut self) {
+        ROSTER_SCOPE.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
+}
+
+/// A cold rebuild can run after the first frame; it still attributes its own synchronous work.
+pub(crate) fn ensure_roster_scope() -> Option<RosterScopeGuard> {
+    ROSTER_SCOPE.with(|slot| {
+        let active = slot.borrow().is_some();
+        if active {
+            None
+        } else {
+            Some(RosterScopeGuard(slot.replace(Some(Default::default()))))
+        }
+    })
+}
+
+/// Opt in only the roster worker to connection/snapshot attribution.
+pub fn roster_scope<T>(work: impl FnOnce() -> T) -> T {
+    if !export_enabled() || ROSTER_SCOPE.with(|slot| slot.borrow().is_some()) {
+        return work();
+    }
+    let _restore = ensure_roster_scope();
+    smallclaims::sqlite::with_reader_timing(
+        |elapsed| roster_wait("st.roster.reader_acquire_ms", elapsed.as_secs_f64() * 1000.0),
+        work,
+    )
+}
+
+pub(crate) fn roster_recording() -> bool {
+    export_enabled()
+        && ROSTER_SCOPE.with(|slot| slot.borrow().is_some())
+        && (COLLECT_ROSTER_WARM.with(std::cell::Cell::get) || roster_destination_recording())
+}
+
+fn roster_destination_recording() -> bool {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    if opentelemetry::Context::current().span().is_recording() {
+        return true;
+    }
+    let span = tracing::Span::current();
+    if span.is_disabled() {
+        return false;
+    }
+    // The tracing bridge supplies a presampled, non-recording context; its sampling
+    // flag represents the recording tracing span (the production sampler is AlwaysOn).
+    let context = span.context();
+    let span_context = context.span().span_context().clone();
+    span_context.is_valid() && span_context.is_sampled()
+}
+
+/// Bounded attributes on existing request/first-frame spans and the active rebuild root.
+pub fn roster_attribute(key: &'static str, value: impl Into<opentelemetry::Value>) {
+    if !export_enabled()
+        || !(COLLECT_ROSTER_WARM.with(std::cell::Cell::get) || roster_destination_recording())
+    {
+        return;
+    }
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+    let value = value.into();
+    tracing::Span::current().set_attribute(key, value.clone());
+    let context = opentelemetry::Context::current();
+    if context.span().is_recording() {
+        context.span().set_attribute(KeyValue::new(key, value.clone()));
+    }
+    ROSTER_SCOPE.with(|slot| {
+        if let Some(attributes) = slot.borrow_mut().as_mut() {
+            attributes.values.insert(key, value);
+        }
+    });
+}
+
+pub fn record_roster_read(path: &'static str, requested: u64, publication: Option<u64>, fresh: bool) {
+    if !export_enabled() {
+        return;
+    }
+    roster_attribute("st.roster.path", path);
+    roster_attribute("st.roster.fresh_requested", fresh);
+    roster_attribute("st.roster.requested_cut", requested as i64);
+    if let Some(publication) = publication {
+        roster_attribute("st.roster.publication_cut", publication as i64);
+    }
+}
+
+fn roster_accumulate(key: &'static str, elapsed: f64) {
+    let previous = ROSTER_SCOPE.with(|slot| slot.borrow().as_ref().and_then(|attributes| {
+        match attributes.values.get(key) { Some(opentelemetry::Value::F64(value)) => Some(*value), _ => None }
+    })).unwrap_or_default();
+    roster_attribute(key, previous + elapsed);
+}
+
+/// Fixed scalar staging retains pre-build waits without allocating discarded attributes.
+fn roster_wait(key: &'static str, elapsed: f64) {
+    if !export_enabled() {
+        return;
+    }
+    let total = ROSTER_SCOPE.with(|slot| {
+        let mut scope = slot.borrow_mut();
+        let attributes = scope.as_mut()?;
+        let counter = match key {
+            "st.roster.worker_queue_ms" => &mut attributes.worker_queue_ms,
+            "st.roster.reader_acquire_ms" => &mut attributes.reader_acquire_ms,
+            _ => unreachable!("roster waits use a closed vocabulary"),
+        };
+        let total = counter.unwrap_or_default() + elapsed;
+        *counter = Some(total);
+        Some(total)
+    }).unwrap_or(elapsed);
+    roster_attribute(key, total);
+}
+
+/// The closure never yields: both clocks therefore belong to one physical worker thread.
+pub fn roster_phase<T>(name: &'static str, work: impl FnOnce() -> T) -> T {
+    if !roster_recording() {
+        return work();
+    }
+    let (wall_key, cpu_key) = match name {
+        "membership" => ("st.roster.phase.membership.wall_ms", "st.roster.phase.membership.cpu_ms"),
+        "status_fold" => ("st.roster.phase.status_fold.wall_ms", "st.roster.phase.status_fold.cpu_ms"),
+        "card_presentation" => ("st.roster.phase.card_presentation.wall_ms", "st.roster.phase.card_presentation.cpu_ms"),
+        "queue_selection" => ("st.roster.phase.queue_selection.wall_ms", "st.roster.phase.queue_selection.cpu_ms"),
+        "serialization" => ("st.roster.phase.serialization.wall_ms", "st.roster.phase.serialization.cpu_ms"),
+        _ => unreachable!("roster phases use a closed vocabulary"),
+    };
+    let started = Instant::now();
+    let cpu = crate::incremental::thread_cpu();
+    let value = work();
+    let cpu_elapsed = crate::incremental::thread_cpu().saturating_sub(cpu);
+    let wall_elapsed = started.elapsed();
+    roster_accumulate(wall_key, wall_elapsed.as_secs_f64() * 1000.0);
+    roster_accumulate(cpu_key, cpu_elapsed.as_secs_f64() * 1000.0);
+    value
+}
+
+pub fn roster_worker_started(submitted: Option<Instant>) {
+    if let Some(submitted) = submitted {
+        roster_wait("st.roster.worker_queue_ms", submitted.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
+pub(crate) fn copy_roster_attributes(context: &opentelemetry::Context) {
+    use opentelemetry::trace::TraceContextExt as _;
+    if !context.span().is_recording() {
+        return;
+    }
+    ROSTER_SCOPE.with(|slot| {
+        if let Some(attributes) = slot.borrow_mut().as_mut() {
+            for (key, elapsed) in [
+                ("st.roster.worker_queue_ms", attributes.worker_queue_ms),
+                ("st.roster.reader_acquire_ms", attributes.reader_acquire_ms),
+            ] {
+                if let Some(elapsed) = elapsed {
+                    attributes.values.insert(key, elapsed.into());
+                }
+            }
+            context.span().set_attributes(attributes.values.iter().map(|(key, value)| KeyValue::new(*key, value.clone())));
+        }
+    });
 }
 
 /// Whether a meter provider was installed. Independent of trace export: the RED metrics
@@ -610,6 +836,86 @@ mod tests {
     };
     use opentelemetry::{Key, KeyValue, Value};
     use opentelemetry_sdk::Resource;
+
+    #[test]
+    fn roster_warm_measurements_move_to_the_publication_worker() {
+        use opentelemetry::trace::{TraceContextExt as _, Tracer as _, TracerProvider as _};
+        let attributes = std::thread::spawn(|| {
+            let _export = super::fixture_export_scope();
+            super::roster_collect_warm(|| {
+                super::roster_accumulate("st.roster.phase.status_fold.wall_ms", 1.0);
+                super::take_roster_attributes()
+            })
+        }).join().unwrap();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let context = opentelemetry::Context::new().with_span(provider.tracer("roster-test").start("publication"));
+        let _context = context.attach();
+        let _export = super::fixture_export_scope();
+        let attributes = super::roster_scope(|| {
+            super::seed_roster_attributes(attributes);
+            super::roster_accumulate("st.roster.phase.status_fold.wall_ms", 2.0);
+            super::take_roster_attributes().unwrap()
+        });
+        assert_eq!(attributes.values.get("st.roster.phase.status_fold.wall_ms"), Some(&Value::F64(3.0)));
+        assert!(!super::roster_recording(), "worker scopes restore their thread-local state");
+    }
+
+    #[test]
+    fn roster_without_recording_destination_skips_attribute_construction() {
+        struct UnexpectedConversion;
+        impl From<UnexpectedConversion> for Value {
+            fn from(_: UnexpectedConversion) -> Self {
+                panic!("a nonrecording roster must not construct attribute values");
+            }
+        }
+        let _context = opentelemetry::Context::new().attach();
+        let _export = super::fixture_export_scope();
+        let attributes = super::roster_scope(|| {
+            assert!(!super::roster_recording());
+            super::roster_attribute("st.roster.path", UnexpectedConversion);
+            assert_eq!(super::roster_phase("membership", || 7), 7);
+            super::roster_wait("st.roster.worker_queue_ms", 1.0);
+            super::roster_wait("st.roster.reader_acquire_ms", 2.0);
+            super::take_roster_attributes().unwrap()
+        });
+        assert!(attributes.values.is_empty(), "no attribute-map allocations without a destination");
+        assert_eq!(attributes.worker_queue_ms, Some(1.0));
+        assert_eq!(attributes.reader_acquire_ms, Some(2.0));
+    }
+
+    #[test]
+    fn roster_retry_workers_accumulate_waits_and_preserve_cut() {
+        use opentelemetry::trace::{TraceContextExt as _, Tracer as _, TracerProvider as _};
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let probe_provider = provider.clone();
+        let attributes = std::thread::spawn(move || {
+            let context = opentelemetry::Context::new().with_span(probe_provider.tracer("roster-test").start("probe"));
+            let _context = context.attach();
+            let _export = super::fixture_export_scope();
+            super::roster_scope(|| {
+                super::roster_wait("st.roster.worker_queue_ms", 1.0);
+                super::roster_wait("st.roster.reader_acquire_ms", 2.0);
+                super::roster_attribute("st.roster.requested_cut", 7_i64);
+                super::take_roster_attributes()
+            })
+        }).join().unwrap();
+        let attributes = std::thread::spawn(move || {
+            let context = opentelemetry::Context::new().with_span(provider.tracer("roster-test").start("retry"));
+            let _context = context.attach();
+            let _export = super::fixture_export_scope();
+            super::roster_scope(|| {
+                super::seed_roster_attributes(attributes);
+                super::roster_wait("st.roster.worker_queue_ms", 3.0);
+                super::roster_wait("st.roster.reader_acquire_ms", 4.0);
+                super::take_roster_attributes().unwrap()
+            })
+        }).join().unwrap();
+        assert_eq!(attributes.values.get("st.roster.worker_queue_ms"), Some(&Value::F64(4.0)));
+        assert_eq!(attributes.values.get("st.roster.reader_acquire_ms"), Some(&Value::F64(6.0)));
+        assert_eq!(attributes.values.get("st.roster.requested_cut"), Some(&Value::I64(7)));
+        assert_eq!(attributes.worker_queue_ms, Some(4.0));
+        assert_eq!(attributes.reader_acquire_ms, Some(6.0));
+    }
 
     #[derive(Debug)]
     struct StalledExporter(std::sync::mpsc::Sender<()>);

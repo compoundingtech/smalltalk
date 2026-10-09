@@ -59,15 +59,20 @@ async fn first_frame_work<F: Future>(span: Option<tracing::Span>, work: F) -> F:
     }
 }
 
+/// Whether the current span is an exported subscription's first-frame root.
+fn first_frame_current() -> bool {
+    crate::otel::export_enabled()
+        && tracing::Span::current()
+            .metadata()
+            .is_some_and(|metadata| metadata.name() == "st.subscription.first_frame")
+}
+
 /// Reuse the actual serialized frame length; later frames do not inspect their payload.
 fn record_subscription_page(value: &Value, bytes: usize) {
-    if !crate::otel::export_enabled() {
+    if !first_frame_current() {
         return;
     }
     let span = tracing::Span::current();
-    if !span.metadata().is_some_and(|metadata| metadata.name() == "st.subscription.first_frame") {
-        return;
-    }
     let body = value.get("value").unwrap_or(value);
     let rows = body["items"].as_array().map_or_else(
         || body["rows"].as_u64().unwrap_or(0) as usize,
@@ -280,7 +285,7 @@ struct CollectionReadAdmission {
     read_gate: Arc<tokio::sync::Semaphore>,
     socket: Option<tokio::sync::OwnedSemaphorePermit>,
     window: Option<tokio::sync::OwnedMutexGuard<()>>,
-    roster: Option<tokio::sync::OwnedMutexGuard<()>>,
+    roster: Option<crate::store::AdmissionGuard>,
     reader: Option<smallclaims::sqlite::ReadPermit>,
 }
 
@@ -325,12 +330,12 @@ impl CollectionReadAdmission {
                 }
             }
             if self.roster.is_none() && needs_roster {
-                self.roster = store.try_admit_agent_resources();
+                self.roster = store.try_admit_agent_resources("ws");
                 if self.roster.is_none() {
                     drop(self.reader.take());
                     drop(self.socket.take());
                     drop(self.window.take());
-                    self.roster = Some(store.admit_agent_resources().await);
+                    self.roster = Some(store.admit_agent_resources("ws").await);
                     continue;
                 }
             }
@@ -459,6 +464,10 @@ async fn collection_items_with_windows(
     let custom_forms = session.custom_forms;
     let arrangement_window = collection == "arrangements";
     let mut admitted = collection != "agents";
+    // Attribute the first frame, and any later cold root; never create a per-frame span.
+    let traced = matches!(collection.as_str(), "agents" | "summary") && first_frame_current();
+    let roster_telemetry = matches!(collection.as_str(), "agents" | "summary") && crate::otel::export_enabled();
+    let mut roster_attributes = None;
     let (snapshot, mut items, mut has_more) = loop {
         // Summary reads the published roster once a refresher keeps one; only a store without
         // one folds it here, behind the shared admission.
@@ -469,6 +478,7 @@ async fn collection_items_with_windows(
         let read_permit = gates.socket.take().expect("admitted collection socket");
         let admission = gates.window.take();
         let roster_admission = gates.roster.take();
+        let submitted = roster_telemetry.then(std::time::Instant::now);
         let state = state.clone();
         let session = session.clone();
         let request = request.clone();
@@ -480,16 +490,16 @@ async fn collection_items_with_windows(
         let prepared = prepared.clone();
         let windows = windows.clone();
         let worker_store = state.store.clone();
-        let (result, read_permit, returned_admission) = super::blocking_store(move || {
-            worker_store.readers.request_read_with_permit(reader_permit, move || {
-        // The worker owns both guards until its physical snapshot finishes, including
-        // after caller cancellation. A miss returns them without allocating shared guards.
-        let mut admission = admission;
-        let result = crate::profile::task(collection_window_label(&collection), || {
+        let (result, read_permit, returned_admission, attributes) = super::blocking_store(move || {
+            crate::profile::task(collection_window_label(&collection), || super::roster_worker(roster_telemetry, submitted, roster_attributes, || {
+            let (result, read_permit, admission) = worker_store.readers.request_read_with_permit(reader_permit, move || {
+            // The worker owns both guards until its physical snapshot finishes, including
+            // after caller cancellation. A miss returns them without allocating shared guards.
+            let mut admission = admission;
             let _roster_admission = roster_admission;
             let store = state.store.clone();
             let commits = windows.as_ref().map(|windows| windows.commits());
-            store.read_snapshot(|index| {
+            let result = store.read_snapshot(|index| {
                 let now = client_now_ms();
                 // Recheck paired grants, including expiry and changed scopes, before any reuse.
                 let (current, person) = match (|| {
@@ -519,20 +529,25 @@ async fn collection_items_with_windows(
                 // Every served roster says when it was published.
                 let mut published = None;
                 let mut published_at = None;
+                let mut roster_path = "exact_cold";
                 let cached_agents = if collection == "agents" {
                     match store.agent_resources_published_at(index, false, None)? {
                         Some((cards, at)) => {
+                            roster_path = "published_complete";
                             published_at = Some(at);
                             Some(cards)
                         }
                         // Before the first complete roster, an unfiltered window can come
                         // from the head the refresher publishes first.
-                        None => match store.published_agent_roster(index, false).or_else(|| {
+                        None => match store.published_agent_roster(index, false)
+                            .map(|roster| ("published_complete", roster)).or_else(|| {
                             status.is_none().then(|| store.published_agent_roster_head(index, limit + 1))
-                                .flatten().map(|(cut, _, head, at)| (cut, Arc::new(head), at))
+                                .flatten()
+                                .map(|(cut, _, head, at)| ("published_head", (cut, Arc::new(head), at)))
                         }) {
-                            Some((cut, cards, at)) => {
+                            Some((path, (cut, cards, at))) => {
                                 store.request_agent_roster_refresh();
+                                roster_path = path;
                                 published = Some(cut);
                                 published_at = Some(at);
                                 Some(cards)
@@ -541,6 +556,9 @@ async fn collection_items_with_windows(
                             // has published one, the window is not ready yet.
                             None if store.agent_roster_refresher_running() => {
                                 store.request_agent_roster_refresh();
+                                if traced {
+                                    crate::otel::record_roster_read("not_ready", index, None, false);
+                                }
                                 return Ok(Err(super::agent_roster_not_ready()));
                             }
                             None if admitted => None,
@@ -555,6 +573,8 @@ async fn collection_items_with_windows(
                 } else {
                     None
                 };
+                // A window hit reuses rows an earlier exact fold computed at this cut.
+                let folded = std::cell::Cell::new(false);
                 let snapshot = match published_at {
                     Some(at) => super::roster_snapshot(&state, published.unwrap_or(index), at),
                     None => client_snapshot_at(&state, index),
@@ -599,9 +619,13 @@ async fn collection_items_with_windows(
                             match &cached_agents {
                                 Some(cards) => cards.iter().take(keep).cloned().collect(),
                                 None if status.is_none() => {
+                                    folded.set(true);
                                     return client_agent_window_cards(&store, index, limit);
                                 }
-                                None => client_agent_resources_cached(&store, false, index)?,
+                                None => {
+                                    folded.set(true);
+                                    client_agent_resources_cached(&store, false, index)?
+                                }
                             }
                         }
                         "work" => client_work_resources(
@@ -646,6 +670,15 @@ async fn collection_items_with_windows(
                     // beside the others instead of behind them.
                     drop(admission.take());
                     overlay_agent_resources(&store, &mut items, &at)?;
+                    if traced {
+                        let path = match (status.is_some(), roster_path, folded.get()) {
+                            (true, _, _) => "filtered_full",
+                            (false, "exact_cold", false) => "exact_warm",
+                            (false, path, _) => path,
+                        };
+                        let served = published.unwrap_or(index);
+                        crate::otel::record_roster_read(path, index, Some(served), false);
+                    }
                     if let Some(status) = &status {
                         items.retain(|item| item["state"].as_str() == Some(status.as_str()));
                     }
@@ -653,14 +686,18 @@ async fn collection_items_with_windows(
                     items.truncate(limit);
                 }
                 Ok(Ok(Some((snapshot, items, has_more))))
-            })
-        });
-        Ok((result?, read_permit, admission))
-        })?
+            });
+            Ok::<_, anyhow::Error>((result?, read_permit, admission))
+            })??;
+            // Keep the failed probe's measurements for the admitted retry, before the
+            // worker scope restores its thread-local accumulator.
+            Ok((result, read_permit, admission, crate::otel::take_roster_attributes()))
+        }))
         })
         .await?;
         gates.socket = Some(read_permit);
         gates.window = returned_admission;
+        roster_attributes = attributes;
         if let Some(rows) = result? {
             break rows;
         }
@@ -710,7 +747,14 @@ fn collection_window_label(collection: &str) -> &'static str {
 }
 
 async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
-    let Ok(payload) = serde_json::to_string(&value) else {
+    let encode = || serde_json::to_string(&value);
+    // Only an agents subscription's first frame attributes its encoding to the roster.
+    let encoded = if value["collection"] == "agents" && first_frame_current() {
+        crate::otel::roster_scope(|| crate::otel::roster_phase("serialization", encode))
+    } else {
+        encode()
+    };
+    let Ok(payload) = encoded else {
         return false;
     };
     if payload.len() > CLIENT_MAX_RESPONSE_BYTES {
@@ -11747,7 +11791,7 @@ mission "queue-parity" state="ready" {
         let (_, expected, _) = collection_items_with_windows(&state, &session, &request,
             semaphore.clone().acquire_owned().await.unwrap(), windows.clone()).await.unwrap();
         let builds = state.store.agent_resources_builds_for_test();
-        let _cold_builder = state.store.admit_agent_resources().await;
+        let _cold_builder = state.store.admit_agent_resources("other").await;
         let start = std::time::Instant::now();
         let (_, actual, _) = tokio::time::timeout(std::time::Duration::from_secs(1),
             collection_items_with_windows(&state, &session, &request,
@@ -11794,7 +11838,7 @@ mission "queue-parity" state="ready" {
             let prepared = windows.prepare(&state, &session, &request).unwrap();
             let held_window = (gate == "window").then(|| prepared.try_admit().unwrap());
             let held_roster = (gate == "roster")
-                .then(|| state.store.try_admit_agent_resources().unwrap());
+                .then(|| state.store.try_admit_agent_resources("other").unwrap());
             let socket = Arc::new(tokio::sync::Semaphore::new(1));
             let mut read = Box::pin(collection_items_with_windows(
                 &state, &session, &request, socket.clone().acquire_owned().await.unwrap(),
@@ -11809,7 +11853,7 @@ mission "queue-parity" state="ready" {
                 assert!(prepared.try_admit().is_some(),
                     "roster followers must release the window gate");
             } else {
-                assert!(state.store.try_admit_agent_resources().is_some(),
+                assert!(state.store.try_admit_agent_resources("other").is_some(),
                     "window followers must not reserve the roster gate");
             }
             let response = tokio::time::timeout(Duration::from_secs(5),
@@ -11843,7 +11887,7 @@ mission "queue-parity" state="ready" {
                 "runtime_id":"cycle-roster", "incarnation_id":"one"})).unwrap(),
             evidence: Vec::new(), expected_subject: None, idempotency_key: None,
         }).unwrap();
-        let roster = state.store.admit_agent_resources().await;
+        let roster = state.store.admit_agent_resources("other").await;
         let (waiting, mut waits) = tokio::sync::mpsc::unbounded_channel();
         let app = axum::Router::new()
             .route("/v1/client/agents", axum::routing::get({
@@ -11916,7 +11960,7 @@ mission "queue-parity" state="ready" {
                 "runtime_id":"miss-roster", "incarnation_id":"one"})).unwrap(),
             evidence: Vec::new(), expected_subject: None, idempotency_key: None,
         }).unwrap();
-        let roster = state.store.admit_agent_resources().await;
+        let roster = state.store.admit_agent_resources("other").await;
         let session = ClientSession::local(None).unwrap();
         let request: CollectionSubscribe = serde_json::from_value(json!({
             "kind":"subscribe", "id":"miss-roster", "collection":"agents", "limit":200,
@@ -12070,7 +12114,7 @@ mission "queue-parity" state="ready" {
                 .then(|| socket.clone().try_acquire_owned().unwrap());
             let held_window = (gate == "window").then(|| prepared.try_admit().unwrap());
             let held_roster = (gate == "roster")
-                .then(|| state.store.try_admit_agent_resources().unwrap());
+                .then(|| state.store.try_admit_agent_resources("other").unwrap());
             drop(held_reader);
             assert!(futures_util::poll!(&mut collection).is_pending());
             assert!(state.store.readers.try_admit_read().is_some(),
@@ -12082,7 +12126,7 @@ mission "queue-parity" state="ready" {
                 assert!(prepared.try_admit().is_some());
             }
             if gate != "roster" {
-                assert!(state.store.try_admit_agent_resources().is_some());
+                assert!(state.store.try_admit_agent_resources("other").is_some());
             }
             drop(held_socket);
             drop(held_window);
@@ -12242,7 +12286,7 @@ mission "queue-parity" state="ready" {
             .await.expect("the daemon publishes its roster as it starts").unwrap();
         assert_eq!(state.store.published_agent_roster(first, false).unwrap().0, first);
         // Hold the next refresh back: readers must answer from the publication without it.
-        let refresh = state.store.admit_agent_resources().await;
+        let refresh = state.store.admit_agent_resources("other").await;
         append("harness.observed", json!({"state":"working", "driver":"codex",
             "incarnation_id":"one"}));
         let current = state.store.index().unwrap();
@@ -12545,7 +12589,7 @@ mission "queue-parity" state="ready" {
 
         // Local activity changes the card without advancing the graph. The stream rereads the
         // same-index publication while the refresh is held, and receives nothing new.
-        let refresh = state.store.admit_agent_resources().await;
+        let refresh = state.store.admit_agent_resources("other").await;
         let revision = *published.borrow_and_update();
         state.store.append_claim(&ClaimInput {
             subject: subject.into(), kind: "harness.timeline".into(),
@@ -12619,7 +12663,7 @@ mission "queue-parity" state="ready" {
 
         // Once that roster is no longer published, the continuation restarts; it never folds.
         // Holding the refresher back keeps it from republishing that cut meanwhile.
-        let _refresh = state.store.admit_agent_resources().await;
+        let _refresh = state.store.admit_agent_resources("other").await;
         state.store.forget_current_views();
         let builds = state.store.agent_resources_builds_for_test();
         let expired = client_agents(State(state.clone()), Extension(first_snapshot),
@@ -12643,7 +12687,7 @@ mission "queue-parity" state="ready" {
         tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
             .await.unwrap().unwrap();
         // A slow refresh holds the roster admission; summary must not queue behind it.
-        let _refresh = state.store.admit_agent_resources().await;
+        let _refresh = state.store.admit_agent_resources("other").await;
         let request: CollectionSubscribe = serde_json::from_value(json!({
             "kind":"subscribe", "id":"summary", "collection":"summary",
         })).unwrap();
