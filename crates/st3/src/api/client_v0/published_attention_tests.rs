@@ -114,6 +114,13 @@ async fn attention_windows_serve_the_published_list_to_each_session_and_never_fo
     let (fresh, items, _) = window(&state, &ada, None, 50).await.unwrap();
     assert_eq!(fresh.store_index, state.store.index().unwrap());
     assert_eq!(items.len(), 3);
+    // Once its refresher stops, a window reads for itself at its own cut again.
+    custom(&state, "custom/garden/review/v1/ada-four", "person/ada");
+    state.store.stop_attention_list_refresher();
+    let (own, items, _) = window(&state, &ada, None, 50).await.unwrap();
+    assert_eq!(own.store_index, state.store.index().unwrap());
+    assert!(own.published_at.is_none());
+    assert_eq!(items.len(), 4);
 }
 
 async fn summary_window(

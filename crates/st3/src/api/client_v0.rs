@@ -430,7 +430,7 @@ async fn collection_items_with_windows(
                 // A daemon's windows never fold attention or read glasses and arrangements:
                 // they serve the newest published view under that view's own cut, and wake its
                 // refresher when it is older.
-                let published_rows = if store.attention_list_refresher_running() {
+                let published_rows = if store.published_view_serving(&collection) {
                     use super::published_attention::{published_attention_rows, published_owner_rows};
                     use crate::store::owner_lists::OwnerView;
                     let rows = match collection.as_str() {
