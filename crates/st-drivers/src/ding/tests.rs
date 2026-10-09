@@ -269,8 +269,11 @@ fn st3_notification_wraps_one_bounded_message_with_its_hash_and_graph_address() 
 }
 
 #[test]
-fn person_messages_describe_where_replies_are_read_in_both_native_notices() {
-    let note = "The person reads replies in st, not in the agent's session.";
+fn person_messages_tell_the_agent_to_answer_in_the_conversation_in_both_native_notices() {
+    let note = PERSON_REPLY_INSTRUCTION;
+    assert!(note.contains("this conversation") && note.contains("people have no inbox"));
+    assert!(note.contains("do not reply with st"));
+    assert!(!note.contains("NO REPLY"));
     for from in ["person/ada", "agent/example/worker", "daemon/runtime"] {
         for body in [
             "".to_owned(),

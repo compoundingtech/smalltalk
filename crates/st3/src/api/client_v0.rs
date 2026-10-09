@@ -11048,6 +11048,53 @@ mission "queue-parity" state="ready" {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_pages_ask_for_a_refresh_after_local_activity_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/local-page";
+        for (kind, fields) in [
+            ("runtime.observed", json!({"status":"running", "runtime_id":"local-page", "incarnation_id":"one"})),
+            ("harness.observed", json!({"state":"working", "driver":"codex", "incarnation_id":"one"})),
+        ] {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let index = state.store.index().unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        let page = || client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery::default()));
+        let (_, Json(before)) = page().await.unwrap();
+        assert!(before.items[0]["last_activity_at"].is_null());
+
+        // Local activity alone: no claim, so the graph index stays put.
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "harness.timeline".into(), actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"operation":"append",
+                "entry_id":"local-page", "source_id":"fixture/local-page",
+                "sequence":1, "revision":1, "role":"assistant", "entry_type":"message",
+                "final":true, "driver":"codex", "incarnation_id":"one",
+                "observed_at_unix_ms":client_now_ms(), "body":{"text":"local activity"}})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert_eq!(state.store.index().unwrap(), index);
+        let revision = *published.borrow_and_update();
+        // This page still shows the published roster, and asks for a newer one.
+        let (_, Json(stale)) = page().await.unwrap();
+        assert!(stale.items[0]["last_activity_at"].is_null());
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|now| *now > revision))
+            .await.expect("a page asks the refresher for local activity").unwrap();
+        let (snapshot, Json(after)) = page().await.unwrap();
+        assert_eq!(snapshot.0.store_index, index);
+        assert!(!after.items[0]["last_activity_at"].is_null(), "{:?}", after.items[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_roster_stream_rereads_a_same_index_publication_after_local_activity() {
         use futures_util::{SinkExt as _, StreamExt as _};
         let root = tempfile::tempdir().unwrap();

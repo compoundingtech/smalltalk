@@ -2,6 +2,8 @@ use super::owned_sets::{Options, Source};
 use super::*;
 use crate::parse_intent;
 
+mod empty_authority_guard;
+
 fn bundle(command: &str, meadow: bool) -> NormalizedIntent {
     parse_intent(
         &format!(
@@ -1671,4 +1673,8 @@ fn the_agent_card_fold_reads_set_owned_declarations_as_the_reduction_does() {
     }
     let indexes = (0..=store.index().unwrap()).collect::<Vec<_>>();
     super::card_fold_tests::assert_card_fold_parity(&store, &indexes);
+    let reads = store
+        .agent_card_reads(&["agent/garden/orchard".to_owned()], store.index().unwrap(), &HashMap::new())
+        .unwrap();
+    assert!(reads.may_have_rollout("agent/garden/orchard"));
 }

@@ -2885,6 +2885,16 @@ impl Store {
         through: u64,
         previous: &[Value],
     ) -> Result<Option<AgentResourcesDelta>> {
+        Ok(self.agent_resources_delta(after, through, previous)?.ok())
+    }
+
+    /// The cards claims between two cuts change, or why that cannot be told card by card.
+    fn agent_resources_delta(
+        &self,
+        after: u64,
+        through: u64,
+        previous: &[Value],
+    ) -> Result<std::result::Result<AgentResourcesDelta, String>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(
             "SELECT subject, kind, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
@@ -2905,7 +2915,7 @@ impl Store {
                 continue;
             }
             if self.smalltalk.claim_registry().claim(&kind).is_none() {
-                return Ok(None);
+                return Ok(Err(format!("unregistered {kind}")));
             }
             if subject.starts_with("agent/") {
                 // All registered agent claims can affect the subject's actual reduction or
@@ -2955,14 +2965,15 @@ impl Store {
                 // pending-delivery blocker, including replies through message ancestors.
                 // Receipts lack endpoints, so use the same message projection blockers read.
                 let Some(message) = self.message(&subject)? else {
-                    return Ok(None);
+                    return Ok(Err(format!("{kind} without its message")));
                 };
                 delta.subjects.extend([message.from, message.to].into_iter()
                     .filter(|party| party.starts_with("agent/")));
                 continue;
             }
             // Any other claim about a card input subject: refold conservatively.
-            return Ok(None);
+            let namespace = subject.split('/').next().unwrap_or_default();
+            return Ok(Err(format!("{kind} on {namespace}/")));
         }
         if !owners.is_empty() {
             // Existing cards carry their historical ownership; current declarations also
@@ -2981,7 +2992,7 @@ impl Store {
             delta.subjects.extend(statement.query_map([owners], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<BTreeSet<_>>>()?);
         }
-        Ok(Some(delta))
+        Ok(Ok(delta))
     }
 
     /// An allow-list for shallow refs, narrower than card-local invalidation: runtime status
@@ -3082,29 +3093,34 @@ impl Store {
         Some(wake)
     }
 
-    /// Whether a complete roster at `index` takes folding at most `bound` cards: the newest
-    /// rows, complete or partial, say which cards changed since, and together with the agents
-    /// they do not cover yet those are no more than `bound`. Read in the snapshot that folds.
-    pub(crate) fn agent_roster_completion_bounded(
+    /// `None` when a complete roster at `index` takes folding at most `bound` cards: the
+    /// newest rows, complete or partial, say which cards changed since, and together with the
+    /// agents they do not cover yet those are no more than `bound`. Otherwise why not. Read in
+    /// the snapshot that folds.
+    pub(crate) fn agent_roster_unbounded_because(
         &self,
         index: u64,
         history: bool,
         bound: usize,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let previous = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.index <= index)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         // Without rows to start from, every agent is missing: a small roster, or an empty
         // one, still completes in one bounded fold.
-        let changed = match &previous {
-            None => 0,
-            Some(previous) if previous.index == index => 0,
-            Some(previous) => match self.changed_agent_resources(previous.index, index, &previous.items)? {
-                Some(delta) => delta.subjects.len(),
-                None => return Ok(false),
+        let (changed, membership) = match &previous {
+            None => (0, true),
+            Some(previous) if previous.index == index => (0, false),
+            Some(previous) => match self.agent_resources_delta(previous.index, index, &previous.items)? {
+                Ok(delta) => (delta.subjects.len(), delta.membership),
+                Err(reason) => return Ok(Some(reason)),
             },
         };
+        // Complete rows whose membership no claim moved miss no agent: skip listing them all.
+        if previous.as_ref().is_some_and(|previous| previous.covered.is_none()) && !membership {
+            return Ok((changed > bound).then(|| "cards changed".to_owned()));
+        }
         let connection = self.readers.get();
         let names = connection.prepare_cached(RANGE_SUBJECTS)?
             .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
@@ -3116,7 +3132,33 @@ impl Store {
         let folded = previous.iter().flat_map(|previous| previous.items.iter())
             .filter_map(|item| item["id"].as_str()).collect::<HashSet<_>>();
         let missing = names.iter().filter(|name| !folded.contains(name.as_str())).count();
-        Ok(changed.saturating_add(missing) <= bound)
+        Ok((changed.saturating_add(missing) > bound).then(|| {
+            if missing > changed { "cards missing" } else { "cards changed" }.to_owned()
+        }))
+    }
+
+    /// Count one roster assembled in chunks because no short fold could complete it, by why.
+    pub(crate) fn note_agent_roster_chunked(&self, reason: &str) {
+        crate::performance::record_request("roster/chunked-assembly", None, std::time::Duration::ZERO);
+        *self.smalltalk.agent_roster_chunked.lock().expect("roster counts poisoned")
+            .entry(reason.to_owned()).or_default() += 1;
+    }
+
+    /// How many rosters were assembled in chunks, by why: each folded every card again.
+    pub fn agent_roster_chunked_assemblies(&self) -> BTreeMap<String, u64> {
+        self.smalltalk.agent_roster_chunked.lock().expect("roster counts poisoned").clone()
+    }
+
+    /// Whether the newest complete roster already is the one at `index`: same graph cut,
+    /// same local activity, and no queue deadline passed since. A refresh would fold nothing.
+    pub(crate) fn agent_roster_current(&self, index: u64, history: bool) -> Result<bool> {
+        let local = roster_local_frontier(&self.readers.get(), index)?;
+        let now = now_ms();
+        Ok(self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .any(|entry| entry.history == history && entry.covered.is_none()
+                && entry.index == index && entry.local == local
+                && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)))
     }
 
     /// Whether a refresher keeps the roster published, so readers must never fold it.
@@ -13008,24 +13050,31 @@ impl Store {
         at_index: u64,
     ) -> Result<BTreeMap<String, String>> {
         let connection = self.readers.get();
+        // Each subject's newest member reconcile decision, for 256 subjects per statement.
         let mut statement = connection.prepare_cached(
-            "SELECT body FROM claims WHERE subject=?1 AND kind='runtime.reconcile-decision'
-               AND store_index<=?2 AND json_extract(body, '$.fields.key')='member-reconcile'
-             ORDER BY store_index DESC LIMIT 1",
+            "SELECT subjects.value,
+                    (SELECT body FROM claims WHERE subject=subjects.value
+                       AND kind='runtime.reconcile-decision' AND store_index<=?2
+                       AND json_extract(body, '$.fields.key')='member-reconcile'
+                     ORDER BY store_index DESC LIMIT 1)
+             FROM json_each(?1) subjects",
         )?;
+        let mut decisions = Vec::new();
+        for chunk in subjects.chunks(256) {
+            for row in statement.query_map(params![serde_json::to_string(chunk)?, at_index], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })? {
+                let (subject, body) = row?;
+                decisions.extend(body.map(|body| (subject, body)));
+            }
+        }
         let mut faults = BTreeMap::new();
-        for subject in subjects {
-            let Some(body) = statement
-                .query_row(params![subject, at_index], |row| row.get::<_, String>(0))
-                .optional()?
-            else {
-                continue;
-            };
+        for (subject, body) in decisions {
             let body: Value = serde_json::from_str(&body)?;
             let fields = body.get("fields").unwrap_or(&body);
             if fields.get("decision").and_then(Value::as_str) == Some("member-fault") {
                 faults.insert(
-                    subject.clone(),
+                    subject,
                     fields
                         .get("reason")
                         .and_then(Value::as_str)
@@ -21493,6 +21542,10 @@ fn selected_actual_source_at(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let rows = rows
+        .iter()
+        .map(|(id, kind, origin, body)| (id.as_str(), kind.as_str(), origin.as_str(), body))
+        .collect::<Vec<_>>();
     let Some((selected_id, selected_origin, rivals)) = select_actual_source(&rows, desired_host)
     else {
         return Ok((None, None, false));
@@ -21508,15 +21561,15 @@ fn selected_actual_source_at(
 /// The selected actual-state claim of `(id, kind, origin, runtime body)` rows in canonical
 /// order, its origin, and the rival observations it must descend from to hold alone.
 fn select_actual_source(
-    rows: &[(String, String, String, Value)],
+    rows: &[(&str, &str, &str, &Value)],
     desired_host: Option<&str>,
 ) -> Option<(String, String, Vec<String>)> {
     let selected = rows
         .iter()
         .rev()
-        .find(|(_, kind, _, _)| kind == "runtime.observed")
+        .find(|(_, kind, _, _)| *kind == "runtime.observed")
         .or_else(|| rows.last());
-    let (selected_id, _, selected_origin, selected_body) = selected?;
+    let &(selected_id, _, selected_origin, selected_body) = selected?;
     // An origin's newer runtime observation supersedes its older observations. In particular,
     // its stop must retire its earlier running claim even when the new owner's intent follows
     // the desired-state branch rather than descending from that runtime branch.
@@ -21525,11 +21578,11 @@ fn select_actual_source(
         .iter()
         .rev()
         .filter(|(_, kind, origin, _)| {
-            kind == "runtime.observed" && observed_origins.insert(origin.as_str())
+            *kind == "runtime.observed" && observed_origins.insert(*origin)
         })
         .filter(|(id, _, origin, body)| {
-            id != selected_id
-                && origin != selected_origin
+            *id != selected_id
+                && *origin != selected_origin
                 && !nonowner_terminal_observation(
                     desired_host,
                     selected_origin,
@@ -21538,9 +21591,9 @@ fn select_actual_source(
                     body,
                 )
         })
-        .map(|(id, _, _, _)| id.clone())
+        .map(|(id, _, _, _)| (*id).to_owned())
         .collect::<Vec<_>>();
-    Some((selected_id.clone(), selected_origin.clone(), rivals))
+    Some((selected_id.to_owned(), selected_origin.to_owned(), rivals))
 }
 
 /// Whether claim `descendant` of `subject` descends from every claim of `ancestors`, walking the
@@ -21653,18 +21706,33 @@ fn latest_actual_at(
 fn fold_latest_actual(
     rows: impl IntoIterator<Item = (String, String)>,
 ) -> Result<Option<Value>> {
+    let rows = rows
+        .into_iter()
+        .map(|(kind, body)| Ok((kind, serde_json::from_str::<Value>(&body)?)))
+        .collect::<Result<Vec<_>>>()?;
+    fold_latest_values(rows)
+}
+
+/// [`fold_latest_actual`] of claims already parsed, `(kind, body)` in canonical order. It takes
+/// the bodies, so each field moves into the folded state instead of being copied.
+fn fold_latest_values(rows: impl IntoIterator<Item = (String, Value)>) -> Result<Option<Value>> {
     let mut rows = rows.into_iter().peekable();
     if rows.peek().is_none() {
         return Ok(None);
     }
     let mut merged = serde_json::Map::new();
     let registry = st3_schema::registry();
-    for (kind, body) in rows {
-        let value: Value = serde_json::from_str(&body)?;
-        let source = value.get("fields").unwrap_or(&value);
-        if let Some(fields) = source.as_object() {
+    for (kind, value) in rows {
+        let source = match value {
+            Value::Object(mut body) => match body.remove("fields") {
+                Some(fields) => fields,
+                None => Value::Object(body),
+            },
+            other => other,
+        };
+        if let Value::Object(fields) = source {
             if kind == "resource.observed" {
-                resources::merge_observation(&mut merged, fields);
+                resources::merge_observation(&mut merged, &fields);
                 continue;
             }
             if registry
@@ -21680,7 +21748,7 @@ fn fold_latest_actual(
                 }
             }
             for (key, value) in fields {
-                merged.insert(key.clone(), value.clone());
+                merged.insert(key, value);
             }
         }
     }
