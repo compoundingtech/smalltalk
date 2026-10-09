@@ -28,6 +28,8 @@ mod card_fold;
 mod card_fold_tests;
 #[cfg(test)]
 mod roster_controls;
+#[cfg(test)]
+mod agents_window_deadline_tests;
 pub(crate) mod step_labels;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -3088,11 +3090,11 @@ impl Store {
         self.cached_agent_resources_for(index, history, None, build)
     }
 
-    /// The complete agents WS window inherits the queue deadline from its shared projection.
+    /// An agents WS window inherits the queue deadline from its selected or complete projection.
     pub(crate) fn agent_roster_valid_until(&self, index: u64) -> Option<u128> {
         self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter().rev()
-            .find(|entry| entry.index == index && !entry.history && entry.covered.is_none())
+            .find(|entry| entry.index == index && !entry.history)
             .and_then(|entry| entry.valid_until_unix_ms)
     }
 
