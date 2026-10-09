@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "stui says offline only when st also fails a fresh request; a lost live stream while st answers shows the reason and reconnects, and each lost stream is logged",
+  "summary": "stui says offline only when st also fails a fresh request; a lost live stream while a local st answers shows the reason and reconnects after the usual short wait, and each such lost stream is logged locally",
   "replay": {
     "status": "none",
     "detail": "No replay, backfill, stored data or transcript change."
@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "none",
-    "detail": "No recovery, durable payload or initialization changes. stui writes a bounded connection.log under its state directory."
+    "detail": "No recovery, durable payload or initialization changes. stui with a local daemon writes a bounded connection.log under its state directory; a paired device writes none."
   }
 }

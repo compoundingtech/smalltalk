@@ -110,8 +110,9 @@ pub enum Update {
     /// st cannot be reached; the feed keeps trying and every window keeps its last items.
     Offline(String),
     /// st answers a fresh request, but the live stream to it dropped or would not open, with this
-    /// reason. The feed opens another at once and every window keeps its last items: the link is
-    /// not offline, and the reason is shown rather than a red word that is not true.
+    /// reason. The feed opens another after its usual short wait and every window keeps its last
+    /// items: the link is not offline, and the reason is shown rather than a red word that is not
+    /// true. Only a daemon on this machine is probed.
     Degraded(String),
     /// The granted glasses shape, delivered before its window. The embedding UI chooses how
     /// to store glasses for this version; the feed owns no application state.
@@ -373,7 +374,10 @@ async fn link_lost(client: &Client, remote: bool, reason: &str) -> Update {
         && tokio::time::timeout(PROBE_WAIT, client.capabilities())
             .await
             .is_ok_and(|outcome| outcome.is_ok());
-    connection_log(reason, answered);
+    // A paired device keeps no daemon or replica state of its own, and writes none for this.
+    if !remote {
+        connection_log(reason, answered);
+    }
     if answered {
         Update::Degraded(reason.to_owned())
     } else {
@@ -381,8 +385,8 @@ async fn link_lost(client: &Client, remote: bool, reason: &str) -> Update {
     }
 }
 
-/// One line per lost stream in `$XDG_STATE_HOME/st3/stui/connection.log`, so a link that keeps
-/// dropping leaves its reasons behind. The file is cut to its last half when it grows past 256 KB.
+/// One line per lost stream of a local daemon in `$XDG_STATE_HOME/st3/stui/connection.log`, so a
+/// link that keeps dropping leaves its reasons behind. The file is cut to its last half when it grows past 256 KB.
 fn connection_log(reason: &str, answered: bool) {
     use std::io::Write as _;
     // Tests lose streams on purpose and must not write to the person's state.
