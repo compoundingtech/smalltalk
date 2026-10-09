@@ -36020,6 +36020,7 @@ mission "summary-child" state="ready" {
             .unwrap()
             .join("\n");
         assert!(plan.contains("mission_runs_root_page_index"), "{plan}");
+        assert!(!plan.contains("SCAN") && !plan.contains("TEMP B-TREE"), "{plan}");
 
         // Only a finished root accepts a user-set outcome. Exercise that separately
         // after checking active descendants and their expired leases above.
@@ -36044,6 +36045,74 @@ mission "summary-child" state="ready" {
             finished.outcome,
             store.mission_run(&root.id).unwrap().unwrap().outcome
         );
+    }
+
+    #[test]
+    fn mission_root_page_seeks_across_equal_time_ties_and_rejects_retired_cursor() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "page-root" state="ready" {
+  goal "Show one bounded page of a large root."
+  step "work" { agentless }
+}
+"#,
+            "page-root",
+        );
+        let root = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "page-root".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "page-root".into(),
+            })
+            .unwrap();
+        // Invented rows isolate equal-time cursor order from admission scheduling.
+        // They share a valid revision but have no steps, so hydration stays inexpensive.
+        let connection = store.connection.write();
+        for index in 0..51 {
+            connection
+                .execute(
+                    "INSERT INTO mission_runs
+                     SELECT ?1,mission_id,initial_revision,current_generation_id,root_revision,
+                            root_run_id,parent_step_run,workspace,requester,inputs,mode,status,
+                            phase,created_at_unix_ms,updated_at_unix_ms
+                     FROM mission_runs WHERE id=?2",
+                    params![format!("page-child-{index:03}"), root.id],
+                )
+                .unwrap();
+        }
+        drop(connection);
+        let expected = store.mission_runs_for_root(&root.subject).unwrap();
+        let (first, cursor) = store
+            .mission_runs_for_root_page(&root.subject, None, 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.len(), 50);
+        let cursor = cursor.expect("51st run requires continuation");
+        let (last, end) = store
+            .mission_runs_for_root_page(&root.subject, Some(&cursor), 50)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.len(), 2);
+        assert!(end.is_none());
+        assert_eq!(
+            first.into_iter().chain(last).map(|run| run.subject).collect::<Vec<_>>(),
+            expected.into_iter().map(|run| run.subject).collect::<Vec<_>>()
+        );
+        store
+            .connection
+            .write()
+            .execute("DELETE FROM mission_runs WHERE id=?1", [&cursor])
+            .unwrap();
+        assert!(store
+            .mission_runs_for_root_page(&root.subject, Some(&cursor), 50)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

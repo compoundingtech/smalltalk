@@ -1724,11 +1724,15 @@ mod tests {
             Some("step-run/demo-generation/release"),
             vec![step("step-run/child-generation/publish", "publish", "ready")],
         );
-        let rendered = render_mission_run_page(&root, &[child], OutputStyle::plain(), 3_000);
+        let rendered = render_mission_run_page(&root, &[child.clone()], OutputStyle::plain(), 3_000);
         assert!(rendered.contains("RUN       mission-run/demo/run"));
         assert!(rendered.contains("PARENT    step-run/demo-generation/release"));
         assert!(rendered.contains("RUN       mission-run/demo/child"));
         assert!(rendered.contains("publish — publish"));
+        let selected_child = render_mission_run_page(&child, &[root], OutputStyle::plain(), 3_000);
+        assert!(selected_child.contains("RUN       mission-run/demo/child"));
+        assert!(selected_child.contains("publish — publish"));
+        assert!(selected_child.contains("RUN       mission-run/demo/run"));
     }
 
     #[test]
