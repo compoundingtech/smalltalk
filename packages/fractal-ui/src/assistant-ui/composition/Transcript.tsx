@@ -99,6 +99,32 @@ function StrandedItem({ item }: { readonly item: ConversationItem }) {
   const text = strandedText(item)
   return <div data-testid="transcript-stranded" data-item-id={item.id} data-item-kind={item._tag} {...stylex.props(styles.semantic)}><span {...stylex.props(styles.semanticText)}>{text === undefined || text.trim() === '' ? 'Couldn\u2019t display this entry' : text}</span></div>
 }
+/** The content-bearing fields of an item; lifecycle and timing fields are left out. */
+const itemContent = (item: ConversationItem): string => {
+  switch (item._tag) {
+    case 'Text': return `${item.text}\u0000${item.attachments.map(attachment => attachment.id).join('\u0000')}`
+    case 'Reasoning': return item.text
+    case 'Message': return item.title ?? ''
+    case 'Notice': return `${item.text}\u0000${item.detail ?? ''}`
+    case 'Event': return `${item.title}\u0000${item.text}`
+    case 'Status': return item.detail ?? ''
+    case 'ToolCall': return `${JSON.stringify(item.input) ?? ''}\u0000${item.result === undefined ? '' : JSON.stringify(item.result.content) ?? ''}`
+    case 'UnknownEvent': return JSON.stringify(item.data) ?? ''
+    case 'Usage': return ''
+  }
+}
+const contentVersions = new WeakMap<ConversationItem, string>()
+/** A cheap content revision (FNV-1a over the content fields), computed once per item object. */
+const contentVersion = (item: ConversationItem): string => {
+  const cached = contentVersions.get(item)
+  if (cached !== undefined) return cached
+  const content = itemContent(item)
+  let hash = 0x811c9dc5
+  for (let index = 0; index < content.length; index++) hash = Math.imul(hash ^ content.charCodeAt(index), 0x01000193)
+  const version = `${item.id}:${content.length}:${(hash >>> 0).toString(36)}`
+  contentVersions.set(item, version)
+  return version
+}
 const PreparedTurn = React.memo(function PreparedTurn({ turn, stranded, onOpenTool, onRetryRun, landmarkContext }: { turn: TranscriptTurn; stranded?: ReadonlySet<string>; onOpenTool: TranscriptProps['onOpenTool']; onRetryRun?: () => void; landmarkContext?: string }) {
   const detail = React.useCallback((call: WorkLogCall) => <ToolDetailPreview call={call} onOpen={onOpenTool} />, [onOpenTool])
   const reasoning = turn.items.filter(item => item._tag === 'Reasoning')
@@ -158,8 +184,8 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     if (strandedIds !== '' && process.env.NODE_ENV !== 'production') console.warn(`Transcript: the runtime never adopted ${strandedIds}; showing a fallback row.`)
   }, [strandedIds])
   const imageOptions = React.useMemo(() => ({ resolveImage, onLoadImage }), [resolveImage, onLoadImage])
-  // New rows or grown text are news; send state, tool status and timing are metadata.
-  const rows = React.useMemo(() => committed.map(turn => ({ id: turn.id, version: (turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]).map(item => `${item.id}:${strandedText(item)?.length ?? 0}`).join(' ') })), [committed])
+  // New rows or changed content are news; send state, tool status and timing are metadata.
+  const rows = React.useMemo(() => committed.map(turn => ({ id: turn.id, version: (turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]).map(contentVersion).join(' ') })), [committed])
   const running = [...committed].reverse().find(turn => turn.work.running)
   const progress = sync._tag === 'Progress' && sync.stage === 'reading' && sync.done !== undefined && sync.total !== undefined ? sync : undefined
   const failure = syncLine({ status: sync, label: 'conversation', now, observedAt })
