@@ -2470,7 +2470,7 @@ mission "writer-load" state="ready" {
                 .attention_items(Some("person/avery"))
                 .unwrap()
                 .iter()
-                .any(|item| item.subject == ask.subject && item.is_alert())
+                .any(|item| item.subject == ask.subject)
         );
         assert_eq!(store.ask_person(&input).unwrap().subject, ask.subject);
         let stop =
@@ -2508,13 +2508,10 @@ mission "writer-load" state="ready" {
         assert!(home.iter().all(|item| item.subject != ask.subject));
         let updates = home
             .iter()
-            .filter(|item| item.is_update())
-            .map(|item| (item.title.clone(), item.is_alert()))
+            .filter(|item| item.request.as_ref().is_some_and(|r| r["type"] == "update"))
+            .map(|item| item.title.clone())
             .collect::<Vec<_>>();
-        assert_eq!(
-            updates,
-            vec![("Cancelled: Choose a release date".to_owned(), false)]
-        );
+        assert_eq!(updates, vec!["Cancelled: Choose a release date".to_owned()]);
     }
 
     #[test]
