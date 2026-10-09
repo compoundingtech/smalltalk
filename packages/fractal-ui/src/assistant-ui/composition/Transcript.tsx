@@ -1,5 +1,6 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
+import { flushSync } from 'react-dom'
 import { ActionBarPrimitive, MessagePrimitive, ThreadPrimitive, useAuiState } from '@assistant-ui/react'
 import { Button, ProgressBar } from 'react-aria-components'
 import type { ConversationItem, MessageItem, TextItem } from '../embrace-data/model'
@@ -135,14 +136,14 @@ const scrollerOf = (timeline: Element | null) => timeline?.parentElement?.parent
 const TurnProximityRef = React.createContext<TurnProximity['observe'] | undefined>(undefined)
 const turnGroupSize = 16
 /**
- * Turns in fixed groups of 16 by position in the transcript, so group keys stay put as turns are added. A distant
- * full group skips as one box: revealing a pane styles the groups, not every turn. A partial group (the newest one
- * while turns arrive) is not observed, so it never skips as a whole; once full it renders a frame at its full height
- * before its first report can mark it distant.
+ * Turns from `start` in fixed groups of 16 by position in the transcript, so group keys stay put as turns are added.
+ * A distant full group skips as one box: revealing a pane styles the groups, not every turn. A partial group (the
+ * oldest one while older turns backfill, the newest one while turns arrive) is not observed, so it never skips as a
+ * whole; once full it renders a frame at its full height before its first report can mark it distant.
  */
-const turnGroups = (turns: readonly TranscriptTurn[]) => {
+const turnGroups = (turns: readonly TranscriptTurn[], start: number) => {
   const groups: { readonly key: number; readonly turns: readonly TranscriptTurn[] }[] = []
-  for (let first = 0; first < turns.length; first += turnGroupSize) groups.push({ key: first / turnGroupSize, turns: turns.slice(first, first + turnGroupSize) })
+  for (let first = start - start % turnGroupSize; first < turns.length; first += turnGroupSize) groups.push({ key: first / turnGroupSize, turns: turns.slice(Math.max(first, start), first + turnGroupSize) })
   return groups
 }
 function TurnGroup({ full, children }: { readonly full: boolean; readonly children: React.ReactNode }) {
@@ -179,6 +180,21 @@ const contentVersion = (item: ConversationItem): string => {
   const version = `${item.id}:${content.length}:${(hash >>> 0).toString(36)}`
   contentVersions.set(item, version)
   return version
+}
+/** Which committed turns are mounted: the newest page first, then older turns from a kept turn id, then all. */
+type MountedTurns = { readonly _tag: 'NewestPage' } | { readonly _tag: 'From'; readonly id: string } | { readonly _tag: 'All' }
+const newestPageTurns = 6
+const backfillChunkTurns = 4
+/** Index of the oldest mounted turn. A kept id that left the transcript mounts everything. */
+const mountedStart = (mounted: MountedTurns, turns: readonly TranscriptTurn[]) =>
+  mounted._tag === 'All' ? 0 : mounted._tag === 'NewestPage' ? Math.max(0, turns.length - newestPageTurns) : Math.max(0, turns.findIndex(turn => turn.id === mounted.id))
+const whenIdle = (task: () => void): (() => void) => {
+  if (typeof requestIdleCallback === 'function') {
+    const handle = requestIdleCallback(task, { timeout: 250 })
+    return () => cancelIdleCallback(handle)
+  }
+  const handle = setTimeout(task, 16)
+  return () => clearTimeout(handle)
 }
 const PreparedTurn = React.memo(function PreparedTurn({ turn, stranded, onOpenTool, onRetryRun, landmarkContext }: { turn: TranscriptTurn; stranded?: ReadonlySet<string>; onOpenTool: TranscriptProps['onOpenTool']; onRetryRun?: () => void; landmarkContext?: string }) {
   const detail = React.useCallback((call: WorkLogCall) => <ToolDetailPreview call={call} onOpen={onOpenTool} />, [onOpenTool])
@@ -242,6 +258,55 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
   const timeline = React.useRef<HTMLDivElement>(null)
   const [proximity] = React.useState(() => new TurnProximity())
   React.useLayoutEffect(() => proximity.attach(scrollerOf(timeline.current)), [proximity, committed.length === 0])
+  // First open commits only the newest page. Older turns backfill in capped chunks while the main thread is idle,
+  // and all at once when the reader nears the top or searches the page (Mod+F), so find and the accessibility
+  // tree see every turn.
+  const [mounted, setMounted] = React.useState<MountedTurns>({ _tag: 'NewestPage' })
+  const start = mountedStart(mounted, committed)
+  const latest = React.useRef({ committed, start })
+  React.useLayoutEffect(() => { latest.current = { committed, start } })
+  const mountOlder = React.useCallback((all: boolean) => {
+    const { committed, start } = latest.current
+    if (start === 0) return
+    const first = timeline.current?.querySelector('[data-testid="transcript-turn"]')
+    const scroller = scrollerOf(timeline.current)
+    const before = first?.getBoundingClientRect().top
+    // A reader already near the top gets every turn, before compensation moves them away from it.
+    const everything = all || scroller != null && scroller.scrollTop < scroller.clientHeight
+    flushSync(() => setMounted(everything ? { _tag: 'All' } : { _tag: 'From', id: committed[Math.max(0, start - backfillChunkTurns)]!.id }))
+    // Turns land above the reader: the previously oldest turn stays where it was on screen.
+    if (first?.isConnected && scroller != null && before !== undefined) scroller.scrollTop += first.getBoundingClientRect().top - before
+  }, [])
+  const backfilling = start > 0
+  React.useEffect(() => {
+    if (start === 0) return
+    // Each chunk waits for a painted frame, then for idle time. A retained pane under `content-visibility: hidden`
+    // has no geometry to keep; it backfills once shown.
+    let cancel = () => {}
+    const frame = requestAnimationFrame(() => {
+      cancel = whenIdle(function step() {
+        if (timeline.current?.checkVisibility() === false) cancel = whenIdle(step)
+        else mountOlder(false)
+      })
+    })
+    return () => {
+      cancelAnimationFrame(frame)
+      cancel()
+    }
+  }, [start, mountOlder])
+  React.useEffect(() => {
+    const scroller = scrollerOf(timeline.current)
+    if (!backfilling || scroller == null) return
+    const nearTop = () => { if (scroller.scrollTop < scroller.clientHeight) mountOlder(true) }
+    const find = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 'f') mountOlder(true) }
+    const view = scroller.ownerDocument.defaultView
+    scroller.addEventListener('scroll', nearTop, { passive: true })
+    view?.addEventListener('keydown', find, { capture: true })
+    return () => {
+      scroller.removeEventListener('scroll', nearTop)
+      view?.removeEventListener('keydown', find, { capture: true })
+    }
+  }, [backfilling, mountOlder])
   const imageOptions = React.useMemo(() => ({ resolveImage, onLoadImage }), [resolveImage, onLoadImage])
   // Stable row versions describe rendered content; ResizeObserver also catches image and disclosure growth.
   const rows = React.useMemo(() => committed.map(turn => ({ id: turn.id, version: (turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]).map(contentVersion).join(' ') })), [committed])
@@ -261,7 +326,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     </header>
     <ErrorOverlayHost lane><EmbraceScrollViewport items={rows} stateKey={viewportKey} scrollToBottomKey={scrollToBottomKey} isRunning={running !== undefined} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={-1} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
       {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
-      {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(committed).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
+      {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(committed, start).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
     </EmbraceScrollViewport>{failure?.tone === 'error' && <ErrorOverlay id={`sync-${failure.text}`} title={failure.text} detail="History stays on screen." onRetry={onRetrySync} />}</ErrorOverlayHost>
   </ThreadPrimitive.Root></RetrySend.Provider></MarkdownImagePolicy.Provider>
 }

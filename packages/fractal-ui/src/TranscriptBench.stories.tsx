@@ -2,6 +2,7 @@ import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { flushSync } from 'react-dom'
 import type { Meta, StoryObj } from '@storybook/react-vite'
+import { expect, fn, userEvent, waitFor, within } from 'storybook/test'
 import { Transcript, type TranscriptHistory, type TranscriptTurn } from './assistant-ui/composition/Transcript'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
 import type { ConversationItem, TextItem } from './assistant-ui/embrace-data/model'
@@ -141,6 +142,90 @@ export const Turns50: Story = { args: { turns: 50 } }
 export const Turns100: Story = { args: { turns: 100 } }
 export const Turns200: Story = {}
 export const Turns200Light: Story = { args: { scheme: 'light' } }
+
+/** Opens the pane again in one synchronous commit and returns the turn count that commit mounted. */
+async function reopen(root: ParentNode): Promise<number> {
+  await settled(root, 200)
+  window.__transcriptBench!.unmount()
+  window.__transcriptBench!.mount()
+  return turnCount(root)
+}
+const scroller = (root: ParentNode) => root.querySelector<HTMLElement>('[data-testid="transcript-scroll"]')!
+const followGap = (scroll: HTMLElement) => scroll.scrollHeight - scroll.clientHeight - scroll.scrollTop
+/** The turn under the viewport's vertical center and its offset from the viewport top. */
+function centerTurn(scroll: HTMLElement): { readonly element: Element; readonly offset: number } {
+  const bounds = scroll.getBoundingClientRect()
+  const center = bounds.top + bounds.height / 2
+  const element = [...scroll.querySelectorAll('[data-testid="transcript-turn"]')].find(turn => turn.getBoundingClientRect().bottom > center)!
+  return { element, offset: element.getBoundingClientRect().top - bounds.top }
+}
+/** Samples every frame until all turns are mounted and returns the largest drift of the anchor turn. */
+async function anchorDrift(root: ParentNode, scroll: HTMLElement, total: number): Promise<number> {
+  const anchor = centerTurn(scroll)
+  let drift = 0
+  while (turnCount(root) < total) {
+    await frame()
+    drift = Math.max(drift, Math.abs(anchor.element.getBoundingClientRect().top - scroll.getBoundingClientRect().top - anchor.offset))
+  }
+  return drift
+}
+
+/** First open commits only the newest page, follows the bottom, and backfills every turn without moving it. */
+export const NewestPageFirst: Story = { play: async ({ canvasElement }) => {
+  const first = await reopen(canvasElement)
+  await expect(first).toBeGreaterThan(0)
+  await expect(first).toBeLessThan(200)
+  const scroll = scroller(canvasElement)
+  await frame()
+  await expect(followGap(scroll)).toBeLessThanOrEqual(1)
+  await expect(turnCount(canvasElement)).toBeLessThan(200)
+  await expect(await anchorDrift(canvasElement, scroll, 200)).toBeLessThanOrEqual(1)
+  await frame()
+  await expect(followGap(scroll)).toBeLessThanOrEqual(1)
+  await expect(within(canvasElement).getAllByRole('region', { name: /^Work log bench\// })).toHaveLength(200)
+} }
+/** A reader who scrolled up keeps their turn in place while older turns land above it. */
+export const BackfillKeepsReaderAnchor: Story = { play: async ({ canvasElement }) => {
+  await expect(await reopen(canvasElement)).toBeLessThan(200)
+  const scroll = scroller(canvasElement)
+  await frame()
+  scroll.dispatchEvent(new WheelEvent('wheel', { deltaY: -scroll.clientHeight / 2 }))
+  scroll.scrollTop -= scroll.clientHeight / 2
+  await frame()
+  await expect(turnCount(canvasElement)).toBeLessThan(200)
+  await expect(scroll.scrollTop).toBeGreaterThanOrEqual(scroll.clientHeight)
+  await expect(await anchorDrift(canvasElement, scroll, 200)).toBeLessThanOrEqual(1)
+  await expect(followGap(scroll)).toBeGreaterThan(scroll.clientHeight / 4)
+} }
+/** Find in page needs every turn: Mod+F mounts the rest synchronously. */
+export const FindMountsAllTurns: Story = { play: async ({ canvasElement }) => {
+  await expect(await reopen(canvasElement)).toBeLessThan(200)
+  const scroll = scroller(canvasElement)
+  await frame()
+  const anchor = centerTurn(scroll)
+  window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true }))
+  await expect(turnCount(canvasElement)).toBe(200)
+  await expect(Math.abs(anchor.element.getBoundingClientRect().top - scroll.getBoundingClientRect().top - anchor.offset)).toBeLessThanOrEqual(1)
+} }
+const loadEarlier = fn()
+/** Reaching the top mounts the older turns at once; the history boundary above them still loads earlier history. */
+export const TopMountsOlderTurns: Story = { args: { history: { _tag: 'HasOlder', onLoadEarlier: loadEarlier } }, play: async ({ canvasElement }) => {
+  loadEarlier.mockClear()
+  await expect(await reopen(canvasElement)).toBeLessThan(200)
+  const scroll = scroller(canvasElement)
+  await frame()
+  scroll.dispatchEvent(new WheelEvent('wheel', { deltaY: -scroll.scrollHeight }))
+  scroll.scrollTop = 0
+  await frame()
+  await frame()
+  await expect(turnCount(canvasElement)).toBe(200)
+  scroll.scrollTop = 0
+  const boundary = await within(canvasElement).findByTestId('history-boundary')
+  await expect(boundary.compareDocumentPosition(canvasElement.querySelector('[data-testid="transcript-turn"]')!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
+  await expect(canvasElement.querySelector('[data-testid="transcript-turn"]')).toHaveAttribute('data-item-id', 'bench/0')
+  await userEvent.click(within(boundary).getByRole('button', { name: 'Load earlier messages' }))
+  await expect(loadEarlier).toHaveBeenCalledTimes(1)
+} }
 
 const styles = stylex.create({
   root: { height: '100vh', width: '100%', minWidth: 0, boxSizing: 'border-box', display: 'flex', flexDirection: 'column', overflow: 'hidden', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
