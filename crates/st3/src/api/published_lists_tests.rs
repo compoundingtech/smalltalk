@@ -488,24 +488,33 @@ fn published_lists_follow_many_changes_and_a_revision_proposal() {
     assert_eq!(store.published_missions_list().rebuilds()["chunked: missions changed"], 1);
     assert_eq!(store.published_work_list().rebuilds()["chunked: work changed"], 1);
 
-    // A revision proposal drains the run, then applies, with no claim on the run itself.
-    let source = r#"version 2
-mission "garden/alpha" state="ready" {
-  goal "Grow the garden in rows."
-  concurrent-runs max=4
-  step "plant" { assigned-to "agent/garden/ash" }
-  step "water" { assigned-to "agent/garden/birch" }
-}"#;
-    let intent = crate::graph::parse_intent(source, store.origin()).unwrap();
-    let preview = store
-        .mission(&intent, crate::model::IntentInput { kdl: source.into(), source_name: None })
-        .unwrap();
-    store.apply_as(&intent, &preview.subject_tokens, "publish-alpha-rows", Some("person/operator")).unwrap();
+    // A revision proposal waits for its reviewer and then applies, changing the run with no
+    // claim on the run itself.
+    let proposed = |goal: &str, key: &str| {
+        let source = format!(
+            r#"version 2
+mission "garden/proposed" state="ready" revisions="human-only" revision-reviewer="person/reviewer" {{
+  goal "Grow by proposal."
+  step "plant" {{ assigned-to "agent/garden/ash"; goal {goal:?} }}
+}}"#
+        );
+        let intent = crate::graph::parse_intent(&source, store.origin()).unwrap();
+        let preview = store
+            .mission(&intent, crate::model::IntentInput { kdl: source.clone(), source_name: None })
+            .unwrap();
+        store.apply_as(&intent, &preview.subject_tokens, key, Some("person/operator")).unwrap();
+        intent.missions["garden/proposed"].clone()
+    };
+    proposed("Plant in beds.", "publish-proposed-beds");
+    let run = start(&store, "garden/proposed", "proposed-1");
+    fold(&store);
+    fold_work_checked(&store);
+    let rows = proposed("Plant in rows.", "publish-proposed-rows");
     let proposal = store
         .create_revision_proposal(
-            &alpha.id,
-            &intent.missions["garden/alpha"],
-            &format!("agent/{}/owner", alpha.id),
+            &run.id,
+            &rows,
+            &format!("agent/{}/owner", run.id),
             "grow in rows",
             "proposal-create",
         )
