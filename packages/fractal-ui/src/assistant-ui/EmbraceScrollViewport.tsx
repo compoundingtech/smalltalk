@@ -267,25 +267,33 @@ export interface EmbraceScrollViewportProps extends React.HTMLAttributes<HTMLDiv
   readonly contentProps?: React.HTMLAttributes<HTMLDivElement>
   /** Each key keeps its own scroll state across viewport mounts. */
   readonly stateKey?: string
+  /** Host command: a changed, defined key resumes following and clears unread; an unchanged key never scrolls. */
+  readonly scrollToBottomKey?: string
 }
 
-export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({ items, children, contentProps, stateKey, ...props }: EmbraceScrollViewportProps) {
+export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({ items, children, contentProps, stateKey, scrollToBottomKey, ...props }: EmbraceScrollViewportProps) {
   const store = React.useContext(ViewportStoreContext)
   const [controller] = React.useState(() => new ViewportController(stateKey === undefined ? undefined : store?.get(stateKey)))
   const previousItems = React.useRef(items)
   const previousKey = React.useRef(stateKey)
+  const previousCommand = React.useRef(scrollToBottomKey)
   React.useLayoutEffect(() => {
     if (stateKey !== previousKey.current) {
       if (previousKey.current !== undefined) store?.save(previousKey.current, controller.released())
       previousKey.current = stateKey
       controller.resume(stateKey === undefined ? undefined : store?.get(stateKey))
+    } else if (scrollToBottomKey !== undefined && scrollToBottomKey !== previousCommand.current) {
+      // Following persists, so rows that commit after the command (the pending send) stay in view.
+      controller.jump()
     } else if (previousItems.current !== items) {
       // Metadata-only snapshots still reach geometry; only new or changed rows count as unread.
       if (sameRows(previousItems.current, items)) controller.schedule()
       else controller.changed()
     }
+    // The first render is not a command, and a conversation switch adopts its key without scrolling.
+    previousCommand.current = scrollToBottomKey
     previousItems.current = items
-  }, [controller, items, store, stateKey])
+  }, [controller, items, store, stateKey, scrollToBottomKey])
   // Mutation-phase saves precede the owning surface's layout effect that removes closed keys.
   React.useLayoutEffect(() => () => {
     if (previousKey.current !== undefined) store?.save(previousKey.current, controller.released())
