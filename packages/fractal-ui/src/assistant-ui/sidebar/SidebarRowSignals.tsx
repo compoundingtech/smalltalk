@@ -2,138 +2,198 @@ import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { spaceVars as s, textVars as ink, typeVars as t } from '../composition-tokens.stylex'
 
-/** Line 1 keeps a truncated title at least sixty percent of the row. Metric and trailing-signal tracks share their widest intrinsic content width per cohort, without measuring the already allocated grid track. Drop token and subagent counts before scope text; preserve the chevron and the distinct unread and needs marks with at least six pixels after the time. */
-export function attachSidebarLine1Fit(row: HTMLElement | null) {
-  if (row === null) return
-  let frame: number | undefined
-  const applyTrack = () => {
-    const scope = row.closest<HTMLElement>('[data-testid="agent-sidebar"]') ?? row.closest<HTMLElement>('[data-frame-rows]') ?? row.closest<HTMLElement>('[data-explore-variant]') ?? row.parentElement!
-    let widest = 0
-    let widestSignals = 0
-    for (const peer of scope.querySelectorAll<HTMLElement>('[data-testid="taste-agent-row"]')) {
-      const natural = Number.parseFloat(peer.dataset.rowTimeNatural ?? '')
-      if (Number.isFinite(natural)) widest = Math.max(widest, natural)
-      const trailing = peer.querySelector<HTMLElement>('[data-row-trailing-signals]')
-      if (trailing !== null) {
-        const gap = Number.parseFloat(getComputedStyle(trailing).columnGap) || 0
+type Line1Row = {
+  row: HTMLElement
+  title: HTMLElement
+  time: HTMLElement
+  content: HTMLElement | null
+  drops: HTMLElement[]
+  count: HTMLElement | null
+  trailing: HTMLElement | null
+  floor: number
+  gap: number
+  nextDrop: number
+  naturalTime: number
+}
+type Line1Cohort = { scope: HTMLElement; rows: Line1Row[]; widest: number; widestSignals: number }
+const pendingLine1Rows = new Set<HTMLElement>()
+const pendingSignalRows = new Set<HTMLElement>()
+const line1Changes = new Map<HTMLElement, MutationObserver>()
+let fitFrame: number | undefined
+
+const writeStyle = (element: HTMLElement, property: string, value: string) => {
+  if (element.style.getPropertyValue(property) !== value) {
+    if (value === '') element.style.removeProperty(property)
+    else element.style.setProperty(property, value)
+  }
+}
+function flushFits() {
+  fitFrame = undefined
+  const scopes = new Set<HTMLElement>()
+  for (const row of pendingLine1Rows) if (row.isConnected) scopes.add(row.closest<HTMLElement>('[data-testid="agent-sidebar"]') ?? row.closest<HTMLElement>('[data-frame-rows]') ?? row.closest<HTMLElement>('[data-explore-variant]') ?? row.parentElement!)
+  pendingLine1Rows.clear()
+  fitLine1(scopes)
+  for (const scope of scopes) for (const signals of scope.querySelectorAll<HTMLElement>('[data-row-signals="measured"]')) pendingSignalRows.add(signals)
+  const signals = [...pendingSignalRows].filter(element => element.isConnected)
+  pendingSignalRows.clear()
+  fitSignals(signals)
+  // Our style writes must not enqueue a redundant line-1 pass through each row's observer.
+  for (const changes of line1Changes.values()) changes.takeRecords()
+}
+function cancelEmptyFrame() {
+  if (pendingLine1Rows.size === 0 && pendingSignalRows.size === 0 && fitFrame !== undefined) {
+    cancelAnimationFrame(fitFrame)
+    fitFrame = undefined
+  }
+}
+
+/** Line 1 keeps a truncated title at least sixty percent of the row. Metric and trailing-signal tracks share their widest intrinsic content width per cohort, without measuring the already allocated grid track. Drop token and subagent counts before scope text; preserve the chevron and the distinct unread and needs marks with at least six pixels after the time. Restore, read every cohort, then write every cohort; each drop step has the same read/write partition. */
+function fitLine1(scopes: Set<HTMLElement>) {
+  const cohorts: Line1Cohort[] = []
+  for (const scope of scopes) {
+    const rows: Line1Row[] = []
+    for (const row of scope.querySelectorAll<HTMLElement>('[data-testid="taste-agent-row"]')) {
+      const title = row.querySelector<HTMLElement>('[data-row-column="title-text"]')
+      const time = row.querySelector<HTMLElement>('[data-row-column="time"]')
+      if (title === null || time === null) continue
+      const drops = ['[data-row-column="time"] [data-line1-drop="tokens"]', '[data-row-column="children"] [data-line1-drop="subs"]', '[data-row-column="time"] [data-line1-drop="scope"]']
+        .map(selector => row.querySelector<HTMLElement>(selector)).filter((drop): drop is HTMLElement => drop !== null)
+      rows.push({ row, title, time, content: time.firstElementChild as HTMLElement | null, drops, count: row.querySelector<HTMLElement>('[data-row-column="children"] [data-line1-drop="subs"]'), trailing: row.querySelector<HTMLElement>('[data-row-trailing-signals]'), floor: 0, gap: 0, nextDrop: 0, naturalTime: 0 })
+    }
+    cohorts.push({ scope, rows, widest: 0, widestSignals: 0 })
+  }
+  for (const cohort of cohorts) for (const row of cohort.rows) for (const drop of row.drops) writeStyle(drop, 'display', '')
+  // Row geometry is read after the restore writes, inside the first shared read phase.
+  for (const cohort of cohorts) for (const row of cohort.rows) {
+    row.floor = row.row.clientWidth * 0.6
+    row.gap = Number.parseFloat(getComputedStyle(row.row).columnGap) || 0
+  }
+  measureAndApplyTracks(cohorts)
+  // At most the existing token/subagent/scope fields can drop. Decisions are made before any row writes.
+  for (let step = 0; step < 3; step++) {
+    const drops: HTMLElement[] = []
+    for (const cohort of cohorts) for (const row of cohort.rows) {
+      if (row.nextDrop === row.drops.length) continue
+      const bounds = row.content?.getBoundingClientRect()
+      const count = row.count?.getBoundingClientRect()
+      const overflow = bounds !== undefined && (bounds.width > row.time.clientWidth + 0.5 || (count !== undefined && count.width > 0 && count.right + row.gap > bounds.left + 0.5))
+      if (row.title.clientWidth < row.floor || overflow) drops.push(row.drops[row.nextDrop++]!)
+    }
+    if (drops.length === 0) break
+    for (const drop of drops) writeStyle(drop, 'display', 'none')
+    measureAndApplyTracks(cohorts)
+  }
+}
+function measureAndApplyTracks(cohorts: Line1Cohort[]) {
+  for (const cohort of cohorts) {
+    cohort.widest = 0
+    cohort.widestSignals = 0
+    for (const row of cohort.rows) {
+      row.naturalTime = row.content === null ? 0 : Math.max(row.content.scrollWidth, row.content.getBoundingClientRect().width)
+      cohort.widest = Math.max(cohort.widest, row.naturalTime)
+      if (row.trailing !== null) {
+        const gap = Number.parseFloat(getComputedStyle(row.trailing).columnGap) || 0
         let width = 0, count = 0
-        for (const signal of trailing.children) {
+        for (const signal of row.trailing.children) {
           const naturalWidth = signal.getBoundingClientRect().width
           if (naturalWidth > 0) { width += naturalWidth + (count > 0 ? gap : 0); count++ }
         }
-        widestSignals = Math.max(widestSignals, width)
+        cohort.widestSignals = Math.max(cohort.widestSignals, width)
       }
     }
-    if (widest > 0) scope.style.setProperty('--sidebar-metric-track', `${Math.ceil(widest)}px`)
-    if (widestSignals > 0) scope.style.setProperty('--sidebar-signal-track', `${Math.ceil(widestSignals)}px`)
-    else scope.style.removeProperty('--sidebar-signal-track')
   }
-  const fit = () => {
-    frame = undefined
-    const title = row.querySelector<HTMLElement>('[data-row-column="title-text"]')
-    const time = row.querySelector<HTMLElement>('[data-row-column="time"]')
-    if (title === null || time === null) return
-    const measureTime = () => {
-      const content = time.firstElementChild as HTMLElement | null
-      row.dataset.rowTimeNatural = String(content === null ? 0 : Math.max(content.scrollWidth, content.getBoundingClientRect().width))
+  for (const cohort of cohorts) {
+    for (const row of cohort.rows) {
+      const value = String(row.naturalTime)
+      if (row.row.dataset.rowTimeNatural !== value) row.row.dataset.rowTimeNatural = value
     }
-    const drops = ['[data-row-column="time"] [data-line1-drop="tokens"]', '[data-row-column="children"] [data-line1-drop="subs"]', '[data-row-column="time"] [data-line1-drop="scope"]']
-      .map(selector => row.querySelector<HTMLElement>(selector)).filter((drop): drop is HTMLElement => drop !== null)
-    for (const drop of drops) drop.style.display = ''
-    measureTime()
-    applyTrack()
-    const floor = row.clientWidth * 0.6
-    const overflow = () => {
-      const content = time.firstElementChild
-      if (content === null) return false
-      const bounds = content.getBoundingClientRect()
-      if (bounds.width > time.clientWidth + 0.5) return true
-      const count = row.querySelector<HTMLElement>('[data-row-column="children"] [data-line1-drop="subs"]')
-      if (count === null || count.getBoundingClientRect().width === 0) return false
-      const gap = Number.parseFloat(getComputedStyle(row).columnGap) || 0
-      return count.getBoundingClientRect().right + gap > bounds.left + 0.5
-    }
-    for (const drop of drops) {
-      if (title.clientWidth >= floor && !overflow()) break
-      drop.style.display = 'none'
-      measureTime()
-      applyTrack()
-    }
-    // Restoring and dropping our own fields must not schedule another fit.
-    changes.takeRecords()
+    if (cohort.widest > 0) writeStyle(cohort.scope, '--sidebar-metric-track', `${Math.ceil(cohort.widest)}px`)
+    writeStyle(cohort.scope, '--sidebar-signal-track', cohort.widestSignals > 0 ? `${Math.ceil(cohort.widestSignals)}px` : '')
   }
-  const schedule = () => { if (frame === undefined) frame = requestAnimationFrame(fit) }
+}
+
+function fitSignals(elements: HTMLElement[]) {
+  const rows = elements.map(element => ({ element, gap: 0, available: 0, fields: [...element.children].map((child, index) => {
+    const field = child as HTMLElement
+    const value = field.firstElementChild?.getAttribute('data-row-retention')
+    const rank = value === null || value === '' ? Number.NaN : Number(value)
+    return { field, index, rank: Number.isFinite(rank) ? rank : 0, currentWork: field.querySelector('[data-row-field="current-work"]') !== null, width: 0, minimum: 0 }
+  }) }))
+  // One preparation write phase for all rows; no geometry read is interleaved with a field write.
+  for (const row of rows) for (const { field } of row.fields) {
+    writeStyle(field, 'position', 'absolute')
+    writeStyle(field, 'visibility', 'hidden')
+    writeStyle(field, 'max-width', 'none')
+    writeStyle(field, 'width', 'max-content')
+    writeStyle(field, 'flex-shrink', '0')
+  }
+  for (const row of rows) {
+    row.gap = Number.parseFloat(getComputedStyle(row.element).columnGap) || 0
+    row.available = row.element.clientWidth
+    for (const measurement of row.fields) {
+      const { field } = measurement
+      measurement.width = field.getBoundingClientRect().width
+      // Only free-text current work may shorten, with twelve measured characters retained.
+      const walker = document.createTreeWalker(field, NodeFilter.SHOW_TEXT)
+      const range = document.createRange()
+      let remaining = 12, width = 0
+      for (let node = walker.nextNode(); node && remaining > 0; node = walker.nextNode()) {
+        const count = Math.min(remaining, node.textContent?.length ?? 0)
+        if (!count) continue
+        range.setStart(node, 0); range.setEnd(node, count)
+        width += range.getBoundingClientRect().width
+        remaining -= count
+      }
+      measurement.minimum = width + (field.textContent && field.textContent.length > 12 ? Number.parseFloat(getComputedStyle(field).fontSize) : 0)
+    }
+  }
+  for (const row of rows) {
+    const order = row.fields.sort((a, b) => b.rank - a.rank || b.index - a.index)
+    let available = row.available, kept = 0, shortened = false
+    for (const { field, width, minimum, currentWork } of order) {
+      const space = available - (kept ? row.gap : 0)
+      const complete = width <= space + 0.5
+      const keep = !shortened && (complete || (currentWork && minimum <= space))
+      field.dataset.rowDropped = String(!keep)
+      field.dataset.rowShortened = String(keep && !complete)
+      field.setAttribute('aria-hidden', String(!keep))
+      if (!keep) continue
+      writeStyle(field, 'position', 'static')
+      writeStyle(field, 'visibility', 'visible')
+      writeStyle(field, 'max-width', `${Math.max(0, space)}px`)
+      available = space - width
+      kept++
+      if (!complete) shortened = true
+    }
+  }
+}
+
+/** One frame batches every mounted row rather than forcing layout from each ref callback. Returns the ref cleanup. */
+export function attachSidebarLine1Fit(row: HTMLElement | null) {
+  if (row === null) return
+  let active = true
+  const schedule = () => { if (active) { pendingLine1Rows.add(row); fitFrame ??= requestAnimationFrame(flushFits) } }
   const resize = new ResizeObserver(schedule)
   const changes = new MutationObserver(schedule)
+  line1Changes.set(row, changes)
   resize.observe(row)
   for (const element of row.querySelectorAll('[data-row-column="title-text"], [data-row-column="time"]')) resize.observe(element)
   changes.observe(row, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ['style'] })
-  fit()
+  schedule()
   document.fonts?.ready.then(schedule)
-  requestAnimationFrame(() => requestAnimationFrame(schedule))
-  return () => { resize.disconnect(); changes.disconnect(); if (frame !== undefined) cancelAnimationFrame(frame) }
+  return () => { active = false; resize.disconnect(); changes.disconnect(); line1Changes.delete(row); pendingLine1Rows.delete(row); cancelEmptyFrame() }
 }
 
- export function SidebarRowSignals({ children }: { readonly children: React.ReactNode }) {
+export function SidebarRowSignals({ children }: { readonly children: React.ReactNode }) {
   const attach = React.useCallback((element: HTMLSpanElement | null) => {
     if (!element) return
-    let frame: number | undefined
-    const fit = () => {
-      frame = undefined
-      const fields = [...element.children] as HTMLElement[]
-      const gap = Number.parseFloat(getComputedStyle(element).columnGap) || 0
-      const widths = new Map<HTMLElement, number>()
-      const minimum = new Map<HTMLElement, number>()
-      for (const field of fields) {
-        field.style.position = 'absolute'
-        field.style.visibility = 'hidden'
-        field.style.maxWidth = 'none'
-        field.style.width = 'max-content'
-        field.style.flexShrink = '0'
-        widths.set(field, field.getBoundingClientRect().width)
-        // Only free-text current work may shorten, with twelve measured characters retained.
-        const walker = document.createTreeWalker(field, NodeFilter.SHOW_TEXT)
-        const range = document.createRange()
-        let remaining = 12, width = 0
-        for (let node = walker.nextNode(); node && remaining > 0; node = walker.nextNode()) {
-          const count = Math.min(remaining, node.textContent?.length ?? 0)
-          if (!count) continue
-          range.setStart(node, 0); range.setEnd(node, count)
-          width += range.getBoundingClientRect().width
-          remaining -= count
-        }
-        minimum.set(field, width + (field.textContent && field.textContent.length > 12 ? Number.parseFloat(getComputedStyle(field).fontSize) : 0))
-      }
-      const retention = (field: HTMLElement) => {
-        const value = field.firstElementChild?.getAttribute('data-row-retention')
-        const rank = value === null || value === '' ? Number.NaN : Number(value)
-        return Number.isFinite(rank) ? rank : 0
-      }
-      const order = fields.map((field, index) => ({ field, index })).sort((a, b) => retention(b.field) - retention(a.field) || b.index - a.index)
-      let available = element.clientWidth, kept = 0, shortened = false
-      for (const { field } of order) {
-        const space = available - (kept ? gap : 0)
-        const complete = widths.get(field)! <= space + 0.5
-        const keep = !shortened && (complete || (field.querySelector('[data-row-field="current-work"]') !== null && minimum.get(field)! <= space))
-        field.dataset.rowDropped = String(!keep)
-        field.dataset.rowShortened = String(keep && !complete)
-        field.setAttribute('aria-hidden', String(!keep))
-        if (!keep) continue
-        field.style.position = 'static'
-        field.style.visibility = 'visible'
-        field.style.maxWidth = `${Math.max(0, space)}px`
-        available = space - widths.get(field)!
-        kept++
-        if (!complete) shortened = true
-      }
-    }
-    const schedule = () => { if (frame === undefined) frame = requestAnimationFrame(fit) }
+    const schedule = () => { pendingSignalRows.add(element); fitFrame ??= requestAnimationFrame(flushFits) }
     const resize = new ResizeObserver(schedule)
     const changes = new MutationObserver(schedule)
     resize.observe(element)
     changes.observe(element, { childList: true, characterData: true, subtree: true })
-    fit()
-    return () => { resize.disconnect(); changes.disconnect(); if (frame !== undefined) cancelAnimationFrame(frame) }
+    schedule()
+    return () => { resize.disconnect(); changes.disconnect(); pendingSignalRows.delete(element); cancelEmptyFrame() }
   }, [])
   return <span ref={attach} data-row-column="subtitle" data-row-signals="measured" {...stylex.props(styles.signals)}>{React.Children.toArray(children).map((child, index) => <span key={index} data-row-priority={index} {...stylex.props(styles.field)}>{child}</span>)}</span>
 }

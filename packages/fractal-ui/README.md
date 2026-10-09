@@ -31,6 +31,7 @@ Stories:
 - **Fractal UI / Sync Line**: every observation across both schemes; `TransitionSequence` asserts fixed-height slots and CLS 0 across all transitions.
 - **Fractal UI / Transcript**: the locked U2·F3·Y3 transcript in dark and light: settled/expanded work, streamed answers, failed/interrupted/unknown work, loading, retained-history synchronization, answer metadata, unavailable conversations, the older-history boundary with and without a load action, pending and failed sends (including Pending→Sent identity) and the read-only empty state.
 - **Fractal UI / Sidebar/Agent Row**: compact hover-card facts, omitted unreported fields, the known-vs-none time cohort and the quick Open hover action.
+- **Fractal UI / Sidebar/Roster**: a deterministic 100-row roster rendered on demand, for fitting cost.
 
 ## Families
 
@@ -109,6 +110,8 @@ Hosts must not invent `Progress` or `Quiet` observations to fill gaps in the wir
 ### Sidebar agent row
 
 Rows render reported facts only; unreported fields are omitted — never shown as placeholders — and remain in the accessible details. Line-one metric and trailing-signal tracks share the widest intrinsic content width in their row cohort, so rows without a reported since-time keep the same title start as their cohort; tree nesting supplies hierarchy without a second indentation. Hovering a row swaps the time slot for a quick Open action. The hover card stays compact — status, host, current work, spend, duration, Last turn/Last activity, model, PR, branch and subagents — and never shows raw timestamps.
+
+Row fitting is batched: every mounted row registers with one shared animation-frame pass that restores line-one fields, reads every cohort, then writes every cohort, so each drop step and the subtitle signal fit force at most one synchronous layout regardless of roster size. **Fractal UI / Sidebar/Roster** `HundredAgentRender` mounts 100 rows and records the render's long tasks.
 
 ### Markdown and the thinking disclosure
 

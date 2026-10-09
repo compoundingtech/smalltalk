@@ -138,7 +138,7 @@ export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, varia
     return () => { clearTimeout(hoverTimer.current) }
   }, [])
   // The hover card anchors to the measured row frame so it follows the row, not its hidden trigger.
-  const rowAnchor = React.useCallback((node: HTMLDivElement | null) => { attachSidebarLine1Fit(node); tooltipAnchor.current = node }, [])
+  const rowAnchor = React.useCallback((node: HTMLDivElement | null) => { tooltipAnchor.current = node; return attachSidebarLine1Fit(node) }, [])
   const hoverIntent = (open: boolean) => { clearTimeout(hoverTimer.current); hoverTimer.current = window.setTimeout(() => setHoverOpen(open), open ? 150 : 300) }
   const prefetch = () => { if (!inTree) callbacks?.prefetch?.(item.ref) }
   const open = () => { callbacks?.select?.(item.id, item.parentRef?.replace(/^agent\//, '')); onOpen?.(item) }
