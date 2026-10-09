@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Link env, bash and sleep into the canary and eval fixtures so they pass in the Nix sandbox",
+  "replay": {"status": "none", "detail": "No replay or rebuild. Test-fixture script only; the daemon is unchanged."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover: only the canary fixture script changed."}
+}
