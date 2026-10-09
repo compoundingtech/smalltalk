@@ -989,7 +989,14 @@ pub fn current_publication_dropped(error: &anyhow::Error) -> bool {
     daemon_unreachable(error).is_some()
         || error
             .chain()
-            .any(|cause| cause.is::<tokio::time::error::Elapsed>())
+            .any(|cause| {
+                cause.is::<tokio::time::error::Elapsed>()
+                    || cause.downcast_ref::<serde_json::Error>().is_some_and(serde_json::Error::is_eof)
+                    || cause.downcast_ref::<std::io::Error>().is_some_and(|error| matches!(error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::TimedOut | std::io::ErrorKind::UnexpectedEof))
+            })
         || api_error_parts(error).is_some_and(|(status, code, message, _)| {
             status == 503
                 || code == "internal"

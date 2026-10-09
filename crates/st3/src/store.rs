@@ -17112,21 +17112,25 @@ impl Store {
         let subjects = {
             let connection = self.readers.get();
             let mut statement = connection.prepare_cached(
-                "SELECT DISTINCT subject FROM local_latest_slots INDEXED BY local_latest_pending_usage_index
+                "SELECT subject FROM local_latest_slots INDEXED BY local_latest_pending_usage_index
                  WHERE kind='harness.usage' AND pending_local_id IS NOT NULL AND subject>?1
                  ORDER BY subject LIMIT 64").map_err(internal)?;
             let rows = statement
                 .query_map([after], |row| row.get::<_, String>(0))
                 .map_err(internal)?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(internal)?
+            let mut subjects = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)?;
+            // Bound index rows as well as returned subjects; DISTINCT would visit every
+            // pending historical slot of one seat before advancing to the next subject.
+            subjects.dedup();
+            subjects
         };
         let mut changed = false;
         for subject in &subjects {
             let harness = self.current_harness(subject).map_err(internal)?;
             if harness
                 .as_ref()
-                .is_none_or(|harness| harness.state != "working")
+                .is_none_or(|harness| harness.state != "working"
+                    || harness.reason.as_deref() == Some("providerCapacity"))
             {
                 changed |= self.flush_pending_usage(
                     subject,

@@ -19051,13 +19051,17 @@ impl NativeObservations {
         };
         self.retry_pending = true;
         if self.provider_incarnation.is_some() && matches!(driver, "omp" | "opencode") {
-            publish_admission_diagnostic(client, subject, &self.runtime, &self.dir,
-                &mut self.admission_diagnostic).await?;
+            publish_admission_diagnostic(
+                client,
+                subject,
+                &self.runtime,
+                &self.dir,
+                &mut self.admission_diagnostic,
+            )
+            .await?;
         }
-        // Bound a wake's work so a backlog does not hold back native delivery.
         let mut events = st_drivers::harness_events::pending(&self.dir, 64)?;
         for event in &mut events {
-            // Discard predecessor builds' queued current values. Their latest snapshot is above.
             if matches!(
                 event.kind.as_str(),
                 "harness-state" | "harness-state-expired" | "harness-todo"
@@ -19079,9 +19083,9 @@ impl NativeObservations {
                 st_drivers::harness_events::acknowledge(&self.dir, event.sequence)?;
                 continue;
             }
-            // Account binding is outbox metadata, not part of the producer's observation.
-            // Preserve it separately for the accounting claim builders below.
-            let account_ref = event.payload.as_object_mut()
+            let account_ref = event
+                .payload
+                .as_object_mut()
                 .and_then(|fields| fields.remove("account_ref"));
             let publisher = ObservationClient {
                 client,
@@ -19137,56 +19141,80 @@ impl NativeObservations {
                             )
                             .await?;
                     }
-                    let _: Value = client.post("/v1/harness-events/usage-flush",
-                        &st3::harness_events::UsageFlush {
-                            subject: subject.into(),
-                            runtime_incarnation: event.runtime_incarnation.clone(),
-                        }).await?;
-                }
-                "harness-context" | "harness-accounting" => {
-                    if let Some(observed) = st_drivers::harness_context::read_raw_at(
-                        &raw,
-                        st_drivers::message::now_ms(),
-                    ) {
-                        publish_harness_usage(
-                            &publisher,
-                            subject,
-                            source_driver,
-                            &event.runtime_incarnation,
-                            &observed,
-                            &mut UsageFingerprints::default(),
-                        )
-                        .await?;
-                        publish_harness_limits(
-                            &publisher,
-                            subject,
-                            source_driver,
-                            &event.runtime_incarnation,
-                            &observed,
-                            &mut None,
-                        )
-                        .await?;
+                    "harness-context" | "harness-accounting" => {
+                        if let Some(observed) = st_drivers::harness_context::read_raw_at(
+                            &raw,
+                            st_drivers::message::now_ms(),
+                        ) {
+                            publish_harness_usage(
+                                &publisher,
+                                subject,
+                                source_driver,
+                                &event.runtime_incarnation,
+                                &observed,
+                                &mut UsageFingerprints::default(),
+                            )
+                            .await?;
+                            publish_harness_limits(
+                                &publisher,
+                                subject,
+                                source_driver,
+                                &event.runtime_incarnation,
+                                &observed,
+                                &mut None,
+                            )
+                            .await?;
+                        }
                     }
+                    "harness-timeline" => {
+                        let operation: st_drivers::harness_timeline::Operation =
+                            serde_json::from_slice(&raw)?;
+                        let fields = timeline_claim_fields(operation, &event.runtime_incarnation);
+                        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
+                        let _: ClaimRecord = publisher
+                            .post(
+                                "/v1/claims",
+                                &ClaimInput {
+                                    subject: subject.into(),
+                                    kind: "harness.timeline".into(),
+                                    actor: Some(subject.into()),
+                                    fields,
+                                    evidence: Vec::new(),
+                                    expected_subject: None,
+                                    idempotency_key: Some(format!(
+                                        "harness-timeline:{subject}:{digest}"
+                                    )),
+                                },
+                            )
+                            .await?;
+                    }
+                    _ => unreachable!("supported kinds were checked above"),
                 }
-                "harness-timeline" => {
-                    let operation: st_drivers::harness_timeline::Operation =
-                        serde_json::from_slice(&raw)?;
-
-                    let fields = timeline_claim_fields(operation, &event.runtime_incarnation);
-                    let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
-                    let _: ClaimRecord = publisher
+                if matches!(
+                    event.kind.as_str(),
+                    "harness-accounting" | "harness-context" | "harness-timeline"
+                ) && event.payload["accounting_stop"] != true
+                    && st_drivers::harness_events::read_runtime_state(
+                        &self.dir,
+                        &event.runtime_incarnation,
+                    )?
+                    .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+                    .is_some_and(|state| {
+                        state["reason"] == "providerCapacity"
+                            || !matches!(
+                                state["state"].as_str(),
+                                Some("active" | "working" | "child")
+                            )
+                    })
+                {
+                    // The final reading can arrive after the stop control. Retain its
+                    // acknowledgement until its independent stop flush has succeeded.
+                    let _: Value = client
                         .post(
-                            "/v1/claims",
-                            &ClaimInput {
+                            "/v1/harness-events/usage-flush",
+                            &st3::harness_events::UsageFlush {
                                 subject: subject.into(),
-                                kind: "harness.timeline".into(),
-                                actor: Some(subject.into()),
-                                fields,
-                                evidence: Vec::new(),
-                                expected_subject: None,
-                                idempotency_key: Some(format!(
-                                    "harness-timeline:{subject}:{digest}"
-                                )),
+                                runtime_incarnation: event.runtime_incarnation.clone(),
                             },
                         )
                         .await?;
@@ -31299,12 +31327,15 @@ mission "review" state="ready" {
     #[tokio::test]
     async fn startup_drops_current_deadlines_and_busy_writers_but_preserves_fences() {
         use axum::{Json, Router, http::StatusCode, response::IntoResponse as _, routing::post};
-        for refusal in ["deadline", "busy", "stale"] {
+        for refusal in ["deadline", "busy", "truncated", "stale"] {
             let app = Router::new().route(
                 "/v1/claims",
                 post(move || async move {
                     if refusal == "deadline" {
                         tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    if refusal == "truncated" {
+                        return (StatusCode::OK, "{\"api_version\":\"st3.v1\",\"value\":").into_response();
                     }
                     let (code, message) = if refusal == "stale" {
                         ("stale-harness-event-session", "retired native incarnation")
