@@ -6163,7 +6163,7 @@ async fn conversation_changes_local_marked(
             || after.is_none()
             || tokio::time::Instant::now() >= deadline
         {
-            return Ok(value);
+            return Ok((value, mark));
         }
         // Read again only when something that concerns this conversation changed: a full read
         // parses the whole transcript, and the fleet commits many times a second.
@@ -6189,7 +6189,7 @@ async fn conversation_changes_local_marked(
                     remember_cursor(&next, mark.transcript_seen);
                     value["next_cursor"] = Value::String(next);
                 }
-                return Ok(value);
+                return Ok((value, mark));
             }
         }
     }
