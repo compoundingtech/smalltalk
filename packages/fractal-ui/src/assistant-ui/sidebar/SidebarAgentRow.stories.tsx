@@ -6,6 +6,8 @@ import { expect, userEvent, within } from 'storybook/test'
 import { AgentHoverCard, SidebarAgentRow } from './SidebarAgentRow'
 import type { SidebarAgentRow as Row } from './model'
 import { spaceVars as s, surfaceVars as surface, textVars as ink, typeVars as t, geometryVars as g, borderVars as border, radiusVars as r, elevationVars as elevation } from '../composition-tokens.stylex'
+import { baselineTheme } from '../neutral-theme'
+import { lightTheme } from '../composition-theme'
 
 const storyNow = Date.UTC(2026, 9, 8, 12, 0, 0)
 /** Fully reported synthetic identity; every optional fact the card can render is present. */
@@ -66,6 +68,9 @@ function QuickOpenCohort() {
 const meta = {
   title: 'Fractal UI/Sidebar/Agent Row',
   component: SidebarAgentRow,
+  args: { scheme: 'dark' },
+  argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } },
+  decorators: [(Story, context) => <div data-scheme={context.args.scheme} {...stylex.props(...baselineTheme, context.args.scheme === 'light' && lightTheme)}><Story /></div>],
   parameters: { layout: 'fullscreen', docs: { description: { component: 'Baseline agent row: reported facts only. The hover card and reported details omit unreported fields instead of showing placeholders; hovering a row swaps the time slot for a quick Open action; rows without a reported time keep the shared metric track so titles stay aligned.' } } },
 } satisfies Meta
 export default meta
@@ -96,10 +101,37 @@ export const QuickOpenAction: Story = { name: 'Row hover · quick Open', render:
   await expect(target.querySelector('[aria-current="page"]')).not.toBeNull()
 } }
 export const AllStates: Story = { render: () => <main {...stylex.props(styles.root)}><CardPair row={knownRow} /><CardPair row={unreportedRow} /><CohortList /></main> }
+export const HoverCardKnownLight: Story = { ...HoverCardKnown, args: { scheme: 'light' } }
+export const HoverCardUnknownLight: Story = { ...HoverCardUnknown, args: { scheme: 'light' } }
+export const TimeCohortLight: Story = { ...TimeCohort, args: { scheme: 'light' } }
+export const QuickOpenActionLight: Story = { ...QuickOpenAction, args: { scheme: 'light' } }
+export const AllStatesLight: Story = { ...AllStates, args: { scheme: 'light' } }
+/** A long roster stays in its pane; status glyphs never overrun the title with elapsed text. */
+export const HonestRoster: Story = { render: () => <main {...stylex.props(styles.root)}><div data-testid="roster-scroll" data-frame-rows {...stylex.props(styles.list, styles.roster)}>{Array.from({ length: 40 }, (_, index) => <SidebarAgentRow key={index} item={{ ...(index % 2 === 0 ? knownRow : unreportedRow), ref: `agent/roster-${index}`, id: `roster-${index}`, title: `Roster session ${index}` }} now={storyNow} layout="SR2-B" />)}</div></main>, play: async ({ canvasElement }) => {
+  await document.fonts.ready
+  await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+  const canvas = within(canvasElement)
+  const pane = canvas.getByTestId('roster-scroll')
+  const rows = canvas.getAllByTestId('taste-agent-row')
+  await expect(pane.scrollHeight).toBeGreaterThan(pane.clientHeight)
+  await expect(document.documentElement.scrollHeight - window.innerHeight, 'a clipped roster must not extend the document').toBeLessThanOrEqual(1)
+  for (const row of rows) {
+    const status = row.querySelector('[data-row-column="status"]')!
+    await expect(status.querySelector('time'), 'the fixed glyph column holds no elapsed text').toBeNull()
+    const details = within(row).getByRole('button', { name: /^Reported details for / })
+    // React Aria's VisuallyHidden wrapper is the absolutely positioned box; the row must contain it.
+    await expect(details.parentElement!.offsetParent, 'hidden details belong to their row containing block').toBe(row)
+  }
+  await expect(rows[0]!.querySelector('[data-row-field="total-duration"] time')).toHaveAttribute('dateTime', 'PT3600S')
+  for (const field of ['total-duration', 'total-usd', 'total-tokens', 'last-turn', 'current-work']) await expect(rows[1]!.querySelector(`[data-row-field="${field}"]`)).toBeNull()
+  await expect(pane.textContent).not.toMatch(/Unknown|unavailable|—/i)
+} }
+export const HonestRosterLight: Story = { ...HonestRoster, args: { scheme: 'light' } }
 
 const styles = stylex.create({
   root: { height: '100vh', minHeight: 0, overflowY: 'auto', boxSizing: 'border-box', padding: s.lg, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading, display: 'flex', flexDirection: 'column', gap: s.xl },
   spread: { display: 'flex', alignItems: 'flex-start', flexWrap: 'wrap', gap: s.xl },
   list: { display: 'flex', flexDirection: 'column', gap: s.xs, width: g.specimenAside, minWidth: 0 },
+  roster: { flex: 1, minHeight: 0, overflowY: 'auto' },
   aside: { width: g.specimenAside, maxWidth: '100%', minWidth: 0, boxSizing: 'border-box', padding: s.lg, backgroundColor: surface.raised, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.md, boxShadow: elevation.popover },
 })
