@@ -11394,6 +11394,7 @@ impl Store {
         let plan = plan_drops(&self.checkpoint_sealed_set(cut).unwrap());
         let mut writer = self.connection.write();
         let transaction = writer.transaction().unwrap();
+        use smallclaims::store::checkpoint::{checkpoint_name, delete_dropped_rows_tx, record_checkpoint_tombstones_tx};
         record_checkpoint_tombstones_tx(&transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims)
             .unwrap();
         delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
