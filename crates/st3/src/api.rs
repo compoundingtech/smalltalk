@@ -2823,6 +2823,7 @@ fn client_agent_resources_from_status(
                 .desired_revision
                 .clone()
                 .or_else(|| subject.claims.last().cloned())
+                .or_else(|| store.latest_claim(&subject.subject, None).ok().flatten().map(|claim| claim.id))
                 .unwrap_or_else(|| format!("agent/{}", subject.subject));
             let queue = work_queues
                 .get(&subject.subject)

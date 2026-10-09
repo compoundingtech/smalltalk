@@ -30,7 +30,7 @@ of the same node as evidence; a claim can cite only claims.
 Current categorical status, context occupancy, todo, workspace availability and peer connectivity
 are replaceable values in `latest_values`. There is one row per subject and kind (per observing
 host for connectivity). A separate SQLite connection uses a zero busy timeout and an immediate
-transaction; contention drops the attempt without entering the ordered graph writer. A new
+transaction with a 100 ms SQLite progress deadline; contention drops the attempt without entering the ordered graph writer. A new
 sample replaces the previous value and its local feed row. Status keeps the current episode's
 start time and a current-incarnation readiness bit; it retains no transition history.
 
@@ -46,7 +46,10 @@ whole-hop bound, including the receiver's 100 ms local hop, independently of sig
 The relay reuses Fabric listeners and HTTP connections; failed attempts discard the listener address
 and leave no retry job. Current samples aimed at a peer in offline/overload backoff or with existing failed connectivity
 evidence are dropped, including while its worker checks that route again; worker recovery does not
-replay them. Native current writes require the same kernel Unix-peer seat identity and
+replay them. The legacy `/v1/harness-events` envelope still validates nonzero sequence and retains its
+native replay and transition-wake contract. Upgraded categorical producers use the bound current
+route; durable numeric and timeline publications use the legacy envelope.
+Native current writes require the same kernel Unix-peer seat identity and
 running incarnation as `/v1/harness-events`. A kernel-bound `starting` hint may precede the durable
 runtime record; it only makes mailbox startup wait and grants no delivery or readiness authority.
 Owner/incarnation binding and source revision order

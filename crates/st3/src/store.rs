@@ -2930,7 +2930,16 @@ impl Store {
                 return Ok(Some(record));
             }
         }
-        self.graph.latest_claim(subject, kind)
+        let legacy = self.graph.latest_claim(subject, kind)?;
+        if legacy.is_none() && kind.is_none() {
+            let connection = self.readers.get();
+            return Ok(connection.query_row(
+                &format!("SELECT {CLAIM_COLUMNS} FROM registered_claims AS claims
+                    WHERE subject=?1 ORDER BY length(accepted_at_unix_ms) DESC,accepted_at_unix_ms DESC,id DESC LIMIT 1"),
+                [subject], claim_from_row,
+            ).optional()?);
+        }
+        Ok(legacy)
     }
 
     pub fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
@@ -11529,12 +11538,18 @@ impl Store {
     ) -> Result<StatusResponse> {
         let connection = self.readers.get();
         let index = selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
-        let names = match names {
+        let all_names = names.is_none();
+        let mut names = match names {
             Some(names) => names.clone(),
             None => connection.prepare_cached(RANGE_SUBJECTS)?
                 .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<BTreeSet<_>>>()?,
         };
+        if all_names {
+            names.extend(connection.prepare_cached(
+                "SELECT DISTINCT subject FROM latest_values WHERE subject LIKE 'agent/%'",
+            )?.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
         // The view and status passes share what they read of each subject.
         let mut reads = card_fold::CardReads::new(index);
         let names = if history { names } else {
@@ -21674,9 +21689,9 @@ fn event_tail_sql(migrating: bool) -> &'static str {
 fn insert_event(
     transaction: &Transaction<'_>,
     store_index: u64,
-    _kind: &str,
+    kind: &str,
     subject: &str,
-    _body: &Value,
+    body: &Value,
 ) -> Result<()> {
     if kind == "harness.limits"
         || (kind == "harness.usage"
@@ -21960,7 +21975,18 @@ fn latest_actual_at(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    fold_latest_actual(rows)
+    let legacy = fold_latest_actual(rows)?;
+    let body: Option<String> = connection.query_row(
+        "SELECT body FROM latest_values WHERE subject=?1 AND kind='workspace.observed'",
+        [subject], |row| row.get(0),
+    ).optional()?;
+    match body {
+        Some(body) => fold_latest_values([
+            (String::new(), legacy.unwrap_or(Value::Null)),
+            ("workspace.observed".into(), serde_json::from_str(&body)?),
+        ]),
+        None => Ok(legacy),
+    }
 }
 
 /// A subject's actual state from its actual-state claims, `(kind, body)` in canonical order.
