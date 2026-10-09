@@ -21,6 +21,7 @@ export interface ErrorOverlayNotice {
 }
 
 interface ErrorOverlayHostState {
+  /** Floating hosts' portal layer once attached; lane hosts render in place and never attach one. */
   readonly layer: HTMLElement | null
   readonly dismissedIds: readonly string[]
   readonly lane: boolean
@@ -37,7 +38,7 @@ export function ErrorOverlayHost({ children, lane = false }: { readonly children
   const [dismissedIds, setDismissedIds] = React.useState<readonly string[]>([])
   const host = React.useMemo(() => ({ layer, dismissedIds, lane }), [layer, dismissedIds, lane])
   const onDismissKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key !== 'Escape' || event.defaultPrevented || layer === null) return
+    if (event.key !== 'Escape' || event.defaultPrevented || (!lane && layer === null)) return
     const banners = event.currentTarget.querySelectorAll<HTMLElement>('[data-error-overlay-id]')
     const newest = banners[banners.length - 1]
     if (newest === undefined) return
@@ -48,7 +49,7 @@ export function ErrorOverlayHost({ children, lane = false }: { readonly children
   }
   return <div data-error-overlay-host onKeyDown={onDismissKey} {...stylex.props(styles.host)}>
     <ErrorOverlaySurface.Provider value={host}>{children}</ErrorOverlaySurface.Provider>
-    <div ref={setLayer} data-error-overlay-layer {...stylex.props(styles.layer)} />
+    {!lane && <div ref={setLayer} data-error-overlay-layer {...stylex.props(styles.layer)} />}
   </div>
 }
 
@@ -56,7 +57,7 @@ export function ErrorOverlay({ id, title, detail, onRetry, onOpenOutput }: Error
   const host = React.useContext(ErrorOverlaySurface)
   const [dismissedId, setDismissedId] = React.useState<string | null>(null)
   if (dismissedId === id || host?.dismissedIds.includes(id)) return null
-  if (host !== null && host.layer === null) return null
+  if (host !== null && !host.lane && host.layer === null) return null
   const banner = <div role="alert" data-error-overlay data-error-overlay-id={id} onKeyDown={event => { if (host === null && event.key === 'Escape' && !event.defaultPrevented) { event.preventDefault(); setDismissedId(id) } }} {...stylex.props(styles.banner, host?.lane === true && styles.bannerLane)}>
     <Icon name="alert" size={14} />
     <span {...stylex.props(styles.text)}><strong {...stylex.props(styles.title)}>{title}</strong>{detail !== undefined && <span {...stylex.props(styles.detail)}>{detail}</span>}</span>

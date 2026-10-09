@@ -110,6 +110,8 @@ const PreparedTurn = React.memo(function PreparedTurn({ turn, stranded, onOpenTo
     {turn.work.running && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.liveActivity)}><span aria-hidden="true">◌</span></div>}
   </section>
 })
+// Hosts using AssistantRuntimeProvider directly expose no adoption store; its absence never changes.
+const staticSubscription = () => () => undefined
 /** Locked U2·F3·Y3 presentation under the host's AssistantRuntimeProvider. */
 export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, onRetrySync, onRetryRun, onRetrySend, resolveImage, onLoadImage, availability = { _tag: 'Available' }, history = { _tag: 'Complete' }, emptyState, viewportKey, landmarkContext }: TranscriptProps) {
   const messages = useAuiState(state => state.thread.messages)
@@ -117,17 +119,26 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
   // adopted messages a task later. Recording the snapshot after its commit is the adoption epoch.
   // An id is pending (deferred so the turn stays mounted) while its snapshot has not been through a
   // commit or while the runtime holds it and the store has yet to publish it; once committed and
-  // absent from the runtime, it is stranded.
+  // absent from the runtime, it is stranded. Only unpublished ids depend on the epoch or on runtime
+  // adoption, so neither is recorded while every id is published: a freshly mounted pane commits once.
   const [adoptionEpoch, setAdoptionEpoch] = React.useState<readonly TranscriptTurn[]>()
-  React.useEffect(() => setAdoptionEpoch(turns), [turns])
-  const runtimeIds = React.useContext(RuntimeAdoptedIds)
+  const published = React.useMemo(() => new Set(messages.map(message => message.id)), [messages])
+  const unpublished = React.useMemo(() => turns.flatMap(turn => [...(turn.prompt === undefined ? [] : [turn.prompt.id]), ...turn.items.map(item => item.id)]).filter(id => !published.has(id)), [turns, published])
+  const adoption = React.useContext(RuntimeAdoptedIds)
+  const heldKey = React.useSyncExternalStore(adoption?.subscribe ?? staticSubscription, () => {
+    const held = adoption?.get()
+    return JSON.stringify(held === undefined ? [] : unpublished.filter(id => held.has(id)))
+  })
+  const runtimeIds = React.useMemo(() => new Set<string>(JSON.parse(heldKey)), [heldKey])
+  React.useEffect(() => {
+    if (adoptionEpoch !== turns && unpublished.some(id => !runtimeIds.has(id))) setAdoptionEpoch(turns)
+  }, [turns, unpublished, runtimeIds, adoptionEpoch])
   const { committed, stranded } = React.useMemo(() => {
-    const published = new Set(messages.map(message => message.id))
     const settled = new Set(adoptionEpoch?.flatMap(turn => [...(turn.prompt === undefined ? [] : [turn.prompt.id]), ...turn.items.map(item => item.id)]))
     const stranded = new Set<string>()
     const visible = (id: string) => {
       if (published.has(id)) return true
-      if (!settled.has(id) || runtimeIds?.has(id)) return false
+      if (!settled.has(id) || runtimeIds.has(id)) return false
       stranded.add(id)
       return true
     }
@@ -142,7 +153,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
       return [{ ...turn, items, work: { ...turn.work, calls: turn.work.calls.filter(call => itemIds.has(call.id)) } }]
     })
     return { committed, stranded }
-  }, [messages, turns, adoptionEpoch, runtimeIds])
+  }, [published, turns, adoptionEpoch, runtimeIds])
   const strandedIds = [...stranded].join(', ')
   React.useEffect(() => {
     if (strandedIds !== '' && process.env.NODE_ENV !== 'production') console.warn(`Transcript: the runtime never adopted ${strandedIds}; showing a fallback row.`)
