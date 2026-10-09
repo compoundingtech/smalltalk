@@ -10420,7 +10420,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_latency_keeps_scope_and_routes_with_a_memory_only_cost_snapshot() {
-        let mut session = ClientSession::for_tests("person/counter-test", "person/counter-test", "local");
+        let mut session = ClientSession::for_tests("person/ada", "person/ada", "local");
         assert_eq!(request_latency(Extension(session.clone())).await.unwrap_err().status, StatusCode::FORBIDDEN);
         session.scopes.insert("read.projections".into());
         let work = smallclaims::sqlite::work::SqliteWorkScope::start();
