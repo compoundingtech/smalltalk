@@ -1,0 +1,11 @@
+version 2
+
+// The seat the canonical missions run on, written out by hand. `st agents new st/reviewer
+// --harness claude --workspace "$HOME/st/agents/st-reviewer"` declares the same thing.
+//
+//   st apply seats/reviewer.kdl --as person/NAME
+agent "st/reviewer" {
+  workspace "/srv/example/st-reviewer"
+  restart "always"
+  harness "claude" {}
+}

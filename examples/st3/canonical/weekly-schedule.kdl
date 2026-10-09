@@ -1,0 +1,42 @@
+version 2
+
+// Run the weekly session review every Monday morning.
+//
+// Publish weekly-session-review.kdl first, then replace the zero placeholder below with that
+// mission's revision on this machine (a revision is specific to the machine that published it), and
+// set the time and timezone you want. Read the revision with:
+//
+//   st --json missions ls --all
+//
+// (the item whose id is `mission/example/canonical/weekly-session-review`, field `mission_revision`).
+//
+//   st apply weekly-schedule.kdl --as person/NAME
+//   st missions start example/canonical/weekly-session-review-schedule \
+//     --id example/canonical/weekly-session-review-schedule/on --workspace "$PWD" --as person/NAME
+//
+// The run stays open while the schedule is on. Stop the schedule by creating the file `retire` in
+// `$PWD/weekly-review` (`touch "$PWD/weekly-review/retire"`); the run then completes.
+
+mission "example/canonical/weekly-session-review-schedule" state="ready" {
+  goal "Start one weekly session review each Monday morning until you retire the schedule."
+
+  schedule "weekly" {
+    host "local"
+    calendar { at "Mon 09:00"; timezone "UTC" }
+    catch-up "latest"
+    work {
+      mission "example/canonical/weekly-session-review@0000000000000000000000000000000000000000000000000000000000000000"
+      workspace "${ST_WORKSPACE}/weekly-review"
+    }
+  }
+
+  step "retire" {
+    agentless
+    gate "you retire the weekly review schedule" {
+      exec "[ -e weekly-review/retire ]"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "1m"
+    }
+  }
+}

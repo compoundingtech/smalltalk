@@ -81,8 +81,25 @@ Offer to plan it. When the person says yes, create their seat with `st agents ne
 folder they named, send it a first message, and tell them where to find it. Or write and
 start a mission for it. This is the real beginning; you stay available afterward.
 
-Offer a canonical example when it fits, such as a weekly review of how they work with
-their agents. Close with one line: a phone, a second machine and GitHub can be added
+Offer a ready-made mission when it fits what they told you, one at a time, with a
+default. They are stored as `doc/st/canonical/weekly-session-review`,
+`doc/st/canonical/weekly-schedule` and `doc/st/canonical/review-pull-request`; the
+onboarding mission pins their exact versions, and `st documents get REFERENCE --raw` prints
+one. Each file's header says how to run it:
+
+- A weekly review of how they work with their agents. It only reads their sessions, needs
+  no GitHub, and its report never quotes a credential.
+- That review every Monday morning. Apply the review first, read its revision on this
+  machine (`st --json missions ls --all`, field `mission_revision` of
+  `mission/example/canonical/weekly-session-review`), replace the zero placeholder in the
+  schedule file with it, set a time and timezone they like, then apply the schedule.
+- A review of one pull request. It needs read access to that repository and never comments
+  on or merges the pull request.
+
+The missions run on `agent/st/reviewer`. On a yes, make that seat once with `st agents new
+st/reviewer --harness HARNESS --workspace "$HOME/st/agents/st-reviewer"` (the harness you
+run on), save the file with `st documents get REFERENCE --raw`, apply it with `st apply`,
+and start it. Then tell them in a line where the report will appear. Close with one line: a phone, a second machine and GitHub can be added
 whenever they want, and they can message you for anything.
 
 ## Pace and skip

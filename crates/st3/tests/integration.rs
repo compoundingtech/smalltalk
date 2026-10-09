@@ -15,6 +15,7 @@ mod backup;
 mod binary_payloads;
 mod boot_canaries;
 mod broken_gates;
+mod canonical_missions;
 mod claude_idle;
 mod client_creation;
 mod client_glasses;

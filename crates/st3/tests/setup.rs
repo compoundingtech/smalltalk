@@ -727,6 +727,20 @@ async fn onboarding_publication_is_graph_decided_and_preserves_stopped_assistant
             .iter()
             .any(|constraint| constraint.contains(&guides.items[0].hash))
     );
+    // The ready-made missions the Assistant offers are stored once and pinned by the mission.
+    for name in ["weekly-session-review", "weekly-schedule", "review-pull-request"] {
+        let versions: st3::model::DocumentListResponse = client
+            .get(&format!("/v1/documents?name=doc%2Fst%2Fcanonical%2F{name}"))
+            .await
+            .unwrap();
+        assert_eq!(versions.items.len(), 1, "{name}");
+        assert!(
+            spec.constraints
+                .iter()
+                .any(|constraint| constraint.contains(&versions.items[0].hash)),
+            "the onboarding mission does not offer {name}"
+        );
+    }
     let mut stop = fixture.cli();
     stop.args(["agents", "stop", "agent/st/assistant", "--as", "person/ada"]);
     success(&run(stop).await);

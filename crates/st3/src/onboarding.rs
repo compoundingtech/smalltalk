@@ -21,6 +21,25 @@ const MISSION: &str = "st/onboarding";
 const ASSISTANT: &str = include_str!("builtins/assistant.kdl");
 const ONBOARDING: &str = include_str!("builtins/onboarding.kdl");
 const GUIDE: &str = include_str!("../../../docs/st3/onboarding-guide.md");
+/// The reusable example missions the Assistant offers in act three: each is stored as a document
+/// the mission pins by hash, and the Assistant applies a copy when the person says yes.
+const CANONICAL: [(&str, &str, &str); 3] = [
+    (
+        "weekly-session-review",
+        "@WEEKLY@",
+        include_str!("../../../examples/st3/canonical/weekly-session-review.kdl"),
+    ),
+    (
+        "review-pull-request",
+        "@PULL_REQUEST@",
+        include_str!("../../../examples/st3/canonical/review-pull-request.kdl"),
+    ),
+    (
+        "weekly-schedule",
+        "@SCHEDULE@",
+        include_str!("../../../examples/st3/canonical/weekly-schedule.kdl"),
+    ),
+];
 
 fn client(config: &Config) -> Result<Client> {
     Client::unix_as(
@@ -77,27 +96,12 @@ pub async fn start(config: &Config, harness: &str, rerun: bool) -> Result<Option
         );
         return Ok(None);
     }
-    let versions: DocumentListResponse = client
-        .get("/v1/documents?name=doc%2Fst%2Fguide&limit=1")
-        .await?;
-    let hash = hex::encode(Sha256::digest(GUIDE.as_bytes()));
-    if !versions.items.iter().any(|version| version.hash == hash) {
-        let _: crate::model::DocumentVersion = client
-            .post(
-                "/v1/documents",
-                &DocumentPutRequest {
-                    name: "doc/st/guide".into(),
-                    bytes: GUIDE.as_bytes().to_vec(),
-                    expected_document: versions
-                        .items
-                        .first()
-                        .map(|version| version.binding_claim_id.clone()),
-                    idempotency_key: format!("onboarding-guide:{hash}"),
-                },
-            )
-            .await?;
+    let hash = store_document(&client, "doc/st/guide", GUIDE).await?;
+    let mut mission_source = ONBOARDING.replace("@GUIDE@", &format!("doc/st/guide@{hash}"));
+    for (name, placeholder, text) in CANONICAL {
+        let hash = store_document(&client, &format!("doc/st/canonical/{name}"), text).await?;
+        mission_source = mission_source.replace(placeholder, &format!("doc/st/canonical/{name}@{hash}"));
     }
-    let mission_source = ONBOARDING.replace("@GUIDE@", &format!("doc/st/guide@{hash}"));
     let parsed = crate::parse_intent(&mission_source, &config.node)?;
     let revision = &parsed
         .missions
@@ -216,6 +220,31 @@ pub async fn start(config: &Config, harness: &str, rerun: bool) -> Result<Option
         "Started mission/st/onboarding with agent/st/assistant. The Assistant stays available after onboarding."
     );
     Ok(Some(ASSISTANT_SUBJECT.into()))
+}
+
+/// Store `text` under `name` unless its newest version already holds it; return its hash.
+async fn store_document(client: &Client, name: &str, text: &str) -> Result<String> {
+    let versions: DocumentListResponse = client
+        .get(&format!("/v1/documents?name={}&limit=1", urlencoding::encode(name)))
+        .await?;
+    let hash = hex::encode(Sha256::digest(text.as_bytes()));
+    if !versions.items.iter().any(|version| version.hash == hash) {
+        let _: crate::model::DocumentVersion = client
+            .post(
+                "/v1/documents",
+                &DocumentPutRequest {
+                    name: name.into(),
+                    bytes: text.as_bytes().to_vec(),
+                    expected_document: versions
+                        .items
+                        .first()
+                        .map(|version| version.binding_claim_id.clone()),
+                    idempotency_key: format!("onboarding-document:{name}:{hash}"),
+                },
+            )
+            .await?;
+    }
+    Ok(hash)
 }
 
 fn declaration_changed(rerun: bool) -> Result<Option<String>> {
@@ -349,6 +378,19 @@ async fn apply(
 
 #[cfg(test)]
 mod tests {
+    /// The onboarding mission with every pinned document filled in, as setup publishes it.
+    fn resolved_mission() -> String {
+        let mut source = super::ONBOARDING.replace(
+            "@GUIDE@",
+            &format!("doc/st/guide@{}", hex::encode(sha2::Sha256::digest(super::GUIDE.as_bytes()))),
+        );
+        for (name, placeholder, text) in super::CANONICAL {
+            let hash = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+            source = source.replace(placeholder, &format!("doc/st/canonical/{name}@{hash}"));
+        }
+        source
+    }
+
     #[test]
     fn assistant_uses_shared_harness_defaults_and_pins_the_guide() {
         assert!(
@@ -356,16 +398,21 @@ mod tests {
             "keep the bundled guide bounded"
         );
         let guide = hex::encode(sha2::Sha256::digest(super::GUIDE.as_bytes()));
-        let mission = crate::parse_intent(
-            &super::ONBOARDING.replace("@GUIDE@", &format!("doc/st/guide@{guide}")),
-            "studio",
-        )
-        .unwrap();
+        let mission = crate::parse_intent(&resolved_mission(), "studio").unwrap();
         assert!(
             mission
                 .document_refs
                 .contains(&format!("doc/st/guide@{guide}"))
         );
+        for (name, _, text) in super::CANONICAL {
+            let hash = hex::encode(sha2::Sha256::digest(text.as_bytes()));
+            assert!(
+                mission
+                    .document_refs
+                    .contains(&format!("doc/st/canonical/{name}@{hash}")),
+                "the mission must pin the canonical {name}"
+            );
+        }
         let revision = &mission.missions[super::MISSION].revision;
         for harness in crate::environment::HARNESSES {
             let source = super::declarations(
@@ -402,12 +449,7 @@ mod tests {
     }
     #[test]
     fn the_play_is_three_acts_spoken_to_you() {
-        let guide = hex::encode(sha2::Sha256::digest(super::GUIDE.as_bytes()));
-        let mission = crate::parse_intent(
-            &super::ONBOARDING.replace("@GUIDE@", &format!("doc/st/guide@{guide}")),
-            "studio",
-        )
-        .unwrap();
+        let mission = crate::parse_intent(&resolved_mission(), "studio").unwrap();
         assert!(mission.missions.contains_key(super::MISSION));
         for act in ["hello", "act-one", "act-two", "act-three"] {
             assert!(

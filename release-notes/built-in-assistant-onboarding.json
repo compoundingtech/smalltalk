@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Add st setup --onboarding. When a provider is installed, setup publishes agent/st/assistant and mission/st/onboarding and pins doc/st/guide. The Assistant uses the ordinary agent creation builder without a model pin. All provider declarations retain the required harness body, including an empty body for providers with no default flags. Declining Claude plugin installation keeps Claude selected and uses the existing inline development channel."
+    "detail": "Add st setup --onboarding. When a provider is installed, setup publishes agent/st/assistant and mission/st/onboarding and pins doc/st/guide. The Assistant uses the ordinary agent creation builder without a model pin. All provider declarations retain the required harness body, including an empty body for providers with no default flags. Declining Claude plugin installation keeps Claude selected and uses the existing inline development channel. Setup also stores three ready-made example missions as doc/st/canonical/weekly-session-review, weekly-schedule and review-pull-request, which the onboarding mission pins and the Assistant offers."
   },
   "downtime": {
     "status": "none",
