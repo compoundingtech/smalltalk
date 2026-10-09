@@ -45,18 +45,21 @@ def summarize(jobs, start, end):
                     # including completed/cancelled jobs removed from the queue.
                     continue
                 terminal = job.get('completed_at')
-                if terminal:
-                    if min(firsts) >= end or timestamp(terminal) <= start:
-                        continue
+                if min(firsts) >= end or (terminal and timestamp(terminal) <= start):
+                    continue
+                if terminal and timestamp(terminal) < min(firsts):
+                    raise ValueError(f"job {job['id']}: terminal before first step")
                 ambiguous.append(dict(id=job['id'], runner_name=job.get('runner_name'),
                                       reason='Namespace planned; actual runner identity missing or unrecognized'))
             continue
         starts = [timestamp(s['started_at']) for s in job.get('steps', []) if s.get('started_at')]
+        terminal = job.get('completed_at')
+        if (starts and min(starts) >= end) or (terminal and timestamp(terminal) <= start):
+            continue
         if not starts:
             unknown.append(job['id'])
             continue
         first = min(starts)
-        terminal = job.get('completed_at')
         if job.get('status') == 'completed' and not terminal:
             unknown.append(job['id'])
             continue
@@ -186,7 +189,13 @@ def main():
                     jobs.append({**job, 'run_id': run['id'], 'event': run['event']})
     except (RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError) as error:
         collection_errors.append(str(error))
-    report = summarize(jobs, start, end)
+    try:
+        report = summarize(jobs, start, end)
+    except (ValueError, KeyError, TypeError) as error:
+        collection_errors.append(f'invalid execution evidence: {error}')
+        # Refuse malformed intervals without publishing an unqualified zero or
+        # losing request/window/error evidence. No execution is inferred.
+        report = summarize([], start, end)
     report['complete'] = report['complete'] and not collection_errors
     report.update(date=args.date, repository=args.repo, generated_at=datetime.now(UTC).isoformat(),
                   retained_run_metadata_scanned=all_runs, relevant_runs=relevant_runs,

@@ -157,3 +157,45 @@ except RuntimeError as error:
     assert 'reserve reached' in str(error)
 assert g['api_requests'] == 0
 print('passed: preserve 500 remaining shared-token requests for runner admission')
+
+# Reruns starting after the day, including active ones without a terminal, are
+# outside coverage for known and unknown runner identities before clamping.
+for runner in ('nsc-runner-active', None):
+    after_day = {**unknown_identity, 'runner_name': runner, 'status': 'in_progress',
+                 'steps': [dict(started_at='2026-10-09T12:00:00Z')], 'completed_at': None}
+    before_day = {**unknown_identity, 'runner_name': runner,
+                  'steps': [dict(started_at='2026-10-07T12:00:00Z')],
+                  'completed_at': '2026-10-07T12:10:00Z'}
+    for job in (after_day, before_day):
+        result = m['summarize']([job], start, end)
+        assert result['complete'] and result['execution_minutes'] == 0
+    reversed_interval = {**unknown_identity, 'runner_name': runner,
+                         'completed_at': '2026-10-08T11:59:00Z'}
+    try:
+        m['summarize']([reversed_interval], start, end)
+        raise AssertionError('reversed in-window interval must be refused')
+    except ValueError as error:
+        assert 'terminal before first step' in str(error)
+# Collection succeeds, but malformed execution evidence still writes partial
+# JSON with the named error rather than losing the report to a traceback.
+run = dict(id=77, created_at='2026-10-08T00:00:00Z', updated_at='2026-10-08T13:00:00Z', status='completed', event='pull_request')
+def invalid_api(path):
+    g['api_requests'] += 1
+    if '/jobs?' in path:
+        return {'jobs': [{**reversed_interval, 'runner_name': 'nsc-runner-bad'}]}
+    return {'total_count': 1, 'workflow_runs': [run]}
+g['api_requests'] = 0; g['api'] = invalid_api
+with tempfile.TemporaryDirectory() as temp:
+    output = Path(temp) / 'partial.json'; saved = sys.argv
+    sys.argv = ['usage', '--date', '2026-10-08', '--output', str(output)]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            m['main']()
+        raise AssertionError('malformed execution must exit nonzero')
+    except SystemExit:
+        partial = json.loads(output.read_text())
+        assert not partial['complete'] and not partial['full_day_complete']
+        assert any('job 7: terminal before first step' in error for error in partial['collection_errors'])
+    finally:
+        sys.argv = saved
+print('passed: known/unknown runner intervals outside UTC day excluded; reversed in-window timestamps refuse with partial JSON')
