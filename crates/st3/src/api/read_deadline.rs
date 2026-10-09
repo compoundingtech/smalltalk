@@ -185,23 +185,37 @@ fn forwarded_deadline(operation: &crate::peer::ClientReadOperation) -> Option<Du
 }
 
 fn timeout_response(state: &AppState, path: &str) -> Response {
-    if let Some(trace) = crate::relay_trace::current() {
-        trace.finish(crate::relay_trace::Outcome::TimedOut);
-    }
-    let error = json!({"code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}});
-    let request_id = super::new_request_id();
-    if let Some(trace) = crate::relay_trace::current() {
-        trace.response(&request_id);
-    }
-    let value = if path.starts_with("/v1/client/") {
-        super::client_error_envelope(StatusCode::GATEWAY_TIMEOUT, &error, &request_id)
-    } else {
-        json!({"api_version":"st3.v1", "request_id":request_id,
+    construct_timeout_response(|| {
+        let error = json!({"code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}});
+        let request_id = super::new_request_id();
+        if let Some(trace) = crate::relay_trace::current() {
+            trace.response(&request_id);
+        }
+        let value = if path.starts_with("/v1/client/") {
+            super::client_error_envelope(StatusCode::GATEWAY_TIMEOUT, &error, &request_id)
+        } else {
+            json!({"api_version":"st3.v1", "request_id":request_id,
             "snapshot_host":state.node,
             "store_index":state.store.index().unwrap_or_default(),
             "code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}})
-    };
-    (StatusCode::GATEWAY_TIMEOUT, Json(value)).into_response()
+        };
+        (StatusCode::GATEWAY_TIMEOUT, Json(value)).into_response()
+    })
+}
+
+/// The deadline has fired, but the response does not exist until construction returns.
+/// Keep the existing construction (including its Store read) inside this interval. A
+/// panic during construction is a panic terminal, never a prematurely completed timeout.
+fn construct_timeout_response(construct: impl FnOnce() -> Response) -> Response {
+    use crate::relay_trace::{Outcome, Phase};
+    let trace = crate::relay_trace::current();
+    let _root = trace.as_ref().map(crate::relay_trace::Trace::guard);
+    crate::relay_trace::span(Phase::Deadline).finish(Outcome::TimedOut);
+    let response = crate::relay_trace::work(Phase::TimeoutEnvelope, construct);
+    if let Some(trace) = trace {
+        trace.finish(Outcome::TimedOut);
+    }
+    response
 }
 
 #[track_caller]
@@ -569,6 +583,117 @@ pub(super) fn error(error: &WorkError) -> Option<ApiError> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn timeout_terminal_waits_for_response_construction_and_survives_late_child_completion() {
+        use crate::relay_trace::{self, Outcome, Phase};
+        let capture = relay_trace::tests::Capture::default();
+        let dispatch = capture.dispatch();
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let request_id = uuid::Uuid::nil().to_string();
+        let expected_id = request_id.clone();
+        let worker = std::thread::spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let trace = relay_trace::tests::trace();
+                let mut child = trace.span(Phase::BlockingWork);
+                relay_trace::blocking(Some(trace.clone()), || {
+                    let response = construct_timeout_response(|| {
+                        trace.response(&request_id);
+                        entered.send(()).unwrap();
+                        // Control an unfinished construction without a Store or a timed sleep.
+                        released.recv().unwrap();
+                        (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            [("x-test-response-id", request_id)],
+                            "unchanged response body",
+                        )
+                            .into_response()
+                    });
+                    child.finish(Outcome::Completed);
+                    trace.finish(Outcome::Completed);
+                    response
+                })
+            })
+        });
+        waiting.recv().unwrap();
+        let during_construction = capture.events();
+        // Release and join before assertions so a failing control cannot strand a worker.
+        release.send(()).unwrap();
+        let response = worker.join().unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(response.headers()["x-test-response-id"], expected_id);
+        assert!(
+            during_construction
+                .iter()
+                .any(|e| { e["phase"] == "Deadline" && e["state"] == "timed-out" })
+        );
+        assert!(
+            during_construction
+                .iter()
+                .any(|e| e["phase"] == "ResponseBinding")
+        );
+        assert!(
+            during_construction
+                .iter()
+                .any(|e| e["phase"] == "TimeoutEnvelope")
+        );
+        assert!(!during_construction.iter().any(|e| e["phase"] == "Terminal"));
+
+        let events = capture.events();
+        let binding = events
+            .iter()
+            .position(|e| e["phase"] == "ResponseBinding")
+            .unwrap();
+        let construction = events
+            .iter()
+            .position(|e| e["phase"] == "TimeoutEnvelope" && e["state"] == "completed")
+            .unwrap();
+        let terminal = events
+            .iter()
+            .position(|e| e["phase"] == "Terminal")
+            .unwrap();
+        assert!(binding < construction && construction < terminal);
+        assert_eq!(events[terminal]["state"], "TimedOut");
+        assert_eq!(
+            events.iter().filter(|e| e["phase"] == "Terminal").count(),
+            1
+        );
+        assert!(events[terminal + 1..].iter().any(|e| {
+            e["phase"] == "BlockingWork"
+                && e["state"] == "completed"
+                && e["after_terminal"] == "true"
+        }));
+    }
+
+    #[test]
+    fn aborted_timeout_construction_records_panic_instead_of_timeout_completion() {
+        use crate::relay_trace;
+        let capture = relay_trace::tests::Capture::default();
+        tracing::dispatcher::with_default(&capture.dispatch(), || {
+            let trace = relay_trace::tests::trace();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                relay_trace::blocking(Some(trace), || {
+                    construct_timeout_response(|| panic!("private construction failure"))
+                })
+            }));
+            assert!(result.is_err());
+            assert!(relay_trace::current().is_none());
+        });
+        let events = capture.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| { e["phase"] == "TimeoutEnvelope" && e["state"] == "panicked" })
+        );
+        assert_eq!(events.last().unwrap()["phase"], "Terminal");
+        assert_eq!(events.last().unwrap()["state"], "Panicked");
+        assert_eq!(
+            events.iter().filter(|e| e["phase"] == "Terminal").count(),
+            1
+        );
+        assert!(!format!("{events:?}").contains("private construction failure"));
+    }
 
     #[test]
     fn a_handler_write_ack_does_not_wait_for_a_second_blocking_pool_slot() {

@@ -346,6 +346,8 @@ pub(crate) enum Phase {
     OwnerCall,
     ForwardCall,
     Envelope,
+    Deadline,
+    TimeoutEnvelope,
 }
 
 struct Inner {
@@ -710,7 +712,7 @@ pub(crate) mod tests {
             self.0.lock().unwrap().clone()
         }
     }
-    fn trace() -> Trace {
+    pub(crate) fn trace() -> Trace {
         Trace::new(format!("request/{}", uuid::Uuid::nil()))
     }
 
