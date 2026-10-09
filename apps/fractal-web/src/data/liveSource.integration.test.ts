@@ -229,10 +229,10 @@ class Gateway {
       collection: 'conversation', session_id: 'session/example',
       replace: false, has_more: false,
       items: [
-        { id: 'timeline-entry/echo/message', sequence: 1, revision: 1,
+        { id: 'timeline-entry/echo/0123456789abcdef-message', sequence: 1, revision: 1,
           type: 'message', role: 'user', final: true, timestamp: snapshot.created_at,
           body: { message_id: this.echoMessageId, from: 'person/operator', to: agent.id } },
-        { id: 'timeline-entry/echo/content', sequence: 2, revision: 1,
+        { id: 'timeline-entry/echo/0123456789abcdef-content', sequence: 2, revision: 1,
           type: 'content', role: 'user', final: true, timestamp: snapshot.created_at,
           body: { media_type: 'text/plain', text: 'hello' } },
       ],
@@ -747,7 +747,9 @@ describe('optimistic conversation sends', () => {
         expect(observed().lastSendId).toBe(second.id)
         gateway.mailEcho()
         yield* settle
-        expect(observed().items.some(item => item.id === second.id)).toBe(false)
+        const secondEcho = observed().items.find(item => item.id === second.id)
+        expect(secondEcho).toMatchObject({ _tag: 'Text' })
+        expect(secondEcho).not.toHaveProperty('sendState')
         expect(observed().lastSendId).toBe(second.id)
         yield* Effect.promise(() => live.source.attachments!.send(request))
         yield* settle
@@ -838,9 +840,11 @@ describe('optimistic conversation sends', () => {
         expect(observed().items.map(item => item.id)).toEqual(['history', 'equal-time', pendingRow.id, 'reply', secondRow.id])
         gateway.mailEcho()
         yield* settle
-        expect(observed().items.some(item => item.id === secondRow.id)).toBe(false)
+        const secondEcho = observed().items.find(item => item.id === secondRow.id)
+        expect(secondEcho).toMatchObject({ _tag: 'Text' })
+        expect(secondEcho).not.toHaveProperty('sendState')
         expect(observed().items.some(item => item.id === pendingRow.id)).toBe(true)
-        expect(observed().items.filter(item => item._tag === 'Message')).toHaveLength(1)
+        expect(observed().items.filter(item => item._tag === 'Message')).toHaveLength(0)
       }),
     )
   })
@@ -882,8 +886,7 @@ describe('optimistic conversation sends', () => {
             yield* settle
             expect(live.registry.get(conversation)).toMatchObject({
               _tag: 'Observed', value: { items: [
-                { _tag: 'Message', messageId: gateway.echoMessageId },
-                { _tag: 'Text', id: 'timeline-entry/echo/content', text: 'hello' },
+                { _tag: 'Text', id: `pending/${gateway.messageActions[0]!.idempotency_key}`, text: 'hello' },
               ] },
             })
           }
@@ -895,7 +898,7 @@ describe('optimistic conversation sends', () => {
           expect(feed._tag).toBe('Observed')
           if (feed._tag !== 'Observed') return
           expect(feed.value.items.filter((item) => item._tag === 'Text')).toEqual([
-            expect.objectContaining({ id: 'timeline-entry/echo/content', text: 'hello' }),
+            expect.objectContaining({ id: `pending/${gateway.messageActions[0]!.idempotency_key}`, text: 'hello' }),
           ])
           expect(feed.value.items.every((item) => item._tag !== 'Text' || item.sendState === undefined)).toBe(true)
           expect(gateway.messageActions[0]?.idempotency_key).toMatch(/^[0-9a-f-]{36}$/)
@@ -1090,7 +1093,7 @@ describe('optimistic conversation sends', () => {
         expect(feed).toMatchObject({ _tag: 'Observed' })
         if (feed._tag !== 'Observed') return
         expect(feed.value.items.filter((item) => item._tag === 'Text')).toEqual([
-          expect.objectContaining({ id: 'timeline-entry/echo/content', text: 'hello' }),
+          expect.objectContaining({ id: `pending/${gateway.messageActions[0]!.idempotency_key}`, text: 'hello' }),
         ])
       }),
     ),
@@ -1134,7 +1137,7 @@ describe('optimistic conversation sends', () => {
         expect(feed).toMatchObject({ _tag: 'Observed' })
         if (feed._tag !== 'Observed') return
         expect(feed.value.items.filter((item) => item._tag === 'Text')).toEqual([
-          expect.objectContaining({ id: 'timeline-entry/echo/content', text: 'hello' }),
+          expect.objectContaining({ id: `pending/${gateway.messageActions[0]!.idempotency_key}`, text: 'hello' }),
         ])
       }),
     ),

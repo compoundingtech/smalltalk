@@ -89,7 +89,6 @@ interface RetainedConversation extends RetainedFeed<ConversationPage> {
 
 interface PendingSend {
   item: TextItem
-  messageIds: readonly string[]
 }
 
 /** Connect retained workbench projections through one SDK runtime and frame writer. */
@@ -568,9 +567,9 @@ export const liveSource = ({
   const attachments = gatewayAttachments(client, messageSnapshot)
   const conversationFamily = Atom.family((ref: string): RetainedConversation => {
     const timeline = new LiveTimeline()
-    // A Sent row retires only on an in-window identity echo. Until smalltalk#1977 provides
-    // owner-side read-after-send visibility, an absent row on even a later replace page proves
-    // nothing: out-of-window Sent rows persist with their retained conversation's LRU lifetime.
+    // A Sent row retires only when its identity-correlated server content is in the window.
+    // Until smalltalk#1977 provides owner-side read-after-send visibility, an absent row on
+    // even a later replace page proves nothing; outbox and key aliases share this feed's lifetime.
     const pending = new Map<string, PendingSend>()
     let lastSendId: string | undefined
     let painted = false
@@ -578,10 +577,9 @@ export const liveSource = ({
     let changedFrom = Infinity
     const projectPage = (): ConversationPage => {
       const projection = timeline.project()
-      const shown = timeline.shownMessageIds()
       const hadPending = pending.size > 0
-      for (const [id, send] of pending)
-        if (send.messageIds.some((messageId) => shown.has(messageId))) pending.delete(id)
+      if (hadPending)
+        for (const item of projection.items) pending.delete(item.id)
       const items = pending.size === 0 ? projection.items : mergeOutboxItems(projection.items, pending.values())
       if (hadPending) {
         // Timeline indices exclude interleaved outbox rows. Compare against the actual
@@ -647,7 +645,6 @@ export const liveSource = ({
           })),
           streaming: false, at: pending.get(id)?.item.at ?? new Date().toISOString(), sendState: { _tag: 'Pending' },
         },
-        messageIds: [],
       }
       // A first send paints immediately: Enter must not wait for any await. An explicit
       // Resend names mail the stream may already show, so its authoritative identity is
@@ -661,7 +658,8 @@ export const liveSource = ({
         // The public device-signing contract names mail from the first 16 SHA-256 hex digits.
         // Resolve this before POST so an echo that wins the HTTP race still replaces its outbox item.
         const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(idempotencyKey)))
-        local.messageIds = [`message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`]
+        const messageIds = [`message/${[...hash.slice(0, 8)].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`]
+        if (request._tag === 'Send') timeline.keepOwnSendId(messageIds, id)
         const submit = async () => {
           const current = await messageSnapshot()
           if (current._tag === 'Refused') return current
@@ -674,9 +672,10 @@ export const liveSource = ({
             idempotency_key: idempotencyKey,
           })
         }
-        if (request._tag === 'Resend' && timeline.shownMessageIds().has(local.messageIds[0]!)) return submit()
+        if (request._tag === 'Resend' && timeline.shownMessageIds().has(messageIds[0]!)) return submit()
         if (request._tag === 'Resend') {
           pending.set(id, local)
+          timeline.keepOwnSendId(messageIds, id)
           publishPending()
         }
         const result = await submit()
@@ -686,7 +685,7 @@ export const liveSource = ({
           local.item = { ...local.item, sendState: { _tag: 'Failed', reason: result.reason, detail: result.detail } }
         } else if (result._tag === 'Success' && result.value.status === 'completed') {
           const affected = result.value.affected_ids.filter((affected) => affected.startsWith('message/'))
-          if (affected.length > 0) local.messageIds = affected
+          if (affected.length > 0) timeline.keepOwnSendId(affected, id)
           // Terminal gateway success settles the outbox row even when the mailbox echo
           // falls outside the newest window; an in-window echo still removes it.
           local.item = { ...local.item, sendState: { _tag: 'Sent' } }

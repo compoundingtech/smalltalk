@@ -336,6 +336,10 @@ export class LiveTimeline {
   private itemsBefore: Array<number> = []
   private items: Array<ConversationItem> = []
   private readonly cache = new Map<string, CachedItem>()
+  /** Presentation identities are local to this retained conversation, never wire ids. */
+  private readonly ownSendIds = new Map<string, string>()
+  /** Keep proven mailbox pairs after their message header leaves the loaded window. */
+  private readonly ownSendContentIds = new Map<string, string>()
   private active = true
   private dirtyFrom = 0
   private reindex = false
@@ -580,6 +584,15 @@ export class LiveTimeline {
     return shown
   }
 
+  /** Register only a send that painted an outbox row; an already-shown Resend keeps its server id. */
+  keepOwnSendId(messageIds: readonly string[], itemId: string): void {
+    for (const messageId of messageIds) {
+      if (this.ownSendIds.get(messageId) === itemId) continue
+      this.ownSendIds.set(messageId, itemId)
+      this.dirtyFrom = 0
+    }
+  }
+
   /** Re-projects from the lowest touched position; free when nothing changed. */
   project(): TimelineProjection {
     if (this.reindex) this.rebuildIndex()
@@ -599,6 +612,11 @@ export class LiveTimeline {
     const shown = this.shownMessageIds()
     const userMailContent = new Set<string>()
     for (const entry of this.ordered) {
+      if (entry.type === 'message' && entry.role === 'user' && entry.body.from?.startsWith('person/')) {
+        const id = this.ownSendIds.get(entry.body.message_id)
+        const key = mailboxPairKey(entry)
+        if (id !== undefined && key !== undefined) this.ownSendContentIds.set(key, id)
+      }
       if (entry.type !== 'content' || entry.role !== 'user' || entry.body.media_type !== 'text/plain') continue
       const key = mailboxPairKey(entry)
       if (key !== undefined) userMailContent.add(key)
@@ -608,6 +626,8 @@ export class LiveTimeline {
       this.itemsBefore.push(items.length)
       if (isTurnHeader(entry) || entry.type === 'truncation') continue
       if (entry.type === 'message' && entry.role === 'user' && entry.body.from?.startsWith('person/')) {
+        // Own-send prose stays in the outbox until its correlated content is visible.
+        if (this.ownSendIds.has(entry.body.message_id)) continue
         const key = mailboxPairKey(entry)
         // Keep header-only mail and separate agent mail; one person send needs only its user row.
         if (key !== undefined && userMailContent.has(key)) continue
@@ -689,8 +709,11 @@ export class LiveTimeline {
     readonly result: ToolResultEntry | undefined
     readonly active: boolean
   }): ConversationItem {
+    const key = entry.type === 'content' && entry.role === 'user' && entry.body.media_type === 'text/plain'
+      ? mailboxPairKey(entry) : undefined
+    const id = (key === undefined ? undefined : this.ownSendContentIds.get(key)) ?? entry.id
     const hit = this.cache.get(entry.id)
-    if (hit !== undefined && hit.entry === entry && hit.result === result && hit.active === active)
+    if (hit !== undefined && hit.entry === entry && hit.result === result && hit.active === active && hit.item.id === id)
       return hit.item
     let item: ConversationItem
     if (entry.type === 'tool_result') item = joinResult({ call: undefined, entry })
@@ -701,6 +724,7 @@ export class LiveTimeline {
           ? joinResult({ call: own, entry: result })
           : own
     }
+    if (item._tag === 'Text' && item.id !== id) item = { ...item, id }
     this.cache.set(entry.id, { entry, result, active, item })
     return item
   }

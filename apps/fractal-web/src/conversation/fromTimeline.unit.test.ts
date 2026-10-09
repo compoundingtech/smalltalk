@@ -224,6 +224,67 @@ in my own words`
     expect(Array.from(timeline.shownMessageIds())).toEqual(['message/abc', 'message/separate'])
   })
 
+  it.each([
+    ['native', mailMessage, mailContent],
+    ['stored fallback', 'timeline-entry/s1/111111111111111111111111', 'timeline-entry/s1/222222222222222222222222'],
+  ])('retains an own-send id through %s echo, revisions and header paging, but not reload', (_, messageId, contentId) => {
+    const timeline = new LiveTimeline()
+    const header = entry(messageId, 4, 'message', {
+      message_id: 'message/abc', from: 'person/operator', to: 'agent/example',
+    })
+    const content = entry(contentId, 5, 'content', { media_type: 'text/plain', text: 'Server prose' })
+    timeline.keepOwnSendId(['message/abc'], 'pending/own-key')
+    timeline.apply({ replace: true, hasMore: false, entries: [header] })
+    // A header is correlation evidence, not a replacement for the visible optimistic prose.
+    expect(timeline.project().items).toEqual([])
+    timeline.apply({ replace: false, hasMore: false, entries: [content] })
+    const echoed = timeline.project().items[0]
+    expect(echoed).toMatchObject({ id: 'pending/own-key', text: 'Server prose' })
+    timeline.apply({ replace: false, hasMore: false, entries: [] })
+    expect(timeline.project().items[0]).toBe(echoed)
+    timeline.apply({ replace: false, hasMore: false, entries: [{
+      ...entry(contentId, 5, 'content', { media_type: 'text/plain', text: 'Revised server prose' }), revision: 2,
+    }] })
+    expect(timeline.project().items[0]).toMatchObject({ id: 'pending/own-key', text: 'Revised server prose' })
+    timeline.apply({ replace: true, hasMore: true, entries: [content] })
+    expect(timeline.project().items[0]).toMatchObject({ id: 'pending/own-key', text: 'Server prose' })
+    timeline.apply({ replace: true, hasMore: false, entries: [header, content] })
+    expect(timeline.project().items[0]?.id).toBe('pending/own-key')
+    const reloaded = new LiveTimeline()
+    reloaded.apply({ replace: true, hasMore: false, entries: [header, content] })
+    expect(reloaded.project().items[0]?.id).toBe(contentId)
+  })
+
+  it('correlates by message identity, never by equal prose or adjacent native content', () => {
+    const timeline = new LiveTimeline()
+    timeline.keepOwnSendId(['message/abc'], 'pending/own-key')
+    timeline.apply({
+      replace: true, hasMore: false,
+      entries: [
+        ...shownMail(4),
+        entry('timeline-entry/s1/3333333333333333-message', 8, 'message', {
+          message_id: 'message/unrelated', from: 'person/operator', to: 'agent/example',
+        }),
+        entry('timeline-entry/s1/3333333333333333-content', 9, 'content', { media_type: 'text/plain', text: 'hello' }),
+        entry('timeline-entry/native-10', 10, 'content', { media_type: 'text/plain', text: 'hello' }),
+      ],
+    })
+    expect(timeline.project().items.map(item => item.id)).toEqual([
+      'pending/own-key', 'timeline-entry/s1/3333333333333333-content', 'timeline-entry/native-10',
+    ])
+  })
+
+  it('invalidates cached server ids when an acknowledgement supplies a new correlation identity', () => {
+    const timeline = new LiveTimeline()
+    timeline.apply({ replace: true, hasMore: false, entries: shownMail(4) })
+    expect(timeline.project().items[0]?.id).toBe(mailContent)
+    timeline.keepOwnSendId(['message/abc'], 'pending/own-key')
+    expect(timeline.project().items[0]?.id).toBe('pending/own-key')
+    const echoed = timeline.project().items[0]
+    timeline.keepOwnSendId(['message/abc'], 'pending/own-key')
+    expect(timeline.project().items[0]).toBe(echoed)
+  })
+
   it('keeps a person header until its own content arrives, then removes the extra row across deltas', () => {
     const timeline = new LiveTimeline()
     timeline.apply({ replace: true, hasMore: false, entries: [shownMail(4)[0]!] })

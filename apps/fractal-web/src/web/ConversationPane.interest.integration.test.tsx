@@ -92,6 +92,7 @@ class Gateway {
   sendGate: Promise<void> | undefined
   readonly actions: Native.ActionRequest[] = []
   echoId: string | undefined
+  sendMessageId: string | undefined
 
   readonly fetch: typeof fetch = async (input, init) => {
     const path = new URL(String(input)).pathname
@@ -100,7 +101,7 @@ class Gateway {
       if (action.type !== 'message.send') throw new Error('Expected a message.send action')
       this.actions.push(action)
       const digest = new Uint8Array(await webcrypto.subtle.digest('SHA-256', new TextEncoder().encode(action.idempotency_key)))
-      this.echoId = `message/${[...digest.slice(0, 8)].map(byte => byte.toString(16).padStart(2, '0')).join('')}`
+      this.echoId = this.sendMessageId ?? `message/${[...digest.slice(0, 8)].map(byte => byte.toString(16).padStart(2, '0')).join('')}`
       await this.sendGate
       if (this.abortSend) throw new TypeError('Failed to fetch')
       if (this.failSend) return new Response(JSON.stringify({
@@ -229,6 +230,7 @@ afterEach(async () => {
   container.remove()
   vi.unstubAllGlobals()
   vi.useRealTimers()
+  vi.restoreAllMocks()
 })
 
 /** Drain socket callbacks, browser-task decode slices, stream fibers and frame-ingest commits. */
@@ -417,8 +419,17 @@ const submitDraft = async () => {
 const userRows = () => [...container.querySelectorAll('[data-testid="user-message"][data-send-state]')]
 
 describe('ConversationPane composer/send binding', () => {
-  it('submit issues Send exactly once and paints Pending, then Sent, then one echo row', async () => {
+  it.each([
+    { echoFirst: false, affectedId: undefined },
+    { echoFirst: true, affectedId: undefined },
+    { echoFirst: false, affectedId: 'message/gateway-assigned' },
+  ])('keeps the own-send row and turn mounted through acknowledgement ($echoFirst, $affectedId)', async ({ echoFirst, affectedId }) => {
+    // The real kit scroller runs against deterministic jsdom dimensions; browser replay
+    // separately checks measured row geometry in a fully styled lane.
+    vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(2000)
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(400)
     await prepareSendPane()
+    gateway!.sendMessageId = affectedId
     const send = vi.spyOn(live!.source.attachments!, 'send')
     let resolve!: () => void
     gateway!.sendGate = new Promise<void>(done => { resolve = done })
@@ -428,15 +439,37 @@ describe('ConversationPane composer/send binding', () => {
     expect(send.mock.calls[0]![0]).toMatchObject({ _tag: 'Send', parameters: { to: scratchSeat, content: 'hello' } })
     expect(userRows()).toHaveLength(1)
     expect(userRows()[0]!.getAttribute('data-send-state')).toBe('pending')
-    resolve()
-    await until(() => userRows()[0]?.getAttribute('data-send-state') === 'sent')
+    const pendingRow = userRows()[0]!
+    const itemId = pendingRow.getAttribute('data-item-id')
+    const turn = pendingRow.closest('[data-testid="transcript-turn"]')
+    expect(itemId).toBe(`pending/${gateway!.actions[0]!.idempotency_key}`)
+    expect(turn?.getAttribute('data-item-id')).toBe(itemId)
+    const lane = container.querySelector<HTMLElement>('[data-testid="transcript-scroll"]')!
+    expect(lane.scrollTop).toBe(1600)
+    if (!echoFirst) {
+      resolve()
+      await until(() => userRows()[0]?.getAttribute('data-send-state') === 'sent')
+      expect(userRows()[0]).toBe(pendingRow)
+    }
+    await until(() => gateway!.echoId !== undefined)
     const echoId = gateway!.echoId
     if (echoId === undefined) throw new Error('the send action returned no message id to echo')
     gateway!.conversationFrame(scratchSeat, [
-      { ...entry(1, ''), id: 'timeline-entry/echo/message', type: 'message', role: 'user', body: { message_id: echoId, from: 'person/operator', to: scratchSeat } },
-      { ...entry(2, 'hello'), id: 'timeline-entry/echo/content', role: 'user' },
+      { ...entry(1, ''), id: 'timeline-entry/echo/0123456789abcdef-message', type: 'message', role: 'user', body: { message_id: echoId, from: 'person/operator', to: scratchSeat } },
+      { ...entry(2, 'Acknowledged hello'), id: 'timeline-entry/echo/0123456789abcdef-content', type: 'content', role: 'user', body: { text: 'Acknowledged hello', media_type: 'text/plain' } },
     ])
-    await until(() => userRows()[0]?.getAttribute('data-item-id') === 'timeline-entry/echo/content')
+    await until(() => userRows()[0]?.textContent === 'Acknowledged hello')
+    expect(userRows()[0]).toBe(pendingRow)
+    expect(userRows()[0]!.getAttribute('data-item-id')).toBe(itemId)
+    expect(userRows()[0]!.closest('[data-testid="transcript-turn"]')).toBe(turn)
+    expect(turn?.getAttribute('data-item-id')).toBe(itemId)
+    if (echoFirst) {
+      resolve()
+      await settle()
+      expect(userRows()[0]).toBe(pendingRow)
+      expect(userRows()[0]!.getAttribute('data-item-id')).toBe(itemId)
+    }
+    expect(lane.scrollTop).toBe(1600)
     expect(userRows()).toHaveLength(1)
     expect(send).toHaveBeenCalledTimes(1)
   })
