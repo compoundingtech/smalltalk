@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Reuse the shared protected-main Nix tool and fixture cache in Linux test archive consumers.",
+  "replay": { "status": "none", "detail": "CI cache routing only; no deployed runtime or data changes." },
+  "schema": { "status": "none", "detail": "CI cache routing only; no deployed runtime or data changes." },
+  "rules": { "status": "none", "detail": "CI cache routing only; no deployed runtime or data changes." },
+  "compatibility": { "status": "none", "detail": "Pinned Nix recipes and exact-source test archive verification remain unchanged." },
+  "downtime": { "status": "none", "detail": "No production deployment or service restart." },
+  "manual": { "status": "none", "detail": "Existing cache misses still prepare the pinned fixtures normally." },
+  "recovery": { "status": "none", "detail": "CI-only change; no live state or migration." }
+}

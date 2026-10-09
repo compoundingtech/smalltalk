@@ -311,7 +311,16 @@ export const testArchiveConsumerSetup = [
     env: { PRODUCER_RESULT: "${{ needs.linux-test-build.result }}" },
     run: '[ "$PRODUCER_RESULT" = success ] || { echo "::error::shared test producer failed or was skipped"; exit 1; }' },
   ...commonSetupSteps.filter((step: any) => step.id !== 'cargo-cache'
-    && step !== buildSnapshotRestore && step !== buildSnapshotPrepare),
+    && step !== buildSnapshotRestore && step !== buildSnapshotPrepare)
+    // The producer already restores the protected-main linux-tests Nix cache.
+    // Reuse that tool/fixture cache here instead of cold, per-consumer entries.
+    // Nix still resolves the pinned recipes; compiled test archives remain bound
+    // separately to this exact successful producer, source, attempt and hashes.
+    .map((step: any) => step.id === 'nix-cache'
+      ? { ...step, with: { ...step.with,
+          key: step.with.key.replace('${{ github.job }}', 'linux-tests'),
+          'restore-keys': step.with['restore-keys'].replaceAll('${{ github.job }}', 'linux-tests') } }
+      : step),
   ...testBuildSteps.slice(0, 2),
   {
     name: 'Download this run attempt’s successful test build',
