@@ -36132,11 +36132,14 @@ mission "page-root" state="ready" {
             first.into_iter().chain(last).map(|run| run.subject).collect::<Vec<_>>(),
             expected.into_iter().map(|run| run.subject).collect::<Vec<_>>()
         );
-        store
-            .connection
-            .write()
+        let connection = store.connection.write();
+        connection
+            .execute("DELETE FROM run_generations WHERE run_id=?1", [&cursor])
+            .unwrap();
+        connection
             .execute("DELETE FROM mission_runs WHERE id=?1", [&cursor])
             .unwrap();
+        drop(connection);
         assert!(store
             .mission_runs_for_root_page(&root.subject, Some(&cursor), 50)
             .unwrap()
