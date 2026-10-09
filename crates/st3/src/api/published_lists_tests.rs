@@ -397,7 +397,7 @@ fn published_work_matches_the_direct_read_for_every_actor_as_time_passes() {
     // Another seat claims and submits its next work; a cancelled run's work leaves the list.
     let (water, birch) = step(&alpha, "water");
     act(&store, &water, &birch, "claim", "claim-water");
-    act(&store, &water, &birch, "submit", "submit-water");
+    act(&store, &water, &birch, "complete", "complete-water");
     fold_work_checked(&store);
     store.set_mission_run_state(&beta.id, "cancelled", "terminal", Some("no longer needed")).unwrap();
     let (publication, _) = fold_work_checked(&store);
