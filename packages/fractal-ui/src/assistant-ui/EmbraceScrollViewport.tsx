@@ -40,8 +40,8 @@ class ViewportController {
   private restored: ViewportState | undefined
   /** A restored line whose content is settling; the first reader scroll clears it. */
   private pendingTop: number | undefined
-  /** A pointer is down somewhere on the page; the dock keeps its layout until release. */
-  private pressing = false
+  /** Pointers down somewhere on the page; the dock keeps its layout until all are released. */
+  private readonly pressed = new Set<number>()
 
   constructor(saved?: ViewportState) {
     if (saved !== undefined && !saved.following) {
@@ -57,7 +57,7 @@ class ViewportController {
 
   /** Shows the jump only for unread rows, and never reflows the lane under an active press. */
   private dock() {
-    if (this.jumpButton !== null && !this.pressing) this.jumpButton.hidden = !this.unread
+    if (this.jumpButton !== null && this.pressed.size === 0) this.jumpButton.hidden = !this.unread
   }
 
   readonly released = (): ViewportState => ({ top: this.lastTop, following: this.following, unread: this.unread })
@@ -190,11 +190,18 @@ class ViewportController {
     }
     // Document-wide, so presses that start anywhere (a row action included) defer the reveal.
     const page = element.ownerDocument
-    const press = () => { this.pressing = true }
-    const release = () => {
-      this.pressing = false
+    const view = page.defaultView
+    const press = (event: PointerEvent) => { this.pressed.add(event.pointerId) }
+    const release = (event: PointerEvent) => {
+      this.pressed.delete(event.pointerId)
       this.dock()
     }
+    // A release the page never sees (the window blurs, the tab hides) must not latch the dock.
+    const abandon = () => {
+      this.pressed.clear()
+      this.dock()
+    }
+    const hidden = () => { if (page.visibilityState === 'hidden') abandon() }
     const observer = new ResizeObserver(this.schedule)
     observer.observe(element)
     if (element.firstElementChild !== null) observer.observe(element.firstElementChild)
@@ -207,6 +214,9 @@ class ViewportController {
     page.addEventListener('pointerdown', press, true)
     page.addEventListener('pointerup', release, true)
     page.addEventListener('pointercancel', release, true)
+    page.addEventListener('lostpointercapture', release, true)
+    page.addEventListener('visibilitychange', hidden)
+    view?.addEventListener('blur', abandon)
     if (this.restored !== undefined) {
       this.following = false
       this.pendingTop = this.restored.top
@@ -231,7 +241,10 @@ class ViewportController {
       page.removeEventListener('pointerdown', press, true)
       page.removeEventListener('pointerup', release, true)
       page.removeEventListener('pointercancel', release, true)
-      this.pressing = false
+      page.removeEventListener('lostpointercapture', release, true)
+      page.removeEventListener('visibilitychange', hidden)
+      view?.removeEventListener('blur', abandon)
+      this.pressed.clear()
       this.element = null
     }
   }
