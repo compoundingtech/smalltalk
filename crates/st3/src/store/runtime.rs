@@ -362,8 +362,8 @@ impl Runtime for SmalltalkRuntime {
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
         self.agent_roster_published.send_modify(|revision| *revision += 1);
-        // Projections replaced without a new claim: the lists stop serving their rows and fold
-        // from nothing, before the windows that read them are told to reread.
+        // Projections replaced without a new claim: the lists fold from nothing, dropping any
+        // fold under way, before the windows that read them are told to reread.
         self.published_missions.forget();
         self.published_work.forget();
         self.published_views.invalidate();
