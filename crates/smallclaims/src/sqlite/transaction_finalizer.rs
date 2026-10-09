@@ -109,6 +109,7 @@ impl<'connection> WriterTransaction<'connection> {
         self.finalizers.run(&self.transaction)?;
         check()?;
         self.transaction.commit()?;
+        crate::profile::managed_commit_succeeded();
         Ok(())
     }
 

@@ -14,6 +14,8 @@ use rusqlite::{Connection, OpenFlags, Transaction};
 mod read_lifetime;
 pub mod writer_budget;
 mod transaction_finalizer;
+#[cfg(test)]
+mod managed_commit_counter_tests;
 mod writer_queue;
 use transaction_finalizer::TransactionFinalizers;
 pub use transaction_finalizer::WriterTransaction;
@@ -765,6 +767,10 @@ fn run_write_batch(
         (_, Some(error)) => Err(error),
         (None, None) => unreachable!("a batch without a transaction failed to begin"),
     };
+    // Observe COMMIT before post-commit callbacks can unwind; no changed-row or ACK claim.
+    if committed.is_ok() {
+        crate::profile::managed_commit_succeeded();
+    }
     if let Ok(index) = current_index(connection) {
         committed_index.store(index, Ordering::Release);
     }
