@@ -177,14 +177,101 @@ impl PreparedPage {
     /// Call in the SAME read snapshot as prepare_*, before any off-writer computation.
     /// Ordinary namespace-keyed tables only. Generated/virtual tables are unsupported.
     pub fn capture_table(&mut self, db: &Connection, name: &str) -> Result<()> {
-        identifier(name)?;
+        self.capture_tables(db, &[name])
+    }
+
+    /// Capture a bounded group on the supplied preparation cut, sharing one foreign-key
+    /// inventory traversal. Nothing is cached across calls/cuts; all metadata is accepted
+    /// together only after every shape and fanout check succeeds. Duplicate group names refuse;
+    /// the single-table wrapper may still recapture an existing table. Schema row caps do not
+    /// qualify SQLite metadata VM/byte work; callers still need actual work accounting.
+    pub fn capture_tables(&mut self, db: &Connection, names: &[&str]) -> Result<()> {
+        ensure!(
+            !names.is_empty() && names.len() <= self.limits.tables,
+            "prepared table bound exceeded"
+        );
+        let requested = names
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        ensure!(requested.len() == names.len(), "duplicate prepared table");
+        for &name in names {
+            identifier(name)?;
+        }
+        ensure!(
+            self.tables
+                .keys()
+                .map(String::as_str)
+                .chain(names.iter().copied())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                <= self.limits.tables,
+            "prepared table bound exceeded"
+        );
+        let mut tables = BTreeMap::new();
+        for &name in names {
+            tables.insert(name.to_owned(), self.capture_table_shape(db, name)?);
+        }
+        // The materialized inventory preserves the old 256-table refusal. A LEFT JOIN
+        // emits a row even for a table with no foreign keys. Stream counts per table to
+        // preserve the old 128 FK-column-row cap, including unrelated tables. The extra
+        // global row detects truncation instead of treating an incomplete walk as safe.
+        const SCHEMA_TABLES: usize = 256;
+        const FK_ROWS: usize = 128;
+        let mut statement = db.prepare(
+            "WITH inventory AS MATERIALIZED (
+               SELECT name FROM main.sqlite_schema WHERE type='table' ORDER BY name LIMIT 257
+             )
+             SELECT inventory.name,f.id,f.\"table\"
+             FROM inventory LEFT JOIN pragma_foreign_key_list(inventory.name,'main') AS f ON 1
+             LIMIT ?1",
+        )?;
+        let mut rows = statement.query([(SCHEMA_TABLES * FK_ROWS + 1) as i64])?;
+        let mut inventory = BTreeMap::<String, usize>::new();
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            count += 1;
+            ensure!(
+                count <= SCHEMA_TABLES * FK_ROWS,
+                "prepared foreign-key inventory exceeds bound"
+            );
+            let candidate: String = row.get(0)?;
+            let fk_id: Option<i64> = row.get(1)?;
+            let target: Option<String> = row.get(2)?;
+            let foreign_keys = inventory.entry(candidate.clone()).or_default();
+            match (fk_id, target) {
+                (None, None) => {}
+                (Some(_), Some(target)) => {
+                    *foreign_keys += 1;
+                    ensure!(
+                        *foreign_keys <= FK_ROWS,
+                        "prepared foreign-key inventory exceeds bound"
+                    );
+                    ensure!(
+                        !names.iter().any(|name| candidate.eq_ignore_ascii_case(name)
+                            || target.eq_ignore_ascii_case(name)),
+                        "prepared output foreign keys unsupported"
+                    );
+                }
+                _ => bail!("prepared malformed foreign-key metadata"),
+            }
+            ensure!(
+                inventory.len() <= SCHEMA_TABLES,
+                "prepared schema inventory exceeds bound"
+            );
+        }
         ensure!(
             schema_version(db)? == self.schema_version,
             "prepared table schema changed"
         );
+        self.tables.extend(tables);
+        Ok(())
+    }
+
+    fn capture_table_shape(&self, db: &Connection, name: &str) -> Result<Table> {
         ensure!(
-            self.tables.len() < self.limits.tables || self.tables.contains_key(name),
-            "prepared table bound exceeded"
+            schema_version(db)? == self.schema_version,
+            "prepared table schema changed"
         );
         let kind: String = db.query_row(
             "SELECT type FROM pragma_table_list WHERE schema='main' AND name=?1",
@@ -193,7 +280,7 @@ impl PreparedPage {
         )?;
         ensure!(kind == "table", "prepared virtual/shadow table unsupported");
         let mut statement =
-            db.prepare("SELECT name,pk,hidden FROM pragma_table_xinfo(?1) LIMIT 129")?;
+            db.prepare("SELECT name,pk,hidden FROM pragma_table_xinfo(?1,'main') LIMIT 129")?;
         let fields = statement
             .query_map([name], |r| {
                 Ok((
@@ -209,39 +296,12 @@ impl PreparedPage {
         );
         ensure!(
             !db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND tbl_name=?1)",
+                "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name=?1)",
                 [name],
                 |r| r.get::<_, bool>(0)
             )?,
             "prepared output triggers unsupported"
         );
-        // Reject every foreign-key edge touching this output: cascades could turn a
-        // bounded point write into unbounded work. Inspect only a bounded schema inventory.
-        let mut inventory = db
-            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 257")?;
-        let names = inventory
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(
-            names.len() <= 256,
-            "prepared schema inventory exceeds bound"
-        );
-        for candidate in names {
-            let mut fk =
-                db.prepare("SELECT \"table\" FROM pragma_foreign_key_list(?1) LIMIT 129")?;
-            let targets = fk
-                .query_map([&candidate], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            ensure!(
-                targets.len() <= 128,
-                "prepared foreign-key inventory exceeds bound"
-            );
-            ensure!(
-                (candidate != name || targets.is_empty())
-                    && !targets.iter().any(|t| t.eq_ignore_ascii_case(name)),
-                "prepared output foreign keys unsupported"
-            );
-        }
         for field in &fields {
             identifier(&field.0)?;
         }
@@ -257,15 +317,11 @@ impl PreparedPage {
             .filter(|f| f.0 != "namespace")
             .map(|f| f.0.clone())
             .collect();
-        self.tables.insert(
-            name.into(),
-            Table {
-                name: name.into(),
-                columns,
-                keys,
-            },
-        );
-        Ok(())
+        Ok(Table {
+            name: name.into(),
+            columns,
+            keys,
+        })
     }
     /// Values cover all non-namespace columns in captured table order; namespace is injected.
     pub fn upsert(&mut self, table: &str, values: Vec<SqlValue>) -> Result<()> {

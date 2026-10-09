@@ -18,6 +18,21 @@ refusing every other TEMP object, including Installer/native/output shadows and
 TEMP triggers attached to main. A new control checks refusal before output/P DML,
 then publication after fresh validation. The quota SQL now uses PENDING_BYTES
 instead of the identical 2 MiB literal; limits and assertions are unchanged.
+At `4fb590855`, hosted merge `c2697667b5c6e57cfefbdce270c8b4b93f459ecb`
+(main `86ed5b7b`) compiled, passed Clippy and selected all sixteen names.
+Fifteen passed, including native crash boundaries and TEMP negatives. The strict
+accounting control failed all three existing CI attempts at 273 statements,
+6,474 VM steps, 672 fullscan steps, two sorts and zero autoindex rows. Its 128
+statement ceiling is unchanged. The current source shares one bounded main
+foreign-key inventory across the requested output tables through additive
+capture_tables; single capture_table is its one-table wrapper. Per-table shape
+and fanout refusals remain, and metadata acceptance is atomic across the group.
+New controls cover exact/one-over 256 tables and 128 FK rows, incoming/outgoing
+and composite/case-variant edges, main FK visibility under a TEMP shadow,
+single/group publication parity and unsupported second-table refusal. Current
+successor work counts and controls are UNRUN; this is not a measured improvement.
+The separate optional cost job failed link-minutes delivery/read/receipt evidence;
+no cause is attributed to this dormant source or the metadata walk.
 
 ## Source and actual dependencies
 

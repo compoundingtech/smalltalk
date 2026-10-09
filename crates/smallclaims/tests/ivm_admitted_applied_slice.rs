@@ -421,8 +421,7 @@ impl Slice {
             self.check(db)?;
             let mut page=self.installer.prepare_live_bounded(db,VIEW,limits(),input_rows,input_bytes)?;
             ensure!(page.rows().len()<=PAGE_ROWS,"fixture input fanout exceeded");
-            page.capture_table(db,"slice_output")?;
-            page.capture_table(db,"slice_coverage")?;
+            page.capture_tables(db,&["slice_output","slice_coverage"])?;
             let mut images=Vec::new();
             let mut bytes=0usize;
             for row in page.rows() {

@@ -406,6 +406,322 @@ fn schema_changes_hidden_fanout_and_bounds_are_refused() {
     assert!(page.capture_table(&db, "cards").is_err());
 }
 
+#[test]
+fn grouped_metadata_publication_matches_single_table_wrapper() {
+    for grouped in [false, true] {
+        let (mut db, i, job) = fixture();
+        ready(&mut db, &i, &job);
+        admit(&mut db, &i, "amber", 1);
+        let mut page = {
+            let tx = db.transaction().unwrap();
+            let mut page = i
+                .prepare_live(&tx, "cards", PublicationLimits::default())
+                .unwrap();
+            if grouped {
+                page.capture_tables(&tx, &["cards", "coverage"]).unwrap();
+            } else {
+                page.capture_table(&tx, "cards").unwrap();
+                page.capture_table(&tx, "coverage").unwrap();
+            }
+            // Recapturing an already captured table retains the old one-table semantics.
+            page.capture_table(&tx, "cards").unwrap();
+            tx.commit().unwrap();
+            page
+        };
+        page.upsert(
+            "cards",
+            vec![Sql::Text("amber".into()), Sql::Text("v1".into())],
+        )
+        .unwrap();
+        evidence(&mut page);
+        let tx = db.transaction().unwrap();
+        i.publish_prepared(&tx, &page, 3).unwrap();
+        tx.commit().unwrap();
+        let root = i.root(&db, "cards").unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT k,body FROM cards WHERE namespace=?1",
+                [root.namespace.as_str()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            )
+            .unwrap(),
+            ("amber".to_owned(), "v1".to_owned())
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT complete FROM coverage WHERE namespace=?1",
+                [root.namespace.as_str()],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert!(i.status(&db, "cards").unwrap().ready);
+    }
+}
+
+#[test]
+fn grouped_metadata_checks_request_union_before_discovery_and_keeps_existing_metadata() {
+    let (mut db, i, job) = fixture();
+    ready(&mut db, &i, &job);
+    let mut page = i
+        .prepare_live(
+            &db,
+            "cards",
+            PublicationLimits {
+                tables: 1,
+                ..PublicationLimits::default()
+            },
+        )
+        .unwrap();
+    page.capture_table(&db, "cards").unwrap();
+    let error = page.capture_tables(&db, &["absent_output"]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("prepared table bound exceeded"),
+        "reject existing+requested table union before attempting absent table discovery"
+    );
+    page.upsert(
+        "cards",
+        vec![Sql::Text("amber".into()), Sql::Text("v1".into())],
+    )
+    .unwrap();
+    db.execute_batch("CREATE TABLE side_effect(k); CREATE TRIGGER hidden_fanout AFTER INSERT ON coverage BEGIN INSERT INTO side_effect VALUES(1); END").unwrap();
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    page.capture_table(&db, "cards").unwrap();
+    assert!(page.capture_tables(&db, &["cards", "coverage"]).is_err());
+    page.upsert(
+        "cards",
+        vec![Sql::Text("amber".into()), Sql::Text("v1".into())],
+    )
+    .unwrap();
+    assert!(page.upsert("coverage", vec![Sql::Integer(1)]).is_err());
+}
+
+#[test]
+fn grouped_metadata_rejects_incoming_outgoing_and_case_variant_foreign_keys() {
+    for ddl in [
+        // Incoming composite edge and case-insensitive target name.
+        "CREATE TABLE child(namespace TEXT,k TEXT,FOREIGN KEY(namespace,k) REFERENCES CaRdS(namespace,k) ON DELETE CASCADE)",
+        // Outgoing edge to an unrelated parent is also unsupported.
+        "CREATE TABLE parent(k TEXT PRIMARY KEY); DROP TABLE coverage;
+         CREATE TABLE coverage(namespace TEXT PRIMARY KEY REFERENCES parent(k),complete INTEGER)",
+        // An incoming edge touching the second requested output cannot be missed.
+        "CREATE TABLE child(namespace TEXT REFERENCES coverage(namespace))",
+    ] {
+        let (mut db, i, job) = fixture();
+        ready(&mut db, &i, &job);
+        db.execute_batch(ddl).unwrap();
+        let mut page = i
+            .prepare_live(&db, "cards", PublicationLimits::default())
+            .unwrap();
+        let error = page
+            .capture_tables(&db, &["cards", "coverage"])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("prepared output foreign keys unsupported"));
+        assert!(
+            page.upsert(
+                "cards",
+                vec![Sql::Text("amber".into()), Sql::Text("body".into())]
+            )
+            .is_err(),
+            "a rejected group must not accept its first table's metadata"
+        );
+        let mut single = i
+            .prepare_live(&db, "cards", PublicationLimits::default())
+            .unwrap();
+        let affected = if ddl.contains("REFERENCES CaRdS") {
+            "cards"
+        } else {
+            "coverage"
+        };
+        assert!(
+            single.capture_table(&db, affected).is_err(),
+            "single-table wrapper retains fanout refusal"
+        );
+    }
+}
+
+#[test]
+fn grouped_metadata_main_foreign_key_inventory_is_not_hidden_by_temp_shadow() {
+    let (mut db, i, job) = fixture();
+    ready(&mut db, &i, &job);
+    db.execute_batch("CREATE TABLE main.child(namespace TEXT,k TEXT,FOREIGN KEY(namespace,k) REFERENCES cards(namespace,k) ON DELETE CASCADE);
+        CREATE TEMP TABLE child(k INTEGER)").unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('child','main')",
+            [],
+            |r| r.get::<_, usize>(0)
+        )
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('child','temp')",
+            [],
+            |r| r.get::<_, usize>(0)
+        )
+        .unwrap(),
+        0
+    );
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    let error = page
+        .capture_tables(&db, &["cards", "coverage"])
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("prepared output foreign keys unsupported"));
+    assert!(
+        page.upsert(
+            "cards",
+            vec![Sql::Text("amber".into()), Sql::Text("body".into())]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn grouped_metadata_accepts_exact_schema_table_cap_and_refuses_one_over() {
+    let (mut db, i, job) = fixture();
+    ready(&mut db, &i, &job);
+    let existing: usize = db
+        .query_row(
+            "SELECT COUNT(*) FROM main.sqlite_schema WHERE type='table'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(existing < 256);
+    for n in existing..256 {
+        db.execute_batch(&format!("CREATE TABLE main.inventory_{n}(k INTEGER)"))
+            .unwrap();
+    }
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM main.sqlite_schema WHERE type='table'",
+            [],
+            |r| r.get::<_, usize>(0)
+        )
+        .unwrap(),
+        256
+    );
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    page.capture_tables(&db, &["cards", "coverage"]).unwrap();
+    page.upsert(
+        "cards",
+        vec![Sql::Text("amber".into()), Sql::Text("body".into())],
+    )
+    .unwrap();
+    db.execute_batch("CREATE TABLE main.one_table_over(k INTEGER)")
+        .unwrap();
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    let error = page
+        .capture_tables(&db, &["cards", "coverage"])
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("prepared schema inventory exceeds bound"));
+    assert!(
+        page.upsert(
+            "cards",
+            vec![Sql::Text("amber".into()), Sql::Text("body".into())]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn grouped_metadata_accepts_exact_fk_row_cap_and_refuses_one_over() {
+    let (mut db, i, job) = fixture();
+    ready(&mut db, &i, &job);
+    db.execute_batch("CREATE TABLE main.other_parent(k INTEGER PRIMARY KEY)")
+        .unwrap();
+    let columns = |count| {
+        (0..count)
+            .map(|n| format!("k{n} INTEGER REFERENCES other_parent(k)"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    db.execute_batch(&format!("CREATE TABLE main.fk_inventory({})", columns(128)))
+        .unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('fk_inventory','main')",
+            [],
+            |r| r.get::<_, usize>(0)
+        )
+        .unwrap(),
+        128
+    );
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    page.capture_tables(&db, &["cards", "coverage"]).unwrap();
+    db.execute_batch(&format!(
+        "DROP TABLE main.fk_inventory; CREATE TABLE main.fk_inventory({})",
+        columns(129)
+    ))
+    .unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_list('fk_inventory','main')",
+            [],
+            |r| r.get::<_, usize>(0)
+        )
+        .unwrap(),
+        129
+    );
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    let error = page
+        .capture_tables(&db, &["cards", "coverage"])
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("prepared foreign-key inventory exceeds bound"));
+    assert!(
+        page.upsert(
+            "cards",
+            vec![Sql::Text("amber".into()), Sql::Text("body".into())]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn grouped_metadata_refuses_unsupported_second_table_without_partial_acceptance() {
+    let (mut db, i, job) = fixture();
+    ready(&mut db, &i, &job);
+    db.execute_batch("CREATE TABLE side_effect(k); CREATE TRIGGER hidden_fanout AFTER INSERT ON coverage BEGIN INSERT INTO side_effect VALUES(1); END").unwrap();
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    assert!(page.capture_tables(&db, &[]).is_err());
+    assert!(page.capture_tables(&db, &["cards", "cards"]).is_err());
+    let error = page
+        .capture_tables(&db, &["cards", "coverage"])
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("prepared output triggers unsupported"));
+    assert!(
+        page.upsert(
+            "cards",
+            vec![Sql::Text("amber".into()), Sql::Text("body".into())]
+        )
+        .is_err()
+    );
+    // The original one-table API still accepts the valid sibling, never the rejected group.
+    page.capture_table(&db, "cards").unwrap();
+    page.upsert(
+        "cards",
+        vec![Sql::Text("amber".into()), Sql::Text("body".into())],
+    )
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_worker_preserves_notice_during_owned_page_and_propagates_failure() {
     use smallclaims::ivm::{
