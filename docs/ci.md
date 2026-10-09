@@ -503,9 +503,12 @@ Generated usage history contains cumulative response rollups for long-lived stan
 with stable attribution, so this scenario exercises many observations per series and period
 baselines and totals rather than an empty report or one series per observation.
 It fails when
-a request's p99 or the daemon's CPU passes its budget, or is more than 20% worse than the worst of
-main's last five reports: one run's p99 on a shared runner can be twice the next run's, so a
-regression is what passes several. Each run downloads the newest five real reports from successful
+a request's p99 or the daemon's CPU passes its absolute budget, or exceeds twice the worst of
+main's last five reports and the corresponding slack below. The relative factor is 2x for both
+route p99 and average daemon CPU; every absolute budget still applies independently, including
+the 300 ms roster budgets and 2-core CPU ceiling. The wider relative tolerance accommodates
+variation on shared runners; a passing historical comparison does not establish a paired effect
+or attribute a difference to runner noise. Each run downloads the newest five real reports from successful
 main runs' `perf-load-logs` artifacts. PR runs never supply baselines. Relative latency comparisons start once five
 main reports exist; until then every path still checks its absolute p99 budget and every request
 error fails. CPU compares as soon as one main report exists, because it averages the whole run.

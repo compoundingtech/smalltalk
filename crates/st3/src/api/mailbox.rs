@@ -652,6 +652,7 @@ async fn stream_with_timers_inner<F, S, H>(
             // first proof. Durable wakes (and the bounded safety heartbeat) let its current
             // consumed nonce repair that episode too, without reoffering native work.
             replay_proven = false;
+            let admission_store = state.store.clone();
             let store = state.store.clone();
             let binding = fence.clone();
             let read = read.clone();
@@ -676,7 +677,7 @@ async fn stream_with_timers_inner<F, S, H>(
                 }
             } else { false };
             if repaired { previous = None; }
-            let result = crate::api::read_deadline::spawn_blocking(move || {
+            let result = crate::api::read_deadline::store_read(&admission_store, move || {
                 crate::profile::task("task mailbox-update", || {
                     let result = update_snapshot(
                         &store,

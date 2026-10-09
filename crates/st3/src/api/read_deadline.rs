@@ -403,6 +403,106 @@ impl std::fmt::Display for WorkError {
 }
 impl std::error::Error for WorkError {}
 
+fn admission_error(error: anyhow::Error) -> WorkError {
+    let typed = smallclaims::error::typed(error);
+    if typed.code == "read-deadline" {
+        WorkError::Deadline(typed)
+    } else {
+        WorkError::Store(typed)
+    }
+}
+
+/// Admit and loan the handler's reader freshly for each poll of its future. Admission is
+/// asynchronous and happens before any store lock; a poll that stays pending — an event
+/// wait, a WebSocket upgrade, or a window/roster permit — returns its loan and permit, so
+/// waits hold no reader on either runtime and cannot starve other read workers. Long-poll
+/// handlers and unbudgeted upgrades never take this loan: their actual queries use their
+/// own explicit scopes.
+pub(super) async fn handler<F>(future: F) -> Response
+where
+    F: Future<Output = Response>,
+{
+    let admission_budget = read_budget::current();
+    let scoped_store = if admission_budget
+        .as_ref()
+        .is_some_and(|budget| !long_poll_route(budget.route()))
+    {
+        STORE.with(|slot| slot.borrow().clone())
+    } else {
+        None
+    };
+    let Some(store) = scoped_store else {
+        return future.await;
+    };
+    let mut future = std::pin::pin!(future);
+    let mut admission = std::pin::pin!(store.readers.admit_read(admission_budget.clone()));
+    let mut diagnostic_admission = None;
+    std::future::poll_fn(|cx| {
+        if smallclaims::sqlite::thread_holds_reader() {
+            if store.readers.has_request_reader() {
+                return future.as_mut().poll(cx);
+            }
+            return store
+                .readers
+                .request_read(|| future.as_mut().poll(cx))
+                .unwrap_or_else(|error| Poll::Ready(ApiError::internal(error).into_response()));
+        }
+        let admission_span = diagnostic_admission.get_or_insert_with(|| {
+            crate::relay_trace::span(crate::relay_trace::Phase::HandlerReaderAdmission)
+        });
+        let admitted = match admission.as_mut().poll(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(permit)) => {
+                admission_span.finish(crate::relay_trace::Outcome::Completed);
+                diagnostic_admission = None;
+                permit
+            }
+            Poll::Ready(Err(error)) => {
+                admission_span.finish(crate::relay_trace::Outcome::Failed);
+                return Poll::Ready(ApiError::internal(error).into_response());
+            }
+        };
+        // Reset the stack-pinned admission future for the next handler poll. The current
+        // poll's loan publishes its returned connection before its permit wakes a waiter.
+        admission.set(store.readers.admit_read(admission_budget.clone()));
+        store
+            .readers
+            .request_read_with_permit(admitted, || future.as_mut().poll(cx))
+            .unwrap_or_else(|error| Poll::Ready(ApiError::internal(error).into_response()))
+    })
+    .await
+}
+
+/// One store-reading worker started outside the request envelope, typically after a
+/// WebSocket upgrade. It takes the same reader admission as an HTTP read worker, but
+/// keeps the upgraded stream's existing policy: no read budget or deadline is imposed,
+/// and dropping the returned future releases a still-pending admission. Same-thread
+/// nested callers run inline: same-pool loans are reused, and another pool is tried without waiting.
+pub(super) async fn store_read<T, F>(store: &Arc<super::Store>, work: F) -> Result<T, WorkError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    if smallclaims::sqlite::thread_holds_reader() {
+        return store.readers.request_read(work).map_err(admission_error);
+    }
+    let permit = store
+        .readers
+        .admit_read(None)
+        .await
+        .map_err(|error| WorkError::Store(smallclaims::error::typed(error)))?;
+    let store = store.clone();
+    let run = move || {
+        store
+            .readers
+            .request_read_with_permit(permit, work)
+            .map_err(|error| WorkError::Store(smallclaims::error::typed(error)))
+    };
+    tokio::task::spawn_blocking(run)
+        .await
+        .map_err(WorkError::Join)?
+}
+
 /// Propagate the read budget to every nested blocking task in the API. This wrapper has
 /// no effect on writes or on stream work started after the request's upgrade completes.
 #[track_caller]
@@ -438,10 +538,23 @@ where
     });
     let worker_budget = budget.clone();
     let diagnostic = crate::relay_trace::current();
-    let mut diagnostic_queue = diagnostic
-        .as_ref()
-        .map(|trace| trace.span(crate::relay_trace::Phase::BlockingQueue));
+    let diagnostic_admission = diagnostic.clone();
+    let diagnostic_dispatch = diagnostic.clone();
     let store = STORE.with(|slot| slot.borrow().clone());
+    let multithread = matches!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread
+    );
+    let reentrant = store
+        .as_ref()
+        .is_some_and(|store| store.readers.has_request_reader());
+    let cross_pool =
+        query && store.is_some() && !reentrant && smallclaims::sqlite::thread_holds_reader();
+    // Handlers never own a whole-request reader: `handler` admits per poll, and their
+    // nested queries take query admission themselves. Only explicit query work admits here.
+    let loan = budget.is_some() && query;
+    let admission_store = store.clone().filter(|_| loan);
+    let admission_budget = budget.clone();
     // Capture cancellation before executing an inline operation, including a panic.
     struct Cancel(Option<ReadBudget>);
     impl Drop for Cancel {
@@ -454,7 +567,8 @@ where
     let cancel = Cancel(budget.clone());
     let profile = query.then(crate::profile::current).flatten();
     let queued = profile.as_ref().map(|op| op.wall_span("blocking/queue"));
-    let run = move || {
+    let run = move |permit: Option<smallclaims::sqlite::ReadPermit>,
+                    mut diagnostic_queue: Option<crate::relay_trace::Span>| {
         if let Some(span) = &mut diagnostic_queue {
             span.finish(crate::relay_trace::Outcome::Completed);
         }
@@ -467,17 +581,19 @@ where
                         if let Some(budget) = &worker_budget {
                             budget.check().map_err(WorkError::Deadline)?;
                         }
-                        let result = if worker_budget.is_some() {
-                            match &store {
-                                Some(store) => {
-                                    store.readers.request_read(work).map_err(|error| {
-                                        WorkError::Store(smallclaims::error::typed(error))
-                                    })?
-                                }
-                                None => work(),
+                        let result = match (&store, permit) {
+                            (Some(store), Some(permit)) => store
+                                .readers
+                                .request_read_with_permit(permit, work)
+                                .map_err(|error| {
+                                    WorkError::Store(smallclaims::error::typed(error))
+                                })?,
+                            (Some(store), None) if loan => {
+                                store.readers.request_read(work).map_err(|error| {
+                                    WorkError::Store(smallclaims::error::typed(error))
+                                })?
                             }
-                        } else {
-                            work()
+                            _ => work(),
                         };
                         if let Some(budget) = &worker_budget {
                             budget.check().map_err(WorkError::Deadline)?;
@@ -488,33 +604,67 @@ where
             })
         })
     };
+    let start_queue = move || {
+        diagnostic_dispatch
+            .as_ref()
+            .map(|trace| trace.span(crate::relay_trace::Phase::BlockingQueue))
+    };
     enum Task<T> {
         Inline(Result<T, WorkError>),
         Spawned(tokio::task::JoinHandle<Result<T, WorkError>>),
     }
     // The marker is installed only by spawn_handler, never on an async runtime worker.
-    // Both paths retain the same read budget, reader lease and committed mutation result.
-    // Nested queries can reuse the handler's reader loan; simultaneous nested wrappers run
-    // serially on that handler. Keep each call's panic boundary so best-effort callers and
-    // cleanup after an error behave as they did with a separate JoinHandle.
-    let inline = IN_HANDLER.with(Cell::get)
-        && matches!(
-            tokio::runtime::Handle::current().runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        );
+    // Handlers loan their reader per poll, so nested wrappers on that thread reuse the
+    // loan inline; a spawned child admits its own permit without holding the parent's.
+    // Both paths retain the same read budget, reader lease and committed mutation result,
+    // and each call keeps its panic boundary for best-effort callers and error cleanup.
+    let inline = cross_pool || (multithread && (IN_HANDLER.with(Cell::get) || reentrant));
     let task = if inline {
         // Leave the handler's block_on context while executing synchronous callbacks. Some
         // callbacks enter a runtime themselves (for example a forwarded conversation read).
-        // This is already a blocking worker, so no second pool slot is needed. A current-thread
-        // runtime keeps its existing spawned path because it cannot use block_in_place.
+        // A current-thread handler instead releases its poll-scoped loan before a child runs.
         Task::Inline(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tokio::task::block_in_place(run)
+                if multithread {
+                    tokio::task::block_in_place(|| run(None, start_queue()))
+                } else {
+                    // A different pool cannot queue while a synchronous outer loan is held.
+                    run(None, start_queue())
+                }
             }))
             .unwrap_or(Err(WorkError::Panic)),
         )
+    } else if let Some(store) = admission_store {
+        // Start eagerly, as before: dropping even an unpolled waiter cancels queued/running
+        // work. Admission itself is asynchronous and happens before opening a connection or
+        // entering the blocking callback's snapshot, writer, cache or roster locks.
+        Task::Spawned(tokio::spawn(async move {
+            let mut admission_span = diagnostic_admission
+                .as_ref()
+                .map(|trace| trace.span(crate::relay_trace::Phase::ReaderAdmission));
+            let admitted = store
+                .readers
+                .admit_read(admission_budget)
+                .await
+                .map_err(admission_error);
+            if let Some(span) = &mut admission_span {
+                span.finish(match &admitted {
+                    Ok(_) => crate::relay_trace::Outcome::Completed,
+                    Err(WorkError::Deadline(_)) => crate::relay_trace::Outcome::TimedOut,
+                    Err(_) => crate::relay_trace::Outcome::Failed,
+                });
+            }
+            let permit = admitted?;
+            let diagnostic_queue = start_queue();
+            tokio::task::spawn_blocking(move || run(Some(permit), diagnostic_queue))
+                .await
+                .map_err(WorkError::Join)?
+        }))
     } else {
-        Task::Spawned(tokio::task::spawn_blocking(run))
+        let diagnostic_queue = start_queue();
+        Task::Spawned(tokio::task::spawn_blocking(move || {
+            run(None, diagnostic_queue)
+        }))
     };
     async move {
         let _cancel = cancel;
@@ -583,6 +733,472 @@ pub(super) fn error(error: &WorkError) -> Option<ApiError> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn bounded_state(root: &std::path::Path, limit: usize) -> AppState {
+        smallclaims::sqlite::with_read_limit_for_test(limit, || super::super::tests::state(root))
+    }
+
+    #[test]
+    fn selected_reader_admission_precedes_blocking_dispatch_without_holding_a_reader() {
+        use crate::relay_trace::{self, Outcome};
+        for handler_case in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let state = bounded_state(root.path(), 1);
+            let store = state.store.clone();
+            let capture = relay_trace::tests::Capture::default();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            tracing::dispatcher::with_default(&capture.dispatch(), || {
+                let trace = relay_trace::tests::trace();
+                with_store(Some(store.clone()), || {
+                    read_budget::with(Some(ReadBudget::new("/phase-control", ORDINARY)), || {
+                        runtime.block_on(relay_trace::scope(Some(trace.clone()), async {
+                            // Occupy only the permit, not a connection/snapshot or a worker.
+                            let held = store.readers.admit_read(None).await.unwrap();
+                            let reading = store.clone();
+                            let mut work = Box::pin(async move {
+                                if handler_case {
+                                    let response = handler(async {
+                                        assert!(reading.readers.has_request_reader());
+                                        StatusCode::OK.into_response()
+                                    })
+                                    .await;
+                                    u64::from(response.status().as_u16())
+                                } else {
+                                    spawn_blocking(move || {
+                                        assert!(reading.readers.has_request_reader());
+                                        reading
+                                            .readers
+                                            .get()
+                                            .query_row("SELECT 42", [], |row| row.get::<_, u64>(0))
+                                            .unwrap()
+                                    })
+                                    .await
+                                    .unwrap()
+                                }
+                            });
+                            assert!(futures_util::poll!(work.as_mut()).is_pending());
+                            let phase = if handler_case {
+                                "HandlerReaderAdmission"
+                            } else {
+                                "ReaderAdmission"
+                            };
+                            let observed = tokio::time::timeout(Duration::from_secs(5), async {
+                                loop {
+                                    if capture.events().iter().any(|e| e["phase"] == phase) {
+                                        break;
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await;
+                            let waiting = capture.events();
+                            // Always release before assertions/joins, including a missed event.
+                            drop(held);
+                            let answer = work.await;
+                            observed.expect("the selected admission was not observed");
+                            assert_eq!(answer, if handler_case { 200 } else { 42 });
+                            assert!(
+                                !waiting
+                                    .iter()
+                                    .any(|e| { e["phase"] == phase && e["state"] == "completed" })
+                            );
+                            assert!(!waiting.iter().any(|e| e["phase"] == "BlockingQueue"));
+                            let events = capture.events();
+                            let admitted = events
+                                .iter()
+                                .position(|e| e["phase"] == phase && e["state"] == "completed")
+                                .unwrap();
+                            if !handler_case {
+                                let dispatched = events
+                                    .iter()
+                                    .position(|e| {
+                                        e["phase"] == "BlockingQueue" && e["state"] == "started"
+                                    })
+                                    .unwrap();
+                                assert!(admitted < dispatched);
+                            }
+                        }));
+                    })
+                });
+                trace.finish(Outcome::Completed);
+            });
+            assert_eq!(store.readers.usage().open, store.readers.usage().idle);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sixty_api_clients_share_the_configured_reader_bound() {
+        use axum::{Router, middleware::from_fn_with_state, routing::get};
+        use tower::ServiceExt;
+        const CLIENTS: usize = 60;
+        const LIMIT: usize = 32;
+        let root = tempfile::tempdir().unwrap();
+        let state = bounded_state(root.path(), LIMIT);
+        let store = state.store.clone();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::watch::channel(false);
+        let app = Router::new()
+            .route("/v1/client/admission-probe", get({
+                let (active, peak) = (active.clone(), peak.clone());
+                move || {
+                    let (store, active, peak, entered, mut released) = (
+                        store.clone(), active.clone(), peak.clone(), entered.clone(), released.clone(),
+                    );
+                    async move {
+                        let value = spawn_blocking(move || {
+                            assert!(store.readers.has_request_reader());
+                            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            entered.send(()).unwrap();
+                            tokio::runtime::Handle::current()
+                                .block_on(released.wait_for(|released| *released))
+                                .unwrap();
+                            let value = store.readers.get().query_row(
+                                "SELECT COUNT(*) FROM claims", [], |row| row.get::<_, u64>(0),
+                            ).unwrap();
+                            active.fetch_sub(1, Ordering::SeqCst);
+                            value
+                        }).await.unwrap();
+                        Json(json!({"claims": value}))
+                    }
+                }
+            }))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let start = Arc::new(tokio::sync::Barrier::new(CLIENTS + 1));
+        let mut clients = Vec::new();
+        for _ in 0..CLIENTS {
+            let (app, start) = (app.clone(), start.clone());
+            clients.push(tokio::spawn(async move {
+                start.wait().await;
+                app.oneshot(request(Method::GET, "/v1/client/admission-probe")).await.unwrap()
+            }));
+        }
+        start.wait().await;
+        let saturated = tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..LIMIT {
+                entries.recv().await.unwrap();
+            }
+        }).await;
+        // Release even if saturation failed, so no blocked callbacks survive an assertion.
+        release.send(true).unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(10), async {
+            for client in clients {
+                assert_eq!(client.await.unwrap().status(), StatusCode::OK);
+            }
+        }).await;
+        saturated.expect("the admitted batch did not start");
+        completed.expect("the API burst did not complete");
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(peak.load(Ordering::SeqCst), LIMIT);
+        assert!(state.store.readers.usage().peak <= LIMIT);
+        assert_eq!(state.store.readers.usage().open, state.store.readers.usage().idle);
+    }
+
+    #[tokio::test]
+    async fn current_thread_handlers_release_their_parent_loan_before_a_nested_worker() {
+        use axum::{Router, middleware::from_fn_with_state, routing::get};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = bounded_state(root.path(), 1);
+        let store = state.store.clone();
+        let app = Router::new()
+            .route("/v1/nested", get(move || {
+                let store = store.clone();
+                async move {
+                    assert!(IN_HANDLER.with(Cell::get));
+                    assert!(store.readers.has_request_reader());
+                    let value = spawn_blocking(move || {
+                        assert!(store.readers.has_request_reader());
+                        // Keep the existing current-thread callback runtime contract.
+                        tokio::runtime::Handle::current().block_on(async {});
+                        store.readers.get().query_row("SELECT 42", [], |row| row.get::<_, u64>(0))
+                            .unwrap()
+                    }).await.unwrap();
+                    Json(json!({"answer": value}))
+                }
+            }))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let response = tokio::time::timeout(
+            Duration::from_secs(5), app.oneshot(request(Method::GET, "/v1/nested")),
+        ).await.expect("a current-thread nested worker deadlocked").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["value"]["answer"], 42);
+        assert_eq!(state.store.readers.usage().peak, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_event_long_poll_releases_its_reader_while_waiting_at_bound_one() {
+        use axum::{Router, extract::{Query, State}, middleware::from_fn_with_state, routing::get};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = bounded_state(root.path(), 1);
+        let (waiting, mut waits) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new()
+            .route("/v1/events/page", get({
+                let state = state.clone();
+                move || {
+                    let (state, waiting) = (state.clone(), waiting.clone());
+                    async move {
+                        let work = super::super::events_page(State(state.clone()), Query(
+                            super::super::EventQuery {
+                                after: 0, subject: None, owner_run: None, wait: Some(true),
+                                timeout_ms: Some(30_000), limit: Some(10),
+                            },
+                        ));
+                        let mut work = std::pin::pin!(work);
+                        let mut notified = false;
+                        std::future::poll_fn(|cx| {
+                            let poll = work.as_mut().poll(cx);
+                            // Nested queries execute inline on this multithread handler.
+                            // Its first Pending is the real event-notification wait.
+                            if poll.is_pending() && !notified {
+                                assert!(!state.store.readers.has_request_reader());
+                                waiting.send(()).unwrap();
+                                notified = true;
+                            }
+                            poll
+                        }).await
+                    }
+                }
+            }))
+            .route("/v1/probe", get({
+                let store = state.store.clone();
+                move || {
+                    let store = store.clone();
+                    async move {
+                        assert!(store.readers.has_request_reader());
+                        let value = store.readers.get()
+                            .query_row("SELECT 42", [], |row| row.get::<_, u64>(0)).unwrap();
+                        Json(json!({"answer": value}))
+                    }
+                }
+            }))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let poll_app = app.clone();
+        let poll = tokio::spawn(async move {
+            poll_app.oneshot(request(Method::GET, "/v1/events/page?wait=true")).await.unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(5), waits.recv()).await
+            .expect("the event handler did not reach its wait").unwrap();
+        let unrelated = tokio::time::timeout(
+            Duration::from_secs(5), app.oneshot(request(Method::GET, "/v1/probe")),
+        ).await;
+        state.store.append_claim(&crate::model::ClaimInput {
+            subject: "agent/admission-wake".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({
+                "status": "running", "runtime_id": "admission-wake", "incarnation_id": "one",
+            })).unwrap(), evidence: Vec::new(),
+            expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        super::super::signal_visible_change(&state);
+        let response = tokio::time::timeout(Duration::from_secs(5), poll).await
+            .expect("the event did not wake the long poll").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(unrelated.expect("the waiting poll retained admission").unwrap().status(), StatusCode::OK);
+        assert_eq!(state.store.readers.usage().peak, 1);
+        assert_eq!(state.store.readers.usage().idle, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upgraded_socket_reads_take_admission_and_reentrant_loans_inline() {
+        let root = tempfile::tempdir().unwrap();
+        let state = bounded_state(root.path(), 1);
+        let store = state.store.clone();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, mut release_rx) = tokio::sync::watch::channel(false);
+        let holder = store.clone();
+        let first = tokio::spawn(async move {
+            let admission_store = holder.clone();
+            store_read(&admission_store, move || {
+            started.send(()).unwrap();
+            tokio::runtime::Handle::current()
+                .block_on(release_rx.wait_for(|released| *released))
+                .unwrap();
+            // A nested socket read on this worker reuses the loan without a second permit.
+            let nested = tokio::runtime::Handle::current()
+                .block_on(store_read(&holder, || 5))
+                .unwrap();
+            assert_eq!(nested, 5);
+            assert_eq!(holder.readers.usage().open, 1);
+            7
+            }).await
+        });
+        started_rx.await.unwrap();
+        assert_eq!(store.readers.usage().open, 1);
+        let queued_store = store.clone();
+        let queued = tokio::spawn(async move { store_read(&queued_store, || 9).await });
+        tokio::task::yield_now().await;
+        // The queued read holds no reader while waiting for admission.
+        assert_eq!(store.readers.usage().open, 1);
+        release_tx.send(true).unwrap();
+        let results = tokio::time::timeout(Duration::from_secs(5), async {
+            (first.await.unwrap().unwrap(), queued.await.unwrap().unwrap())
+        })
+        .await
+        .expect("upgraded-socket reads did not finish");
+        assert_eq!(results, (7, 9));
+        assert_eq!(store.readers.usage().peak, 1);
+        assert_eq!(store.readers.usage().idle, 1);
+    }
+
+    #[test]
+    fn opposite_cross_pool_async_queries_do_not_queue_under_outer_loans() {
+        for multithread in [false, true] {
+            let mut builder = if multithread {
+                tokio::runtime::Builder::new_multi_thread()
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+            };
+            builder.enable_all();
+            if multithread {
+                builder.worker_threads(2);
+            }
+            let runtime = builder.build().unwrap();
+            let first = Arc::new(smallclaims::sqlite::with_read_limit_for_test(1, ||
+                super::super::Store::open_memory("first")).unwrap());
+            let second = Arc::new(smallclaims::sqlite::with_read_limit_for_test(1, ||
+                super::super::Store::open_memory("second")).unwrap());
+            let held = Arc::new(std::sync::Barrier::new(2));
+            let (finished, completed) = std::sync::mpsc::channel();
+            let workers = [(first.clone(), second.clone()), (second.clone(), first.clone())]
+                .map(|(outer, inner)| {
+                let held = held.clone();
+                let finished = finished.clone();
+                let handle = runtime.handle().clone();
+                std::thread::spawn(move || {
+                    let result = outer.readers.request_read(|| {
+                        held.wait();
+                        let query_store = inner.clone();
+                        let value = handle.block_on(store_read(&inner, move ||
+                            query_store.readers.get().query_row("SELECT 7", [], |row| row.get::<_, u64>(0))
+                        )).unwrap().unwrap();
+                        assert_eq!(value, 7);
+                        // Both outer loans still own their sole permits for the budgeted
+                        // query helper as well as the unbudgeted upgraded-stream helper.
+                        held.wait();
+                        let query_store = inner.clone();
+                        let value = with_store(Some(inner.clone()), || read_budget::with(
+                            Some(ReadBudget::new("/cross-pool", ORDINARY)),
+                            || handle.block_on(async move {
+                                spawn_blocking(move ||
+                                    query_store.readers.get().query_row("SELECT 9", [], |row| row.get::<_, u64>(0))
+                                ).await
+                            }),
+                        )).unwrap().unwrap();
+                        assert_eq!(value, 9);
+                    });
+                    finished.send(result).unwrap();
+                })
+            });
+            drop(finished);
+            for _ in 0..2 {
+                completed.recv_timeout(Duration::from_secs(10))
+                    .expect("a nested cross-pool API query waited on an outer loan").unwrap();
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert!(first.readers.try_admit_read().is_some());
+            assert!(second.readers.try_admit_read().is_some());
+        }
+    }
+
+    /// An ordinary (non-long-poll) route that stays pending holds no reader: its poll
+    /// permit and loan drop at the await, so the only configured slot stays usable.
+    async fn ordinary_pending_holds_no_reader(nested_worker: bool) {
+        use axum::{Router, middleware::from_fn_with_state, routing::get};
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = bounded_state(root.path(), 1);
+        let store = state.store.clone();
+        let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let app = Router::new()
+            .route("/v1/client/ordinary", get(move || {
+                let (store, entered_tx, mut release_rx) = (store.clone(), entered_tx.clone(), release_rx.clone());
+                async move {
+                    assert!(IN_HANDLER.with(Cell::get));
+                    assert!(store.readers.has_request_reader());
+                    entered_tx.send(()).unwrap();
+                    // The whole-request await: no reader may survive into it.
+                    release_rx.changed().await.unwrap();
+                    if nested_worker {
+                        let answer = spawn_blocking(move || {
+                            assert!(store.readers.has_request_reader());
+                            store.readers.get()
+                                .query_row("SELECT 7", [], |row| row.get::<_, u64>(0)).unwrap()
+                        }).await.unwrap();
+                        return Json(json!({"answer": answer}));
+                    }
+                    Json(json!({"answer": 1}))
+                }
+            }))
+            .route("/v1/probe", get({
+                let store = state.store.clone();
+                move || {
+                    let store = store.clone();
+                    async move {
+                        assert!(store.readers.has_request_reader());
+                        let value = store.readers.get()
+                            .query_row("SELECT 42", [], |row| row.get::<_, u64>(0)).unwrap();
+                        Json(json!({"answer": value}))
+                    }
+                }
+            }))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                super::super::response_envelope,
+            ));
+        let pending_app = app.clone();
+        let pending = tokio::spawn(async move {
+            pending_app.oneshot(request(Method::GET, "/v1/client/ordinary")).await.unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.recv()).await
+            .expect("the ordinary handler did not start").unwrap();
+        // The pending wait released the whole-request reader: the loan's connection is
+        // back in the pool and the unrelated read takes the same single slot.
+        let unrelated = tokio::time::timeout(
+            Duration::from_secs(5), app.oneshot(request(Method::GET, "/v1/probe")),
+        ).await;
+        release_tx.send(true).unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(5), pending).await
+            .expect("the ordinary handler did not resume").unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let expected = if nested_worker { 7 } else { 1 };
+        assert_eq!(body["value"]["answer"], expected);
+        assert_eq!(unrelated.expect("the pending ordinary handler held its reader")
+            .unwrap().status(), StatusCode::OK);
+        assert_eq!(state.store.readers.usage().peak, 1);
+        assert_eq!(state.store.readers.usage().idle, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_ordinary_handler_holds_no_reader_on_a_multithread_runtime() {
+        ordinary_pending_holds_no_reader(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pending_ordinary_handler_holds_no_reader_and_keeps_nested_workers_on_a_current_thread_runtime() {
+        ordinary_pending_holds_no_reader(true).await;
+    }
 
     #[test]
     fn timeout_terminal_waits_for_response_construction_and_survives_late_child_completion() {
@@ -1651,28 +2267,18 @@ mod tests {
         read_budget::with(Some(budget), || {
             first.readers.request_read(|| {
                 first.read_snapshot(|outer| {
-                    let first_key = first.readers.key();
                     second.readers.request_read(|| {
                         second.read_snapshot(|_| {
-                            assert!(
-                                smallclaims::sqlite::PINNED_READER.with(|slot| slot
-                                    .borrow()
-                                    .as_ref()
-                                    .unwrap()
-                                    .0
-                                    == second.readers.key())
-                            );
+                            // Membership is per pool: the inner pin is on top while the
+                            // outer store's pin stays registered below it.
+                            assert!(second.readers.has_pinned_reader());
+                            assert!(first.readers.has_pinned_reader());
                             Ok(())
                         })
                     })??;
-                    assert!(
-                        smallclaims::sqlite::PINNED_READER.with(|slot| slot
-                            .borrow()
-                            .as_ref()
-                            .unwrap()
-                            .0
-                            == first_key)
-                    );
+                    // The inner pin popped; only the outer store's pin remains.
+                    assert!(first.readers.has_pinned_reader());
+                    assert!(!second.readers.has_pinned_reader());
                     first.read_snapshot(|again| {
                         assert_eq!(again, outer);
                         Ok(())
@@ -1682,7 +2288,8 @@ mod tests {
         })
         .unwrap()
         .unwrap();
-        assert!(smallclaims::sqlite::PINNED_READER.with(|slot| slot.borrow().is_none()));
+        assert!(!first.readers.has_pinned_reader());
+        assert!(!second.readers.has_pinned_reader());
         assert!(first.readers.get().is_autocommit());
         assert!(second.readers.get().is_autocommit());
     }

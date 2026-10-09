@@ -5610,25 +5610,119 @@ fn raise_open_file_limit() {
     }
 }
 
-fn select_private_gateway(config: &mut Config, private_state: bool, private_socket: bool) {
+#[derive(Debug)]
+struct PrivateGatewayCollision {
+    derived: PathBuf,
+}
+
+impl std::fmt::Display for PrivateGatewayCollision {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            output,
+            "pass --client-gateway-socket; the derived private gateway {} equals the shared default gateway",
+            self.derived.display()
+        )
+    }
+}
+
+impl std::error::Error for PrivateGatewayCollision {}
+
+fn gateway_path_for_comparison(socket: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let socket = std::path::absolute(socket)?;
+    let parent = socket.parent().context("gateway socket has no parent")?;
+    let mut ancestor = parent;
+    let mut resolved = loop {
+        match fs::canonicalize(ancestor) {
+            Ok(resolved) => break resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor
+                    .parent()
+                    .context("gateway socket has no existing ancestor")?;
+            }
+            Err(error) => return Err(error).context("resolve gateway socket parent"),
+        }
+    };
+    let mut missing_depth = 0_usize;
+    for component in parent.strip_prefix(ancestor)?.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+                if missing_depth > 0 {
+                    missing_depth -= 1;
+                } else {
+                    // Walk from the physical ancestor, not the lexical symlink location.
+                    resolved = fs::canonicalize(&resolved)
+                        .context("resolve gateway socket ancestor after ..")?;
+                }
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                if missing_depth > 0 {
+                    missing_depth += 1;
+                    continue;
+                }
+                // A .. can return to an existing directory; resolve symlinks again there.
+                match fs::canonicalize(&resolved) {
+                    Ok(path) => resolved = path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match fs::symlink_metadata(&resolved) {
+                            Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {
+                                missing_depth = 1;
+                            }
+                            Ok(_) => {
+                                return Err(error).context("resolve existing gateway socket ancestor");
+                            }
+                            Err(error) => {
+                                return Err(error).context("inspect gateway socket ancestor");
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error).context("resolve gateway socket ancestor"),
+                }
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                anyhow::bail!("gateway socket suffix must be relative");
+            }
+        }
+    }
+    Ok(resolved.join(
+        socket
+            .file_name()
+            .context("gateway socket has no file name")?,
+    ))
+}
+
+fn select_private_gateway(
+    config: &mut Config,
+    private_state: bool,
+    private_socket: bool,
+) -> Result<()> {
     if !(private_state || private_socket) {
-        return;
+        return Ok(());
     }
-    let defaults = Config::default();
-    if config.state_dir == defaults.state_dir && config.socket == defaults.socket {
-        return;
-    }
-    let parent = if private_socket {
+    let parent = if private_state {
+        Some(config.state_dir.as_path())
+    } else {
         config
             .socket
             .parent()
             .filter(|path| !path.as_os_str().is_empty())
-    } else {
-        Some(config.state_dir.as_path())
     };
     config.client_gateway_socket = parent
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("st3-client.sock");
+    if gateway_path_for_comparison(&config.client_gateway_socket)?
+        == gateway_path_for_comparison(&Config::default().client_gateway_socket)?
+    {
+        return Err(PrivateGatewayCollision {
+            derived: config.client_gateway_socket.clone(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5640,26 +5734,113 @@ mod private_gateway_tests {
         let mut config = Config::default();
         let default_gateway = config.client_gateway_socket.clone();
         config.state_dir = "/tmp/private-state".into();
-        select_private_gateway(&mut config, true, false);
+        select_private_gateway(&mut config, true, false).unwrap();
         assert_eq!(
             config.client_gateway_socket,
             PathBuf::from("/tmp/private-state/st3-client.sock")
         );
         config.socket = "/tmp/private-socket/api.sock".into();
-        select_private_gateway(&mut config, true, true);
+        select_private_gateway(&mut config, true, true).unwrap();
+        assert_eq!(
+            config.client_gateway_socket,
+            PathBuf::from("/tmp/private-state/st3-client.sock")
+        );
+        assert_ne!(config.client_gateway_socket, default_gateway);
+        select_private_gateway(&mut config, false, true).unwrap();
         assert_eq!(
             config.client_gateway_socket,
             PathBuf::from("/tmp/private-socket/st3-client.sock")
         );
-        assert_ne!(config.client_gateway_socket, default_gateway);
     }
 
     #[test]
     fn default_daemon_keeps_its_default_gateway() {
         let mut config = Config::default();
         let gateway = config.client_gateway_socket.clone();
-        select_private_gateway(&mut config, false, false);
+        select_private_gateway(&mut config, false, false).unwrap();
         assert_eq!(config.client_gateway_socket, gateway);
+    }
+
+    #[test]
+    fn private_socket_in_runtime_dir_refuses_shared_default_gateway() {
+        let mut config = Config::default();
+        config.socket = config.socket.with_file_name("private-st.sock");
+        let error = select_private_gateway(&mut config, false, true).unwrap_err();
+        let collision = error.downcast_ref::<PrivateGatewayCollision>().unwrap();
+        assert_eq!(collision.derived, Config::default().client_gateway_socket);
+        assert!(error.to_string().contains("pass --client-gateway-socket"));
+    }
+
+    #[test]
+    fn private_state_takes_priority_over_runtime_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.state_dir = root.path().join("private-state");
+        config.socket = config.socket.with_file_name("private-st.sock");
+        select_private_gateway(&mut config, true, true).unwrap();
+        assert_eq!(
+            config.client_gateway_socket,
+            config.state_dir.join("st3-client.sock")
+        );
+        assert!(!config.state_dir.exists());
+    }
+
+    #[test]
+    fn gateway_comparison_resolves_symlinked_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&runtime, &alias).unwrap();
+        assert_eq!(
+            gateway_path_for_comparison(&runtime.join("st3-client.sock")).unwrap(),
+            gateway_path_for_comparison(&alias.join("st3-client.sock")).unwrap()
+        );
+        assert!(!runtime.join("st3-client.sock").exists());
+    }
+
+    #[test]
+    fn gateway_comparison_resolves_ancestor_above_missing_runtime_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert_eq!(
+            gateway_path_for_comparison(&real.join("missing/run/st3-client.sock")).unwrap(),
+            gateway_path_for_comparison(&alias.join("missing/run/st3-client.sock")).unwrap()
+        );
+        assert!(!real.join("missing").exists());
+    }
+
+    #[test]
+    fn gateway_comparison_normalizes_missing_suffix_after_resolving_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        fs::create_dir_all(real.join("deep")).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(real.join("deep"), &alias).unwrap();
+        let target = real.join("run/st3-client.sock");
+        for path in [
+            alias.join("missing/../../run/st3-client.sock"),
+            alias.join("./missing/.././../run/st3-client.sock"),
+            alias.join("missing/../other/../../run/st3-client.sock"),
+        ] {
+            assert_eq!(
+                gateway_path_for_comparison(&path).unwrap(),
+                gateway_path_for_comparison(&target).unwrap()
+            );
+        }
+        // After canceling a missing component, resolve an existing symlink before parent traversal.
+        std::os::unix::fs::symlink(real.join("deep"), real.join("link")).unwrap();
+        assert_eq!(
+            gateway_path_for_comparison(&real.join("missing/../link/../run/st3-client.sock"))
+                .unwrap(),
+            gateway_path_for_comparison(&target).unwrap()
+        );
+        assert!(!real.join("deep/missing").exists());
+        assert!(!real.join("missing").exists());
+        assert!(!real.join("run").exists());
     }
 }
 
@@ -5685,7 +5866,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.client_gateway_socket = socket;
     }
     if !explicit_gateway {
-        select_private_gateway(&mut config, private_state, private_socket);
+        select_private_gateway(&mut config, private_state, private_socket)?;
     }
     if let Some(peer_listen) = args.peer_listen {
         config.peer_listen = Some(peer_listen);
