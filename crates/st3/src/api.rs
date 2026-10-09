@@ -12007,6 +12007,8 @@ fn accept_message_receipt_with_upload_owner(
             "external sender imports require the enrolled adapter endpoint",
         )));
     }
+    crate::model::refuse_person_recipient(&normalize_message_party(&request.to))
+        .map_err(ApiError::bad)?;
     if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "empty-message",
@@ -21601,6 +21603,83 @@ version 2
     }
 
     #[tokio::test]
+    async fn a_send_or_reply_to_a_person_is_refused_and_an_agent_still_receives() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let message = |key: &str, from: &str, to: &str, in_reply_to: Option<&str>| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.into(),
+                from: from.into(),
+                to: to.into(),
+                content: "Hello".into(),
+                title: None,
+                in_reply_to: in_reply_to.map(str::to_owned),
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+        };
+        // An agent, and a person writing to an agent, are unchanged.
+        let (status, asked) =
+            json_request(app.clone(), "/v1/messages", message("ask", "person/ada", "agent/worker", None)).await;
+        assert_eq!(status, StatusCode::OK, "{asked}");
+        let asked = asked["subject"].as_str().unwrap().to_owned();
+        let (status, relayed) =
+            json_request(app.clone(), "/v1/messages", message("relay", "agent/worker", "agent/helper", None)).await;
+        assert_eq!(status, StatusCode::OK, "{relayed}");
+        // A send to a person, a reply to a person, a bare name that means the requester, and a
+        // person writing to a person all fail with the one error, and write nothing.
+        let before = state.store.claims_for_kind_at("message.sent", None, true, 100).unwrap().claims.len();
+        for (key, from, to, parent) in [
+            ("send", "agent/worker", "person/ada", None),
+            ("reply", "agent/worker", "person/ada", Some(asked.as_str())),
+            ("requester", "agent/worker", "requester", None),
+            ("people", "person/ada", "person/robin", None),
+        ] {
+            let (status, body) =
+                json_request(app.clone(), "/v1/messages", message(key, from, to, parent)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{key}: {body}");
+            assert_eq!(body["code"], "person-has-no-inbox", "{key}");
+            let text = body["message"].as_str().unwrap();
+            assert!(text.starts_with("people do not have inboxes: print your answer in the chat"), "{text}");
+            let chat = text.find("print in the chat").unwrap();
+            assert!(chat < text.find("work ask").unwrap() && chat < text.find("work update").unwrap());
+            assert!(text.contains("only if the person asked for it"), "{text}");
+        }
+        assert_eq!(
+            state.store.claims_for_kind_at("message.sent", None, true, 100).unwrap().claims.len(),
+            before,
+            "a refused message is not written"
+        );
+        // What an older client already holds stays readable: a message to a person that is in the
+        // graph still lists, reads and settles.
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/earlier".into(),
+                kind: "message.sent".into(),
+                actor: Some("agent/worker".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("agent/worker")),
+                    ("to".into(), json!("person/ada")),
+                    ("content".into(), json!("Sent before people lost their inbox.")),
+                    ("status".into(), json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("earlier".into()),
+            })
+            .unwrap();
+        let (status, listed) = get_request(app.clone(), "/v1/messages?to=person/ada&include_closed=true").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert!(listed.as_array().unwrap().iter().any(|row| row["subject"] == "message/earlier"), "{listed}");
+        let (status, read) = get_request(app, "/v1/messages/read/earlier").await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["content"], "Sent before people lost their inbox.");
+    }
+
+    #[tokio::test]
     async fn message_lifecycle_requires_the_exact_recipient_actor() {
         let root = tempfile::tempdir().unwrap();
         let app = router(state(root.path()));
@@ -21610,7 +21689,7 @@ version 2
             serde_json::to_value(MessageSendRequest {
                 idempotency_key: "recipient-authority-message".into(),
                 from: "agent/sender".into(),
-                to: "person/receiver".into(),
+                to: "agent/receiver".into(),
                 content: "Please review this.".into(),
                 title: None,
                 in_reply_to: None,
@@ -21671,7 +21750,7 @@ version 2
             serde_json::to_value(MessageLifecycleRequest {
                 delegation: None,
                 lifecycle: "staged".into(),
-                actor: Some("person/receiver".into()),
+                actor: Some("agent/receiver".into()),
                 transport: Some("codex-app-server".into()),
                 runtime_id: Some("runtime/receiver".into()),
                 evidence: Vec::new(),
@@ -21683,7 +21762,7 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{staged}");
         assert_eq!(staged["body"]["fields"]["status"], "staged");
-        assert_eq!(staged["body"]["fields"]["recipient"], "person/receiver");
+        assert_eq!(staged["body"]["fields"]["recipient"], "agent/receiver");
         assert_eq!(staged["body"]["fields"]["transport"], "codex-app-server");
         assert_eq!(staged["body"]["fields"]["runtime_id"], "runtime/receiver");
 
@@ -21693,7 +21772,7 @@ version 2
             serde_json::to_value(MessageLifecycleRequest {
                 delegation: None,
                 lifecycle: "delivered".into(),
-                actor: Some("person/receiver".into()),
+                actor: Some("agent/receiver".into()),
                 transport: None,
                 runtime_id: None,
                 evidence: Vec::new(),
@@ -21704,7 +21783,7 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{read}");
-        assert_eq!(read["actor"], "person/receiver");
+        assert_eq!(read["actor"], "agent/receiver");
 
         let legacy = app
             .oneshot(

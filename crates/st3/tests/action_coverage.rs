@@ -16,6 +16,8 @@ use tokio::sync::{Notify, watch};
 
 const NODE: &str = "action-coverage";
 const PERSON: &str = "person/avery";
+/// A mailbox owner: a person has no inbox, so mail to read and clean up goes to an agent.
+const READER: &str = "agent/example/reader";
 const WORKER: &str = "agent/example/worker";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2186,22 +2188,54 @@ async fn cli_send_reply_read_archive_search_and_attachments_survive_restart() {
         daemon.restart().await;
         cli_value(daemon.cli(WORKER, &arguments).await);
     }
+    // People have no inbox: the worker cannot answer the person with st, and nothing is written.
+    let sent_before = daemon.store().claims_for_kind_at("message.sent", None, true, 1_000).unwrap().claims.len();
+    let refused = daemon
+        .cli(
+            WORKER,
+            &[
+                "conversations", "reply", message, "--from", WORKER, "--body", "Copper answer",
+                "--idempotency-key", "coverage-cli-reply-refused",
+            ],
+        )
+        .await;
+    assert!(!refused.status.success());
+    let refusal = String::from_utf8_lossy(&refused.stderr);
+    assert!(refusal.contains("people do not have inboxes: print your answer in the chat"), "{refusal}");
+    assert_eq!(
+        daemon.store().claims_for_kind_at("message.sent", None, true, 1_000).unwrap().claims.len(),
+        sent_before
+    );
+    // A reply between agents is unchanged: it keeps its thread and is sent once across a restart.
+    const PEER: &str = "agent/example/peer";
+    let ask = cli_value(
+        daemon
+            .cli(
+                WORKER,
+                &[
+                    "conversations", "send", PEER, "--from", WORKER, "--body", "Copper handoff?",
+                    "--idempotency-key", "coverage-cli-ask-peer",
+                ],
+            )
+            .await,
+    );
+    let ask = ask["subject"].as_str().unwrap().to_owned();
     let reply_args = [
         "conversations",
         "reply",
-        message,
+        ask.as_str(),
         "--from",
-        WORKER,
+        PEER,
         "--body",
         "Copper answer",
         "--idempotency-key",
         "coverage-cli-reply-once",
     ];
-    let reply = cli_value(daemon.cli(WORKER, &reply_args).await);
+    let reply = cli_value(daemon.cli(PEER, &reply_args).await);
     let reply_id = reply["subject"].as_str().unwrap();
     daemon.restart().await;
     assert_eq!(
-        cli_value(daemon.cli(WORKER, &reply_args).await)["subject"],
+        cli_value(daemon.cli(PEER, &reply_args).await)["subject"],
         reply_id
     );
     assert_eq!(
@@ -2212,7 +2246,7 @@ async fn cli_send_reply_read_archive_search_and_attachments_survive_restart() {
             .unwrap()
             .in_reply_to
             .as_deref(),
-        Some(message)
+        Some(ask.as_str())
     );
     cli_value(
         daemon
@@ -2251,13 +2285,13 @@ async fn cli_aged_unread_cleanup_preserves_fresh_and_read_mail_across_restart() 
         .as_millis();
     let mut messages = BTreeMap::new();
     for (name, recipient, phase, fresh) in [
-        ("old-sent", PERSON, "sent", false),
-        ("old-delivered", PERSON, "delivered", false),
-        ("old-read", PERSON, "read", false),
-        ("old-closed", PERSON, "closed", false),
-        ("old-other", "person/blair", "sent", false),
-        ("fresh-sent", PERSON, "sent", true),
-        ("fresh-delivered", PERSON, "delivered", true),
+        ("old-sent", READER, "sent", false),
+        ("old-delivered", READER, "delivered", false),
+        ("old-read", READER, "read", false),
+        ("old-closed", READER, "closed", false),
+        ("old-other", "agent/example/other", "sent", false),
+        ("fresh-sent", READER, "sent", true),
+        ("fresh-delivered", READER, "delivered", true),
     ] {
         daemon
             .store()
@@ -2335,13 +2369,13 @@ async fn cli_aged_unread_cleanup_preserves_fresh_and_read_mail_across_restart() 
         "conversations",
         "cleanup",
         "--as",
-        PERSON,
+        READER,
         "--older-than",
         "1h",
     ];
-    assert_eq!(cli_value(daemon.cli(PERSON, &scoped).await)["count"], 2);
+    assert_eq!(cli_value(daemon.cli(READER, &scoped).await)["count"], 2);
     daemon.restart().await;
-    assert_eq!(cli_value(daemon.cli(PERSON, &scoped).await)["count"], 0);
+    assert_eq!(cli_value(daemon.cli(READER, &scoped).await)["count"], 0);
     for (name, expected) in [
         ("old-sent", "closed"),
         ("old-delivered", "closed"),

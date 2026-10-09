@@ -14018,7 +14018,7 @@ subscription "watch/source" {
                 snapshot_id: snapshot.id.clone(),
                 ..Default::default()
             },
-            parameters: json!({"to":"person/blair","content":"Send once despite unrelated activity."}),
+            parameters: json!({"to":"agent/blair","content":"Send once despite unrelated activity."}),
         };
         state
             .store

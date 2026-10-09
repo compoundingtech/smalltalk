@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Refuse conversations send and reply to a person with a clear error: people have no inbox",
+  "replay": {"status": "none", "detail": "No replay or projection changes. Messages to a person that are already in the graph replicate, list and read as before."},
+  "schema": {"status": "none", "detail": "No tables, indexes or stored data formats change."},
+  "rules": {"status": "none", "detail": "No rule, claim kind or authorization changes. The refusal runs before the message claim is written."},
+  "compatibility": {"status": "changed", "detail": "A send or reply whose recipient is a person now fails in the CLI and in the message API (422, code person-has-no-inbox) with the message: people do not have inboxes; print your answer in the chat; only if the person asked for it, use work ask or work update. Sends to agents are unchanged, so existing stui and iOS builds, which write to agents, keep working, and nothing they read disappears. Daemon-originated messages (planning questions, limits notices) are not sends and are unchanged."},
+  "downtime": {"status": "none", "detail": "No restart migration or downtime is required."},
+  "manual": {"status": "none", "detail": "No configuration changes are needed. A script that sends to a person must print to the chat or use work ask or work update instead."},
+  "recovery": {"status": "none", "detail": "Reverting the change allows sends to a person again; nothing was written while they were refused."}
+}
