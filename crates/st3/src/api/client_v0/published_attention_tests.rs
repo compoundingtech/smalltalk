@@ -52,7 +52,7 @@ async fn attention_windows_serve_the_published_list_to_each_session_and_never_fo
     let state = super::tests::test_state_named(root.path(), "attention-list");
     custom(&state, "custom/garden/review/v1/ada-one", "person/ada");
     custom(&state, "custom/garden/review/v1/ada-two", "person/ada");
-    custom(&state, "custom/garden/review/v1/bo", "person/bo");
+    custom(&state, "custom/garden/review/v1/robin", "person/robin");
     // A store whose refresher has not published yet refuses the window, retryably.
     state.store.start_attention_list_refresher().unwrap();
     let refused = window(&state, &ClientSession::local(Some("person/ada")).unwrap(), None, 50)
@@ -77,11 +77,11 @@ async fn attention_windows_serve_the_published_list_to_each_session_and_never_fo
     for (session, person, expected) in [
         // A person sees their own rows, whatever they ask for nothing else.
         ("person/ada", None, full(Some("person/ada"))),
-        ("person/bo", Some("person/bo"), full(Some("person/bo"))),
+        ("person/robin", Some("person/robin"), full(Some("person/robin"))),
         // An agent sees every person's rows, or the person it selects.
         ("agent/garden/seed", None, full(None)),
         ("agent/garden/seed", Some("person/ada"), full(Some("person/ada"))),
-        ("agent/garden/seed", Some("person/nobody"), Vec::new()),
+        ("agent/garden/seed", Some("person/visitor"), Vec::new()),
     ] {
         let client = ClientSession::local(Some(session)).unwrap();
         let (snapshot, items, has_more) = window(&state, &client, person, 50).await.unwrap();
@@ -92,7 +92,7 @@ async fn attention_windows_serve_the_published_list_to_each_session_and_never_fo
     }
     assert_eq!(full(None).len(), 3);
     // A person cannot select another person's private rows.
-    let other = window(&state, &ClientSession::local(Some("person/ada")).unwrap(), Some("person/bo"), 50)
+    let other = window(&state, &ClientSession::local(Some("person/ada")).unwrap(), Some("person/robin"), 50)
         .await
         .unwrap_err();
     assert_eq!(other.status, StatusCode::FORBIDDEN);
@@ -156,7 +156,7 @@ async fn summary_windows_serve_the_published_row_of_their_selection() {
     let root = tempfile::tempdir().unwrap();
     let state = super::tests::test_state_named(root.path(), "summary-list");
     custom(&state, "custom/garden/review/v1/ada-one", "person/ada");
-    custom(&state, "custom/garden/review/v1/bo", "person/bo");
+    custom(&state, "custom/garden/review/v1/robin", "person/robin");
     state.store.start_attention_list_refresher().unwrap();
     let ada = ClientSession::local(Some("person/ada")).unwrap();
     let agent = ClientSession::local(Some("agent/garden/seed")).unwrap();
