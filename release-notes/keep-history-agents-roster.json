@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep the newest complete agents roster for each history mode when the other mode republishes",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or stored history changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema, version or stored data changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "With a roster refresher running, agents list requests retain the newest complete publication for both current and history modes within the existing eight-entry cache. Repeated current publications no longer remove the history roster used by st agents ls --all, and repeated history publications no longer remove the newest current roster. A stale first page keeps the retained roster's own cut and publication time and requests a refresh. No client or protocol shape changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption or startup migration is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes."
+  }
+}

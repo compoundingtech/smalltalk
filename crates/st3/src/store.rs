@@ -3624,7 +3624,16 @@ impl Store {
             cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
             let items = Arc::clone(&entry.items);
             cache.push_back(entry);
-            if cache.len() > 8 { cache.pop_front(); }
+            if cache.len() > 8 {
+                // Keep the newest complete publication of each mode, even while the other
+                // mode republishes or this one is still assembling partial chunks.
+                let oldest = cache.iter().position(|entry| entry.covered.is_some()
+                    || cache.iter().any(|newer| newer.history == entry.history
+                        && newer.covered.is_none()
+                        && (newer.index, newer.local) > (entry.index, entry.local)))
+                    .expect("only two complete roster publications can be protected");
+                cache.remove(oldest);
+            }
             items
         };
         drop(cache);
