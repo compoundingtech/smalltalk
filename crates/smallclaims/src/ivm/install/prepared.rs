@@ -783,6 +783,34 @@ impl Installer {
         view: &str,
         limits: PublicationLimits,
     ) -> Result<PreparedPage> {
+        self.prepare_live_inner(db, view, limits, limits.rows, limits.bytes)
+    }
+    /// Bound input references separately from the combined input/write/evidence budget.
+    /// This allows a page to consume N inputs and publish their bounded outputs without
+    /// selecting extra inputs merely to leave room for writes. Both budgets are cumulative.
+    pub fn prepare_live_bounded(
+        &self,
+        db: &Connection,
+        view: &str,
+        limits: PublicationLimits,
+        input_rows: usize,
+        input_bytes: usize,
+    ) -> Result<PreparedPage> {
+        limits.validate()?;
+        ensure!(
+            (1..=limits.rows).contains(&input_rows) && (1..=limits.bytes).contains(&input_bytes),
+            "prepared input bound exceeds publication budget"
+        );
+        self.prepare_live_inner(db, view, limits, input_rows, input_bytes)
+    }
+    fn prepare_live_inner(
+        &self,
+        db: &Connection,
+        view: &str,
+        limits: PublicationLimits,
+        input_rows: usize,
+        input_bytes: usize,
+    ) -> Result<PreparedPage> {
         let (namespace,source,fingerprint,source_fp,epoch,applied,ready,generation,status):(String,String,String,String,u64,u64,bool,u64,u64)=db.query_row("SELECT namespace,source,fingerprint,source_fingerprint,epoch,revision,ready,generation,status_revision FROM ivm_install_roots WHERE view=?1",[view],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)))?;
         ensure!(
             ready && self.fingerprints.get(view) == Some(&fingerprint),
@@ -805,7 +833,7 @@ impl Installer {
             page.position.epoch == epoch && page.position.fingerprint == source_fp,
             "prepared live source replaced"
         );
-        page.load_references(db, applied, limits.rows, limits.bytes)?;
+        page.load_references(db, applied, input_rows, input_bytes)?;
         Ok(page)
     }
     /// Apply only precomputed writes. Caller uses a short managed reactor transaction and

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Allow prepared IVM pages to bound input separately from output and evidence",
+  "replay": {
+    "status": "none",
+    "detail": "No startup replay or automatic installation. Existing prepare_live callers retain their prior input limits."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No persistent schema change. Slice tables and capture triggers exist only in isolated file-backed Store tests."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No native admission, authority, canonical order, retention or checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Additive prepare_live_bounded method; original prepare_live delegates with the same row and byte limits. No production provider, worker or consumer is enabled."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployment or runtime mode switch."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No database action, new collector or automatic background scheduling."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Existing atomic prepared publication behavior is unchanged; failure-qualified writer exit and production source lifetime remain separate prerequisites."
+  }
+}
