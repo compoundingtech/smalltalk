@@ -127,22 +127,29 @@ session, person, and mode binding, expiry, and owner/incarnation checks remain u
 
 ## Read connections and SQLite allocation
 
-Top-level API read workers admit before opening a connection, pinning a snapshot, or taking
-writer, cache, or roster locks. Each pool admits at most 32 workers by default. Set
+Top-level API read queries admit before opening a connection or pinning a snapshot.
+Waiting for reader capacity holds no cache, roster, or socket gate; waiting for those gates
+holds no reader capacity. Each pool admits at most 32 top-level workers by default. Set
 `SMALLCLAIMS_MAX_READ_WORKERS` in the **daemon's** environment to a positive integer to
 override this count; zero, invalid, or values beyond Tokio's semaphore capacity use 32.
 The value is read once per process. Queued reads observe their existing cancellation and
 deadline budgets without opening a reader. An upgraded stream's query is admitted without
 adding a deadline policy; waiting for events or socket/window admission holds no reader.
-Same-thread nested reads reuse their loan, including pinned snapshots. Status fanout tries
+Collections retain their FIFO reader grant into the physical query instead of discarding
+it and racing a new try-acquire. Other gates are tried without waiting; contention releases
+capacity and unrelated gates before waiting for the contended gate.
+Same-pool nested reads reuse their loan, including pinned snapshots. Cross-pool nested
+reads never wait for the inner pool's capacity while holding an outer loan or snapshot:
+they try spare capacity, otherwise use an unadmitted nested loan. Status fanout tries
 extra capacity without waiting, then reduces inline on the parent's reader if none is free.
 
 After admission, reads take an idle connection or open another when all retained connections
 are busy. The pool still retains up to 128 idle connections by default;
 `SMALLCLAIMS_MAX_IDLE_READ_CONNECTIONS` overrides only that retention ceiling. Admission
 does not change page-cache targets, statement caching, or the allocator. Legacy raw pool
-checkout and non-API background reads remain ungated: 32 is a worker-admission bound, not a
-global physical connection count or a process memory limit.
+checkout, non-API background reads, and the cross-pool nested fallback remain ungated:
+32 is a top-level worker-admission bound, not a global physical connection count or a
+process memory limit.
 
 Each reader requests a fixed 8 MiB page-cache target by default. Set
 `SMALLCLAIMS_READ_CACHE_KIB` in the **daemon's** environment to override it in KiB; positive

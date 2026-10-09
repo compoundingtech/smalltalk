@@ -892,9 +892,10 @@ impl Drop for WriterGuard<'_> {
     }
 }
 
-/// Read connections, with separate admission and idle-retention ceilings. API workers enter
-/// admitted request scopes before acquiring a connection or other store locks. Legacy raw
-/// `get`/`try_get` remain ungated: nested raw loans must not wait while holding another loan.
+/// Read connections, with separate admission and idle-retention ceilings. Top-level API
+/// workers enter admitted request scopes before acquiring a connection or other store locks.
+/// Cross-pool nested scopes never wait for admission, like legacy raw `get`/`try_get`:
+/// waiting while holding another loan or snapshot can create a dependency cycle.
 /// Within a request or pinned snapshot, raw reads reuse that thread's connection.
 pub struct ReadPool {
     pub idle: Mutex<Vec<ReadConnection>>,
@@ -1062,6 +1063,14 @@ fn request_reader_for(pool: usize) -> Option<Rc<ReadConnection>> {
             .find(|loan| loan.pool == pool)
             .map(|loan| loan.connection.clone())
     })
+}
+
+/// Whether this thread holds any pool's request loan or pinned snapshot. Such a thread must
+/// not wait for read admission: another worker may hold that capacity while waiting on this
+/// thread's reader. Async callers should run nested reads through `ReadPool::request_read`.
+pub fn thread_holds_reader() -> bool {
+    REQUEST_READER.with(|slot| !slot.borrow().is_empty())
+        || PINNED_STACK.with(|stack| !stack.borrow().is_empty())
 }
 
 /// This thread's innermost pin for `pool`, even below another store's pin: reentry must
@@ -1270,15 +1279,18 @@ impl ReadPool {
     }
 
     /// One reader per blocking worker, without BEGIN. Reads still take a snapshot per
-    /// statement unless Store::read_snapshot explicitly pins a transaction. Nested scopes
-    /// reuse the same loan, including a pinned snapshot; unrelated workers admit before acquisition.
+    /// statement unless Store::read_snapshot explicitly pins a transaction. Same-pool nested
+    /// scopes reuse their loan or snapshot. Cross-pool nesting tries admission without waiting
+    /// and, if unavailable, borrows outside the top-level bound like legacy raw checkout.
     #[track_caller]
     pub fn request_read<T>(&self, work: impl FnOnce() -> T) -> Result<T> {
         crate::read_budget::check()?;
         if self.has_request_reader() {
             return Ok(work());
         }
-        self.request_read_with_permit(self.admit_read_sync()?, work)
+        let nested = thread_holds_reader();
+        let permit = if nested { self.try_admit_read() } else { Some(self.admit_read_sync()?) };
+        self.request_read_loan(permit, work)
     }
 
     /// Establish the normal request loan with capacity acquired before the worker was spawned.
@@ -1290,9 +1302,15 @@ impl ReadPool {
             drop(permit);
             return Ok(work());
         }
+        self.request_read_loan(Some(permit), work)
+    }
+
+    /// Register admitted and unadmitted nested loans with the same ownership and cleanup.
+    #[track_caller]
+    fn request_read_loan<T>(&self, permit: Option<ReadPermit>, work: impl FnOnce() -> T) -> Result<T> {
         let mut guard = self.try_get()?;
         let mut connection = guard.connection.take().expect("try_get holds a connection");
-        connection.permit = Some(permit);
+        connection.permit = permit;
         let connection = Rc::new(connection);
         let live = guard._live.take();
         drop(guard);

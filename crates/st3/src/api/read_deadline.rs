@@ -329,8 +329,12 @@ where
     let mut future = std::pin::pin!(future);
     let mut admission = std::pin::pin!(store.readers.admit_read(admission_budget.clone()));
     std::future::poll_fn(|cx| {
-        if store.readers.has_request_reader() {
-            return future.as_mut().poll(cx);
+        if smallclaims::sqlite::thread_holds_reader() {
+            if store.readers.has_request_reader() {
+                return future.as_mut().poll(cx);
+            }
+            return store.readers.request_read(|| future.as_mut().poll(cx))
+                .unwrap_or_else(|error| Poll::Ready(ApiError::internal(error).into_response()));
         }
         let admitted = match admission.as_mut().poll(cx) {
             Poll::Pending => return Poll::Pending,
@@ -354,14 +358,14 @@ where
 /// WebSocket upgrade. It takes the same reader admission as an HTTP read worker, but
 /// keeps the upgraded stream's existing policy: no read budget or deadline is imposed,
 /// and dropping the returned future releases a still-pending admission. Same-thread
-/// callers that already hold this pool's loan run inline on it instead.
+/// nested callers run inline: same-pool loans are reused, and another pool is tried without waiting.
 pub(super) async fn store_read<T, F>(store: &Arc<super::Store>, work: F) -> Result<T, WorkError>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    if store.readers.has_request_reader() {
-        return Ok(work());
+    if smallclaims::sqlite::thread_holds_reader() {
+        return store.readers.request_read(work).map_err(admission_error);
     }
     let permit = store
         .readers
@@ -420,6 +424,8 @@ where
         tokio::runtime::RuntimeFlavor::MultiThread
     );
     let reentrant = store.as_ref().is_some_and(|store| store.readers.has_request_reader());
+    let cross_pool = query && store.is_some() && !reentrant
+        && smallclaims::sqlite::thread_holds_reader();
     // Handlers never own a whole-request reader: `handler` admits per poll, and their
     // nested queries take query admission themselves. Only explicit query work admits here.
     let loan = budget.is_some() && query;
@@ -472,14 +478,19 @@ where
     // loan inline; a spawned child admits its own permit without holding the parent's.
     // Both paths retain the same read budget, reader lease and committed mutation result,
     // and each call keeps its panic boundary for best-effort callers and error cleanup.
-    let inline = multithread && (IN_HANDLER.with(Cell::get) || reentrant);
+    let inline = cross_pool || (multithread && (IN_HANDLER.with(Cell::get) || reentrant));
     let task = if inline {
         // Leave the handler's block_on context while executing synchronous callbacks. Some
         // callbacks enter a runtime themselves (for example a forwarded conversation read).
         // A current-thread handler instead releases its poll-scoped loan before a child runs.
         Task::Inline(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tokio::task::block_in_place(|| run(None))
+                if multithread {
+                    tokio::task::block_in_place(|| run(None))
+                } else {
+                    // A different pool cannot queue while a synchronous outer loan is held.
+                    run(None)
+                }
             }))
             .unwrap_or(Err(WorkError::Panic)),
         )
@@ -798,6 +809,68 @@ mod tests {
         assert_eq!(results, (7, 9));
         assert_eq!(store.readers.usage().peak, 1);
         assert_eq!(store.readers.usage().idle, 1);
+    }
+
+    #[test]
+    fn opposite_cross_pool_async_queries_do_not_queue_under_outer_loans() {
+        for multithread in [false, true] {
+            let mut builder = if multithread {
+                tokio::runtime::Builder::new_multi_thread()
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+            };
+            builder.enable_all();
+            if multithread {
+                builder.worker_threads(2);
+            }
+            let runtime = builder.build().unwrap();
+            let first = Arc::new(smallclaims::sqlite::with_read_limit_for_test(1, ||
+                super::super::Store::open_memory("first")).unwrap());
+            let second = Arc::new(smallclaims::sqlite::with_read_limit_for_test(1, ||
+                super::super::Store::open_memory("second")).unwrap());
+            let held = Arc::new(std::sync::Barrier::new(2));
+            let (finished, completed) = std::sync::mpsc::channel();
+            let workers = [(first.clone(), second.clone()), (second.clone(), first.clone())]
+                .map(|(outer, inner)| {
+                let held = held.clone();
+                let finished = finished.clone();
+                let handle = runtime.handle().clone();
+                std::thread::spawn(move || {
+                    let result = outer.readers.request_read(|| {
+                        held.wait();
+                        let query_store = inner.clone();
+                        let value = handle.block_on(store_read(&inner, move ||
+                            query_store.readers.get().query_row("SELECT 7", [], |row| row.get::<_, u64>(0))
+                        )).unwrap().unwrap();
+                        assert_eq!(value, 7);
+                        // Both outer loans still own their sole permits for the budgeted
+                        // query helper as well as the unbudgeted upgraded-stream helper.
+                        held.wait();
+                        let query_store = inner.clone();
+                        let value = with_store(Some(inner.clone()), || read_budget::with(
+                            Some(ReadBudget::new("/cross-pool", ORDINARY)),
+                            || handle.block_on(async move {
+                                spawn_blocking(move ||
+                                    query_store.readers.get().query_row("SELECT 9", [], |row| row.get::<_, u64>(0))
+                                ).await
+                            }),
+                        )).unwrap().unwrap();
+                        assert_eq!(value, 9);
+                    });
+                    finished.send(result).unwrap();
+                })
+            });
+            drop(finished);
+            for _ in 0..2 {
+                completed.recv_timeout(Duration::from_secs(10))
+                    .expect("a nested cross-pool API query waited on an outer loan").unwrap();
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert!(first.readers.try_admit_read().is_some());
+            assert!(second.readers.try_admit_read().is_some());
+        }
     }
 
     /// An ordinary (non-long-poll) route that stays pending holds no reader: its poll

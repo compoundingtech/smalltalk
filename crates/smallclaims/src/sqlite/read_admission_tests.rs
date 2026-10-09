@@ -179,6 +179,120 @@ fn outer_snapshots_are_reused_when_reentered_below_another_store_at_bound_one() 
     second.readers.request_read(|| assert!(second.readers.get().is_autocommit())).unwrap();
 }
 
+fn connection_address(pool: &ReadPool) -> usize {
+    std::ptr::from_ref::<Connection>(&pool.get()) as usize
+}
+
+#[test]
+fn opposite_cross_pool_request_nesting_does_not_wait_at_bound_one() {
+    let first = Arc::new(with_read_limit_for_test(1, || Store::open_memory("first", Arc::new(Plain))).unwrap());
+    let second = Arc::new(with_read_limit_for_test(1, || Store::open_memory("second", Arc::new(Plain))).unwrap());
+    assert!(read_budget::current().is_none());
+    let outer_held = Arc::new(Barrier::new(2));
+    let inner_held = Arc::new(Barrier::new(2));
+    let (finished, completed) = std::sync::mpsc::channel();
+    let workers = [(first.clone(), second.clone()), (second.clone(), first.clone())]
+        .map(|(outer, inner)| {
+            let outer_held = outer_held.clone();
+            let inner_held = inner_held.clone();
+            let finished = finished.clone();
+            std::thread::spawn(move || {
+                assert!(!thread_holds_reader());
+                outer.readers.request_read(|| {
+                    assert!(thread_holds_reader());
+                    let outer_connection = connection_address(&outer.readers);
+                    outer_held.wait();
+                    // Each pool's only permit is held by the opposite worker's outer loan.
+                    inner.readers.request_read(|| {
+                        assert!(inner.readers.has_request_reader());
+                        assert_eq!(inner.readers.get().query_row("SELECT 1", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+                        // Before the barrier, the opposite outer loan cannot have ended.
+                        assert!(outer.readers.try_admit_read().is_none());
+                        assert!(inner.readers.try_admit_read().is_none());
+                        assert_eq!(inner.readers.usage().open, 2);
+                        inner_held.wait();
+                        outer.readers.request_read(|| {
+                            assert_eq!(connection_address(&outer.readers), outer_connection);
+                        }).unwrap();
+                        inner.readers.request_read(|| assert!(inner.readers.get().is_autocommit())).unwrap();
+                    }).unwrap();
+                    assert!(!inner.readers.has_request_reader());
+                    assert_eq!(connection_address(&outer.readers), outer_connection);
+                }).unwrap();
+                assert!(!thread_holds_reader());
+                finished.send(()).unwrap();
+            })
+        });
+    drop(finished);
+    for _ in 0..2 {
+        completed.recv_timeout(Duration::from_secs(10))
+            .expect("opposite cross-pool requests must not wait on each other's capacity");
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    for store in [&first, &second] {
+        let usage = store.readers.usage();
+        assert_eq!(usage.open, usage.idle);
+        assert_eq!(usage.opened, 2);
+        let permit = store.readers.try_admit_read().expect("every loan returned its capacity");
+        assert!(store.readers.try_admit_read().is_none());
+        drop(permit);
+    }
+}
+
+#[test]
+fn opposite_bare_snapshots_enter_other_pools_without_waiting() {
+    let first = Arc::new(with_read_limit_for_test(1, || Store::open_memory("first", Arc::new(Plain))).unwrap());
+    let second = Arc::new(with_read_limit_for_test(1, || Store::open_memory("second", Arc::new(Plain))).unwrap());
+    // Unrelated holders own both pools' only permits; bare pins hold none themselves.
+    let held = (first.readers.try_admit_read().unwrap(), second.readers.try_admit_read().unwrap());
+    let pinned = Arc::new(Barrier::new(2));
+    let inner_held = Arc::new(Barrier::new(2));
+    let (finished, completed) = std::sync::mpsc::channel();
+    let workers = [(first.clone(), second.clone()), (second.clone(), first.clone())]
+        .map(|(outer, inner)| {
+            let pinned = pinned.clone();
+            let inner_held = inner_held.clone();
+            let finished = finished.clone();
+            std::thread::spawn(move || {
+                outer.read_snapshot(|outer_index| {
+                    assert!(thread_holds_reader());
+                    pinned.wait();
+                    inner.readers.request_read(|| {
+                        assert!(inner.readers.has_request_reader());
+                        assert!(inner.readers.get().is_autocommit());
+                        assert!(inner.readers.try_admit_read().is_none());
+                        inner_held.wait();
+                        outer.read_snapshot(|inner_index| {
+                            assert_eq!(inner_index, outer_index);
+                            assert!(!outer.readers.get().is_autocommit());
+                            Ok(())
+                        })
+                    }).unwrap()
+                }).unwrap();
+                assert!(!thread_holds_reader());
+                finished.send(()).unwrap();
+            })
+        });
+    drop(finished);
+    for _ in 0..2 {
+        completed.recv_timeout(Duration::from_secs(10))
+            .expect("opposite pinned requests must not wait on each other's capacity");
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    drop(held);
+    for store in [&first, &second] {
+        let usage = store.readers.usage();
+        assert_eq!(usage.open, usage.idle);
+        let permit = store.readers.try_admit_read().expect("unadmitted loans never retain capacity");
+        assert!(store.readers.try_admit_read().is_none());
+        drop(permit);
+    }
+}
+
 #[test]
 fn bare_snapshots_reenter_the_outer_store_transaction_below_another_store() {
     let first = with_read_limit_for_test(1, || Store::open_memory("first", Arc::new(Plain))).unwrap();

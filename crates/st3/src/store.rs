@@ -2935,6 +2935,11 @@ impl Store {
             .unwrap_or_default())
     }
 
+    /// Never waits; multi-gate readers release unrelated guards before queuing on a miss.
+    pub(crate) fn try_admit_agent_resources(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.smalltalk.agent_resources_admission.clone().try_lock_owned().ok()
+    }
+
     /// One physical roster reader across HTTP pages and differently authorized WS windows.
     /// Waiting happens before SQLite snapshot acquisition, so followers pin no old WAL mark.
     pub(crate) async fn admit_agent_resources(&self) -> tokio::sync::OwnedMutexGuard<()> {
