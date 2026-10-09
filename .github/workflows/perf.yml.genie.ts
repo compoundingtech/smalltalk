@@ -28,7 +28,20 @@ export default githubWorkflow({
     push: { branches: ['main'], paths },
     schedule: [{ cron: '23 2 * * *' }],
     pull_request: { paths },
-    workflow_dispatch: {},
+    workflow_dispatch: {
+  "inputs": {
+    "retry_cap_qualification": {
+      "description": "Finite frozen retry-cap checkpoint; suppress ordinary load for this dispatch",
+      "type": "boolean",
+      "default": false
+    },
+    "qualification_assignment": {
+      "description": "Exact separately recorded Speed finite execution-assignment reference",
+      "type": "string",
+      "default": ""
+    }
+  }
+},
   },
   permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' },
   concurrency: {
@@ -41,7 +54,82 @@ export default githubWorkflow({
     selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
   },
   jobs: {
+    'retry-cap-implementation': {
+  "name": "retry-cap implementation and thirteen controls",
+  "runs-on": linuxStageRunner,
+  "timeout-minutes": 30,
+  "if": "github.event_name == 'workflow_dispatch' && inputs.retry_cap_qualification == true && github.run_attempt == 1",
+  "defaults": {
+    "run": {
+      "shell": "bash"
+    }
+  },
+  "env": {
+    "CARGO_PROFILE_DEV_DEBUG": "0",
+    "CARGO_PROFILE_TEST_DEBUG": "0",
+    "CARGO_INCREMENTAL": "0",
+    "SCCACHE_IDLE_TIMEOUT": "0",
+    "RETRY_QUALIFICATION_ASSIGNMENT": "${{ inputs.qualification_assignment }}"
+  },
+  "steps": [
+    {
+      "uses": "actions/checkout@v4",
+      "with": {
+        "fetch-depth": 0,
+        "persist-credentials": false
+      }
+    },
+    {
+      "name": "Verify and import frozen complete candidate source",
+      "run": "python3 scripts/ci-retry-cap-qualification prepare --out \"$RUNNER_TEMP/retry-cap\""
+    },
+    {
+      "name": "Isolate test state and keep the compiler cache",
+      "run": "home=\"$RUNNER_TEMP/test-home\"\nmkdir -p \"$home\"/{.config,.cache,.local/state} \"$RUNNER_TEMP/cargo-home\"/{registry,git} \"$RUNNER_TEMP/perf-sccache\"\nprintf 'CARGO_HOME=%s\\nCI_CACHE_DIR=%s\\nSCCACHE_DIR=%s\\nSCCACHE_CACHE_SIZE=1G\\n' \"$RUNNER_TEMP/cargo-home\" \"$RUNNER_TEMP/st-ci-cache\" \"$RUNNER_TEMP/perf-sccache\" >> \"$GITHUB_ENV\"\nprintf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_STATE_HOME=%s/.local/state\\n' \"$home\" \"$home\" \"$home\" \"$home\" >> \"$GITHUB_ENV\"\n"
+    },
+    {
+      "name": "Restore ordinary locked Cargo dependency cache",
+      "uses": "actions/cache/restore@v4",
+      "with": {
+        "path": "${{ runner.temp }}/cargo-home/registry\n${{ runner.temp }}/cargo-home/git",
+        "key": "cargo-retry-cap-implementation-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock', 'Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config.toml') }}",
+        "restore-keys": "cargo-retry-cap-implementation-${{ runner.os }}-"
+      }
+    },
+    {
+      "name": "Install Nix",
+      "uses": "DeterminateSystems/determinate-nix-action@v3",
+      "env": {
+        "GITHUB_TOKEN": "${{ github.token }}"
+      },
+      "with": {
+        "extra-conf": "experimental-features = nix-command flakes\naccept-flake-config = true\nextra-substituters = https://overeng-effect-utils.cachix.org\nextra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=\naccess-tokens = github.com=${{ github.token }}\n",
+        "summarize": true
+      }
+    },
+    {
+      "name": "Build once and run thirteen exact initial controls",
+      "run": "nix develop \"$RUNNER_TEMP/retry-cap/candidate#default\" -c python3 \"$GITHUB_WORKSPACE/scripts/ci-retry-cap-qualification\" execute --out \"$RUNNER_TEMP/retry-cap\""
+    },
+    {
+      "name": "Retain exact qualification evidence and archive",
+      "if": "always()",
+      "uses": "actions/upload-artifact@v4",
+      "with": {
+        "name": "retry-cap-9512-${{ github.run_id }}-attempt-${{ github.run_attempt }}",
+        "path": "${{ runner.temp }}/retry-cap/\n!${{ runner.temp }}/retry-cap/candidate/\n!${{ runner.temp }}/retry-cap/inventory-extract/\n!${{ runner.temp }}/retry-cap/run-extract/",
+        "retention-days": 7,
+        "compression-level": 0,
+        "if-no-files-found": "error"
+      }
+    }
+  ],
+  "permissions": {
+    "contents": "read"
+  }
+},
     'perf-load': {
+      if: "github.event_name != 'workflow_dispatch' || inputs.retry_cap_qualification != true",
       name: 'perf-load',
       'runs-on': linuxStageRunner,
       'timeout-minutes': 30,

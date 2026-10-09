@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Pure strict inventory/result checks for the single frozen hosted checkpoint."""
+import hashlib
+import json
+from pathlib import Path
+import re
+import xml.etree.ElementTree as ET
+
+
+def require(condition, reason):
+    if not condition:
+        raise ValueError(reason)
+
+
+def unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result, f'duplicate JSON key: {key}')
+        result[key] = value
+    return result
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text(), object_pairs_hook=unique_pairs)
+
+
+def digest(path):
+    with Path(path).open('rb') as stream:
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+
+def inventory(document, manifest, extracted):
+    suites = document['rust-suites']
+    require(len(suites) == 1, 'exactly one compiled library suite required')
+    key, suite = next(iter(suites.items()))
+    require(suite['package-name'] == 'smallclaims' and suite['kind'] == 'lib', 'wrong package/kind')
+    require(suite['status'] == 'listed' and key == suite['binary-id'], 'unlisted/inconsistent binary')
+    for field in ('binary-name', 'package-id', 'binary-id', 'binary-path', 'cwd'):
+        require(bool(suite[field]), f'missing actual binary identity: {field}')
+    cases = suite['testcases']
+    require(document['test-count'] == len(cases), 'inventory count mismatch')
+    short = manifest['authored_names']
+    require(len(short) == len(set(short)) == 13, 'authored set must contain 13 unique names')
+    prefix = manifest['expected_prefix']
+    expected = {prefix + name for name in short}
+    actual = {name for name in cases if name.startswith(prefix)}
+    require(actual == expected, 'missing/extra retry-module test')
+    for name in short:
+        require(sum(full.rsplit('::', 1)[-1] == name for full in cases) == 1, 'ambiguous authored name')
+    for name in actual:
+        require(cases[name]['ignored'] is False, 'ignored control')
+        require(cases[name]['filter-match']['status'] == 'matches', 'control excluded by CI profile')
+    binary = Path(suite['binary-path']).resolve(strict=True)
+    require(binary.is_relative_to(Path(extracted).resolve()), 'binary outside private archive extraction')
+    return {'binary_id': key, 'package_id': suite['package-id'], 'binary_name': suite['binary-name'],
+            'binary_path': str(binary), 'binary_sha256': digest(binary),
+            'full_names': sorted(actual), 'filter': 'package(=smallclaims) and kind(lib) and (' +
+            ' or '.join(f'test(={name})' for name in sorted(actual)) + ')'}
+
+
+def results(xml_text, raw, selection, exit_code):
+    require(exit_code == 0, 'nonzero control phase')
+    root = ET.fromstring(xml_text)
+    require(root.tag == 'testsuites', 'unexpected XML root')
+    for field, count in (('tests', 13), ('failures', 0), ('errors', 0)):
+        require(root.get(field) == str(count), f'root {field} mismatch')
+    suites = root.findall('testsuite')
+    require(len(suites) == 1 and suites[0].get('name') == selection['binary_id'], 'wrong JUnit binary')
+    suite = suites[0]
+    for field, count in (('tests', 13), ('failures', 0), ('errors', 0)):
+        require(suite.get(field) == str(count), f'suite {field} mismatch')
+    for field in ('disabled', 'skipped'):
+        require(suite.get(field, '0') == '0', f'nonzero {field}')
+    cases = suite.findall('testcase')
+    names = [case.get('name') for case in cases]
+    require(len(names) == len(set(names)) == 13 and set(names) == set(selection['full_names']), 'wrong named results')
+    for case in cases:
+        require(case.get('classname') == selection['binary_id'], 'wrong testcase binary')
+        require(case.get('timestamp') and case.get('time'), 'missing per-name execution timestamps')
+        require(float(case.get('time')) >= 0, 'invalid per-name time')
+        require(all(child.tag in ('system-out', 'system-err') for child in case), 'failure/skip/retry/unknown result tag')
+    # Use only nextest's status rows and terminal summary, never libtest summary text.
+    rows = re.findall(r'^\s*PASS\s+\[[^\]\n]+\]\s+(\S+)\s+(\S+)\s*$', raw, re.M)
+    require(len(rows) == 13 and len(set(rows)) == 13, 'missing/duplicate raw initial PASS rows')
+    require({(selection['binary_id'], name) for name in names} == set(rows), 'raw/JUnit named result mismatch')
+    require(not re.search(r'^\s*(?:TRY\s+\d+|RETRY|FLAKY|LEAK|FAIL|ABORT|SKIP|TIMEOUT)\b', raw, re.M), 'noninitial or negative raw outcome')
+    summaries = re.findall(r'^\s*Summary\s+\[[^\]\n]+\]\s+13 tests run: 13 passed(?:, \d+ skipped)?\s*$', raw, re.M)
+    require(len(summaries) == 1, 'missing/ambiguous exact 13/13 terminal summary')
+    return {'qualified': True, 'initial_passes': 13, 'names': sorted(names), 'retries': 0}

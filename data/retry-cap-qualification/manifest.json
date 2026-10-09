@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "state": "PLANNING_ONLY",
+  "candidate": "9512a6a758f55bb5f735397084c05c72f764aae4",
+  "tree": "ef4d8a055205ae230c84b806a42f2c338f7efb1c",
+  "bundle_prerequisite": "4f0e4787e2697196e154ffe3a1f75484b2ff85fc",
+  "bundle_sha256": "1c915b9858250dab1449247f457f9a712f3bf9fab17c527352d2c5658ac3a7e0",
+  "authored_names": [
+    "credit_starts_absent_expires_and_is_spent_once",
+    "wake_caller_and_failed_advance_keep_the_original_counter_and_cap",
+    "already_due_and_new_signed_cooldown_do_not_allow_an_advance",
+    "earn_spend_and_submission_reject_changed_authority_routes_and_auth",
+    "actual_export_and_submission_callers_dispatch_once_and_fence_slow_export",
+    "export_outlasting_the_original_cap_does_not_restart_failure_wait",
+    "submission_checks_changes_after_export_and_cancellation_never_rearms",
+    "typed_status_builder_and_non_http_failures_are_not_transport_permissions",
+    "structural_reqwest_timeout_is_phase_and_scheme_specific",
+    "lost_headers_do_not_undo_remote_effect_and_signed_duplicate_is_idempotent",
+    "checkpoint_caller_refuses_first_and_next_pages_without_adoption_cooldown",
+    "real_head405_caller_advances_once_then_resumes_original_deadline_and_backoff",
+    "advanced_success_rechecks_after_final_receive_without_rearming_credit"
+  ],
+  "expected_prefix": "sync::worker::retry::tests::",
+  "source_sha256": {
+    ".cargo/config.toml": "545fbc979201c6c45e96d71954d91fbcef058ee29d339b5a3599954f077abdf5",
+    ".config/nextest.toml": "e244b4734b5c86e447f861ea0e4bd69bce230d0dc32ae5e74e1fb81062955e32",
+    ".github/workflows/perf.yml.genie.ts": "d3a4e7307e7cfdb93e43fb716ba6f3a41a1695dff165fbee6a4c38707e31aa02",
+    ".github/workflows/workspace-ci.ts": "8d3d93f97ed1fd17d121d6c9aea99377cb6c16715adf1bffb17ddeefd2d582b7",
+    "Cargo.lock": "91b9747e403743cebde1e6dd3c5d8a4c0aad6e50e508450c35dd1a4447a5a521",
+    "Cargo.toml": "84f6271eaa339ddec834d50234e1b95f1b8272d7b940b131b61cec06120f2f88",
+    "build.rs": "ba92d89a89b9c033e0cb65b9aedb4ed83869259a1de3f609b24bcd11b8b81863",
+    "crates/smallclaims/Cargo.toml": "e5dca09e615d0ce75ec9528f0396b44c8b4a92557cb2f362cae1573edd6a2bfc",
+    "crates/smallclaims/src/sync/worker.rs": "e211b839e18a6d7a090f8b6013eb852355c3a5db8c83ce240e43dca6ee025d95",
+    "crates/smallclaims/src/sync/worker_retry.rs": "880bd6861210effceb45b501bcc4cceb09f1ccf2a601e2840149af870ac76620",
+    "crates/smallclaims/src/sync/worker_retry_tests.rs": "a7e47ed4c970135bedbf258e5ef351f443d576f6c3a0993be003d5ad2be5d823",
+    "flake.lock": "ddaabb242481705987b30aaed0825c29899c7bb94a7f046b6e3e8ebe0803acda",
+    "flake.nix": "fa55f9aaaead51dfe4b96d69fd6c04267c043fdc7001ec54ff99a347ba123532"
+  },
+  "runner_class": "nscloud-ubuntu-24.04-amd64-8x16-with-features",
+  "event_priority": "ordinary manual class 2 from existing linuxStageRunner",
+  "artifact_qualification": "No compiled archive held; one new hosted archive build only"
+}

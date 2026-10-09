@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Finite pure stand-ins; never invoke Cargo, native controls or hosted APIs."""
+import copy
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+import tempfile
+import unittest
+import xml.etree.ElementTree as ET
+
+loader = importlib.machinery.SourceFileLoader('verify', str(Path(__file__).with_name('ci-retry-cap-verify')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+v = importlib.util.module_from_spec(spec)
+loader.exec_module(v)
+MANIFEST = v.read_json(Path(__file__).parents[1] / 'data/retry-cap-qualification/manifest.json')
+NAMES = sorted(MANIFEST['expected_prefix'] + name for name in MANIFEST['authored_names'])
+SELECTION = {'binary_id': 'smallclaims', 'full_names': NAMES}
+
+
+def good_xml():
+    root = ET.Element('testsuites', tests='13', failures='0', errors='0')
+    suite = ET.SubElement(root, 'testsuite', name='smallclaims', tests='13', failures='0', errors='0')
+    for name in NAMES:
+        ET.SubElement(suite, 'testcase', name=name, classname='smallclaims', timestamp='2026-10-09T21:00:00Z', time='0.1')
+    return root
+
+
+def good_raw():
+    return '\n'.join('PASS [0.1s] smallclaims ' + name for name in NAMES) + '\nSummary [1.3s] 13 tests run: 13 passed, 100 skipped\n'
+
+
+class EvidenceTests(unittest.TestCase):
+    def test_positive_and_negative_results(self):
+        self.assertTrue(v.results(ET.tostring(good_xml()), good_raw(), SELECTION, 0)['qualified'])
+        for tag in ['failure', 'error', 'skipped', 'rerunFailure', 'flakyFailure', 'rerunError', 'flakyError', 'unknown']:
+            with self.subTest(tag=tag):
+                root = good_xml(); ET.SubElement(root.find('testsuite/testcase'), tag)
+                with self.assertRaises(ValueError): v.results(ET.tostring(root), good_raw(), SELECTION, 0)
+        for kind in ['missing', 'extra', 'duplicate', 'name', 'binary', 'count', 'time']:
+            with self.subTest(kind=kind):
+                root = good_xml(); suite = root.find('testsuite')
+                if kind == 'missing': suite.remove(suite[-1])
+                elif kind == 'extra': ET.SubElement(suite, 'testcase', name='extra')
+                elif kind == 'duplicate': suite[-1].set('name', NAMES[0])
+                elif kind == 'name': suite[-1].set('name', 'wrong')
+                elif kind == 'binary': suite[-1].set('classname', 'wrong')
+                elif kind == 'count': root.set('tests', '12')
+                elif kind == 'time': suite[-1].set('time', '-1')
+                with self.assertRaises(ValueError): v.results(ET.tostring(root), good_raw(), SELECTION, 0)
+        for raw in ['Summary [1s] 13 tests run: 13 passed\n', good_raw() + good_raw(),
+                    good_raw().replace('13 passed', '12 passed'), good_raw() + 'RETRY control\n']:
+            with self.subTest(raw=raw[-80:]):
+                with self.assertRaises(ValueError): v.results(ET.tostring(good_xml()), raw, SELECTION, 0)
+        for exit_code in [1, 101, 130, 143, -9]:
+            with self.subTest(exit_code=exit_code):
+                with self.assertRaises(ValueError): v.results(ET.tostring(good_xml()), good_raw(), SELECTION, exit_code)
+
+    def test_inventory_refuses_wrong_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / 'smallclaims'; binary.write_bytes(b'stand-in only')
+            suite = {'package-name': 'smallclaims', 'kind': 'lib', 'status': 'listed', 'binary-id': 'smallclaims',
+                     'binary-name': 'smallclaims', 'package-id': 'stand-in', 'binary-path': str(binary), 'cwd': directory,
+                     'testcases': {name: {'ignored': False, 'filter-match': {'status': 'matches'}} for name in NAMES}}
+            document = {'test-count': 13, 'rust-suites': {'smallclaims': suite}}
+            self.assertEqual(v.inventory(document, MANIFEST, directory)['full_names'], NAMES)
+            for kind in ['missing', 'extra', 'ignored', 'excluded', 'duplicate-short', 'wrong-kind', 'extra-binary', 'count']:
+                with self.subTest(kind=kind):
+                    item = copy.deepcopy(document); selected = item['rust-suites']['smallclaims']; cases = selected['testcases']
+                    if kind == 'missing': cases.pop(NAMES[0]); item['test-count'] -= 1
+                    elif kind == 'extra': cases[MANIFEST['expected_prefix'] + 'extra'] = cases[NAMES[0]]; item['test-count'] += 1
+                    elif kind == 'ignored': cases[NAMES[0]]['ignored'] = True
+                    elif kind == 'excluded': cases[NAMES[0]]['filter-match']['status'] = 'mismatch'
+                    elif kind == 'duplicate-short': cases['other::' + NAMES[0].rsplit('::', 1)[-1]] = cases[NAMES[0]]; item['test-count'] += 1
+                    elif kind == 'wrong-kind': selected['kind'] = 'bin'
+                    elif kind == 'extra-binary': item['rust-suites']['other'] = selected
+                    elif kind == 'count': item['test-count'] = 14
+                    with self.assertRaises(ValueError): v.inventory(item, MANIFEST, directory)
+
+    def test_duplicate_json_keys_refused(self):
+        with self.assertRaises(ValueError):
+            v.json.loads('{"rust-suites":{},"rust-suites":{}}', object_pairs_hook=v.unique_pairs)
+
+
+if __name__ == '__main__':
+    unittest.main()

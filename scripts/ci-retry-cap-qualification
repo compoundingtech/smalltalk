@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Proposed dispatch-only orchestrator. Never run from planning/local shells."""
+import argparse
+import importlib.util
+import importlib.machinery
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import subprocess
+import sys
+import time
+import tomllib
+
+loader = importlib.machinery.SourceFileLoader('verify', str(Path(__file__).with_name('ci-retry-cap-verify')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+verify = importlib.util.module_from_spec(spec)
+loader.exec_module(verify)
+
+
+def save(path, value):
+    Path(path).write_text(json.dumps(value, indent=2, sort_keys=True) + '\n')
+
+
+def git(source, *args):
+    return subprocess.check_output(['git', '-C', str(source), *args], text=True).strip()
+
+
+def source_check(source, manifest):
+    verify.require(git(source, 'rev-parse', 'HEAD') == manifest['candidate'], 'candidate SHA mismatch')
+    verify.require(git(source, 'rev-parse', 'HEAD^{tree}') == manifest['tree'], 'candidate tree mismatch')
+    verify.require(not git(source, 'status', '--porcelain'), 'candidate dirty')
+    for name, expected in manifest['source_sha256'].items():
+        verify.require(verify.digest(source / name) == expected, f'source hash mismatch: {name}')
+
+
+def phase(out, name, command, cwd):
+    started = time.monotonic_ns()
+    receipt = {'argv': command, 'cwd': str(cwd), 'started_monotonic_ns': started, 'status': 'STARTED'}
+    save(out / (name + '.phase.json'), receipt)
+    with (out / (name + '.stdout')).open('w') as stdout, (out / (name + '.stderr')).open('w') as stderr:
+        process = subprocess.Popen(command, cwd=cwd, stdout=stdout, stderr=stderr)
+        receipt['pid'] = process.pid
+        try:
+            receipt['cgroup_at_start'] = Path(f'/proc/{process.pid}/cgroup').read_text()
+        except OSError:
+            receipt['cgroup_at_start'] = None
+        save(out / (name + '.phase.json'), receipt)
+        code = process.wait()
+    receipt.update(exit_code=code, ended_monotonic_ns=time.monotonic_ns(), status='TERMINAL')
+    save(out / (name + '.phase.json'), receipt)
+    print(f'{name}: real exit {code}', flush=True)
+    if code:
+        # Retain the signed subprocess code; conventional process exit preserves signals.
+        raise SystemExit(code if code >= 0 else 128 - code)
+    return receipt
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('action', choices=['prepare', 'execute'])
+    parser.add_argument('--out', required=True, type=Path)
+    args = parser.parse_args()
+    verify.require(os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch', 'hosted manual event required')
+    verify.require(os.environ.get('GITHUB_RUN_ATTEMPT') == '1', 'no rerun attempt is authorized')
+    verify.require(os.environ.get('RETRY_QUALIFICATION_ASSIGNMENT'), 'separate finite assignment reference required')
+    automation = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+    inputs = automation / 'data/retry-cap-qualification'
+    manifest = verify.read_json(inputs / 'manifest.json')
+    out = args.out.resolve()
+    if args.action == 'prepare':
+        out.mkdir(exist_ok=False)
+        save(out / 'result.json', {'qualified': False, 'status': 'PREPARING', 'source': manifest['candidate']})
+        bundle = inputs / '9512.bundle'
+        verify.require(verify.digest(bundle) == manifest['bundle_sha256'], 'source bundle hash mismatch')
+        verify.require(git(automation, 'rev-parse', 'HEAD') == os.environ['GITHUB_SHA'], 'automation checkout mismatch')
+        phase(out, 'bundle-verify', ['git', 'bundle', 'verify', str(bundle)], automation)
+        phase(out, 'bundle-import', ['git', 'fetch', '--no-tags', '--no-write-fetch-head', str(bundle), 'HEAD'], automation)
+        source = out / 'candidate'
+        phase(out, 'candidate-checkout', ['git', 'worktree', 'add', '--detach', str(source), manifest['candidate']], automation)
+        source_check(source, manifest)
+        save(out / 'prepared.json', {'candidate': manifest['candidate'], 'tree': manifest['tree'], 'source': str(source),
+            'automation_sha': os.environ['GITHUB_SHA'], 'automation_tree': git(automation, 'rev-parse', 'HEAD^{tree}'),
+            'manifest_sha256': verify.digest(inputs / 'manifest.json'), 'bundle_sha256': verify.digest(bundle),
+            'assignment': os.environ['RETRY_QUALIFICATION_ASSIGNMENT'], 'host': platform.node(), 'machine': platform.machine(),
+            'job': os.environ['GITHUB_JOB'], 'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+            'runner_name': os.environ.get('RUNNER_NAME'), 'workflow_ref': os.environ.get('GITHUB_WORKFLOW_REF'),
+            'resources': {'cpu_count': os.cpu_count(), 'meminfo': Path('/proc/meminfo').read_text(),
+                          'self_cgroup': Path('/proc/self/cgroup').read_text()}})
+        print('Verified full private candidate tree; no compiler invoked by prepare.', flush=True)
+        return
+    prepared = verify.read_json(out / 'prepared.json')
+    verify.require(prepared['manifest_sha256'] == verify.digest(inputs / 'manifest.json'), 'manifest changed after prepare')
+    verify.require(prepared['automation_sha'] == os.environ['GITHUB_SHA'], 'automation changed')
+    source = Path(prepared['source'])
+    source_check(source, manifest)
+    try:
+        tools = {}
+        for name, command in [('rustc', ['rustc', '-vV']), ('cargo', ['cargo', '-V']), ('nextest', ['cargo', 'nextest', '--version'])]:
+            phase(out, 'tool-' + name, command, source)
+            tools[name] = (out / ('tool-' + name + '.stdout')).read_text()
+        tools['executables'] = {}
+        for name in ['cargo', 'rustc', 'cargo-nextest']:
+            executable = shutil.which(name)
+            verify.require(executable and Path(executable).resolve().is_relative_to('/nix/store'), 'tool outside pinned Nix shell: ' + name)
+            tools['executables'][name] = {'path': executable, 'resolved': str(Path(executable).resolve()), 'sha256': verify.digest(executable)}
+        tools['selected_environment'] = {key: os.environ.get(key) for key in ['RUSTC_WRAPPER', 'CARGO_HOME',
+            'CARGO_BUILD_JOBS', 'CARGO_PROFILE_DEV_DEBUG', 'CARGO_PROFILE_TEST_DEBUG', 'CARGO_INCREMENTAL']}
+        save(out / 'tools.json', tools)
+        # Normal locked dependency fetch is not a compile or test. The archive build is offline.
+        phase(out, 'dependencies', ['cargo', 'fetch', '--locked'], source)
+        archive = out / 'retry-cap.tar.zst'
+        phase(out, 'build', ['cargo', 'nextest', 'archive', '-p', 'smallclaims', '--lib', '--features', 'test-support',
+            '--locked', '--offline', '--profile', 'ci', '--color', 'never', '--archive-file', str(archive)], source)
+        archive_hash = verify.digest(archive)
+        extracted = out / 'inventory-extract'
+        phase(out, 'inventory', ['cargo', 'nextest', 'list', '--archive-file', str(archive), '--extract-to', str(extracted),
+            '--workspace-remap', str(source), '--profile', 'ci', '--color', 'never', '--message-format', 'json'], source)
+        selected = verify.inventory(verify.read_json(out / 'inventory.stdout'), manifest, extracted)
+        metadata = verify.read_json(extracted / 'target/nextest/cargo-metadata.json')
+        nodes = [node for node in metadata['resolve']['nodes'] if node['id'] == selected['package_id']]
+        verify.require(len(nodes) == 1 and set(nodes[0]['features']) == {'test-support'}, 'compiled feature identity mismatch')
+        selected['resolved_features'] = nodes[0]['features']
+        selected['cargo_metadata_sha256'] = verify.digest(extracted / 'target/nextest/cargo-metadata.json')
+        selected['archive_sha256'] = archive_hash
+        save(out / 'selection.json', selected)
+        (out / 'exact.filter').write_text(selected['filter'] + '\n')
+        config = source / '.config/nextest.toml'
+        original = tomllib.loads(config.read_text())
+        verify.require('junit' not in original['profile']['ci'] and 'store' not in original, 'unexpected report config collision')
+        reporting = config.read_text() + '\n[store]\ndir = ' + json.dumps(str(out / 'nextest-store')) + '\n' + \
+            '[profile.ci.junit]\npath = "retry-cap-attempt1.xml"\nstore-success-output = true\nstore-failure-output = true\n'
+        overlay = out / 'retry-nextest.toml'
+        overlay.write_text(reporting)
+        parsed = tomllib.loads(reporting)
+        del parsed['store']; del parsed['profile']['ci']['junit']
+        verify.require(parsed == original, 'report-only config altered policy')
+        junit = out / 'nextest-store/ci/retry-cap-attempt1.xml'
+        verify.require(not junit.exists(), 'stale JUnit file')
+        run_extracted = out / 'run-extract'
+        phase(out, 'controls', ['cargo', 'nextest', 'run', '--archive-file', str(archive), '--extract-to', str(run_extracted),
+            '--workspace-remap', str(source), '--config-file', str(overlay), '--profile', 'ci', '--retries', '0',
+            '--test-threads', '1', '--no-fail-fast', '--status-level', 'pass', '--final-status-level', 'fail',
+            '--success-output', 'immediate', '--failure-output', 'immediate', '--color', 'never', '-E', selected['filter']], source)
+        relative_binary = Path(selected['binary_path']).relative_to(extracted)
+        verify.require(verify.digest(run_extracted / relative_binary) == selected['binary_sha256'], 'execution binary changed')
+        verify.require(verify.digest(archive) == archive_hash, 'archive changed')
+        source_check(source, manifest)
+        raw = (out / 'controls.stderr').read_text() + '\n' + (out / 'controls.stdout').read_text()
+        verdict = verify.results(junit.read_text(), raw, selected, 0)
+        verdict.update(source=manifest['candidate'], tree=manifest['tree'], archive_sha256=archive_hash,
+                       junit_sha256=verify.digest(junit), config_sha256=verify.digest(overlay), status='TERMINAL')
+        save(out / 'result.json', verdict)
+        print('Exactly 13 named initial PASS results verified; no retries.', flush=True)
+    except BaseException as error:
+        save(out / 'result.json', {'qualified': False, 'status': 'FAILED_OR_PARTIAL', 'error_type': type(error).__name__,
+                                  'error': str(error), 'source': manifest['candidate'], 'tree': manifest['tree']})
+        raise
+
+
+if __name__ == '__main__':
+    main()

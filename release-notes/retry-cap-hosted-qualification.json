@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add a dispatch-only frozen retry-cap implementation checkpoint",
+  "replay": {
+    "status": "none",
+    "detail": "Qualification automation only; no runtime, durable data, contract, deployment or quarantine change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Qualification automation only; no runtime, durable data, contract, deployment or quarantine change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Qualification automation only; no runtime, durable data, contract, deployment or quarantine change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Qualification automation only; no runtime, durable data, contract, deployment or quarantine change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Qualification automation only; no runtime, durable data, contract, deployment or quarantine change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Qualification automation only; no runtime, durable data, contract, deployment or quarantine change."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "After separately recorded finite authorization, publish the reviewed automation branch and dispatch Performance with retry_cap_qualification=true and its assignment reference once. The ordinary load job is suppressed only for that dispatch."
+  }
+}
