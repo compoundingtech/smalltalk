@@ -1,0 +1,29 @@
+{
+ "variant": "silent",
+ "started_ms": 0,
+ "person_messages": [],
+ "assistant_text": [
+  {
+   "ms": 2000,
+   "text": "Hello! In about five minutes I will show you two agents talking, then a small mission running. You can say skip any time."
+  },
+  {
+   "ms": 20000,
+   "text": "I started a second agent beside this chat. I asked it a question, and you can see its answer. Two agents sent each other messages, and either can wake the other."
+  },
+  {
+   "ms": 110000,
+   "text": "You watched a small mission run: a goal, owners and a recorded result. What do you want to accomplish in Smalltalk today?"
+  },
+  {
+   "ms": 150000,
+   "text": "You have been quiet, so I will leave it here for now. I am available whenever you want to start, and phone pairing and GitHub are there when you want them."
+  }
+ ],
+ "messages": [],
+ "demo_agent_exists": false,
+ "demo_mission_state": "completed",
+ "welcome_bytes": 92,
+ "onboarding_run_state": "completed",
+ "skip_ms": null
+}

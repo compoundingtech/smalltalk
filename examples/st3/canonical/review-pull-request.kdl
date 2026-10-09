@@ -1,0 +1,39 @@
+version 2
+
+// Canonical mission 2: review one pull request and recommend, without touching it.
+//
+// Give it a pull request address. It reads the change, runs what it can in a scratch checkout, and
+// stores a review with recommendations. It never comments on, approves, merges or pushes to the
+// pull request: you decide what to do with the review. It needs read access to the repository (a
+// checkout, or the GitHub CLI signed in); nothing else in Smalltalk needs GitHub.
+//
+//   st agents new st/reviewer --harness claude --workspace "$HOME/st/agents/st-reviewer"
+//   st apply review-pull-request.kdl --as person/NAME
+//   st missions start example/canonical/review-pull-request \
+//     --id example/canonical/review-pull-request/first \
+//     --input pr=https://github.com/example/garden/pull/12 --workspace "$PWD" --as person/NAME
+
+mission "example/canonical/review-pull-request" state="ready" {
+  input "pr" kind="text"
+  goal "A stored review of the pull request gives a verdict and ranked recommendations, and the pull request itself is unchanged."
+  constraint "Do not comment on, approve, request changes on, merge, or push to the pull request."
+  constraint "Run tests only in a scratch checkout inside the workspace. Say plainly what you could not run and why."
+
+  step "read" timeout="45m" {
+    available-to "agent/st/reviewer"
+    goal "Read ${input.pr}: the description, the diff, and the files around the change, and write down what it is meant to do and what it actually does."
+  }
+
+  step "check" timeout="1h" {
+    available-to "agent/st/reviewer"
+    depends-on { step "read" completed }
+    goal "Run the tests and checks that touch the change in a scratch checkout, and note every defect with its file and line."
+  }
+
+  step "review" timeout="30m" {
+    available-to "agent/st/reviewer"
+    depends-on { step "check" completed }
+    goal "Store the review with st documents put and complete this step with its reference, a one-line verdict, and the three most important recommendations in order."
+    constraint "Separate what must change from what is only a suggestion. Quote at most three lines of code."
+  }
+}

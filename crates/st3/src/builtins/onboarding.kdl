@@ -1,46 +1,42 @@
 version 2
 mission "st/onboarding" state="ready" {
-  goal "Learn to see agents, give them work, and answer their questions from Home."
-  assigned-to "agent/st/expert"
+  goal "You meet the Smalltalk Assistant, watch two agents talk and a small mission run, then tell it what you want to do in Smalltalk and it starts that work."
+  assigned-to "agent/st/assistant"
   baseline "the bundled guide is available" {
     document "@GUIDE@"
   }
-  constraint "Read @GUIDE@ before guiding the person. Read the configured person, machines and doctor results from the graph; do not assume installation facts."
-  constraint "Never ask for or type a password. Offer exact commands for the person to run when their decision or system privileges are needed."
-  constraint "Keep sample work inside the scratch workspace and graph. Use invented names. Do not publish outside this machine or require GitHub. Optional steps may be skipped."
-  step "hello" {
-    goal "Greet the configured person and check st doctor and machines. Explain seats, missions and Home in five sentences; store the checked results as evidence."
+  baseline "the ready-made missions are available" {
+    document "@WEEKLY@"
+    document "@SCHEDULE@"
+    document "@PULL_REQUEST@"
   }
-  step "tour" {
+  constraint "Read @GUIDE@ before you speak. It says how to run each act and which commands to use. Read the configured person, the machine and the doctor results from the graph; do not assume installation facts."
+  constraint "In act three, when it fits what they tell you, offer one of these ready-made missions and apply it for them if they say yes. Read one with st documents get REFERENCE --raw. A weekly review of how they work with their agents: @WEEKLY@. Running that review every Monday: @SCHEDULE@. A review of one pull request, which needs read access to its repository: @PULL_REQUEST@. Only the pull request review involves GitHub."
+  constraint "Everything you say goes to the person as you, in this conversation. Never send them to Home or to an attention item, never ask them to run st themselves, and never mention steps, checks, gates, verifying or the graph."
+  constraint "Never ask for or type a password. Keep demo work inside the demo folder and the graph, with invented names, and publish nothing outside this machine. The person can say skip at any time."
+  step "hello" timeout="10m" {
+    goal "Within 15 seconds you are greeted, told in one sentence what is about to happen, and told you can say skip at any time."
+  }
+  step "act-one" timeout="20m" {
     depends-on { step "hello" completed }
-    goal "Guide the person through Home, Agents, Missions and the command palette. Explain attaching, detaching and quitting while work keeps running. Ask for a short choice on Home to check that the sidebar opened."
+    goal "You watch two agents talk: the Assistant starts a second agent beside the conversation, asks it a question, and you see both sides of the exchange before the Assistant says in two sentences what happened."
+    gate "the second agent exists" { exists "agent/st/demo" }
   }
-  step "first-mission" {
-    depends-on { step "tour" completed }
-    goal "Show a tiny private garden-note mission, preview its KDL, ask for a decision on Home before starting it, and follow its completed run and answered review."
+  step "act-two" timeout="30m" {
+    depends-on { step "act-one" completed }
+    goal "You watch a small mission, written by the Assistant for those two agents, run in a split until it is done, without answering any question."
+    gate "the demo note exists" {
+      // Gates run with a minimal environment and no HOME: the demo folder sits beside this
+      // run's workspace, under ~/st/agents.
+      exec "[ -s ../st-demo/welcome.md ]"
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "1m"
+    }
   }
-  step "your-project" {
-    depends-on { step "first-mission" completed }
-    goal "Ask which directory and harness the person wants, create their seat through st agents new, send a first message, and check its incarnation and read receipt."
-  }
-  step "keep-running" {
-    depends-on { step "your-project" completed }
-    goal "Check service status and platform permissions. Explain reboot behavior and give exact manual commands for any missing permissions; never run sudo."
-  }
-  step "phone" {
-    depends-on { step "keep-running" completed }
-    goal "Offer phone pairing through st devices, or record that the person skipped it."
-  }
-  step "second-machine" {
-    depends-on { step "phone" completed }
-    goal "Explain fleets and invites only if the person wants another machine; otherwise record a skip."
-  }
-  step "github" {
-    depends-on { step "second-machine" completed }
-    goal "Offer the optional GitHub observer. If gh is absent or the person declines, record a skip and continue. Never require it for onboarding."
-  }
-  step "wrap-up" {
-    depends-on { step "github" completed }
-    goal "List the checked work and objects that now exist, explain messaging agent/st/expert again, and point to @GUIDE@ and st --help. Finish the run and remain available for future messages."
+  step "act-three" timeout="2h" {
+    depends-on { step "act-two" completed }
+    goal "You are asked what you want to accomplish in Smalltalk today, and the Assistant asks follow-ups until it can start a seat or a mission for your project, in a folder you name."
+    goal "You leave knowing the Assistant stays here for questions, and that phone pairing, a second machine and GitHub are there when you want them."
   }
 }

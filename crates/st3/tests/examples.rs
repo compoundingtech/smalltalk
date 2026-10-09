@@ -1595,6 +1595,7 @@ fn every_example_previews_cleanly_once_its_seats_exist() {
         "examples/st3/seats/chief.kdl",
         "examples/st3/seats/planner.kdl",
         "examples/st3/seats/reviewer.kdl",
+        "examples/st3/canonical/seats/reviewer.kdl",
     ] {
         let source = fs::read_to_string(root.join(seat)).expect("read seat example");
         let intent = st3::parse_intent(&source, "local").expect("parse seat example");

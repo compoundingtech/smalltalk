@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Provide a first-run terminal UI entry point to open the newly published expert conversation.",
+  "summary": "Provide a first-run terminal UI entry point to open the newly published Smalltalk Assistant conversation.",
   "replay": {
     "status": "none",
     "detail": "No claim replay, projection rebuild or store recovery changes."

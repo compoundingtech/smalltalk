@@ -1,0 +1,52 @@
+version 2
+
+// Canonical mission 1: a weekly review of your own agent sessions.
+//
+// It looks across last week's conversations for habits worth breaking and for tools or concepts
+// worth learning, and writes one report you can read when it suits you. It only reads: it changes
+// nothing outside its workspace and publishes nothing outside this machine. It needs no GitHub.
+//
+// The work runs on the seat `agent/st/reviewer`. Make it once, then publish and start the review:
+//
+//   st agents new st/reviewer --harness claude --workspace "$HOME/st/agents/st-reviewer"
+//   st apply weekly-session-review.kdl --as person/NAME
+//   st missions start example/canonical/weekly-session-review \
+//     --id example/canonical/weekly-session-review/first --workspace "$PWD" --as person/NAME
+//
+// The report step is guarded by a gate that rejects a report which looks like it quotes a
+// credential: a key, a token, a private key block or a `password=` style assignment. The gate is
+// a backstop for the constraint above it, not a substitute for it.
+
+mission "example/canonical/weekly-session-review" state="ready" {
+  goal "One report lists the habits to break and the tools or concepts worth learning, based on last week's sessions."
+  constraint "Read-only: do not change any file outside the workspace, and publish nothing outside this machine."
+  constraint "Sessions can contain secrets and private details. Never quote a credential, token, key, or personal detail in the report; describe the pattern instead."
+  constraint "Be specific and kind: name a pattern, show one short invented or paraphrased example, say why it costs time, and suggest one small change. No more than seven items."
+
+  step "gather" timeout="30m" {
+    available-to "agent/st/reviewer"
+    goal "Find last week's sessions with st conversations search and st conversations ls, and write a short list of what was worked on, how often each agent was corrected or re-asked, and what was repeated."
+    constraint "Look back exactly seven days from now. Note which sessions you could not read and why."
+  }
+
+  step "analyze" timeout="45m" {
+    available-to "agent/st/reviewer"
+    depends-on { step "gather" completed }
+    goal "From the list, find repeated corrections, long detours, avoidable re-explanations, and tasks where a tool, a mission, or a different way of asking would have saved time."
+  }
+
+  step "report" timeout="30m" {
+    available-to "agent/st/reviewer"
+    depends-on { step "analyze" completed }
+    goal "Write the report to report.md in the workspace, store it with st documents put, and complete this step with its reference and a three-sentence summary."
+    constraint "The report starts with the single most useful change, then the other items, then what to try this week."
+    gate "the report exists and quotes no credential" {
+      // Not yet (1) while report.md is missing, empty or looks like it quotes a credential; broken (2)
+      // if grep itself cannot run, so a missing tool is never mistaken for a clean report.
+      exec #"[ -s report.md ] || exit 1; grep -E -q -i -e 'sk-[a-z0-9_-]{16,}' -e 'AKIA[0-9A-Z]{16}' -e 'gh[pousr]_[a-z0-9]{20,}' -e 'xox[abp]-[a-z0-9-]{10,}' -e 'BEGIN [A-Z ]*PRIVATE KEY' -e '(password|passwd|secret|token|api[_-]?key)[^a-z0-9]{0,4}[:=][ ]*[^ ]{6,}' report.md; case $? in 1) exit 0;; 0) exit 1;; *) exit 2;; esac"#
+      host "local"
+      workspace "${ST_WORKSPACE}"
+      time-limit "1m"
+    }
+  }
+}
