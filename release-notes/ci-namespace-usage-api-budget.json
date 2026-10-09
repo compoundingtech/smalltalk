@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Allow the read-only daily Namespace history report its measured API collection time.",
+  "replay": {
+    "status": "none",
+    "detail": "Only the metadata-report timeout grows from15 to30minutes; no build, runtime, database or service resource setting changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Only the metadata-report timeout grows from15 to30minutes; no build, runtime, database or service resource setting changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Only the metadata-report timeout grows from15 to30minutes; no build, runtime, database or service resource setting changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only the metadata-report timeout grows from15 to30minutes; no build, runtime, database or service resource setting changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only the metadata-report timeout grows from15 to30minutes; no build, runtime, database or service resource setting changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Only the metadata-report timeout grows from15 to30minutes; no build, runtime, database or service resource setting changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Only the metadata-report timeout grows from15 to30minutes; no build, runtime, database or service resource setting changes."
+  }
+}

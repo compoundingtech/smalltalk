@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import itertools
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -20,8 +21,10 @@ bash = shutil.which("bash")
 assert bash, "runner selection tests require bash on PATH"
 
 
+ids = itertools.count(1)
+
 def runner(label="ci1", busy=False, status="online"):
-    return {"status": status, "busy": busy, "labels": [{"name": label}]}
+    return {"id": next(ids), "status": status, "busy": busy, "labels": [{"name": label}]}
 
 
 def check(name, pages, expected=None, api=True, **overrides):
@@ -43,6 +46,7 @@ def check(name, pages, expected=None, api=True, **overrides):
             "HEAD_REPOSITORY": "example/project",
             "OWNER": "example",
             "PR_LABELS": "[]",
+            "MERGE_LOCAL_ONLY": "on",
             "QUEUE_REF": "",
             "GH_REPO_TOKEN": "",
             "NEED": "1",
@@ -111,6 +115,28 @@ check("reserved workers never count as extra general capacity", [{'runners': [ru
 check("status lookup failure preserves priority primary", four, 'ci1-priority', PR_LABELS='["ci-priority"]', API_EXIT='1')
 check("invalid status response preserves merge primary", four, 'ci1-merge', EVENT='merge_group', API_RESPONSE='not JSON')
 
+# Whole-group overflow chooses Namespace when admission cannot retain PR headroom.
+check("busy merge pool overflows", [{'runners': [runner('ci1-merge', busy=True)]}],
+      EVENT='merge_group', MERGE_LOCAL_ONLY='')
+check("missing status token overflows instead of queueing locally", [], api=False,
+      EVENT='merge_group', MERGE_LOCAL_ONLY='', GH_TOKEN='')
+check("failed runner lookup overflows", [], EVENT='merge_group', MERGE_LOCAL_ONLY='', API_EXIT='1')
+check("malformed runner lookup overflows", [], EVENT='merge_group', MERGE_LOCAL_ONLY='', API_RESPONSE='not JSON')
+check("five dedicated workers retain two PR slots", [{'runners': [runner('ci1-merge') for _ in range(5)] + [runner() for _ in range(2)]}],
+      {'merge_ci1': ['ci1-merge']}, EVENT='merge_group', MERGE_LOCAL_ONLY='')
+check("one PR slot is not enough", [{'runners': [runner('ci1-merge') for _ in range(5)] + [runner()]}],
+      EVENT='merge_group', MERGE_LOCAL_ONLY='')
+mixed = [runner() for _ in range(5)]
+for item in mixed: item['labels'].append({'name': 'ci1-merge'})
+check("five mixed workers cannot also promise two PR slots", [{'runners': mixed}], EVENT='merge_group', MERGE_LOCAL_ONLY='')
+check("five mixed plus two general workers admit a group", [{'runners': mixed + [runner(), runner()]}],
+      {'merge_ci1': ['ci1-merge']}, EVENT='merge_group', MERGE_LOCAL_ONLY='')
+check("duplicated API runner IDs never inflate capacity", [{'runners': mixed}, {'runners': mixed}],
+      EVENT='merge_group', MERGE_LOCAL_ONLY='')
+priority = [runner('ci1-priority') for _ in range(7)]
+for item in priority: item['labels'].extend([{'name': 'ci1-merge'}, {'name': 'ci1'}])
+check("priority-only workers remain reserved", [{'runners': priority}], EVENT='merge_group', MERGE_LOCAL_ONLY='')
+
 # Supporting PR jobs must never spend ordinary work on priority/merge capacity.
 import re
 blocks = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow.split("\njobs:\n", 1)[1]))
@@ -124,7 +150,7 @@ for job in ("linux-clippy", "linux-fleet-compat", "genie-freshness", "typescript
     else:
         assert "namespace-features:github.run-id=" in blocks[job], (job, "shape labels need a separate features label")
 for job, output in [('linux-tests-shard-2', 'ci1_secondary'), ('mail-redelivery-canaries', 'ci1_mail')]:
-    assert f'outputs.{output} ||' in blocks[job], (job, 'extra jobs need their own idle-slot output')
+    assert f'outputs.{output}) ||' in blocks[job], (job, 'extra jobs need their own idle-slot output')
     assert not re.search(r'outputs\.ci1\b', blocks[job]), (job, 'extra jobs must never take the primary reserved lane')
     assert 'job.priority={1}' in blocks[job] and 'github.run-id={0}' in blocks[job], (job, 'Namespace fallback must evaluate priority and run affinity')
     assert "github.event_name == 'merge_group' && 1 || 2" in blocks[job], job
@@ -167,8 +193,9 @@ for job in ("linux-tests", "linux-tests-shard-2"):
 assert "vars.CI1_MIN_IDLE || '1'" in picker, "use an idle general slot without requiring the entire pool"
 
 # Evaluate the generated runs-on expressions, not a second copy of the routing rule.
-def route(job, event, profile='', picked='', merge_ci1=''):
+def route(job, event, profile='', picked='', merge_ci1='', merge_picked=''):
     expression = blocks[job].split('runs-on: ', 1)[1].splitlines()[0].strip().removeprefix('${{').removesuffix('}}').strip()
+    expression = expression.replace('needs.pick-runner.outputs.merge_ci1', repr(merge_picked))
     expression = re.sub(r'needs\.pick-runner\.outputs\.ci1(?:_secondary|_mail)?', repr(picked), expression)
     expression = expression.replace('github.event_name', repr(event)).replace('github.run_id', '123').replace('vars.CI_MERGE_NAMESPACE_PROFILE', repr(profile)).replace('vars.CI_MERGE_CI1', repr(merge_ci1))
     return eval(expression.replace('&&', ' and ').replace('||', ' or '), {'__builtins__': {}}, {'fromJSON': json.loads, 'format': lambda template, *args: template.format(*args)})
@@ -177,6 +204,7 @@ for job in ('linux-test-build', 'linux-clippy', 'linux-fleet-compat', 'genie-fre
     assert route(job, 'merge_group', merge_ci1='on') == ['ci1-merge'], job
     assert route(job, 'merge_group', 'queue-reserved', '["ci1"]', merge_ci1='on') == ['ci1-merge'], (job, 'configured reservation overrides picked general slots')
     assert route(job, 'merge_group', 'queue-reserved') == ['namespace-profile-queue-reserved;job.priority=1;github.run-id=123'], job
+    assert route(job, 'merge_group', merge_picked='["ci1-merge"]') == ['ci1-merge'], (job, 'one admitted group uses the same local pool for every job')
     merge_fallback = route(job, 'merge_group')
     assert 'job.priority=1' in merge_fallback[0] and any('github.run-id=123' in label for label in merge_fallback), job
     for event in ('pull_request', 'workflow_dispatch'):
@@ -184,7 +212,7 @@ for job in ('linux-test-build', 'linux-clippy', 'linux-fleet-compat', 'genie-fre
         assert ordinary == route(job, event, 'queue-reserved', merge_ci1='on'), (job, 'PRs cannot consume reserved profile')
         assert 'job.priority=2' in ordinary[0], (job, 'queued PRs follow merge groups')
     if job in ('linux-test-build', 'linux-tests', 'linux-tests-shard-2', 'mail-redelivery-canaries'):
-        assert route(job, 'merge_group', 'queue-reserved', '["ci1-merge"]') == ['ci1-merge'], (job, 'retain picked ci1 lane')
+        assert route(job, 'merge_group', 'queue-reserved', '["ci1-merge"]') == ['namespace-profile-queue-reserved;job.priority=1;github.run-id=123'], (job, 'no individual picked lane may override whole-group admission')
 print('passed: all merge jobs use provisioned ci1 or Namespace reserve; PRs cannot; unset switches preserve shapes and affinity')
 
 # Exercise the actual generated step predicates, including restoring ordinary behavior.

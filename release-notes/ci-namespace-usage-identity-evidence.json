@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Refuse complete Namespace daily evidence when executed runner identity is ambiguous.",
+  "replay": {
+    "status": "none",
+    "detail": "CI usage-report classification/control and documentation correction only; no runtime or deployment change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI usage-report classification/control and documentation correction only; no runtime or deployment change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI usage-report classification/control and documentation correction only; no runtime or deployment change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI usage-report classification/control and documentation correction only; no runtime or deployment change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI usage-report classification/control and documentation correction only; no runtime or deployment change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "CI usage-report classification/control and documentation correction only; no runtime or deployment change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI usage-report classification/control and documentation correction only; no runtime or deployment change."
+  }
+}

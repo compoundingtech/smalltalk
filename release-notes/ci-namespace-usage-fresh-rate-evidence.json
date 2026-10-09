@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Require fresh API capacity evidence for each Namespace usage request.",
+  "replay": {
+    "status": "none",
+    "detail": "CI metadata reporting only; missing or invalid current quota headers retain partial evidence instead of inheriting prior observations. No runtime/database/resource-policy changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI metadata reporting only; missing or invalid current quota headers retain partial evidence instead of inheriting prior observations. No runtime/database/resource-policy changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI metadata reporting only; missing or invalid current quota headers retain partial evidence instead of inheriting prior observations. No runtime/database/resource-policy changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI metadata reporting only; missing or invalid current quota headers retain partial evidence instead of inheriting prior observations. No runtime/database/resource-policy changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI metadata reporting only; missing or invalid current quota headers retain partial evidence instead of inheriting prior observations. No runtime/database/resource-policy changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "CI metadata reporting only; missing or invalid current quota headers retain partial evidence instead of inheriting prior observations. No runtime/database/resource-policy changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI metadata reporting only; missing or invalid current quota headers retain partial evidence instead of inheriting prior observations. No runtime/database/resource-policy changes."
+  }
+}
