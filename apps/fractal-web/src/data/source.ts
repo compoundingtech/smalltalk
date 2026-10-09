@@ -38,6 +38,7 @@ import type { MonitorSource } from '../monitor/source.ts'
 import type { AgentResourceSource } from '../resources/agent/source.ts'
 import type { SubjectEnvelope } from '../resources/envelope.ts'
 import type { TerminalHistoryFactory } from '../terminal/historySource.ts'
+import type { TerminalInputPortFactory } from '../terminal/orderedTerminalInput.ts'
 import type { TerminalResizePort } from '../terminal/terminal-resize-port.ts'
 import type { SubjectReads } from './subjectReadPort.ts'
 
@@ -257,6 +258,8 @@ export interface DataSource {
   readonly terminalResize?: TerminalResizePort
   /** Retained owner scrollback, with its own independently granted availability. */
   readonly terminalHistory?: TerminalHistoryFactory
+  /** Admitted local-owner ordered socket sessions; absent until the generated producer publishes them. */
+  readonly terminalInput?: TerminalInputPortFactory
   /** Keyed by subject ref (PR, CI run, mission, pty …). */
   readonly envelope: (ref: string) => Atom.Atom<Feed<SubjectEnvelope>>
   /** Real graph observations, polled while visible until upstream adds resource subscriptions. */

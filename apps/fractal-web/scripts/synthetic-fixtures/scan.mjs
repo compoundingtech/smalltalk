@@ -1,7 +1,11 @@
 import { lstat, readdir, readFile } from 'node:fs/promises'
-import { resolve, join } from 'node:path'
+import { resolve, join, relative } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
+import { createHash } from 'node:crypto'
+
+const repositoryRoot = new URL('../../../../', import.meta.url).pathname
+const binaryManifest = new URL('../../src/terminal/assets/binary-assets.json', import.meta.url)
 
 // Values are never returned or logged. Built-in rules are generic and public; real identities
 // belong only in an owner-held policy passed with --policy, never in the repository.
@@ -58,9 +62,22 @@ const forbiddenText = (text, { rules, allows }) => {
   return rules.some((rule) => rule(identity))
 }
 export const forbiddenLine = (line, policy) => forbiddenText(normalize(line), compileRules(policy))
-export const scanFiles = async (roots, policy) => {
+export const scanFiles = async (roots, policy, manifest = binaryManifest) => {
   const compiled = compileRules(policy)
   const findings = []
+  let assets = []
+  try { assets = JSON.parse(await readFile(manifest, 'utf8')) }
+  catch (error) { if (error.code !== 'ENOENT') throw error }
+  if (!Array.isArray(assets) || assets.some((asset) =>
+    typeof asset.path !== 'string' || asset.path.startsWith('/') ||
+    asset.path.split('/').some((part) => part === '..' || part === '.') ||
+    !/^[a-f0-9]{64}$/.test(asset.sha256) ||
+    typeof asset.origin !== 'string' || !asset.origin ||
+    typeof asset.license !== 'string' || !asset.license))
+    throw new Error('Invalid binary asset manifest')
+  const approvedBinary = (path, bytes) => assets.some((asset) =>
+    asset.path === relative(repositoryRoot, path) &&
+    asset.sha256 === createHash('sha256').update(bytes).digest('hex'))
   const visit = async (path) => {
     const stat = await lstat(path)
     if (stat.isDirectory()) {
@@ -74,9 +91,15 @@ export const scanFiles = async (roots, policy) => {
     const bytes = await readFile(path)
     let text
     try { text = new TextDecoder('utf-8', { fatal: true }).decode(bytes) }
-    catch { findings.push({ file: path, line: 1 }); return }
-    // Raster captures/build blobs cannot be certified by a text scan; reject rather than skip.
-    if (text.includes('\0')) { findings.push({ file: path, line: 1 }); return }
+    catch {
+      if (!approvedBinary(path, bytes)) findings.push({ file: path, line: 1 })
+      return
+    }
+    // Only explicitly reviewed, hash-pinned vendored assets bypass text scanning.
+    if (text.includes('\0')) {
+      if (!approvedBinary(path, bytes)) findings.push({ file: path, line: 1 })
+      return
+    }
     text.split(/\r?\n/).forEach((line, i) => {
       if (forbiddenText(normalize(line), compiled)) findings.push({ file: path, line: i + 1 })
     })

@@ -63,3 +63,18 @@ test('CLI fails with file and line only, and rejects binary or symlink bypasses'
     await assert.rejects(scanFiles([file], []))
   } finally { await rm(dir, { recursive: true, force: true }) }
 })
+test('binary assets require a listed path and an exact reviewed hash', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'synthetic-assets-'))
+  const file = new URL('../../src/terminal/assets/ghostty-key-encoder.generated.wasm', import.meta.url).pathname
+  const manifest = new URL('../../src/terminal/assets/binary-assets.json', import.meta.url)
+  try {
+    assert.deepEqual(await scanFiles([file]), [])
+    const { readFile } = await import('node:fs/promises')
+    const assets = JSON.parse(await readFile(manifest, 'utf8'))
+    const policyPath = join(dir, 'assets.json')
+    await writeFile(policyPath, JSON.stringify(assets.map((asset) => ({ ...asset, sha256: '0'.repeat(64) }))))
+    assert.deepEqual(await scanFiles([file], undefined, policyPath), [{ file, line: 1 }])
+    await writeFile(policyPath, '[]')
+    assert.deepEqual(await scanFiles([file], undefined, policyPath), [{ file, line: 1 }])
+  } finally { await rm(dir, { recursive: true, force: true }) }
+})
