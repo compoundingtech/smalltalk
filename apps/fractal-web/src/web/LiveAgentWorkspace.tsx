@@ -314,7 +314,7 @@ const GatewayConnectionStatus = () => {
   const now = useNow()
   if (observation === undefined) return null
   const line = syncLine({
-    ...observation, label: 'connection', gateway: source.gateway, now,
+    ...observation, label: 'connection', now,
     socket: observation.status._tag !== 'Failed',
   })
   const reconnecting = observation.status._tag === 'Stale' && observation.status.reason._tag === 'Reconnecting'

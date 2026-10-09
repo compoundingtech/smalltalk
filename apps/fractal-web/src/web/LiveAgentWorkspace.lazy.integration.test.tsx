@@ -139,10 +139,11 @@ const renderShell = async (ux?: UxTelemetry) => {
 
 
 describe('gateway footer honesty', () => {
-  it('uses the sync wording rather than a raw Live tag', async () => {
+  it('uses user-facing connection wording rather than a raw host or Live tag', async () => {
     await renderShell()
     const footer = container.querySelector('footer')
-    expect(footer?.textContent).toContain('alpha.example')
+    expect(footer?.textContent).toContain('Connected')
+    expect(footer?.textContent).not.toContain('alpha.example')
     expect(footer?.textContent).not.toContain('Live')
   })
 
