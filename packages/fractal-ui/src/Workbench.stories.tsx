@@ -21,9 +21,8 @@ type State = 'one' | 'two' | 'three' | 'dragging' | 'nested' | 'tabs'
 type ThreadState = 'live' | 'empty' | 'loading' | 'stale' | 'failed' | 'unavailable'
 const tabLayout = group([{ uri: 'agent:worker-1' }, { uri: 'agent:worker-2' }])
 const fixtureLayout = (state: State): WorkbenchLayout => state === 'one' ? onePaneLayout : state === 'nested' ? nestedLayout : state === 'tabs' ? tabLayout : twoPaneLayout
-function WorkbenchStory({ scheme = 'dark', state = 'two', threadState = 'live', persist = true }: { scheme?: Scheme; state?: State; threadState?: ThreadState; persist?: boolean }) {
+function WorkbenchStory({ scheme = 'dark', state = 'two', threadState = 'live', persist = true, workspaceId = `kit-b-${scheme}-${state}-${threadState}` }: { scheme?: Scheme; state?: State; threadState?: ThreadState; persist?: boolean; workspaceId?: string }) {
   const fixture = useWorkbenchFixture()
-  const workspaceId = `kit-b-${scheme}-${state}-${threadState}`
   const initial = fixtureLayout(state)
   const [layout, setLayout] = React.useState(() => persist ? readStoredLayout(workspaceId, initial) : initial)
   const [epoch, setEpoch] = React.useState(0)
@@ -51,16 +50,16 @@ function WorkbenchStory({ scheme = 'dark', state = 'two', threadState = 'live', 
     if (path !== undefined) { const next = openAgentAtPath(layout, path, 'agent:worker-2', placement); storeLayout(workspaceId, next); setLayout(next); setFocused('agent:worker-2') }
   }
   const openTerminal = (ref?: string) => { setTerminalRef(ref); setTerminalOpen(true) }
-  return <main data-testid="workbench-story" data-state={state} data-layout={JSON.stringify(layout)} data-workspace={workspaceId} {...stylex.props(styles.canvas, ...baselineTheme, scheme === 'light' && lightTheme)}>
+  return <section aria-label={`Workbench, ${state}, ${threadState}`} data-testid="workbench-story" data-state={state} data-layout={JSON.stringify(layout)} data-workspace={workspaceId} {...stylex.props(styles.canvas, ...baselineTheme, scheme === 'light' && lightTheme)}>
     <div role="toolbar" aria-label="Workbench fixture actions" {...stylex.props(styles.toolbar)}><AgentDragRow onOpen={open} /><AgentDragRow agentKey="terminal/worker-1" title="Checks terminal" onOpen={() => openTerminal('terminal/worker-1')} /><Button onPress={() => { storeLayout(workspaceId, initial); setLayout(initial); setFocused('agent:worker-1'); setRevealRequest(undefined); setEpoch(value => value + 1) }} {...stylex.props(styles.button)}>Reset layout</Button><span>W3 · H1 · P3 · D2 · deterministic host</span></div>
     <div {...stylex.props(styles.workspace)}><Workbench key={epoch} layout={layout} resources={resources} workspaceId={workspaceId} scheme={scheme} appearance={decidedAppearance} landmarkContext={state} previewPlacement={state === 'dragging' ? 'right' : undefined} focusedPaneKey={focused} onPaneSelect={setFocused} onLayoutChange={setLayout} describePane={fixture.describePane} revealRequest={revealRequest} onOpenTerminal={openTerminal} /></div>
     {terminalOpen && <TerminalFixturePanel frame={terminal.frame} selectedRef={terminalRef} onSelect={setTerminalRef} onHide={() => setTerminalOpen(false)} onAdd={() => { const ref = terminal.add(); if (ref !== undefined) setTerminalRef(ref) }} onKill={terminal.kill} />}
-  </main>
+  </section>
 }
 const meta = {
   title: 'Fractal UI/Workbench', component: WorkbenchStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', state: 'two', threadState: 'live' },
-  argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, state: { options: ['one', 'two', 'three', 'dragging', 'nested', 'tabs'], control: 'select' }, threadState: { options: ['live', 'empty', 'loading', 'stale', 'failed', 'unavailable'], control: 'select' }, persist: { table: { disable: true } } },
-  render: args => <WorkbenchStory key={`${args.scheme}-${args.state}-${args.threadState}`} {...args} />,
+  argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, state: { options: ['one', 'two', 'three', 'dragging', 'nested', 'tabs'], control: 'select' }, threadState: { options: ['live', 'empty', 'loading', 'stale', 'failed', 'unavailable'], control: 'select' }, persist: { table: { disable: true } }, workspaceId: { table: { disable: true } } },
+  render: (args, { id }) => <main aria-label="Workbench"><WorkbenchStory key={`${id}-${args.scheme}-${args.state}-${args.threadState}`} {...args} workspaceId={`kit-b-${id}-${args.scheme}-${args.state}-${args.threadState}`} /></main>,
 } satisfies Meta<typeof WorkbenchStory>
 export default meta
 type Story = StoryObj<typeof meta>
@@ -111,6 +110,7 @@ export const KeyboardCloseAndSnapshot: Story = { args: { state: 'nested' }, play
   await settle()
   const neighbour = canvasElement.querySelector('[data-pane-key="agent:worker-1 view=secondary"]')!
   const editor = neighbour.querySelector<HTMLTextAreaElement>('[data-testid="composer-input"]')!
+  await userEvent.clear(editor)
   await userEvent.type(editor, 'Keep the secondary-view draft')
   const close = canvas.getByRole('button', { name: 'Close Changes' })
   close.focus()
@@ -145,6 +145,7 @@ export const KeyboardTabsAndTerminal: Story = { args: { state: 'tabs' }, play: a
   await expect(canvas.queryByRole('tab', { name: 'worker-2' })).toBeNull()
   const before = canvas.getByTestId('workbench-story').dataset.layout
   const input = canvas.getByTestId('composer-input')
+  await userEvent.clear(input)
   await userEvent.type(input, 'Keep this draft while opening terminal')
   await userEvent.click(canvas.getByRole('button', { name: 'Open terminal' }))
   await expect(canvas.getByTestId('terminal-drawer')).toBeVisible()
@@ -158,6 +159,7 @@ export const KeyboardSplitPreservesHost: Story = { args: { state: 'one' }, play:
   await userEvent.click(canvas.getByRole('button', { name: 'Reset layout' }))
   const host = canvasElement.querySelector('[data-pane-key="agent:worker-1"]')!
   const editor = canvas.getByTestId('composer-input')
+  await userEvent.clear(editor)
   await userEvent.type(editor, 'Preserve across split')
   await userEvent.click(canvas.getByRole('button', { name: 'worker-2 actions' }))
   await userEvent.click(within(document.body).getByRole('menuitem', { name: 'Open in split right' }))
@@ -182,7 +184,7 @@ export const HostToolReveal: Story = { args: { state: 'two' }, play: async ({ ca
   await settle()
   await expect(file).toHaveAttribute('aria-expanded', 'true')
 } }
-export const AllStates: Story = { render: args => <div {...stylex.props(styles.matrix)}>{(['one', 'two', 'three', 'dragging'] as const).map(state => <section key={state} {...stylex.props(styles.specimen)}><h2>{state} · W3/H1/P3/D2</h2><WorkbenchStory {...args} state={state} persist={false} /></section>)}</div>, play: async ({ canvasElement }) => {
+export const AllStates: Story = { render: args => <main aria-label="Workbench states" {...stylex.props(styles.matrix)}>{(['one', 'two', 'three', 'dragging'] as const).map(state => <section key={state} {...stylex.props(styles.specimen)}><h2>{state} · W3/H1/P3/D2</h2><WorkbenchStory {...args} state={state} persist={false} /></section>)}</main>, play: async ({ canvasElement }) => {
   await settle()
   // Syntax tokens belong to kit A; these assertions target newly reachable UI counts, markers and washes.
   const chrome = canvasElement.querySelectorAll('[data-testid="pane-header"] span, [data-testid="diff-panel"] span, [data-testid="diff-code"] > div')
