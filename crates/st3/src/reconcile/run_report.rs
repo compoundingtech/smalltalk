@@ -70,29 +70,28 @@ fn can_stall(run: &MissionRunView) -> bool {
 }
 
 impl<R: RuntimeControl> Reconciler<R> {
-    /// The report a run asked for when it was created, if any.
+    /// Who a run reports to: its latest `st missions report-to`, else what it was created with.
     pub(super) fn run_report(&self, run: &MissionRunView) -> Result<Option<RunReport>> {
-        let Some(created) = self
+        let claim = match self
             .store
-            .latest_claim(&run.subject, Some("mission-run.created"))?
-        else {
-            return Ok(None);
+            .latest_claim(&run.subject, Some(crate::store::RUN_REPORT_KIND))?
+        {
+            Some(changed) => changed,
+            None => match self
+                .store
+                .latest_claim(&run.subject, Some("mission-run.created"))?
+            {
+                Some(created) => created,
+                None => return Ok(None),
+            },
         };
-        let fields = created.body.get("fields").unwrap_or(&created.body);
-        let Some(to) = fields.get("report_to").and_then(Value::as_str) else {
-            return Ok(None);
-        };
-        Ok(Some(RunReport {
-            to: to.to_owned(),
-            stalled_after_ms: fields
-                .get("stalled_after_ms")
-                .and_then(Value::as_u64)
-                .unwrap_or(crate::mission::DEFAULT_STALLED_AFTER_MS),
-            completed: fields
-                .get("report_completed")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-        }))
+        Ok(crate::store::run_report_fields(&claim.body).map(
+            |(to, stalled_after_ms, completed)| RunReport {
+                to,
+                stalled_after_ms,
+                completed,
+            },
+        ))
     }
 
     /// Tell the reporter what this run's phase calls for, and return when a run that has not

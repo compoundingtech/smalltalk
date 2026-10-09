@@ -2676,6 +2676,33 @@ pub struct MissionRunOutcomeRequest {
     pub idempotency_key: String,
 }
 
+/// Who a running run reports to from now on. `report_to` of `None` clears it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MissionRunReportRequest {
+    pub actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub report_completed: bool,
+    pub idempotency_key: String,
+}
+
+/// Who a run reports to, as its latest report claim or its creation claim records it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MissionRunReportView {
+    pub run: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub report_completed: bool,
+    /// Whether this request changed it.
+    pub changed: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MissionRetireRequest {
     pub actor: String,

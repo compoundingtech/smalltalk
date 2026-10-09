@@ -50,7 +50,7 @@ use crate::model::{
     FaultView, HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS,
     MessageView, MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
     MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunOutcomeView,
-    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
+    MissionRunReportView, MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
     OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult,
     PlannedAction, PlannerSpec, PlanningCandidateView, PlanningPreviewView,
     PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
@@ -6068,6 +6068,149 @@ impl Store {
         )
         .map_err(internal)?;
         let view = mission_run_view_tx(&transaction, run_id).map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                params![
+                    opaque_cache_key(idempotency_key),
+                    serde_json::to_string(&view).map_err(internal)?
+                ],
+            )
+            .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        Ok(view)
+    }
+
+    /// Change who a running run reports to, or clear it, as `missions start --report-to` would
+    /// have set it: the mission's own `stalled-after` and `report-completed` apply unless the
+    /// request names a limit. Only a person or the agent that requested the run may. It is a
+    /// claim of its own on the run, so the creation claim keeps what the run started with and a
+    /// repeated declaration of the run still compares with it. A request that changes nothing
+    /// writes nothing.
+    pub fn set_mission_run_report(
+        &self,
+        run: &str,
+        actor: &str,
+        report_to: Option<&str>,
+        stalled_after_ms: Option<u64>,
+        report_completed: bool,
+        idempotency_key: &str,
+    ) -> Result<MissionRunReportView, St3Error> {
+        if let Some(response) = self
+            .cached_idempotency_response(idempotency_key)
+            .map_err(smallclaims::error::typed)?
+        {
+            return Ok(response);
+        }
+        match report_to {
+            None if stalled_after_ms.is_some() || report_completed => {
+                return Err(St3Error::new(
+                    "report-without-recipient",
+                    "a stall limit or completion report needs a `report-to` agent",
+                ));
+            }
+            None => {}
+            Some(report_to) => crate::mission::validate_report_to(report_to)?,
+        }
+        if stalled_after_ms == Some(0) {
+            return Err(St3Error::new(
+                "invalid-stalled-after",
+                "stalled-after must be greater than zero",
+            ));
+        }
+        let actor = normalize_actor(actor, "agent");
+        let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction().map_err(internal)?;
+        if let Some(response) =
+            smallclaims::store::idempotency::cached_response(&transaction, idempotency_key)?
+        {
+            return serde_json::from_str(&response).map_err(internal);
+        }
+        let current = mission_run_header_tx(&transaction, run_id)
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-mission-run",
+                    format!("mission run `mission-run/{run_id}` does not exist"),
+                )
+            })?;
+        if current.phase == "terminal" {
+            return Err(St3Error::new(
+                "mission-run-not-running",
+                format!(
+                    "mission run `{}` has finished as {}; only a running run takes a reporter",
+                    current.subject, current.status
+                ),
+            ));
+        }
+        if !actor.starts_with("person/") && actor != current.requester {
+            return Err(St3Error::new(
+                "run-report-authority-denied",
+                format!(
+                    "only a person or the run's requester `{}` may change who `{}` reports to",
+                    current.requester, current.subject
+                ),
+            ));
+        }
+        let desired = match report_to {
+            None => None,
+            Some(report_to) => {
+                let mission = mission_revision_spec_tx(
+                    &transaction,
+                    current
+                        .mission
+                        .strip_prefix("mission/")
+                        .unwrap_or(&current.mission),
+                    &current.revision,
+                )?;
+                Some((
+                    report_to.to_owned(),
+                    stalled_after_ms
+                        .or(mission.as_ref().and_then(|mission| mission.stalled_after_ms))
+                        .unwrap_or(crate::mission::DEFAULT_STALLED_AFTER_MS),
+                    report_completed
+                        || mission.as_ref().is_some_and(|mission| mission.report_completed),
+                ))
+            }
+        };
+        let changed = desired != current_run_report_tx(&transaction, &current.subject)?;
+        if changed {
+            let mut fields = serde_json::Map::new();
+            if let Some((report_to, stalled_after_ms, completed)) = &desired {
+                fields.insert("report_to".into(), json!(report_to));
+                fields.insert("stalled_after_ms".into(), json!(stalled_after_ms));
+                if *completed {
+                    fields.insert("report_completed".into(), json!(true));
+                }
+            }
+            append_receipt_claim_tx(
+                &transaction,
+                &self.origin,
+                &current.subject,
+                RUN_REPORT_KIND,
+                Some(&actor),
+                &json!({ "fields": fields }),
+                &[],
+                None,
+                idempotency_key,
+            )
+            .map_err(internal)?;
+        }
+        let (report_to, stalled_after_ms, report_completed) = match desired {
+            Some((report_to, stalled_after_ms, completed)) => {
+                (Some(report_to), Some(stalled_after_ms), completed)
+            }
+            None => (None, None, false),
+        };
+        let view = MissionRunReportView {
+            run: current.subject,
+            report_to,
+            stalled_after_ms,
+            report_completed,
+            changed,
+        };
         transaction
             .execute(
                 "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
@@ -17942,17 +18085,7 @@ fn requested_run_report(
     connection: &Connection,
     creation: &crate::model::MissionRunCreation,
 ) -> Result<Option<(String, bool)>, St3Error> {
-    let mission = connection
-        .query_row(
-            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
-            params![creation.mission, creation.revision],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(internal)?
-        .map(|body| serde_json::from_str::<MissionSpec>(&body))
-        .transpose()
-        .map_err(internal)?;
+    let mission = mission_revision_spec_tx(connection, &creation.mission, &creation.revision)?;
     Ok(mission.and_then(|mission| {
         resolved_run_report(
             &mission,
@@ -17978,6 +18111,58 @@ fn mission_run_report_tx(
         )
         .optional()
         .map(|row| row.and_then(|(report_to, completed)| Some((report_to?, completed))))
+        .map_err(internal)
+}
+
+/// The claim that changes who a run reports to after it started. Its latest one replaces what
+/// the creation claim recorded; one with no `report_to` means the run reports to nobody.
+pub(crate) const RUN_REPORT_KIND: &str = "mission-run.report-to";
+
+/// The agent, stall limit and completion report that a report claim or a creation claim
+/// records, or `None` when it names no agent.
+pub(crate) fn run_report_fields(body: &Value) -> Option<(String, u64, bool)> {
+    let fields = body.get("fields").unwrap_or(body);
+    Some((
+        fields.get("report_to")?.as_str()?.to_owned(),
+        fields
+            .get("stalled_after_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(crate::mission::DEFAULT_STALLED_AFTER_MS),
+        fields
+            .get("report_completed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    ))
+}
+
+/// Who a run reports to now: its latest report claim, else its creation claim.
+fn current_run_report_tx(
+    transaction: &Transaction<'_>,
+    run: &str,
+) -> Result<Option<(String, u64, bool)>, St3Error> {
+    let claim = match latest_claim_of_kind_tx(transaction, run, RUN_REPORT_KIND)? {
+        Some(claim) => Some(claim),
+        None => latest_claim_of_kind_tx(transaction, run, "mission-run.created")?,
+    };
+    Ok(claim.and_then(|claim| run_report_fields(&claim.body)))
+}
+
+/// One published revision of a mission, if this store holds it.
+fn mission_revision_spec_tx(
+    connection: &Connection,
+    mission: &str,
+    revision: &str,
+) -> Result<Option<MissionSpec>, St3Error> {
+    connection
+        .query_row(
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![mission, revision],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .map(|body| serde_json::from_str::<MissionSpec>(&body))
+        .transpose()
         .map_err(internal)
 }
 
@@ -41403,6 +41588,162 @@ version 2
             let (_, same) = declare(run, mission, extra);
             assert!(same.blockers.is_empty(), "{run}: {:?}", same.blockers);
         }
+    }
+
+    #[test]
+    fn a_running_runs_reporter_changes_by_its_own_claim_and_leaves_creation_alone() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let watched = publish_mission(
+            &store,
+            "version 2\nmission \"watched\" state=\"ready\" report-to=\"agent/ops/mission-reporter\" stalled-after=\"15m\" { concurrent-runs; goal \"Watched.\"; step \"work\" { agentless } }",
+            "publish-watched",
+        );
+        let source = format!(
+            "version 2\nmission-run \"watched/1\" {{\n  mission \"mission/{}@{}\"\n  workspace {:?}\n  requester \"agent/ops/owner\"\n}}\n",
+            watched.id,
+            watched.revision,
+            workspace.path().display().to_string(),
+        );
+        let declare = || {
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let preview = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source.clone(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            (intent, preview)
+        };
+        let (intent, preview) = declare();
+        store
+            .apply_as(
+                &intent,
+                &preview.subject_tokens,
+                "start-watched-1",
+                Some("agent/ops/owner"),
+            )
+            .unwrap();
+        let run = "mission-run/watched/1";
+        let created = store
+            .latest_claim(run, Some("mission-run.created"))
+            .unwrap()
+            .unwrap();
+        let reports = || store.claims_for(run, Some(RUN_REPORT_KIND)).unwrap().len();
+        let code = |result: Result<MissionRunReportView, St3Error>| result.unwrap_err().code;
+
+        // Only a person or the agent that requested the run may change it, and only to an
+        // agent; a limit or completion means nothing without one.
+        assert_eq!(
+            code(store.set_mission_run_report(
+                run,
+                "agent/ops/stranger",
+                Some("agent/ops/watcher"),
+                None,
+                false,
+                "stranger",
+            )),
+            "run-report-authority-denied"
+        );
+        assert_eq!(
+            code(store.set_mission_run_report(
+                run,
+                "person/operator",
+                Some("person/operator"),
+                None,
+                false,
+                "person-reporter",
+            )),
+            "invalid-report-to"
+        );
+        assert_eq!(
+            code(store.set_mission_run_report(
+                run,
+                "person/operator",
+                None,
+                Some(60_000),
+                false,
+                "limit-alone",
+            )),
+            "report-without-recipient"
+        );
+        assert_eq!(reports(), 0);
+
+        // The requester names a watcher; the mission's own limit applies unless one is named.
+        let changed = store
+            .set_mission_run_report(
+                run,
+                "agent/ops/owner",
+                Some("agent/ops/watcher"),
+                None,
+                false,
+                "owner-sets",
+            )
+            .unwrap();
+        assert!(changed.changed);
+        assert_eq!(changed.report_to.as_deref(), Some("agent/ops/watcher"));
+        assert_eq!(changed.stalled_after_ms, Some(15 * 60_000));
+        assert!(!changed.report_completed);
+        // Asking for what it already is writes nothing.
+        let again = store
+            .set_mission_run_report(
+                run,
+                "person/operator",
+                Some("agent/ops/watcher"),
+                None,
+                false,
+                "person-repeats",
+            )
+            .unwrap();
+        assert!(!again.changed);
+        assert_eq!(reports(), 1);
+        let limited = store
+            .set_mission_run_report(
+                run,
+                "person/operator",
+                Some("agent/ops/watcher"),
+                Some(60 * 60_000),
+                true,
+                "person-limits",
+            )
+            .unwrap();
+        assert_eq!(limited.stalled_after_ms, Some(60 * 60_000));
+        assert!(limited.report_completed);
+        let latest = store
+            .latest_claim(run, Some(RUN_REPORT_KIND))
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.actor.as_deref(), Some("person/operator"));
+        assert_eq!(
+            run_report_fields(&latest.body),
+            Some(("agent/ops/watcher".into(), 60 * 60_000, true))
+        );
+
+        // Clearing reports to nobody, even though the mission names a reporter.
+        let cleared = store
+            .set_mission_run_report(run, "agent/ops/owner", None, None, false, "owner-clears")
+            .unwrap();
+        assert!(cleared.changed);
+        assert_eq!(cleared.report_to, None);
+        let latest = store
+            .latest_claim(run, Some(RUN_REPORT_KIND))
+            .unwrap()
+            .unwrap();
+        assert_eq!(run_report_fields(&latest.body), None);
+        assert_eq!(reports(), 3);
+
+        // The creation claim is what the run started with, so declaring the run again exactly
+        // as it was started is still a retry.
+        let still = store
+            .latest_claim(run, Some("mission-run.created"))
+            .unwrap()
+            .unwrap();
+        assert_eq!((still.id, still.body), (created.id, created.body));
+        let (_, redeclared) = declare();
+        assert!(redeclared.blockers.is_empty(), "{:?}", redeclared.blockers);
     }
 
     #[test]
