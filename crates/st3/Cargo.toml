@@ -85,6 +85,10 @@ proptest = "1"
 name = "reader_cache"
 required-features = ["test-support"]
 
+[[example]]
+name = "collection_fixture"
+required-features = ["test-support"]
+
 [[bin]]
 name = "st3"
 path = "src/main.rs"
