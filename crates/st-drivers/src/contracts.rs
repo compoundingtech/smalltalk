@@ -23,7 +23,7 @@ pub fn env(name: &str) -> Option<String> {
 }
 
 /// Admit only the exact old spelling of this version; future or foreign schemas stay rejected.
-pub(crate) fn schema_matches(actual: &str, current: &str) -> bool {
+pub fn schema_matches(actual: &str, current: &str) -> bool {
     actual == current
         || current
             .strip_prefix("st.")
@@ -131,8 +131,8 @@ mod tests {
         let schema = |path: &Path| {
             serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap()["schema"].as_str().unwrap().to_owned()
         };
-        let mut old =
-            state::Writer::new(&dir, "host.worker", "codex", Some("host.worker".into())).with_ownership("old", seq);
+        let mut old = state::Writer::new(&dir, "host.worker", "codex", Some("host.worker".into()))
+            .with_ownership("old", seq);
         old.observe(state::Observation::new(
             state::Activity::Active,
             state::BlockedOn::None,

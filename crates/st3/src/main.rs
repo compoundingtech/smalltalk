@@ -18764,8 +18764,11 @@ impl NativeObservations {
             .as_ref()
             .is_some_and(|task| wait || task.is_finished())
         {
-            let task = self.durable_task.take().unwrap();
-            let outcome = task.await?;
+            // Keep the handle owned while awaiting: a completion deadline must abort it,
+            // rather than detach a still-running publisher when its waiter is cancelled.
+            let outcome = self.durable_task.as_mut().unwrap().await;
+            self.durable_task.take();
+            let outcome = outcome?;
             self.admission_diagnostic = outcome.diagnostic;
             self.retry_pending = outcome.retry;
             outcome.result?;
@@ -19011,27 +19014,51 @@ impl NativeObservations {
         driver: &str,
         ready: &mut bool,
     ) -> Result<()> {
-        let mut last_warning = None;
-        loop {
-            let result = async {
-                loop {
-                    self.drain(client, subject, driver, ready).await?;
-                    if !self.retry_pending {
-                        break;
+        self.finish_accounting_with_budget(client, subject, driver, ready, Duration::from_secs(45))
+            .await
+    }
+
+    async fn finish_accounting_with_budget(
+        &mut self,
+        client: &Client,
+        subject: &str,
+        driver: &str,
+        ready: &mut bool,
+        budget: Duration,
+    ) -> Result<()> {
+        let completion = async {
+            let mut last_warning = None;
+            loop {
+                let result = async {
+                    loop {
+                        self.drain(client, subject, driver, ready).await?;
+                        if !self.retry_pending {
+                            break;
+                        }
                     }
+                    // Completion requests the stop flush even if the current stop sample dropped.
+                    flush_native_usage(client, subject, &self.runtime).await
                 }
-                // An ended snapshot/control can lose its zero-wait writer attempt. Provider
-                // completion itself is the durable stop obligation; never depend on that sample.
-                flush_native_usage(client, subject, &self.runtime).await
+                .await;
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(error) if accounting_request_is_transient(&error) => {
+                        note_driver_tick_failure(subject, error, &mut last_warning);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            .await;
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error) if accounting_request_is_transient(&error) => {
-                    note_driver_tick_failure(subject, error, &mut last_warning);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+        };
+        match tokio::time::timeout(budget, completion).await {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(task) = self.durable_task.take() {
+                    task.abort();
                 }
-                Err(error) => return Err(error),
+                anyhow::bail!(
+                    "accounting completion deadline reached; retained events remain spooled for a later driver"
+                )
             }
         }
     }
@@ -19114,35 +19141,33 @@ impl NativeObservations {
                 st_drivers::harness_events::acknowledge(&self.dir, event.sequence)?;
                 continue;
             }
-            if !matches!(
-                event.kind.as_str(),
-                "harness-state-control"
-                    | "harness-context"
-                    | "harness-accounting"
-                    | "harness-timeline"
-            ) {
-                let _ = write_driver_log(
-                    subject,
-                    &format!("ignored unsupported harness event `{}`", event.kind),
-                );
-                st_drivers::harness_events::quarantine(
-                    &self.dir,
-                    event.sequence,
-                    "unsupported harness event kind",
-                )?;
-                continue;
-            }
+            anyhow::ensure!(
+                matches!(
+                    event.kind.as_str(),
+                    "harness-state-control"
+                        | "harness-context"
+                        | "harness-accounting"
+                        | "harness-timeline"
+                ),
+                "event kind requires a compatible driver: {}",
+                event.kind
+            );
             if let Err(error) = validate_accounting_event(event) {
-                st_drivers::harness_events::quarantine(
-                    &self.dir,
-                    event.sequence,
-                    &format!("{error:#}"),
-                )?;
-                let _ = write_driver_log(
-                    subject,
-                    &format!("accounting event {} quarantined: {error:#}", event.sequence),
-                );
-                continue;
+                // A future schema/harness or an unconfirmed timestamp is retained until a
+                // compatible decoder/evidence exists. Only malformed known JSON is permanent.
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<serde_json::Error>()
+                        .is_some_and(|error| error.is_data() || error.is_syntax())
+                }) {
+                    st_drivers::harness_events::quarantine(
+                        &self.dir,
+                        event.sequence,
+                        &format!("{error:#}"),
+                    )?;
+                    continue;
+                }
+                return Err(error);
             }
             let account_ref = event
                 .payload
@@ -19324,6 +19349,22 @@ fn validate_accounting_event(event: &st_drivers::harness_events::Event) -> Resul
         matches!(driver, "claude" | "codex" | "pi" | "omp" | "opencode"),
         "unknown event driver"
     );
+    if let Some(schema) = event.payload["schema"].as_str() {
+        let expected = if event.kind == "harness-timeline" {
+            "st.harness-timeline.v1"
+        } else if matches!(
+            event.kind.as_str(),
+            "harness-context" | "harness-accounting"
+        ) {
+            "st.harness-context.v1"
+        } else {
+            "st.harness-state.v1"
+        };
+        anyhow::ensure!(
+            st_drivers::contracts::schema_matches(schema, expected),
+            "event schema requires a compatible driver: {schema}"
+        );
+    }
     let raw = serde_json::to_vec(&event.payload)?;
     if matches!(
         event.kind.as_str(),
@@ -19340,17 +19381,11 @@ fn validate_accounting_event(event: &st_drivers::harness_events::Event) -> Resul
 }
 
 fn accounting_request_is_transient(error: &anyhow::Error) -> bool {
-    st3::client::current_publication_dropped(error)
-        || st3::client::is_missing_route(error)
-        || st3::client::http_status(error)
-            .is_some_and(|status| status >= 500 || matches!(status, 408 | 429))
-        || error.chain().any(|cause| cause.is::<std::io::Error>())
-        || st3::client::api_error_parts(error).is_some_and(|(status, code, _, details)| {
-            status >= 500
-                || matches!(status, 408 | 429)
-                || code == "stale-harness-event-session"
-                    && details.get("retired") != Some(&Value::Bool(true))
-        })
+    // Publication failures are retryable unless a known envelope defect is explicit.
+    // Identity discovery, authorization, conflicts, BUSY and incomplete replies are unknown.
+    !st3::client::api_error_parts(error).is_some_and(|(_, code, _, _)| {
+        matches!(code, "invalid-harness-event" | "invalid-harness-diagnostic")
+    })
 }
 
 async fn harness_event_is_retired(
@@ -19388,7 +19423,7 @@ async fn harness_event_is_retired(
             || fields["incarnation_id"].as_str() == Some(runtime)
                 && matches!(
                     fields["status"].as_str(),
-                    Some("exited" | "stopped" | "absent" | "vanished")
+                    Some("exited" | "stopped" | "absent" | "vanished" | "failed")
                 )
     }))
 }
@@ -31546,6 +31581,93 @@ mission "review" state="ready" {
     }
 
     #[tokio::test]
+    async fn provider_exit_deadline_retains_events_for_missing_unbound_and_stalled_daemons() {
+        use axum::{Json, Router, http::StatusCode, routing::post};
+        for refusal in ["missing", "unbound", "busy", "stall"] {
+            let root = tempfile::tempdir().unwrap();
+            st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
+            let context = json!({"schema":"st.harness-context.v1", "agent":"example/seat",
+                "harness":"claude", "incarnation":"provider-a", "observedAtMs":st_drivers::message::now_ms(),
+                "sessionTotalTokens":456});
+            let connection =
+                rusqlite::Connection::open(st_drivers::harness_events::database_path(root.path()))
+                    .unwrap();
+            connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES('runtime-a',1,'harness-context',?1)",
+                [context.to_string()]).unwrap();
+            connection.execute("UPDATE metadata SET value=(SELECT SUM(length(CAST(body AS BLOB))) FROM events) WHERE key='pending-bytes'", []).unwrap();
+            drop(connection);
+            let app = Router::new().route("/v1/harness-events", post(move || async move {
+                if refusal == "stall" { std::future::pending::<()>().await; }
+                let status = match refusal {
+                    "missing" => StatusCode::NOT_FOUND,
+                    "unbound" => StatusCode::FORBIDDEN,
+                    _ => StatusCode::SERVICE_UNAVAILABLE,
+                };
+                (status, Json(json!({"code": if refusal == "unbound" {"unbound-harness-event"} else {"internal"}, "message":refusal})))
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Client::new(st3::client::Endpoint::Http(format!(
+                "http://{}",
+                listener.local_addr().unwrap()
+            )));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut observations = NativeObservations::start(root.path(), "runtime-a").unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                observations.finish_accounting_with_budget(
+                    &client,
+                    "agent/example/seat",
+                    "claude",
+                    &mut false,
+                    Duration::from_millis(80),
+                ),
+            )
+            .await
+            .unwrap();
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("completion deadline"),
+                "{refusal}"
+            );
+            let retained = st_drivers::harness_events::pending(root.path(), 10).unwrap();
+            assert_eq!(retained.len(), 1, "{refusal}");
+            assert_eq!(retained[0].runtime_incarnation, "runtime-a");
+            assert_eq!(retained[0].payload, context);
+            server.abort();
+        }
+        assert!(accounting_request_is_transient(&anyhow::anyhow!(
+            "incomplete HTTP response"
+        )));
+    }
+
+    #[tokio::test]
+    async fn future_accounting_schema_remains_spooled_for_a_compatible_driver() {
+        let root = tempfile::tempdir().unwrap();
+        st_drivers::harness_events::enable(root.path(), "runtime-a").unwrap();
+        let payload = json!({"schema":"st.harness-context.v2", "harness":"claude"});
+        let connection =
+            rusqlite::Connection::open(st_drivers::harness_events::database_path(root.path()))
+                .unwrap();
+        connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES('runtime-a',1,'harness-context',?1)",
+            [payload.to_string()]).unwrap();
+        connection.execute("UPDATE metadata SET value=(SELECT SUM(length(CAST(body AS BLOB))) FROM events) WHERE key='pending-bytes'", []).unwrap();
+        drop(connection);
+        let client = Client::new(st3::client::Endpoint::Http("http://127.0.0.1:1".into()));
+        let mut observations = NativeObservations::start(root.path(), "runtime-a").unwrap();
+        let error = observations
+            .drain(&client, "agent/example/seat", "claude", &mut false)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("compatible driver"));
+        assert_eq!(
+            st_drivers::harness_events::pending(root.path(), 10).unwrap()[0].payload,
+            payload
+        );
+    }
+
+    #[tokio::test]
     async fn retired_stops_and_missing_flush_routes_do_not_block_successor_accounting() {
         use axum::{Json, Router, http::StatusCode, routing::post};
         use std::sync::{Arc, Mutex};
@@ -31627,9 +31749,13 @@ mission "review" state="ready" {
         let seq =
             st_drivers::harness_state::claim(root.path(), "example/seat", "claude", "provider-a")
                 .unwrap();
-        let mut writer =
-            st_drivers::harness_state::Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
-                .with_ownership("provider-a", seq);
+        let mut writer = st_drivers::harness_state::Writer::new(
+            root.path(),
+            "example/seat",
+            "claude",
+            Some("pty".into()),
+        )
+        .with_ownership("provider-a", seq);
         writer
             .observe(st_drivers::harness_state::Observation::new(
                 st_drivers::harness_state::Activity::Active,
@@ -31698,6 +31824,24 @@ mission "review" state="ready" {
         .unwrap()
         .unwrap();
         assert!(!observations.durable_task.as_ref().unwrap().is_finished());
+        assert_eq!(
+            st_drivers::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .len(),
+            1
+        );
+        let error = observations
+            .finish_accounting_with_budget(
+                &client,
+                "agent/example/seat",
+                "claude",
+                &mut false,
+                Duration::from_millis(80),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("completion deadline"));
+        assert!(observations.durable_task.is_none());
         assert_eq!(
             st_drivers::harness_events::pending(root.path(), 100)
                 .unwrap()

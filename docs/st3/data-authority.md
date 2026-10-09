@@ -78,12 +78,15 @@ incarnation, payload and reason; no automatic replay or successor attribution oc
 daemon's missing optional flush route is logged; a missing numeric publication route retains
 the event for a compatible daemon. Install matching release artifacts to
 obtain the independent stop guarantee during upgrades. One ordered spool publisher runs
-outside the driver's mail receive loop. Completion drains every retained batch and requests
-the stop flush even when the final current snapshot or stop marker dropped, before publishing exit.
+outside the driver's mail receive loop. Completion spends at most 45 seconds draining retained batches and requesting
+the stop flush even when the final current snapshot or stop marker dropped. Deadline expiry
+leaves unpublished events spooled and permits the driver to exit. Quarantine retains at most
+256 records and 64 MiB of payloads, pruning oldest inspection evidence first. Unknown publication
+failures and future event schemas remain spooled rather than being classified as permanent.
 The daemon also recovers retained numeric work in indexed batches of at most 64 rows,
 continuing past a failed subject with bounded per-subject backoff,
-including adopted providers without a spool and daemon restarts. `context_occupancy` is exclusively a current
-value and never enters that flush. Messages, work ownership, runtime launch/stop proofs and
+including adopted providers without a spool and daemon restarts. `context_occupancy` from upgraded drivers is exclusively a current
+value and never enters that flush; nonzero-sequence legacy envelopes retain their old accounting path. Messages, work ownership, runtime launch/stop proofs and
 replication inventories retain their durable contracts.
 
 Current readers accept the old claim kinds and read legacy graph observations until a register

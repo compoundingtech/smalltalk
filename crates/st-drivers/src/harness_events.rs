@@ -17,6 +17,8 @@ pub const CURRENT_WAKE_PIPE: &str = ".st-harness-current-wake";
 pub const WAKE_PIPE: &str = ".st-harness-events-wake";
 pub const DATABASE: &str = "st-harness-events.sqlite";
 const MAX_PENDING_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_QUARANTINE_ROWS: u64 = 256;
+const MAX_QUARANTINE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Event {
@@ -664,8 +666,24 @@ pub fn quarantine(agent_dir: &Path, sequence: u64, reason: &str) -> Result<()> {
     tx.execute("INSERT OR IGNORE INTO quarantined_events
         SELECT sequence,runtime_incarnation,queued_at_ms,kind,body,?2 FROM events WHERE sequence=?1",
         params![sequence,reason])?;
+    prune_quarantine_tx(&tx, MAX_QUARANTINE_ROWS, MAX_QUARANTINE_BYTES)?;
     acknowledge_tx(&tx, sequence)?;
     tx.commit()?;
+    Ok(())
+}
+
+fn prune_quarantine_tx(tx: &Connection, max_rows: u64, max_bytes: u64) -> Result<()> {
+    // Keep the newest suffix within both caps; old inspection evidence is pruned first.
+    // A valid spool event fits the byte cap, including a single oversized-row workload.
+    tx.execute(
+        "DELETE FROM quarantined_events WHERE sequence IN (
+        SELECT sequence FROM (
+            SELECT sequence, ROW_NUMBER() OVER (ORDER BY sequence DESC) AS position,
+                SUM(length(CAST(body AS BLOB))) OVER (ORDER BY sequence DESC) AS bytes
+            FROM quarantined_events
+        ) WHERE position>?1 OR bytes>?2)",
+        params![max_rows, max_bytes],
+    )?;
     Ok(())
 }
 
@@ -829,6 +847,38 @@ mod tests {
             bytes,
             serde_json::to_vec(&remaining[0].payload).unwrap().len()
         );
+    }
+
+    #[test]
+    fn quarantine_prunes_oldest_evidence_with_both_row_and_payload_bounds() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let connection = open(root.path()).unwrap();
+        connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES('runtime-a',1,'fixture','{}')", []).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value='2' WHERE key='pending-bytes'",
+                [],
+            )
+            .unwrap();
+        quarantine(root.path(), 1, "fixture").unwrap();
+        for sequence in 2..=MAX_QUARANTINE_ROWS + 12 {
+            connection.execute("INSERT INTO quarantined_events VALUES(?1,'runtime-a',1,'fixture','1234','fixture')", [sequence]).unwrap();
+        }
+        prune_quarantine_tx(&connection, MAX_QUARANTINE_ROWS, MAX_QUARANTINE_BYTES).unwrap();
+        let (count, oldest): (u64, u64) = connection
+            .query_row(
+                "SELECT COUNT(*),MIN(sequence) FROM quarantined_events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, MAX_QUARANTINE_ROWS);
+        assert_eq!(oldest, 13);
+        // A small byte budget independently keeps only the newest complete payload.
+        prune_quarantine_tx(&connection, MAX_QUARANTINE_ROWS, 6).unwrap();
+        let (count, newest, bytes): (u64,u64,u64) = connection.query_row("SELECT COUNT(*),MAX(sequence),SUM(length(CAST(body AS BLOB))) FROM quarantined_events", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!((count, newest, bytes), (1, MAX_QUARANTINE_ROWS + 12, 4));
     }
 
     #[test]

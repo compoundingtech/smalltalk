@@ -20519,9 +20519,15 @@ fn publish_due_usage_tx(
         )
         .optional()
         .map_err(internal)?;
-    let query = harness_sql(transaction, &input.subject, &latest_claim_of_kind_query()).map_err(internal)?;
-    let working = transaction.query_row(&query, params![input.subject, "harness.observed"], claim_from_row)
-        .optional().map_err(internal)?.is_some_and(|claim| {
+    let query = harness_sql(transaction, &input.subject, &latest_claim_of_kind_query())
+        .map_err(internal)?;
+    let working = transaction
+        .prepare_cached(&query)
+        .map_err(internal)?
+        .query_row(params![input.subject, "harness.observed"], claim_from_row)
+        .optional()
+        .map_err(internal)?
+        .is_some_and(|claim| {
             claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("working")
         });
     let due = match &last {
@@ -48906,6 +48912,15 @@ mission "nested-work" state="ready" {
             check().unwrap_err().details.get("retired"),
             Some(&json!(true))
         );
+        runtime.fields.insert("status".into(), json!("failed"));
+        store.append_claim(&runtime).unwrap();
+        assert_eq!(
+            check_harness_event_runtime(&store.readers.get(), subject, Some("inc-2"))
+                .unwrap_err()
+                .details
+                .get("retired"),
+            Some(&json!(true))
+        );
     }
 
     #[test]
@@ -56207,9 +56222,6 @@ pub fn validate_claim_input(input: &ClaimInput) -> Result<(), St3Error> {
     Ok(())
 }
 
-/// Record an observation of `local` retention on this node only. It gets no batch, no
-/// envelope and no idempotency row, and it never replicates. A repeated idempotency key
-/// returns the first observation. The record's ID starts with `local-observation/`.
 fn check_harness_event_runtime(
     connection: &Connection,
     subject: &str,
@@ -56237,7 +56249,7 @@ fn check_harness_event_runtime(
             || fields["incarnation_id"].as_str() == Some(runtime)
                 && matches!(
                     fields["status"].as_str(),
-                    Some("exited" | "stopped" | "absent" | "vanished")
+                    Some("exited" | "stopped" | "absent" | "vanished" | "failed")
                 );
         return Err(St3Error::new(
             "stale-harness-event-session",
@@ -56248,6 +56260,9 @@ fn check_harness_event_runtime(
     Ok(())
 }
 
+/// Record an observation of `local` retention on this node only. It gets no batch, no
+/// envelope and no idempotency row, and it never replicates. A repeated idempotency key
+/// returns the first observation. The record's ID starts with `local-observation/`.
 fn append_local_observation_fenced(
     graph: &GraphStore,
     input: &ClaimInput,
