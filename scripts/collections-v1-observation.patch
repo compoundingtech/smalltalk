@@ -1,0 +1,79 @@
+--- a/crates/st3/tests/daemon_load.rs
++++ b/crates/st3/tests/daemon_load.rs
+@@ -194,6 +194,9 @@
+     seconds: f64,
+     /// The daemon's average CPU over the run, in cores.
+     daemon_cores: f64,
++    /// Study-only raw sample bounds; no reconcile subtraction or change to the CPU gate.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    study_cpu_observation: Option<Value>,
+     #[serde(default)]
+     long_poll_seats: usize,
+     #[serde(default)]
+@@ -1305,11 +1308,16 @@
+     if matches!(regime, LoadRegime::Steady) {
+         assert!(!migration_pending_at_load_start);
+     }
++    let study_origin = Instant::now();
++    let study_before_begin_ns = study_origin.elapsed().as_nanos() as u64;
+     let cpu_before = (process_cpu(), load_cpu(&peer_threads));
++    let study_before_end_ns = study_origin.elapsed().as_nanos() as u64;
++    let study_load_stop_ns = std::sync::atomic::AtomicU64::new(0);
+     let full_folds_before = context.store.agent_roster_chunked_assemblies();
+     let cpu_by_kind_before = cpu_by_kind();
+     let cursor = context.store.index().unwrap();
+     let started = Instant::now();
++    let study_load_start_ns = study_origin.elapsed().as_nanos() as u64;
+     load.block_on(async {
+         let mut tasks = Vec::new();
+         let mut polls = Vec::new();
+@@ -1527,6 +1535,7 @@
+         initial_done.send_replace(true);
+         tokio::time::sleep_until(tokio::time::Instant::from_std(started + duration)).await;
+         running.store(false, Ordering::Relaxed);
++        study_load_stop_ns.store(study_origin.elapsed().as_nanos() as u64, Ordering::Relaxed);
+         // Cancelling outstanding quiet waits keeps their deliberate timeout outside the CPU
+         // drain window. Otherwise up to 30 idle seconds would dilute the daemon's average CPU.
+         for poll in polls {
+@@ -1553,7 +1562,10 @@
+         }
+     });
+     let elapsed = started.elapsed().as_secs_f64();
++    let study_drain_end_ns = study_origin.elapsed().as_nanos() as u64;
++    let study_after_begin_ns = study_origin.elapsed().as_nanos() as u64;
+     let cpu_after = (process_cpu(), load_cpu(&peer_threads));
++    let study_after_end_ns = study_origin.elapsed().as_nanos() as u64;
+     let mut cpu_by_kind = cpu_by_kind().into_iter()
+         .map(|(kind, ms)| (ms - cpu_by_kind_before.get(&kind).copied().unwrap_or(0.0), kind))
+         .filter(|(ms, _)| *ms > 0.0)
+@@ -1608,6 +1620,30 @@
+         claims,
+         seconds: elapsed,
+         daemon_cores: daemon_cpu / elapsed,
++        study_cpu_observation: Some(json!({
++            "clock": "std::time::Instant; offsets from this regime study_origin",
++            "clock_unit": "nanoseconds",
++            "cpu_unit": "seconds; process user+system, excluded load/peer thread CPU",
++            "process_start_seconds": cpu_before.0,
++            "process_end_seconds": cpu_after.0,
++            "excluded_threads_start_seconds": cpu_before.1,
++            "excluded_threads_end_seconds": cpu_after.1,
++            "daemon_cpu_seconds": daemon_cpu,
++            "denominator_seconds": elapsed,
++            "before_sample_begin_ns": study_before_begin_ns,
++            "before_sample_end_ns": study_before_end_ns,
++            "workload_start_ns": study_load_start_ns,
++            "workload_stop_ns": study_load_stop_ns.load(Ordering::Relaxed),
++            "drain_end_ns": study_drain_end_ns,
++            "after_sample_begin_ns": study_after_begin_ns,
++            "after_sample_end_ns": study_after_end_ns,
++            "reconcile_adjustment_qualified": false,
++            "reconcile_mode": "UNKNOWN",
++            "legacy_charged_cpu_ms": cpu_by_kind.iter()
++                .map(|(ms, kind)| (kind.clone(), *ms)).collect::<BTreeMap<_, _>>(),
++            "coverage": "legacy top20 rolling300s/drop-charged spans; not in-window attribution",
++            "endpoint_alignment": "CPU reads are sequential and bracketed; inherited load denominator excludes pre-start reads; no exact common endpoint claim"
++        })),
+         long_poll_seats: long_poll_seats.load(Ordering::Relaxed),
+         roster_subscribers,
+         roster_change_frames: roster_change_frames.load(Ordering::Relaxed),

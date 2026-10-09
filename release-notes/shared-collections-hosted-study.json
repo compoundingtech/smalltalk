@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add one frozen manual hosted collections-v1 study with four balanced executions and raw evidence",
+  "replay": {"status": "none", "detail": "No production replay; the study uses standard private generated fixtures."},
+  "schema": {"status": "none", "detail": "No schema change; original migration regimes remain."},
+  "rules": {"status": "none", "detail": "No authority, admission or benchmark budget changes."},
+  "compatibility": {"status": "none", "detail": "Ordinary Performance behavior is unchanged; a manual dispatch can select the frozen study."},
+  "downtime": {"status": "none", "detail": "No production activation."},
+  "manual": {"status": "none", "detail": "Only the assigned CI governor dispatches after exact source and command qualification."},
+  "recovery": {"status": "none", "detail": "Failures are retained without retries; deleting the study restores the previous workflow surface."}
+}

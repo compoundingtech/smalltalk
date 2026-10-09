@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Finite ST receipt gate: read only the governor's named local terminal evidence, never an API."""
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+if not path.exists():
+    sys.exit(1)
+try:
+    receipt = json.loads(path.read_text())
+    if receipt.get('assignment') != 'doc/fleet/smalltalk/speed/2026-10-09/shared-collections-v1-pair-assignment@2d25669da2d9b694cf702f61654abdfb2e11404b8c9ee74ef93b23a7cf6da60a':
+        raise ValueError('assignment mismatch')
+    result = Path(receipt['result_path'])
+    if hashlib.sha256(result.read_bytes()).hexdigest() != receipt['result_sha256']:
+        raise ValueError('result identity mismatch')
+    data = json.loads(result.read_text())
+    if data['manifest'].get('tracking_run') != receipt.get('tracking_run') or receipt.get('tracking_run') != sys.argv[2]:
+        raise ValueError('creation run identity mismatch')
+    if data['manifest']['control_source'] != receipt['control_source'] or not receipt.get('hosted_terminal'):
+        raise ValueError('control source or natural hosted terminal missing')
+    if not data.get('complete') or not data.get('data_complete'):
+        raise ValueError('hosted study partial; no automatic retry')
+    if [row['label'] for row in data['executions']] != ['B1', 'C1', 'C2', 'B2']:
+        raise ValueError('four-execution order mismatch')
+    # Workload budget failures are outcomes in the result, not hidden by this receipt gate.
+except (ValueError, KeyError, OSError) as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(2)

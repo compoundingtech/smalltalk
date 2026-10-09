@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Finite offline orchestration controls; stand-ins only, no Rust/native/load/API."""
+import copy
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+loader = importlib.machinery.SourceFileLoader('study', str(Path(__file__).with_name('ci-collections-study')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+s = importlib.util.module_from_spec(spec)
+loader.exec_module(s)
+
+
+def report(source=s.BASE, regime='steady-after-migration', cores=1.0):
+    paths = {c + suffix: dict(count=22, p50_ms=50, p99_ms=100, max_ms=100, budget_ms=300)
+             for c in ('agents roster',) + s.COLLECTIONS for suffix in (' snapshot', ' connect+snapshot')}
+    return dict(profile='collections-v1', scale=1, claims=238320, seconds=120, regime=regime,
+        actual_ci_checkout=source, daemon_cores=cores, failed={}, paths=paths,
+        roster_subscribers=22, collection_subscribers={c: 22 for c in s.COLLECTIONS}, collection_change_frames={c: 0 for c in s.COLLECTIONS},
+        study_cpu_observation=dict(process_start_seconds=0, process_end_seconds=120 * cores,
+            excluded_threads_start_seconds=0, excluded_threads_end_seconds=0, daemon_cpu_seconds=120 * cores,
+            denominator_seconds=120, reconcile_adjustment_qualified=False,
+            before_sample_begin_ns=0, before_sample_end_ns=1, workload_start_ns=2,
+            workload_stop_ns=120000000002, drain_end_ns=120000000003,
+            after_sample_begin_ns=120000000004, after_sample_end_ns=120000000005))
+
+
+class Study(unittest.TestCase):
+    def test_profile_source_units_and_bounds_refuse_unsupported(self):
+        s.validate_report(report(), 'steady-after-migration', s.BASE)
+        for key, value in [('profile', 'agents-v1'), ('scale', 0.1), ('seconds', 15), ('actual_ci_checkout', s.CANDIDATE)]:
+            row = report(); row[key] = value
+            with self.assertRaises(ValueError): s.validate_report(row, 'steady-after-migration', s.BASE)
+        for key, value in [('denominator_seconds', 121), ('after_sample_begin_ns', 0), ('reconcile_adjustment_qualified', True)]:
+            row = report(); row['study_cpu_observation'][key] = value
+            with self.assertRaises(ValueError): s.validate_report(row, 'steady-after-migration', s.BASE)
+
+    def test_single_nonignored_execution_and_signal_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'log'
+            valid = 'running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 240.01s\n'
+            log.write_text(valid); s.selection(log, 0)
+            for text, status in [(valid, 143), (valid + valid, 0), (valid.replace('0 ignored', '1 ignored'), 0), (valid.replace('running 1', 'running 0'), 0)]:
+                log.write_text(text)
+                with self.assertRaises(ValueError): s.selection(log, status)
+
+    def test_goals_strict_and_mode_unknown_never_adjusted(self):
+        rows = []
+        for label in s.ORDER:
+            reports = {regime: report(regime=regime) for regime in ('upgrade-under-load', 'steady-after-migration')}
+            rows.append(dict(label=label, reports=reports))
+        rows[1]['reports']['steady-after-migration']['paths']['missions snapshot']['p99_ms'] = 300
+        rows[1]['reports']['steady-after-migration']['daemon_cores'] = 1.01
+        summary = s.aggregate(rows)
+        self.assertFalse(summary['collections']['steady-after-migration']['missions snapshot']['requested_candidate_strict_under_300_ms'])
+        self.assertFalse(summary['raw_no_worse_observations'][1]['comparisons'][0]['no_worse'])
+        self.assertEqual(summary['within_mode_comparison'], 'UNKNOWN')
+        self.assertIsNone(summary['adjusted_cores'])
+        self.assertTrue(s.aggregate(rows[:2])['partial'])
+
+    def exercise(self, changes=None):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); out = root / 'out'; out.mkdir()
+            tools = root / 'tools'; tools.mkdir(); events = root / 'events'
+            template = root / 'template.json'; template.write_text(json.dumps(report()))
+            binary = '''#!/usr/bin/env python3
+import json,os,sys
+from pathlib import Path
+p=Path(os.environ['ST_LOAD_REPORT']); label=p.parent.name
+with open(os.environ['EVENTS'],'a') as f: f.write(label+'\\n')
+assert sys.argv[1:]==['daemon_load::the_daemon_keeps_its_budgets_under_a_busy_hosts_load','--exact','--nocapture','--test-threads','1']
+assert 'ST_LOAD_BASELINE' not in os.environ
+assert os.environ['ST_LOAD_PROFILE']=='collections-v1' and os.environ['ST_LOAD_SCALE']=='1' and os.environ['ST_LOAD_SECONDS']=='120' and os.environ['ST_LOAD_GATE']=='1'
+fixture=Path(os.environ['ST_BENCH_DIR'])
+for name in ['generated-1.sqlite3','generated-1-peer.sqlite3']:
+ if not (fixture/name).exists(): (fixture/name).write_bytes(b'immutable generated input')
+if label==os.environ.get('MUTATE_LABEL'): (fixture/'generated-1.sqlite3').write_bytes(b'changed input')
+for regime,path in [('steady-after-migration',p),('upgrade-under-load',p.parent/'upgrade/load.json')]:
+ row=json.loads(Path(os.environ['TEMPLATE']).read_text());row['regime']=regime;row['actual_ci_checkout']=os.environ['GITHUB_SHA']
+ if label==os.environ.get('BAD_PROFILE'): row['profile']='agents-v1'
+ path.parent.mkdir(parents=True,exist_ok=True);path.write_text(json.dumps(row))
+status=101 if label==os.environ.get('FAIL_LABEL') else 0
+print('running 1 test')
+print('test result: '+('FAILED. 0 passed; 1 failed' if status else 'ok. 1 passed; 0 failed')+'; 0 ignored; 0 measured; 15 filtered out; finished in 240.00s')
+sys.exit(status)
+'''
+            arms = {}
+            for arm, source in [('B', s.BASE), ('C', s.CANDIDATE)]:
+                cwd = root / arm; cwd.mkdir(); executable = cwd / 'fake-perf'; executable.write_text(binary); executable.chmod(0o755)
+                arms[arm] = dict(path=str(cwd), source=source, tree='pinned-tree', recipes={'generator':'same-recipe'})
+            cargo = tools / 'cargo'
+            cargo.write_text('''#!/usr/bin/env python3
+import json,os,sys
+from pathlib import Path
+with open(os.environ['EVENTS'],'a') as f: f.write('build-'+Path.cwd().name+'\\n')
+assert '--release' in sys.argv and '--locked' in sys.argv and '--no-run' in sys.argv
+if Path.cwd().name==os.environ.get('BUILD_FAIL'): sys.exit(9)
+print(json.dumps({'reason':'compiler-artifact','target':{'name':'perf_load'},'profile':{'debug_assertions':False},'executable':str(Path.cwd()/'fake-perf')}))
+''');cargo.chmod(0o755)
+            s.write(out / 'manifest.json', dict(arms=arms))
+            env = dict(os.environ, PATH=str(tools) + ':' + os.environ['PATH'], EVENTS=str(events), TEMPLATE=str(template), ST_LOAD_BASELINE='must-be-removed')
+            env.update(changes or {})
+            with patch.dict(os.environ, env, clear=True): status = s.run(root, out)
+            result = json.loads((out / 'result.json').read_text())
+            return status, result, events.read_text().splitlines()
+
+    def test_build_both_then_exact_order_even_when_absolute_fails(self):
+        for settings, expected in [({}, 0), ({'FAIL_LABEL':'C1'}, 1)]:
+            status, result, calls = self.exercise(settings)
+            self.assertEqual(status, expected)
+            self.assertEqual(calls, ['build-B','build-C','B1','C1','C2','B2'])
+            self.assertTrue(result['complete']); self.assertTrue(result['data_complete'])
+            self.assertEqual(len(result['executions']), 4)
+            self.assertEqual(sum(len(row['reports']) for row in result['executions']), 8)
+            self.assertEqual(result['comparison']['within_mode_comparison'], 'UNKNOWN')
+            self.assertEqual(result['executions'][0]['inputs_after'], result['executions'][-1]['inputs_after'])
+
+    def test_build_failure_never_measures_or_retries(self):
+        status, result, calls = self.exercise({'BUILD_FAIL':'B'})
+        self.assertEqual(status, 1); self.assertEqual(calls, ['build-B','build-C'])
+        self.assertFalse(result['complete']); self.assertEqual(result['executions'], [])
+
+    def test_mutated_input_aborts_without_retry(self):
+        status, result, calls = self.exercise({'MUTATE_LABEL':'C1'})
+        self.assertEqual(status, 1); self.assertFalse(result['complete'])
+        self.assertEqual(calls, ['build-B','build-C','B1','C1'])
+        self.assertIn('immutable input changed', result['errors'][0])
+
+    def test_partial_bad_profile_retains_four_and_never_qualifies(self):
+        status, result, calls = self.exercise({'BAD_PROFILE':'C1'})
+        self.assertEqual(status, 1); self.assertTrue(result['complete']); self.assertFalse(result['data_complete'])
+        self.assertEqual(calls, ['build-B','build-C','B1','C1','C2','B2'])
+        self.assertTrue(result['comparison']['partial'])
+
+    def test_local_and_retry_prepare_refused_before_allocation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / 'allocation'
+            for actions, attempt in [('false','1'), ('true','2')]:
+                with patch.dict(os.environ, {'GITHUB_ACTIONS':actions, 'GITHUB_RUN_ATTEMPT':attempt}):
+                    with self.assertRaises(ValueError): s.prepare(Path(temp), out)
+                self.assertFalse(out.exists())
+
+
+if __name__ == '__main__':
+    unittest.main()

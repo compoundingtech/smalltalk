@@ -28,7 +28,15 @@ export default githubWorkflow({
     push: { branches: ['main'], paths },
     schedule: [{ cron: '23 2 * * *' }],
     pull_request: { paths },
-    workflow_dispatch: {},
+    workflow_dispatch: {
+      inputs: {
+        study_run: { description: 'Exact governed mission run created before the study dispatch', type: 'string', default: '' },
+        collections_study: {
+          description: 'Run the frozen shared collections-v1 study (B1,C1,C2,B2) instead of ordinary perf-load',
+          type: 'boolean', default: false,
+        },
+      },
+    },
   },
   permissions: { contents: 'read', actions: 'read', 'pull-requests': 'read' },
   concurrency: {
@@ -41,8 +49,40 @@ export default githubWorkflow({
     selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxRunner, ...linuxStageRunner],
   },
   jobs: {
+    'collections-study': {
+      name: 'shared collections-v1 study (four executions)',
+      if: "github.event_name == 'workflow_dispatch' && inputs.collections_study == true",
+      'runs-on': linuxStageRunner,
+      'timeout-minutes': 240,
+      defaults: { run: { shell: 'bash' } },
+      env: { ...buildEnv, SCCACHE_IDLE_TIMEOUT: '0', COLLECTIONS_STUDY_RUN: '${{ inputs.study_run }}' },
+      steps: [
+        { uses: 'actions/checkout@v4', with: { 'fetch-depth': 0, 'persist-credentials': false } },
+        { name: 'Check finite study controls', run: 'python3 scripts/ci-collections-study-test' },
+        { name: 'Freeze compatible study sources and observation overlay', run: 'python3 scripts/ci-collections-study prepare --out "$RUNNER_TEMP/collections-study"' },
+        ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+        {
+          name: 'Isolate study state and preserve the normal compiler cache',
+          run: `study_home="$RUNNER_TEMP/collections-study-home"
+mkdir -p "$study_home"/{.config,.cache,.local/state} "$RUNNER_TEMP/collections-cargo-home"/{registry,git} "$RUNNER_TEMP/collections-sccache"
+printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_STATE_HOME=%s/.local/state\\n' "$study_home" "$study_home" "$study_home" "$study_home" >> "$GITHUB_ENV"
+printf 'CARGO_HOME=%s\\nSCCACHE_DIR=%s\\nSCCACHE_CACHE_SIZE=1G\\n' "$RUNNER_TEMP/collections-cargo-home" "$RUNNER_TEMP/collections-sccache" >> "$GITHUB_ENV"`,
+        },
+        {
+          name: 'Build both frozen release artifacts, then B1 C1 C2 B2 without retries',
+          run: 'nix develop "$RUNNER_TEMP/collections-study/B#perf" -c python3 "$GITHUB_WORKSPACE/scripts/ci-collections-study" run --out "$RUNNER_TEMP/collections-study"',
+        },
+        {
+          name: 'Retain all study source, raw reports, input hashes and failures',
+          uses: 'actions/upload-artifact@v4', if: 'always()',
+          with: { name: 'shared-collections-v1-evidence', path: '${{ runner.temp }}/collections-study/\n!${{ runner.temp }}/collections-study/target-*/\n!${{ runner.temp }}/collections-study/B/\n!${{ runner.temp }}/collections-study/C/\n!${{ runner.temp }}/collections-study/standard-generated-inputs/',
+            'retention-days': 30, 'if-no-files-found': 'error' },
+        },
+      ],
+    },
     'perf-load': {
       name: 'perf-load',
+      if: "github.event_name != 'workflow_dispatch' || inputs.collections_study != true",
       'runs-on': linuxStageRunner,
       'timeout-minutes': 30,
       defaults: { run: { shell: 'bash' } },
