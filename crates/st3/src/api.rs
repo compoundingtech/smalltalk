@@ -470,7 +470,7 @@ pub(crate) fn admitted_mailbox_protocol_router(state: AppState) -> Router {
 #[cfg(feature = "test-support")]
 pub(crate) fn synthetic_mailbox_protocol_router(state: AppState, subject: &str) -> Router {
     assert!(subject.starts_with("agent/example/"));
-    admitted_mailbox_protocol_router(state).layer(Extension(NativeDeliveryPeer {
+    admitted_mailbox_protocol_router(state).layer(Extension(NativeDeliveryPeer { start_token: None,
         agent: subject.into(),
         transport: "omp-channel",
         pid: std::process::id(),
