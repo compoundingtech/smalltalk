@@ -165,6 +165,8 @@ export const AllStates: Story = { render: args => <AllStatesStory {...args} />, 
     await expect(surface.querySelector('[data-scenario="all-known"] [data-variant="row"]')).toHaveAttribute('data-primary-axis', 'needs_you')
     await expect(surface.querySelector('[data-scenario="crash"] [data-variant="row"]')).toHaveAttribute('data-primary-axis', 'harness_exit')
     await expect(surface.querySelector('[data-scenario="offline"] [data-variant="row"]')).toHaveAttribute('data-primary-axis', 'host_reachability')
+    const activityText = surface.querySelector<HTMLElement>('[data-scenario="long-tool"] [data-variant="header"] [data-diagnostic-axis="activity"] > span')!
+    await expect(activityText.clientWidth).toBeGreaterThanOrEqual(activityText.scrollWidth)
     await assertNoPlaceholder(surface)
   }
 } }

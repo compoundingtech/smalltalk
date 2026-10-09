@@ -45,7 +45,7 @@ const styles = stylex.create({
   timer: { display: 'inline-block', width: '17ch', flexShrink: 0, textAlign: 'right', fontFamily: t.fontMono, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
   stale: { color: ink.fgMuted }, danger: { color: tone.dangerFg }, attention: { color: tone.attention },
   header: { height: 'auto', minHeight: g.toolRow, alignItems: 'flex-start', paddingBlock: s.md, paddingInline: s.lg, boxSizing: 'border-box', backgroundColor: surface.canvas, borderBottomWidth: g.hairline, borderBottomStyle: 'solid', borderBottomColor: border.border },
-  axes: { display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: s.md, flex: '1 1 0', minWidth: 0, '@media (max-width: 900px)': { gridTemplateColumns: 'repeat(2, minmax(0, 1fr))' } },
+  axes: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 280px), 1fr))', gap: s.md, flex: '1 1 0', minWidth: 0 },
   headerAxis: { display: 'flex', flexDirection: 'column', gap: s.xs2, minWidth: 0 },
   label: { color: ink.fgMuted, fontSize: t.denseSize, fontWeight: t.weightMedium },
   button: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', height: g.toolRow, flexShrink: 0, paddingInline: s.xs, paddingBlock: s.zero, borderWidth: 0, borderRadius: r.sm, backgroundColor: surface.transparent, color: ink.fgSoft, fontFamily: t.fontSans, fontSize: t.denseSize, cursor: 'pointer', ':hover': { backgroundColor: surface.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
