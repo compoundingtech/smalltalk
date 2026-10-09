@@ -480,6 +480,8 @@ impl WorkPlan {
                 refold_work(store, &mut rows, &chunk, time, cut)
             })?;
         }
+        // The rows the chunks did not refold run on to the plan's time too.
+        retime_work(&mut rows, self.time);
         // Leases are rechecked from the plan's time, the earliest any row now holds at.
         rows.time_unix_ms = self.time;
         rows.frontier = self.frontier;

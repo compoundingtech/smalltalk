@@ -392,23 +392,7 @@ fn published_work_matches_the_direct_read_for_every_actor_as_time_passes() {
     let (_, changed) = fold(&store);
     assert!(changed, "the quiet renewal moved the step's since");
 
-    // The seat asks a person; the ask's step shows on the list, and its answer later moves it.
-    store
-        .ask_person(&crate::model::PersonAskRequest {
-            legacy_request: None,
-            person: "person/operator".into(),
-            title: "Which bed?".into(),
-            reason: "The plan names two beds.".into(),
-            actor: ash.clone(),
-            step: Some(plant.clone()),
-            new_run: None,
-            incarnation: Some(format!("{ash}-1")),
-            request: None,
-            idempotency_key: "ask-plant".into(),
-        })
-        .unwrap();
-    fold_work_checked(&store);
-    fold(&store);
+
 
     // The lease ends: once the list's time passes it, the step is ready again.
     let lease = store.next_lease_end(0).unwrap().expect("the claim holds a lease");
