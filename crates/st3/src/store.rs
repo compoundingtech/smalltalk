@@ -152,6 +152,7 @@ pub mod agent_view;
 mod conversation_reads;
 mod usage_period;
 mod runtime;
+pub(crate) mod published_views;
 #[cfg(test)]
 mod tombstones_tests;
 pub use runtime::SmalltalkRuntime;
