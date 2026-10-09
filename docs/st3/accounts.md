@@ -215,6 +215,21 @@ an agent; the legacy `ask` setting is accepted but never sends raw events to a p
 Each seat is stopped once per weekly window: start it again and it stays up until the reset. Give
 every node that hosts seats the same `[limits]`.
 
+An account that should never be stopped is exempt, by the name `st usage` shows (the declared
+account or the provider's label), and so is a whole harness:
+
+```toml
+[limits]
+exempt_accounts = ["ada/codex"]
+exempt_harnesses = ["codex"]
+```
+
+Exemption belongs to the account, not to the seat, so a seat started later on it is covered
+without listing it; `keep` still names single seats. The daemon reads `[limits]` again on every
+two-minute pass, so an edit (including enabling the policy) applies without a restart. A file that
+does not parse or validate leaves the last good policy running and is logged. `st usage` marks
+exempt accounts and prints an `EXEMPT` line for the policy.
+
 A person who owns more than one Claude or Codex account declares them and binds a seat to one or to
 a pool; a pooled seat at its limit restarts on another account instead of stopping, and `st usage`
 names each declared account. A seat that binds nothing runs on the

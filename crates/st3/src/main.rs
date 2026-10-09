@@ -5624,6 +5624,7 @@ mod private_gateway_tests {
 }
 
 async fn run_up(args: UpArgs) -> Result<()> {
+    let args_config = args.config.clone();
     let private_state = args.state_dir.is_some();
     let private_socket = args.socket.is_some();
     let explicit_gateway = args.client_gateway_socket.is_some();
@@ -5829,24 +5830,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
         }
     });
     tokio::spawn(st3::profile::watch_runtime_lag());
-    if config.limits.enabled {
-        tokio::spawn(enforce_account_limits(
-            store.clone(),
-            st3::store::LimitsPolicy {
-                stop_at_weekly_percent: config.limits.stop_at_weekly_percent,
-                keep: config.limits.keep.iter().cloned().collect(),
-                notify: config
-                    .limits
-                    .notify
-                    .clone()
-                    .expect("the daemon validated its limits operations agent"),
-                fresh_ms: config
-                    .limits
-                    .fresh_ms()
-                    .expect("the daemon validated its limits freshness"),
-            },
-        ));
-    }
+    // The policy reads `[limits]` again on every pass, so an edit applies without a restart.
+    st3::config::set_daemon_config(args_config.as_deref());
+    tokio::spawn(enforce_account_limits(store.clone(), config.limits.clone()));
     recycle_idle_wal(config.state_dir.join("claims.sqlite3"), Arc::downgrade(&store));
     let _contention_retry = retry_projection_contention(Arc::downgrade(&store), notify.clone(), event_notify.clone(), config.state_dir.clone());
     tokio::spawn(convert_envelope_payloads(store.clone()));
@@ -9302,12 +9288,36 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
         for limit in limits {
             let _ = writeln!(
                 output,
-                "{}  {}  {}  {}  {}",
+                "{}  {}  {}  {}  {}{}",
                 percent(&limit["weekly_percent"]),
                 percent(&limit["five_hour_percent"]),
                 time(&limit["weekly_resets_at_unix_ms"]),
                 time(&limit["measured_at_unix_ms"]),
                 account_name(&limit["account"], &limit["account_ref"]),
+                if limit["exempt"].as_bool() == Some(true) {
+                    "  exempt"
+                } else {
+                    ""
+                },
+            );
+        }
+        let names = |key: &str| {
+            report["limits_policy"][key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (accounts, harnesses) = (names("exempt_accounts"), names("exempt_harnesses"));
+        if !accounts.is_empty() || !harnesses.is_empty() {
+            let _ = writeln!(
+                output,
+                "EXEMPT  never stopped at {}% · accounts: {} · harnesses: {}",
+                report["limits_policy"]["stop_at_weekly_percent"],
+                if accounts.is_empty() { "none" } else { &accounts },
+                if harnesses.is_empty() { "none" } else { &harnesses },
             );
         }
     }
@@ -23054,11 +23064,21 @@ fn idempotency(kdl: &str, tokens: &BTreeMap<String, Vec<String>>) -> String {
 /// never replicate, so this never changes what any peer holds.
 /// Apply this node's `[limits]` policy every two minutes: stop the seats it hosts on an account
 /// past its weekly limit, and notify operations once per weekly window.
-async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPolicy) {
+async fn enforce_account_limits(store: Arc<Store>, started_with: st3::config::LimitsConfig) {
     const LIMITS_INTERVAL: Duration = Duration::from_secs(2 * 60);
+    let mut limits = started_with;
     loop {
+        // A config file that cannot be read or does not validate keeps the last good policy.
+        match st3::config::reload_daemon_limits() {
+            Some(Ok(reloaded)) => limits = reloaded,
+            Some(Err(error)) => eprintln!("st3: limits policy keeps its last config: {error:#}"),
+            None => {}
+        }
+        let Some(policy) = st3::store::LimitsPolicy::from_config(&limits) else {
+            tokio::time::sleep(LIMITS_INTERVAL).await;
+            continue;
+        };
         let pass = store.clone();
-        let policy = policy.clone();
         match tokio::task::spawn_blocking(move || {
             st3::profile::task("task enforce-account-limits", || {
                 let now = now_ms();
@@ -24865,6 +24885,19 @@ mod tests {
             output_with_limits
                 .contains("96%  ?  2027-01-15 08:00 UTC  2027-01-03 18:13 UTC  claude/aaaa"),
             "{output_with_limits}"
+        );
+        let exempt = json!({"rows": [], "limits": [
+            {"account": "codex/aaaa", "weekly_percent": 99.0, "five_hour_percent": null, "exempt": true,
+             "weekly_resets_at_unix_ms": 1_800_000_000_000_u64, "measured_at_unix_ms": 1_799_000_000_000_u64},
+            {"account": "claude/bbbb", "weekly_percent": 50.0, "five_hour_percent": null, "exempt": false,
+             "weekly_resets_at_unix_ms": 1_800_000_000_000_u64, "measured_at_unix_ms": 1_799_000_000_000_u64},
+        ], "limits_policy": {"stop_at_weekly_percent": 95, "exempt_accounts": ["ada/codex"], "exempt_harnesses": []}});
+        let output_exempt = render_usage_report(&exempt, 24, None);
+        assert!(output_exempt.contains("codex/aaaa  exempt\n"), "{output_exempt}");
+        assert!(output_exempt.contains("claude/bbbb\n"), "{output_exempt}");
+        assert!(
+            output_exempt.contains("EXEMPT  never stopped at 95% · accounts: ada/codex · harnesses: none"),
+            "{output_exempt}"
         );
         let by_step = render_usage_report(&report, 24, Some(UsageBy::Step));
         assert_eq!(by_step.matches("USAGE  ").count(), 1);
