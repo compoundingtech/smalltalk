@@ -1,5 +1,6 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
+import { Button } from 'react-aria-components'
 import { colorVars as c, typeVars as t, radiusVars as r, geometryVars as g } from '../composition-tokens.stylex'
 import { SidebarStatus as StatusGlyph } from '../sidebar/SidebarStatus'
 import { Icon } from './Icons'
@@ -109,6 +110,7 @@ export function ThreadHeader({
   nativeActions,
   actionPortalRef,
   terminalAvailable = false,
+  terminalDisabledReason,
   onOpen,
   onCommit,
   statusSince,
@@ -134,6 +136,8 @@ export function ThreadHeader({
   nativeActions?: React.ReactNode
   actionPortalRef?: React.Ref<HTMLDivElement>
   terminalAvailable?: boolean
+  /** Why the terminal is unavailable. With `terminalAvailable` false, a set reason shows the toggle disabled and described by it; without one the toggle stays hidden. */
+  terminalDisabledReason?: string
   onOpen?: () => void
   onCommit?: () => void
   panelOpen: boolean
@@ -144,6 +148,7 @@ export function ThreadHeader({
   sidebarCollapsed?: boolean
   onToggleSidebar?: () => void
 }) {
+  const terminalReasonId = React.useId()
   return (
     <header data-testid="thread-header" {...stylex.props(styles.header)}>
       {sidebarCollapsed && onToggleSidebar !== undefined ? (
@@ -165,6 +170,13 @@ export function ThreadHeader({
         {terminalAvailable && <button type="button" aria-label="Toggle terminal drawer" title="Toggle terminal drawer" aria-pressed={drawerOpen} onClick={onToggleDrawer} {...stylex.props(styles.ghostMd, drawerOpen && styles.ghostOn)}>
           <Icon name="drawer" />
         </button>}
+        {/* A disabled button receives no pointer events, so the hover title sits on its wrapper. */}
+        {!terminalAvailable && terminalDisabledReason !== undefined && <span data-testid="terminal-toggle-disabled" title={terminalDisabledReason} {...stylex.props(styles.disabledWrap)}>
+          <Button isDisabled aria-label="Toggle terminal drawer" aria-describedby={terminalReasonId} {...stylex.props(styles.ghostMd, styles.ghostDisabled)}>
+            <Icon name="drawer" />
+          </Button>
+          <span id={terminalReasonId} hidden>{terminalDisabledReason}</span>
+        </span>}
         <button type="button" aria-label="Toggle right panel" title="Toggle right panel" aria-pressed={panelOpen} onClick={onTogglePanel} {...stylex.props(styles.ghostMd, panelOpen && styles.ghostOn)}>
           <Icon name="panel" />
         </button>
@@ -198,6 +210,8 @@ const styles = stylex.create({
   outlineXs: { height: g.controlSm, display: 'inline-flex', alignItems: 'center', paddingInline: 6, borderWidth: 1, borderStyle: 'solid', borderColor: c.borderStrong, backgroundColor: 'rgba(255, 255, 255, 0.025)', color: c.fg, borderRadius: r.control, fontSize: t.metaSize, lineHeight: t.metaLeading, fontWeight: t.weightMedium, cursor: 'pointer', ':hover': { backgroundColor: c.rowHover }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
   ghostMd: { width: 28, height: 28, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: 'transparent', color: c.fgMuted, borderRadius: r.control, cursor: 'pointer', fontSize: t.uiSize, transition: 'background-color 150ms ease, color 150ms ease', ':hover': { backgroundColor: c.rowHover, color: c.fg }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
   ghostOn: { color: c.fg, backgroundColor: c.rowHover },
+  ghostDisabled: { color: c.fgFaint, cursor: 'default', ':hover': { backgroundColor: 'transparent', color: c.fgFaint } },
+  disabledWrap: { display: 'inline-flex' },
   drawer: { display: 'flex', flexDirection: 'column', borderTopWidth: 1, borderTopStyle: 'solid', borderTopColor: c.borderStrong, backgroundColor: c.canvas, flexShrink: 0, minHeight: 0 },
   drawerHead: { height: 32, display: 'flex', alignItems: 'center', gap: 12, paddingInline: 12 },
   drawerLabel: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: c.fgMuted, fontWeight: t.weightMedium },
