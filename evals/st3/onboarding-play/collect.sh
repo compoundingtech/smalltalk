@@ -14,9 +14,18 @@ session="$("$st" conversations sessions --as "$assistant" --json \
   | jq -r --arg a "$assistant" '[.value.items[] | select(.owner_id == $a)] | sort_by(.started_at) | last | .id // empty')"
 timeline='[]'
 if [ -n "$session" ]; then
-  timeline="$("$st" conversations timeline "$session" --as "$assistant" --json --limit 500 \
-    | jq '[.value.items[] | select(.type == "content" and .final == true and (.body.text // "") != "")
-           | {ms: ((.timestamp | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) * 1000), role, text: .body.text}]')"
+  # The daemon caps a page at 200 entries; follow the cursor toward older ones. Each raw page is kept
+  # when EVAL_RAW_DIR is set, so a bundle that fails to build can be rebuilt from what was read.
+  cursor=""
+  for page in 1 2 3 4 5 6 7 8 9 10; do
+    page_json="$("$st" conversations timeline "$session" --as "$assistant" --json --limit 200 ${cursor:+--cursor "$cursor"})"
+    [ -n "${EVAL_RAW_DIR:-}" ] && { mkdir -p "$EVAL_RAW_DIR"; printf '%s\n' "$page_json" >"$EVAL_RAW_DIR/timeline-$page.json"; }
+    timeline="$(jq --argjson more "$(jq '[.value.items[] | select(.type == "content" and .final == true and (.body.text // "") != "")
+           | {ms: ((.timestamp | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) * 1000), role, text: .body.text}]' <<<"$page_json")" \
+      '. + $more | sort_by(.ms)' <<<"$timeline")"
+    cursor="$(jq -r '.value.page.next_cursor // empty' <<<"$page_json")"
+    [ -n "$cursor" ] || break
+  done
 fi
 # Assistant text is what it said as itself; the person's text arrived as a message from the person.
 assistant_text="$(jq '[.[] | select(.role == "assistant") | {ms, text}]' <<<"$timeline")"

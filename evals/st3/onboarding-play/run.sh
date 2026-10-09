@@ -100,8 +100,16 @@ stop_throwaway() { # kill the daemon this run started: the st3 whose environment
 failures=0; ran=0
 for variant in "${plan[@]}"; do
   ran=$((ran + 1))
-  root="$(mktemp -d)"; mkdir -p "$root/home/.config" "$root/home/.local/state" "$root/run"
-  run_env=(env -i PATH="$PATH" HOME="$root/home" USER=avery LANG="${LANG:-C.UTF-8}" TERM=xterm-256color
+  root="$(mktemp -d)"; mkdir -p "$root/home/.config" "$root/home/.local/state" "$root/home/.local/bin" "$root/run"
+  # What `st setup --install` would put in ~/.local/bin, linked rather than copied: the candidate
+  # binary and the pty on this machine's PATH (setup refuses to start without them).
+  ln -s "$st_bin" "$root/home/.local/bin/st3"; ln -s "$st_bin" "$root/home/.local/bin/st"
+  ln -s "$(command -v pty)" "$root/home/.local/bin/pty"
+  # The daemon reads its PATH from a login shell run with this throwaway HOME, which has no profile:
+  # give it one that finds the throwaway bin, where the harness executable is linked (not its login).
+  ln -s "$(command -v "$harness")" "$root/home/.local/bin/$harness"
+  printf 'export PATH="%s:$PATH"\n' "$root/home/.local/bin" >"$root/home/.bash_profile"
+  run_env=(env -i PATH="$root/home/.local/bin:$PATH" HOME="$root/home" USER=avery LANG="${LANG:-C.UTF-8}" TERM=xterm-256color
     XDG_CONFIG_HOME="$root/home/.config" XDG_STATE_HOME="$root/home/.local/state" XDG_RUNTIME_DIR="$root/run"
     ST_BIN="$st_bin" EVAL_PERSON="$person")
   [ -n "$claude_dir" ] && run_env+=(CLAUDE_CONFIG_DIR="$claude_dir")
@@ -134,7 +142,7 @@ for variant in "${plan[@]}"; do
   # A silent person leaves the Assistant to its default; give it the window after its last question.
   [ "$variant" = silent ] && [ -z "$verdict" ] && sleep 60
   if [ "${verdict#stopped}" = "$verdict" ] && [ "$verdict" != "setup failed" ]; then
-    "${run_env[@]}" "$here/collect.sh" "$variant" "$started" "$skip_ms" >"$out/$variant.json" 2>"$out/$variant.collect.log" \
+    "${run_env[@]}" EVAL_RAW_DIR="$out/$variant.raw" "$here/collect.sh" "$variant" "$started" "$skip_ms" >"$out/$variant.json" 2>"$out/$variant.collect.log" \
       || verdict="collection failed (see $variant.collect.log)"
     if [ -z "$verdict" ]; then
       if "$here/judge.sh" "$out/$variant.json" | tee "$out/$variant.txt"; then verdict=pass; else verdict=fail; fi
@@ -142,6 +150,10 @@ for variant in "${plan[@]}"; do
   fi
   # The tokens the throwaway graph recorded for this run, kept beside the verdict (counts only).
   st usage --hours 3 --json >"$out/$variant.usage.json" 2>/dev/null || true
+  # Claude seats report no cumulative usage to st, only the size of their context at the end.
+  for seat in assistant demo; do
+    st agents show "agent/st/$seat" --json 2>/dev/null | jq '.value.usage' >"$out/$variant.$seat.seat-usage.json" 2>/dev/null || true
+  done
   st agents stop agent/st/assistant >/dev/null 2>&1 || true
   stop_throwaway "$root"
   echo "   -> $variant: $verdict"; echo "$variant: $verdict" >>"$out/summary.txt"
