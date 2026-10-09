@@ -1,4 +1,8 @@
 import XCTest
+import Foundation
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
@@ -60,8 +64,7 @@ final class St3ClientTests: XCTestCase {
     }
 
     func testCapabilitiesFixtureDecodes() throws {
-        let json = #"{"api_version":"st3.client.v0","request_id":"request/1","snapshot":{"id":"snapshot/host/1/a","host_id":"host/a","store_index":1,"projection_version":"client-projection.v0","created_at":"2026-09-20T12:00:00Z"},"value":{"kind":"capabilities","session_actor":"person/a/session/b","transport":"fabric-loopback","capabilities":[],"limits":{"max_page_items":200,"max_event_items":500,"max_response_bytes":1048576,"max_wait_ms":30000},"event_cursor":"event-cursor/a/1","oldest_event_cursor":"event-cursor/a/0","schemas":["schema.json"]}}"#
-        let value = try JSONDecoder().decode(Envelope<Capabilities>.self, from: Data(json.utf8))
+        let value = try JSONDecoder().decode(Envelope<Capabilities>.self, from: TraceTestFixtures.capabilities)
         XCTAssertEqual(value.value.limits.maxPageItems, 200)
     }
 
@@ -281,5 +284,251 @@ final class St3ClientTests: XCTestCase {
         XCTAssertEqual(unknown.fields["name"], .string("Pinned"))
         let again = try JSONDecoder().decode(Resource.self, from: JSONEncoder().encode(resource))
         XCTAssertEqual(again.id, resource.id)
+    }
+    @MainActor
+    func testHTTPTraceContextIsReadOncePerRequestAndForwardedVerbatim() async throws {
+        let contexts = [
+            TraceContext(traceparent: TraceTestFixtures.traceparent, tracestate: "vendor=value"),
+            TraceContext(traceparent: TraceTestFixtures.traceparent, tracestate: "vendor=value,st=existing"),
+            TraceContext(traceparent: "01-11111111111111111111111111111111-2222222222222222-00"),
+        ]
+        let probe = TraceContextProbe(contexts)
+        let requests = try await captureHTTPRequests(traceContext: { probe.next() }, count: contexts.count)
+        XCTAssertEqual(probe.count, contexts.count)
+        XCTAssertEqual(requests.count, contexts.count)
+        for (request, context) in zip(requests, contexts) {
+            XCTAssertEqual(request.value(forHTTPHeaderField: "traceparent"), context.traceparent)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "tracestate"), context.tracestate)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-credential")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "x-st3-client"), "test-app 1")
+        }
+    }
+
+    @MainActor
+    func testHTTPWithoutTraceContextCallbackOmitsBothHeaders() async throws {
+        let requests = try await captureHTTPRequests()
+        assertNoTraceHeaders(try XCTUnwrap(requests.first))
+    }
+
+    @MainActor
+    func testHTTPNilTraceContextOmitsBothHeadersAndCallsOnce() async throws {
+        let probe = TraceContextProbe([nil])
+        let requests = try await captureHTTPRequests(traceContext: { probe.next() })
+        assertNoTraceHeaders(try XCTUnwrap(requests.first))
+        XCTAssertEqual(probe.count, 1)
+    }
+
+    @MainActor
+    func testHTTPInvalidTraceparentOmitsBothHeaders() async throws {
+        for traceparent in TraceTestFixtures.invalidTraceparents {
+            let probe = TraceContextProbe([TraceContext(traceparent: traceparent, tracestate: "vendor=value")])
+            let requests = try await captureHTTPRequests(traceContext: { probe.next() })
+            assertNoTraceHeaders(try XCTUnwrap(requests.first))
+            XCTAssertEqual(probe.count, 1, traceparent)
+        }
+    }
+
+    @MainActor
+    func testEveryWebSocketBuilderReadsContextOnceAndForwardsVerbatim() async throws {
+        let session = WebSocketCaptureSession()
+        defer { session.invalidateAndCancel() }
+        let context = TraceContext(traceparent: TraceTestFixtures.traceparent, tracestate: "vendor=value,st=existing")
+        let probe = TraceContextProbe([context])
+        let client = St3Client(fabricLoopbackURL: URL(string: "https://trace.example/")!,
+            credential: "test-credential", session: session, client: "test-app 1",
+            traceContext: { probe.next() })
+        _ = await client.conversationStream(sessionID: "session/example")
+        _ = await client.glassesStream()
+        _ = await client.arrangementsStream(person: "person/example")
+        _ = await client.terminalStream("terminal/example", streamCapability: "test-capability")
+        let requests = session.capture.requests
+        XCTAssertEqual(probe.count, 4)
+        XCTAssertEqual(requests.count, 4)
+        XCTAssertEqual(requests.map { $0.url?.path }, [
+            "/v1/client/conversations/example/stream", "/v1/client/collections/stream",
+            "/v1/client/collections/stream", "/v1/client/terminals/example/stream",
+        ])
+        for request in requests {
+            XCTAssertEqual(request.url?.scheme, "wss")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "traceparent"), context.traceparent)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "tracestate"), context.tracestate)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-credential")
+            XCTAssertNotNil(request.value(forHTTPHeaderField: "Sec-WebSocket-Protocol"))
+        }
+    }
+
+    @MainActor
+    func testWebSocketWithoutTraceContextCallbackOmitsBothHeaders() async throws {
+        let session = WebSocketCaptureSession()
+        defer { session.invalidateAndCancel() }
+        let client = St3Client(fabricLoopbackURL: URL(string: "https://trace.example/")!, session: session)
+        _ = await client.conversationStream(sessionID: "session/example")
+        assertNoTraceHeaders(try XCTUnwrap(session.capture.requests.first))
+    }
+
+    @MainActor
+    func testWebSocketNilOrInvalidContextOmitsBothHeadersAndCallsOnce() async throws {
+        let contexts: [TraceContext?] = [nil] + TraceTestFixtures.invalidTraceparents.map {
+            TraceContext(traceparent: $0, tracestate: "vendor=value")
+        }
+        for context in contexts {
+            let session = WebSocketCaptureSession()
+            defer { session.invalidateAndCancel() }
+            let probe = TraceContextProbe([context])
+            let client = St3Client(fabricLoopbackURL: URL(string: "https://trace.example/")!,
+                session: session, traceContext: { probe.next() })
+            _ = await client.conversationStream(sessionID: "session/example")
+            assertNoTraceHeaders(try XCTUnwrap(session.capture.requests.first))
+            XCTAssertEqual(probe.count, 1)
+        }
+    }
+
+    @MainActor
+    private func captureHTTPRequests(traceContext: (@Sendable () -> TraceContext?)? = nil,
+        count: Int = 1) async throws -> [URLRequest] {
+        let url = URL(string: "https://trace-\(UUID().uuidString.lowercased()).example/")!
+        let capture = TraceRequestCapture()
+        TraceHTTPRegistry.shared.register(capture, host: url.host!)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TraceHTTPProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+            TraceHTTPRegistry.shared.remove(host: url.host!)
+        }
+        let client = St3Client(fabricLoopbackURL: url, credential: "test-credential",
+            session: session, client: "test-app 1", traceContext: traceContext)
+        for _ in 0..<count { _ = try await client.capabilities() }
+        return capture.requests
+    }
+
+    private func assertNoTraceHeaders(_ request: URLRequest,
+        file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertNil(request.value(forHTTPHeaderField: "traceparent"), file: file, line: line)
+        XCTAssertNil(request.value(forHTTPHeaderField: "tracestate"), file: file, line: line)
+    }
+}
+
+private enum TraceTestFixtures {
+    static let traceparent = "00-0123456789abcdef0123456789abcdef-0123456789abcdef-01"
+    static let invalidTraceparents = [
+        "",
+        traceparent.uppercased(),
+        traceparent + "\n",
+        " " + traceparent,
+        traceparent + "-extra",
+        "00-0123456789abcdef0123456789abcde-0123456789abcdef-01",
+        "00-0123456789abcdef0123456789abcdef-0123456789abcde-01",
+        "00-0123456789abcdef0123456789abcdef-0123456789abcdef-0",
+        "00-0123456789abcdef0123456789abcdeg-0123456789abcdef-01",
+        "00_0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+        "ff-0123456789abcdef0123456789abcdef-0123456789abcdef-01",
+        "00-00000000000000000000000000000000-0123456789abcdef-01",
+        "00-0123456789abcdef0123456789abcdef-0000000000000000-01",
+    ]
+    static let capabilities = Data(#"{"api_version":"st3.client.v0","request_id":"request/1","snapshot":{"id":"snapshot/host/1/a","host_id":"host/a","store_index":1,"projection_version":"client-projection.v0","created_at":"2026-09-20T12:00:00Z"},"value":{"kind":"capabilities","session_actor":"person/a/session/b","transport":"fabric-loopback","capabilities":[],"limits":{"max_page_items":200,"max_event_items":500,"max_response_bytes":1048576,"max_wait_ms":30000},"event_cursor":"event-cursor/a/1","oldest_event_cursor":"event-cursor/a/0","schemas":["schema.json"]}}"#.utf8)
+}
+
+private final class TraceContextProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let contexts: [TraceContext?]
+    private var calls = 0
+
+    init(_ contexts: [TraceContext?]) { self.contexts = contexts }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return calls
+    }
+
+    func next() -> TraceContext? {
+        lock.lock()
+        defer { lock.unlock() }
+        let context = contexts[min(calls, contexts.count - 1)]
+        calls += 1
+        return context
+    }
+}
+
+private final class TraceRequestCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var captured: [URLRequest] = []
+
+    var requests: [URLRequest] {
+        lock.lock()
+        defer { lock.unlock() }
+        return captured
+    }
+
+    func append(_ request: URLRequest) {
+        lock.lock()
+        defer { lock.unlock() }
+        captured.append(request)
+    }
+}
+
+private final class TraceHTTPRegistry: @unchecked Sendable {
+    static let shared = TraceHTTPRegistry()
+    private let lock = NSLock()
+    private var captures: [String: TraceRequestCapture] = [:]
+
+    func register(_ capture: TraceRequestCapture, host: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        captures[host] = capture
+    }
+
+    func remove(host: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        captures.removeValue(forKey: host)
+    }
+
+    func capture(for request: URLRequest) -> TraceRequestCapture? {
+        lock.lock()
+        defer { lock.unlock() }
+        return captures[request.url?.host ?? ""]
+    }
+}
+
+private final class TraceHTTPProtocol: URLProtocol, @unchecked Sendable {
+    override class func canInit(with request: URLRequest) -> Bool {
+        TraceHTTPRegistry.shared.capture(for: request) != nil
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let capture = TraceHTTPRegistry.shared.capture(for: request),
+              let url = request.url,
+              let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil,
+                  headerFields: ["Content-Type": "application/json"]) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        capture.append(request)
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: TraceTestFixtures.capabilities)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final class WebSocketCaptureSession: URLSession, @unchecked Sendable {
+    let capture = TraceRequestCapture()
+    private let backing = URLSession(configuration: .ephemeral)
+
+    override func webSocketTask(with request: URLRequest) -> URLSessionWebSocketTask {
+        capture.append(request)
+        let task = backing.webSocketTask(with: request)
+        // Capture the public builder's request without opening a network connection.
+        task.cancel(with: .normalClosure, reason: nil)
+        return task
+    }
+
+    override func invalidateAndCancel() {
+        backing.invalidateAndCancel()
     }
 }
