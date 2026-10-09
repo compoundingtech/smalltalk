@@ -6703,15 +6703,48 @@ fn client_session_id(owner: &str, incarnation: &str) -> String {
     format!("session/{}", &digest[..24])
 }
 
+/// What a page of events needs from the store to attribute its subjects, read once per page
+/// instead of once per event.
+#[derive(Default)]
+struct EventPageLookups {
+    missions: BTreeMap<String, String>,
+    custom_sources: BTreeSet<String>,
+}
+
+impl EventPageLookups {
+    fn read<'a>(state: &AppState, records: impl IntoIterator<Item = &'a EventRecord>) -> Self {
+        let (mut runs, mut customs) = (BTreeSet::new(), BTreeSet::new());
+        for record in records {
+            if record.subject.starts_with("custom/") {
+                customs.insert(record.subject.clone());
+            } else if record.subject.starts_with("mission-run/") {
+                runs.insert(record.subject.clone());
+            }
+        }
+        Self {
+            missions: state
+                .store
+                .run_missions(&runs.into_iter().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            custom_sources: state
+                .store
+                .registered_custom_subjects(&customs.into_iter().collect::<Vec<_>>())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[cfg(test)]
 fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec<String>, Value) {
-    if record.subject.starts_with("custom/")
-        && state
-            .store
-            .custom_subject(&record.subject)
-            .ok()
-            .flatten()
-            .is_some()
-    {
+    safe_event_projection_with(state, record, &EventPageLookups::read(state, [record]))
+}
+
+fn safe_event_projection_with(
+    state: &AppState,
+    record: &EventRecord,
+    lookups: &EventPageLookups,
+) -> (String, Vec<String>, Value) {
+    if record.subject.starts_with("custom/") && lookups.custom_sources.contains(&record.subject) {
         return (
             "attention.changed".into(),
             vec![record.subject.clone()],
@@ -6774,9 +6807,9 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
     {
         resource_ids.push(record.subject.clone());
     } else if record.subject.starts_with("mission-run/")
-        && let Ok(Some(mission)) = state.store.mission_for_run(&record.subject)
+        && let Some(mission) = lookups.missions.get(&record.subject)
     {
-        resource_ids.push(mission);
+        resource_ids.push(mission.clone());
     } else if record.subject.starts_with("planning-session/") {
         resource_ids.push(format!(
             "launch/{}",
@@ -6879,6 +6912,13 @@ pub(super) async fn events(
     // The projection enrichment reads the store (mission attribution, snapshot ids), so it
     // takes one admitted query scope; the wait above held no reader.
     let items = super::read_deadline::query(&state.store, "/v1/client/events", || {
+        // Every event is named by its own cut; read all of the page's cuts in one statement.
+        let cuts = records
+            .iter()
+            .map(|(record, _)| record.store_index)
+            .collect::<Vec<_>>();
+        let times = state.store.projection_times_at(&cuts).unwrap_or_default();
+        let lookups = EventPageLookups::read(&state, records.iter().map(|(record, _)| record));
         Ok(records
             .into_iter()
             .map(|(record, local)| {
@@ -6896,8 +6936,12 @@ pub(super) async fn events(
                         local: None,
                     },
                 };
-                let event_snapshot = client_snapshot_at(&state, record.store_index);
-                let (event_type, resource_ids, body) = safe_event_projection(&state, &record);
+                let event_snapshot = client_snapshot_with_time(
+                    &state,
+                    record.store_index,
+                    times.get(&record.store_index).copied().unwrap_or_default(),
+                );
+                let (event_type, resource_ids, body) = safe_event_projection_with(&state, &record, &lookups);
                 json!({
                     "id": format!("projection-event/{}/{}", state.node, position.label()),
                     "epoch": state.node,
@@ -11838,6 +11882,65 @@ mission "queue-parity" state="ready" {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fresh_agent_roster_read_cuts_the_refresh_pause_short_and_plain_reads_do_not() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/fresh-pause";
+        let append = |fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "harness.observed".into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            state.store.index().unwrap()
+        };
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"fresh-pause", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        let list = |fresh: bool| client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery { fresh, ..ClientListQuery::default() }));
+        let publishes = |cut: u64| {
+            let store = state.store.clone();
+            move |_: &u64| store.published_agent_roster(store.index().unwrap(), false)
+                .is_some_and(|(published, _, _)| published >= cut)
+        };
+
+        // A plain read asks for a refresh; once it publishes, the refresher pauses a second.
+        let working = append(json!({"state":"working", "driver":"codex", "incarnation_id":"one"}));
+        let _ = list(false).await;
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(publishes(working)))
+            .await.expect("the refresher publishes the asked-for cut").unwrap();
+
+        // Unchanged: plain reads during the pause answer from the publication and do not cut it
+        // short, however many ask.
+        let idle = append(json!({"state":"idle", "driver":"codex", "incarnation_id":"one"}));
+        for _ in 0..3 {
+            let (Extension(snapshot), Json(page)) = list(false).await.unwrap();
+            assert!(snapshot.store_index < idle, "a plain read answers from the publication");
+            assert_eq!(page.items[0]["harness_state"], "working");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), published.wait_for(publishes(idle)))
+                .await.is_err(),
+            "plain reads must not shorten the refresher's minimum pause",
+        );
+
+        // Changed: a fresh read waits for one fold, not the rest of the pause (about 750 ms here).
+        let started = std::time::Instant::now();
+        let (Extension(snapshot), Json(page)) = list(true).await.unwrap();
+        let waited = started.elapsed();
+        assert!(snapshot.store_index >= idle, "a fresh read shows what was written before it");
+        assert_eq!(page.items[0]["harness_state"], "idle");
+        assert!(waited < Duration::from_millis(500), "a fresh read waited {waited:?} for the pause");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_roster_pages_ask_for_a_refresh_after_local_activity_alone() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
@@ -16038,6 +16141,109 @@ mission "example/zero-run" state="ready" {
         .0;
         assert_eq!(page["oldest_cursor"], expected);
         assert!(!serde_json::to_string(&page).unwrap().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn event_pages_keep_each_events_own_cut_and_read_in_constant_statements() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "cut-node");
+        let session = ClientSession::local(None).unwrap();
+        let accepted = std::cell::RefCell::new(Vec::new());
+        let append = |count: usize| {
+            for _ in 0..count {
+                let key = format!("cut-{}", accepted.borrow().len());
+                accepted.borrow_mut().push(
+                    state
+                        .store
+                        .append_claim(&ClaimInput {
+                            subject: format!("message/{key}"),
+                            kind: "message.sent".into(),
+                            actor: Some("person/alex".into()),
+                            fields: BTreeMap::from([
+                                ("from".into(), Value::String("person/alex".into())),
+                                ("to".into(), Value::String("agent/worker".into())),
+                                ("content".into(), Value::String("safe".into())),
+                                ("status".into(), Value::String("sent".into())),
+                            ]),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(key),
+                        })
+                        .unwrap(),
+                );
+                // Acceptance times are milliseconds; keep neighbouring cuts distinct.
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let page = |after: Option<String>, limit: usize| {
+            let (state, session) = (state.clone(), session.clone());
+            async move {
+                let scope = smallclaims::sqlite::work::SqliteWorkScope::start();
+                let page = events(
+                    State(state),
+                    Extension(session),
+                    Query(EventsQuery { after, limit: Some(limit), wait_ms: None }),
+                )
+                .await
+                .unwrap()
+                .0;
+                (page, scope.finish().statements)
+            }
+        };
+        append(100);
+
+        // Each event keeps its own cut: its timestamp and snapshot id are the single lookup's.
+        let (tail, _) = page(None, 100).await;
+        let items = tail["items"].as_array().unwrap();
+        assert_eq!(items.len(), 100);
+        for item in items {
+            let sequence = item["sequence"].as_u64().unwrap();
+            let single = client_snapshot_at(&state, sequence);
+            assert_eq!(item["timestamp"], single.created_at, "sequence {sequence}");
+            assert_eq!(item["snapshot_id"], single.id, "sequence {sequence}");
+        }
+        let times = items.iter().map(|item| item["timestamp"].as_str().unwrap().to_owned()).collect::<BTreeSet<_>>();
+        assert!(times.len() > 1, "events must not share one page time");
+
+        // Statements stay flat as the page grows, and as unrelated history grows.
+        let mut counts = Vec::new();
+        for size in [10, 50, 100] {
+            counts.push(page(None, size).await.1);
+        }
+        eprintln!("events statements: 10/50/100 items {counts:?}");
+        assert!(counts.windows(2).all(|pair| pair[0] == pair[1]), "grew with page size: {counts:?}");
+        append(200);
+        let mut grown = Vec::new();
+        for size in [10, 50, 100] {
+            grown.push(page(None, size).await.1);
+        }
+        eprintln!("events statements after +200 claims of history: {grown:?}");
+        assert_eq!(counts, grown, "statements must not grow with history");
+
+        // Walking forward in pages, with an append during the walk, yields each event once, in
+        // order, with the same cuts.
+        let first = accepted.borrow()[0].store_index.saturating_sub(1);
+        let mut cursor = Some(format!("event-cursor/cut-node/{first}"));
+        let mut sequences = Vec::new();
+        let mut appended = false;
+        loop {
+            let (walked, _) = page(cursor.clone(), 7).await;
+            for item in walked["items"].as_array().unwrap() {
+                let sequence = item["sequence"].as_u64().unwrap();
+                assert_eq!(item["timestamp"], client_snapshot_at(&state, sequence).created_at);
+                sequences.push(sequence);
+            }
+            cursor = Some(walked["resume_cursor"].as_str().unwrap().to_owned());
+            if !appended {
+                appended = true;
+                append(3);
+            }
+            if !walked["has_more"].as_bool().unwrap() {
+                break;
+            }
+        }
+        let expected = accepted.borrow().iter().map(|claim| claim.store_index).collect::<Vec<_>>();
+        assert_eq!(sequences, expected);
     }
 
     #[tokio::test]

@@ -3233,6 +3233,27 @@ impl Store {
         self.request_agent_roster_refresh();
     }
 
+    /// Ask the refresher, if one runs, for a roster at the newest cut on behalf of a reader that
+    /// waits for it: a refresher pausing between refreshes stops pausing once it has paused as
+    /// long as its last refresh took, and at least a tenth of a second.
+    pub(crate) fn request_fresh_agent_roster(&self, history: bool) {
+        if self.smalltalk.agent_roster_refresh.get().is_none() {
+            return;
+        }
+        self.smalltalk.agent_roster_fresh_wanted.notify_one();
+        if history {
+            self.request_agent_roster_history();
+        } else {
+            self.request_agent_roster_refresh();
+        }
+    }
+
+    /// Resolves once a reader waits for a fresh roster, including one that asked before this
+    /// was called and was not yet answered by a refresh's pause.
+    pub(crate) async fn fresh_agent_roster_wanted(&self) {
+        self.smalltalk.agent_roster_fresh_wanted.notified().await;
+    }
+
     /// Whether a reader asked for the history roster since the last time this was taken.
     pub(crate) fn take_agent_roster_history_request(&self) -> bool {
         self.smalltalk.agent_roster_history_wanted.swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -12037,6 +12058,45 @@ impl Store {
             .and_then(|value| value.parse::<u128>().ok())
             .unwrap_or_default();
         Ok(value)
+    }
+
+    /// `projection_time_at` for several cuts in one statement: each distinct cut is one indexed
+    /// seek of `claims` by `store_index`, so the statement count does not grow with the cuts.
+    pub fn projection_times_at(&self, store_indexes: &[u64]) -> Result<HashMap<u64, u128>> {
+        let mut times = HashMap::with_capacity(store_indexes.len());
+        let mut cuts = store_indexes
+            .iter()
+            .copied()
+            .filter(|store_index| *store_index != 0)
+            .collect::<Vec<_>>();
+        cuts.sort_unstable();
+        cuts.dedup();
+        if let Some(zero) = store_indexes.iter().find(|store_index| **store_index == 0) {
+            times.insert(*zero, 0);
+        }
+        if cuts.is_empty() {
+            return Ok(times);
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT cut.value,
+                    (SELECT accepted_at_unix_ms FROM claims
+                     WHERE store_index <= cut.value ORDER BY store_index DESC LIMIT 1)
+             FROM json_each(?1) AS cut",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(&cuts)?], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (cut, value) = row?;
+            times.insert(
+                cut,
+                value
+                    .and_then(|value| value.parse::<u128>().ok())
+                    .unwrap_or_default(),
+            );
+        }
+        Ok(times)
     }
 
     pub fn events_after_filtered(
@@ -33469,6 +33529,45 @@ mod tests {
         other.join().unwrap();
         assert_eq!(completed.unwrap().unwrap()[0]["id"], "agent/cached");
         assert_eq!(resumed, published.unwrap());
+    }
+
+    #[test]
+    fn projection_times_at_names_every_cut_like_the_single_lookup() {
+        let store = roster_cache_store();
+        let (_, newest) = store.event_bounds().unwrap();
+        assert!(newest > 1, "the fixture needs several claims");
+        // Heterogeneous, repeated, unordered, empty-store and past-the-frontier cuts.
+        let mut cuts = vec![0, newest + 7, 1, newest, 1, newest / 2, 0, newest];
+        cuts.extend(1..=newest);
+        let batched = store.projection_times_at(&cuts).unwrap();
+        for cut in &cuts {
+            assert_eq!(batched[cut], store.projection_time_at(*cut).unwrap(), "cut {cut}");
+        }
+        assert_eq!(batched.len(), (0..=newest + 7).filter(|c| cuts.contains(c)).count());
+        assert!(store.projection_times_at(&[]).unwrap().is_empty());
+        // Acceptance times are per claim, not one shared value, once the clock moves.
+        assert!(batched[&newest] >= batched[&1]);
+    }
+
+    #[test]
+    fn projection_times_at_seeks_the_claim_index_once_per_cut() {
+        let store = roster_cache_store();
+        let connection = store.readers.get();
+        let plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT cut.value,
+                        (SELECT accepted_at_unix_ms FROM claims
+                         WHERE store_index <= cut.value ORDER BY store_index DESC LIMIT 1)
+                 FROM json_each(?1) AS cut",
+            )
+            .unwrap()
+            .query_map(["[1,2]"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("SEARCH claims USING INTEGER PRIMARY KEY"), "{plan}");
+        assert!(!plan.contains("SCAN claims"), "{plan}");
     }
 
     fn roster_cache_store() -> Store {

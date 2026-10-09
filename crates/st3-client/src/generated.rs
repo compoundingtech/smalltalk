@@ -907,6 +907,7 @@ pub struct MissionRunSummary {
     pub status: String,
     pub phase: String,
     pub progress: Value,
+    /// Step assignees and claimants are nullable ActorRef strings, not agent-only IDs.
     pub current_steps: Vec<Value>,
     pub must_act: String,
     pub state_since: String,
@@ -938,8 +939,10 @@ pub struct MissionStep {
     pub title: Option<String>,
     pub state: String,
     pub attempt: u32,
+    /// An ActorRef: agent, daemon, or person.
     #[serde(default)]
     pub assignee: Option<String>,
+    /// An ActorRef: agent, daemon, or person.
     #[serde(default)]
     pub claimant: Option<String>,
     #[serde(default)]
@@ -973,6 +976,7 @@ pub struct MissionStep {
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MissionWake {
+    /// An ActorRef: agent, daemon, or person.
     pub assignee: String,
     pub assignee_state: String,
     pub incarnation_id: String,

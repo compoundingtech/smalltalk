@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A fresh agents roster read waits for one refresh instead of the rest of the refresher's one-second pause, and request latency reports agents reads by fresh, first page and continuation",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, admission, authority or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Agents pages keep the same shape, cut, pagination and 2 s fresh bound. The request-latency routes array keeps its route and work-action rows and adds scope=agents-read rows (read=first-page|fresh|continuation) for GET /v1/client/agents. They are subsets of the route total; do not sum across scopes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal binary rollout; no startup work."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator steps. Latency consumers can select scope=agents-read."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Counters are in memory and reset on restart; a rollback restores the one-second minimum pause for fresh reads and route-only agents latency without changing durable state."
+  }
+}

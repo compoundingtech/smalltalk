@@ -140,9 +140,10 @@ check("priority-only workers remain reserved", [{'runners': priority}], EVENT='m
 # Supporting PR jobs must never spend ordinary work on priority/merge capacity.
 import re
 blocks = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow.split("\njobs:\n", 1)[1]))
+required_priority = "(github.event_name == 'merge_group' || github.event_name == 'pull_request') && 1 || 2"
 for job in ("linux-clippy", "linux-fleet-compat", "genie-freshness", "typescript-client", "isolation-vm", "perf-cost"):
     assert "outputs.ci1" not in blocks[job], (job, "supporting job consumes reserved cores")
-    assert "github.event_name == 'merge_group' && 1 || 2" in blocks[job], (job, "merge groups must precede queued PRs")
+    assert (required_priority if job != "perf-cost" else "github.event_name == 'merge_group' && 1 || 2") in blocks[job], (job, "required PR checks share merge priority; optional cost stays separate")
     assert "github.run-id=" in blocks[job], (job, "prevent cross-run assignment")
     if job in ("genie-freshness", "typescript-client", "isolation-vm"):
         assert "namespace-profile-linux-x86-64;job.priority={1};github.run-id=" in blocks[job], (job, "profile controls must be inline")
@@ -153,7 +154,7 @@ for job, output in [('linux-tests-shard-2', 'ci1_secondary'), ('mail-redelivery-
     assert f'outputs.{output}) ||' in blocks[job], (job, 'extra jobs need their own idle-slot output')
     assert not re.search(r'outputs\.ci1\b', blocks[job]), (job, 'extra jobs must never take the primary reserved lane')
     assert 'job.priority={1}' in blocks[job] and 'github.run-id={0}' in blocks[job], (job, 'Namespace fallback must evaluate priority and run affinity')
-    assert "github.event_name == 'merge_group' && 1 || 2" in blocks[job], job
+    assert required_priority in blocks[job], job
 assert "outputs.ci1" in blocks["linux-tests"], "primary shard must retain reserved routing"
 canaries = blocks['mail-redelivery-canaries']
 assert 'needs: [pick-runner, linux-test-build]' in canaries and 'needs: [linux-tests]' not in canaries, "canaries must run beside both test shards after the shared build"
@@ -210,10 +211,12 @@ for job in ('linux-test-build', 'linux-clippy', 'linux-fleet-compat', 'genie-fre
     for event in ('pull_request', 'workflow_dispatch'):
         ordinary = route(job, event)
         assert ordinary == route(job, event, 'queue-reserved', merge_ci1='on'), (job, 'PRs cannot consume reserved profile')
-        assert 'job.priority=2' in ordinary[0], (job, 'queued PRs follow merge groups')
+        assert f"job.priority={1 if event == 'pull_request' else 2}" in ordinary[0], (job, 'required PRs share merge class; manual work remains second')
     if job in ('linux-test-build', 'linux-tests', 'linux-tests-shard-2', 'mail-redelivery-canaries'):
         assert route(job, 'merge_group', 'queue-reserved', '["ci1-merge"]') == ['namespace-profile-queue-reserved;job.priority=1;github.run-id=123'], (job, 'no individual picked lane may override whole-group admission')
-print('passed: all merge jobs use provisioned ci1 or Namespace reserve; PRs cannot; unset switches preserve shapes and affinity')
+assert required_priority not in blocks['perf-cost'], 'optional cost must not join required PR priority'
+assert "job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}" in blocks['perf-cost']
+print('passed: required PR and merge checks share priority; optional/manual remain second; reservations, shapes and affinity preserved')
 
 # Exercise the actual generated step predicates, including restoring ordinary behavior.
 cache_conditions = re.findall(

@@ -205,6 +205,10 @@ type Snapshot = (
 );
 
 type MaintenanceIds = std::collections::BTreeSet<String>;
+/// Canonical order keys of a stream's admitted mail, kept across its updates.
+type MailboxOrder = std::collections::BTreeMap<String, smallclaims::store::canonical::ClaimKey>;
+/// The seat's rollout intake hold, read at most once per update; `None` until first needed.
+type IntakeHold = Option<Option<crate::rollout::Operation>>;
 type SnapshotUpdate = (crate::store::MailboxWatermark, Snapshot, bool, MaintenanceIds);
 
 /// Recover only recent mail which has never been offered. A prior staging claim is
@@ -310,7 +314,7 @@ fn raw_snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
 #[cfg(test)]
 fn snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
     let (seat, mut messages) = raw_snapshot(store, binding)?;
-    let _ = filter_messages(store, binding, &mut messages, &mut Default::default())?;
+    let _ = filter_messages(store, binding, &mut messages, &mut Default::default(), &mut None)?;
     Ok((seat, messages))
 }
 
@@ -320,6 +324,7 @@ fn filter_messages(
     binding: &Fence,
     messages: &mut Vec<crate::model::MessageView>,
     policy_rechecks: &mut std::collections::BTreeSet<String>,
+    hold: &mut IntakeHold,
 ) -> anyhow::Result<MaintenanceIds> {
     let mut allowed = Vec::new();
     let mut close_own = std::collections::BTreeSet::new();
@@ -349,7 +354,13 @@ fn filter_messages(
                 continue;
             }
         }
-        if store.rollout_message_allowed(&message)? {
+        // Every message here is to this seat, so one hold read serves the whole update.
+        if message.status != "sent" || {
+            if hold.is_none() {
+                *hold = Some(store.rollout_intake_hold(&binding.subject)?);
+            }
+            store.rollout_message_allowed_under(hold.as_ref().and_then(Option::as_ref), &message)?
+        } {
             allowed.push(message);
         } else {
             // A reply's eligibility may depend on a parent's receipt. Recheck only these
@@ -362,6 +373,7 @@ fn filter_messages(
 }
 
 /// Update the connection's admitted mailbox, reading only changed durable identities.
+#[allow(clippy::too_many_arguments)]
 fn update_snapshot<F>(
     store: &Store,
     binding: &Fence,
@@ -370,17 +382,20 @@ fn update_snapshot<F>(
     floor: (u128, u64),
     admitted: &mut std::collections::BTreeSet<String>,
     policy_rechecks: &mut std::collections::BTreeSet<String>,
+    order: &mut MailboxOrder,
 ) -> anyhow::Result<SnapshotUpdate>
 where
     F: FnOnce(&Store, &Fence) -> anyhow::Result<Snapshot>,
 {
     let (since, through) = floor;
     let mut close_own = std::collections::BTreeSet::new();
+    let mut hold = None;
     let result = store.read_snapshot(|_| {
         let (mark, seat, mut messages) = if let Some((mark, (mut seat, mut messages))) = previous {
             let changes = store.mailbox_changes(binding, &mark, &messages)?;
             let mut updated = changes.seat || changes.resync || !changes.messages.is_empty();
             if changes.resync {
+                order.clear();
                 let (seat, messages) =
                     crate::profile::task("task mailbox-snapshot", || read(store, binding))?;
                 (changes.mark, seat, messages)
@@ -390,6 +405,10 @@ where
                         .desired_subjects_named(std::slice::from_ref(&binding.subject))?
                         .into_iter()
                         .next();
+                }
+                // A key belongs to the subject's own claims; a policy recheck keeps its key.
+                for subject in &changes.messages {
+                    order.remove(subject);
                 }
                 let subjects = changes
                     .messages
@@ -409,7 +428,13 @@ where
                         Some(through),
                         &mut admitted.clone(),
                     )?;
-                    close_own.extend(filter_messages(store, binding, &mut changed, policy_rechecks)?);
+                    close_own.extend(filter_messages(
+                        store,
+                        binding,
+                        &mut changed,
+                        policy_rechecks,
+                        &mut hold,
+                    )?);
                     retain_live_mail(store, &mut changed, since, Some(through), admitted)?;
                     if serde_json::to_value(old)? != serde_json::to_value(changed.first())? {
                         messages.retain(|message| message.subject != subject);
@@ -419,11 +444,12 @@ where
                     }
                 }
                 if reorder {
-                    store.order_mailbox_messages(&mut messages)?;
+                    store.order_mailbox_messages(&mut messages, order)?;
                 }
                 return Ok((changes.mark, (seat, messages), updated));
             }
         } else {
+            order.clear();
             let mark = store.mailbox_watermark(binding)?;
             let (seat, messages) =
                 crate::profile::task("task mailbox-snapshot", || read(store, binding))?;
@@ -444,7 +470,13 @@ where
             .into_iter()
             .map(|message| message.subject)
             .collect::<std::collections::BTreeSet<_>>();
-        close_own.extend(filter_messages(store, binding, &mut messages, policy_rechecks)?);
+        close_own.extend(filter_messages(
+            store,
+            binding,
+            &mut messages,
+            policy_rechecks,
+            &mut hold,
+        )?);
         policy_rechecks.retain(|subject| eligible.contains(subject));
         retain_live_mail(store, &mut messages, since, Some(through), admitted)?;
         Ok((mark, (seat, messages), true))
@@ -638,6 +670,7 @@ async fn stream_with_timers_inner<F, S, H>(
     let mut replay_proven = false;
     let mut recovered = std::collections::BTreeSet::new();
     let mut policy_rechecks = std::collections::BTreeSet::new();
+    let mut order = MailboxOrder::new();
     let own_posts = own_post_reactor(&state, &fence);
     let mut dirty = true;
     let mut last: Option<(crate::store::MailboxWatermark, Snapshot)> = None;
@@ -659,6 +692,7 @@ async fn stream_with_timers_inner<F, S, H>(
             subscription.changed.borrow_and_update();
             let mut admitted = recovered.clone();
             let mut policies = policy_rechecks.clone();
+            let mut keys = std::mem::take(&mut order);
             let mut previous = last.take();
             // This watch actor owns reconnection control. Finish that explicit command
             // before entering the read worker; snapshots never perform lease/fault writes.
@@ -687,13 +721,14 @@ async fn stream_with_timers_inner<F, S, H>(
                         (since, through),
                         &mut admitted,
                         &mut policies,
+                        &mut keys,
                     );
-                    (result, admitted, policies)
+                    (result, admitted, policies, keys)
                 })
             })
             .await;
             let (mark, (seat, mut messages), updated, closures) = match result {
-                Ok((Ok(snapshot), admitted, policies)) => {
+                Ok((Ok(snapshot), admitted, policies, keys)) => {
                     if repaired {
                         previous_mailbox.clear();
                         replay_nonce = Fence::new(&fence.subject, &fence.incarnation, "replay").token;
@@ -702,9 +737,10 @@ async fn stream_with_timers_inner<F, S, H>(
                     }
                     recovered = admitted;
                     policy_rechecks = policies;
+                    order = keys;
                     snapshot
                 }
-                Ok((Err(error), _, _)) => {
+                Ok((Err(error), _, _, _)) => {
                     if error
                         .downcast_ref::<St3Error>()
                         .is_some_and(|error| error.code == "stale-mailbox-session")
@@ -2821,6 +2857,7 @@ mod tests {
         );
         let mut admitted = Default::default();
         let mut policies = Default::default();
+        let mut order = MailboxOrder::new();
         let (mark, view, _, _) = update_snapshot(
             &store,
             &fence,
@@ -2829,6 +2866,7 @@ mod tests {
             floor,
             &mut admitted,
             &mut policies,
+            &mut order,
         )
         .unwrap();
         assert_eq!(
@@ -2867,6 +2905,7 @@ mod tests {
             floor,
             &mut admitted,
             &mut policies,
+            &mut order,
         )
         .unwrap();
         assert_eq!(
@@ -2888,6 +2927,7 @@ mod tests {
             floor,
             &mut admitted,
             &mut policies,
+            &mut order,
         )
         .unwrap();
         assert!(!updated);
@@ -2911,6 +2951,7 @@ mod tests {
         let through = store.index().unwrap();
         let mut admitted = std::collections::BTreeSet::new();
         let mut policies = std::collections::BTreeSet::new();
+        let mut order = MailboxOrder::new();
         let (mark, view, _, _) = update_snapshot(
             &store,
             &fence,
@@ -2919,6 +2960,7 @@ mod tests {
             (since, through),
             &mut admitted,
             &mut policies,
+            &mut order,
         )
         .unwrap();
         let mut previous = Some((mark, view));
@@ -2977,6 +3019,7 @@ mod tests {
                 (since, through),
                 &mut admitted,
                 &mut policies,
+                &mut order,
             )
             .unwrap();
             let mut oracle = snapshot(&store, &fence).unwrap();
@@ -2998,6 +3041,7 @@ mod tests {
                 (since, through),
                 &mut admitted,
                 &mut policies,
+                &mut order,
             )
             .unwrap();
             assert!(!updated);
@@ -3013,6 +3057,7 @@ mod tests {
             (since, through),
             &mut admitted,
             &mut policies,
+            &mut order,
         )
         .unwrap();
         assert!(!updated);
@@ -3041,6 +3086,7 @@ mod tests {
             (since, through),
             &mut admitted,
             &mut policies,
+            &mut order,
         )
         .unwrap();
         assert!(updated);
@@ -3097,6 +3143,7 @@ mod tests {
         };
         let mut admitted = Default::default();
         let mut policies = Default::default();
+        let mut order = MailboxOrder::new();
         let (mark, view, _, _) = update_snapshot(
             &store,
             &fence,
@@ -3105,6 +3152,7 @@ mod tests {
             (since, through),
             &mut admitted,
             &mut policies,
+            &mut order,
         )
         .unwrap();
         assert!(view.1.is_empty());
@@ -3120,6 +3168,7 @@ mod tests {
             (since, through),
             &mut admitted,
             &mut policies,
+            &mut order,
         )
         .unwrap();
         assert!(updated);
@@ -3132,6 +3181,7 @@ mod tests {
             (since, through),
             &mut admitted,
             &mut policies,
+            &mut order,
         )
         .unwrap();
         assert!(!updated);
@@ -3189,6 +3239,7 @@ mod tests {
         let floor = (client_now_ms(), store.index().unwrap());
         let mut admitted = Default::default();
         let mut policies = Default::default();
+        let mut order = MailboxOrder::new();
         let before = store.index().unwrap();
         let (_, view, _, closures) = update_snapshot(
             store,
@@ -3198,6 +3249,7 @@ mod tests {
             floor,
             &mut admitted,
             &mut policies,
+            &mut order,
         )
         .unwrap();
         assert!(view.1.is_empty());
@@ -3405,3 +3457,6 @@ mod tests {
 #[cfg(test)]
 #[path = "mailbox_profile.rs"]
 mod profile;
+
+#[cfg(test)]
+mod update_cost_tests;
