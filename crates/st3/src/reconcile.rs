@@ -7018,8 +7018,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 .map(|report| self.report_run(&run, &report, now_ms()))
                                 .transpose()
                         }) {
-                            Ok(stalls_at) => {
-                                due = [due, stalls_at.flatten()].into_iter().flatten().min();
+                            Ok(None) => {
+                                // A run whose reporter was cleared has nobody left to fail.
+                                if let Err(error) = self.close_fault(
+                                    &run.subject,
+                                    run_report::REPORT_FAULT_SCOPE,
+                                    "the run reports to nobody",
+                                ) {
+                                    eprintln!("st3: run report for {}: {error:#}", run.subject);
+                                }
+                            }
+                            Ok(Some(stalls_at)) => {
+                                due = [due, stalls_at].into_iter().flatten().min();
                             }
                             Err(error) => {
                                 if let Err(error) = self.record_fault(

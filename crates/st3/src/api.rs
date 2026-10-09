@@ -42,9 +42,10 @@ use crate::model::{
     LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendReceipt,
     MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
     MissionResponse, MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest,
-    MissionRunRequest, MissionRunView, OperationalRepairApplyRequest, OperationalRepairPlan,
-    OperationalRepairResult, PlannerSpec, PlanningApprovalRequest, PlanningCancelRequest,
-    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
+    MissionRunReportRequest, MissionRunReportView, MissionRunRequest, MissionRunView,
+    OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult, PlannerSpec,
+    PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
+    PlanningProposalRequest, PlanningRevisionRequest,
     PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest, QuickAgentResponse,
     ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse, ReplicationHealAnswer,
     ReplicationHealAnswerRequest, ReplicationHealNextRequest, ReplicationHealStep,
@@ -836,6 +837,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route(
             "/v1/mission-runs/{run}/outcome",
             post(set_mission_run_outcome),
+        )
+        .route(
+            "/v1/mission-runs/{run}/report-to",
+            post(set_mission_run_report),
         )
         .route("/v1/mission-runs/{run}", get(get_mission_run))
         .route("/v1/run-generations/{generation}", get(get_run_generation))
@@ -13712,6 +13717,29 @@ async fn set_mission_run_outcome(
     .await?;
     signal_changed(&state);
     Ok(Json(outcome))
+}
+
+/// A person or the run's requester changes who a running run reports to.
+async fn set_mission_run_report(
+    State(state): State<AppState>,
+    AxumPath(run): AxumPath<String>,
+    Json(request): Json<MissionRunReportRequest>,
+) -> Result<Json<MissionRunReportView>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "run-report-authority-denied")?;
+    let store = state.store.clone();
+    let report = blocking_action(move || {
+        store.set_mission_run_report(
+            &run,
+            &actor,
+            request.report_to.as_deref(),
+            request.stalled_after_ms,
+            request.report_completed,
+            &request.idempotency_key,
+        )
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(report))
 }
 
 /// A person or an agent retires a mission.
