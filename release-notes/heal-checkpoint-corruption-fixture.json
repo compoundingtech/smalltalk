@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Correct the isolated checkpoint-corruption fixture while preserving source identity guards",
+  "replay": {
+    "status": "none",
+    "detail": "Test-only fixture correction; runtime replay and operation repair code are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Test-only raw request_digest corruption replaces illegal source-ID mutation. No DDL or migration is added by this correction; the feature index impact remains in heal-checkpoint-digest-extrema.json."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Canonical/refusal/whole-repair rollback assertions and production immutable-source triggers are preserved."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Client and peer interfaces remain unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No runtime correction or additional restart impact from this test-only change; the feature first-open index risk retains its existing unknown classification."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No production Store mutation or corrupted-store construction is requested. The raw malformed digest exists only in the isolated native fixture."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Runtime bytes remain identical to the prior feature head; rollback/recovery behavior is unchanged."
+  }
+}

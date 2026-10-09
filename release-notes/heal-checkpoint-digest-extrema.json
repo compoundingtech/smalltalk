@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Stream the affected checkpoint operation index and retain only digest extrema",
+  "replay": {
+    "status": "none",
+    "detail": "No replay. expected_operation keeps stored claim decoding and reads checkpoint digest extrema for its selected operation instead of copying/sorting its entire dropped-candidate vector."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Adds checkpoint_claims_operation_digest, a partial covering index on operation_id, request_digest and id, at ordinary Store open. Schema version remains17; existing checkpoint data is unchanged. First upgraded open builds the index over existing checkpoint metadata; time and writer cost are unmeasured."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Unchanged canonical stored ID/fallback, conflict decision, repaired and duplicate membership, snapshot and corruption refusal. No checkpoint/rules digest change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire or API signature change. Existing old/new dependency collection, repair savepoints, outer transaction, failure rollback, runtime authority and commit-before-ACK remain in place."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal restart plus first-open additive index construction; construction duration/writer cost is unmeasured. Selected checkpoint history is still decoded for legacy corruption refusal; complete heal repair-list and stored affected-operation history remain unbounded. No production latency acceptance."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No live heal, replay, reset, policy action or manual database operation is requested. Unrelated damaged operation rows are not silently rebuilt by a record repair."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Older builds ignore the extra additive index and continue their original checkpoint enumeration. No immutable record/data rewrite or format migration."
+  }
+}

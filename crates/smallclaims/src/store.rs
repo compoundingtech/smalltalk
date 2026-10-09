@@ -693,6 +693,10 @@ CREATE INDEX IF NOT EXISTS checkpoint_claims_envelope
 ON checkpoint_claims(writer, sequence, envelope_hash);
 CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
 ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
+-- A keyed operation repair needs dropped digest extrema, not a copied checkpoint history.
+CREATE INDEX IF NOT EXISTS checkpoint_claims_operation_digest
+ON checkpoint_claims(operation_id, request_digest, id)
+WHERE operation_id IS NOT NULL AND request_digest IS NOT NULL;
 "#;
 
 /// The store's schema version, set once the graph's and the runtime's tables exist.
@@ -7956,11 +7960,41 @@ pub fn expected_operation(
     if stored.is_empty() {
         return Ok(None);
     }
-    let dropped = checkpoint::checkpointed_operation(connection, operation_id)?
-        .into_iter()
-        .filter(|(_, claim_id)| !stored.iter().any(|(_, stored)| stored == claim_id))
-        .collect();
+    let dropped = checkpoint_operation_extrema(connection, operation_id, &stored)?;
     Ok(Some(operation_row(&stored, dropped)))
+}
+
+// Only the least and greatest dropped digest can affect operation_row: stored claims still
+// supply its canonical ID. Stream the affected covering index, retaining the old typed row
+// decoder even for duplicates/interior candidates; malformed history must still refuse repair.
+const CHECKPOINT_OPERATION_EXTREMA_QUERY: &str =
+    "SELECT request_digest, id FROM checkpoint_claims INDEXED BY checkpoint_claims_operation_digest
+     WHERE operation_id=?1 AND operation_id IS NOT NULL AND request_digest IS NOT NULL
+       AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=checkpoint_claims.id)
+     ORDER BY request_digest, id";
+
+fn checkpoint_operation_extrema(
+    connection: &Connection,
+    operation_id: &str,
+    stored: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    let stored_ids: BTreeSet<&str> = stored.iter().map(|(_, id)| id.as_str()).collect();
+    let mut statement = connection.prepare_cached(CHECKPOINT_OPERATION_EXTREMA_QUERY)?;
+    let mut first = None;
+    let mut last = None;
+    for row in statement.query_map([operation_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })? {
+        let row = row?;
+        if stored_ids.contains(row.1.as_str()) {
+            continue;
+        }
+        if first.is_none() {
+            first = Some(row.clone());
+        }
+        last = Some(row);
+    }
+    Ok(first.into_iter().chain(last).collect())
 }
 
 /// Bring the rows of `operation_ids` to what their claims say, and leave every other row alone.
