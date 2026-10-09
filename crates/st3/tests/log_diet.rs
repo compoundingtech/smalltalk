@@ -140,6 +140,7 @@ mission "diet/loop-{index}" state="ready" {{
 }
 
 struct Daemon {
+    state: AppState,
     store: Arc<Store>,
     client: Client,
     server: tokio::task::JoinHandle<()>,
@@ -168,6 +169,7 @@ impl Daemon {
         };
         let socket = root.join("st3.sock");
         let server_socket = socket.clone();
+        let workload_state = state.clone();
         let server = tokio::spawn(async move {
             let _ = st3::api::serve_unix(&server_socket, st3::api::router(state)).await;
         });
@@ -187,6 +189,7 @@ impl Daemon {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         Self {
+            state: workload_state,
             store,
             client: Client::new(Endpoint::Unix(socket)),
             server,
@@ -270,10 +273,24 @@ impl Daemon {
 
     async fn post(&self, input: ClaimInput) -> ClaimRecord {
         if st3::store::is_current_input(&input) {
-            self.store.append_claim(&input).unwrap()
+            let value = self.native_request(&input.subject, "/v1/claims", serde_json::to_value(&input).unwrap()).await;
+            serde_json::from_value(value).unwrap()
         } else {
             self.client.post("/v1/claims", &input).await.unwrap()
         }
+    }
+
+    async fn native_request(&self, subject: &str, path: &str, input: Value) -> Value {
+        use tower::ServiceExt as _;
+        let response = st3::api::native_observation_protocol_router(self.state.clone(), subject)
+            .oneshot(axum::http::Request::builder().method("POST").uri(path)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(input.to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(status.is_success(), "{path}: {body}");
+        body["value"].clone()
     }
 }
 
@@ -490,9 +507,13 @@ async fn run_workload(seconds: u64) -> Report {
     std::fs::write(workspace.join("config.toml"), "version = 0\n").unwrap();
     let daemon = Daemon::start(root.path()).await;
     let runs = daemon.publish(&workload_source(&workspace), &workspace);
-    let setup_index = daemon.store.index().unwrap();
-
     let mut harnesses = (0..HARNESSES).map(Harness::new).collect::<Vec<_>>();
+    for harness in &harnesses {
+        daemon.post(harness.input("runtime.observed",
+            serde_json::from_value(json!({"status":"running","incarnation_id":"inc-1"})).unwrap(),
+            format!("diet-runtime:{}", harness.subject))).await;
+    }
+    let setup_index = daemon.store.index().unwrap();
     let mut state_changes = BTreeMap::<String, Vec<ClaimRecord>>::new();
     let mut posted = BTreeMap::<String, u64>::new();
     let mut messages = Vec::new();
@@ -528,12 +549,11 @@ async fn run_workload(seconds: u64) -> Report {
     }
 
     let store = daemon.store.clone();
-    // Simulated providers stop here; the real daemon performs this durable flush separately
-    // from its best-effort current-status publication.
+    // Simulated providers deliver their reliable accounting stop through the native API,
+    // independently of their current idle samples.
     for harness in &harnesses {
-        store
-            .flush_pending_usage(&harness.subject, "inc-1")
-            .unwrap();
+        daemon.native_request(&harness.subject, "/v1/harness-events/usage-flush",
+            json!({"subject":harness.subject,"runtime_incarnation":"inc-1"})).await;
     }
     daemon.stop().await;
     let all = claims(&store);

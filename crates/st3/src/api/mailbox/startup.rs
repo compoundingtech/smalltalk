@@ -33,7 +33,7 @@ pub(super) fn live_native_incarnation(
     }
     // The authenticated seat's selected declaration names the launch. No caller text
     // is interpreted as a path, and no whole registry is enumerated on a bind retry.
-    let Ok(desired) = store.desired_subjects_named(&[peer.agent.clone()]) else {
+    let Ok(desired) = store.desired_subjects_named(std::slice::from_ref(&peer.agent)) else {
         return false;
     };
     let Some(member) = desired

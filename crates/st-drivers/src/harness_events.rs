@@ -337,6 +337,44 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
         signal_wake(agent_dir);
         Ok(())
     })();
+    if kind == "harness-state"
+        && (!matches!(value["state"].as_str(), Some("active" | "working" | "child"))
+            || value["reason"] == "providerCapacity")
+        && !(value["state"] == "ended" && value["exit"].is_null() && value["reason"] == "superseded")
+    {
+        // Stop accounting and diagnostics are durable obligations. They do not publish
+        // categorical state, and their commit/retry is independent of the current attempt.
+        let obligation: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='accounting-fingerprint')
+                OR EXISTS(SELECT 1 FROM timeline)", [], |row| row.get(0),
+        )?;
+        if !obligation && value["reason"] != "providerCapacity" {
+            return current_result;
+        }
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let accounting: Option<String> = tx.query_row(
+            "SELECT value FROM metadata WHERE key='accounting-fingerprint'", [], |row| row.get(0),
+        ).optional()?;
+        let timeline: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM timeline)", [], |row| row.get(0))?;
+        let obligation = accounting.is_some() || timeline || value["reason"] == "providerCapacity";
+        let fingerprint = serde_json::to_string(&serde_json::json!([
+            value["incarnation"], value["state"], value["reason"], value["sinceMs"],
+            value["exit"], value["harness"], accounting,
+        ]))?;
+        let previous: Option<String> = tx.query_row(
+            "SELECT value FROM metadata WHERE key='state-control-fingerprint'", [], |row| row.get(0),
+        ).optional()?;
+        if obligation && previous.as_deref() != Some(fingerprint.as_str()) {
+            append_event(&tx, "harness-state-control", &value)?;
+            tx.execute(
+                "INSERT INTO metadata(key,value) VALUES ('state-control-fingerprint',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value", [&fingerprint],
+            )?;
+            tx.commit()?;
+            signal_wake(agent_dir);
+        }
+    }
     if kind == "harness-context"
         && (value["sessionTotalTokens"].is_number()
             || value["rateLimits"]["fiveHour"].is_number()
@@ -674,6 +712,33 @@ pub(crate) fn read_timeline(agent_dir: &Path) -> Result<Option<Record>> {
 mod tests {
     use super::*;
     use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer, claim};
+    #[test]
+    fn accounting_stop_retries_a_full_spool_without_replaying_current_status() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let seq = claim(root.path(), "example/seat", "claude", "provider-a").unwrap();
+        let mut writer = Writer::new(root.path(), "example/seat", "claude", None).with_ownership("provider-a", seq);
+        writer.observe(Observation::new(Activity::Active, BlockedOn::None, InputBuffer::Unknown)).unwrap();
+        let mut context = crate::harness_context::Writer::new_paths(root.path(), "example/seat", crate::harness_context::Harness::Claude)
+            .unwrap().with_session("provider-a");
+        context.observe(crate::harness_context::Reading { session_total_tokens: Some(123), ..Default::default() }).unwrap();
+        let accounting = pending(root.path(), 10).unwrap().remove(0);
+        acknowledge(root.path(), accounting.sequence).unwrap();
+        open(root.path()).unwrap().execute("UPDATE metadata SET value=?1 WHERE key='pending-bytes'", [MAX_PENDING_BYTES]).unwrap();
+        let idle = || Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown);
+        assert!(writer.observe(idle()).is_err());
+        let snapshot: Value = serde_json::from_slice(&read_runtime_state(root.path(), "runtime-a").unwrap().unwrap()).unwrap();
+        assert_eq!(snapshot["state"], "idle", "the current sample commits independently of accounting backpressure");
+        open(root.path()).unwrap().execute("UPDATE metadata SET value=0 WHERE key='pending-bytes'", []).unwrap();
+        writer.observe(idle()).unwrap();
+        writer.heartbeat().unwrap();
+        let events = pending(root.path(), 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "harness-state-control");
+        enable(root.path(), "runtime-a").unwrap();
+        assert_eq!(pending(root.path(), 10).unwrap()[0].sequence, events[0].sequence);
+    }
+
     #[test]
     fn current_snapshots_replace_without_publication_jobs() {
         let root = tempfile::tempdir().unwrap();

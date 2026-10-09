@@ -9,3 +9,10 @@ pub struct Publication {
     pub sequence: u64,
     pub claim: ClaimInput,
 }
+
+/// A durable accounting stop, independent of whether its current status sample was accepted.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UsageFlush {
+    pub subject: String,
+    pub runtime_incarnation: String,
+}

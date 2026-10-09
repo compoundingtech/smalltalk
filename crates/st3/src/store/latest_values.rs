@@ -10,6 +10,8 @@ CREATE TABLE IF NOT EXISTS latest_values (
     PRIMARY KEY(subject, kind, slot)
 );
 CREATE INDEX IF NOT EXISTS latest_values_local_index ON latest_values(local_id);
+CREATE INDEX IF NOT EXISTS latest_values_agent_local_index ON latest_values(local_id)
+WHERE subject LIKE 'agent/%';
 CREATE UNIQUE INDEX IF NOT EXISTS latest_values_source_index ON latest_values(source_id);
 -- A register replacement retracts a cleared login candidate from this index immediately.
 -- Match the legacy positive-evidence predicate used by attention discovery.
@@ -220,8 +222,10 @@ pub(super) fn current_sql(sql: &str) -> String {
 pub(super) fn harness_sql(connection: &Connection, subject: &str, sql: &str) -> Result<String> {
     let current: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM latest_values v WHERE subject=?1 AND kind='harness.observed'
-         AND NOT EXISTS(SELECT 1 FROM main.claims c WHERE c.subject=v.subject AND c.kind=v.kind
-             AND CAST(c.accepted_at_unix_ms AS INTEGER)>v.source_at))",
+         AND COALESCE((SELECT CAST(c.accepted_at_unix_ms AS INTEGER)
+             FROM main.claims c INDEXED BY claims_subject_kind_accepted_index
+             WHERE c.subject=v.subject AND c.kind='harness.observed'
+             ORDER BY length(c.accepted_at_unix_ms) DESC,c.accepted_at_unix_ms DESC LIMIT 1),0)<=v.source_at)",
         [subject],
         |row| row.get(0),
     )?;
@@ -672,6 +676,12 @@ impl Store {
     /// A signed fleet sender supplies its own current observation. Imported registers never
     /// enter replication inventories, and an older delivery cannot overwrite a newer value.
     pub fn receive_current_value(&self, record: &ClaimRecord) -> Result<bool, St3Error> {
+        if record.accepted_at_unix_ms > now_ms().saturating_add(60_000) {
+            return Err(St3Error::new(
+                "invalid-current-value",
+                "current value sender clock is too far in the future",
+            ));
+        }
         if !is_current_value(&record.kind)
             || (record.kind == "harness.usage"
                 && record.body["fields"]["semantics"] != "context_occupancy")
@@ -722,11 +732,15 @@ impl Store {
                 .map_err(internal)?;
             if let Some((owner, body)) = runtime {
                 let body: Value = serde_json::from_str(&body).map_err(internal)?;
-                incarnation_bound = body["fields"]["status"] == "running";
-                if incarnation_bound
+                let running = body["fields"]["status"] == "running";
+                // Workspace availability belongs to the host reconciler, not a native
+                // harness incarnation. It must still come from the running seat's host.
+                incarnation_bound = running && record.kind != "workspace.observed";
+                if running
                     && (owner != record.origin
-                        || body["fields"]["incarnation_id"]
-                            != record.body["fields"]["incarnation_id"])
+                        || (incarnation_bound
+                            && body["fields"]["incarnation_id"]
+                                != record.body["fields"]["incarnation_id"]))
                 {
                     return Err(St3Error::new(
                         "stale-harness-event-session",
@@ -894,6 +908,95 @@ mod tests {
             assert!(!permission_blocked(&resumed.body["fields"]));
             assert!(resumed.body["fields"]["ask"].is_null());
         }
+    }
+
+    #[test]
+    fn a_late_reduction_cannot_revalidate_an_evicted_current_status() {
+        let store = Store::open_memory("owner").unwrap();
+        let mut runtime = state("idle", "one", 1);
+        runtime.kind = "runtime.observed".into();
+        runtime.fields =
+            serde_json::from_value(json!({"status":"running","incarnation_id":"one"})).unwrap();
+        store.append_claim(&runtime).unwrap();
+        store.append_claim(&state("idle", "one", 10)).unwrap();
+        let index = store.index().unwrap();
+        let old_revision = subject_current_revision(&store.readers.get(), "agent/cedar").unwrap();
+        let old = store
+            .status(Some("agent/cedar"))
+            .unwrap()
+            .subjects
+            .remove(0);
+        store.append_claim(&state("working", "one", 20)).unwrap();
+        store.refresh_current_caches().unwrap();
+        // A reader pinned before the write finishes after the newer reader evicts its entry.
+        store.keep_subject_status(
+            "agent/cedar",
+            index,
+            SubjectStatusMode::Full,
+            old_revision,
+            &old,
+            &None,
+        );
+        let revision = subject_current_revision(&store.readers.get(), "agent/cedar").unwrap();
+        assert!(
+            store
+                .kept_subject_status("agent/cedar", index, SubjectStatusMode::Full, revision)
+                .is_none()
+        );
+        let current = store.status(Some("agent/cedar")).unwrap();
+        assert_eq!(
+            current.subjects[0].harness.as_ref().unwrap().state,
+            "working"
+        );
+    }
+
+    #[test]
+    fn current_register_batches_respect_the_roster_fold_bound() {
+        let store = Store::open_memory("owner").unwrap();
+        for name in ["cedar", "birch", "elm"] {
+            let mut input = state("idle", "one", 1);
+            input.subject = format!("agent/{name}");
+            store.append_legacy_claim(&input).unwrap();
+        }
+        let index = store.index().unwrap();
+        let items = ["cedar", "birch", "elm"]
+            .map(|name| json!({"id":format!("agent/{name}"),"name":name,"state":"idle"}));
+        store
+            .cached_agent_resources(index, true, |_| Ok(items.to_vec()))
+            .unwrap();
+        for name in ["cedar", "birch", "elm"] {
+            let mut input = state("working", "one", 10);
+            input.subject = format!("agent/{name}");
+            store.append_claim(&input).unwrap();
+        }
+        assert_eq!(store.index().unwrap(), index);
+        assert_eq!(
+            store
+                .agent_roster_unbounded_because(index, true, 2)
+                .unwrap(),
+            Some("cards changed".to_owned())
+        );
+        assert_eq!(
+            store
+                .agent_roster_unbounded_because(index, true, 3)
+                .unwrap(),
+            None
+        );
+        let selected = BTreeSet::from(["agent/cedar".to_owned(), "agent/birch".to_owned()]);
+        store
+            .cached_agent_resources_chunk(index, true, &selected, |changed| {
+                let (names, _) = changed.unwrap();
+                assert_eq!(names, &selected);
+                Ok(items[..2].to_vec())
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .agent_roster_unbounded_because(index, true, 1)
+                .unwrap(),
+            None,
+            "only the unrefreshed card remains after the bounded chunk"
+        );
     }
 
     #[test]
@@ -1235,6 +1338,45 @@ mod tests {
                 .body["fields"]["state"],
             "idle"
         );
+    }
+
+    #[test]
+    fn workspace_registers_bind_to_the_running_host_without_a_native_incarnation() {
+        let source = Store::open_memory("owner").unwrap();
+        let peer = Store::open_memory("owner").unwrap();
+        let mut runtime = state("idle", "one", 1);
+        runtime.kind = "runtime.observed".into();
+        runtime.fields =
+            serde_json::from_value(json!({"status":"running","incarnation_id":"one"})).unwrap();
+        peer.append_claim(&runtime).unwrap();
+        let mut workspace = runtime;
+        workspace.kind = "workspace.observed".into();
+        workspace.fields =
+            serde_json::from_value(json!({"host":"owner","workspace":"/work/cedar"})).unwrap();
+        let record = source.append_claim(&workspace).unwrap();
+        assert!(peer.receive_current_value(&record).unwrap());
+        let foreign = Store::open_memory("foreign")
+            .unwrap()
+            .append_claim(&workspace)
+            .unwrap();
+        assert_eq!(
+            peer.receive_current_value(&foreign).unwrap_err().code,
+            "stale-harness-event-session"
+        );
+    }
+
+    #[test]
+    fn a_future_sender_clock_cannot_pin_a_current_register() {
+        let source = Store::open_memory("owner").unwrap();
+        let peer = Store::open_memory("peer").unwrap();
+        let record = source.append_claim(&state("working", "one", 10)).unwrap();
+        let mut future = record.clone();
+        future.accepted_at_unix_ms = now_ms() + 3_600_000;
+        assert_eq!(
+            peer.receive_current_value(&future).unwrap_err().code,
+            "invalid-current-value"
+        );
+        assert!(peer.receive_current_value(&record).unwrap());
     }
 
     #[test]

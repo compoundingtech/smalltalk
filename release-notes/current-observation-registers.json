@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Publish categorical agent observations as replaceable current registers while retaining durable numeric accounting and diagnostics.",
+  "replay": {"status": "none", "detail": "Durable graph replay is unchanged. Current registers are outside graph replay and are refreshed by their live owners."},
+  "schema": {"status": "changed", "detail": "Adds latest_values, latest_readiness and local indexes plus current-value epoch and feed-boundary metadata. No numeric staging migration or graph backfill is introduced. Older binaries can open the additive schema."},
+  "rules": {"status": "none", "detail": "No claim kind, checkpoint rule or durable numeric accounting retention rule changes."},
+  "compatibility": {"status": "changed", "detail": "Categorical status, context occupancy, todo, workspace and connectivity use one-shot current publication. Register-backed status-history returns empty items with complete=false and retained_from=now. Current values use request-time state even at a pinned graph cut; a missed heartbeat can produce staleness after 90 seconds. Old peers without current-value transport appear frozen then stale until upgraded. Numeric usage, limits, accounting stops, diagnostics and timeline keep durable publication and retries."},
+  "downtime": {"status": "none", "detail": "No daemon downtime or seat interruption is required for ordinary upgrades. Fleet operations preserves existing seats and installs the CI release artifact."},
+  "manual": {"status": "changed", "detail": "Upgrade all peers to receive current values. After restoring an older database, restart its native producers with fresh runtime incarnations before resuming current publication."},
+  "recovery": {"status": "changed", "detail": "Dropped current samples are never replayed; a new owner sample refreshes the register. Ordinary reopen preserves the database epoch. Feed cursor gaps require snapshot resynchronization. Durable accounting and control obligations remain in their outboxes across daemon outages and driver re-exec."}
+}

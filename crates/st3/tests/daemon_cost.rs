@@ -369,6 +369,7 @@ const NOT_MEASURED: &[(&str, &str)] = &[
 struct Probe {
     /// The route as `api.rs` declares it, with its method.
     route: &'static str,
+    label: &'static str,
     path: &'static str,
     body: Option<fn(&Fixture, usize) -> Value>,
     /// The store call the route makes, for a route that only a live seat process may call.
@@ -380,6 +381,7 @@ type Direct = fn(&Store, &Fixture, usize) -> Result<Value, String>;
 const fn get(route: &'static str, path: &'static str) -> Probe {
     Probe {
         route,
+        label: route,
         path,
         body: None,
         direct: None,
@@ -393,6 +395,7 @@ const fn post(
 ) -> Probe {
     Probe {
         route,
+        label: route,
         path,
         body: Some(body),
         direct: None,
@@ -402,10 +405,18 @@ const fn post(
 const fn direct(route: &'static str, call: Direct) -> Probe {
     Probe {
         route,
+        label: route,
         path: "",
         body: None,
         direct: Some(call),
     }
+}
+
+const fn post_named(label: &'static str, route: &'static str, path: &'static str,
+    body: fn(&Fixture, usize) -> Value) -> Probe {
+    let mut probe = post(route, path, body);
+    probe.label = label;
+    probe
 }
 
 const PROBES: &[Probe] = &[
@@ -800,7 +811,7 @@ const PROBES: &[Probe] = &[
         "/v1/hosts/bench-host/agent-workspace?identity=bench/seat-0",
     ),
     // Writes, each with a new idempotency key.
-    post("POST /v1/claims", "/v1/claims", |fixture, attempt| {
+    post_named("POST /v1/claims (durable)", "POST /v1/claims", "/v1/claims", |fixture, attempt| {
         serde_json::to_value(claim_input(
             "message.sent",
             &format!("cost-claim-{attempt}"),
@@ -813,6 +824,16 @@ const PROBES: &[Probe] = &[
             input
         })
         .unwrap()
+    }),
+    post("POST /v1/claims", "/v1/claims", |fixture, attempt| {
+        let seat = &fixture.subjects.seats[0];
+        json!({"subject":seat,"actor":seat,"kind":"harness.observed",
+            "fields":{"state":if attempt % 2 == 0 { "idle" } else { "working" },
+                "driver":"codex","incarnation_id":SEAT_RUNTIME},
+            "evidence":[],"idempotency_key":format!("cost-current-write-{attempt}")})
+    }),
+    post("POST /v1/harness-events/usage-flush", "/v1/harness-events/usage-flush", |fixture, _| {
+        json!({"subject":fixture.subjects.seats[0],"runtime_incarnation":SEAT_RUNTIME})
     }),
     direct(
         "POST /v1/internal/current-value",
@@ -1719,10 +1740,11 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
         native_session_home: Some(root.join("home")),
         planner_default: st3::model::PlannerSpec::default(),
     };
+    let native_subject = fleet_subjects(&store, 3).seats[0].clone();
     let server_socket = socket.clone();
     let server =
         tokio::spawn(
-            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+            async move { st3::api::serve_unix(&server_socket, st3::api::native_observation_protocol_router(state, &native_subject)).await },
         );
     while UnixStream::connect(&socket).is_err() {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1936,7 +1958,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
             }),
             ..cost
         };
-        costs.insert(probe.route.to_owned(), cost);
+        costs.insert(probe.label.to_owned(), cost);
     }
     // A real seat update invalidates its card between every read. Count only the read, using
     // the same canonical claim path as a driver; the warm probe above remains unchanged.

@@ -66,7 +66,6 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_limit_stops` | Local | Seats this node's limits policy stopped, once per account and weekly window. |
 | `local_latest_slots` | Local | Local latest-retention publication slots and pending local observation pointers. |
 | `latest_values`, `latest_readiness` | Local current values | Replace-in-place observations and per-incarnation readiness. Current owner epochs and source revisions fence these values independently of immutable graph digests. They provide no retained observation series. |
-| `numeric_values`, `numeric_account_windows`, `numeric_limit_seats` | Local derived indexes before numeric cutover | Rebuildable latest numeric readings, independently measured account windows and seat/account bindings over admitted compatibility claims. Those claims remain covered by shared graph digests. These indexes are not numeric replication authority or evidence that every required reader supports a future cutover. |
 | `revision_proposals` | Shared projection | Shared candidate/source generation, reviewers/approvals, cutover/compatibility, status/preview/successor and durable timestamps. |
 | `planning_sessions` | Shared projection | Shared launch/planner/request/config, status, selected revision, ownership and durable timestamps. |
 | `planning_candidates` | Shared projection | Shared immutable variant/revision/document references, mission revision and submission timestamp. |

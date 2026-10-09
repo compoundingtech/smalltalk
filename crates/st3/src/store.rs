@@ -28,9 +28,6 @@ mod roster_controls;
 pub(crate) mod step_labels;
 mod canonical;
 mod latest_values;
-pub mod numeric_readiness;
-mod numeric_values;
-pub use numeric_values::{NumericAccountLimit, NumericLimitSource};
 use latest_values::{current_sql, harness_sql};
 pub use latest_values::{CurrentObservationBoundary, is_current_input, is_current_value};
 
@@ -959,6 +956,7 @@ const AGENT_ROSTER_OVERDUE_MS: u64 = 30_000;
 /// One subject's reduction, read at snapshot `read_at`, so it holds from there on.
 struct StatusEntry {
     read_at: u64,
+    current_revision: u64,
     owners: Vec<String>,
     status: SubjectStatus,
     action: Option<PlannedAction>,
@@ -973,6 +971,11 @@ struct ViewEntry {
     /// Whether the answer used a declaration, and so the snapshot's owner state.
     declared: bool,
     owners: Vec<String>,
+}
+
+fn subject_current_revision(connection: &Connection, subject: &str) -> Result<u64> {
+    Ok(connection.query_row("SELECT COALESCE(MAX(local_id),0) FROM latest_values WHERE subject=?1",
+        [subject], |row| row.get(0))?)
 }
 
 fn subject_head_at(connection: &Connection, subject: &str, store_index: u64) -> Result<u64> {
@@ -2751,12 +2754,9 @@ pub fn runtime() -> Arc<dyn smallclaims::Runtime> {
 }
 
 /// The local rows a roster card can read: timeline entries an agent subject made, which date its
-/// activity and its managed session. Heartbeat and telemetry observations never change a card —
-/// the harness fold, working episodes, usage summaries and todos all read replicated claims —
-/// and neither do `Latest` observations, which reach cards only through the claims written when
-/// their state changes. So the frontier is the newest agent timeline row at or before the cut,
-/// an exact `MAX(id)`: it never assumes observation ids and graph cuts rise together, which
-/// repair and trim can break.
+/// activity and its managed session, together with current agent registers. Legacy heartbeat
+/// and telemetry rows do not change a card. Timeline rows respect the graph cut; registers
+/// deliberately reflect request-time state. Both use the local observation id clock.
 const ROSTER_LOCAL_FRONTIER: &str = "SELECT MAX(
  COALESCE((SELECT id FROM local_observations WHERE kind='harness.timeline'
  AND subject LIKE 'agent/%' AND after_store_index<=?1 ORDER BY id DESC LIMIT 1),0),
@@ -3219,14 +3219,18 @@ impl Store {
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         // Without rows to start from, every agent is missing: a small roster, or an empty
         // one, still completes in one bounded fold.
-        let (changed, membership) = match &previous {
-            None => (0, true),
-            Some(previous) if previous.index == index => (0, false),
+        let (mut changed, membership) = match &previous {
+            None => (BTreeSet::new(), true),
+            Some(previous) if previous.index == index => (BTreeSet::new(), false),
             Some(previous) => match self.agent_resources_delta(previous.index, index, &previous.items)? {
-                Ok(delta) => (delta.subjects.len(), delta.membership),
+                Ok(delta) => (delta.subjects, delta.membership),
                 Err(reason) => return Ok(Some(reason)),
             },
         };
+        if let Some(previous) = &previous {
+            changed.extend(self.changed_current_agents(previous.local)?);
+        }
+        let changed = changed.len();
         // Complete rows whose membership no claim moved miss no agent: skip listing them all.
         if previous.as_ref().is_some_and(|previous| previous.covered.is_none()) && !membership {
             return Ok((changed > bound).then(|| "cards changed".to_owned()));
@@ -3508,8 +3512,8 @@ impl Store {
         let valid = |entry: &&runtime::AgentResourcesEntry| {
             entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
         };
-        // Local agent timeline rows do not advance the graph index, but do change cards; the
-        // frontier ignores heartbeats and every other local kind, none of which a card reads.
+        // Local agent timeline rows and current registers do not advance the graph index,
+        // but do change cards. The frontier ignores legacy heartbeat and telemetry rows.
         // Read it inside the caller's SQLite snapshot, never from a future atomic generation
         // that could race this cut.
         let local = crate::performance::task("roster/frontier-read", || {
@@ -11371,20 +11375,21 @@ impl Store {
         &self, connection: &Connection, subject: &str, store_index: u64,
         newest: bool, mode: SubjectStatusMode,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
-        if let Some(kept) = self.kept_subject_status(subject, store_index, mode) {
+        let current_revision = subject_current_revision(connection, subject)?;
+        if let Some(kept) = self.kept_subject_status(subject, store_index, mode, current_revision) {
             return Ok(kept);
         }
         let (status, action) = subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
             .expect("a reduction without an owner filter always has a status");
         if newest {
-            self.keep_subject_status(subject, store_index, mode, &status, &action);
+            self.keep_subject_status(subject, store_index, mode, current_revision, &status, &action);
         }
         Ok((status, action))
     }
 
     /// `subject`'s kept status reduction, if one holds at `store_index`.
     fn kept_subject_status(
-        &self, subject: &str, store_index: u64, mode: SubjectStatusMode,
+        &self, subject: &str, store_index: u64, mode: SubjectStatusMode, current_revision: u64,
     ) -> Option<(SubjectStatus, Option<PlannedAction>)> {
         let cache = self
             .smalltalk
@@ -11396,14 +11401,15 @@ impl Store {
             SubjectStatusMode::AgentCard => &cache.card_statuses,
         };
         entries.get(subject)
-            .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
+            .filter(|entry| entry.read_at <= store_index && store_index <= cache.through
+                && entry.current_revision == current_revision)
             .map(|entry| (entry.status.clone(), entry.action.clone()))
     }
 
     /// Keep a reduction read at the newest applied snapshot, `store_index`.
     fn keep_subject_status(
         &self, subject: &str, store_index: u64, mode: SubjectStatusMode,
-        status: &SubjectStatus, action: &Option<PlannedAction>,
+        current_revision: u64, status: &SubjectStatus, action: &Option<PlannedAction>,
     ) {
         let mut cache = self
             .smalltalk
@@ -11434,6 +11440,7 @@ impl Store {
             subject.to_owned(),
             StatusEntry {
                 read_at: store_index,
+                current_revision,
                 owners,
                 status: status.clone(),
                 action: action.clone(),
@@ -11559,8 +11566,11 @@ impl Store {
         let mode = SubjectStatusMode::AgentCard;
         let mut kept = HashMap::new();
         let mut missing = Vec::new();
+        let mut revisions = BTreeMap::new();
         for name in &names {
-            match self.kept_subject_status(name, index, mode) {
+            let revision = subject_current_revision(&connection, name)?;
+            revisions.insert(name.clone(), revision);
+            match self.kept_subject_status(name, index, mode, revision) {
                 Some((status, _)) => {
                     kept.insert(name.clone(), status);
                 }
@@ -11569,7 +11579,7 @@ impl Store {
         }
         for (name, (status, action)) in self.agent_card_statuses(&connection, &missing, index, &mut reads)? {
             if newest {
-                self.keep_subject_status(&name, index, mode, &status, &action);
+                self.keep_subject_status(&name, index, mode, revisions[&name], &status, &action);
             }
             kept.insert(name, status);
         }
@@ -17046,6 +17056,15 @@ impl Store {
         current_harness_fold_at(&connection, subject, None, true, true)
     }
     /// Flush retained numeric accounting at a provider stop independently of current status.
+    pub(crate) fn flush_bound_pending_usage(&self, subject: &str, incarnation: &str) -> Result<bool, St3Error> {
+        self.connection.batched(|tx| {
+            check_harness_event_runtime(tx, subject, Some(incarnation))?;
+            publish_pending_usage_tx(tx, &self.origin, subject, incarnation, now_ms())
+                .map(|claims| !claims.is_empty())
+        }).map_err(|e| St3Error::new("internal", e))?
+    }
+
+    /// Flush retained numeric accounting in store fixtures without a native peer.
     pub fn flush_pending_usage(&self, subject: &str, incarnation: &str) -> Result<bool, St3Error> {
         let connection = self.readers.get();
         let pending: bool = connection.query_row(
@@ -21689,21 +21708,10 @@ fn event_tail_sql(migrating: bool) -> &'static str {
 fn insert_event(
     transaction: &Transaction<'_>,
     store_index: u64,
-    kind: &str,
+    _kind: &str,
     subject: &str,
-    body: &Value,
+    _body: &Value,
 ) -> Result<()> {
-    if kind == "harness.limits"
-        || (kind == "harness.usage"
-            && matches!(body.pointer("/fields/semantics").and_then(Value::as_str),
-                Some("session_cumulative" | "response_rollup")))
-    {
-        let claim = transaction.query_row(
-            &format!("SELECT {CLAIM_COLUMNS} FROM claims WHERE store_index=?1"),
-            [store_index], claim_from_row,
-        )?;
-        numeric_values::stage(transaction, &claim)?;
-    }
     if subject.starts_with("glass/") {
         return Ok(());
     }
@@ -28668,11 +28676,6 @@ fn replay_graph_from_nothing_with_progress_tx(
         })
     };
     stage("full-replay/clear");
-    // These are pre-cutover reader projections. Repair/replay must not leave an
-    // obsolete compatibility reading selected after its source claim is repaired.
-    transaction.execute("DELETE FROM numeric_values", []).map_err(internal)?;
-    transaction.execute("DELETE FROM numeric_account_windows", []).map_err(internal)?;
-    transaction.execute("DELETE FROM numeric_limit_seats", []).map_err(internal)?;
     for table in REPLAYED_GRAPH_TABLES {
         transaction
             .execute(&format!("DELETE FROM {table}"), [])
@@ -37529,6 +37532,7 @@ observer "ordered/file" {
             cache.card_statuses.clear();
             for n in 0..AGENT_CARD_STATUS_LIMIT {
                 cache.card_statuses.insert(format!("agent/fill/{n}"), StatusEntry {
+                    current_revision: 0,
                     read_at: cut, owners: Vec::new(), status: first.subjects[0].clone(), action: None,
                 });
             }

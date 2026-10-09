@@ -35708,7 +35708,7 @@ mission "work-alert" state="ready" {
             2
         );
 
-        store
+        let error = store
             .append_claim(&ClaimInput {
                 subject: desired.subject.clone(),
                 kind: "harness.observed".into(),
@@ -35726,6 +35726,7 @@ mission "work-alert" state="ready" {
                 idempotency_key: Some("worker-three-idle".into()),
             })
             .unwrap_err();
+        assert_eq!(error.code, "stale-harness-event-session");
         let historical_wake = store
             .step_run(&step.subject)
             .unwrap()

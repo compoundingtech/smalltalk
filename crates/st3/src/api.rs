@@ -478,6 +478,20 @@ pub(crate) fn synthetic_mailbox_protocol_router(state: AppState, subject: &str) 
     }))
 }
 
+/// Disposable-store protocol workloads with an already admitted native seat. Physical
+/// Unix-peer identity is tested separately; this has no daemon or CLI entry point.
+#[cfg(feature = "test-support")]
+pub fn native_observation_protocol_router(state: AppState, subject: &str) -> Router {
+    assert!(subject.starts_with("agent/"));
+    router(state).layer(Extension(NativeDeliveryPeer {
+        start_token: None,
+        agent: subject.into(),
+        transport: "omp-channel",
+        pid: std::process::id(),
+        archives_inbox: false,
+    }))
+}
+
 /// Build the loopback-only client gateway. Unlike the local Unix boundary, every ordinary
 /// client request on this router requires a paired bearer credential.
 pub fn fabric_router(state: AppState) -> Router {
@@ -733,6 +747,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages/cleanup", post(mail_backlog::cleanup))
         .route("/v1/mailbox", get(mailbox::subscribe))
         .route("/v1/harness-events", post(harness_events::publish))
+        .route("/v1/harness-events/usage-flush", post(harness_events::flush_usage))
         .route("/v1/mailbox/bind", post(mailbox::bind))
         .route("/v1/mailbox/attachment", get(mailbox::attachment))
         .route("/v1/mailbox/receipts", post(mailbox::receipt))
@@ -6043,10 +6058,12 @@ async fn guard_bound_request(
     let path = request.uri().path();
     // A forwarded client read carries a person's authority between fleet members. Only the
     // replication worker, which runs in no harness, hands one over.
-    if path.starts_with(crate::peer::CLIENT_READ_FORWARD_PATH) {
+    if path.starts_with(crate::peer::CLIENT_READ_FORWARD_PATH)
+        || path == "/v1/internal/current-value"
+    {
         return Err(ApiError::bad(St3Error::new(
             "foreign-agent-actor",
-            format!("this harness is `{bound_agent}` and cannot forward a person's client read"),
+            format!("this harness is `{bound_agent}` and cannot submit replication worker requests"),
         )));
     }
     if ![
@@ -11207,26 +11224,6 @@ async fn finish_claim_publication(
             if kind == "harness.observed" && response.body["fields"]["status_transition"] != false {
                 state.notify.notify_one();
             }
-            if kind == "harness.observed" && response.body["fields"]["state"] != "working" {
-                // Numeric accounting is explicitly durable. Its final flush may wait for the
-                // graph writer, independently of the already accepted current status.
-                let state = state.clone();
-                let subject = response.subject.clone();
-                let incarnation = response.body["fields"]["incarnation_id"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned();
-                tokio::spawn(async move {
-                    let store = state.store.clone();
-                    if matches!(
-                        blocking_action(move || store.flush_pending_usage(&subject, &incarnation))
-                            .await,
-                        Ok(true)
-                    ) {
-                        signal_visible_change(&state);
-                    }
-                });
-            }
             if let Some(relay) = state.client_relay.clone() {
                 let record = response.clone();
                 tokio::spawn(async move {
@@ -15730,6 +15727,14 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 .await
                 .is_ok()
         );
+        for path in [crate::peer::CLIENT_READ_FORWARD_PATH, "/v1/internal/current-value"] {
+            let request = Request::builder().method("POST").uri(path)
+                .body(Body::from(json!({"subject":"agent/peer","kind":"harness.observed"}).to_string())).unwrap();
+            let error = guard_bound_request(request, Some("agent/own")).await.unwrap_err();
+            assert_eq!(error.code, "foreign-agent-actor", "{path}");
+            let worker_request = Request::builder().method("POST").uri(path).body(Body::empty()).unwrap();
+            assert!(guard_bound_request(worker_request, None).await.is_ok());
+        }
         let request = Request::builder()
             .method("POST")
             .uri("/v1/agent-queue-moves")

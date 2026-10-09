@@ -124,14 +124,20 @@ for the subsequent owner-native conversation cutover. Activity, context occupanc
 the current-attempt path above without outbox events. Context producers retain numeric session
 usage and account-limit samples in separate `harness-accounting` events without occupancy fields;
 these durable facts keep the normal request timeout, prepared attribution and retry path, and
-publication fingerprints advance only after success. At the source, unchanged accounting does
+publication fingerprints advance only after success. A source with accounting or timeline data
+retains a separate durable stop control; it flushes pending numeric usage through the native
+owner-fenced accounting endpoint even when the idle/ended register was dropped. A final reading
+that arrives after the control remains unacknowledged until its stop flush succeeds. Admission
+and provider-capacity diagnostics also retain normal timeout and retry handling outside the
+current publisher. Timestamp-only state heartbeats do not duplicate these obligations. At the source, unchanged accounting does
 not append another event merely because context occupancy or its record timestamps changed. The
 comparison includes the owner, account, numeric values, resets and actual limit-source timestamp;
 a new account-window measurement still provides fresh evidence for the 95% stop. This guard commits
 atomically with the durable event and survives driver re-exec. A busy or full accounting spool cannot
 advance the guard or roll back a committed current snapshot. The matching driver discards queued categorical events from
-predecessor builds while retaining numeric usage and limits from older context events. Evidence expiry replaces the snapshot with unknown; a
-concurrent heartbeat supersedes it. The remaining timeline outbox preserves source runtime,
+predecessor builds while retaining numeric usage and limits from older context events. Evidence expiry
+wakes one derived unknown attempt; a concurrent heartbeat supersedes it. Expired snapshots do not
+re-arm the driver's expiry deadline. The remaining timeline outbox preserves source runtime,
 source account and prepared attribution across replay until that separately reviewed removal.
 Accounting durability remains required after that removal.
 Its 64 MiB limit cannot block a current-value write. Native transcripts and session bindings

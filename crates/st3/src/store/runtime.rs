@@ -171,7 +171,6 @@ impl Runtime for SmalltalkRuntime {
     fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
         connection.execute_batch(latest_values::SCHEMA)?;
-        connection.execute_batch(numeric_values::SCHEMA)?;
         latest_values::initialize_epoch(connection)?;
         connection.execute_batch(arrangements::SCHEMA)?;
         usage_period::create_schema(connection)?;
@@ -219,7 +218,6 @@ impl Runtime for SmalltalkRuntime {
         agent_messages::open(transaction)?;
         arrangements::open(transaction)?;
         limits::open_limits(transaction)?;
-        numeric_values::open(transaction)?;
         if shared_memory {
             rebuild_operations_tx(transaction)?;
             rebuild_planning_tx(transaction)?;
