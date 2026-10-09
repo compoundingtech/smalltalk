@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "Keep retained-removal report aggregation consistent and verify its eight controls independently in hosted CI.",
+  "commits": ["6733381710dd7b125a456128bfb352a03ec759aa"],
+  "replay": {"status": "none", "detail": "No production replay, initialization, collector or writer activation."},
+  "schema": {"status": "none", "detail": "No database, schema version, index, migration or persisted-format change."},
+  "rules": {"status": "none", "detail": "Checkpoint and signed/current-key refusal producer rules are unchanged."},
+  "compatibility": {"status": "none", "detail": "The report builder consistently retains collected failures; the HTTP handler already computed its final aggregate. No additional wire, enum or strict CLI policy change. Missing removal evidence remains unknown."},
+  "downtime": {"status": "none", "detail": "No additional daemon lifecycle transition. Source and selector validation do not establish runtime or filesystem latency."},
+  "manual": {"status": "none", "detail": "The new hosted step selects exactly eight removal controls from the existing verified archive with zero retries and separate records. Original eight controls and operator behavior remain unchanged; no second compilation or local probe is required."},
+  "recovery": {"status": "none", "detail": "No additional production mutation or rollback constraint. Actual control execution and broader signed-refusal/nonzero integration remain separately required."}
+}
