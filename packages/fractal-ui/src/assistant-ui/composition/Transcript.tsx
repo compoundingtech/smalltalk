@@ -153,10 +153,11 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
   const published = React.useMemo(() => new Set(messages.map(message => message.id)), [messages])
   const unpublished = React.useMemo(() => turns.flatMap(turn => [...(turn.prompt === undefined ? [] : [turn.prompt.id]), ...turn.items.map(item => item.id)]).filter(id => !published.has(id)), [turns, published])
   const adoption = React.useContext(RuntimeAdoptedIds)
-  const heldKey = React.useSyncExternalStore(adoption?.subscribe ?? staticSubscription, () => {
+  const getHeldKey = () => {
     const held = adoption?.get()
     return JSON.stringify(held === undefined ? [] : unpublished.filter(id => held.has(id)))
-  })
+  }
+  const heldKey = React.useSyncExternalStore(adoption?.subscribe ?? staticSubscription, getHeldKey, getHeldKey)
   const runtimeIds = React.useMemo(() => new Set<string>(JSON.parse(heldKey)), [heldKey])
   React.useEffect(() => {
     if (adoptionEpoch !== turns && unpublished.some(id => !runtimeIds.has(id))) setAdoptionEpoch(turns)

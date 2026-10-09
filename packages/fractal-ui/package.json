@@ -19,7 +19,8 @@
     "storybook": "storybook dev -p 53705 --host 127.0.0.1 --no-open --disable-telemetry",
     "build-storybook": "storybook build --disable-telemetry",
     "typecheck": "tsc --noEmit",
-    "test:palettes": "node --test src/legacy-palettes.test.mjs"
+    "test:palettes": "node --test src/legacy-palettes.test.mjs",
+    "test:transcript": "node --test --test-force-exit src/assistant-ui/composition/Transcript.unit.test.mjs"
   },
   "dependencies": {
     "react": "19.2.3",
