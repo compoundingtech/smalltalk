@@ -684,10 +684,13 @@ fields are:
 The authenticated session supplies actor and scopes. `actor`, `credential`, and fleet secrets are
 invalid request fields. Repeating the same key, action ID, type and parameters returns the
 original result; a refreshed fence does not change the action's idempotency identity. A different
-action under that key returns `idempotency-conflict`. Receipts from older daemons still accept the
-exact original request. A snapshot fence proves the host and an index no newer than the current
-store; unrelated commits do not stale an action. Stale generation, subject revision, incarnation,
-preview or terminal screen fences return `stale-fence` without a partial mutation.
+action under that key returns `idempotency-conflict`. A receipt or terminal attachment storing
+only the legacy full-request digest also returns HTTP 409 `idempotency-conflict`, even for
+an exact replay; it never executes the action again. Inspect the original committed outcome
+before deliberately submitting a new action with a fresh key. A snapshot fence proves the host
+and an index no newer than the current store; unrelated commits do not stale an action.
+Stale generation, subject revision, incarnation, preview or terminal screen fences return
+`stale-fence` without a partial mutation.
 Multi-subject actions commit atomically or have no effect.
 
 New completed local response receipts last at least **7 days**. Clients must never reuse a
