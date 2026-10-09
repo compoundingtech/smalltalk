@@ -11108,7 +11108,11 @@ async fn get_usage(
     .await?;
     let mut report = json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages});
     // The policy as the config file says now, so `st usage` shows which accounts it never stops.
-    if let Some(Ok(config)) = crate::config::reload_daemon_limits()
+    let reloaded = tokio::task::spawn_blocking(crate::config::reload_daemon_limits)
+        .await
+        .ok()
+        .flatten();
+    if let Some(Ok(config)) = reloaded
         && let Some(policy) = crate::store::LimitsPolicy::from_config(&config)
     {
         for (row, limit) in report["limits"]

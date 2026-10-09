@@ -23072,11 +23072,26 @@ fn idempotency(kdl: &str, tokens: &BTreeMap<String, Vec<String>>) -> String {
 async fn enforce_account_limits(store: Arc<Store>, started_with: st3::config::LimitsConfig) {
     const LIMITS_INTERVAL: Duration = Duration::from_secs(2 * 60);
     let mut limits = started_with;
+    let mut last_error = None::<String>;
     loop {
-        // A config file that cannot be read or does not validate keeps the last good policy.
-        match st3::config::reload_daemon_limits() {
-            Some(Ok(reloaded)) => limits = reloaded,
-            Some(Err(error)) => eprintln!("st3: limits policy keeps its last config: {error:#}"),
+        // A config file that is missing, cannot be read or does not validate keeps the last
+        // good policy. The reason is logged when it changes, not on every pass.
+        let reloaded = tokio::task::spawn_blocking(st3::config::reload_daemon_limits)
+            .await
+            .ok()
+            .flatten();
+        match reloaded {
+            Some(Ok(reloaded)) => {
+                limits = reloaded;
+                last_error = None;
+            }
+            Some(Err(error)) => {
+                let error = format!("{error:#}");
+                if last_error.as_ref() != Some(&error) {
+                    eprintln!("st3: limits policy keeps its last config: {error}");
+                    last_error = Some(error);
+                }
+            }
             None => {}
         }
         let Some(policy) = st3::store::LimitsPolicy::from_config(&limits) else {

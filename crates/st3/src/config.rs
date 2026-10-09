@@ -189,11 +189,21 @@ pub fn set_daemon_config(path: Option<&Path>) {
 /// `None` outside a daemon.
 pub fn reload_daemon_limits() -> Option<Result<LimitsConfig>> {
     let path = DAEMON_CONFIG.get()?;
-    Some((|| {
-        let limits = Config::load_unvalidated(path.as_deref())?.limits;
-        limits.validate()?;
-        Ok(limits)
-    })())
+    Some(read_limits(path.as_deref()))
+}
+
+/// `[limits]` from a config file that must exist: a file that is missing for a moment must not
+/// read as the default, which has the policy off.
+fn read_limits(path: Option<&Path>) -> Result<LimitsConfig> {
+    let selected = path.map(Path::to_path_buf).unwrap_or_else(Config::default_path);
+    anyhow::ensure!(
+        selected.exists(),
+        "st config {} is missing",
+        selected.display()
+    );
+    let limits = Config::load_unvalidated(Some(&selected))?.limits;
+    limits.validate()?;
+    Ok(limits)
 }
 
 /// Observations of `local` retention stay on the node that made them. The daemon trims
@@ -629,6 +639,22 @@ sekrets_profile = "nathan/daemon-gh"
         );
         assert!(error.contains("--client-gateway-socket"), "{error}");
         assert!(error.contains("XDG_RUNTIME_DIR"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_config_file_is_an_error_not_a_disabled_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let error = read_limits(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("is missing"), "{error}");
+        fs::write(
+            &path,
+            "person = \"person/avery\"\n[limits]\nenabled = true\nnotify = \"agent/example/operations\"\n",
+        )
+        .unwrap();
+        assert!(read_limits(Some(&path)).unwrap().enabled);
+        fs::remove_file(&path).unwrap();
+        assert!(read_limits(Some(&path)).is_err());
     }
 
     #[test]
