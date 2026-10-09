@@ -72,6 +72,8 @@ export interface Subscriber {
    * reconnect and on every resubscribe. Each run gets a fresh wire id (its generation).
    */
   readonly subscribe: (args: { readonly stream: CollectionStream; readonly id: string }) => Effect.Effect<void>
+  /** Ordinary reads can probe transport without a new single-use terminal capability. */
+  readonly probeEligible?: boolean
   /** A frame addressed to this subscription's current generation. */
   readonly onFrame: (frame: CollectionFrame) => void
   /** The socket ended; a fresh subscribe follows once a new one is live. */
@@ -88,6 +90,12 @@ export interface Channel {
   readonly suspend: () => void
   /** Resume retained subscriptions without a lifecycle timer. */
   readonly resume: Effect.Effect<void>
+  /** Browser reachability interrupts a dead socket without waiting for a read failure. */
+  readonly setOnline: (online: boolean) => Effect.Effect<void>
+  /** One immediate attempt, replacing an existing backoff; concurrent requests coalesce. */
+  readonly reconnect: Effect.Effect<void>
+  /** Probe an existing subscription only after a suspicion signal, never on idle time. */
+  readonly probe: Effect.Effect<void>
   /** A subscription has successfully decoded a data frame from this socket. */
   readonly onDecodedFrame: () => void
   /** Register and, when a socket is live, subscribe now. */
@@ -142,6 +150,10 @@ export const makeChannel = ({
     onDiagnostics?.({ _tag: 'Connection', state: { _tag: 'Idle' } })
     let suspended = false
     let disposed = false
+    let online = true
+    let restarting = false
+    // A pending reachability read or upgrade is one attempt; backoff and a live socket are not.
+    let connecting = false
     let permanentlyRejected = false
     const setConnection = (state: ConnectionState) =>
       SubscriptionRef.set(connection, state).pipe(
@@ -199,12 +211,13 @@ export const makeChannel = ({
     const wires = new Map<string, string>()
     let live: CollectionStream | undefined
 
-    const subscribe = (id: string) =>
+    const subscribe = (id: string, probing = false) =>
       Effect.gen(function* () {
         const entry = subscribers.get(id)
         if (entry === undefined || live === undefined) return
         entry.fiber?.interruptUnsafe()
         if (entry.wire !== undefined) {
+          if (entry.wire.id === probeWire) clearProbe()
           wires.delete(entry.wire.id)
           // Release the superseded generation on its own socket; a dead socket held nothing.
           if (entry.wire.stream === live) live.unsubscribe(entry.wire.id)
@@ -213,15 +226,24 @@ export const makeChannel = ({
         const wire = entry.generation === 1 ? id : `${id}.${entry.generation}`
         entry.wire = { id: wire, stream: live }
         wires.set(wire, id)
+        if (probing) probeWire = wire
         entry.fiber = yield* Effect.forkIn(entry.subscriber.subscribe({ stream: live, id: wire }), scope)
       })
 
+    let probeWire: string | undefined
+    let probeTimer: ReturnType<typeof setTimeout> | undefined
+    let endSocket: ((error: Error) => void) | undefined
+    const clearProbe = () => {
+      clearTimeout(probeTimer)
+      probeTimer = undefined
+      probeWire = undefined
+    }
     const dispatch = (frame: CollectionFrame) => {
       onDiagnostics?.({ _tag: 'Frame' })
       const id = 'id' in frame ? frame.id : undefined
+      if (id === probeWire) clearProbe()
       if (id === undefined) {
         // A socket-level error names no subscription: the command itself was malformed.
-        if (frame.kind === 'error') console.warn(`st collections socket: ${frame.message}`)
         return
       }
       const owner = wires.get(id)
@@ -244,6 +266,10 @@ export const makeChannel = ({
             if (command.kind !== 'subscribe') return
             const owner = wires.get(command.id)
             if (owner !== undefined) onSubscribeSent?.({ id: owner, wire: command.id })
+            if (command.id === probeWire) probeTimer = setTimeout(() => {
+              clearProbe()
+              endSocket?.(new Error('The collections probe did not answer before its deadline'))
+            }, 15_000)
           },
           onEnd: (error) => {
             socketEnded = true
@@ -256,9 +282,12 @@ export const makeChannel = ({
         // Creation includes credential resolution and issuing the upgrade, not its full lifetime.
         Effect.withSpan('st3.socket.create', { kind: 'client', root: parent === undefined, parent, attributes: { 'span.label': 'socket' } }),
       )
+      endSocket = (error) => { Deferred.doneUnsafe(ended, Exit.succeed(error)) }
       return yield* Effect.gen(function* () {
-        const didOpen = yield* Deferred.await(opened)
+        const didOpen = yield* Deferred.await(opened).pipe(Effect.timeout(15_000))
         if (!didOpen || socketEnded) return 'the collections socket ended before opening'
+        connecting = false
+        online = true
         live = stream
         yield* setConnection({ _tag: 'Live' })
         for (const id of subscribers.keys()) yield* subscribe(id)
@@ -276,6 +305,8 @@ export const makeChannel = ({
         Effect.ensuring(
           Effect.sync(() => {
             if (live === stream) live = undefined
+            clearProbe()
+            endSocket = undefined
             stream.close()
           }),
         ),
@@ -286,11 +317,18 @@ export const makeChannel = ({
     const connect = ({
       attempt,
       issue,
+      forceReachability = false,
     }: {
       readonly attempt: number
       readonly issue: string | undefined
+      readonly forceReachability?: boolean
     }): Effect.Effect<void> =>
       Effect.gen(function* () {
+        if (!online && !forceReachability) {
+          yield* setConnection({ _tag: 'Reconnecting', attempt, issue: 'The browser is offline' })
+          return yield* Effect.never
+        }
+        connecting = true
         if (issue !== undefined) onDiagnostics?.({ _tag: 'Retry' })
         yield* setConnection(
           issue === undefined
@@ -309,13 +347,15 @@ export const makeChannel = ({
                 message: cause instanceof Error ? cause.message : String(cause),
               }),
             })),
+            Effect.timeout(15_000),
             Effect.withSpan('st3.socket.probe', { kind: 'client', root: parent === undefined, parent, attributes: { 'span.label': 'probe' } }),
           ),
         )
         if (Result.isFailure(probe)) {
+          connecting = false
           onProbeFailure?.()
           const error = probe.failure
-          if (isRejection(error.cause)) {
+          if (error instanceof ProbeFailure && isRejection(error.cause)) {
             yield* setConnection({ _tag: 'Rejected', message: error.message, code: error.cause.response.code })
             return
           }
@@ -328,12 +368,31 @@ export const makeChannel = ({
         const ended = yield* runSocket.pipe(
           Effect.catchCause((cause) => Effect.succeed(String(Cause.squash(cause)))),
         )
+        connecting = false
         yield* setConnection({ _tag: 'Reconnecting', attempt: 1, issue: ended, nextAt: Date.now() + backoffMillis(1) })
         yield* Effect.sleep(backoffMillis(1))
         return yield* connect({ attempt: 2, issue: ended })
       })
 
     let connectionFiber = yield* Effect.forkIn(connect({ attempt: 1, issue: undefined }), scope)
+    const restart = Effect.fn('st3.socket.restart')(function* ({
+      forceReachability = false, interruptAttempt = false,
+    }: { readonly forceReachability?: boolean; readonly interruptAttempt?: boolean } = {}) {
+      if (disposed || suspended || permanentlyRejected || restarting || (connecting && !interruptAttempt)) return
+      restarting = true
+      yield* Effect.gen(function* () {
+        yield* setConnection({ _tag: 'Reconnecting', attempt: 1, issue: 'Reconnecting', nextAt: Date.now() })
+        for (const entry of subscribers.values()) {
+          entry.fiber?.interruptUnsafe()
+          entry.fiber = undefined
+          entry.subscriber.onDrop()
+        }
+        yield* Fiber.interrupt(connectionFiber)
+        connecting = false
+        if (disposed || suspended || permanentlyRejected) return
+        connectionFiber = yield* Effect.forkIn(connect({ attempt: 1, issue: 'Reconnecting', forceReachability }), scope)
+      }).pipe(Effect.ensuring(Effect.sync(() => { restarting = false })))
+    })
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
         disposed = true
@@ -349,6 +408,21 @@ export const makeChannel = ({
     return {
       connection,
       syncStatus,
+      setOnline: (value) => Effect.suspend(() => {
+        if (online === value) return Effect.void
+        online = value
+        return restart({ interruptAttempt: !value })
+      }),
+      reconnect: restart({ forceReachability: true }),
+      probe: Effect.gen(function* () {
+        if (disposed || suspended || permanentlyRejected || !online || probeWire !== undefined) return
+        if (live === undefined) return
+        for (const [id, entry] of subscribers) {
+          if (entry.subscriber.probeEligible !== true) continue
+          yield* subscribe(id, true)
+          return
+        }
+      }),
       suspend: () => {
         if (suspended || disposed || permanentlyRejected) return
         suspended = true
@@ -391,6 +465,7 @@ export const makeChannel = ({
         entry.fiber?.interruptUnsafe()
         if (entry.wire === undefined) return
         wires.delete(entry.wire.id)
+        if (entry.wire.id === probeWire) clearProbe()
         if (entry.wire.stream === live) live.unsubscribe(entry.wire.id)
       },
       resubscribe: (id) =>

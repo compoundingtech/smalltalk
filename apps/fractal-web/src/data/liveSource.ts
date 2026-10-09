@@ -40,12 +40,14 @@ import {
   observeFeedSync,
   transitionFeedSync,
   type FeedSync,
+  type FeedSyncObservation,
 } from './feedSync.ts'
 import {
   type ConversationPage,
   type AttachmentPort,
   type ConversationPortResult,
   type DataSource,
+  type NetworkReachability,
   type Feed,
   type Grants,
   observed,
@@ -158,6 +160,11 @@ export const liveSource = ({
   })
   const registry = AtomRegistry.make()
   const readRefusal = Atom.keepAlive(Atom.make<string | undefined>(undefined))
+  const networkLoss = Atom.keepAlive(Atom.make<FeedSyncObservation | undefined>(undefined))
+  const degradeReaders = new Set<(status: SyncStatus) => void>()
+  const network = Atom.keepAlive(Atom.make<NetworkReachability>({
+    _tag: typeof navigator !== 'undefined' && navigator.onLine === false ? 'Offline' : 'Online',
+  }))
   const resources = gatewayResources({
     baseUrl,
     fetchImpl: fetch,
@@ -175,6 +182,24 @@ export const liveSource = ({
       onDiagnostics: (event) => {
         switch (event._tag) {
           case 'Connection':
+            if (event.state._tag === 'Live' && !online) {
+              // A successful transport attempt overrides a false browser offline hint.
+              online = true
+              registry.set(network, { _tag: 'Online' })
+            }
+            if (event.state._tag === 'Reconnecting') {
+              const status: SyncStatus = {
+                _tag: 'Stale',
+                reason: event.state.nextAt === undefined ? { _tag: 'Unknown' } : {
+                  _tag: 'Reconnecting', attempt: event.state.attempt, nextAt: event.state.nextAt, issue: event.state.issue,
+                },
+              }
+              for (const degrade of degradeReaders) degrade(status)
+              const loss = registry.get(networkLoss)
+              if (loss !== undefined) registry.set(networkLoss, {
+                status, observedAt: loss.status._tag === 'Stale' && loss.status.reason._tag === status.reason._tag ? loss.observedAt : Date.now(),
+              })
+            }
             if (event.state._tag === 'Reconnecting') connectionAttempt = event.state.attempt
             setDebug('Wf.socketLive', event.state._tag === 'Live' ? 1 : 0)
             if (event.state._tag === 'Rejected') {
@@ -217,6 +242,36 @@ export const liveSource = ({
   )
   let sdk: St3['Service'] | undefined
   let disposed = false
+  const browser = typeof window === 'undefined' ? undefined : window
+  const documentEvents = typeof document === 'undefined' ? undefined : document
+  let online = typeof navigator === 'undefined' || navigator.onLine !== false
+  const markNetworkLoss = () => {
+    const now = Date.now()
+    const status: SyncStatus = { _tag: 'Stale', reason: { _tag: 'Unknown' } }
+    registry.set(networkLoss, { status, observedAt: now })
+    for (const degrade of degradeReaders) degrade(status)
+  }
+  const onOffline = () => {
+    if (disposed) return
+    online = false
+    registry.set(network, { _tag: 'Offline' })
+    markNetworkLoss()
+    if (sdk !== undefined) runtime.runFork(sdk.setNetworkOnline(false))
+  }
+  const onOnline = () => {
+    if (disposed || online) return
+    online = true
+    registry.set(network, { _tag: 'Online' })
+    if (sdk !== undefined) runtime.runFork(sdk.setNetworkOnline(true))
+  }
+  const onVisible = () => {
+    if (!disposed && documentEvents?.visibilityState === 'visible' && sdk !== undefined)
+      runtime.runFork(sdk.probeSockets)
+  }
+  browser?.addEventListener('offline', onOffline)
+  browser?.addEventListener('online', onOnline)
+  documentEvents?.addEventListener('visibilitychange', onVisible)
+  if (!online) markNetworkLoss()
   const ingest = makeFrameIngest<() => void, () => void>({ write: ({ value }) => value() })
 
   const retain = <A, TSpec extends FollowSpec>({
@@ -286,10 +341,18 @@ export const liveSource = ({
           registry.set(syncData, syncLatest)
         }
       }
+      const degrade = (status: SyncStatus) => {
+        if (terminalFailure) return
+        syncLatest = transitionFeedSync(syncLatest, status, Date.now())
+        if (latest._tag === 'Observed') latest = { ...latest, freshness: 'stale' }
+        commit()
+      }
+      degradeReaders.add(degrade)
       const setSync = (status: SyncStatus) => {
         if (terminalFailure && status._tag !== 'Failed') return
         ux?.().observeSync({ key: syncData, kind: telemetryKind, status })
         syncLatest = transitionFeedSync(syncLatest, status, Date.now())
+        if (status._tag === 'Live' && online) registry.set(networkLoss, undefined)
         if (status._tag !== 'Live' && latest._tag === 'Observed')
           latest = { ...latest, freshness: 'stale' }
         ingest.accept({ key: commit, value: commit })
@@ -492,6 +555,7 @@ export const liveSource = ({
       get.addFinalizer(() => {
         active = false
         deniedReaders.delete(deny)
+        degradeReaders.delete(degrade)
         fiber.interruptUnsafe()
       })
       return latest
@@ -528,16 +592,23 @@ export const liveSource = ({
       // can use the already decoded snapshot without waiting for the next writer frame.
       get(retained.snapshot)
       // Snapshot-only readers have no follow controller, but still lose read authority on rejection.
+      const loss = get(networkLoss)
       const refusal = get(readRefusal)
       if (refusal !== undefined) return unavailable({ reason: 'ungranted', detail: refusal, ...(telemetryKind === 'terminal' ? { retryable: false } : {}) })
-      return latest
+      return loss !== undefined && latest._tag === 'Observed' ? { ...latest, freshness: 'stale' as const } : latest
     })
     retained = {
       atom,
       interest,
       snapshot: data,
       controller: following,
-      sync: syncData,
+      sync: Atom.make((get) => {
+        const current = get(syncData)
+        const loss = get(networkLoss)
+        return loss === undefined || current.sync.status._tag === 'Failed'
+          ? current
+          : transitionFeedSync(current, loss.status, loss.observedAt)
+      }),
       publish: (value) => {
         // A refused read stays refused: a local outbox update must never
         // resurrect transcript rows the gateway stopped authorizing.
@@ -901,7 +972,7 @@ export const liveSource = ({
   const terminal = (ref: string) => terminalFamily(ref).atom
   const terminalSync = (ref: string) => terminalFamily(ref).sync
 
-  const connection = Atom.keepAlive(
+  const transportConnection = Atom.keepAlive(
     Atom.make((get): ConnectionState => {
       const fiber = runtime.runFork(
         Effect.flatMap(St3, (st3) =>
@@ -912,7 +983,14 @@ export const liveSource = ({
       return { _tag: 'Connecting', attempt: 1 }
     }),
   )
-  const gatewaySync = Atom.keepAlive(
+  const connection = Atom.make((get): ConnectionState => {
+    const state = get(transportConnection)
+    const loss = get(networkLoss)
+    return loss === undefined || state._tag === 'Rejected' ? state : {
+      _tag: 'Reconnecting', attempt: connectionAttempt, issue: 'Reconnecting',
+    }
+  })
+  const transportSync = Atom.keepAlive(
     Atom.make((get) => {
       let current = initialFeedSync<never>(Date.now())
       const fiber = runtime.runFork(
@@ -920,7 +998,8 @@ export const liveSource = ({
           st3.gatewaySyncStatus.pipe(
             Stream.runForEach((status) => Effect.sync(() => {
               current = transitionFeedSync(current, status, Date.now())
-              ux?.().observeSync({ key: gatewaySync, kind: 'gateway', status })
+              if (status._tag === 'Live' && online) registry.set(networkLoss, undefined)
+              ux?.().observeSync({ key: transportSync, kind: 'gateway', status })
               get.setSelf(current.sync)
             })),
           ),
@@ -930,6 +1009,10 @@ export const liveSource = ({
       return current.sync
     }),
   )
+  const gatewaySync = Atom.make((get) => {
+    const current = get(transportSync)
+    return get(networkLoss) ?? current
+  })
   const grants = Atom.keepAlive(
     Atom.make((get): Grants => {
       if (readRejection !== undefined) return noGrants
@@ -963,7 +1046,10 @@ export const liveSource = ({
   return {
     selectConversation,
     registry,
-    ready: runtime.runPromise(Effect.map(St3, (service) => { sdk = service })),
+    ready: runtime.runPromise(Effect.gen(function* () {
+      sdk = yield* St3
+      if (!online) yield* sdk.setNetworkOnline(false)
+    })),
     suspendSockets: () => sdk?.suspendSockets(),
     resumeSockets: () => {
       if (!disposed && sdk !== undefined) runtime.runFork(sdk.resumeSockets)
@@ -979,6 +1065,10 @@ export const liveSource = ({
       attachments: { ...attachments, send: (request) => retainConversation(request.parameters.to).send(request) },
       sessionTrace: (query) => runtime.runPromise(sessionTrace(query)),
       connection,
+      network,
+      reconnect: () => {
+        if (!disposed && sdk !== undefined) runtime.runFork(sdk.reconnectSockets)
+      },
       agents,
       missions,
       attention,
@@ -1044,6 +1134,9 @@ export const liveSource = ({
     },
     dispose: async () => {
       disposed = true
+      browser?.removeEventListener('offline', onOffline)
+      browser?.removeEventListener('online', onOnline)
+      documentEvents?.removeEventListener('visibilitychange', onVisible)
       releaseSelection?.()
       ingest.dispose()
       for (const entry of recentConversations.values()) entry.release()

@@ -279,6 +279,12 @@ export class St3 extends Context.Service<
     readonly suspendSockets: () => void
     /** Reconnect and resubscribe retained follows after a bfcache restore; no lifecycle timer. */
     readonly resumeSockets: Effect.Effect<void>
+    /** Browser reachability fast path; offline pauses reads, online attempts immediately. */
+    readonly setNetworkOnline: (online: boolean) => Effect.Effect<void>
+    /** Replace backoff with one reconnect attempt; concurrent requests coalesce. */
+    readonly reconnectSockets: Effect.Effect<void>
+    /** An on-demand subscription read with a deadline, not an idle heartbeat timer. */
+    readonly probeSockets: Effect.Effect<void>
     /** The gateway's capabilities (limits, actions and the scopes this credential holds). */
     readonly capabilities: Effect.Effect<Capabilities, Rejected>
     /** A fresh HTTP snapshot, never the generated client's cached discovery snapshot. */
@@ -769,6 +775,7 @@ const make = (options: St3Options) =>
             id,
             subscriber: {
               subscribe,
+              probeEligible: spec._tag !== 'Terminal',
               onRejected: (message, code) => fail(new Rejected({ code, message })),
               onDrop: () => {
                 endAttempt('dropped')
@@ -1024,6 +1031,9 @@ const make = (options: St3Options) =>
         channel.suspend()
       },
       resumeSockets: channel.resume,
+      setNetworkOnline: channel.setOnline,
+      reconnectSockets: channel.reconnect,
+      probeSockets: channel.probe,
       freshness: freshnessRef,
       followFreshness: (key) =>
         SubscriptionRef.changes(freshnessRef).pipe(

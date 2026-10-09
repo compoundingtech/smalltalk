@@ -59,6 +59,7 @@ class Gateway {
   terminalInputGrant: 'granted' | 'ungranted' = 'granted'
   transportFailure = false
   capabilityGate: Promise<void> | undefined
+  capabilityFailure = false
   rejectedCredential = false
   runtimeRefusalStatus: number | undefined
   runtimeRefusalCode: string | undefined
@@ -84,6 +85,7 @@ class Gateway {
     let value: unknown
     if (path === '/v1/client/capabilities') {
       this.capabilityReads += 1
+      if (this.capabilityFailure) throw new TypeError('The gateway is unreachable')
       await this.capabilityGate
       if (this.rejectedCredential)
         return new Response(
@@ -383,6 +385,214 @@ const withGateway = (
     yield* test(live, gateway)
   }).pipe(Effect.scoped)
 
+
+describe('connection loss detection', () => {
+  const withBrowser = (test: (live: LiveSource, gateway: Gateway, browser: EventTarget, documentEvents: EventTarget) => Effect.Effect<void>) =>
+    Effect.gen(function* () {
+      const browser = new EventTarget()
+      const documentEvents = new EventTarget()
+      Object.defineProperty(documentEvents, 'visibilityState', { value: 'visible' })
+      vi.stubGlobal('window', browser)
+      vi.stubGlobal('document', documentEvents)
+      vi.stubGlobal('navigator', { onLine: true })
+      yield* withGateway((live, gateway) => test(live, gateway, browser, documentEvents), { maxFollows: 4 })
+    })
+  const mountLiveFeeds = (live: LiveSource, gateway: Gateway) => Effect.gen(function* () {
+    const connection = live.registry.mount(live.source.connection)
+    const agents = live.registry.mount(live.source.agents)
+    const conversation = live.registry.mount(live.source.conversation(agent.id))
+    const interest = live.registry.mount(live.source.conversationInterest!(agent.id))
+    const agentsSync = live.registry.mount(live.source.sync!.agents)
+    const conversationSync = live.registry.mount(live.source.sync!.conversation(agent.id))
+    yield* settle
+    gateway.fleet([agent])
+    gateway.mailEcho()
+    yield* settle
+    expect(live.registry.get(live.source.sync!.agents).sync.status._tag).toBe('Live')
+    expect(live.registry.get(live.source.sync!.conversation(agent.id)).sync.status._tag).toBe('Live')
+    return () => { connection(); agents(); conversation(); interest(); agentsSync(); conversationSync() }
+  })
+
+  it.live('marks roster and conversation stale immediately on a browser offline event', () =>
+    withBrowser((connected, server, browser) => Effect.gen(function* () {
+      const release = yield* mountLiveFeeds(connected, server)
+      browser.dispatchEvent(new Event('offline'))
+      expect(connected.registry.get(connected.source.connection)._tag).not.toBe('Live')
+      expect(connected.registry.get(connected.source.sync!.agents).sync.status._tag).toBe('Stale')
+      expect(connected.registry.get(connected.source.sync!.conversation(agent.id)).sync.status._tag).toBe('Stale')
+      expect(connected.registry.get(connected.source.agents)).toMatchObject({ freshness: 'stale' })
+      release()
+    })),
+  )
+
+  it.live('marks a silently stalled socket stale after a visible-resume probe misses its read deadline', () =>
+    withBrowser((live, gateway, browser, documentEvents) => Effect.gen(function* () {
+      const release = yield* mountLiveFeeds(live, gateway)
+      documentEvents.dispatchEvent(new Event('visibilitychange'))
+      yield* settle
+      yield* Effect.promise(() => vi.advanceTimersByTimeAsync(15_000))
+      yield* settle
+      expect(live.registry.get(live.source.connection)._tag).not.toBe('Live')
+      expect(live.registry.get(live.source.sync!.agents).sync.status._tag).not.toBe('Live')
+      expect(live.registry.get(live.source.sync!.conversation(agent.id)).sync.status._tag).not.toBe('Live')
+      release()
+    })),
+  )
+
+  it.live('keeps a healthy quiet socket without an idle reconnect timer', () =>
+    withBrowser((live, gateway, browser, documentEvents) => Effect.gen(function* () {
+      const release = yield* mountLiveFeeds(live, gateway)
+      const reads = gateway.capabilityReads
+      yield* Effect.promise(() => vi.advanceTimersByTimeAsync(60_000))
+      yield* settle
+      expect(live.registry.get(live.source.connection)._tag).toBe('Live')
+      expect(gateway.capabilityReads).toBe(reads)
+      documentEvents.dispatchEvent(new Event('visibilitychange'))
+      yield* settle
+      gateway.fleet([agent])
+      yield* settle
+      yield* Effect.promise(() => vi.advanceTimersByTimeAsync(15_000))
+      yield* settle
+      expect(live.registry.get(live.source.connection)._tag).toBe('Live')
+      expect(gateway.capabilityReads).toBe(reads)
+      release()
+    })),
+  )
+
+  it.live('reconnects immediately on online and coalesces repeated online events', () =>
+    withBrowser((live, gateway, browser) => Effect.gen(function* () {
+      const release = yield* mountLiveFeeds(live, gateway)
+      browser.dispatchEvent(new Event('offline'))
+      yield* settle
+      const reads = gateway.capabilityReads
+      yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000))
+      yield* settle
+      expect(gateway.capabilityReads).toBe(reads)
+      browser.dispatchEvent(new Event('online'))
+      browser.dispatchEvent(new Event('online'))
+      yield* settle
+      expect(gateway.capabilityReads).toBe(reads + 1)
+      expect(live.registry.get(live.source.sync!.agents).sync.status._tag).not.toBe('Live')
+      gateway.fleet([agent])
+      gateway.mailEcho()
+      yield* settle
+      expect(live.registry.get(live.source.sync!.agents).sync.status._tag).toBe('Live')
+      release()
+    })),
+  )
+
+  it.live('reconnects once for a manual action without an effect-driven retry loop', () =>
+    withBrowser((live, gateway) => Effect.gen(function* () {
+      const release = yield* mountLiveFeeds(live, gateway)
+      gateway.socket?.onclose?.({ code: 1006, reason: '' })
+      yield* settle
+      const reads = gateway.capabilityReads
+      live.source.reconnect?.()
+      yield* settle
+      expect(gateway.capabilityReads).toBe(reads + 1)
+      gateway.fleet([agent])
+      gateway.mailEcho()
+      yield* settle
+      yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000))
+      yield* settle
+      expect(gateway.capabilityReads).toBe(reads + 1)
+      release()
+    })),
+  )
+
+  it.live('allows one explicit reachability attempt after a false browser offline hint', () =>
+    withBrowser((live, gateway, browser) => Effect.gen(function* () {
+      const release = yield* mountLiveFeeds(live, gateway)
+      browser.dispatchEvent(new Event('offline'))
+      yield* settle
+      const reads = gateway.capabilityReads
+      live.source.reconnect?.()
+      yield* settle
+      expect(gateway.capabilityReads).toBe(reads + 1)
+      gateway.fleet([agent])
+      gateway.mailEcho()
+      yield* settle
+      expect(live.registry.get(live.source.network!)).toEqual({ _tag: 'Online' })
+      expect(live.registry.get(live.source.sync!.agents).sync.status._tag).toBe('Live')
+      expect(live.registry.get(live.source.sync!.conversation(agent.id)).sync.status._tag).toBe('Live')
+      yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000))
+      yield* settle
+      expect(gateway.capabilityReads).toBe(reads + 1)
+      release()
+    })),
+  )
+
+  it.live('coalesces manual reconnects while the online reachability attempt is pending', () =>
+    withBrowser((live, gateway, browser) => Effect.gen(function* () {
+      const release = yield* mountLiveFeeds(live, gateway)
+      browser.dispatchEvent(new Event('offline'))
+      yield* settle
+      let resolveProbe: (() => void) | undefined
+      gateway.capabilityGate = new Promise<void>((resolve) => { resolveProbe = resolve })
+      const reads = gateway.capabilityReads
+      const socket = gateway.socket
+      browser.dispatchEvent(new Event('online'))
+      yield* settle
+      for (let press = 0; press < 3; press += 1) {
+        live.source.reconnect?.()
+        yield* settle
+      }
+      expect(gateway.capabilityReads).toBe(reads + 1)
+      expect(gateway.socket).toBe(socket)
+      resolveProbe?.()
+      yield* settle
+      expect(gateway.socket).not.toBe(socket)
+      gateway.fleet([agent])
+      gateway.mailEcho()
+      yield* settle
+      expect(live.registry.get(live.source.sync!.agents).sync.status._tag).toBe('Live')
+      expect(gateway.capabilityReads).toBe(reads + 1)
+      release()
+    })),
+  )
+
+  it.live('preserves backoff across repeated visible-resume browser events while the gateway is down', () =>
+    withBrowser((live, gateway, browser, documentEvents) => Effect.gen(function* () {
+      const release = yield* mountLiveFeeds(live, gateway)
+      gateway.capabilityFailure = true
+      gateway.socket?.onclose?.({ code: 1006, reason: '' })
+      yield* settle
+      const reads = gateway.capabilityReads
+      for (let resume = 0; resume < 3; resume += 1) {
+        documentEvents.dispatchEvent(new Event('visibilitychange'))
+        yield* settle
+      }
+      expect(gateway.capabilityReads).toBe(reads)
+      yield* Effect.promise(() => vi.advanceTimersByTimeAsync(500))
+      yield* settle
+      expect(gateway.capabilityReads).toBe(reads + 1)
+      for (let resume = 0; resume < 3; resume += 1) {
+        documentEvents.dispatchEvent(new Event('visibilitychange'))
+        yield* settle
+      }
+      expect(gateway.capabilityReads).toBe(reads + 1)
+      release()
+    })),
+  )
+
+  it.live('does not turn one failed manual attempt into automatic reads against an offline hint', () =>
+    withBrowser((live, gateway, browser) => Effect.gen(function* () {
+      const release = yield* mountLiveFeeds(live, gateway)
+      browser.dispatchEvent(new Event('offline'))
+      yield* settle
+      gateway.capabilityFailure = true
+      const reads = gateway.capabilityReads
+      live.source.reconnect?.()
+      yield* settle
+      expect(gateway.capabilityReads).toBe(reads + 1)
+      yield* Effect.promise(() => vi.advanceTimersByTimeAsync(2_000))
+      yield* settle
+      expect(gateway.capabilityReads).toBe(reads + 1)
+      expect(live.registry.get(live.source.network!)).toEqual({ _tag: 'Offline' })
+      release()
+    })),
+  )
+})
 it.live('exposes the native default and an injected trace provider through the owned source runtime', () =>
   withGateway((live) => Effect.gen(function* () {
     const query = { native_session_id: 'native-example', range: '7d', bucket: '15m' } as const

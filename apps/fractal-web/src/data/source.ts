@@ -227,6 +227,8 @@ export interface AttachmentPort {
   readonly send: (request: AttachmentSendRequest) => Promise<ConversationPortResult<ActionResult>>
 }
 
+export type NetworkReachability = { readonly _tag: 'Online' } | { readonly _tag: 'Offline' }
+
 /**
  * Everything a feature may read: one atom (or atom family) per projection plus the source's
  * clock, grants and usage port. Fixtures and live implement the same shape.
@@ -245,6 +247,10 @@ export interface DataSource {
   /** Schema-coupled native family reads; unsupported native producers carry an explicit reason. */
   readonly subjectReads: SubjectReads
   readonly connection: Atom.Atom<ConnectionState>
+  /** Browser reachability is a local signal, not a claim about the gateway's host. */
+  readonly network?: Atom.Atom<NetworkReachability>
+  /** One explicit reconnect attempt, bypassing the current countdown. */
+  readonly reconnect?: () => void
   readonly agents: Atom.Atom<Feed<readonly AgentRow[]>>
   readonly missions: Atom.Atom<Feed<readonly Mission[]>>
   readonly attention: Atom.Atom<Feed<readonly Attention[]>>
