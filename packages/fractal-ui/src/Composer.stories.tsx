@@ -92,7 +92,7 @@ function ComposerFrame({ policy, state, effort, frameId, composerWidth }: { read
       {snapshot.options.isRunning && <Button onPress={source.finish} {...stylex.props(styles.button)}>Finish run</Button>}
       {snapshot.offline && <Button onPress={source.reconnect} {...stylex.props(styles.button)}>Reconnect</Button>}
     </header>
-    <div data-testid="composer-geometry" {...stylex.props(styles.frameBody, composerWidth !== undefined && styles.budgetFrameBody)}>
+    <div {...stylex.props(styles.frameBody, composerWidth !== undefined && styles.budgetFrameBody)}>
       <ComposerSession draftKey={`fractal.composer.${frameId}.${state}.${effort}`} {...session} />
       <div aria-label="Accepted fixture messages" role="log" {...stylex.props(styles.receipts)}>{snapshot.receipts.map((receipt, index) => {
         const serialized = receipt.message.runConfig?.custom?.embraceDraft as SerializedDraft | undefined
@@ -148,7 +148,7 @@ export const Geometry: StoryObj<ComposerArgs & { compareLayout?: boolean; compar
     ] as const
     const axis = axes.find(candidate => args[candidate.flag])
     const policy = { layout: args.layout, running: args.running, mentions: args.mentions, target: args.target }
-    return axis === undefined ? <SingleComposer {...args} /> : <Surface scheme={args.scheme}><section role="region" aria-label={axis.label}><div {...stylex.props(styles.gallery)}>{axis.choices.map(choice => <ComposerFrame key={choice} policy={{ ...policy, [axis.field]: choice }} state={args.state} effort={args.effort} frameId={choice} />)}</div></section></Surface>
+    return <Surface scheme={args.scheme}>{axis === undefined ? <div data-testid="composer-geometry-lane" {...stylex.props(styles.geometryLane(768))}><ComposerFrame policy={policy} state={args.state} effort={args.effort} frameId="single" /></div> : <section role="region" aria-label={axis.label}><div {...stylex.props(styles.gallery)}>{axis.choices.map(choice => <div key={choice} data-testid="composer-geometry-lane" {...stylex.props(styles.geometryLane(768))}><ComposerFrame policy={{ ...policy, [axis.field]: choice }} state={args.state} effort={args.effort} frameId={choice} /></div>)}</div></section>}</Surface>
   },
 }
 
@@ -604,6 +604,7 @@ export const PlainTextAdapter: Story = {
 const styles = stylex.create({
   root: { minHeight: '100vh', width: '100%', boxSizing: 'border-box', padding: s.xl, display: 'flex', flexDirection: 'column', gap: s.xl, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading },
   lane: { width: '100%', maxWidth: g.modalMax, display: 'flex', flexDirection: 'column', gap: s.md },
+  geometryLane: (width: number) => ({ width, maxWidth: '100%', minWidth: 0 }),
   narrow: { width: g.tooltipMax, minWidth: 0 },
   gallery: { display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: s.xl },
   budgetPreviews: { display: 'flex', flexWrap: 'wrap', alignItems: 'flex-start', gap: s.md },
