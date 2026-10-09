@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Tell agents to answer a person in the conversation and not reply with st",
+  "replay": {"status": "none", "detail": "No replay or projection changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes or stored data formats change."},
+  "rules": {"status": "none", "detail": "No rule, claim or authorization changes; the text added to a delivery does not change the message or its digest."},
+  "compatibility": {"status": "changed", "detail": "The note st adds after a message from a person, the Claude channel instructions and the st skill now say to answer in the conversation because people have no inbox. Existing stui and iOS builds that do not know the new sentence show it as part of the person's message until they update; nothing they read disappears."},
+  "downtime": {"status": "none", "detail": "No restart migration or downtime is required."},
+  "manual": {"status": "none", "detail": "No configuration changes are needed; seats pick up the new text when they restart."},
+  "recovery": {"status": "none", "detail": "Reverting the change restores the earlier sentence, which every view still recognizes."}
+}

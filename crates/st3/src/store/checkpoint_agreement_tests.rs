@@ -1219,3 +1219,49 @@ fn stale_rule_seals_do_not_end_excusal_until_normal_matching_runtime_reentry() {
     assert!(status.excused.is_empty());
     assert_eq!(status.participants, names(&["alder", "birch"]));
 }
+
+#[test]
+fn the_agent_card_fold_matches_per_subject_reductions_after_a_trim() {
+    let scratch = tempfile::tempdir().unwrap();
+    let context = context(scratch.path(), 0);
+    let [alder, birch] = ["alder", "birch"].map(|name| Store::open_memory(name).unwrap());
+    for (store, seat) in [(&alder, "agent/alder.keeper"), (&birch, "agent/birch.keeper")] {
+        for (kind, fields) in [
+            ("runtime.observed", json!({"status": "running", "runtime_id": seat,
+                "incarnation_id": "keeper-1"})),
+            ("harness.observed", json!({"state": "working", "driver": "omp",
+                "incarnation_id": "keeper-1"})),
+            ("harness.observed", json!({"state": "idle", "driver": "omp",
+                "incarnation_id": "keeper-1"})),
+            ("runtime.observed", json!({"status": "stopped", "runtime_id": seat,
+                "incarnation_id": "keeper-1"})),
+            ("runtime.observed", json!({"status": "running", "runtime_id": seat,
+                "incarnation_id": "keeper-2"})),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: seat.into(),
+                    kind: kind.into(),
+                    actor: Some(seat.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+    }
+    sync(&[&alder, &birch]);
+    let mut trimmed = false;
+    for _ in 0..4 {
+        for node in [&alder, &birch] {
+            trimmed |= kinds(&step(node, &context)).contains(&"trimmed");
+        }
+        sync(&[&alder, &birch]);
+    }
+    assert!(trimmed, "the fixture reached a trim");
+    for node in [&alder, &birch] {
+        let indexes = (0..=node.index().unwrap()).collect::<Vec<_>>();
+        super::card_fold_tests::assert_card_fold_parity(node, &indexes);
+    }
+}

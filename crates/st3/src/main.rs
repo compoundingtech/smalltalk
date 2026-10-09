@@ -1889,6 +1889,15 @@ struct MissionRunStartArgs {
     #[arg(long, value_name = "RUN")]
     #[arg(add = ArgValueCompleter::new(Complete(Entity::MissionRun { unfinished_only: true })))]
     after: Option<String>,
+    /// Tell this agent when the run fails, is cancelled or stalls, replacing the mission's own
+    /// `report-to`. A run that sits 30 minutes without progress counts as stalled unless the
+    /// mission sets `stalled-after`.
+    #[arg(long, value_name = "AGENT")]
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+    report_to: Option<String>,
+    /// Also tell the reporting agent when the run completes.
+    #[arg(long, requires = "report_to")]
+    report_completed: bool,
     /// Follow until finished or stopped; retry timeouts and wait up to 5min for an unreachable daemon.
     #[arg(long)]
     follow: bool,
@@ -4618,7 +4627,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
-    run_cli(cli)
+    run_cli(
+        cli,
+        matches.subcommand_name().expect("a subcommand was parsed"),
+    )
 }
 
 /// Export the runtime fence before any provider or runtime worker thread starts. Fresh
@@ -4770,11 +4782,35 @@ fn record_daemon_commands(args: &UpArgs) {
 }
 
 #[tokio::main]
-async fn run_cli(cli: Cli) -> ExitCode {
+async fn run_cli(cli: Cli, command_name: &str) -> ExitCode {
     if matches!(&cli.command, Command::Driver(_)) {
         st3::telemetry::local_only();
     }
-    match run(cli).await {
+    let _telemetry = (!matches!(
+        &cli.command,
+        Command::Driver(_) | Command::Up(_) | Command::ReplicationWorker(_)
+    ))
+    .then(|| st3::otel::Telemetry::init(st3::otel::Unit::Cli, None));
+    let command_span = if st3::otel::export_enabled() {
+        tracing::info_span!("st3.cli.command", span.label = command_name)
+    } else {
+        tracing::Span::none()
+    };
+    let result = {
+        use tracing::Instrument as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        let result = run(cli).instrument(command_span.clone()).await;
+        if result.as_ref().is_err_and(|error| {
+            !error
+                .downcast_ref::<CommandExit>()
+                .is_some_and(|exit| exit.0 == 0)
+        }) {
+            command_span.set_status(opentelemetry::trace::Status::error("command failed"));
+        }
+        result
+    };
+    drop(command_span);
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             if let Some(exit) = error.downcast_ref::<CommandExit>() {
@@ -4941,7 +4977,7 @@ async fn run(cli: Cli) -> Result<()> {
         let code = st3::sekrets::cli::run(args, cli.json).await?;
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
-        std::process::exit(code);
+        return Err(CommandExit(code as u8).into());
     }
     if let Command::Admission { command } = cli.command {
         return run_admission(command, cli.json);
@@ -4974,7 +5010,11 @@ async fn run(cli: Cli) -> Result<()> {
         }
         config.apply_fleet_file()?;
         st3::node_identity::resolve(&mut config)?;
-        return st3::peer::run_worker(config).await;
+        let mut telemetry =
+            st3::otel::Telemetry::init(st3::otel::Unit::ReplicationWorker, Some(&config.node));
+        let result = st3::peer::run_worker(config).await;
+        telemetry.shutdown();
+        return result;
     }
     let config = Config::load_unvalidated(None)?;
     let endpoint = cli
@@ -5624,6 +5664,7 @@ mod private_gateway_tests {
 }
 
 async fn run_up(args: UpArgs) -> Result<()> {
+    let args_config = args.config.clone();
     let private_state = args.state_dir.is_some();
     let private_socket = args.socket.is_some();
     let explicit_gateway = args.client_gateway_socket.is_some();
@@ -5663,6 +5704,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     }
     config.apply_fleet_file()?;
     let _state_identity = st3::node_identity::acquire(&mut config)?;
+    let mut telemetry = st3::otel::Telemetry::init(st3::otel::Unit::Daemon, Some(&config.node));
     config.validate()?;
     st3::resource::configure_github(&config)?;
     validate_unix_socket_path(&config.socket, "--socket")?;
@@ -5829,24 +5871,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
         }
     });
     tokio::spawn(st3::profile::watch_runtime_lag());
-    if config.limits.enabled {
-        tokio::spawn(enforce_account_limits(
-            store.clone(),
-            st3::store::LimitsPolicy {
-                stop_at_weekly_percent: config.limits.stop_at_weekly_percent,
-                keep: config.limits.keep.iter().cloned().collect(),
-                notify: config
-                    .limits
-                    .notify
-                    .clone()
-                    .expect("the daemon validated its limits operations agent"),
-                fresh_ms: config
-                    .limits
-                    .fresh_ms()
-                    .expect("the daemon validated its limits freshness"),
-            },
-        ));
-    }
+    // The policy reads `[limits]` again on every pass, so an edit applies without a restart.
+    st3::config::set_daemon_config(args_config.as_deref());
+    tokio::spawn(enforce_account_limits(store.clone(), config.limits.clone()));
     recycle_idle_wal(config.state_dir.join("claims.sqlite3"), Arc::downgrade(&store));
     let _contention_retry = retry_projection_contention(Arc::downgrade(&store), notify.clone(), event_notify.clone(), config.state_dir.clone());
     tokio::spawn(convert_envelope_payloads(store.clone()));
@@ -5927,6 +5954,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         ),
         st3::api::serve_unix_with_ready(&client_gateway_socket, fabric_router(state), ready),
     )?;
+    telemetry.shutdown();
     Ok(())
 }
 
@@ -6899,6 +6927,8 @@ async fn start_mission_run(
         &inputs,
         "run",
         after.as_deref(),
+        args.report_to.as_deref(),
+        args.report_completed,
     );
     if args.print_kdl {
         print!("{kdl}");
@@ -7190,6 +7220,8 @@ fn mission_run_intent(
     inputs: &BTreeMap<String, String>,
     mode: &str,
     after: Option<&str>,
+    report_to: Option<&str>,
+    report_completed: bool,
 ) -> String {
     let mut run = KdlNode::new("mission-run");
     run.entries_mut().push(KdlEntry::new(run_id));
@@ -7211,6 +7243,13 @@ fn mission_run_intent(
     }
     if let Some(after) = after {
         body.nodes_mut().push(kdl_node("after", [after]));
+    }
+    if let Some(report_to) = report_to {
+        body.nodes_mut().push(kdl_node("report-to", [report_to]));
+        if report_completed {
+            body.nodes_mut()
+                .push(kdl_node("report-completed", ["true"]));
+        }
     }
     run.set_children(body);
     publication_document(run)
@@ -9302,12 +9341,36 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
         for limit in limits {
             let _ = writeln!(
                 output,
-                "{}  {}  {}  {}  {}",
+                "{}  {}  {}  {}  {}{}",
                 percent(&limit["weekly_percent"]),
                 percent(&limit["five_hour_percent"]),
                 time(&limit["weekly_resets_at_unix_ms"]),
                 time(&limit["measured_at_unix_ms"]),
                 account_name(&limit["account"], &limit["account_ref"]),
+                if limit["exempt"].as_bool() == Some(true) {
+                    "  exempt"
+                } else {
+                    ""
+                },
+            );
+        }
+        let names = |key: &str| {
+            report["limits_policy"][key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let (accounts, harnesses) = (names("exempt_accounts"), names("exempt_harnesses"));
+        if !accounts.is_empty() || !harnesses.is_empty() {
+            let _ = writeln!(
+                output,
+                "EXEMPT  never stopped at {}% · accounts: {} · harnesses: {}",
+                report["limits_policy"]["stop_at_weekly_percent"],
+                if accounts.is_empty() { "none" } else { &accounts },
+                if harnesses.is_empty() { "none" } else { &harnesses },
             );
         }
     }
@@ -13228,15 +13291,10 @@ async fn run_agent_inspection(
         .await;
     }
     let generated = generated_client(endpoint, None)?;
-    let response = if let Some(status) = args.status.as_deref() {
-        generated
-            .agents_list_for_status(status, args.cursor.as_deref(), Some(args.limit), args.all)
-            .await?
-    } else {
-        generated
-            .agents_list(args.cursor.as_deref(), Some(args.limit), args.all)
-            .await?
-    };
+    // A command shows what was written before it ran.
+    let response = generated
+        .agents_list_fresh(args.status.as_deref(), args.cursor.as_deref(), Some(args.limit), args.all)
+        .await?;
     if json_output {
         print_value(&response, true)?;
         note_partial_page(&response.value);
@@ -23059,11 +23117,36 @@ fn idempotency(kdl: &str, tokens: &BTreeMap<String, Vec<String>>) -> String {
 /// never replicate, so this never changes what any peer holds.
 /// Apply this node's `[limits]` policy every two minutes: stop the seats it hosts on an account
 /// past its weekly limit, and notify operations once per weekly window.
-async fn enforce_account_limits(store: Arc<Store>, policy: st3::store::LimitsPolicy) {
+async fn enforce_account_limits(store: Arc<Store>, started_with: st3::config::LimitsConfig) {
     const LIMITS_INTERVAL: Duration = Duration::from_secs(2 * 60);
+    let mut limits = started_with;
+    let mut last_error = None::<String>;
     loop {
+        // A config file that is missing, cannot be read or does not validate keeps the last
+        // good policy. The reason is logged when it changes, not on every pass.
+        let reloaded = tokio::task::spawn_blocking(st3::config::reload_daemon_limits)
+            .await
+            .ok()
+            .flatten();
+        match reloaded {
+            Some(Ok(reloaded)) => {
+                limits = reloaded;
+                last_error = None;
+            }
+            Some(Err(error)) => {
+                let error = format!("{error:#}");
+                if last_error.as_ref() != Some(&error) {
+                    eprintln!("st3: limits policy keeps its last config: {error}");
+                    last_error = Some(error);
+                }
+            }
+            None => {}
+        }
+        let Some(policy) = st3::store::LimitsPolicy::from_config(&limits) else {
+            tokio::time::sleep(LIMITS_INTERVAL).await;
+            continue;
+        };
         let pass = store.clone();
-        let policy = policy.clone();
         match tokio::task::spawn_blocking(move || {
             st3::profile::task("task enforce-account-limits", || {
                 let now = now_ms();
@@ -23460,7 +23543,8 @@ impl WalCheckpointLogBucket {
     }
 }
 /// Counts checkpoint samples in a row that left part of the WAL un-copied and copied no more
-/// than the sample before: some reader holds an older snapshot open.
+/// than the sample before. This is neither holder identity nor snapshot age; errors retain
+/// the previous count without advancing it.
 #[derive(Default)]
 struct WalPinTracker {
     last_backfilled: Option<i32>,
@@ -23661,19 +23745,15 @@ fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
                         None => json!({"outcome":"error", "phase_durations_available":false}),
                     };
                     let pinned = (stuck >= WAL_PIN_REPORT_AFTER).then(|| {
-                        let oldest = smallclaims::sqlite::oldest_live_read();
                         json!({
                             "stuck_samples": stuck,
-                            "oldest_live_read": oldest.as_ref().map(|read| json!({
-                                "age_ms": read.age_ms,
-                                "kind": if read.snapshot { "snapshot" } else { "lent-connection" },
-                                "at": read.at,
-                            })),
-                            "live_reads": oldest.as_ref().map(|read| read.live),
+                            "read_lifetimes": store.readers.live_read_report(),
                         })
                     });
                     eprintln!("st3: WAL checkpoint {}", json!({
                         "bucket": if abnormal { "abnormal" } else { "ordinary" },
+                        "observed_at_unix_ms": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH).ok().map(|age| age.as_millis()),
                         "report": outcome, "duration_ms": duration_ms, "retained": retained,
                         "pinned": pinned,
                     }));
@@ -24873,6 +24953,19 @@ mod tests {
             output_with_limits
                 .contains("96%  ?  2027-01-15 08:00 UTC  2027-01-03 18:13 UTC  claude/aaaa"),
             "{output_with_limits}"
+        );
+        let exempt = json!({"rows": [], "limits": [
+            {"account": "codex/aaaa", "weekly_percent": 99.0, "five_hour_percent": null, "exempt": true,
+             "weekly_resets_at_unix_ms": 1_800_000_000_000_u64, "measured_at_unix_ms": 1_799_000_000_000_u64},
+            {"account": "claude/bbbb", "weekly_percent": 50.0, "five_hour_percent": null, "exempt": false,
+             "weekly_resets_at_unix_ms": 1_800_000_000_000_u64, "measured_at_unix_ms": 1_799_000_000_000_u64},
+        ], "limits_policy": {"stop_at_weekly_percent": 95, "exempt_accounts": ["ada/codex"], "exempt_harnesses": []}});
+        let output_exempt = render_usage_report(&exempt, 24, None);
+        assert!(output_exempt.contains("codex/aaaa  exempt\n"), "{output_exempt}");
+        assert!(output_exempt.contains("claude/bbbb\n"), "{output_exempt}");
+        assert!(
+            output_exempt.contains("EXEMPT  never stopped at 95% · accounts: ada/codex · harnesses: none"),
+            "{output_exempt}"
         );
         let by_step = render_usage_report(&report, 24, Some(UsageBy::Step));
         assert_eq!(by_step.matches("USAGE  ").count(), 1);
@@ -27385,6 +27478,8 @@ mod tests {
                     &BTreeMap::new(),
                     "run",
                     None,
+                    None,
+                    false,
                 );
                 let intent = st3::graph::parse_intent(&kdl, "node").unwrap();
                 assert!(
@@ -27464,6 +27559,8 @@ mod tests {
             &BTreeMap::new(),
             "run",
             Some("mission-run/release/build/1"),
+            None,
+            false,
         );
         assert!(
             kdl.contains("after \"mission-run/release/build/1\""),
@@ -27477,6 +27574,79 @@ mod tests {
         assert_eq!(
             creation.after.as_deref(),
             Some("mission-run/release/build/1")
+        );
+    }
+
+    #[test]
+    fn mission_start_report_to_names_an_agent_and_completion_needs_one() {
+        let cli = Cli::try_parse_from([
+            "st3",
+            "missions",
+            "start",
+            "release/demo",
+            "--report-to",
+            "agent/ops/watcher",
+            "--report-completed",
+            "--as",
+            "person/operator",
+        ])
+        .unwrap();
+        let Command::Missions {
+            command: MissionViewCommand::Start(args),
+        } = cli.command
+        else {
+            panic!("the mission start command did not parse");
+        };
+        assert_eq!(args.report_to.as_deref(), Some("agent/ops/watcher"));
+        assert!(args.report_completed);
+        let kdl = mission_run_intent(
+            "release/demo/3",
+            "release/demo",
+            &"a".repeat(64),
+            Path::new("/work/demo"),
+            "person/operator",
+            &BTreeMap::new(),
+            "run",
+            None,
+            args.report_to.as_deref(),
+            args.report_completed,
+        );
+        let intent = st3::graph::parse_intent(&kdl, "node").unwrap();
+        let creation = intent.mission_runs["mission-run/release/demo/3"]
+            .creation
+            .as_ref()
+            .unwrap();
+        assert_eq!(creation.report_to.as_deref(), Some("agent/ops/watcher"));
+        assert!(creation.report_completed);
+
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "missions",
+                "start",
+                "release/demo",
+                "--report-completed",
+                "--as",
+                "person/operator",
+            ])
+            .is_err(),
+            "--report-completed means nothing without --report-to"
+        );
+        let person = mission_run_intent(
+            "release/demo/4",
+            "release/demo",
+            &"a".repeat(64),
+            Path::new("/work/demo"),
+            "person/operator",
+            &BTreeMap::new(),
+            "run",
+            None,
+            Some("person/ada"),
+            false,
+        );
+        assert_eq!(
+            st3::graph::parse_intent(&person, "node").unwrap_err().code,
+            "invalid-report-to"
         );
     }
 
@@ -30179,6 +30349,8 @@ mission "review" state="ready" {
                     workspace: root.path().to_path_buf(),
                     inputs: Vec::new(),
                     after: None,
+                    report_to: None,
+                    report_completed: false,
                     follow: false,
                     actor: "person/test".into(),
                     print_kdl: false,
@@ -30256,6 +30428,8 @@ mission "review" state="ready" {
                 workspace: starter_root.path().to_path_buf(),
                 inputs: Vec::new(),
                 after: None,
+                report_to: None,
+                report_completed: false,
                 follow: false,
                 actor: "person/test".into(),
                 print_kdl: false,

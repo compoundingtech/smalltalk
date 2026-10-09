@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Never fold more than 250 agents roster cards in one read snapshot",
+  "replay": {"status": "none", "detail": "No claim replay or stored history changes."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."},
+  "compatibility": {"status": "none", "detail": "Responses are unchanged. The background refresher completes a roster only when at most 250 cards are changed or missing, otherwise in 250-card steps; readers keep the previous roster meanwhile."},
+  "downtime": {"status": "none", "detail": "No additional service interruption or startup migration is required."},
+  "manual": {"status": "none", "detail": "No action is required."},
+  "recovery": {"status": "none", "detail": "Only volatile in-memory caches change; reverting restores unbounded final folds."}
+}
