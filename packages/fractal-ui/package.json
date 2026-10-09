@@ -18,7 +18,8 @@
   "scripts": {
     "storybook": "storybook dev -p 53705 --host 127.0.0.1 --no-open --disable-telemetry",
     "build-storybook": "storybook build --disable-telemetry",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:palettes": "node --test src/legacy-palettes.test.mjs"
   },
   "dependencies": {
     "react": "19.2.3",
