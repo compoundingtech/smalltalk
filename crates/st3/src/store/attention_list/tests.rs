@@ -186,7 +186,8 @@ fn claims_attention_never_reads_republish_the_same_rows_without_a_fold() {
 fn custom_requests_converge_whichever_order_replication_delivers_them() {
     let left = Store::open_memory("alder").unwrap();
     let right = Store::open_memory("birch").unwrap();
-    let at = now_ms() + 60_000;
+    // Both writers date their request the same past instant, so neither waits to be eligible.
+    let at = now_ms() - 60_000;
     for (store, person) in [(&left, "person/lichen"), (&right, "person/avery")] {
         store.set_write_clock_at(at).unwrap();
         custom(store, "custom/garden/review/v1/concurrent", person);
