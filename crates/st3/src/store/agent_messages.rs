@@ -56,7 +56,12 @@ pub(super) fn create_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+// Opening the daemon never pays for the optional usage estimate's historical backfill.
 pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
+    flush(transaction)
+}
+
+fn ensure_ready(transaction: &Transaction<'_>) -> Result<()> {
     let filled: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM meta WHERE key='agent_message_days_v1')",
         [],
@@ -70,7 +75,7 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
              SELECT DISTINCT subject FROM claims WHERE kind='message.sent';",
         )?;
     }
-    flush(transaction)?;
+    flush_pending(transaction)?;
     if !filled {
         transaction.execute(
             "INSERT INTO meta(key,value) VALUES('agent_message_days_v1','1')",
@@ -134,6 +139,18 @@ fn eligible(fields: &Value) -> bool {
 }
 
 pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
+    let ready: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key='agent_message_days_v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    if ready {
+        flush_pending(transaction)?;
+    }
+    Ok(())
+}
+
+fn flush_pending(transaction: &Transaction<'_>) -> Result<()> {
     let pending = transaction
         .prepare_cached("SELECT subject FROM local_agent_message_pending")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -211,9 +228,46 @@ pub(super) fn windows(since: u64, until: u64) -> Vec<(u64, u64)> {
         .collect()
 }
 
+// A caller's pinned snapshot cannot be initialized by a later writer commit. Fold that
+// snapshot's retained sends instead, with the same earliest-send arbitration and eligibility.
+fn snapshot_sends(connection: &Connection) -> Result<Vec<(u64, String)>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT sent_ms,body FROM (
+             SELECT CAST(accepted_at_unix_ms AS INTEGER) AS sent_ms,body,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY subject ORDER BY CAST(accepted_at_unix_ms AS INTEGER),id
+                    ) AS rank
+             FROM claims WHERE kind='message.sent'
+         ) WHERE rank=1"
+    )?;
+    let mut rows = statement.query([])?;
+    let mut sends = Vec::new();
+    while let Some(row) = rows.next()? {
+        let body: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
+        if eligible(&body["fields"]) {
+            sends.push((row.get(0)?, body["fields"]["to"].as_str().unwrap().to_owned()));
+        }
+    }
+    Ok(sends)
+}
+
 impl Store {
     pub(super) fn agent_message_estimate(&self, days: &[DailyUsage]) -> Result<Value> {
+        // Complete the migration atomically on the first estimate request, never return
+        // partially backfilled counts. Subsequent writes maintain the ready index as before.
+        let ready: bool = self.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='agent_message_days_v1')",
+            [],
+            |row| row.get(0),
+        )?;
+        let pinned = PINNED_READER.with(|slot| {
+            slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == self.readers.key())
+        });
+        if !ready && !pinned {
+            self.connection.batched(ensure_ready).map_err(anyhow::Error::msg)??;
+        }
         let connection = self.readers.get();
+        let snapshot_sends = (!ready && pinned).then(|| snapshot_sends(&connection)).transpose()?;
         let calibration: Option<(String, Vec<u8>)> = connection
             .query_row(
                 "SELECT d.hash,b.bytes FROM documents d JOIN blobs b ON b.hash=d.hash
@@ -249,7 +303,15 @@ impl Store {
         } in days
         {
             let day = since / DAY_MS * DAY_MS;
-            let counts = if since == day && until == day.saturating_add(DAY_MS) {
+            let counts = if let Some(sends) = &snapshot_sends {
+                let mut counts = BTreeMap::<String, u64>::new();
+                for (sent_ms, recipient) in sends {
+                    if since <= *sent_ms && *sent_ms < until {
+                        *counts.entry(recipient.clone()).or_default() += 1;
+                    }
+                }
+                counts.into_iter().collect()
+            } else if since == day && until == day.saturating_add(DAY_MS) {
                 connection
                     .prepare_cached(
                         "SELECT recipient,count FROM agent_message_days WHERE day_ms=?1",
@@ -342,6 +404,98 @@ mod tests {
             })
             .unwrap()
             .unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an exclusively owned copied corpus in ST3_AGENT_MESSAGES_CORPUS"]
+    fn copied_corpus_lazy_backfill_benchmark() {
+        let path = std::env::var("ST3_AGENT_MESSAGES_CORPUS").unwrap();
+        let mut connection = Connection::open(path).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute("DELETE FROM meta WHERE key='agent_message_days_v1'", []).unwrap();
+        let started = std::time::Instant::now();
+        ensure_ready(&transaction).unwrap();
+        let eager = started.elapsed();
+        let expected = transaction.prepare(
+            "SELECT day_ms,recipient,count FROM agent_message_days ORDER BY day_ms,recipient"
+        ).unwrap().query_map([], |row| Ok((
+            row.get::<_, u64>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?
+        ))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        transaction.rollback().unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute("DELETE FROM meta WHERE key='agent_message_days_v1'", []).unwrap();
+        let started = std::time::Instant::now();
+        open(&transaction).unwrap();
+        let lazy_open = started.elapsed();
+        let started = std::time::Instant::now();
+        ensure_ready(&transaction).unwrap();
+        let lazy_first_estimate = started.elapsed();
+        let actual = transaction.prepare(
+            "SELECT day_ms,recipient,count FROM agent_message_days ORDER BY day_ms,recipient"
+        ).unwrap().query_map([], |row| Ok((
+            row.get::<_, u64>(0)?, row.get::<_, String>(1)?, row.get::<_, u64>(2)?
+        ))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(actual, expected);
+        println!("eager_open={eager:?} lazy_open={lazy_open:?} first_estimate={lazy_first_estimate:?} messages={}",
+            actual.iter().map(|(_, _, count)| count).sum::<u64>());
+        transaction.rollback().unwrap();
+    }
+
+    #[test]
+    fn first_estimate_in_pinned_snapshot_does_not_write_or_see_later_sends() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("pinned.sqlite3"), "node").unwrap();
+        let fields = json!({"from":"agent/alder","to":"agent/birch","status":"sent"});
+        send(&store, "message/old", DAY_MS + 1, fields.clone());
+        let day = [(DAY_MS, 2 * DAY_MS, 1_000_000, 0)];
+        let pinned = store.read_snapshot(|_| {
+            std::thread::scope(|scope| {
+                scope.spawn(|| send(&store, "message/new", DAY_MS + 2, fields));
+            });
+            estimate_days(&store, &day)
+        }).unwrap();
+        assert_eq!(pinned["days"][0]["messages"], 1);
+        let ready: bool = store.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='agent_message_days_v1')",
+            [], |row| row.get(0)
+        ).unwrap();
+        assert!(!ready);
+        assert_eq!(estimate_days(&store, &day).unwrap()["days"][0]["messages"], 2);
+    }
+
+    #[test]
+    fn legacy_open_defers_estimate_backfill_without_losing_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("lazy.sqlite3");
+        let fields = json!({"from":"agent/alder","to":"agent/birch","status":"sent"});
+        {
+            let store = Store::open(&path, "node").unwrap();
+            send(&store, "message/old", DAY_MS + 1, fields.clone());
+            store.connection.batched(|tx| {
+                tx.execute("DELETE FROM meta WHERE key='agent_message_days_v1'", [])?;
+                tx.execute("DELETE FROM agent_message_sends", [])?;
+                tx.execute("DELETE FROM local_agent_message_pending", [])?;
+                Ok::<_, anyhow::Error>(())
+            }).unwrap().unwrap();
+        }
+        let store = Store::open(&path, "node").unwrap();
+        let counts: (u64, u64) = store.readers.get().query_row(
+            "SELECT (SELECT COUNT(*) FROM agent_message_sends),
+                    (SELECT COUNT(*) FROM local_agent_message_pending)",
+            [], |row| Ok((row.get(0)?, row.get(1)?))
+        ).unwrap();
+        assert_eq!(counts, (0, 0));
+        send(&store, "message/new", DAY_MS + 2, fields);
+        let day = [(DAY_MS, 2 * DAY_MS, 1_000_000, 0)];
+        assert_eq!(estimate_days(&store, &day).unwrap()["days"][0]["messages"], 2);
+        store.connection.batched(|tx| {
+            tx.execute("DELETE FROM claims WHERE subject='message/old'", [])?;
+            flush(tx)
+        }).unwrap().unwrap();
+        assert_eq!(estimate_days(&store, &day).unwrap()["days"][0]["messages"], 1);
+        drop(store);
+        let reopened = Store::open(&path, "node").unwrap();
+        assert_eq!(estimate_days(&reopened, &day).unwrap()["days"][0]["messages"], 1);
     }
 
     #[test]
