@@ -80,6 +80,8 @@ struct Item {
     due: Option<u128>,
     dirty: bool,
     generation: u64,
+    /// Async intake completion can arrive while a selected evaluation records its reads.
+    completion: u64,
 }
 
 /// The keys a change can affect: its subject, its actor's work, its kind, and for some kinds a
@@ -275,6 +277,55 @@ impl Incremental {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::mark_locked(&mut state, key);
+    }
+
+    /// Mark only this retained intake item when an arm completes, including completion with
+    /// no claim write. No completion queue is allocated. Missing/overflowed state conservatively
+    /// invalidates retained work, including a first arm that finishes before its first evaluation.
+    pub(crate) fn intake_completed(&self, item: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = state.items.get_mut(item)
+            && let Some(next) = cached.completion.checked_add(1)
+        {
+            cached.completion = next;
+            cached.dirty = true;
+            return;
+        }
+        Self::invalidate_locked(&mut state);
+    }
+
+    pub(crate) fn intake_completion_token(&self, item: &str) -> (u64, Option<u64>) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            state.generation,
+            state.items.get(item).map(|item| item.completion),
+        )
+    }
+
+    /// A successful generic evaluation clears dirty. Preserve a completion that overlapped
+    /// this consumer's evaluation instead of silently consuming its notification/retry progress.
+    /// Other item/effect evaluators keep their existing behavior.
+    pub(crate) fn retain_intake_completion(&self, item: &str, before: (u64, Option<u64>)) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = state.generation != before.0
+            || before.1.is_some_and(|version| {
+                state
+                    .items
+                    .get(item)
+                    .is_none_or(|item| item.completion != version)
+            });
+        if changed && let Some(cached) = state.items.get_mut(item) {
+            cached.dirty = true;
+        }
     }
 
     /// Whether this pass must evaluate every item of `section`: the first since a start, or the
@@ -536,6 +587,7 @@ impl Incremental {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = state.generation;
+        let completion = state.items.get(item).map_or(0, |item| item.completion);
         let State { items, readers, .. } = &mut *state;
         if let Some(previous) = items.get(item) {
             for key in &previous.reads {
@@ -560,6 +612,7 @@ impl Incremental {
                 due,
                 dirty: false,
                 generation,
+                completion,
             },
         );
     }

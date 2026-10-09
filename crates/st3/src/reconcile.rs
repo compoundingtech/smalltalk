@@ -11629,6 +11629,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if skip && !self.incremental.needs(item, now_ms()) {
             return;
         }
+        let completion = self.incremental.intake_completion_token(item);
         if self
             .isolate(section, subject, || {
                 self.reconcile_item(section, item, skip, || {
@@ -11650,6 +11651,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             self.incremental.touch(item);
         }
+        self.incremental.retain_intake_completion(item, completion);
     }
 
     fn schedules_caught_up(&self) -> Result<bool> {
@@ -11819,6 +11821,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let store = self.store.clone();
         let notify = self.notify.clone();
         let event_notify = self.event_notify.clone();
+        let incremental = self.incremental.clone();
         let armed = self.armed_schedules.clone();
         let schedule_subject = schedule.subject.clone();
         let schedule_declaration = schedule.clone();
@@ -11856,6 +11859,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&operation);
+                    incremental.intake_completed(&format!("schedule:{schedule_subject}"));
+                    incremental.intake_completed(&format!("schedule-work:{schedule_subject}"));
                     signal_changed(&notify, &event_notify);
                     return;
                 }
@@ -11882,6 +11887,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&operation);
+                    incremental.intake_completed(&format!("schedule:{schedule_subject}"));
+                    incremental.intake_completed(&format!("schedule-work:{schedule_subject}"));
                     signal_changed(&notify, &event_notify);
                     return;
                 }
@@ -11945,6 +11952,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .remove(&operation);
+                        incremental.intake_completed(&format!("schedule:{schedule_subject}"));
+                        incremental.intake_completed(&format!("schedule-work:{schedule_subject}"));
                         signal_changed(&notify, &event_notify);
                         return;
                     };
@@ -11975,6 +11984,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&operation);
+                incremental.intake_completed(&format!("schedule:{schedule_subject}"));
+                incremental.intake_completed(&format!("schedule-work:{schedule_subject}"));
                 signal_changed(&notify, &event_notify);
             });
         } else {
@@ -13019,6 +13030,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let provider = self.resource_provider.clone();
         let notify = self.notify.clone();
         let event_notify = self.event_notify.clone();
+        let incremental = self.incremental.clone();
         let armed = self.armed_observers.clone();
         #[cfg(test)]
         let completion_fault = self.fault_injection.clone();
@@ -13067,6 +13079,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&operation);
+                    incremental.intake_completed(&format!("observer:{observer_subject}"));
                     signal_changed(&notify, &event_notify);
                     return;
                 }
@@ -13095,6 +13108,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if !current()
                     || store.selected_desired_revision(&observer_subject).ok().flatten().as_deref() != Some(revision.as_str()) {
                     armed.lock().unwrap_or_else(PoisonError::into_inner).remove(&operation);
+                    incremental.intake_completed(&format!("observer:{observer_subject}"));
                     signal_changed(&notify, &event_notify);
                     return;
                 }
@@ -13256,6 +13270,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if let Some(injection) = &completion_fault {
                     injection.fault("observer-completion-finished", &observer_subject);
                 }
+                incremental.intake_completed(&format!("observer:{observer_subject}"));
                 signal_changed(&notify, &event_notify);
             });
         } else {

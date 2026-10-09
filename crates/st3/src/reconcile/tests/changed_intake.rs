@@ -489,6 +489,7 @@ schedule "later" {{ at "{at}"; work {{ mission "scheduled-cycle@{revision}"; wor
 
 /// A real provider call remains pending after the observer's armed timer has fired.
 struct PendingProvider {
+    fail: bool,
     calls: Arc<AtomicUsize>,
     entered: Arc<Notify>,
     release: Arc<Notify>,
@@ -508,6 +509,9 @@ impl ResourceProvider for PendingProvider {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.entered.notify_one();
             self.release.notified().await;
+            if self.fail {
+                anyhow::bail!("fixture connection reset");
+            }
             Ok(crate::resource::ProviderObservation {
                 facts: serde_json::json!({"issues":[]}),
                 cursor: Some("completed".into()),
@@ -536,6 +540,7 @@ async fn an_elapsed_observer_deadline_is_consumed_while_the_real_provider_is_pen
     .skipping_unneeded(true)
     .with_fault_injection(entries.clone())
     .with_resource_provider(Arc::new(PendingProvider {
+        fail: false,
         calls: calls.clone(),
         entered: entered.clone(),
         release: release.clone(),
@@ -731,5 +736,133 @@ schedule "later" {{ every "1h"; anchor "{anchor}"
             .unwrap()
             .len(),
         2
+    );
+}
+
+#[test]
+fn an_overlapping_timer_completion_survives_selected_evaluation_recording() {
+    let _clock = Clock::at(START);
+    let (store, reconciler, _) = fixture(1);
+    let desired = store.desired_subjects().unwrap();
+    stages(&reconciler, &desired);
+    let item = "observer:observer/repo-0";
+    // Force a real selected recorder to finish AFTER the completion's dirty mark. A generic
+    // successful evaluation clears dirty; the intake token must retain this overlapping event.
+    reconciler.reconcile_selected_intake("observer", item, "observer/repo-0", false, || {
+        reconciler.incremental.intake_completed(item);
+        Ok(())
+    });
+    assert!(reconciler.incremental.needs(item, START));
+    reconciler.reconcile_selected_intake("observer", item, "observer/repo-0", true, || Ok(()));
+    assert!(!reconciler.incremental.needs(item, START));
+    let new = "observer:observer/new";
+    reconciler.reconcile_selected_intake("observer", new, "observer/new", false, || {
+        reconciler.incremental.intake_completed(new);
+        Ok(())
+    });
+    assert!(
+        reconciler.incremental.needs(new, START),
+        "first-arm completion before registration"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn unchanged_provider_failure_without_a_claim_still_selects_the_new_retry_deadline() {
+    let clock = Clock::at(START);
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    store.set_write_clock_at(START).unwrap();
+    apply_source(&store, SCRIPTED_OBSERVER, "unchanged-provider-failure");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let reconciler = Reconciler::new(
+        store.clone(),
+        Arc::new(FakeRuntime::default()),
+        "node".into(),
+        Arc::new(Notify::new()),
+    )
+    .skipping_unneeded(true)
+    .with_resource_provider(Arc::new(PendingProvider {
+        fail: true,
+        calls: calls.clone(),
+        entered: entered.clone(),
+        release: release.clone(),
+    }));
+    let desired = store.desired_subjects().unwrap();
+    let mut completion = reconciler.event_notify.subscribe();
+    reconciler
+        .reconcile_resource_observers(&desired, &desired)
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), completion.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .claims_for("observer/repo", Some("observer.state"))
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        reconciler
+            .incremental
+            .needs("observer:observer/repo", START)
+    );
+    reconciler
+        .reconcile_resource_observers(&desired, &desired)
+        .unwrap();
+    assert_eq!(
+        reconciler.incremental.next_due("observer:"),
+        Some(START + 60_000)
+    );
+    tokio::task::yield_now().await;
+    clock.set(START + 60_000);
+    tokio::time::advance(Duration::from_millis(60_000)).await;
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    reconciler
+        .reconcile_resource_observers(&desired, &desired)
+        .unwrap();
+    assert_eq!(reconciler.incremental.next_due("observer:"), None);
+    assert!(
+        !reconciler
+            .incremental
+            .needs("observer:observer/repo", now_ms())
+    );
+    let before = store.index();
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), completion.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.index(),
+        before,
+        "unchanged failure publishes no new claim"
+    );
+    assert!(
+        reconciler
+            .incremental
+            .needs("observer:observer/repo", now_ms()),
+        "completion itself must select work without append hints"
+    );
+    reconciler
+        .reconcile_resource_observers(&desired, &desired)
+        .unwrap();
+    assert_eq!(
+        reconciler.incremental.next_due("observer:"),
+        Some(START + 120_000)
+    );
+    assert!(
+        !reconciler
+            .incremental
+            .needs("observer:observer/repo", now_ms())
     );
 }
