@@ -6,6 +6,8 @@ mod arrangements;
 mod arrangements_tests;
 #[cfg(test)]
 mod authored_pull_requests_tests;
+#[cfg(test)]
+mod schedule_active_run_tests;
 mod glasses;
 pub(crate) mod mailbox_wakes;
 mod mailbox_changes;
@@ -15376,17 +15378,27 @@ impl Store {
             .map_err(Into::into)
     }
 
+    // Expose the bare primary key for a seek, retaining the original equality as the
+    // prefix/type/collation filter. Byte slicing preserves embedded NULs; the second
+    // key also preserves SQLite blob-valued IDs without scanning other runs. The
+    // prefix byte length follows the database encoding.
+    const SCHEDULE_ACTIVE_STARTED_RUN_QUERY: &str = "SELECT EXISTS(
+        SELECT 1 FROM claims AS started
+        JOIN mission_runs AS run
+          ON run.id IN (
+               CAST(substr(CAST(json_extract(started.body, '$.fields.mission_run') AS BLOB), length(CAST('mission-run/' AS BLOB))+1) AS TEXT),
+               substr(CAST(json_extract(started.body, '$.fields.mission_run') AS BLOB), length(CAST('mission-run/' AS BLOB))+1)
+             )
+         AND json_extract(started.body, '$.fields.mission_run')='mission-run/' || run.id
+        WHERE started.subject=?1 AND started.kind='schedule.work-started'
+          AND run.status NOT IN ('completed','cancelled','failed')
+    )";
+
     pub fn schedule_has_active_started_run(&self, subject: &str) -> Result<bool> {
         let connection = self.readers.get();
         connection
             .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM claims AS started
-                   JOIN mission_runs AS run
-                     ON json_extract(started.body, '$.fields.mission_run')='mission-run/' || run.id
-                   WHERE started.subject=?1 AND started.kind='schedule.work-started'
-                     AND run.status NOT IN ('completed','cancelled','failed')
-                 )",
+                Self::SCHEDULE_ACTIVE_STARTED_RUN_QUERY,
                 [subject],
                 |row| row.get(0),
             )
