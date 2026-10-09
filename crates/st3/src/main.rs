@@ -6035,7 +6035,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         event_notify.clone(),
         recorder.map(|installation| installation.directory),
     )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()).with_person(config.person.clone()));
-    tokio::spawn(reconciler.supervise());
+    reconciler.set_max_passes_per_minute(config.reconcile.max_passes_per_minute)?;
+    tokio::spawn(reconciler.clone().supervise());
     // A start no longer rebuilds the operation projection; check it once the API serves.
     tokio::spawn({
         let store = store.clone();
@@ -6054,7 +6055,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     tokio::spawn(st3::profile::watch_runtime_lag());
     // The policy reads `[limits]` again on every pass, so an edit applies without a restart.
     st3::config::set_daemon_config(args_config.as_deref());
-    tokio::spawn(enforce_account_limits(store.clone(), config.limits.clone()));
+    tokio::spawn(enforce_account_limits(store.clone(), config.limits.clone(), reconciler));
     recycle_idle_wal(config.state_dir.join("claims.sqlite3"), Arc::downgrade(&store));
     let _contention_retry = retry_projection_contention(Arc::downgrade(&store), notify.clone(), event_notify.clone(), config.state_dir.clone());
     tokio::spawn(convert_envelope_payloads(store.clone()));
@@ -23306,26 +23307,29 @@ fn idempotency(kdl: &str, tokens: &BTreeMap<String, Vec<String>>) -> String {
 /// never replicate, so this never changes what any peer holds.
 /// Apply this node's `[limits]` policy every two minutes: stop the seats it hosts on an account
 /// past its weekly limit, and notify operations once per weekly window.
-async fn enforce_account_limits(store: Arc<Store>, started_with: st3::config::LimitsConfig) {
+async fn enforce_account_limits(store: Arc<Store>, started_with: st3::config::LimitsConfig, reconciler: Arc<Reconciler>) {
     const LIMITS_INTERVAL: Duration = Duration::from_secs(2 * 60);
     let mut limits = started_with;
     let mut last_error = None::<String>;
     loop {
         // A config file that is missing, cannot be read or does not validate keeps the last
         // good policy. The reason is logged when it changes, not on every pass.
-        let reloaded = tokio::task::spawn_blocking(st3::config::reload_daemon_limits)
+        let reloaded = tokio::task::spawn_blocking(st3::config::reload_daemon_policies)
             .await
             .ok()
             .flatten();
         match reloaded {
-            Some(Ok(reloaded)) => {
+            Some(Ok((reloaded, reconcile))) => {
+                // Validation already passed; preserve last-start history while changing the rate.
+                reconciler.set_max_passes_per_minute(reconcile.max_passes_per_minute)
+                    .expect("validated reconcile cap");
                 limits = reloaded;
                 last_error = None;
             }
             Some(Err(error)) => {
                 let error = format!("{error:#}");
                 if last_error.as_ref() != Some(&error) {
-                    eprintln!("st3: limits policy keeps its last config: {error}");
+                    eprintln!("st3: daemon policies keep their last config: {error}");
                     last_error = Some(error);
                 }
             }
