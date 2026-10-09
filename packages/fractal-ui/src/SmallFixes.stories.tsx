@@ -7,6 +7,8 @@ import { MessageNotSentError } from '@assistant-ui/react'
 import { WorkLogV1 } from './assistant-ui/taste/WorkLogV1'
 import { ThinkingEntry } from './assistant-ui/composition/ThinkingEntry'
 import { Transcript } from './assistant-ui/composition/Transcript'
+import { ErrorOverlay } from './assistant-ui/composition/ErrorOverlay'
+import { elevationVars as elevation } from './assistant-ui/composition-tokens.stylex'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
 import { Input, CommandMenu } from './kit'
 import { EmbraceComposer, type EmbraceComposerHandle, type ComposerDraftCause } from './assistant-ui/EmbraceComposer'
@@ -23,6 +25,7 @@ function WorkFocus({ scheme = 'dark' }: { scheme?: Scheme }) {
 }
 const styles = stylex.create({
   root: { padding: s.xl, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, minHeight: '100vh' },
+  dialogElevation: { marginTop: s.xl, padding: s.xl, backgroundColor: surface.raised, boxShadow: elevation.dialog },
   dock: { position: 'fixed', bottom: s.xl, insetInline: s.xl },
 })
 const meta = { title: 'Fractal UI/Small Fixes', component: WorkFocus, args: { scheme: 'dark' }, parameters: { layout: 'fullscreen' } } satisfies Meta<typeof WorkFocus>
@@ -219,3 +222,16 @@ export const FailedSendPreservesNewerDraft: Story = { render: args => <DraftCaus
   await expect(canvas.getByTestId('draft-events')).toHaveTextContent('[]')
 } }
 export const FailedSendPreservesNewerDraftLight: Story = { ...FailedSendPreservesNewerDraft, args: { scheme: 'light' } }
+
+function ElevationSurface({ scheme = 'dark' }: { scheme?: Scheme }) {
+  return <section {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
+    <ErrorOverlay id="synthetic-elevation-failure" title="Run failed" detail="The synthetic command did not complete." />
+    <div data-testid="dialog-elevation" {...stylex.props(styles.dialogElevation)}>Dialog elevation token</div>
+  </section>
+}
+export const LightElevation: Story = { args: { scheme: 'light' }, render: args => <ElevationSurface {...args} />, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const banner = await canvas.findByRole('alert')
+  await expect(getComputedStyle(banner).boxShadow).toBe('rgba(0, 0, 0, 0.18) 0px 18px 44px -18px')
+  await expect(getComputedStyle(canvas.getByTestId('dialog-elevation')).boxShadow).toBe('rgba(0, 0, 0, 0.22) 0px 24px 64px -24px')
+} }

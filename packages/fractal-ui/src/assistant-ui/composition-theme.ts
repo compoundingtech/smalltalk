@@ -1,5 +1,5 @@
 import * as stylex from '@stylexjs/stylex'
-import { surfaceVars, textVars, borderVars, accentVars, statusVars, colorVars } from './composition-tokens.stylex'
+import { surfaceVars, textVars, borderVars, accentVars, statusVars, colorVars, elevationVars } from './composition-tokens.stylex'
 
 export type Scheme = 'dark' | 'light'
 
@@ -76,7 +76,12 @@ const colorTheme = stylex.createTheme(colorVars, {
   scrollThumb: 'rgba(0, 0, 0, 0.15)',
   scrollThumbHover: 'rgba(0, 0, 0, 0.25)',
 })
+export const lightElevationTheme = stylex.createTheme(elevationVars, {
+  popover: '0 18px 44px -18px rgb(0 0 0 / 18%)',
+  dialog: '0 24px 64px -24px rgb(0 0 0 / 22%)',
+})
 
-export const lightThemeWithoutStatus = [surfaceVarsTheme, textVarsTheme, borderVarsTheme, accentVarsTheme, colorTheme] as const
+
+export const lightThemeWithoutStatus = [surfaceVarsTheme, textVarsTheme, borderVarsTheme, accentVarsTheme, colorTheme, lightElevationTheme] as const
 export const lightTheme = [...lightThemeWithoutStatus, lightStatusTheme] as const
 export const lightThemes = { color: colorTheme }
