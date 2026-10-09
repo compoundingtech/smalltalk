@@ -56,3 +56,10 @@ priority = 100
 [[profile.ci.overrides]]
 filter = 'package(st3) and (test(/^action_coverage::/) or test(/^fleet::action_coverage_/))'
 retries = 0
+
+# Keep both measured control intervals visible even when the idle positive passes.
+# A CPU regression or a broken busy negative must remain a failure without retry.
+[[profile.ci.overrides]]
+filter = 'package(st3) and test(/^idle_budget::a_quiescent_daemon_cpu_control_accepts_idle_and_rejects_busy$/)'
+success-output = "immediate"
+retries = 0
