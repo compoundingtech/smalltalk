@@ -104,7 +104,11 @@ fn dormant_operator_accepts_six_nonselecting_action_kinds_and_terminal_observati
             .chain(NON_SELECTING.iter().copied())
             .collect::<Vec<_>>()
     );
-    let text = witness(&encoded(input.clone())).unwrap().unwrap();
+    input["observed"]["evidence"] = json!(vec!["claim/launch-one"; 16]);
+    let text = witness(&encoded(input.clone()))
+        .unwrap()
+        .into_witness()
+        .unwrap();
     assert!(text.contains("exit code 2") && text.contains("will not restart"));
     let mut fixture = Fixture::new();
     fixture.record(mutation("gate/one", Some(input)));
@@ -113,7 +117,7 @@ fn dormant_operator_accepts_six_nonselecting_action_kinds_and_terminal_observati
 }
 
 #[test]
-fn dormant_decoder_refuses_rival_nonruntime_unknown_incomplete_and_missing_launch_facts() {
+fn dormant_key_refusal_retracts_only_that_key_and_preserves_another_proven_warning() {
     for (path, value) in [
         (["domain", "origin"], json!("node/rival")),
         (
@@ -125,21 +129,74 @@ fn dormant_decoder_refuses_rival_nonruntime_unknown_incomplete_and_missing_launc
             json!(["runtime.observed", "runtime.action.new-kind"]),
         ),
         (["domain", "complete"], json!(false)),
-        (["policy", "complete"], json!(false)),
+        (["policy", "version"], json!("unsupported.v9")),
         (["observed", "evidence"], json!(["claim/old-launch"])),
         (["observed", "exit_code"], Value::Null),
         (["generation", "revision"], json!("rev/old")),
         (["desired", "restart"], json!("always")),
+        (["gate", "subject"], json!("exec/${ST_ATTEMPT}")),
+        (["gate", "operator"], json!("contains")),
+        (["gate", "expected"], json!("not-an-integer")),
     ] {
         let mut input = facts();
         input[path[0]][path[1]] = value;
-        assert!(witness(&encoded(input.clone())).is_err(), "{path:?}");
+        assert_eq!(
+            witness(&encoded(input.clone())).unwrap(),
+            Decision::NoWitness,
+            "{path:?}"
+        );
         let mut fixture = Fixture::new();
         fixture.record(mutation("gate/one", Some(facts())));
+        fixture.record(mutation("gate/other", Some(facts())));
         fixture.record(mutation("gate/one", Some(input)));
+        let root = fixture.installer.root(&fixture.db, VIEW).unwrap();
+        assert!(fixture.installer.status(&fixture.db, VIEW).unwrap().ready);
+        assert_eq!(fixture.member_rows(&root.namespace), 1);
+        let key: String = fixture
+            .db
+            .query_row(
+                "SELECT key FROM test_terminal_members WHERE namespace=?1",
+                [root.namespace.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key, "gate/other");
+    }
+}
+
+#[test]
+fn dormant_global_capture_encoding_and_storage_failures_still_fence_the_namespace() {
+    let mut incomplete = facts();
+    incomplete["policy"]["complete"] = json!(false);
+    for input in [
+        encoded(incomplete),
+        Value::String("{\"policy\":}".into()),
+        Value::String(" ".repeat(INPUT_BYTES + 1)),
+    ] {
+        assert!(witness(&input).is_err());
+        let mut fixture = Fixture::new();
+        fixture.record(mutation("gate/one", Some(facts())));
+        fixture.record(mutation("gate/other", Some(facts())));
+        let root = fixture.installer.root(&fixture.db, VIEW).unwrap();
+        fixture.record(Mutation {
+            key: "gate/one".into(),
+            old: None,
+            new: Some(input),
+        });
         assert!(fixture.installer.root(&fixture.db, VIEW).is_err());
         assert!(!fixture.installer.status(&fixture.db, VIEW).unwrap().ready);
+        // Saved outputs remain physically present but may not be presented as current.
+        assert_eq!(fixture.member_rows(&root.namespace), 2);
     }
+    let mut fixture = Fixture::new();
+    fixture.record(mutation("gate/one", Some(facts())));
+    fixture
+        .db
+        .execute_batch("DROP TABLE test_terminal_members")
+        .unwrap();
+    fixture.record(mutation("gate/other", Some(facts())));
+    assert!(fixture.installer.root(&fixture.db, VIEW).is_err());
+    assert!(!fixture.installer.status(&fixture.db, VIEW).unwrap().ready);
 }
 
 #[test]
@@ -149,7 +206,9 @@ fn dormant_decoder_caps_bytes_depth_markers_identifiers_and_evidence_before_use(
         format!("{}0{}", "[".repeat(9), "]".repeat(9)),
         format!(
             "[{}]",
-            std::iter::repeat_n("0", 66).collect::<Vec<_>>().join(",")
+            std::iter::repeat_n("0", STRUCTURAL_MARKERS + 1)
+                .collect::<Vec<_>>()
+                .join(",")
         ),
     ] {
         assert!(preflight(&raw).is_err());
@@ -166,7 +225,7 @@ fn dormant_decoder_caps_bytes_depth_markers_identifiers_and_evidence_before_use(
     assert!(witness(&encoded(input)).is_err());
     let mut input = facts();
     input["ninth_fact"] = json!(true);
-    assert!(witness(&encoded(input)).is_err());
+    assert_eq!(witness(&encoded(input)).unwrap(), Decision::NoWitness);
     // Escaped strings are not mistaken for nested JSON syntax.
     preflight(r#"{"text":"[\"{,\""}"#).unwrap();
 }
@@ -184,8 +243,11 @@ fn dormant_expansion_accepts_stable_bindings_and_refuses_attempt_assignee_and_in
         let mut input = facts();
         input["gate"]["subject"] = json!(format!("exec/${{{variable}}}"));
         let f: Facts = serde_json::from_value(input.clone()).unwrap();
-        input["desired"]["subject"] = json!(expanded_subject(&f).unwrap());
-        assert!(witness(&encoded(input)).unwrap().is_some());
+        input["desired"]["subject"] = json!(expanded_subject(&f).unwrap().unwrap());
+        assert!(matches!(
+            witness(&encoded(input)).unwrap(),
+            Decision::Negative(_)
+        ));
     }
     for variable in [
         "ST_ATTEMPT",
@@ -196,7 +258,7 @@ fn dormant_expansion_accepts_stable_bindings_and_refuses_attempt_assignee_and_in
     ] {
         let mut input = facts();
         input["gate"]["subject"] = json!(format!("exec/${{{variable}}}"));
-        assert!(witness(&encoded(input)).is_err());
+        assert_eq!(witness(&encoded(input)).unwrap(), Decision::NoWitness);
     }
 }
 
@@ -310,7 +372,7 @@ fn dormant_fixture_flush_probe_and_unrelated_lookup_have_fixed_measured_sql_work
                 INSERT INTO test_terminal_members SELECT 'foreign/'||i,'other','other witness' FROM n;").unwrap();
         }
         for sql in [
-            "SELECT pending FROM test_terminal_meta WHERE namespace=?1",
+            "SELECT members<>0 FROM test_terminal_meta WHERE namespace=?1",
             "SELECT EXISTS(SELECT 1 FROM test_terminal_members WHERE namespace=?1 AND key='unrelated')",
         ] {
             SQL_STATEMENTS.with(|count| count.set(0));

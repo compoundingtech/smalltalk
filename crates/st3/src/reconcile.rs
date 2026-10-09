@@ -16487,7 +16487,9 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
                 facts["observed"]["exit_code"] = serde_json::json!(exit_code);
                 let encoded = Value::String(facts.to_string());
                 assert_eq!(
-                    crate::store::terminal_gate_evidence::witness(&encoded).unwrap(),
+                    crate::store::terminal_gate_evidence::witness(&encoded)
+                        .unwrap()
+                        .into_witness(),
                     reason(&store),
                     "dormant predicate differs from selected-launch oracle"
                 );

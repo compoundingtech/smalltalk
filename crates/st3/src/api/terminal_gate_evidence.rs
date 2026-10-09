@@ -34,17 +34,12 @@ pub(crate) fn read(tx: &Transaction<'_>, installer: &Installer) -> Result<Eviden
             });
         }
     };
-    let (members, pending): (usize, bool) = tx.query_row(
-        "SELECT members,pending FROM test_terminal_meta WHERE namespace=?1",
+    let members: usize = tx.query_row(
+        "SELECT members FROM test_terminal_meta WHERE namespace=?1",
         [root.namespace.as_str()],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| r.get(0),
     )?;
     ensure!(members <= 64, "terminal reader membership cap");
-    if pending {
-        return Ok(Evidence::Fenced {
-            reason: "fixture publication pending".into(),
-        });
-    }
     if members == 0 {
         return Ok(Evidence::Unknown);
     }
@@ -77,6 +72,32 @@ pub(crate) fn read(tx: &Transaction<'_>, installer: &Installer) -> Result<Eviden
 mod tests {
     use super::*;
     use crate::store::terminal_gate_evidence::tests::{Fixture, facts, mutation};
+
+    #[test]
+    fn dormant_reader_preserves_other_warnings_through_key_refusal_and_recovery() {
+        let mut fixture = Fixture::new();
+        for key in ["gate/one", "gate/other"] {
+            fixture.record(mutation(key, Some(facts())));
+        }
+        let mut unsupported = facts();
+        unsupported["desired"]["restart"] = serde_json::json!("always");
+        fixture.record(mutation("gate/one", Some(unsupported)));
+        let tx = fixture.db.transaction().unwrap();
+        assert!(
+            matches!(read(&tx, &fixture.installer).unwrap(), Evidence::Warning { at_least:1, truncated:false, witnesses } if witnesses.len()==1 && witnesses[0].contains("exit code 2"))
+        );
+        tx.commit().unwrap();
+        fixture.record(mutation("gate/other", None));
+        let tx = fixture.db.transaction().unwrap();
+        assert_eq!(read(&tx, &fixture.installer).unwrap(), Evidence::Unknown);
+        tx.commit().unwrap();
+        fixture.record(mutation("gate/one", Some(facts())));
+        let tx = fixture.db.transaction().unwrap();
+        assert!(matches!(
+            read(&tx, &fixture.installer).unwrap(),
+            Evidence::Warning { at_least: 1, .. }
+        ));
+    }
 
     #[test]
     fn dormant_reader_warns_with_a_bounded_lower_bound_then_refuses_fenced_evidence() {
@@ -131,10 +152,9 @@ mod tests {
         tx.commit().unwrap();
         fixture.record(mutation("gate/one", Some(facts())));
         let tx = fixture.db.transaction().unwrap();
-        let root = fixture.installer.root(&tx, VIEW).unwrap();
         tx.execute(
-            "UPDATE test_terminal_meta SET pending=1 WHERE namespace=?1",
-            [root.namespace.as_str()],
+            "UPDATE ivm_install_sources SET revision=revision+1 WHERE name=?1",
+            [crate::store::terminal_gate_evidence::SOURCE],
         )
         .unwrap();
         assert!(

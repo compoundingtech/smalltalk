@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Correct dormant terminal-gate key refusal and decoding limits.",
+  "replay": {
+    "status": "none",
+    "detail": "Dormant cfg(test)-only correction: per-key uncertainty retracts only its own witness; global malformed/capped/capture/storage failures still fence. No production registration, schema, bridge or public behavior change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Dormant cfg(test)-only correction: per-key uncertainty retracts only its own witness; global malformed/capped/capture/storage failures still fence. No production registration, schema, bridge or public behavior change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Dormant cfg(test)-only correction: per-key uncertainty retracts only its own witness; global malformed/capped/capture/storage failures still fence. No production registration, schema, bridge or public behavior change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Dormant cfg(test)-only correction: per-key uncertainty retracts only its own witness; global malformed/capped/capture/storage failures still fence. No production registration, schema, bridge or public behavior change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Dormant cfg(test)-only correction: per-key uncertainty retracts only its own witness; global malformed/capped/capture/storage failures still fence. No production registration, schema, bridge or public behavior change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Dormant cfg(test)-only correction: per-key uncertainty retracts only its own witness; global malformed/capped/capture/storage failures still fence. No production registration, schema, bridge or public behavior change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Dormant cfg(test)-only correction: per-key uncertainty retracts only its own witness; global malformed/capped/capture/storage failures still fence. No production registration, schema, bridge or public behavior change."
+  }
+}
