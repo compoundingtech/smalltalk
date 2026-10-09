@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Tolerate up to twice main in relative perf-load latency and CPU comparisons while keeping every absolute budget and correctness check.",
+  "replay": {
+    "status": "none",
+    "detail": "Performance test policy only; no projection or replay changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, migration or stored-data changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No writer, checkpoint, retention or authority changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Existing workload, reports, baseline provenance and migration regimes are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service or runner deployment is introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step or workflow rerun is introduced."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Reverting this test policy restores the prior 1.2x relative threshold; historical failures remain recorded."
+  }
+}
