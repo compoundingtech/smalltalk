@@ -31,6 +31,7 @@ pub(crate) mod step_labels;
 mod canonical;
 mod latest_values;
 use latest_values::{current_sql, harness_sql};
+pub(crate) use latest_values::CURRENT_VALUE_KINDS;
 pub use latest_values::{CurrentObservationBoundary, is_current_input, is_current_value};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};

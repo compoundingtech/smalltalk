@@ -382,6 +382,14 @@ mod tests {
         ] {
             let root = tempfile::tempdir().unwrap();
             let (state, mut peer, mut fence, mut metadata) = bootstrap_fixture(root.path());
+            // Ordinary Linux admission inventories the registry's daemon PID file as well
+            // as metadata. The point-proof helper alone does not need that inventory.
+            fs::write(
+                state.pty_root.join("eval.worker.pid"),
+                std::process::id().to_string(),
+            )
+            .unwrap();
+
             let agent_dir = crate::hooks::claude_agent_dir(
                 &state.state_dir.join("drivers"),
                 &fence.subject,

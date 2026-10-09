@@ -193,6 +193,67 @@ async fn a_usage_commit_rereads_agents_and_leaves_missions_idle() {
 }
 
 #[tokio::test]
+async fn local_and_received_status_registers_reread_agents_without_missions_or_work() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "alder");
+    let mut fixture = Fixture::open(state, false, None, &["missions", "agents", "work"]).await;
+    for _ in 0..3 {
+        assert_eq!(fixture.frame().await["kind"], "snapshot");
+    }
+    fixture.claim(
+        "agent/fixture-roster",
+        "runtime.observed",
+        json!({"status":"running", "incarnation_id":"one"}),
+    );
+    for _ in 0..3 {
+        assert_eq!(fixture.frame().await["kind"], "changes");
+    }
+    fixture.claim(
+        "agent/fixture-roster",
+        "harness.observed",
+        json!({"state":"working", "driver":"codex", "incarnation_id":"one"}),
+    );
+    let changed = fixture.frame().await;
+    assert_eq!(changed["id"], "agents", "{changed}");
+    fixture.quiet().await;
+    assert_eq!(
+        fixture.counts(),
+        counts(&[("agents", 3), ("missions", 2), ("work", 2)])
+    );
+
+    let source = Store::open_memory("alder").unwrap();
+    let received = source
+        .append_claim(&ClaimInput {
+            subject: "agent/fixture-roster".into(),
+            kind: "harness.observed".into(),
+            actor: None,
+            fields: serde_json::from_value(
+                json!({"state":"idle", "driver":"codex", "incarnation_id":"one"}),
+            )
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    assert!(
+        fixture
+            .state
+            .store
+            .receive_current_value(&received)
+            .unwrap()
+    );
+    signal_changed(&fixture.state);
+    let changed = fixture.frame().await;
+    assert_eq!(changed["id"], "agents", "{changed}");
+    fixture.quiet().await;
+    assert_eq!(
+        fixture.counts(),
+        counts(&[("agents", 4), ("missions", 2), ("work", 2)])
+    );
+}
+
+#[tokio::test]
 async fn a_published_view_rereads_when_it_publishes_and_not_on_commits() {
     let root = tempfile::tempdir().unwrap();
     let state = super::tests::test_state_named(root.path(), "alder");

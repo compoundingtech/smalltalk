@@ -78,14 +78,15 @@ pub trait Runtime: Send + Sync {
     }
 
     /// Process-local invalidation for replaceable observations committed outside the graph
-    /// writer. This is a cache hint, never an immutable graph or authority frontier.
-    fn current_observation_revision(&self) -> u64 {
+    /// writer. Empty kind names the aggregate; otherwise read that kind's revision. These
+    /// are cache hints, never immutable graph or authority frontiers.
+    fn current_observation_revision(&self, _kind: &str) -> u64 {
         0
     }
 
     /// Called only after a current-observation transaction successfully commits. The hook
     /// must be non-blocking and do no SQL; immutable runtimes need no invalidation.
-    fn current_observation_committed(&self) {}
+    fn current_observation_committed(&self, _kind: &str) {}
 
     /// Check a replicated claim's kind and fields once the graph has verified its hash and batch.
     fn classify_replicated_claim(

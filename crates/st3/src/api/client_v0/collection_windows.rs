@@ -20,10 +20,21 @@ const COLLECTIONS: [&str; 8] = [
     "summary-missions",
 ];
 
+/// Registers affect live seat overlays, not durable mission/work or descriptor windows.
+fn register_affects(collection: &str, kind: &str) -> bool {
+    match collection {
+        "agents" | "summary" => true,
+        "attention" => kind == "harness.observed",
+        _ => false,
+    }
+}
+
 #[derive(Default)]
 struct Revisions {
     index: u64,
     commits: u64,
+    writers: u64,
+    current: [u64; crate::store::CURRENT_VALUE_KINDS.len()],
     local: u64,
     values: [u64; 8],
 }
@@ -100,7 +111,7 @@ impl Windows {
         let current = self
             .store
             .upgrade()
-            .map_or(0, |store| store.runtime.current_observation_revision());
+            .map_or(0, |store| store.runtime.current_observation_revision(""));
         self.commits.load(Ordering::Acquire).wrapping_add(current)
     }
     pub(super) fn attach(store: &Arc<Store>) -> Option<Arc<Self>> {
@@ -212,7 +223,10 @@ impl Windows {
             .observed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let commits = self.commits();
+        let writers = self.commits.load(Ordering::Acquire);
+        let commits = writers.wrapping_add(store.runtime.current_observation_revision(""));
+        let current = crate::store::CURRENT_VALUE_KINDS
+            .map(|kind| store.runtime.current_observation_revision(kind));
         // A slower physical reader can hold an older SQLite snapshot. It cannot update the
         // shared frontier or reuse rows from a newer one.
         if index < revisions.index
@@ -226,29 +240,43 @@ impl Windows {
         let local = observed.local;
         drop(observed);
         if index != revisions.index || commits != revisions.commits {
-            let connection = store.readers.get();
-            let mut kinds = connection.prepare_cached("SELECT kind FROM claims WHERE store_index>?1 AND store_index<=?2 ORDER BY store_index LIMIT ?3")?;
-            let kinds = kinds
-                .query_map(
-                    rusqlite::params![revisions.index, index, KIND_LIMIT + 1],
-                    |row| row.get::<_, String>(0),
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            // A non-claim commit can change local availability, ordering or lease state.
-            // Overflow, replay/trim and metadata errors must never certify an unchanged view.
-            let all = local != revisions.local
-                || index == revisions.index
-                || kinds.is_empty()
-                || kinds.len() > KIND_LIMIT;
-            let arrangements = store.arrangements_changed(revisions.index, index)?;
+            let graph_changed = index != revisions.index;
+            let kinds = if graph_changed {
+                let connection = store.readers.get();
+                let mut kinds = connection.prepare_cached("SELECT kind FROM claims WHERE store_index>?1 AND store_index<=?2 ORDER BY store_index LIMIT ?3")?;
+                kinds
+                    .query_map(
+                        rusqlite::params![revisions.index, index, KIND_LIMIT + 1],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+            // Retain the existing conservative rule for managed nonclaim commits, replay,
+            // trim and incomplete claim metadata. Register-only commits use their kind below.
+            let all = (writers != revisions.writers
+                && (local != revisions.local || !graph_changed))
+                || (graph_changed && (kinds.is_empty() || kinds.len() > KIND_LIMIT));
+            let arrangements =
+                graph_changed && store.arrangements_changed(revisions.index, index)?;
             for (position, name) in COLLECTIONS.iter().enumerate() {
+                let register_changed = crate::store::CURRENT_VALUE_KINDS.iter().enumerate().any(
+                    |(kind_index, kind)| {
+                        current[kind_index] != revisions.current[kind_index]
+                            && register_affects(name, kind)
+                    },
+                );
                 if all
+                    || register_changed
                     || (*name == "arrangements" && arrangements)
                     || kinds.iter().any(|kind| !collection_ignores(name, kind))
                 {
                     revisions.values[position] = revisions.values[position].wrapping_add(1);
                 }
             }
+            revisions.writers = writers;
+            revisions.current = current;
             revisions.index = index;
             revisions.commits = commits;
             revisions.local = local;

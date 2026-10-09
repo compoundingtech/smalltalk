@@ -124,15 +124,16 @@ fn retire_feed_through(tx: &Transaction<'_>, cursor: i64) -> Result<(), St3Error
     Ok(())
 }
 
+pub(crate) const CURRENT_VALUE_KINDS: [&str; 5] = [
+    "harness.observed",
+    "harness.usage",
+    "harness.todo.observed",
+    "workspace.observed",
+    "transport.observed",
+];
+
 pub fn is_current_value(kind: &str) -> bool {
-    matches!(
-        kind,
-        "harness.observed"
-            | "harness.usage"
-            | "harness.todo.observed"
-            | "workspace.observed"
-            | "transport.observed"
-    )
+    CURRENT_VALUE_KINDS.contains(&kind)
 }
 
 pub fn is_current_input(input: &ClaimInput) -> bool {
@@ -499,7 +500,7 @@ pub(super) fn append(
     .map_err(internal)?;
     update_readiness(&tx, &input)?;
     tx.commit().map_err(internal)?;
-    graph.runtime.current_observation_committed();
+    graph.runtime.current_observation_committed(&input.kind);
     Ok((local, true))
 }
 
@@ -822,7 +823,7 @@ impl Store {
         ).map_err(internal)?;
         update_readiness(&tx, &input)?;
         tx.commit().map_err(internal)?;
-        self.graph.runtime.current_observation_committed();
+        self.graph.runtime.current_observation_committed(&record.kind);
         Ok(true)
     }
 }

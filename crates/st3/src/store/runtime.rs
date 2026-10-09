@@ -30,6 +30,7 @@ pub struct SmalltalkRuntime {
     pub(crate) conversation_owners: Mutex<VecDeque<(u64, Arc<conversation_reads::Owners>)>>,
     /// Successful register commits bypass the managed graph writer's commit callbacks.
     current_observation_revision: std::sync::atomic::AtomicU64,
+    current_observation_kinds: [std::sync::atomic::AtomicU64; CURRENT_VALUE_KINDS.len()],
     pub(crate) actual_cache: Mutex<HashMap<String, (ActualCacheKey, Option<Value>)>>,
     /// Immutable placement ancestry, keyed by the selected declaration claim.
     pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::placement::Fence>>>>,
@@ -269,14 +270,28 @@ impl Runtime for SmalltalkRuntime {
         compatibility_digest(&self.claim_registry().digest())
     }
 
-    fn current_observation_revision(&self) -> u64 {
-        self.current_observation_revision
-            .load(std::sync::atomic::Ordering::Acquire)
+    fn current_observation_revision(&self, kind: &str) -> u64 {
+        if kind.is_empty() {
+            return self
+                .current_observation_revision
+                .load(std::sync::atomic::Ordering::Acquire);
+        }
+        CURRENT_VALUE_KINDS
+            .iter()
+            .position(|known| *known == kind)
+            .map_or(0, |position| {
+                self.current_observation_kinds[position].load(std::sync::atomic::Ordering::Acquire)
+            })
     }
 
-    fn current_observation_committed(&self) {
-        self.current_observation_revision
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    fn current_observation_committed(&self, kind: &str) {
+        if let Some(position) = CURRENT_VALUE_KINDS.iter().position(|known| *known == kind) {
+            self.current_observation_kinds[position]
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            // Publish the aggregate after its kind, so an aggregate acquire observes that kind.
+            self.current_observation_revision
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
     }
 
     fn current_observation_sql(&self, kind: &str, sql: &str) -> String {
