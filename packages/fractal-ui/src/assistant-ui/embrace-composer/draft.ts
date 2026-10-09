@@ -1,19 +1,20 @@
 import { TokenFieldValue } from 'react-aria-components'
+import { Schema } from 'effect'
 
 /** Minimal port of the app composer draft contract; no gateway or resource registry dependency. */
-export interface MentionToken {
-  readonly _tag: 'Mention'
-  readonly ref: string
-  readonly family: string
-  readonly label: string
-}
+export const MentionToken = Schema.TaggedStruct('Mention', {
+  ref: Schema.String, family: Schema.String, label: Schema.String,
+}).annotate({ identifier: 'Composer.MentionToken' })
+export type MentionToken = typeof MentionToken.Type
 
-export type SlashCommandId = 'reply' | 'title' | 'attach' | 'terminal'
-export interface CommandToken {
-  readonly _tag: 'Command'
-  readonly command: SlashCommandId
-}
-export type DraftToken = MentionToken | CommandToken
+export const SlashCommandId = Schema.Literals(['reply', 'title', 'attach', 'terminal'])
+export type SlashCommandId = typeof SlashCommandId.Type
+export const CommandToken = Schema.TaggedStruct('Command', {
+  command: SlashCommandId,
+}).annotate({ identifier: 'Composer.CommandToken' })
+export type CommandToken = typeof CommandToken.Type
+export const DraftToken = Schema.Union([MentionToken, CommandToken])
+export type DraftToken = typeof DraftToken.Type
 export type Draft = TokenFieldValue<DraftToken>
 
 export interface SlashCommand {

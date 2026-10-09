@@ -118,6 +118,13 @@ const languageAliases: Readonly<Record<string, keyof typeof grammars>> = {
   rs: 'rust', py: 'python', yml: 'yaml', md: 'markdown',
 }
 
+/** File-path language lookup uses the same eager grammar allowlist as fenced code. */
+export function languageFromPath(path: string): string {
+  const extension = /\.([^.]+)$/.exec(path)?.[1]?.toLowerCase() ?? ''
+  const canonical = Object.hasOwn(languageAliases, extension) ? languageAliases[extension]! : extension
+  return Object.hasOwn(grammars, canonical) ? canonical : ''
+}
+
 function SyntaxToken({ node }: { node: SyntaxNode }): React.ReactNode {
   if (node.type === 'text') return node.value
   if (node.type !== 'element') return null

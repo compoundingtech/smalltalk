@@ -12,6 +12,7 @@ const surfaceVarsTheme = stylex.createTheme(surfaceVars, {
   rowHover: '#f4f4f5',
   rowActive: '#ebebeb',
   codeBg: '#f4f4f5',
+  terminal: '#ffffff',
   washSubtle: 'rgba(0, 0, 0, 0.02)',
   controlFill: 'rgba(0, 0, 0, 0.025)',
   scrim: 'rgba(0, 0, 0, 0.3)', transparent: 'transparent',
@@ -39,7 +40,7 @@ const accentVarsTheme = stylex.createTheme(accentVars, {
   onPrimary: '#ffffff',
 })
 
-const statusVarsTheme = stylex.createTheme(statusVars, {
+export const lightStatusTheme = stylex.createTheme(statusVars, {
   running: '#2563eb',
   runningFg: '#1d4ed8',
   done: '#059669',
@@ -76,5 +77,6 @@ const colorTheme = stylex.createTheme(colorVars, {
   scrollThumbHover: 'rgba(0, 0, 0, 0.25)',
 })
 
-export const lightTheme = [surfaceVarsTheme, textVarsTheme, borderVarsTheme, accentVarsTheme, statusVarsTheme, colorTheme] as const
+export const lightThemeWithoutStatus = [surfaceVarsTheme, textVarsTheme, borderVarsTheme, accentVarsTheme, colorTheme] as const
+export const lightTheme = [...lightThemeWithoutStatus, lightStatusTheme] as const
 export const lightThemes = { color: colorTheme }
