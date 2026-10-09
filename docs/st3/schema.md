@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `36c1ac93a1df8efdcd4bb87ab29016f9c6831f60e025062f06378b1af0295fc4`
+Digest: `75a909dc601e114d62edf7c6a01ee228b7ffa527cbce9e9f1ed2bbf161a6a925`
 
 ## Subject families
 
@@ -121,6 +121,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `message.sent` | `message` | `ordinary-client` | `once` | `durable` | `attachments:array`, `content:string`, `from:subject-reference`, `in_reply_to:subject-reference`, `session_id:string`, `status!:string`, `tags:array`, `title:string`, `to:subject-reference` | `message` |
 | `message.staged` | `message` | `system-only` | `once-per-actor` | `durable` | `recipient:subject-reference`, `runtime_id:string`, `status!:string`, `transport:string` | `message` |
 | `mission-run.created` | `mission-run` | `system-only` | `once` | `durable` | `ad_hoc_title:string`, `after:subject-reference`, `current_generation:subject-reference`, `deadline_at_unix_ms:integer`, `default_selector:object`, `generation:subject-reference`, `initial_revision:string`, `inputs:object`, `mission:subject-reference`, `mission_spec:object`, `mode:string`, `parent_step_run:subject-reference`, `report_completed:boolean`, `report_to:subject-reference`, `requester:subject-reference`, `revision:string`, `root_mission_run:subject-reference`, `root_revision:string`, `stalled_after_ms:integer`, `status:string`, `timeout_ms:integer`, `workspace:string` | `mission-run` |
+| `mission-run.report-to` | `mission-run` | `system-only` | `state-transition` | `durable` | `report_completed:boolean`, `report_to:subject-reference`, `stalled_after_ms:integer` |  |
 | `mission-run.state` | `mission-run` | `system-only` | `state-transition` | `durable` | `completion:string`, `finally:string`, `phase:string`, `previous_phase:string`, `reason:string`, `status:string` | `mission-run`, `completion`, `finally`, `cancellation` |
 | `mission.produced` | `mission`, `step-run` | `capability-holder` | `append` | `durable` | `attempt:integer`, `mission:subject-reference`, `name:string`, `revision:string`, `step_definition:string` | `produces` |
 | `mission.provenance` | `mission` | `system-only` | `once` | `durable` | `mission!:subject-reference(mission)`, `provenance!:object`, `revision!:string` | `provenance` |

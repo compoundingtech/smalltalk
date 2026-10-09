@@ -1126,11 +1126,24 @@ pub struct Agent {
     pub checkout: Option<AgentCheckout>,
     #[serde(default)]
     pub workspace: Option<String>,
+    /// The selected agent declaration's optional `lifecycle` child; omitted when undeclared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<AgentLifecycle>,
     /// Placement handoff phase and the sources still holding its fence.
     #[serde(default)]
     pub handoff: Option<AgentHandoff>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout: Option<Value>,
+}
+/// Declared seat lifecycle: standing, owner, or bounded. Absence means undeclared.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentLifecycle {
+    Standing,
+    Owner,
+    Bounded,
+    #[serde(other)]
+    Unknown,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentHandoff {

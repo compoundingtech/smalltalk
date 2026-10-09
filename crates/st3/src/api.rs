@@ -42,9 +42,10 @@ use crate::model::{
     LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendReceipt,
     MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
     MissionResponse, MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest,
-    MissionRunRequest, MissionRunView, OperationalRepairApplyRequest, OperationalRepairPlan,
-    OperationalRepairResult, PlannerSpec, PlanningApprovalRequest, PlanningCancelRequest,
-    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
+    MissionRunReportRequest, MissionRunReportView, MissionRunRequest, MissionRunView,
+    OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult, PlannerSpec,
+    PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
+    PlanningProposalRequest, PlanningRevisionRequest,
     PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest, QuickAgentResponse,
     ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse, ReplicationHealAnswer,
     ReplicationHealAnswerRequest, ReplicationHealNextRequest, ReplicationHealStep,
@@ -821,6 +822,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
         .route("/v1/mission-runs", get(list_mission_runs))
+        .route("/v1/mission-runs/tree", get(list_mission_run_tree))
         .route("/v1/mission-overview", get(mission_overview))
         .route("/v1/outcome-history", get(outcome_history))
         .route("/v1/performance", get(performance_report))
@@ -836,6 +838,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route(
             "/v1/mission-runs/{run}/outcome",
             post(set_mission_run_outcome),
+        )
+        .route(
+            "/v1/mission-runs/{run}/report-to",
+            post(set_mission_run_report),
         )
         .route("/v1/mission-runs/{run}", get(get_mission_run))
         .route("/v1/run-generations/{generation}", get(get_run_generation))
@@ -2267,7 +2273,7 @@ fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> 
         let declaration = desired.get(&id);
         let name = crate::model::effective_agent_name(&id, declaration.map(|d| &d.desired));
         let queue = queues.get(&id).cloned().unwrap_or_default();
-        json!({
+        let mut reference = json!({
             "id":id, "name":name,
             "host_id":declaration.and_then(|d| d.member.as_ref()).map(|m| client_host_id(&m.host)),
             "current_work_ids":queue.current_work_ids, "active_work_count":queue.active_work_count,
@@ -2276,7 +2282,11 @@ fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> 
             "current_work":queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
             "next_work":queue.next_work_id.as_ref().and_then(label),
             "upcoming_work":queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
-        })
+        });
+        if let Some(lifecycle) = crate::model::declared_agent_lifecycle(declaration.map(|d| &d.desired)) {
+            reference["lifecycle"] = json!(lifecycle);
+        }
+        reference
     }).collect::<Vec<_>>();
     refs.sort_by(|a, b| {
         a["name"]
@@ -2867,6 +2877,9 @@ fn client_agent_resources_from_status(
                     None
                 },
             });
+            if let Some(lifecycle) = crate::model::declared_agent_lifecycle(subject.desired.as_ref()) {
+                value["lifecycle"] = json!(lifecycle);
+            }
             if let Some((_, previous)) = changed.filter(|_| retain_queues)
                 && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
                 for field in AGENT_QUEUE_FIELDS {
@@ -12044,6 +12057,8 @@ fn accept_message_receipt_with_upload_owner(
             "external sender imports require the enrolled adapter endpoint",
         )));
     }
+    crate::model::refuse_person_recipient(&normalize_message_party(&request.to))
+        .map_err(ApiError::bad)?;
     if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "empty-message",
@@ -13058,6 +13073,13 @@ struct MissionRunQuery {
 }
 
 #[derive(Deserialize)]
+struct MissionRunTreeQuery {
+    root: String,
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct MissionOverviewQuery {
     mission: String,
 }
@@ -13147,6 +13169,43 @@ async fn list_mission_runs(
             "select exactly one mission or root mission run",
         ))),
     }
+}
+
+async fn list_mission_run_tree(
+    State(state): State<AppState>,
+    Query(query): Query<MissionRunTreeQuery>,
+) -> Result<Json<crate::model::MissionRunTreePage>, ApiError> {
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=50).contains(&limit) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-mission-run-limit",
+            "mission run tree page limit must be 1 through 50",
+        )));
+    }
+    let store = state.store.clone();
+    let page = blocking_store(move || {
+        store.read_snapshot(|frontier| {
+            let Some((mut runs, next_cursor)) =
+                store.mission_runs_for_root_page(&query.root, query.after.as_deref(), limit)?
+            else {
+                return Ok(None);
+            };
+            annotate_stuck_gates(&store, &mut runs)?;
+            Ok(Some(crate::model::MissionRunTreePage {
+                runs,
+                has_more: next_cursor.is_some(),
+                next_cursor,
+                frontier,
+            }))
+        })
+    })
+    .await?;
+    page.map(Json).ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "invalid-mission-run-cursor",
+            "the mission run cursor is absent from this root; start again without a cursor",
+        ))
+    })
 }
 
 fn annotate_stuck_gates(store: &Store, runs: &mut [MissionRunView]) -> anyhow::Result<()> {
@@ -13715,6 +13774,29 @@ async fn set_mission_run_outcome(
     .await?;
     signal_changed(&state);
     Ok(Json(outcome))
+}
+
+/// A person or the run's requester changes who a running run reports to.
+async fn set_mission_run_report(
+    State(state): State<AppState>,
+    AxumPath(run): AxumPath<String>,
+    Json(request): Json<MissionRunReportRequest>,
+) -> Result<Json<MissionRunReportView>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "run-report-authority-denied")?;
+    let store = state.store.clone();
+    let report = blocking_action(move || {
+        store.set_mission_run_report(
+            &run,
+            &actor,
+            request.report_to.as_deref(),
+            request.stalled_after_ms,
+            request.report_completed,
+            &request.idempotency_key,
+        )
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(report))
 }
 
 /// A person or an agent retires a mission.
@@ -16252,6 +16334,33 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let removed = client_agent_page_refs(&state.store, false, index).unwrap();
         assert_eq!(removed.len(), 1, "a stopped undeclared runtime moves to history");
         assert_eq!(removed, client_agent_page_refs_uncached(&state.store, false, index).unwrap());
+    }
+
+    #[test]
+    fn agent_lifecycle_roster_tracks_current_declaration_without_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        for (version, lifecycle) in [None, Some("standing"), Some("owner"), Some("bounded"), None]
+            .into_iter().enumerate()
+        {
+            let field = lifecycle.map(|value| format!("lifecycle \"{value}\";")).unwrap_or_default();
+            let source = format!("version 2\nagent \"example/purpose\" {{ {field} command \"true\" }}");
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+            let plan = store.mission(&intent, crate::model::IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            store.apply(&intent, &plan.subject_tokens, &format!("lifecycle-{version}")).unwrap();
+            let index = store.index().unwrap();
+            for history in [false, true] {
+                let refs = client_agent_page_refs(store, history, index).unwrap();
+                let rows = checked_agent_cache(store, history, index);
+                let cards = client_agent_cards_for_page(store, history, index, &refs, "0").unwrap();
+                for row in refs.iter().chain(rows.iter()).chain(cards.iter()) {
+                    assert_eq!(row.get("lifecycle"), lifecycle.map(|value| json!(value)).as_ref());
+                }
+            }
+        }
     }
 
     #[test]
@@ -21641,6 +21750,83 @@ version 2
     }
 
     #[tokio::test]
+    async fn a_send_or_reply_to_a_person_is_refused_and_an_agent_still_receives() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let message = |key: &str, from: &str, to: &str, in_reply_to: Option<&str>| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.into(),
+                from: from.into(),
+                to: to.into(),
+                content: "Hello".into(),
+                title: None,
+                in_reply_to: in_reply_to.map(str::to_owned),
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+        };
+        // An agent, and a person writing to an agent, are unchanged.
+        let (status, asked) =
+            json_request(app.clone(), "/v1/messages", message("ask", "person/ada", "agent/worker", None)).await;
+        assert_eq!(status, StatusCode::OK, "{asked}");
+        let asked = asked["subject"].as_str().unwrap().to_owned();
+        let (status, relayed) =
+            json_request(app.clone(), "/v1/messages", message("relay", "agent/worker", "agent/helper", None)).await;
+        assert_eq!(status, StatusCode::OK, "{relayed}");
+        // A send to a person, a reply to a person, a bare name that means the requester, and a
+        // person writing to a person all fail with the one error, and write nothing.
+        let before = state.store.claims_for_kind_at("message.sent", None, true, 100).unwrap().claims.len();
+        for (key, from, to, parent) in [
+            ("send", "agent/worker", "person/ada", None),
+            ("reply", "agent/worker", "person/ada", Some(asked.as_str())),
+            ("requester", "agent/worker", "requester", None),
+            ("people", "person/ada", "person/robin", None),
+        ] {
+            let (status, body) =
+                json_request(app.clone(), "/v1/messages", message(key, from, to, parent)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{key}: {body}");
+            assert_eq!(body["code"], "person-has-no-inbox", "{key}");
+            let text = body["message"].as_str().unwrap();
+            assert!(text.starts_with("people do not have inboxes: print your answer in the chat"), "{text}");
+            let chat = text.find("print in the chat").unwrap();
+            assert!(chat < text.find("work ask").unwrap() && chat < text.find("work update").unwrap());
+            assert!(text.contains("only if the person asked for it"), "{text}");
+        }
+        assert_eq!(
+            state.store.claims_for_kind_at("message.sent", None, true, 100).unwrap().claims.len(),
+            before,
+            "a refused message is not written"
+        );
+        // What an older client already holds stays readable: a message to a person that is in the
+        // graph still lists, reads and settles.
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/earlier".into(),
+                kind: "message.sent".into(),
+                actor: Some("agent/worker".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("agent/worker")),
+                    ("to".into(), json!("person/ada")),
+                    ("content".into(), json!("Sent before people lost their inbox.")),
+                    ("status".into(), json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("earlier".into()),
+            })
+            .unwrap();
+        let (status, listed) = get_request(app.clone(), "/v1/messages?to=person/ada&include_closed=true").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert!(listed.as_array().unwrap().iter().any(|row| row["subject"] == "message/earlier"), "{listed}");
+        let (status, read) = get_request(app, "/v1/messages/read/earlier").await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["content"], "Sent before people lost their inbox.");
+    }
+
+    #[tokio::test]
     async fn message_lifecycle_requires_the_exact_recipient_actor() {
         let root = tempfile::tempdir().unwrap();
         let app = router(state(root.path()));
@@ -21650,7 +21836,7 @@ version 2
             serde_json::to_value(MessageSendRequest {
                 idempotency_key: "recipient-authority-message".into(),
                 from: "agent/sender".into(),
-                to: "person/receiver".into(),
+                to: "agent/receiver".into(),
                 content: "Please review this.".into(),
                 title: None,
                 in_reply_to: None,
@@ -21711,7 +21897,7 @@ version 2
             serde_json::to_value(MessageLifecycleRequest {
                 delegation: None,
                 lifecycle: "staged".into(),
-                actor: Some("person/receiver".into()),
+                actor: Some("agent/receiver".into()),
                 transport: Some("codex-app-server".into()),
                 runtime_id: Some("runtime/receiver".into()),
                 evidence: Vec::new(),
@@ -21723,7 +21909,7 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{staged}");
         assert_eq!(staged["body"]["fields"]["status"], "staged");
-        assert_eq!(staged["body"]["fields"]["recipient"], "person/receiver");
+        assert_eq!(staged["body"]["fields"]["recipient"], "agent/receiver");
         assert_eq!(staged["body"]["fields"]["transport"], "codex-app-server");
         assert_eq!(staged["body"]["fields"]["runtime_id"], "runtime/receiver");
 
@@ -21733,7 +21919,7 @@ version 2
             serde_json::to_value(MessageLifecycleRequest {
                 delegation: None,
                 lifecycle: "delivered".into(),
-                actor: Some("person/receiver".into()),
+                actor: Some("agent/receiver".into()),
                 transport: None,
                 runtime_id: None,
                 evidence: Vec::new(),
@@ -21744,7 +21930,7 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{read}");
-        assert_eq!(read["actor"], "person/receiver");
+        assert_eq!(read["actor"], "agent/receiver");
 
         let legacy = app
             .oneshot(

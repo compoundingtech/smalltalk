@@ -110,6 +110,57 @@ final class St3ClientTests: XCTestCase {
         }
     }
 
+    func testAgentLifecycleKnownAndFutureKindsRoundTrip() throws {
+        for (raw, expected) in [
+            ("standing", AgentLifecycle.standing),
+            ("owner", AgentLifecycle.owner),
+            ("bounded", AgentLifecycle.bounded),
+            ("future-kind", AgentLifecycle.unknown("future-kind")),
+        ] {
+            let encoded = try JSONEncoder().encode(raw)
+            let decoded = try JSONDecoder().decode(AgentLifecycle.self, from: encoded)
+            XCTAssertEqual(decoded, expected)
+            XCTAssertEqual(try JSONEncoder().encode(decoded), encoded)
+        }
+    }
+
+    func testAgentLifecycleFutureKindPreservesRosterRow() throws {
+        let json = #"{"id":"agent/example","kind":"agent","revision":"r1","updated_at":"2026-10-08T12:00:00Z","name":"Example","state":"idle","reachability":"online","runtime_ids":[],"under":[],"lifecycle":"future-kind"}"#
+        let data = Data(json.utf8)
+        let agent = try JSONDecoder().decode(AgentResource.self, from: data)
+        XCTAssertEqual(agent.id, "agent/example")
+        XCTAssertEqual(agent.name, "Example")
+        XCTAssertEqual(agent.lifecycle, .unknown("future-kind"))
+
+        let roster = try JSONDecoder().decode([Resource].self, from: Data("[\(json)]".utf8))
+        XCTAssertEqual(roster.count, 1)
+        guard case .agent(let row) = roster[0] else { return XCTFail("agent discriminator lost") }
+        XCTAssertEqual(row.id, agent.id)
+        XCTAssertEqual(row.name, agent.name)
+        XCTAssertEqual(row.lifecycle, .unknown("future-kind"))
+
+        let again = try JSONDecoder().decode(Resource.self, from: JSONEncoder().encode(roster[0]))
+        guard case .agent(let roundTrip) = again else { return XCTFail("agent discriminator lost on round trip") }
+        XCTAssertEqual(roundTrip.id, agent.id)
+        XCTAssertEqual(roundTrip.lifecycle, .unknown("future-kind"))
+    }
+
+    func testAgentLifecycleKnownAndAbsentPreserveRosterRows() throws {
+        for (field, expected) in [
+            (#","lifecycle":"standing""#, Optional(AgentLifecycle.standing)),
+            (#","lifecycle":"owner""#, Optional(AgentLifecycle.owner)),
+            (#","lifecycle":"bounded""#, Optional(AgentLifecycle.bounded)),
+            ("", nil),
+            (#","lifecycle":null"#, nil),
+        ] {
+            let json = #"{"id":"agent/example","kind":"agent","revision":"r1","updated_at":"2026-10-08T12:00:00Z","name":"Example","state":"idle","reachability":"online","runtime_ids":[],"under":[]\#(field)}"#
+            let resource = try JSONDecoder().decode(Resource.self, from: Data(json.utf8))
+            guard case .agent(let agent) = resource else { return XCTFail("agent discriminator lost") }
+            XCTAssertEqual(agent.id, "agent/example")
+            XCTAssertEqual(agent.lifecycle, expected)
+        }
+    }
+
     func testDiscriminatedResourceFixturePreservesTypedDetailsAndVisualization() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }

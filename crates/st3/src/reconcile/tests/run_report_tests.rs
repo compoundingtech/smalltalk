@@ -417,3 +417,149 @@ fn a_reporter_that_is_not_running_gets_a_fault_on_the_run_and_no_loop() {
             })
     );
 }
+
+impl Fixture {
+    fn start_by(&self, mission: &str, key: &str, requester: &str) -> crate::model::MissionRunView {
+        let run = self
+            .store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: mission.into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some(requester.into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: key.into(),
+            })
+            .unwrap();
+        self.reconciler.reconcile_once().unwrap();
+        run
+    }
+
+    fn report_to(
+        &self,
+        run: &crate::model::MissionRunView,
+        actor: &str,
+        to: Option<&str>,
+        stalled_after_ms: Option<u64>,
+        key: &str,
+    ) -> crate::model::MissionRunReportView {
+        self.store
+            .set_mission_run_report(&run.subject, actor, to, stalled_after_ms, false, key)
+            .unwrap()
+    }
+}
+
+#[test]
+fn a_quiet_run_that_opts_in_is_reported_stalled_once() {
+    let (_clock, fixture) = fixture();
+    let run = fixture.start_by("unwatched", "opt-in-quiet", "agent/node.builder");
+    fixture.passes(3);
+    let started = fixture.store.mission_run(&run.id).unwrap().unwrap();
+    let quiet_since = crate::reconcile::run_report::run_activity(&started);
+
+    // Two hours of silence with nobody to tell writes nothing.
+    let _late = Clock::at(&fixture.store, quiet_since + 120 * MINUTE);
+    fixture.passes(3);
+    assert_eq!(fixture.report_claims(), 0);
+
+    // Its requester opts it in with a one-hour limit: the silence is already past it, so the
+    // next evaluation tells the watcher once, and no later pass tells it again.
+    fixture.report_to(
+        &run,
+        "agent/node.builder",
+        Some(REPORTER),
+        Some(60 * MINUTE as u64),
+        "opt-in-quiet-report",
+    );
+    fixture.passes(1);
+    let reports = fixture.reports(REPORTER);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(
+        reports[0]
+            .tags
+            .contains(&"st3-run-report:stalled".to_owned())
+    );
+    assert!(
+        reports[0].content.contains("its limit is 1h"),
+        "{}",
+        reports[0].content
+    );
+    fixture.passes(8);
+    assert_eq!(fixture.reports(REPORTER).len(), 1);
+    // The run kept the creation claim it started with.
+    let created = fixture
+        .store
+        .latest_claim(&run.subject, Some("mission-run.created"))
+        .unwrap()
+        .unwrap();
+    assert!(created.body["fields"].get("report_to").is_none());
+}
+
+#[test]
+fn a_changed_reporter_is_told_instead_and_a_cleared_run_tells_nobody() {
+    let (_clock, fixture) = fixture();
+    let moved = fixture.start("watched", "moved-reporter");
+    let cleared = fixture.start("watched", "cleared-reporter");
+    fixture.report_to(
+        &moved,
+        "person/requester",
+        Some("agent/node.builder"),
+        None,
+        "moved-report",
+    );
+    fixture.report_to(&cleared, "person/requester", None, None, "cleared-report");
+    for run in [&moved, &cleared] {
+        fixture
+            .store
+            .set_step_state(&Fixture::step(run, "build"), "failed", Some("broken"))
+            .unwrap();
+    }
+    fixture.passes(6);
+    assert!(fixture.reports(REPORTER).is_empty());
+    let reports = fixture.reports("agent/node.builder");
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert!(
+        reports[0]
+            .tags
+            .contains(&format!("mission-run:{}", moved.subject))
+    );
+    assert!(
+        reports[0]
+            .tags
+            .contains(&"st3-run-report:failed".to_owned())
+    );
+    assert_eq!(fixture.report_claims(), 1);
+
+    // A finished run takes no reporter.
+    let finished = fixture
+        .store
+        .set_mission_run_report(
+            &moved.subject,
+            "person/requester",
+            Some(REPORTER),
+            None,
+            false,
+            "finished-report",
+        )
+        .unwrap_err();
+    assert_eq!(finished.code, "mission-run-not-running");
+}
+
+#[test]
+fn clearing_an_unreachable_reporter_closes_its_fault() {
+    let (_clock, fixture) = fixture();
+    let run = fixture.start("absent-reporter", "absent-then-cleared");
+    fixture.passes(2);
+    let started = fixture.store.mission_run(&run.id).unwrap().unwrap();
+    let quiet_since = crate::reconcile::run_report::run_activity(&started);
+    let _late = Clock::at(&fixture.store, quiet_since + 31 * MINUTE);
+    fixture.passes(2);
+    assert_eq!(fixture.faults(&run), ["faulted"]);
+    fixture.report_to(&run, "person/requester", None, None, "absent-cleared");
+    fixture.passes(2);
+    assert_eq!(fixture.faults(&run), ["faulted", "recovered"]);
+    fixture.passes(4);
+    assert_eq!(fixture.faults(&run), ["faulted", "recovered"]);
+    assert_eq!(fixture.report_claims(), 0);
+}

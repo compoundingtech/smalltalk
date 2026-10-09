@@ -151,13 +151,13 @@ fn a_newcomer_gets_signed_claims_with_no_new_step_or_prompt() {
         &[
             "conversations",
             "send",
-            "person/ada",
+            "agent/garden/worker",
             "--from",
             "person/ada",
             "--body",
             "hello",
         ],
-        &["conversations", "ls", "person/ada"],
+        &["conversations", "ls", "agent/garden/worker"],
     ] {
         let output = newcomer
             .try_run(args)

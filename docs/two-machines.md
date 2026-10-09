@@ -94,14 +94,14 @@ If doctor reports invalid claim-signature warnings, retain the report and follow
 To show that a write travels back from beacon, send a message **on beacon**:
 
 ```sh
-st conversations send person/ada --from person/ada \
+st conversations send agent/garden/worker --from person/ada \
   --subject 'Replication check' --body 'Hello from beacon.'
 ```
 
 Read it **on studio** after the next exchange:
 
 ```sh
-st conversations ls person/ada
+st conversations ls agent/garden/worker
 ```
 
 | Replicates | Stays on the owning machine |

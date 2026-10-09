@@ -17,6 +17,8 @@ use crate::read_budget::ReadBudget;
 mod read_lifetime;
 pub mod writer_budget;
 mod transaction_finalizer;
+#[cfg(test)]
+mod managed_commit_counter_tests;
 mod writer_queue;
 
 #[cfg(test)]
@@ -713,6 +715,7 @@ fn write_queue(
     while let Some(job) = admission.next() {
         match job {
             WriterJob::Lend { lent, returned } | WriterJob::FenceLend { lent, returned, .. } => {
+                let _hold = crate::windows::Timer::start(crate::windows::StoreWork::WriterHold);
                 if let Err(std::sync::mpsc::SendError(back)) = lent.send(connection) {
                     connection = back;
                     continue;
@@ -754,6 +757,8 @@ fn run_write_batch(
 ) -> Option<WriterJob> {
     let (observers, finalizers) = callbacks;
     let started = std::time::Instant::now();
+    let _hold = crate::windows::Timer::start(crate::windows::StoreWork::WriterHold);
+    let transaction_timer = crate::windows::Timer::start(crate::windows::StoreWork::WriteTransaction);
     let mut answers = Vec::new();
     let mut lend = None;
     let (transaction, mut failure) =
@@ -815,6 +820,11 @@ fn run_write_batch(
         (_, Some(error)) => Err(error),
         (None, None) => unreachable!("a batch without a transaction failed to begin"),
     };
+    drop(transaction_timer);
+    // Observe COMMIT before post-commit callbacks can unwind; no changed-row or ACK claim.
+    if committed.is_ok() {
+        crate::profile::managed_commit_succeeded();
+    }
     if let Ok(index) = current_index(connection) {
         committed_index.store(index, Ordering::Release);
     }
@@ -1051,6 +1061,8 @@ pub struct PinnedRead<'a> {
     /// Whether the pin was registered in this thread's pin stack: set once its transaction
     /// began, so a failed BEGIN neither registers nor disturbs an outer pin.
     pub registered: bool,
+    /// Times the read transaction until it ends.
+    pub transaction: Option<crate::windows::Timer>,
 }
 
 impl Drop for PinnedRead<'_> {
@@ -1065,6 +1077,7 @@ impl Drop for PinnedRead<'_> {
         if connection.execute_batch("COMMIT").is_err() && !connection.is_autocommit() {
             let _ = connection.execute_batch("ROLLBACK");
         }
+        drop(self.transaction.take());
         configure_read_cancellation(&connection);
         // Every guard lent from the pin is gone by now; if one escaped, the pool loses that
         // connection rather than sharing it.
@@ -1454,6 +1467,7 @@ pub fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
     STATEMENTS_RUN.with(|run| run.set(run.get() + 1));
     crate::profile::sql(statement, duration);
     crate::performance::record_query(statement, duration);
+    crate::windows::record_store(crate::windows::StoreWork::Statement, duration);
     #[cfg(any(test, feature = "test-support"))]
     histogram::record(statement, duration);
     SQLITE_NANOS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
@@ -2018,6 +2032,7 @@ mod tests {
             pool: &pool,
             connection: Some(connection),
             registered: false,
+            transaction: None,
         });
         assert_eq!((pool.usage().open, pool.usage().idle), (1, 0));
         drop(escaped);

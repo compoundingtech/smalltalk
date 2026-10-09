@@ -1977,7 +1977,7 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
         "api_version": "st3.client.v0", "id": "action/message-test", "type": "message.send",
         "idempotency_key": "message-send-test-000001",
         "fence": { "snapshot_id": snapshot, "subject_revisions": {} },
-        "parameters": { "to": "person/test", "content": "hello" }
+        "parameters": { "to": "agent/test", "content": "hello" }
     });
     let (status, first) = client_post_json(app.clone(), "/v1/client/actions", action.clone()).await;
     assert_eq!(status, StatusCode::OK, "{first}");

@@ -10,6 +10,8 @@ pub(super) mod arrangements;
 pub(super) mod conversation_blocks;
 mod collection_windows;
 mod collection_ivm;
+#[cfg(test)]
+mod collection_refresh_tests;
 mod summary;
 
 #[cfg(test)]
@@ -25,7 +27,10 @@ pub(super) async fn request_latency(
     Extension(session): Extension<ClientSession>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
-    Ok(Json(json!({ "routes": super::request_latency_snapshot() })))
+    Ok(Json(json!({
+        "routes": super::request_latency_snapshot(),
+        "cost_counters": crate::profile::cost_snapshot(),
+    })))
 }
 
 // A client holds one socket for all its current collection views. A subscription
@@ -67,6 +72,8 @@ struct CollectionSubscription {
     /// The roster publication revision when this window's last read began. An agents window
     /// rereads once a later roster is published, even at the same graph index.
     roster_revision: u64,
+    /// The same for every other published view: its revision when this window's last read began.
+    view_revision: u64,
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
@@ -92,6 +99,12 @@ const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
 const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 const COLLECTION_PING_INTERVAL: Duration = Duration::from_secs(8);
 const COLLECTION_SEND_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Whether a collection's rows change as time passes without a claim: attention grace periods,
+/// mission and work-queue leases, and the summary counts made of them.
+fn collection_follows_clock(collection: &str) -> bool {
+    matches!(collection, "attention" | "missions" | "agents" | "summary")
+}
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
@@ -862,7 +875,9 @@ async fn conversation_page(
     .map_err(ApiError::internal)?
 }
 
-/// What changed in a conversation after `after`, waiting up to `wait_ms` for something to.
+/// What changed in a conversation after `after`, waiting up to `wait_ms` for something to. A
+/// local follower keeps the conversation's `mark` between calls, so its owner and transcript are
+/// found once rather than on every wait.
 async fn conversation_changes_value(
     state: &AppState,
     session: &ClientSession,
@@ -870,6 +885,7 @@ async fn conversation_changes_value(
     remote: Option<&str>,
     after: Option<&str>,
     wait_ms: u64,
+    mark: &mut Option<ConversationMark>,
 ) -> Result<Value, ApiError> {
     if let Some(owner) = remote {
         let relay = state
@@ -896,7 +912,10 @@ async fn conversation_changes_value(
             })
             .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
-    conversation_changes_local(state, session, session_id, after, wait_ms).await
+    let (value, kept) =
+        conversation_changes_local_marked(state, session, session_id, after, wait_ms, mark.take()).await?;
+    *mark = Some(kept);
+    Ok(value)
 }
 
 /// Capture the first page and its replay boundary with one timeline read. The graph and local
@@ -906,17 +925,18 @@ async fn conversation_open_value(
     session: &ClientSession,
     session_id: &str,
     remote: Option<&str>,
-) -> Result<(Value, Value), ApiError> {
+) -> Result<(Value, Value, Option<ConversationMark>), ApiError> {
     if remote.is_some() {
         // Existing owners relay the two public reads. Keep mixed-build relay compatibility.
-        let start = conversation_changes_value(state, session, session_id, remote, None, 0).await?;
+        let start = conversation_changes_value(state, session, session_id, remote, None, 0, &mut None).await?;
         let page = conversation_page(state, session, session_id, remote).await?;
-        return Ok((start, page));
+        return Ok((start, page, None));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
     let admission_store = state.store.clone();
     super::read_deadline::store_read(&admission_store, move || {
-        conversation_open_local(&state, &session, &session_id)
+        conversation_open_local_marked(&state, &session, &session_id)
+            .map(|(start, page, mark)| (start, page, Some(mark)))
     }).await.map_err(ApiError::internal)?
 }
 
@@ -926,9 +946,17 @@ thread_local! {
     static BEFORE_CONVERSATION_PAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
 fn conversation_open_local(
     state: &AppState, session: &ClientSession, session_id: &str,
 ) -> Result<(Value, Value), ApiError> {
+    conversation_open_local_marked(state, session, session_id).map(|(start, page, _)| (start, page))
+}
+
+/// The first page and its replay cursor, with the mark a follower keeps for its later waits.
+fn conversation_open_local_marked(
+    state: &AppState, session: &ClientSession, session_id: &str,
+) -> Result<(Value, Value, ConversationMark), ApiError> {
     // Local rows follow a graph position. Capture their high-water first: a row newer than
     // the graph cut must never be excluded from both this page and its replay cursor.
     let local_position = local_latest_position(state)?;
@@ -951,7 +979,7 @@ fn conversation_open_local(
         state, session_id, snapshot.store_index, local_position, native,
     );
     remember_cursor(&cursor, mark.transcript_seen);
-    Ok((json!({"next_cursor":cursor}), page))
+    Ok((json!({"next_cursor":cursor}), page, mark))
 }
 
 fn native_latest_sequence(page: &Value) -> u64 {
@@ -998,7 +1026,7 @@ async fn follow_conversation(
                 opened = conversation_open_value(&state, &session, &session_id, remote).await;
             }
         }
-        let (start, page) = match opened {
+        let (start, page, mut mark) = match opened {
             Ok(opened) => opened,
             Err(error) => {
                 if client_error_retryable(error.status, Some(&error.code)) {
@@ -1036,6 +1064,7 @@ async fn follow_conversation(
                 remote,
                 after.as_deref(),
                 10_000,
+                &mut mark,
             )
             .await
             {
@@ -1192,6 +1221,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut ivm_notices = sources.as_ref().map(|sources| sources.subscribe());
     let mut changed = state.event_notify.subscribe();
     let mut roster = state.store.subscribe_agent_roster();
+    let mut views = state.store.subscribe_collection_views();
     let windows = collection_windows::Windows::attach(&state.store);
     let mut window_revisions = [0; 8];
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
@@ -1199,7 +1229,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut conversations = ConversationFollowers::default();
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, u64, Value)>();
-    // The commits already weighed for a reread, whether one is due, and when the last ran.
+    // The commits already weighed, the windows due for a reread, and when the last reread ran.
     let mut attention_clock = tokio::time::interval_at(
         tokio::time::Instant::now() + ATTENTION_CLOCK_INTERVAL,
         ATTENTION_CLOCK_INTERVAL,
@@ -1211,7 +1241,10 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     );
     ping_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut weighed = state.store.index().unwrap_or_default();
-    let mut reread_due = false;
+    let mut reread_due = BTreeSet::<String>::new();
+    // Whether a commit may have changed the agents roster since its refresher was last asked
+    // to publish. Asking is paced like a reread: before, a stale reread asked for it.
+    let mut roster_wanted = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
     let mut reads = futures_util::stream::FuturesUnordered::new();
     let read_slots = Arc::new(tokio::sync::Semaphore::new(COLLECTION_MAX_SUBSCRIPTIONS));
@@ -1247,6 +1280,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         if request.kind == "unsubscribe" {
                             if let Some(presence) = &presence { presence.unfollow(&request.id); }
                             subscriptions.remove(&request.id);
+                            reread_due.remove(&request.id);
                             terminals.remove(&request.id);
                             conversations.stop(&request.id);
                             break 'command;
@@ -1266,6 +1300,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         // A subscription with a held ID replaces it.
                         subscriptions.remove(&request.id);
+                        reread_due.remove(&request.id);
                         terminals.remove(&request.id);
                         conversations.stop(&request.id);
                         // Allocate a fresh token for every accepted subscribe, including terminal
@@ -1308,7 +1343,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         refresh.push(request.id.clone());
                         // Collection results and conversation frames share the same generation fence.
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, request });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, view_revision: 0, request });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -1328,9 +1363,9 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                     Refreshed::Current => {}
                     Refreshed::Retry => {
                         if subscription.ivm.is_some() { subscription.dirty = true; }
-                        else { reread_due = true; }
+                        else { reread_due.insert(id.clone()); }
                     }
-                    Refreshed::Dropped => { subscriptions.remove(&id); }
+                    Refreshed::Dropped => { subscriptions.remove(&id); reread_due.remove(&id); }
                     Refreshed::Closed => return,
                 }
             }
@@ -1356,55 +1391,98 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
             }
             result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
-                // Weigh only the commits since the last look: a reread is due when one of them
-                // can change a held window.
+                // Weigh only the commits since the last look: a window is due for a reread when
+                // one of them can change it. A published view rereads when it publishes instead;
+                // a commit that can change the agents roster asks its refresher to publish.
                 let index = state.store.index().unwrap_or(weighed);
-                if subscriptions.values().all(|s| s.ivm.is_some()) {
+                let roster_refresher = state.store.agent_roster_refresher_running();
+                let followed = |s: &CollectionSubscription| s.ivm.is_none()
+                    && !state.store.collection_view_published(&s.request.collection);
+                if !subscriptions.values().any(followed) {
                     weighed = index;
                     continue;
                 }
+                let mut affected = BTreeSet::<String>::new();
                 if let Some(windows) = &windows {
+                    // Sockets on one store share the revisions: the first to look weighs a commit.
+                    let current = windows.current_changes(&state.store);
                     let (windows, store) = (windows.clone(), state.store.clone());
-                    match blocking_store(move || crate::profile::task("stream collection/invalidation", || windows.changes(&store))).await {
+                    let revisions = match current {
+                        Some(revisions) => Ok(revisions),
+                        None => blocking_store(move || crate::profile::task("stream collection/invalidation", || windows.changes(&store))).await,
+                    };
+                    match revisions {
                         Ok(revisions) => {
-                            reread_due |= subscriptions.values().filter(|s| s.ivm.is_none()).any(|subscription| collection_windows::Windows::changed(&subscription.request.collection, &window_revisions, &revisions));
+                            affected.extend(subscriptions.iter().filter(|(_, s)| followed(s)
+                                && collection_windows::Windows::changed(&s.request.collection, &window_revisions, &revisions))
+                                .map(|(id, _)| id.clone()));
                             window_revisions = revisions;
                         }
-                        Err(_) => { reread_due = true; }
+                        Err(_) => affected.extend(subscriptions.iter().filter(|(_, s)| followed(s)).map(|(id, _)| id.clone())),
                     }
                     weighed = index;
                 } else if index > weighed {
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims);
                     let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
                     let arrangements_changed = subscriptions.values().any(|s| s.request.collection == "arrangements") && state.store.arrangements_changed(weighed, index).unwrap_or(true);
-                    reread_due |= glasses_changed || arrangements_changed || match claims {
-                        Err(_) => true,
-                        Ok(claims) => claims.len() >= 10_000 || subscriptions.values().filter(|s| s.ivm.is_none()).any(|subscription| {
-                            claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
-                        }),
-                    };
+                    affected.extend(subscriptions.iter().filter(|(_, s)| followed(s) && (
+                        (glasses_changed && s.request.collection == "glasses")
+                        || (arrangements_changed && s.request.collection == "arrangements")
+                        || match &claims {
+                            Err(_) => true,
+                            Ok(claims) => claims.len() >= 10_000
+                                || claims.iter().any(|claim| !collection_ignores(&s.request.collection, &claim.kind)),
+                        }
+                    )).map(|(id, _)| id.clone()));
                     weighed = index;
                 }
-                if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
+                // Reading the roster before its refresher publishes would serve the one already
+                // held, and read it again once the newer one arrives.
+                let (roster_windows, others): (Vec<_>, Vec<_>) = affected.into_iter().partition(|id| roster_refresher
+                    && subscriptions.get(id).is_some_and(|s| s.request.collection == "agents"));
+                roster_wanted |= !roster_windows.is_empty();
+                reread_due.extend(others);
+                if reread_due.is_empty() && !roster_wanted || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                if std::mem::take(&mut roster_wanted) {
+                    state.store.request_agent_roster_refresh();
+                    last_reread = tokio::time::Instant::now();
+                }
+                refresh.extend(reread_due.iter().cloned());
             }
             result = roster.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 // A window read before this roster was published rereads it.
                 let published = *roster.borrow_and_update();
-                reread_due |= subscriptions.values().any(|s| s.ivm.is_none()
-                    && s.request.collection == "agents" && s.roster_revision < published);
-                if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
+                reread_due.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && s.request.collection == "agents" && s.roster_revision < published)
+                    .map(|(id, _)| id.clone()));
+                if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                refresh.extend(reread_due.iter().cloned());
             }
-            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (reread_due || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none() && reread_due || s.ivm.is_some() && s.dirty && s.reading.is_none()).map(|(id, _)| id.clone()));
+            result = views.changed(), if !command_waiting => {
+                if result.is_err() { return; }
+                // The same for every other published view.
+                let published = *views.borrow_and_update();
+                reread_due.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && s.view_revision < crate::store::published_views::revision(&published, &s.request.collection))
+                    .map(|(id, _)| id.clone()));
+                if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                refresh.extend(reread_due.iter().cloned());
+            }
+            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (!reread_due.is_empty() || roster_wanted || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
+                if std::mem::take(&mut roster_wanted) { state.store.request_agent_roster_refresh(); }
+                refresh.extend(reread_due.iter().cloned());
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_some() && s.dirty && s.reading.is_none()).map(|(id, _)| id.clone()));
                 last_reread = tokio::time::Instant::now();
             }
             _ = attention_clock.tick(), if !command_waiting && !subscriptions.is_empty() => {
-                // Pairing expiry and mission lease state can change without a claim. Stable
-                // rows remain reusable; authority and local overlays are rechecked on reads.
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
+                // Grace periods, leases and queue deadlines pass without a claim, and so does a
+                // paired grant's expiry. Stable rows remain reusable; authority and local
+                // overlays are rechecked on reads.
+                let paired = session.transport != "unix";
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && (paired || collection_follows_clock(&s.request.collection)))
+                    .map(|(id, _)| id.clone()));
             }
             _ = ping_clock.tick() => {
                 // Protocol liveness never schedules an authorized window read.
@@ -1442,12 +1520,14 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
         if refresh.is_empty() {
             continue;
         }
+        // Rereads are paced together: reading any due window, or every held window (as a lone
+        // new subscription does), starts the next interval.
         let legacy_windows = subscriptions.values().filter(|s| s.ivm.is_none()).count();
         let refreshed_legacy = refresh.iter().filter(|id| subscriptions.get(*id).is_some_and(|s| s.ivm.is_none())).count();
-        if legacy_windows > 0 && refreshed_legacy == legacy_windows {
-            reread_due = false;
+        if refresh.iter().any(|id| reread_due.contains(id)) || legacy_windows > 0 && refreshed_legacy == legacy_windows {
             last_reread = tokio::time::Instant::now();
         }
+        reread_due.retain(|id| !refresh.contains(id));
         // Keep admission, conversation and terminal delivery live while each window reads.
         // Replaced/unsubscribed windows are fenced by their subscription generation.
         for id in refresh {
@@ -1460,6 +1540,8 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
             }
             subscription.dirty = false;
             subscription.roster_revision = *roster.borrow();
+            subscription.view_revision =
+                crate::store::published_views::revision(&views.borrow(), &subscription.request.collection);
             let (cancel, canceled) = tokio::sync::oneshot::channel::<()>();
             subscription.reading = Some(cancel);
             let request = subscription.request.clone();
@@ -5114,14 +5196,19 @@ fn managed_claude_transcript(
     // provider's binding can survive a restart, so it counts only when it names the same
     // provider incarnation as the seat's current observation; neither its presence nor the
     // newest transcript in a workspace is sufficient.
-    let hook_binding = std::fs::read(directory.join("claude-native-session"))
+    let hook_record = std::fs::read(directory.join("claude-native-session"))
         .ok()
         .and_then(|binding| serde_json::from_slice::<Value>(&binding).ok())
-        .and_then(|binding| {
-            (binding["incarnation"].as_str() == Some(evidence))
-                .then(|| binding["native_session_id"].as_str().map(str::to_owned))
-                .flatten()
-        });
+        .filter(|binding| binding["incarnation"].as_str() == Some(evidence));
+    let hook_binding = hook_record
+        .as_ref()
+        .and_then(|binding| binding["native_session_id"].as_str().map(str::to_owned));
+    // The path Claude gave the hook is where this session's transcript really is, on whatever
+    // login the seat runs: `~/.claude` or any account's `CLAUDE_CONFIG_DIR`.
+    let recorded_path = hook_record
+        .as_ref()
+        .and_then(|binding| binding["transcript_path"].as_str())
+        .map(std::path::PathBuf::from);
     let native_id = match hook_binding {
         Some(native_id) => native_id,
         // Without the hook, prove the session from the live processes instead; see
@@ -5131,11 +5218,35 @@ fn managed_claude_transcript(
             format!("the SessionStart hook did not bind this incarnation, and {reason}")
         })?,
     };
-    match crate::external_sessions::find_bound_transcript(
-        home,
-        crate::external_sessions::ExternalDriver::Claude,
-        &native_id,
-    ) {
+    let find = |extra_roots: &[std::path::PathBuf]| {
+        crate::external_sessions::find_bound_transcript_with(
+            home,
+            crate::external_sessions::ExternalDriver::Claude,
+            &native_id,
+            recorded_path.as_deref(),
+            extra_roots,
+        )
+    };
+    let mut found = find(&[]);
+    // A seat started before its binding recorded a path, on an account's own login: look in the
+    // declared accounts' login directories too. Only reached when the ordinary places miss.
+    if matches!(found, Ok(None)) {
+        let host = st_drivers::run::detect_host();
+        let roots = state
+            .store
+            .declared_accounts()
+            .unwrap_or_default()
+            .iter()
+            .filter(|account| account.driver() == Some("claude"))
+            .filter_map(|account| account.login_for(&host))
+            .filter_map(|login| crate::accounts::expand_login(login, Some(home)))
+            .map(|login| login.join("projects"))
+            .collect::<Vec<_>>();
+        if !roots.is_empty() {
+            found = find(&roots);
+        }
+    }
+    match found {
         Ok(Some(session)) => Ok(session),
         Ok(None) => Err(Missing::not_yet(format!(
             "Claude session {native_id} has no transcript file yet"
@@ -6046,6 +6157,9 @@ fn conversation_read_now_unbounded(
 struct ConversationMark {
     owner: Option<String>,
     transcript: Option<std::path::PathBuf>,
+    /// When the owner and transcript were found. A harness can move to a new transcript within
+    /// one incarnation, so a kept mark finds them again after [`CONVERSATION_MARK_REUSE`].
+    resolved_at: std::time::Instant,
     store_index: u64,
     local_position: u64,
     transcript_seen: Option<(u64, std::time::SystemTime)>,
@@ -6056,6 +6170,9 @@ struct ConversationMark {
 /// rebuilding the timeline, that nothing concerning the conversation changed since: idle polls
 /// rebuilt a 200-entry timeline every time, 275–620 ms of daemon CPU each (idle-cpu findings).
 type TranscriptSeen = Option<(u64, std::time::SystemTime)>;
+/// How long a follower reuses the owner and transcript it found: one follow wait, as long as a
+/// wait-long changes read always reused them.
+const CONVERSATION_MARK_REUSE: Duration = Duration::from_secs(10);
 type HashMap<K, V> = std::collections::HashMap<K, V>;
 const ISSUED_CURSORS: usize = 4096;
 
@@ -6086,6 +6203,14 @@ fn issued_transcript(cursor: &str) -> Option<TranscriptSeen> {
     issued_cursors().lock().ok()?.1.get(cursor).copied()
 }
 
+/// Conversation owners and transcripts found, by session, counted by the work-budget tests.
+#[cfg(test)]
+fn conversation_marks_resolved() -> &'static std::sync::Mutex<HashMap<String, u64>> {
+    static RESOLVED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    RESOLVED.get_or_init(Default::default)
+}
+
 /// First-page builds for initial OPEN and reactive changes, counted by the work-budget tests.
 #[cfg(test)]
 fn timeline_rebuilds() -> &'static std::sync::Mutex<HashMap<String, u64>> {
@@ -6107,6 +6232,10 @@ impl ConversationMark {
     }
 
     fn new_unbounded(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        #[cfg(test)]
+        if let Ok(mut resolved) = conversation_marks_resolved().lock() {
+            *resolved.entry(session_id.to_owned()).or_default() += 1;
+        }
         let index = state.store.index().map_err(ApiError::internal)?;
         let managed = super::managed_session_owner_at(&state.store, index, session_id)
             .map_err(ApiError::internal)?;
@@ -6124,10 +6253,26 @@ impl ConversationMark {
         Ok(Self {
             transcript_seen: transcript_seen(transcript.as_deref()),
             transcript,
+            resolved_at: std::time::Instant::now(),
             owner,
             store_index: index,
             local_position: local_latest_position(state)?,
         })
+    }
+
+    /// Bring a kept mark up to now without finding its owner or transcript again: the same as a
+    /// new mark while they are known and recently found. Otherwise find them again.
+    fn refresh(mut self, state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        if self.transcript.is_none() || self.resolved_at.elapsed() >= CONVERSATION_MARK_REUSE {
+            return Self::new(state, session_id);
+        }
+        super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+            self.store_index = state.store.index().map_err(ApiError::internal)?;
+            self.local_position = local_latest_position(state)?;
+            Ok(())
+        })?;
+        self.transcript_seen = transcript_seen(self.transcript.as_deref());
+        Ok(self)
     }
 
     /// Whether anything that concerns the conversation changed since the last look.
@@ -6167,9 +6312,27 @@ async fn conversation_changes_local(
     after: Option<&str>,
     wait_ms: u64,
 ) -> Result<Value, ApiError> {
+    conversation_changes_local_marked(state, session, session_id, after, wait_ms, None)
+        .await
+        .map(|(value, _)| value)
+}
+
+/// [`conversation_changes_local`], starting from a mark kept from an earlier read of the same
+/// conversation, and returning the mark to keep for the next.
+async fn conversation_changes_local_marked(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+    wait_ms: u64,
+    kept: Option<ConversationMark>,
+) -> Result<(Value, ConversationMark), ApiError> {
     let mut changed = state.event_notify.subscribe();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(30_000));
-    let mut mark = ConversationMark::new(state, session_id)?;
+    let mut mark = match kept {
+        Some(mark) => mark.refresh(state, session_id)?,
+        None => ConversationMark::new(state, session_id)?,
+    };
     // A cursor this member gave out, with nothing that concerns the conversation changed since:
     // there is nothing to read yet, so wait without rebuilding the timeline.
     let mut quiet = None;
@@ -6205,7 +6368,7 @@ async fn conversation_changes_local(
             || after.is_none()
             || tokio::time::Instant::now() >= deadline
         {
-            return Ok(value);
+            return Ok((value, mark));
         }
         // Read again only when something that concerns this conversation changed: a full read
         // parses the whole transcript, and the fleet commits many times a second.
@@ -6231,7 +6394,7 @@ async fn conversation_changes_local(
                     remember_cursor(&next, mark.transcript_seen);
                     value["next_cursor"] = Value::String(next);
                 }
-                return Ok(value);
+                return Ok((value, mark));
             }
         }
     }
@@ -10556,6 +10719,21 @@ pub(super) async fn action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_latency_keeps_scope_and_routes_with_a_memory_only_cost_snapshot() {
+        let mut session = ClientSession::for_tests("person/ada", "person/ada", "local");
+        assert_eq!(request_latency(Extension(session.clone())).await.unwrap_err().status, StatusCode::FORBIDDEN);
+        session.scopes.insert("read.projections".into());
+        let work = smallclaims::sqlite::work::SqliteWorkScope::start();
+        let Json(value) = request_latency(Extension(session)).await.unwrap();
+        assert_eq!(work.finish(), smallclaims::sqlite::work::SqliteWork::default(), "the counter handler must not execute SQLite statements");
+        assert!(value["routes"].is_array());
+        assert!(value["cost_counters"]["state"].is_string());
+        assert!(value["cost_counters"]["as_of_unix_ms"].is_number());
+        assert!(value["cost_counters"].get("window").is_some());
+    }
+
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
@@ -10991,6 +11169,59 @@ mission "queue-parity" state="ready" {
         let mut bad_retry = frame.clone();
         bad_retry["retryable"] = json!("yes");
         assert!(!validator.is_valid(&bad_retry));
+    }
+
+    #[tokio::test]
+    async fn agent_lifecycle_declaration_updates_live_roster_rows() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let writer = state.clone();
+        let apply = |lifecycle: Option<&str>, key: &str| {
+            let field = lifecycle.map(|value| format!("lifecycle \"{value}\";")).unwrap_or_default();
+            let source = format!("version 2\nagent \"example/purpose\" {{ {field} command \"true\" }}");
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let planned = writer.store.mission(&intent, IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            writer.store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            signal_changed(&writer);
+        };
+        apply(Some("standing"), "lifecycle-initial");
+        let app = axum::Router::new().route("/stream", axum::routing::get(
+            move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| collection_stream_socket_with_reader(
+                        socket, state, ClientSession::local(None).unwrap(), None,
+                        |state, session, request, permit| async move {
+                            collection_items(&state, &session, &request, permit).await
+                        },
+                    ))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"lifecycle","collection":"agents","limit":2}).to_string().into(),
+        )).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["kind"], "snapshot");
+        assert_eq!(frame["items"][0]["lifecycle"], "standing");
+        for (lifecycle, key) in [(Some("owner"), "lifecycle-owner"), (Some("bounded"), "lifecycle-bounded"), (None, "lifecycle-removed")] {
+            apply(lifecycle, key);
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["kind"], "changes", "{frame}");
+            assert_eq!(frame["upserts"][0]["id"], "agent/example/purpose");
+            assert_eq!(frame["upserts"][0].get("lifecycle"), lifecycle.map(|value| json!(value)).as_ref());
+        }
+        socket.close(None).await.unwrap();
+        server.abort();
     }
 
     #[tokio::test]
@@ -12320,8 +12551,8 @@ mission "queue-parity" state="ready" {
                                         entered.send(()).unwrap();
                                         held.notified().await;
                                     } else if request.id == "probe" && probe.fetch_add(1, Ordering::SeqCst) > 0 {
-                                        // A second work read can only come from the all-window
-                                        // commit refresh; the same pass marks held dirty.
+                                        // This mission publication changes both work and missions;
+                                        // the same commit refresh marks held dirty.
                                         refreshed.send(()).unwrap();
                                     }
                                     result
@@ -14585,7 +14816,7 @@ subscription "watch/source" {
                 snapshot_id: snapshot.id.clone(),
                 ..Default::default()
             },
-            parameters: json!({"to":"person/blair","content":"Send once despite unrelated activity."}),
+            parameters: json!({"to":"agent/blair","content":"Send once despite unrelated activity."}),
         };
         state
             .store
@@ -16086,7 +16317,11 @@ mission "example/zero-run" state="ready" {
             assert_eq!(frame["has_more"], lines * 2 > 200);
             assert!(frame_bytes(&frame) <= CLIENT_MAX_RESPONSE_BYTES);
             let rebuilds = || timeline_rebuilds().lock().unwrap().get(&session_id).copied().unwrap_or(0);
+            let resolved = || conversation_marks_resolved().lock().unwrap().get(&session_id).copied().unwrap_or(0);
             assert_eq!(rebuilds(), 1, "OPEN must not fold an empty baseline before its page");
+            // Let the follower start its first wait: it keeps the owner and transcript OPEN found.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(resolved(), 1, "OPEN and its first wait find the transcript once");
             // Change the source after the first frame. The next frame is a delta, not a reload.
             use std::io::Write as _;
             let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -16099,6 +16334,8 @@ mission "example/zero-run" state="ready" {
             assert!(delta["items"].as_array().unwrap().iter().any(|item|
                 item["body"]["text"].as_str().is_some_and(|text| text.starts_with(&format!("answer {lines} ")))));
             assert_eq!(rebuilds(), 2);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(resolved(), 1, "a delta and the wait after it reuse the kept mark");
             assert_collection_frame_conforms(&delta);
             follower.abort();
             let _ = follower.await;

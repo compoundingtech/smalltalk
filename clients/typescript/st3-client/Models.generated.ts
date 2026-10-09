@@ -46,6 +46,7 @@ export type Agent = ResourceHeader & {
   incarnation_id?: string | null;
   kind: "agent";
   last_activity_at?: (Timestamp | null);
+  lifecycle?: AgentLifecycle;
   name: string;
   next_work?: (WorkLabel | null);
   next_work_id?: (Id | null);
@@ -119,6 +120,8 @@ export type AgentHandoff = {
 };
 
 export type AgentId = string;
+
+export type AgentLifecycle = ("standing" | "owner" | "bounded" | string);
 
 export type AgentMessageDay = {
   calibrated_messages: number;

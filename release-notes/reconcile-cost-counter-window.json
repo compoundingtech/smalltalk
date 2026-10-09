@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Expose one completed reconciliation/process-cost window through request latency",
+  "replay": {
+    "status": "none",
+    "detail": "No claims, projection, admission, authority or effect changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "In-memory diagnostics only; no table/index/trigger or numeric schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Rules, digests and checkpoint format unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Add cost_counters to existing read.projections request-latency response, preserving routes. Disabled/missing windows and unavailable source/CPU are explicit. Completed profiled reconcile operations include errors; SQL belongs to that task scope, with direct/unprofiled/unfinished exclusions. Process CPU uses the process clock. managed_outer_commits is PARTIAL, includes no-op outer commits, excludes raw/autocommit/SQL BEGIN-COMMIT and private direct abortable commits. Counts are neither total writes, claim rows nor durable ACKs. Sequential boundary sampling is disclosed; no profiler activation, endpoint file/DB scan, new timer or collector."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration or extra downtime."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new activation or configuration. Cost windows exist only when existing profiling is already enabled."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Compatible rollback removes the added response field and diagnostic atomic increments; no durable state conversion."
+  }
+}

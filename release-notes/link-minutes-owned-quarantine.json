@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Quarantine the link-minutes recovery test in optional perf-cost with the merge-queue-flakes builder as owner",
+  "replay": {"status": "none", "detail": "CI test routing only; no claim replay or rebuild."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No authority or claim rule change."},
+  "compatibility": {"status": "none", "detail": "Only messaging_faults::link_minutes leaves required CI. It runs once with all original native, authentication and ten-second recovery assertions in optional perf-cost; all other messaging faults remain required."},
+  "downtime": {"status": "none", "detail": "No production runtime change."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "The merge-queue-flakes builder owns the open signed-exchange retry-cap mismatch and removal of this quarantine after repair qualification. No production retry policy is changed."}
+}

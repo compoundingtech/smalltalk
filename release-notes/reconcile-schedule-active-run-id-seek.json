@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Seek schedule-started mission runs by their existing ID index",
+  "replay": {"status": "none", "detail": "No replay or projection changes. Historical schedule.work-started rows retain their existing matching semantics."},
+  "schema": {"status": "none", "detail": "Uses the existing mission_runs primary-key index; no table, index, trigger or schema-version change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "Preserves the original exact mission-run reference equality, subject/kind selection and terminal-status exclusions. No phase, origin, scheduling, authority or admission policy changes."},
+  "downtime": {"status": "none", "detail": "No additional migration or interruption beyond a normal binary swap."},
+  "manual": {"status": "none", "detail": "No configuration or manual migration is required."},
+  "recovery": {"status": "none", "detail": "Rollback restores the former read query without durable-state conversion or cache invalidation."}
+}
