@@ -263,7 +263,7 @@ export function EmbraceComposerToolbar({ target, recipients, models, onTargetCha
     <div {...stylex.props(styles.targets)}>
       {selectRecipient ? <MenuTrigger>
         <TooltipTrigger delay={150} closeDelay={0}>
-          <Button aria-label="Select recipient" aria-description={target.label} {...stylex.props(styles.button, styles.target, compact && styles.targetCompact, iconOnly && styles.targetIcon)}>
+          <Button aria-label={`Select recipient: ${target.label}`} {...stylex.props(styles.button, styles.target, compact && styles.targetCompact, iconOnly && styles.targetIcon)}>
             <span data-composer-picker-label={!iconOnly ? true : undefined} {...stylex.props(styles.targetLabel)}>{iconOnly ? <Icon name="message" /> : target.label}</span>
             {!compact && <Icon name="chevron-down" size={12} />}
           </Button>
@@ -276,7 +276,7 @@ export function EmbraceComposerToolbar({ target, recipients, models, onTargetCha
       </TooltipTrigger>}
       {selectModel && <MenuTrigger>
         <TooltipTrigger delay={150} closeDelay={0}>
-          <Button aria-label="Select model" aria-description={target.model ?? 'Model'} {...stylex.props(styles.button, styles.target, compact && styles.targetCompact, iconOnly && styles.targetIcon)}>
+          <Button aria-label={`Select model: ${target.model ?? 'Model'}`} {...stylex.props(styles.button, styles.target, compact && styles.targetCompact, iconOnly && styles.targetIcon)}>
             <span data-composer-picker-label={!iconOnly ? true : undefined} {...stylex.props(styles.targetLabel)}>{iconOnly ? <Icon name="gear" /> : target.model ?? 'Model'}</span>
             {!compact && <Icon name="chevron-down" size={12} />}
           </Button>
