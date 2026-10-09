@@ -618,10 +618,10 @@ fn native_outer_and_savepoint_rollback_restore_claim_image_reference_and_prefix(
     assert!(slice.store.claims_for("note/rollback", None)?.is_empty());
     {
         let mut writer = slice.store.connection.write();
-        let mut tx = writer.transaction()?;
-        let mut savepoint = tx.savepoint()?;
+        let tx = writer.transaction()?;
+        tx.execute_batch("SAVEPOINT slice_native_rollback")?;
         Plain.append_claim_tx(
-            &savepoint,
+            &tx,
             "slice-fixture",
             "note/savepoint",
             "example.slice-unknown",
@@ -630,8 +630,7 @@ fn native_outer_and_savepoint_rollback_restore_claim_image_reference_and_prefix(
             &[],
             None,
         )?;
-        savepoint.rollback()?;
-        savepoint.commit()?;
+        tx.execute_batch("ROLLBACK TO slice_native_rollback; RELEASE slice_native_rollback")?;
         tx.commit()?;
     }
     assert_eq!(slice.tuple()?, before);

@@ -2,8 +2,12 @@
 
 Status: first reviewable source slice, 2026-10-09, following plan `938933bcb`.
 The additive fixture and narrow input-budget method are authored; all controls
-are UNRUN. No compiler, SQLite execution, load, collector, production
+are UNRUN. No local compiler, SQLite execution, load, collector, production
 registration or activation occurred. The asynchronous-catch-up claim remains open.
+The first hosted test producer on `59ee523dc` failed before any selected control:
+the native savepoint fixture passed a Savepoint where Runtime requires Transaction.
+Its correction uses an explicit nested savepoint on that managed outer transaction;
+failure-qualified cleanup remains a separate prerequisite, not a waived failure.
 
 ## Source and actual dependencies
 
