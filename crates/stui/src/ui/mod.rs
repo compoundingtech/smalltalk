@@ -1591,6 +1591,7 @@ impl Ui {
                     ("alt+←→↑↓", "splits"),
                     ("ctrl+w", "close"),
                     ("?", "help"),
+                    ("ctrl+q", "quit"),
                 ]
             } else {
                 let mut hints = vec![("1-5", "tabs"), ("↑↓", "select")];
