@@ -39,8 +39,12 @@ pub struct SmalltalkRuntime {
     /// When the oldest refresh request no refresh has answered yet was made, in Unix ms; 0
     /// when none waits. A refresh clears it only once it publishes.
     pub(crate) agent_roster_requested_at: std::sync::atomic::AtomicU64,
+    /// Whether the current overdue refresh request was already reported.
+    pub(crate) agent_roster_overdue_warned: std::sync::atomic::AtomicBool,
     /// Whether a reader asked for the history roster since the refresher last folded it.
     pub(crate) agent_roster_history_wanted: std::sync::atomic::AtomicBool,
+    /// Rosters assembled in chunks because no short fold could complete them, by why.
+    pub(crate) agent_roster_chunked: Mutex<BTreeMap<String, u64>>,
     /// Counts complete current roster publications, same graph index or not, so collection
     /// streams that read an earlier one reread the newer.
     pub(crate) agent_roster_published: tokio::sync::watch::Sender<u64>,

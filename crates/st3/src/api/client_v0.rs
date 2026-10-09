@@ -251,7 +251,11 @@ async fn collection_items_with_windows(
     let arrangement_window = collection == "arrangements";
     let mut admitted = collection != "agents";
     let (snapshot, mut items, mut has_more) = loop {
-        let roster_admission = if matches!(collection.as_str(), "agents" | "summary") && admitted {
+        // Summary reads the published roster once a refresher keeps one; only a store without
+        // one folds it here, behind the shared admission.
+        let roster_admission = if admitted && (collection == "agents"
+            || collection == "summary" && !state.store.agent_roster_refresher_running())
+        {
             Some(state.store.admit_agent_resources().await)
         } else {
             None
@@ -11066,6 +11070,53 @@ mission "queue-parity" state="ready" {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_pages_ask_for_a_refresh_after_local_activity_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/local-page";
+        for (kind, fields) in [
+            ("runtime.observed", json!({"status":"running", "runtime_id":"local-page", "incarnation_id":"one"})),
+            ("harness.observed", json!({"state":"working", "driver":"codex", "incarnation_id":"one"})),
+        ] {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let index = state.store.index().unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        let page = || client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery::default()));
+        let (_, Json(before)) = page().await.unwrap();
+        assert!(before.items[0]["last_activity_at"].is_null());
+
+        // Local activity alone: no claim, so the graph index stays put.
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "harness.timeline".into(), actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"operation":"append",
+                "entry_id":"local-page", "source_id":"fixture/local-page",
+                "sequence":1, "revision":1, "role":"assistant", "entry_type":"message",
+                "final":true, "driver":"codex", "incarnation_id":"one",
+                "observed_at_unix_ms":client_now_ms(), "body":{"text":"local activity"}})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert_eq!(state.store.index().unwrap(), index);
+        let revision = *published.borrow_and_update();
+        // This page still shows the published roster, and asks for a newer one.
+        let (_, Json(stale)) = page().await.unwrap();
+        assert!(stale.items[0]["last_activity_at"].is_null());
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|now| *now > revision))
+            .await.expect("a page asks the refresher for local activity").unwrap();
+        let (snapshot, Json(after)) = page().await.unwrap();
+        assert_eq!(snapshot.0.store_index, index);
+        assert!(!after.items[0]["last_activity_at"].is_null(), "{:?}", after.items[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_roster_stream_rereads_a_same_index_publication_after_local_activity() {
         use futures_util::{SinkExt as _, StreamExt as _};
         let root = tempfile::tempdir().unwrap();
@@ -11209,6 +11260,38 @@ mission "queue-parity" state="ready" {
             Query(continue_query)).await.unwrap_err();
         assert_eq!(expired.code, "page-cursor-expired");
         assert_eq!(state.store.agent_resources_builds_for_test(), builds);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_roster_summary_reads_the_publication_without_roster_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/summary-roster".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"summary-roster", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        // A slow refresh holds the roster admission; summary must not queue behind it.
+        let _refresh = state.store.admit_agent_resources().await;
+        let request: CollectionSubscribe = serde_json::from_value(json!({
+            "kind":"subscribe", "id":"summary", "collection":"summary",
+        })).unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let (_, items, _) = tokio::time::timeout(Duration::from_secs(2),
+            collection_items_with_windows(&state, &ClientSession::local(None).unwrap(), &request,
+                semaphore.acquire_owned().await.unwrap(),
+                collection_windows::Windows::attach(&state.store)))
+            .await.expect("summary must not wait for the roster admission").unwrap();
+        assert_eq!(items[0]["kind"], "summary");
+        // The agent counts name the published roster they came from.
+        let (cut, _, published_at) = state.store.published_agent_roster(state.store.index().unwrap(), false).unwrap();
+        assert_eq!(items[0]["agents_as_of"]["store_index"], cut);
+        assert_eq!(items[0]["agents_as_of"]["published_at"], client_timestamp(published_at));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

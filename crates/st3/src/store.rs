@@ -946,8 +946,7 @@ const AGENT_CARD_STATUS_LIMIT: usize = 4096;
 /// A roster head: its cut, every agent's refs, the first cards in order, and when published.
 pub(crate) type PublishedRosterHead = (u64, Arc<Vec<Value>>, Vec<Value>, u128);
 
-/// How long a roster refresh request may go unanswered before readers stop serving published
-/// rows and say the roster is not ready.
+/// How long a roster refresh request may go unanswered before the daemon warns about it.
 const AGENT_ROSTER_OVERDUE_MS: u64 = 30_000;
 
 /// One subject's reduction, read at snapshot `read_at`, so it holds from there on.
@@ -2886,6 +2885,16 @@ impl Store {
         through: u64,
         previous: &[Value],
     ) -> Result<Option<AgentResourcesDelta>> {
+        Ok(self.agent_resources_delta(after, through, previous)?.ok())
+    }
+
+    /// The cards claims between two cuts change, or why that cannot be told card by card.
+    fn agent_resources_delta(
+        &self,
+        after: u64,
+        through: u64,
+        previous: &[Value],
+    ) -> Result<std::result::Result<AgentResourcesDelta, String>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare_cached(
             "SELECT subject, kind, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
@@ -2906,7 +2915,7 @@ impl Store {
                 continue;
             }
             if self.smalltalk.claim_registry().claim(&kind).is_none() {
-                return Ok(None);
+                return Ok(Err(format!("unregistered {kind}")));
             }
             if subject.starts_with("agent/") {
                 // All registered agent claims can affect the subject's actual reduction or
@@ -2956,14 +2965,15 @@ impl Store {
                 // pending-delivery blocker, including replies through message ancestors.
                 // Receipts lack endpoints, so use the same message projection blockers read.
                 let Some(message) = self.message(&subject)? else {
-                    return Ok(None);
+                    return Ok(Err(format!("{kind} without its message")));
                 };
                 delta.subjects.extend([message.from, message.to].into_iter()
                     .filter(|party| party.starts_with("agent/")));
                 continue;
             }
             // Any other claim about a card input subject: refold conservatively.
-            return Ok(None);
+            let namespace = subject.split('/').next().unwrap_or_default();
+            return Ok(Err(format!("{kind} on {namespace}/")));
         }
         if !owners.is_empty() {
             // Existing cards carry their historical ownership; current declarations also
@@ -2982,7 +2992,7 @@ impl Store {
             delta.subjects.extend(statement.query_map([owners], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<BTreeSet<_>>>()?);
         }
-        Ok(Some(delta))
+        Ok(Ok(delta))
     }
 
     /// An allow-list for shallow refs, narrower than card-local invalidation: runtime status
@@ -3083,29 +3093,34 @@ impl Store {
         Some(wake)
     }
 
-    /// Whether a complete roster at `index` takes folding at most `bound` cards: the newest
-    /// rows, complete or partial, say which cards changed since, and together with the agents
-    /// they do not cover yet those are no more than `bound`. Read in the snapshot that folds.
-    pub(crate) fn agent_roster_completion_bounded(
+    /// `None` when a complete roster at `index` takes folding at most `bound` cards: the
+    /// newest rows, complete or partial, say which cards changed since, and together with the
+    /// agents they do not cover yet those are no more than `bound`. Otherwise why not. Read in
+    /// the snapshot that folds.
+    pub(crate) fn agent_roster_unbounded_because(
         &self,
         index: u64,
         history: bool,
         bound: usize,
-    ) -> Result<bool> {
+    ) -> Result<Option<String>> {
         let previous = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.index <= index)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         // Without rows to start from, every agent is missing: a small roster, or an empty
         // one, still completes in one bounded fold.
-        let changed = match &previous {
-            None => 0,
-            Some(previous) if previous.index == index => 0,
-            Some(previous) => match self.changed_agent_resources(previous.index, index, &previous.items)? {
-                Some(delta) => delta.subjects.len(),
-                None => return Ok(false),
+        let (changed, membership) = match &previous {
+            None => (0, true),
+            Some(previous) if previous.index == index => (0, false),
+            Some(previous) => match self.agent_resources_delta(previous.index, index, &previous.items)? {
+                Ok(delta) => (delta.subjects.len(), delta.membership),
+                Err(reason) => return Ok(Some(reason)),
             },
         };
+        // Complete rows whose membership no claim moved miss no agent: skip listing them all.
+        if previous.as_ref().is_some_and(|previous| previous.covered.is_none()) && !membership {
+            return Ok((changed > bound).then(|| "cards changed".to_owned()));
+        }
         let connection = self.readers.get();
         let names = connection.prepare_cached(RANGE_SUBJECTS)?
             .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
@@ -3117,7 +3132,33 @@ impl Store {
         let folded = previous.iter().flat_map(|previous| previous.items.iter())
             .filter_map(|item| item["id"].as_str()).collect::<HashSet<_>>();
         let missing = names.iter().filter(|name| !folded.contains(name.as_str())).count();
-        Ok(changed.saturating_add(missing) <= bound)
+        Ok((changed.saturating_add(missing) > bound).then(|| {
+            if missing > changed { "cards missing" } else { "cards changed" }.to_owned()
+        }))
+    }
+
+    /// Count one roster assembled in chunks because no short fold could complete it, by why.
+    pub(crate) fn note_agent_roster_chunked(&self, reason: &str) {
+        crate::performance::record_request("roster/chunked-assembly", None, std::time::Duration::ZERO);
+        *self.smalltalk.agent_roster_chunked.lock().expect("roster counts poisoned")
+            .entry(reason.to_owned()).or_default() += 1;
+    }
+
+    /// How many rosters were assembled in chunks, by why: each folded every card again.
+    pub fn agent_roster_chunked_assemblies(&self) -> BTreeMap<String, u64> {
+        self.smalltalk.agent_roster_chunked.lock().expect("roster counts poisoned").clone()
+    }
+
+    /// Whether the newest complete roster already is the one at `index`: same graph cut,
+    /// same local activity, and no queue deadline passed since. A refresh would fold nothing.
+    pub(crate) fn agent_roster_current(&self, index: u64, history: bool) -> Result<bool> {
+        let local = roster_local_frontier(&self.readers.get(), index)?;
+        let now = now_ms();
+        Ok(self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .any(|entry| entry.history == history && entry.covered.is_none()
+                && entry.index == index && entry.local == local
+                && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)))
     }
 
     /// Whether a refresher keeps the roster published, so readers must never fold it.
@@ -3158,14 +3199,24 @@ impl Store {
             let _ = requested.compare_exchange(0, pending, std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Relaxed);
         }
+        if result.is_ok() {
+            self.smalltalk.agent_roster_overdue_warned.store(false, std::sync::atomic::Ordering::Release);
+        }
         result
     }
 
-    /// Whether a refresh request has gone unanswered so long that the refresher must be failing
-    /// or stopped: published rows are then no longer served, and readers are told not ready.
-    fn agent_roster_refresh_overdue(&self) -> bool {
+    /// Say once when a refresh request has gone unanswered so long that the refresher must be
+    /// slow, failing or stopped. Readers keep serving the newest publication, which carries its
+    /// own cut and publication time, rather than refusing rows that exist.
+    fn warn_if_agent_roster_overdue(&self) {
         let requested = self.smalltalk.agent_roster_requested_at.load(std::sync::atomic::Ordering::Acquire);
-        requested != 0 && (now_ms() as u64).saturating_sub(requested) > AGENT_ROSTER_OVERDUE_MS
+        let waited = (now_ms() as u64).saturating_sub(requested);
+        if requested != 0 && waited > AGENT_ROSTER_OVERDUE_MS
+            && !self.smalltalk.agent_roster_overdue_warned.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            eprintln!("st3: WARN an agents roster refresh asked for {} s ago is still unanswered; \
+                serving the newest published roster", waited / 1000);
+        }
     }
 
     /// The newest complete current roster published at or before `index`, with its own graph
@@ -3178,9 +3229,7 @@ impl Store {
         history: bool,
     ) -> Option<(u64, Arc<Vec<Value>>, u128)> {
         self.smalltalk.agent_roster_refresh.get()?;
-        if self.agent_roster_refresh_overdue() {
-            return None;
-        }
+        self.warn_if_agent_roster_overdue();
         self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
@@ -3213,9 +3262,7 @@ impl Store {
         count: usize,
     ) -> Option<PublishedRosterHead> {
         self.smalltalk.agent_roster_refresh.get()?;
-        if self.agent_roster_refresh_overdue() {
-            return None;
-        }
+        self.warn_if_agent_roster_overdue();
         let (cut, refs) = self.smalltalk.agent_page_refs_cache.lock()
             .expect("agent page refs cache poisoned").iter()
             .filter(|entry| !entry.history && entry.index <= index)
@@ -4637,6 +4684,8 @@ impl Store {
                 "deadline_at_unix_ms": deadline_at_unix_ms,
             }
         });
+        let mut body = body;
+        add_run_report_fields(&mut body, &mission, None, false);
         append_receipt_claim_tx(
             &transaction,
             &self.origin,
@@ -13003,24 +13052,31 @@ impl Store {
         at_index: u64,
     ) -> Result<BTreeMap<String, String>> {
         let connection = self.readers.get();
+        // Each subject's newest member reconcile decision, for 256 subjects per statement.
         let mut statement = connection.prepare_cached(
-            "SELECT body FROM claims WHERE subject=?1 AND kind='runtime.reconcile-decision'
-               AND store_index<=?2 AND json_extract(body, '$.fields.key')='member-reconcile'
-             ORDER BY store_index DESC LIMIT 1",
+            "SELECT subjects.value,
+                    (SELECT body FROM claims WHERE subject=subjects.value
+                       AND kind='runtime.reconcile-decision' AND store_index<=?2
+                       AND json_extract(body, '$.fields.key')='member-reconcile'
+                     ORDER BY store_index DESC LIMIT 1)
+             FROM json_each(?1) subjects",
         )?;
+        let mut decisions = Vec::new();
+        for chunk in subjects.chunks(256) {
+            for row in statement.query_map(params![serde_json::to_string(chunk)?, at_index], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })? {
+                let (subject, body) = row?;
+                decisions.extend(body.map(|body| (subject, body)));
+            }
+        }
         let mut faults = BTreeMap::new();
-        for subject in subjects {
-            let Some(body) = statement
-                .query_row(params![subject, at_index], |row| row.get::<_, String>(0))
-                .optional()?
-            else {
-                continue;
-            };
+        for (subject, body) in decisions {
             let body: Value = serde_json::from_str(&body)?;
             let fields = body.get("fields").unwrap_or(&body);
             if fields.get("decision").and_then(Value::as_str) == Some("member-fault") {
                 faults.insert(
-                    subject.clone(),
+                    subject,
                     fields
                         .get("reason")
                         .and_then(Value::as_str)
@@ -17239,6 +17295,8 @@ fn prepare_mission_run_declaration(
                 || stored_values != creation.inputs
                 || mode != &creation.mode
                 || mission_run_after_tx(connection, run_id)? != creation.after
+                || mission_run_report_tx(connection, run_id)?
+                    != requested_run_report(connection, creation)?
             {
                 blockers.push(format!(
                     "mission run `{}` already exists with different creation fields",
@@ -17739,6 +17797,12 @@ fn create_declared_mission_run_tx(
     if let Some(after) = &creation.after {
         body["fields"]["after"] = json!(after);
     }
+    add_run_report_fields(
+        &mut body,
+        &mission,
+        creation.report_to.as_deref(),
+        creation.report_completed,
+    );
     let run_claim = append_claim_tx(
         transaction,
         origin,
@@ -17807,6 +17871,51 @@ fn awaited_mission_run_tx(connection: &Connection, run: &str) -> Result<Option<S
             |row| row.get(0),
         )
         .optional()?)
+}
+
+/// Who a new declaration of an existing run asks it to report to, resolved against the mission
+/// revision the run started from, so that it compares with what the creation claim stored.
+fn requested_run_report(
+    connection: &Connection,
+    creation: &crate::model::MissionRunCreation,
+) -> Result<Option<(String, bool)>, St3Error> {
+    let mission = connection
+        .query_row(
+            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![creation.mission, creation.revision],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .map(|body| serde_json::from_str::<MissionSpec>(&body))
+        .transpose()
+        .map_err(internal)?;
+    Ok(mission.and_then(|mission| {
+        resolved_run_report(
+            &mission,
+            creation.report_to.as_deref(),
+            creation.report_completed,
+        )
+    }))
+}
+
+/// Who a run reports to and whether it also reports completion, as its creation claim recorded
+/// them.
+fn mission_run_report_tx(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<Option<(String, bool)>, St3Error> {
+    connection
+        .query_row(
+            "SELECT json_extract(body, '$.fields.report_to'),
+                    COALESCE(json_extract(body, '$.fields.report_completed'), 0)
+             FROM claims WHERE subject=?1 AND kind='mission-run.created' LIMIT 1",
+            [format!("mission-run/{run_id}")],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()
+        .map(|row| row.and_then(|(report_to, completed)| Some((report_to?, completed))))
+        .map_err(internal)
 }
 
 fn mission_run_after_tx(connection: &Connection, run_id: &str) -> Result<Option<String>, St3Error> {
@@ -21488,6 +21597,10 @@ fn selected_actual_source_at(
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let rows = rows
+        .iter()
+        .map(|(id, kind, origin, body)| (id.as_str(), kind.as_str(), origin.as_str(), body))
+        .collect::<Vec<_>>();
     let Some((selected_id, selected_origin, rivals)) = select_actual_source(&rows, desired_host)
     else {
         return Ok((None, None, false));
@@ -21503,15 +21616,15 @@ fn selected_actual_source_at(
 /// The selected actual-state claim of `(id, kind, origin, runtime body)` rows in canonical
 /// order, its origin, and the rival observations it must descend from to hold alone.
 fn select_actual_source(
-    rows: &[(String, String, String, Value)],
+    rows: &[(&str, &str, &str, &Value)],
     desired_host: Option<&str>,
 ) -> Option<(String, String, Vec<String>)> {
     let selected = rows
         .iter()
         .rev()
-        .find(|(_, kind, _, _)| kind == "runtime.observed")
+        .find(|(_, kind, _, _)| *kind == "runtime.observed")
         .or_else(|| rows.last());
-    let (selected_id, _, selected_origin, selected_body) = selected?;
+    let &(selected_id, _, selected_origin, selected_body) = selected?;
     // An origin's newer runtime observation supersedes its older observations. In particular,
     // its stop must retire its earlier running claim even when the new owner's intent follows
     // the desired-state branch rather than descending from that runtime branch.
@@ -21520,11 +21633,11 @@ fn select_actual_source(
         .iter()
         .rev()
         .filter(|(_, kind, origin, _)| {
-            kind == "runtime.observed" && observed_origins.insert(origin.as_str())
+            *kind == "runtime.observed" && observed_origins.insert(*origin)
         })
         .filter(|(id, _, origin, body)| {
-            id != selected_id
-                && origin != selected_origin
+            *id != selected_id
+                && *origin != selected_origin
                 && !nonowner_terminal_observation(
                     desired_host,
                     selected_origin,
@@ -21533,9 +21646,9 @@ fn select_actual_source(
                     body,
                 )
         })
-        .map(|(id, _, _, _)| id.clone())
+        .map(|(id, _, _, _)| (*id).to_owned())
         .collect::<Vec<_>>();
-    Some((selected_id.clone(), selected_origin.clone(), rivals))
+    Some((selected_id.to_owned(), selected_origin.to_owned(), rivals))
 }
 
 /// Whether claim `descendant` of `subject` descends from every claim of `ancestors`, walking the
@@ -21648,18 +21761,33 @@ fn latest_actual_at(
 fn fold_latest_actual(
     rows: impl IntoIterator<Item = (String, String)>,
 ) -> Result<Option<Value>> {
+    let rows = rows
+        .into_iter()
+        .map(|(kind, body)| Ok((kind, serde_json::from_str::<Value>(&body)?)))
+        .collect::<Result<Vec<_>>>()?;
+    fold_latest_values(rows)
+}
+
+/// [`fold_latest_actual`] of claims already parsed, `(kind, body)` in canonical order. It takes
+/// the bodies, so each field moves into the folded state instead of being copied.
+fn fold_latest_values(rows: impl IntoIterator<Item = (String, Value)>) -> Result<Option<Value>> {
     let mut rows = rows.into_iter().peekable();
     if rows.peek().is_none() {
         return Ok(None);
     }
     let mut merged = serde_json::Map::new();
     let registry = st3_schema::registry();
-    for (kind, body) in rows {
-        let value: Value = serde_json::from_str(&body)?;
-        let source = value.get("fields").unwrap_or(&value);
-        if let Some(fields) = source.as_object() {
+    for (kind, value) in rows {
+        let source = match value {
+            Value::Object(mut body) => match body.remove("fields") {
+                Some(fields) => fields,
+                None => Value::Object(body),
+            },
+            other => other,
+        };
+        if let Value::Object(fields) = source {
             if kind == "resource.observed" {
-                resources::merge_observation(&mut merged, fields);
+                resources::merge_observation(&mut merged, &fields);
                 continue;
             }
             if registry
@@ -21675,7 +21803,7 @@ fn fold_latest_actual(
                 }
             }
             for (key, value) in fields {
-                merged.insert(key.clone(), value.clone());
+                merged.insert(key, value);
             }
         }
     }
@@ -24687,6 +24815,45 @@ pub(crate) const GATE_BROKEN_CONDITION: &str = "gate-broken";
 /// The earliest end that still counts as recent.
 pub(crate) fn recently_ended_since() -> u128 {
     now_ms().saturating_sub(RECENTLY_ENDED_MS)
+}
+
+/// Who a run reports to and whether it also reports completion: the agent whoever started the
+/// run named, else the mission's own `report-to`, and completion if either asked and there is
+/// someone to tell. `None` when nobody is named.
+fn resolved_run_report(
+    mission: &MissionSpec,
+    report_to: Option<&str>,
+    report_completed: bool,
+) -> Option<(String, bool)> {
+    let report_to = report_to.or(mission.report_to.as_deref())?;
+    Some((
+        report_to.to_owned(),
+        report_completed || mission.report_completed,
+    ))
+}
+
+/// Record on a run's creation claim who hears of its failure, cancellation or stall. A run with
+/// nobody to tell carries no report fields at all, so nothing about it changes.
+fn add_run_report_fields(
+    body: &mut Value,
+    mission: &MissionSpec,
+    report_to: Option<&str>,
+    report_completed: bool,
+) {
+    let Some((report_to, completed)) = resolved_run_report(mission, report_to, report_completed)
+    else {
+        return;
+    };
+    let fields = &mut body["fields"];
+    fields["report_to"] = json!(report_to);
+    fields["stalled_after_ms"] = json!(
+        mission
+            .stalled_after_ms
+            .unwrap_or(crate::mission::DEFAULT_STALLED_AFTER_MS)
+    );
+    if completed {
+        fields["report_completed"] = json!(true);
+    }
 }
 
 fn insert_mission_deadline_tx(
@@ -40826,6 +40993,118 @@ version 2
             "record.repaired",
         ] {
             assert!(!Store::simple_replication_kind(kind), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_run_started_with_a_reporter_records_it_and_an_unset_run_records_nothing() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let plain = publish_mission(
+            &store,
+            "version 2\nmission \"plain\" state=\"ready\" { concurrent-runs; goal \"Plain.\"; step \"work\" { agentless } }",
+            "publish-plain",
+        );
+        let watched = publish_mission(
+            &store,
+            "version 2\nmission \"watched\" state=\"ready\" report-to=\"agent/ops/mission-reporter\" stalled-after=\"15m\" { concurrent-runs; goal \"Watched.\"; step \"work\" { agentless } }",
+            "publish-watched",
+        );
+        let declare = |run: &str, mission: &MissionSpec, extra: &str| {
+            let source = format!(
+                "version 2\nmission-run {run:?} {{\n  mission \"mission/{}@{}\"\n  workspace {:?}\n  requester \"person/operator\"\n{extra}}}\n",
+                mission.id,
+                mission.revision,
+                workspace.path().display().to_string(),
+            );
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let preview = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            (intent, preview)
+        };
+        let start = |run: &str, mission: &MissionSpec, extra: &str| {
+            let (intent, preview) = declare(run, mission, extra);
+            assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+            store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("start-{run}"),
+                    Some("person/operator"),
+                )
+                .unwrap();
+            store
+                .latest_claim(&format!("mission-run/{run}"), Some("mission-run.created"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]
+                .clone()
+        };
+
+        let unset = start("plain/1", &plain, "");
+        for field in ["report_to", "stalled_after_ms", "report_completed"] {
+            assert!(unset.get(field).is_none(), "{field}");
+        }
+        // Whoever starts a run names the reporter, and the default limit applies.
+        let named = start(
+            "plain/2",
+            &plain,
+            "  report-to \"agent/ops/starter\"\n  report-completed \"true\"\n",
+        );
+        assert_eq!(named["report_to"], "agent/ops/starter");
+        assert_eq!(named["stalled_after_ms"], 30 * 60_000);
+        assert_eq!(named["report_completed"], true);
+        // The mission's own reporter and limit apply when the start names none.
+        let inherited = start("watched/1", &watched, "");
+        assert_eq!(inherited["report_to"], "agent/ops/mission-reporter");
+        assert_eq!(inherited["stalled_after_ms"], 15 * 60_000);
+        assert!(inherited.get("report_completed").is_none());
+        // The start's reporter replaces the mission's.
+        let replaced = start("watched/2", &watched, "  report-to \"agent/ops/starter\"\n");
+        assert_eq!(replaced["report_to"], "agent/ops/starter");
+        assert_eq!(replaced["stalled_after_ms"], 15 * 60_000);
+
+        // Declaring the same run again with different reporting is not a retry: the stored
+        // creation claim would be left unchanged while the operator is told it was accepted.
+        let different = "mission run `mission-run/plain/2` already exists with different creation fields";
+        for (what, extra) in [
+            ("another reporter", "  report-to \"agent/ops/other\"\n  report-completed \"true\"\n"),
+            ("no reporting at all", ""),
+            ("the reporter alone, dropping completion", "  report-to \"agent/ops/starter\"\n"),
+        ] {
+            let (_, changed) = declare("plain/2", &plain, extra);
+            assert_eq!(changed.blockers, [different], "{what}");
+        }
+        // Adding completion to a run that was started without it is not a retry either.
+        let (_, added) = declare(
+            "watched/2",
+            &watched,
+            "  report-to \"agent/ops/starter\"\n  report-completed \"true\"\n",
+        );
+        assert_eq!(
+            added.blockers,
+            ["mission run `mission-run/watched/2` already exists with different creation fields"]
+        );
+        // The exact declarations, and one that leaves the mission's own reporter to apply, are.
+        for (run, mission, extra) in [
+            (
+                "plain/2",
+                &plain,
+                "  report-to \"agent/ops/starter\"\n  report-completed \"true\"\n",
+            ),
+            ("watched/1", &watched, ""),
+            ("watched/2", &watched, "  report-to \"agent/ops/starter\"\n"),
+            ("plain/1", &plain, ""),
+        ] {
+            let (_, same) = declare(run, mission, extra);
+            assert!(same.blockers.is_empty(), "{run}: {:?}", same.blockers);
         }
     }
 

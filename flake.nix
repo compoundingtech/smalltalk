@@ -427,6 +427,8 @@
             runHook postCheck
           '';
           ST3_MESSAGING_COMPAT_BIN = "${messagingBaseline}/bin/st3";
+          ST3_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
+          ST3_OTEL_REQUIRE = "1";
           # These two tests put an openpty(3) terminal into raw mode. In the macOS Nix build one
           # fails and the other hangs, so they run on Linux only until they pass on macOS.
           checkFlags = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
@@ -467,6 +469,7 @@
             pkgs.curl
             pkgs.nodejs
             ptyPackage
+            effect-utils.packages.${system}.otelite
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.util-linux pkgs.systemd ]
           # Native session discovery lists processes with ps and lsof on macOS (Linux reads /proc).
@@ -1141,9 +1144,8 @@
             pkgs.lld
             ptyPackage
             libghosttyVT
-            # Local runs of the OTLP export integration gate
-            # (`cargo test --test integration otel_export::`) need the same collector the
-            # Nix check pins; `ST2_OTELITE_BIN` points at it.
+            # Local st2/st3 OTLP export integration tests use the same collector as Nix checks;
+            # ST2_OTELITE_BIN and ST3_OTELITE_BIN point at it.
             effect-utils.packages.${system}.otelite
             # st3's messaging fault matrix runs the omp channel hook (TypeScript) under the
             # provider stand-in with Node's built-in type stripping, which Node 24 enables.
@@ -1155,6 +1157,7 @@
           # Same collector the Nix gate pins, so a bare
           # `cargo test --test integration otel_export::` in this shell runs against it.
           ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
+          ST3_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
           RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
         };
         # The in-process load test uses a stand-in PTY and needs no collector or harness tools.

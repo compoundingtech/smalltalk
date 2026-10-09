@@ -114,7 +114,22 @@ pub(super) fn native(
                 && (m["active"] == true || gates.contains(m["id"].as_str().unwrap_or_default()))
         })
         .count();
-    let mut agents = client_agent_resources_cached(store, false, snapshot.store_index)?;
+    // A daemon's reads never fold the roster: count from its newest publication, and say which.
+    let mut agents_as_of = None;
+    let mut agents = if store.agent_roster_refresher_running() {
+        let Some((cut, cards, published_at)) = store.published_agent_roster(snapshot.store_index, false)
+        else {
+            store.request_agent_roster_refresh();
+            anyhow::bail!("the agents roster is still being prepared; retry shortly");
+        };
+        if cut < snapshot.store_index {
+            store.request_agent_roster_refresh();
+        }
+        agents_as_of = Some(json!({"store_index": cut, "published_at": client_timestamp(published_at)}));
+        (*cards).clone()
+    } else {
+        client_agent_resources_cached(store, false, snapshot.store_index)?
+    };
     overlay_agent_resources(store, &mut agents, &client_timestamp(now))?;
     let working = agents.iter().filter(|agent| working(agent)).count();
     let machines = machine_summary_resources(state, snapshot, session)?;
@@ -124,6 +139,10 @@ pub(super) fn native(
     value["id"] = json!("summary/current");
     value["kind"] = json!("summary");
     value["updated_at"] = json!(client_timestamp(now));
+    // Outside the revision: a newer roster with the same counts changes nothing a client shows.
+    if let Some(as_of) = agents_as_of {
+        value["agents_as_of"] = as_of;
+    }
     Ok(vec![value])
 }
 
@@ -172,6 +191,9 @@ pub(super) fn retain_timestamp(items: &mut [Value], previous: &BTreeMap<String, 
             && old["person_id"] == item["person_id"]
         {
             item["updated_at"] = old["updated_at"].clone();
+            if !old["agents_as_of"].is_null() {
+                item["agents_as_of"] = old["agents_as_of"].clone();
+            }
         }
     }
 }
