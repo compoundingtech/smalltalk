@@ -1304,16 +1304,25 @@ fn routine_records_and_delivery_echoes_do_not_reach_the_conversation() {
     ] {
         assert!(text.contains(kept), "missing {kept}: {text}");
     }
-    // The repeated channel error is one line with a count once the records between are gone.
-    let errors = shown
+    // A hold of mail while Claude's channel is confirmed, released a moment later, is not an
+    // error: each pair is one quiet line, and the pairs, once the records between them are gone,
+    // fold into one counted line. A hold that has not been released stays a visible line.
+    assert!(!text.contains("claude-channel-unattached"), "{text}");
+    assert!(!text.contains("error: claude-channel"), "{text}");
+    let events = shown
         .iter()
         .filter_map(|entry| match &entry.body {
-            Body::Event(line) if line.contains("claude-channel-unattached") => Some(line.clone()),
+            Body::Event(line) if line.starts_with("delivery") => Some(line.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(errors.len(), 1, "{errors:?}");
-    assert!(errors[0].ends_with("×3"), "{errors:?}");
+    assert_eq!(
+        events,
+        [
+            "delivery paused, then resumed ×3",
+            "delivery paused · channel not verified yet",
+        ]
+    );
 }
 
 #[test]

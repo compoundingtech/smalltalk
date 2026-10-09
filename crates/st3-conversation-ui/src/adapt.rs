@@ -398,6 +398,17 @@ pub fn conversation_with_filters(
                     delivery.insert(entry.id.clone(), true);
                     Body::Event("delivery resumed".into())
                 }
+                // Claude's channel could not be confirmed attached for a moment (usually about a
+                // second), so st held the mail; confirming it releases the mail. The same pause
+                // and resume as above, so a pair reads as one quiet line, not two errors.
+                "claude-channel-unattached" => {
+                    delivery.insert(entry.id.clone(), false);
+                    Body::Event("delivery paused · channel not verified yet".into())
+                }
+                "claude-channel-attached" => {
+                    delivery.insert(entry.id.clone(), true);
+                    Body::Event("delivery resumed".into())
+                }
                 // A warning is st noting something it is handling, not a failure.
                 _ if error.details.get("severity").and_then(Value::as_str) == Some("warning") => {
                     Body::Event(bounded_preview(&error.message, 256).into_owned())

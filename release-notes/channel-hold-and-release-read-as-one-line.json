@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A conversation shows st holding mail while Claude's channel is confirmed, then releasing it, as one quiet pause-and-resume line instead of two lines that read as errors",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, stored data or transcript change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Published schema, operations and contract digest are unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "stui and st conversations timeline read the claude-channel-unattached and claude-channel-attached entries the way they read a delivery pause and resume: 'delivery paused · channel not verified yet', 'delivery resumed', and a pair as 'delivery paused, then resumed'. A hold that has not resumed stays visible. The Swift and TypeScript renderers are not changed."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; no data conversion or extra startup work."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, durable payload or initialization changes."
+  }
+}
