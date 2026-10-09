@@ -81,6 +81,8 @@ class ConversationPaneCodeBoundary extends React.Component<React.ComponentProps<
 
 // The kit diff viewer imports Markdown; keep it outside the shell's eager graph too.
 const ChangesInspector = React.lazy(() => import('./ChangesInspector.tsx').then(module => ({ default: module.ChangesInspector })))
+// The terminal grid, fonts and native key encoder load only when a terminal pane opens.
+const TerminalDetail = React.lazy(() => import('../terminal/TerminalDetail.tsx').then((module) => ({ default: module.TerminalDetail })))
 
 const sidebarRatio = persistedAtom({ key: 'round2.sidebarRatio', schema: Schema.Number, defaultValue: 256 / 1440 })
 const panelRatio = persistedAtom({ key: 'round2.panelRatio', schema: Schema.Number, defaultValue: 380 / 1440 })
@@ -137,9 +139,14 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   const rosterCommit = React.useCallback((node: HTMLElement | null) => node === null || !rosterObserved ? undefined : ux?.rosterCommitted(), [ux, rosterObserved])
   const current = initialAgentFromUrl() ?? (storedAgent || agents[0]?.ref || '')
   const agent = agents.find((row) => row.ref === current)
-  // Fleet projection assigns every agent this canonical subject address; it is not a
-  // claim that the runtime has a terminal or that terminal input is granted.
-  const terminalRef = agent?.terminal ?? terminalSubjectForAgent(current)
+  // A canonical subject address is not proof of a terminal. Keep the control disabled
+  // from its first render until the roster can establish the selected agent's runtime.
+  const terminalDisabledReason = terminalSubjectForAgent(current) === undefined ? undefined
+    : fleet._tag === 'Waiting' ? 'Waiting for the live agent roster to find this agent’s terminal.'
+      : fleet._tag === 'Unavailable' ? 'The agent roster is unavailable, so this agent’s terminal cannot be found.'
+        : agent === undefined ? 'This agent is not in the live agent roster, so it has no terminal.'
+          : agent.terminalDisabledReason
+  const terminalRef = terminalDisabledReason === undefined ? agent?.terminal : undefined
   const [headerSlot, setHeaderSlot] = React.useState<HTMLDivElement | null>(null)
   const [paneHost, setPaneHost] = React.useState<HTMLDivElement | null>(null)
   const [search, setSearch] = React.useState('')
@@ -333,7 +340,15 @@ export function WorkspaceBody({ current, rosterRefs, view, agentName, onOpenTool
       </div>
     })}
     {current === '' ? <div {...stylex.props(styles.empty)}>Choose an agent to open its live thread.</div>
-      : view._tag === 'Thread' ? null : <p role="status" {...stylex.props(styles.empty)}>{workspaceViewNotice(view)}</p>}
+      : view._tag === 'Thread' ? null
+      : view._tag === 'Terminal' ? (
+        <div key={view.ref} data-testid="terminal-pane" {...stylex.props(styles.retainedPane, styles.terminalPane)}>
+          <React.Suspense fallback={<p role="status" {...stylex.props(styles.empty)}>Loading terminal…</p>}>
+            <TerminalDetail address={{ ref: view.ref, presentation: 'detail' }} visibility="visible" />
+          </React.Suspense>
+        </div>
+      )
+      : <p role="status" {...stylex.props(styles.empty)}>{workspaceViewNotice(view)}</p>}
   </ViewportStoreContext.Provider>
 }
 
@@ -357,6 +372,7 @@ const styles = stylex.create({
   retainedPane: { position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, backgroundColor: c.canvas },
   shownPane: { zIndex: 1 },
   hiddenPane: { contentVisibility: 'hidden' },
+  terminalPane: { zIndex: 2 },
   tabs: { height: 32, display: 'flex', alignItems: 'center', gap: s.xs, paddingInline: s.lg, borderBottomWidth: 1, borderBottomStyle: 'solid', borderBottomColor: c.border, flexShrink: 0 },
   notice: { padding: s.lg, fontSize: t.metaSize, color: c.fgMuted },
   empty: { position: 'relative', zIndex: 2, margin: 'auto', padding: s.section, color: c.fgMuted },

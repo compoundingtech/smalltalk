@@ -223,6 +223,11 @@ class Gateway {
     this.socket?.onmessage?.({ data: JSON.stringify(frame) })
   }
 
+  /** A wire frame the generated schema rejects, sent byte-for-byte as a gateway could. */
+  sendUnchecked(frame: Record<string, unknown>) {
+    this.socket?.onmessage?.({ data: JSON.stringify(frame) })
+  }
+
   mailEcho() {
     this.send({
       kind: 'conversation', id: this.subscription('conversation').id,
@@ -559,6 +564,51 @@ describe('terminal dependent-read authority', () => {
         yield* settle
         expect(live.registry.get(live.source.terminal(ref))).toMatchObject({ _tag: 'Unavailable', reason: 'ungranted' })
         expect(live.registry.get(live.source.sync!.terminal(ref)).sync.status).toEqual({ _tag: 'Failed', cause: { _tag: 'Unknown' } })
+      }),
+    ),
+  )
+
+  it.live('bounds left terminal grids to the four most recent and unsubscribes the oldest', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.agents)
+        yield* settle
+        const names = ['term-0', 'term-1', 'term-2', 'term-3', 'term-4']
+        gateway.fleet(names.map((name) => ({ ...agent, id: `agent/${name}`, runtime_ids: [`runtime/${name}`] })))
+        yield* settle
+        const subscriptions: string[] = []
+        for (const name of names) {
+          const leave = live.registry.mount(live.source.terminalInterest!(`terminal/${name}`))
+          yield* settle
+          subscriptions.push(gateway.subscription('terminal').id)
+          leave()
+          yield* settle
+        }
+        const unsubscribed = gateway.commands.flatMap((command) => command.kind === 'unsubscribe' ? [command.id] : [])
+        expect(unsubscribed).toEqual([subscriptions[0]])
+      }),
+    { maxFollows: 8 }),
+  )
+
+  it.live('drops a malformed terminal screen without logging its text or the decode error', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+        live.registry.mount(live.source.agents)
+        yield* settle
+        gateway.fleet([agent])
+        yield* settle
+        live.registry.mount(live.source.terminalInterest!('terminal/example'))
+        yield* settle
+        gateway.sendUnchecked({
+          kind: 'screen', id: gateway.subscription('terminal').id, collection: 'terminal', snapshot,
+          value: { kind: 'terminal-screen', terminal_id: 'terminal/example', title: 'private-title', columns: 'wide', lines: [{ row: 0, text: 'private-screen-text' }] },
+        })
+        yield* settle
+        const logged = JSON.stringify(warn.mock.calls, (_key, value: unknown) => value instanceof Error ? `${value.name}: ${value.message}` : value)
+        warn.mockRestore()
+        expect(logged).not.toMatch(/private-screen-text|private-title|wide|Error/)
+        expect(live.registry.get(live.source.terminal('terminal/example'))._tag).not.toBe('Observed')
       }),
     ),
   )

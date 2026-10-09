@@ -1,21 +1,25 @@
 /**
- * What the workspace body shows for the selected pane. Only the thread has a web surface; any other pane states
- * its own unavailability instead of repeating the transcript under a different tab.
+ * What the workspace body shows for the selected pane. The thread and terminal subjects have web surfaces; any
+ * other pane states its own unavailability instead of repeating the transcript under a different tab.
  */
 export type WorkspaceView =
   | { readonly _tag: 'Thread' }
-  | { readonly _tag: 'TerminalUnavailable'; readonly ref: string; readonly reason: string }
+  | { readonly _tag: 'Terminal'; readonly ref: TerminalRef }
   | { readonly _tag: 'ViewUnavailable'; readonly ref: string; readonly reason: string }
+
+/** A terminal subject address, as `terminalSubjectForAgent` and the fleet projection produce it. */
+export type TerminalRef = `terminal/${string}`
+const isTerminalRef = (ref: string): ref is TerminalRef => ref.startsWith('terminal/')
 
 export const workspaceView = (pane: { readonly ref: string } | undefined): WorkspaceView =>
   pane === undefined
     ? { _tag: 'Thread' }
-    : pane.ref.startsWith('terminal/')
-      ? { _tag: 'TerminalUnavailable', ref: pane.ref, reason: 'This web client has no terminal renderer yet.' }
+    : isTerminalRef(pane.ref)
+      ? { _tag: 'Terminal', ref: pane.ref }
       : { _tag: 'ViewUnavailable', ref: pane.ref, reason: 'This web client does not render this view yet.' }
 
-export const workspaceViewNotice = (view: Exclude<WorkspaceView, { _tag: 'Thread' }>): string =>
-  `${view._tag === 'TerminalUnavailable' ? 'Terminal unavailable' : 'View unavailable'}. ${view.reason}`
+export const workspaceViewNotice = (view: Extract<WorkspaceView, { _tag: 'ViewUnavailable' }>): string =>
+  `View unavailable. ${view.reason}`
 
 /** A conversation pane kept mounted after it was opened; `used` is its logical recency. */
 export interface RetainedPane {

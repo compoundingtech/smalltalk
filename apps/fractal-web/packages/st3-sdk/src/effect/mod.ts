@@ -949,8 +949,9 @@ const make = (options: St3Options) =>
             if (frame.kind !== 'screen') return undefined
             try {
               return decodeScreen(frame.value)
-            } catch (error) {
-              console.warn('st3 terminal screen did not decode', error)
+            } catch {
+              // The schema failure quotes the frame, which carries screen text: log fixed text only.
+              console.warn('st3 terminal screen did not decode')
               return undefined
             }
           },

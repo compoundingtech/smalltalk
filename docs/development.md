@@ -393,6 +393,39 @@ pnpm --dir apps/fractal-web exec vitest run src/data/projections.unit.test.ts
 pnpm exec tsc --noEmit -p apps/fractal-web
 ```
 
+## Fractal web terminal attachment
+
+The header's **Toggle terminal drawer** stays disabled with an accessible description and
+hover title until the live roster establishes a runtime for the selected agent. While
+loading, its reason is “Waiting for the live agent roster to find this agent’s terminal.”
+An absent roster row or an empty runtime list keeps it disabled with the specific cause.
+An explicit terminal deep link still shows its local reason beside the usable thread.
+
+`NO_TERMINAL=1 node apps/fractal-web/scripts/terminal-failure-e2e.mjs <baseUrl> <outDir> <seat>`
+is a read-only proof for a terminal-less seat. It samples the page-level button's disabled,
+title and `aria-describedby` attributes as soon as the control is visible, before waiting
+for the transcript, and again after loading. The negative control is the earlier
+roster-loading fallback that enabled a canonical terminal subject without runtime evidence:
+the first-control assertion must fail even if the settled control is correctly disabled.
+
+`data/liveSource.ts` resolves an agent's terminal runtime and passes the decoded runtime
+and its snapshot ID as `FollowSpec.Terminal.initialRuntime` to `@st3/sdk/effect`.
+The first attach consumes that observation rather than reading the same runtime twice.
+Admission identity remains the runtime ID; the observation is not a runtime cache.
+Reconnects and resyncs read the runtime afresh before obtaining another attachment.
+
+The daemon still checks the incarnation fence; an older same-host snapshot is valid
+([client-v0 terminal contract](st3/client-v0/README.md#terminal-protocol)).
+Only a `stale-fence` attach refusal triggers one runtime re-read and one retry, with the
+new terminal ID, incarnation and snapshot. A second refusal ends the follow, as do other
+attach errors without a refresh. This never retries terminal input.
+
+`src/data/liveSource.integration.test.ts` exercises the real live source, SDK and generated
+client against a controlled gateway: one runtime read per happy-path attach, fresh reconnect
+resolution, refreshed fences after a runtime replacement, and bounded refusal handling.
+For the stale-fence negative control, replace the SDK retry's `readTerminalRuntime(runtimeRef)`
+with `Effect.succeed(observation)`: the stale-attach test must fail because no fresh runtime
+is read and the replacement terminal cannot be subscribed.
 ## Continuous integration
 
 Workspace CI runs on pull requests and merge groups. The five required checks are `linux-gate`,

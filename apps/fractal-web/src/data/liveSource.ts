@@ -749,6 +749,7 @@ export const liveSource = ({
       ),
     )
     return retain<TerminalScreen, Extract<FollowSpec, { _tag: 'Terminal' }>>({
+      keepAlive: false,
       explicitInterest: true,
       telemetryKind: 'terminal',
       resolve: (get) => {
@@ -785,6 +786,22 @@ export const liveSource = ({
         ),
     })
   })
+  const recentTerminals = new Map<string, RetainedFeed<TerminalScreen>>()
+  const retainTerminal = (ref: string) => {
+    const entry = terminalFamily(ref)
+    recentTerminals.delete(ref)
+    recentTerminals.set(ref, entry)
+    // Like conversations: a visible pane owns its own mount; this LRU only bounds how many
+    // terminal grids keep folding after their pane was left. Grids stay memory-only.
+    if (recentTerminals.size > 4) {
+      for (const [key, candidate] of recentTerminals) {
+        recentTerminals.delete(key)
+        candidate.release()
+        if (recentTerminals.size <= 4) break
+      }
+    }
+    return entry
+  }
   const terminal = (ref: string) => terminalFamily(ref).atom
   const terminalSync = (ref: string) => terminalFamily(ref).sync
 
@@ -882,7 +899,7 @@ export const liveSource = ({
       retryConversation: (ref) => retainConversation(ref).retry(),
       resources,
       terminal,
-      terminalInterest: (ref) => terminalFamily(ref).interest,
+      terminalInterest: (ref) => retainTerminal(ref).interest,
       terminalResize: gatewayTerminalResize(client),
       terminalHistory: unavailableTerminalHistory,
       events: Atom.make(
@@ -915,6 +932,8 @@ export const liveSource = ({
       ingest.dispose()
       for (const entry of recentConversations.values()) entry.release()
       recentConversations.clear()
+      for (const entry of recentTerminals.values()) entry.release()
+      recentTerminals.clear()
       registry.dispose()
       await runtime.dispose()
       setDebug('Wf.conversationEntries', 0)
