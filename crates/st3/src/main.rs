@@ -19073,8 +19073,8 @@ impl NativeObservations {
                         {
                             *ready = true;
                         }
-                        if !claimed {
-                            if let Err(error) = publish_harness_activity(
+                        if !claimed
+                            && let Err(error) = publish_harness_activity(
                                 &publisher,
                                 subject,
                                 driver,
@@ -19089,9 +19089,9 @@ impl NativeObservations {
                                 &observed,
                                 &mut None,
                             )
-                            .await {
-                                self.note_current_drop(subject, &format!("current activity sample dropped: {error:#}"));
-                            }
+                            .await
+                        {
+                            self.note_current_drop(subject, &format!("current activity sample dropped: {error:#}"));
                         }
                     }
                     "harness-context" => {

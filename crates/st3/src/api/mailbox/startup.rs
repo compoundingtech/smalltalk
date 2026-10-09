@@ -369,11 +369,12 @@ mod tests {
     struct ArgvStats {
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         task: Option<std::thread::JoinHandle<()>>,
+        requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     #[cfg(target_os = "linux")]
     impl ArgvStats {
-        fn start(root: &std::path::Path) -> Self {
+        fn start(root: &std::path::Path, replace_terminal: bool) -> Self {
             use std::io::{Read as _, Write as _};
             use std::sync::{
                 Arc,
@@ -384,6 +385,8 @@ mod tests {
             listener.set_nonblocking(true).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let stopped = stop.clone();
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received = requests.clone();
             let pid = std::process::id();
             let body = json!({"name":"eval.worker", "createdAt":"launch-time", "uptimeSeconds":1,
                 "daemon":{"pid":pid,"resources":null},
@@ -401,8 +404,14 @@ mod tests {
                             .unwrap();
                         let mut request = [0; 128];
                         if socket.read(&mut request).is_ok() {
+                            let count = received.fetch_add(1, Ordering::AcqRel);
+                            let reply = if replace_terminal && count > 0 {
+                                body.replace("\"alive\":true", "\"alive\":false")
+                            } else {
+                                body.clone()
+                            };
                             let _ = socket
-                                .write_all(&pty_core::protocol::encode_status_response(&body));
+                                .write_all(&pty_core::protocol::encode_status_response(&reply));
                         }
                     } else {
                         std::thread::sleep(Duration::from_millis(1));
@@ -412,6 +421,7 @@ mod tests {
             Self {
                 stop,
                 task: Some(task),
+                requests,
             }
         }
     }
@@ -434,6 +444,7 @@ mod tests {
                 "admitted",
                 "foreign-birth",
                 "foreign-subject",
+                "replaced-terminal",
                 "ended",
                 "exited",
                 "other-running",
@@ -442,7 +453,7 @@ mod tests {
                 "past-token",
             ] {
                 let root = tempfile::tempdir().unwrap();
-                if argv && case == "provider-ended" {
+                if (argv && case == "provider-ended") || (!argv && case == "replaced-terminal") {
                     continue;
                 }
                 let (state, mut peer, mut fence, mut metadata) = bootstrap_fixture(root.path());
@@ -455,7 +466,10 @@ mod tests {
                         .apply_internal(&intent, "argv-bind-route-fixture")
                         .unwrap();
                     peer.transport = "omp-channel";
-                    Some(ArgvStats::start(&state.pty_root))
+                    Some(ArgvStats::start(
+                        &state.pty_root,
+                        case == "replaced-terminal",
+                    ))
                 } else {
                     None
                 };
@@ -563,11 +577,25 @@ mod tests {
                     _ => {}
                 }
                 let before = state.store.index().unwrap();
+                let fence_before = fence.clone();
                 let routed =
                     super::super::bind(State(state.clone()), Some(Extension(peer)), Json(fence))
                         .await;
                 if case == "admitted" {
-                    assert!(routed.unwrap().0.epoch > 0);
+                    let bound = routed.unwrap().0;
+                    let mut expected = fence_before;
+                    expected.epoch = 1;
+                    assert_eq!(
+                        serde_json::to_value(bound).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                    if let Some(stats) = &_stats {
+                        assert_eq!(
+                            stats.requests.load(std::sync::atomic::Ordering::Acquire),
+                            2,
+                            "admitted argv path read extra launch proof"
+                        );
+                    }
                     assert_eq!(state.store.index().unwrap(), before);
                     continue;
                 }
