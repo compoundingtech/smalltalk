@@ -116,7 +116,7 @@ describe('native subject reads', () => {
                 name: 'Recorded machine',
                 state: 'local',
                 capacity: { state: 'unknown', reason: 'no capacity observation' },
-                occupancy: { running_runtimes: 16 },
+                occupancy: { running_runtimes: 2 },
                 transports: [],
                 projects: [],
                 work: [],
