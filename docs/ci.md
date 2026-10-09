@@ -582,6 +582,11 @@ those sparse p99s are effectively observed maxima. This bounded tolerance still 
 regressions on rare paths. CPU tolerates 0.05 cores. A PR without a main baseline fails as P0;
 a main bootstrap may check only absolute budgets and errors.
 
+The CPU budget (2 cores) comes from [`slo/targets.toml`](../slo/targets.toml), which st3 builds in:
+a missing file fails the build and an invalid one fails the run, with no default. The report and step summary also show each
+path's p99 target from that file (`descriptive_target_ms`, `over_descriptive_target`) when the path
+stands for one. Targets describe and never gate: the budgets and main's baseline remain the gates.
+
 Performance uses the small `.#perf` Nix shell and the opt-in `perf_load` test target (feature
 `perf-load`), which imports the same `daemon_load` and `daemon_bench` modules without compiling
 all integration fixtures. Completed main and PR runs retain seven-day build snapshots containing
