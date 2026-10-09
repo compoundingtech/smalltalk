@@ -208,10 +208,11 @@ impl PreparedPage {
                 <= self.limits.tables,
             "prepared table bound exceeded"
         );
-        let mut tables = BTreeMap::new();
-        for &name in names {
-            tables.insert(name.to_owned(), self.capture_table_shape(db, name)?);
-        }
+        ensure!(
+            schema_version(db)? == self.schema_version,
+            "prepared table schema changed"
+        );
+        let tables = self.capture_table_shapes(db, names)?;
         // The materialized inventory preserves the old 256-table refusal. A LEFT JOIN
         // emits a row even for a table with no foreign keys. Stream counts per table to
         // preserve the old 128 FK-column-row cap, including unrelated tables. The extra
@@ -268,60 +269,97 @@ impl PreparedPage {
         Ok(())
     }
 
-    fn capture_table_shape(&self, db: &Connection, name: &str) -> Result<Table> {
-        ensure!(
-            schema_version(db)? == self.schema_version,
-            "prepared table schema changed"
+    fn capture_table_shapes(
+        &self,
+        db: &Connection,
+        names: &[&str],
+    ) -> Result<BTreeMap<String, Table>> {
+        // Names were validated and bounded before discovery. Materialize headers so
+        // table_list and trigger discovery are shared, rather than repeated per field.
+        // NOT INDEXED keeps the small bounded header join from building an autoindex.
+        // The LEFT JOIN retains missing/zero-column shapes for explicit refusal.
+        let requested = vec!["(?)"; names.len()].join(",");
+        let sql = format!(
+            "WITH requested(name) AS (VALUES {requested}),
+             kinds AS MATERIALIZED (
+               SELECT name,type FROM pragma_table_list WHERE schema='main'
+                 AND name IN (SELECT name FROM requested)
+             ), headers AS MATERIALIZED (
+               SELECT requested.name,kinds.type,
+                 EXISTS(SELECT 1 FROM main.sqlite_schema
+                        WHERE type='trigger' AND tbl_name=requested.name) AS triggered
+               FROM requested LEFT JOIN kinds NOT INDEXED ON kinds.name=requested.name
+             )
+             SELECT headers.name,headers.type,headers.triggered,f.name,f.pk,f.hidden
+             FROM headers LEFT JOIN pragma_table_xinfo(headers.name,'main') AS f ON 1
+             LIMIT {}",
+            names.len() * 128 + 1
         );
-        let kind: String = db.query_row(
-            "SELECT type FROM pragma_table_list WHERE schema='main' AND name=?1",
-            [name],
-            |r| r.get(0),
-        )?;
-        ensure!(kind == "table", "prepared virtual/shadow table unsupported");
-        let mut statement =
-            db.prepare("SELECT name,pk,hidden FROM pragma_table_xinfo(?1,'main') LIMIT 129")?;
-        let fields = statement
-            .query_map([name], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, u32>(1)?,
-                    r.get::<_, u32>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(
-            !fields.is_empty() && fields.len() <= 128 && fields.iter().all(|f| f.2 == 0),
-            "prepared generated/oversized table unsupported"
-        );
-        ensure!(
-            !db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='trigger' AND tbl_name=?1)",
-                [name],
-                |r| r.get::<_, bool>(0)
-            )?,
-            "prepared output triggers unsupported"
-        );
-        for field in &fields {
-            identifier(&field.0)?;
+        let mut statement = db.prepare(&sql)?;
+        let mut rows = statement.query(params_from_iter(names.iter()))?;
+        let mut fields = BTreeMap::<String, Vec<(String, u32)>>::new();
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            count += 1;
+            ensure!(
+                count <= names.len() * 128,
+                "prepared generated/oversized table unsupported"
+            );
+            let name: String = row.get(0)?;
+            let kind: Option<String> = row.get(1)?;
+            ensure!(
+                kind.as_deref() == Some("table"),
+                "prepared virtual/shadow/missing table unsupported"
+            );
+            ensure!(
+                !row.get::<_, bool>(2)?,
+                "prepared output triggers unsupported"
+            );
+            let column: Option<String> = row.get(3)?;
+            let pk: Option<u32> = row.get(4)?;
+            let hidden: Option<u32> = row.get(5)?;
+            let (Some(column), Some(pk), Some(0)) = (column, pk, hidden) else {
+                anyhow::bail!("prepared generated/oversized table unsupported");
+            };
+            identifier(&column)?;
+            let columns = fields.entry(name).or_default();
+            ensure!(
+                columns.len() < 128,
+                "prepared generated/oversized table unsupported"
+            );
+            columns.push((column, pk));
         }
-        let columns = fields.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
-        let mut primary = fields.iter().filter(|f| f.1 > 0).collect::<Vec<_>>();
-        primary.sort_by_key(|f| f.1);
         ensure!(
-            primary.iter().any(|f| f.0 == "namespace"),
-            "namespace must be part of prepared primary key"
+            fields.len() == names.len(),
+            "prepared table metadata incomplete"
         );
-        let keys = primary
-            .iter()
-            .filter(|f| f.0 != "namespace")
-            .map(|f| f.0.clone())
-            .collect();
-        Ok(Table {
-            name: name.into(),
-            columns,
-            keys,
-        })
+        let mut tables = BTreeMap::new();
+        for &name in names {
+            let fields = fields
+                .get(name)
+                .context("prepared table metadata incomplete")?;
+            let columns = fields.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
+            let mut primary = fields.iter().filter(|f| f.1 > 0).collect::<Vec<_>>();
+            primary.sort_by_key(|f| f.1);
+            ensure!(
+                primary.iter().any(|f| f.0 == "namespace"),
+                "namespace must be part of prepared primary key"
+            );
+            let keys = primary
+                .iter()
+                .filter(|f| f.0 != "namespace")
+                .map(|f| f.0.clone())
+                .collect();
+            tables.insert(
+                name.to_owned(),
+                Table {
+                    name: name.into(),
+                    columns,
+                    keys,
+                },
+            );
+        }
+        Ok(tables)
     }
     /// Values cover all non-namespace columns in captured table order; namespace is injected.
     pub fn upsert(&mut self, table: &str, values: Vec<SqlValue>) -> Result<()> {

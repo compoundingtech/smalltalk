@@ -722,6 +722,81 @@ fn grouped_metadata_refuses_unsupported_second_table_without_partial_acceptance(
     .unwrap();
 }
 
+#[test]
+fn grouped_shape_accepts_exact_column_cap_and_refuses_one_over_atomically() {
+    let (mut db, i, job) = fixture();
+    ready(&mut db, &i, &job);
+    let columns = |count: usize| {
+        let mut columns = vec!["namespace TEXT PRIMARY KEY".to_owned()];
+        columns.extend((1..count).map(|n| format!("c{n} TEXT")));
+        columns.join(",")
+    };
+    db.execute_batch(&format!("CREATE TABLE main.wide_output({})", columns(128)))
+        .unwrap();
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    page.capture_tables(&db, &["cards", "wide_output"]).unwrap();
+    page.upsert("wide_output", vec![Sql::Null; 127]).unwrap();
+    db.execute_batch(&format!(
+        "DROP TABLE main.wide_output; CREATE TABLE main.wide_output({})",
+        columns(129)
+    ))
+    .unwrap();
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    let error = page
+        .capture_tables(&db, &["cards", "wide_output"])
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("prepared generated/oversized table unsupported"));
+    assert!(
+        page.upsert(
+            "cards",
+            vec![Sql::Text("amber".into()), Sql::Text("body".into())]
+        )
+        .is_err()
+    );
+    assert!(page.upsert("wide_output", vec![Sql::Null; 128]).is_err());
+    page.capture_table(&db, "cards").unwrap();
+    page.upsert(
+        "cards",
+        vec![Sql::Text("amber".into()), Sql::Text("body".into())],
+    )
+    .unwrap();
+}
+
+#[test]
+fn grouped_shape_reads_main_columns_and_refuses_generated_or_missing_sibling() {
+    let (mut db, i, job) = fixture();
+    ready(&mut db, &i, &job);
+    db.execute_batch("CREATE TEMP TABLE cards(unrelated INTEGER); CREATE TEMP VIEW coverage AS SELECT 1 AS other").unwrap();
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    page.capture_tables(&db, &["cards", "coverage"]).unwrap();
+    page.upsert(
+        "cards",
+        vec![Sql::Text("amber".into()), Sql::Text("main body".into())],
+    )
+    .unwrap();
+    page.upsert("coverage", vec![Sql::Integer(1)]).unwrap();
+    db.execute_batch("CREATE TABLE main.generated_output(namespace TEXT PRIMARY KEY,k TEXT,g TEXT GENERATED ALWAYS AS (k) VIRTUAL)").unwrap();
+    for sibling in ["generated_output", "absent_output"] {
+        let mut page = i
+            .prepare_live(&db, "cards", PublicationLimits::default())
+            .unwrap();
+        assert!(page.capture_tables(&db, &["cards", sibling]).is_err());
+        assert!(
+            page.upsert(
+                "cards",
+                vec![Sql::Text("amber".into()), Sql::Text("body".into())]
+            )
+            .is_err()
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_worker_preserves_notice_during_owned_page_and_propagates_failure() {
     use smallclaims::ivm::{

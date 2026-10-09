@@ -35,8 +35,22 @@ The separate optional cost job failed link-minutes delivery/read/receipt evidenc
 no cause is attributed to this dormant source or the metadata walk.
 The first grouped source `ce5ccfb7e` failed its hosted producer before control
 execution: the new malformed-metadata refusal used an unimported bail macro.
-The current correction explicitly qualifies anyhow::bail; traversal, publication,
-controls and accounting assertions are unchanged. No grouped work result exists.
+The macro correction explicitly qualified anyhow::bail without traversal changes.
+At `fcc64d252`, hosted producer and Clippy passed and all 23 names ran: 22
+passed, including all seven grouped controls and substantive crash boundaries.
+The strict page control failed all three automatic attempts at 135 statements,
+5,411 VM steps, 549 fullscan steps, one sort and zero autoindex rows; the unchanged
+128-statement ceiling still refuses qualification. Own logs are retained under
+`/var/tmp/ivm-admitted-applied-slice-ci-fcc` (jobs 114055848153 and 114055848008).
+The next source consolidates requested table shapes into one main-bound metadata
+statement with a materialized table-kind/header inventory, explicit main xinfo,
+trigger refusal and per-table 128-column/global lookahead bounds. Request/union
+bounds still precede discovery; schema is checked before and after the entire
+capture; FK traversal and all-or-nothing acceptance remain unchanged. NOT INDEXED
+prevents an automatic header join index. Two additional controls cover 128/129
+columns, main shape discovery under TEMP shadows, generated and missing siblings.
+All 25 successor controls and work counts are UNRUN; row bounds and static query
+consolidation are not an engine-work or production adoption certificate.
 
 ## Source and actual dependencies
 
