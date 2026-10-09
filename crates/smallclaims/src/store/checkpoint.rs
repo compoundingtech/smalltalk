@@ -612,6 +612,7 @@ pub fn prove_on_copy(
     sealed: &SealedSet,
     plan: &DropPlan,
 ) -> Result<CheckpointProof> {
+    let _completion = super::checkpoint_completion::Completion::work();
     runtime.checkpoint_preflight()?;
     let mut connection = open_checkpoint_copy(copy)?;
     let transaction = connection.transaction()?;
@@ -1152,6 +1153,7 @@ impl Store {
         cut_unix_ms: u128,
         scratch: &Path,
     ) -> Result<(DropPlan, CheckpointProof)> {
+        let _completion = super::checkpoint_completion::Completion::outer();
         self.plan_checkpoint_through(cut_unix_ms, None, scratch)
             .map(|(_, plan, proof)| (plan, proof))
     }
@@ -1164,6 +1166,7 @@ impl Store {
         through_rowid: Option<i64>,
         scratch: &Path,
     ) -> Result<(SealedSet, DropPlan, CheckpointProof)> {
+        let _completion = super::checkpoint_completion::Completion::outer();
         self.runtime.checkpoint_preflight()?;
         let sealed = self.checkpoint_sealed_set_through(cut_unix_ms, through_rowid)?;
         let plan = self.runtime.plan_checkpoint_drops(&sealed);
@@ -1179,6 +1182,7 @@ impl Store {
         plan: &DropPlan,
         scratch: &Path,
     ) -> Result<CheckpointProof> {
+        let _completion = super::checkpoint_completion::Completion::work();
         self.runtime.checkpoint_preflight()?;
         fs::create_dir_all(scratch)?;
         let copy = scratch.join(format!("proof-{}.sqlite3", Uuid::now_v7().simple()));
@@ -1197,6 +1201,7 @@ impl Store {
         cut_unix_ms: u128,
         scratch: &Path,
     ) -> Result<CheckpointPlanView> {
+        let _completion = super::checkpoint_completion::Completion::outer();
         let (plan, proof) = self.plan_checkpoint(cut_unix_ms, scratch)?;
         Ok(CheckpointPlanView {
             checkpoint: checkpoint_name(cut_unix_ms),
@@ -1248,4 +1253,11 @@ mod memory_tests {
         );
         transaction.rollback().unwrap();
     }
+}
+
+/// One-shot completion attempts, glibc calls, and their duration on this thread.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn allocator_reclaim_stats_for_test() -> (u64, u64, std::time::Duration) {
+    super::checkpoint_completion::reclaim_stats()
 }

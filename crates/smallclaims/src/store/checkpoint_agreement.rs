@@ -908,6 +908,7 @@ impl Store {
         if failures.in_backoff(context.now_unix_ms) {
             return Ok(());
         }
+        let _completion = super::checkpoint_completion::Completion::outer();
         let sealed = self.checkpoint_sealed_set_through(terms.cut_unix_ms, Some(seal_rowid))?;
         let plan = self.runtime.plan_checkpoint_drops(&sealed);
         if plan.sealed_digest != terms.sealed_digest {

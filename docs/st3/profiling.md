@@ -348,6 +348,15 @@ envelope, any `max` counter records pressure, or the files cannot be inspected. 
 counters include other descendants; historical hits do not prove a current OOM. On other
 platforms it reports that cgroup diagnostics are Linux-only.
 
+Checkpoint application and proof completion make one best-effort allocator-reclamation
+attempt on Linux with glibc (`malloc_trim(0)`). Nested entrypoints defer that one call until
+the outer operation has dropped its temporary inputs and SQLite guards. Successful,
+reader-mismatch, and error completions share the cleanup; skipped agreement/proof work
+does not trigger it. There is no periodic trim, idle-WAL hook, or ordinary API-read hook.
+Other targets use a no-op. This releases only unused glibc pages, not live SQLite caches
+or retained application data, and is not a process-memory cap. The call may contend with
+concurrent allocator activity; compare its duration as well as post-operation RSS.
+
 Reproduce reader-cache multiplication with invented data and the bundled SQLite artifact:
 
 ```sh
