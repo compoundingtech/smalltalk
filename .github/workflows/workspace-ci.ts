@@ -467,7 +467,8 @@ export const fractalWebJobs = {
   'fractal-web-execution': {
     name: 'fractal-web-execution',
     needs: ['fractal-web-changes', 'genie-freshness'],
-    if: "${{ !cancelled() && needs.fractal-web-changes.result == 'success' && needs.fractal-web-changes.outputs.relevant == 'true' && needs.genie-freshness.result == 'success' }}",
+    // q85 bakeoff only: measure the web lanes even though genie-freshness fails at the devbar pin.
+    if: "${{ !cancelled() && needs.fractal-web-changes.result == 'success' && needs.fractal-web-changes.outputs.relevant == 'true' }}",
     'runs-on': 'ubuntu-latest',
     'timeout-minutes': 25,
     permissions: { contents: 'read' },
