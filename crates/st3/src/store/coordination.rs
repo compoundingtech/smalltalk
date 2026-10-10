@@ -65,7 +65,7 @@ pub(super) fn sync(
 
 /// At most eight historical subjects per writer batch. No startup scan or read-side build.
 /// Live pending sends are maintained by the existing send projection, including replication.
-pub(super) fn backfill(transaction: &Transaction<'_>) -> Result<()> {
+pub(super) fn backfill(transaction: &Transaction<'_>) -> Result<bool> {
     let started = std::time::Instant::now();
     transaction.execute(
         "INSERT OR IGNORE INTO local_coordination_backfill
@@ -78,7 +78,7 @@ pub(super) fn backfill(transaction: &Transaction<'_>) -> Result<()> {
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     if complete {
-        return Ok(());
+        return Ok(true);
     }
     let batch = transaction.prepare_cached(
         "SELECT store_index,subject FROM claims INDEXED BY claims_kind_index
@@ -113,19 +113,26 @@ pub(super) fn backfill(transaction: &Transaction<'_>) -> Result<()> {
         )?;
         processed += 1;
     }
+    let complete = processed == batch.len() && batch.len() < 8;
     transaction.execute(
         "UPDATE local_coordination_backfill SET cursor=?1,complete=?2 WHERE singleton=1",
         params![
             batch
                 .get(processed.wrapping_sub(1))
                 .map_or(ceiling, |(index, _)| *index),
-            processed == batch.len() && batch.len() < 8
+            complete
         ],
     )?;
-    Ok(())
+    Ok(complete)
 }
 
 impl Store {
+    /// One bounded bootstrap job on the existing FIFO writer. The daemon awaits this job
+    /// and pauses between jobs, so several per-claim projections cannot multiply its budget.
+    pub fn advance_coordination_counts(&self) -> Result<bool> {
+        self.connection.batched(backfill)?
+    }
+
     /// One covering range read; counts distinct message subjects, including already read mail.
     /// FYI is the held subset of agent-to-agent sends. Person-directed sends are separate.
     pub fn coordination_counts(&self, since: u64, until: u64) -> Result<Value> {
@@ -183,13 +190,26 @@ mod tests {
         assert!(partial["agent_to_agent"].as_u64().unwrap() <= 8);
         assert_eq!(partial["complete"], false);
         assert_eq!(store.coordination_counts(0, u64::MAX / 2).unwrap(), partial);
+        // Many projections can share one outer transaction. None may spend another
+        // historical budget: only the single daemon bootstrap job advances the cursor.
+        store
+            .connection
+            .batched(|tx| {
+                for _ in 0..16 {
+                    agent_messages::flush(tx)?;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.coordination_counts(0, u64::MAX / 2).unwrap(), partial);
         let mut complete = partial;
         for _ in 0..20 {
             if complete["complete"] == true {
                 break;
             }
             let previous = complete["agent_to_agent"].as_u64().unwrap();
-            store.connection.batched(backfill).unwrap().unwrap();
+            store.advance_coordination_counts().unwrap();
             complete = store.coordination_counts(0, u64::MAX / 2).unwrap();
             let next = complete["agent_to_agent"].as_u64().unwrap();
             assert!(next >= previous && next <= previous + 8);

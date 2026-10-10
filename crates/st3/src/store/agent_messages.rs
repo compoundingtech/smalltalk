@@ -71,6 +71,7 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
         )?;
     }
     flush(transaction)?;
+    coordination::backfill(transaction)?;
     if !filled {
         transaction.execute(
             "INSERT INTO meta(key,value) VALUES('agent_message_days_v1','1')",
@@ -185,7 +186,6 @@ pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
             [&subject],
         )?;
     }
-    coordination::backfill(transaction)?;
     Ok(())
 }
 

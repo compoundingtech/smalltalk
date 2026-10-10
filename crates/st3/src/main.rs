@@ -6170,6 +6170,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let _contention_retry = retry_projection_contention(Arc::downgrade(&store), notify.clone(), event_notify.clone(), config.state_dir.clone());
     tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(migrate_event_payloads(store.clone()));
+    tokio::spawn(catch_up_coordination_counts(store.clone()));
     spawn_response_expiry(store.clone());
     tokio::spawn(trim_local_observations(
         store.clone(),
@@ -24471,6 +24472,27 @@ async fn convert_envelope_payloads(store: Arc<Store>) {
             Ok(Ok(_)) => tokio::time::sleep(Duration::from_millis(50)).await,
             error => {
                 eprintln!("st3: binary envelope conversion failed: {error:?}");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    }
+}
+
+/// Exactly one awaited bootstrap job, then a pause longer than the writer's batch window.
+/// This never wakes a seat and stops once historical count metadata is complete.
+async fn catch_up_coordination_counts(store: Arc<Store>) {
+    loop {
+        let page_store = store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            st3::profile::task("task coordination-counts-catch-up", || {
+                page_store.advance_coordination_counts()
+            })
+        }).await;
+        match result {
+            Ok(Ok(true)) => return,
+            Ok(Ok(false)) => tokio::time::sleep(Duration::from_secs(1)).await,
+            error => {
+                eprintln!("st3: coordination count bootstrap failed: {error:?}");
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         }
