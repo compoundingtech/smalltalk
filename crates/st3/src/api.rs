@@ -522,6 +522,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/devices", get(client_v0::devices))
         .route("/v1/client/attention", get(client_attention))
         .route("/v1/client/attention/{*id}", get(client_attention_detail))
+        // The same rows under the name a person reads.
+        .route("/v1/client/alerts", get(client_attention))
+        .route("/v1/client/alerts/{*id}", get(client_attention_detail))
         .route("/v1/client/messages", get(client_messages))
         .route("/v1/client/messages/{*id}", get(client_messages_detail))
         .route("/v1/client/launches", get(client_launches))
@@ -3331,6 +3334,8 @@ pub(crate) fn client_attention_resources_at(
     let mut resources = Vec::new();
     for item in current {
         let id = client_attention_id(&item.subject, &item.person, &item.episode)?;
+        let alert = item.is_alert();
+        let conversations = item.conversations();
         let mut resource = json!({
             "id": id, "kind": "attention", "attention_kind": item.kind,
             "source_id": item.subject, "source_kind": item.kind, "episode": item.episode,
@@ -3339,9 +3344,14 @@ pub(crate) fn client_attention_resources_at(
             "title": item.title, "detail": item.detail, "priority": item.priority,
             "state": "open", "requested_at": client_timestamp(item.requested_at_unix_ms),
             "targets": item.targets, "actions": client_attention_actions(&item.kind, item.review_mode.as_deref()),
-            "operational": {"layer": "current", "actionable": true, "reasons": []}
+            "operational": {"layer": "current", "actionable": true, "reasons": []},
+            "alert": alert,
         });
+        if !conversations.is_empty() {
+            resource["conversation_ids"] = json!(conversations);
+        }
         for (name, value) in [
+            ("conversation_id", item.conversation),
             ("requester_id", item.requester_id),
             ("launch_id", item.launch_id),
             ("variant_id", item.variant_id),
