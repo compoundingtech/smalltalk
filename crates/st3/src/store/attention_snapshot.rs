@@ -72,6 +72,8 @@ impl Store {
         if !durable && !observation.id.starts_with("local-observation/") {
             return Err(St3Error::new("missing-evidence", "the prompt observation is not stored"));
         }
+        let episode = Self::native_prompt_episode(observation);
+        let reference = hex::encode(sha2::Sha256::digest(episode.as_bytes()));
         self.append_claim(&ClaimInput {
             subject: observation.subject.clone(),
             kind: "harness.diagnostic".into(),
@@ -81,11 +83,11 @@ impl Store {
                 ("status".into(), json!("resolved")),
                 ("driver".into(), json!("claude")),
                 ("incarnation_id".into(), json!(incarnation)),
-                ("reason".into(), json!(format!("native prompt {} was refused in the terminal", Self::native_prompt_episode(observation)))),
+                ("reason".into(), json!(format!("The native prompt was refused in the terminal. Reference: {reference}."))),
             ]),
             evidence: if durable { vec![observation.id.clone()] } else { vec![] },
             expected_subject: None,
-            idempotency_key: Some(native_prompt_gone_key(&Self::native_prompt_episode(observation))),
+            idempotency_key: Some(native_prompt_gone_key(&episode)),
         })
     }
 

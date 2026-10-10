@@ -56323,7 +56323,9 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         assert_eq!(prompts()[0].episode, episode);
         assert!(store.record_native_prompt_gone(&heartbeat, "other").is_err());
         let clear = store.record_native_prompt_gone(&heartbeat, "one").unwrap();
-        assert_eq!(clear.body["fields"]["reason"], format!("native prompt {episode} was refused in the terminal"));
+        let reason = clear.body["fields"]["reason"].as_str().unwrap();
+        assert!(reason.starts_with("The native prompt was refused in the terminal. Reference: "));
+        assert!(reason.len() <= 128 && !reason.contains(&episode) && !reason.contains("local-observation/"));
         assert_eq!(clear.body["evidence"], json!([]));
         assert!(prompts().is_empty());
         let later = sample(10);
