@@ -114,3 +114,7 @@ required-features = ["perf-load"]
 [[test]]
 name = "api_accept"
 path = "tests/api_accept.rs"
+
+[[test]]
+name = "gate_teardown"
+path = "tests/gate_teardown.rs"

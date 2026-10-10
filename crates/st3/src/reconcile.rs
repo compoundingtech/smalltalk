@@ -5024,7 +5024,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         observation: Option<&RuntimeObservation>,
     ) -> Result<bool> {
         // A runtime whose state could not be read may still run. Wait for a readable observation.
-        if observation.is_some_and(|observation| observation.status == "unknown") {
+        if observation.is_some_and(|observation| {
+            matches!(observation.status.as_str(), "unknown" | "indeterminate")
+        }) {
+            self.arm_restart(&format!("stop:{subject}"), now_ms().saturating_add(100));
             return Ok(false);
         }
         if observation.is_none_or(|observation| observation.status != "running") {
