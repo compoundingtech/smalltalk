@@ -46,6 +46,7 @@ export type Agent = ResourceHeader & {
   incarnation_id?: string | null;
   kind: "agent";
   last_activity_at?: (Timestamp | null);
+  lifecycle?: AgentLifecycle;
   name: string;
   next_work?: (WorkLabel | null);
   next_work_id?: (Id | null);
@@ -119,6 +120,8 @@ export type AgentHandoff = {
 };
 
 export type AgentId = string;
+
+export type AgentLifecycle = ("standing" | "owner" | "bounded" | string);
 
 export type AgentMessageDay = {
   calibrated_messages: number;
@@ -1065,8 +1068,8 @@ export type MissionRunSummary = {
 
 } | null;
   current_steps: Array<{
-  assignee?: (AgentId | null);
-  claimant?: (AgentId | null);
+  assignee?: (ActorRef | null);
+  claimant?: (ActorRef | null);
   id: StepRunId;
   since: Timestamp;
   state: WorkState;
@@ -1093,12 +1096,12 @@ export type MissionState = ("draft" | "ready" | "retired" | "running" | "standin
 
 export type MissionStep = {
   agentless?: boolean;
-  assignee?: (AgentId | null);
+  assignee?: (ActorRef | null);
   attempt: number;
   blocked_reason?: string | null;
   blockers?: Array<Id>;
   claim_expires_at?: (Timestamp | null);
-  claimant?: (AgentId | null);
+  claimant?: (ActorRef | null);
   constraints?: Array<string>;
   goals?: Array<string>;
   id: Id;
@@ -1117,7 +1120,7 @@ export type MissionStep = {
 
 export type MissionWake = {
   acknowledged_by?: string | null;
-  assignee: AgentId;
+  assignee: ActorRef;
   assignee_state: string;
   attempts: number;
   failure?: string | null;

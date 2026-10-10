@@ -45,6 +45,14 @@ run-detail endpoint. The detail uses the same enriched `Store::mission_run` read
 runs keep lightweight effective-step summaries. Headers and enrichment share one reader
 snapshot; mission lists retain their lightweight summary reads.
 
+Mission `run_details[].steps[]` and `run_details[].current_steps[]` expose nullable
+`assignee` and `claimant` actor references (`agent/...`, `daemon/...`, or `person/...`),
+not agent-only IDs. A person-ask mission therefore retains its assigned person in both
+step views. `steps[].wake.assignee` uses the same actor-reference contract, including a
+ready person's unavailable, zero-attempt wake observation. `requester` and `outcome.actor`
+also use `ActorRef`. Clients must preserve these mission rows and handle the actor family
+instead of assuming every assignee or claimant is an agent.
+
 `loop_round` and `loop_max_rounds` belong to the loop attached to that exact step in the current
 generation; they are null for a non-loop step. `loop_reason` is the observed loop-state reason.
 `next_wake_at` is the observed not-before time (earliest work eligibility), not a delivery promise
@@ -57,6 +65,22 @@ RFC 3339 UTC strings; unknown values are null. Older servers may omit these opti
 Loop and wake enrichment is detail-only and bounded to open runs plus the latest finish;
 null timing fields on lists or older finished runs are not proof of no loop or wake.
 Clients can render `round N/M · wakes in …` without reading claim envelopes.
+
+### Agent lifecycle metadata
+
+An agent roster row has an optional `lifecycle` field. The declaration currently accepts
+`"standing"`, `"owner"`, or `"bounded"`. It reports the selected agent declaration's optional KDL
+`lifecycle` child, not observed activity, runtime state, restart policy, or inferred ownership.
+Declaration replacements are reflected in subsequent roster reads and collection updates,
+including removal of the field when the replacement omits the child.
+
+When the declaration has no lifecycle, the server omits the field rather than supplying null
+or a default. A client treats an absent field as unknown, including when reading an older
+server; it must not infer `"standing"`, `"owner"`, or `"bounded"` from other fields.
+Like the other forward-compatible response enums, the wire schema accepts future strings.
+Generated clients decode an unfamiliar value as `Unknown` without dropping the roster row;
+this differs from an absent field, which means no lifecycle was declared.
+See [agent declarations](../kdl-lifecycle.md#definitions-do-not-start-work).
 
 ### Agent activity and human blocking
 

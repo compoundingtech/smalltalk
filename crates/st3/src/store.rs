@@ -27,6 +27,8 @@ mod card_fold;
 mod card_fold_tests;
 #[cfg(test)]
 mod roster_controls;
+#[cfg(test)]
+mod agents_window_deadline_tests;
 pub(crate) mod step_labels;
 mod canonical;
 mod latest_values;
@@ -162,6 +164,8 @@ mod runtime;
 pub(crate) mod published_views;
 #[cfg(test)]
 mod tombstones_tests;
+#[cfg(test)]
+mod work_renew_tests;
 pub use runtime::SmalltalkRuntime;
 #[cfg(test)]
 pub(crate) use smallclaims::sqlite::STATEMENTS_RUN;
@@ -3234,11 +3238,11 @@ impl Store {
         self.cached_agent_resources_for(index, history, None, build)
     }
 
-    /// The complete agents WS window inherits the queue deadline from its shared projection.
+    /// An agents WS window inherits the queue deadline from its selected or complete projection.
     pub(crate) fn agent_roster_valid_until(&self, index: u64) -> Option<u128> {
         self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter().rev()
-            .find(|entry| entry.index == index && !entry.history && entry.covered.is_none())
+            .find(|entry| entry.index == index && !entry.history)
             .and_then(|entry| entry.valid_until_unix_ms)
     }
 
@@ -3322,6 +3326,41 @@ impl Store {
                 && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)))
     }
 
+    /// Whether the newest complete roster published at or before `index` already shows every
+    /// card as it would at `index`: no claim since its cut changes a card's inputs (the same
+    /// delta the incremental fold trusts), no agent timeline row arrived, and no queue deadline
+    /// passed. A read that must see what was written before it need not wait for a refresh
+    /// that would fold nothing. One range read over the claims since the cut; it never folds.
+    pub(crate) fn published_agent_roster_unchanged_through(
+        &self,
+        index: u64,
+        history: bool,
+    ) -> Result<bool> {
+        if self.smalltalk.agent_roster_refresh.get().is_none() {
+            return Ok(false);
+        }
+        let Some((cut, local, valid_until, items)) = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
+            .max_by_key(|entry| (entry.index, entry.local))
+            .map(|entry| (entry.index, entry.local, entry.valid_until_unix_ms, Arc::clone(&entry.items)))
+        else {
+            return Ok(false);
+        };
+        if valid_until.is_some_and(|expiry| now_ms() >= expiry)
+            || roster_local_frontier(&self.readers.get(), index)? != local
+        {
+            return Ok(false);
+        }
+        if cut == index {
+            return Ok(true);
+        }
+        Ok(match self.agent_resources_delta(cut, index, &items)? {
+            Ok(delta) => delta.subjects.is_empty() && !delta.queues && !delta.membership,
+            Err(_) => false,
+        })
+    }
+
     /// Whether a refresher keeps the roster published, so readers must never fold it.
     pub(crate) fn agent_roster_refresher_running(&self) -> bool {
         self.smalltalk.agent_roster_refresh.get().is_some()
@@ -3343,6 +3382,27 @@ impl Store {
     pub(crate) fn request_agent_roster_history(&self) {
         self.smalltalk.agent_roster_history_wanted.store(true, std::sync::atomic::Ordering::Release);
         self.request_agent_roster_refresh();
+    }
+
+    /// Ask the refresher, if one runs, for a roster at the newest cut on behalf of a reader that
+    /// waits for it: a refresher pausing between refreshes stops pausing once it has paused as
+    /// long as its last refresh took, and at least a tenth of a second.
+    pub(crate) fn request_fresh_agent_roster(&self, history: bool) {
+        if self.smalltalk.agent_roster_refresh.get().is_none() {
+            return;
+        }
+        self.smalltalk.agent_roster_fresh_wanted.notify_one();
+        if history {
+            self.request_agent_roster_history();
+        } else {
+            self.request_agent_roster_refresh();
+        }
+    }
+
+    /// Resolves once a reader waits for a fresh roster, including one that asked before this
+    /// was called and was not yet answered by a refresh's pause.
+    pub(crate) async fn fresh_agent_roster_wanted(&self) {
+        self.smalltalk.agent_roster_fresh_wanted.notified().await;
     }
 
     /// Whether a reader asked for the history roster since the last time this was taken.
@@ -8420,8 +8480,11 @@ impl Store {
             })?;
         let now = now_ms();
         // One work action in a savepoint of the writer's next batch, answered once that batch commits.
-        self.connection
+        let committed = self
+            .connection
             .batched(|transaction| -> Result<StepRunView, St3Error> {
+                #[cfg(test)]
+                let _writer_work = WorkActionWriterProbe::start(&request.idempotency_key);
                 if let Some(response) = smallclaims::store::idempotency::cached_response(transaction, &request.idempotency_key)?
                 {
                     if let Some(input) = handoff {
@@ -8712,11 +8775,9 @@ impl Store {
                     && request.evidence.is_empty();
                 let last_replicated_expiry = if quiet_renewal {
                     transaction
+                        .prepare_cached(&last_replicated_lease_query())
+                        .map_err(internal)?
                         .query_row(
-                            &canonical_sql("SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
-                             FROM claims WHERE subject=?1
-                               AND kind IN ('work.claimed','work.renewed','work.progress')
-                             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                             [&subject],
                             |row| row.get::<_, Option<u64>>(0),
                         )
@@ -8813,7 +8874,12 @@ impl Store {
                     "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                             lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
                      FROM step_runs WHERE subject=?1", [&subject], step_run_from_row).map_err(internal)?;
-                enrich_step_queue(transaction, &mut view).map_err(internal)?;
+                // A renewal only moves the lease. Its view's timing, summaries and wake fold the
+                // step's whole claim history, which would hold the writer longer the older the
+                // step grows, so a renewal's view is filled from a reader after COMMIT.
+                if action != "renew" {
+                    enrich_step_queue(transaction, &mut view).map_err(internal)?;
+                }
                 transaction
                     .execute(
                         "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
@@ -8828,7 +8894,19 @@ impl Store {
                 }
                 Ok(view)
             })
-            .map_err(|error| St3Error::new("internal", error))?
+            .map_err(|error| St3Error::new("internal", error))?;
+        let mut view = committed?;
+        if action == "renew" {
+            // An exact retry of a renewal also replays a view cached without these fields.
+            self.enrich_work_response(&mut view)
+                .map_err(|error| St3Error::new("store-read-failed", format!("{error:#}")))?;
+        }
+        Ok(view)
+    }
+
+    /// Fill a committed work acknowledgement's queue, timing, summaries and wake from a reader.
+    pub(crate) fn enrich_work_response(&self, view: &mut StepRunView) -> Result<()> {
+        enrich_step_queue(&self.readers.get(), view).map_err(Into::into)
     }
 
     pub fn set_step_state(
@@ -12192,6 +12270,45 @@ impl Store {
             .and_then(|value| value.parse::<u128>().ok())
             .unwrap_or_default();
         Ok(value)
+    }
+
+    /// `projection_time_at` for several cuts in one statement: each distinct cut is one indexed
+    /// seek of `claims` by `store_index`, so the statement count does not grow with the cuts.
+    pub fn projection_times_at(&self, store_indexes: &[u64]) -> Result<HashMap<u64, u128>> {
+        let mut times = HashMap::with_capacity(store_indexes.len());
+        let mut cuts = store_indexes
+            .iter()
+            .copied()
+            .filter(|store_index| *store_index != 0)
+            .collect::<Vec<_>>();
+        cuts.sort_unstable();
+        cuts.dedup();
+        if let Some(zero) = store_indexes.iter().find(|store_index| **store_index == 0) {
+            times.insert(*zero, 0);
+        }
+        if cuts.is_empty() {
+            return Ok(times);
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT cut.value,
+                    (SELECT accepted_at_unix_ms FROM claims
+                     WHERE store_index <= cut.value ORDER BY store_index DESC LIMIT 1)
+             FROM json_each(?1) AS cut",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(&cuts)?], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (cut, value) = row?;
+            times.insert(
+                cut,
+                value
+                    .and_then(|value| value.parse::<u128>().ok())
+                    .unwrap_or_default(),
+            );
+        }
+        Ok(times)
     }
 
     pub fn events_after_filtered(
@@ -22049,6 +22166,32 @@ fn cache_local_apply_receipt_tx(
     Ok(response)
 }
 
+/// The lease expiry of a step's newest replicated `work.claimed`, `work.renewed` or
+/// `work.progress` claim. Each kind's newest accepted time is one seek of the subject-kind
+/// index; only the claims accepted in those milliseconds are put in canonical order, so the read
+/// stays the same size however many reports and renewals the step has.
+fn last_replicated_lease_query() -> String {
+    let newest = |kind: &str| {
+        format!(
+            "SELECT '{kind}', (SELECT accepted_at_unix_ms FROM claims INDEXED BY claims_subject_kind_accepted_index
+                 WHERE subject=?1 AND kind='{kind}'
+                 ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC LIMIT 1)"
+        )
+    };
+    canonical_sql(&format!(
+        "WITH newest(kind, accepted) AS ({} UNION ALL {} UNION ALL {})
+         SELECT json_extract(claims.body, '$.fields.claim_expires_at_unix_ms')
+         FROM newest CROSS JOIN claims INDEXED BY claims_subject_kind_accepted_index
+           ON claims.subject=?1 AND claims.kind=newest.kind
+          AND length(claims.accepted_at_unix_ms)=length(newest.accepted)
+          AND claims.accepted_at_unix_ms=newest.accepted
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+        newest("work.claimed"),
+        newest("work.renewed"),
+        newest("work.progress"),
+    ))
+}
+
 fn mark_replay_safe_receipt_tx(transaction: &Transaction<'_>, key: &str) -> Result<()> {
     transaction.execute(
         "UPDATE idempotency SET replay_safe=1 WHERE operation_id=?1",
@@ -27122,6 +27265,41 @@ thread_local! {
     pub(crate) static SUBJECT_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Steps whose queue, timing and wake a read enriched, so a test can see a read's work.
     pub(crate) static STEPS_ENRICHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The SQLite work each work action did inside its writer job, by idempotency key, so a test
+/// can see what one action holds the single writer for.
+#[cfg(test)]
+pub(crate) static WORK_ACTION_WRITER_WORK: Mutex<
+    BTreeMap<String, smallclaims::sqlite::work::SqliteWork>,
+> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+struct WorkActionWriterProbe {
+    key: String,
+    scope: Option<smallclaims::sqlite::work::SqliteWorkScope>,
+}
+
+#[cfg(test)]
+impl WorkActionWriterProbe {
+    fn start(key: &str) -> Self {
+        Self {
+            key: key.to_owned(),
+            scope: Some(smallclaims::sqlite::work::SqliteWorkScope::start()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for WorkActionWriterProbe {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.take() {
+            WORK_ACTION_WRITER_WORK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(std::mem::take(&mut self.key), scope.finish());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -33866,6 +34044,45 @@ mod tests {
         other.join().unwrap();
         assert_eq!(completed.unwrap().unwrap()[0]["id"], "agent/cached");
         assert_eq!(resumed, published.unwrap());
+    }
+
+    #[test]
+    fn projection_times_at_names_every_cut_like_the_single_lookup() {
+        let store = roster_cache_store();
+        let (_, newest) = store.event_bounds().unwrap();
+        assert!(newest > 1, "the fixture needs several claims");
+        // Heterogeneous, repeated, unordered, empty-store and past-the-frontier cuts.
+        let mut cuts = vec![0, newest + 7, 1, newest, 1, newest / 2, 0, newest];
+        cuts.extend(1..=newest);
+        let batched = store.projection_times_at(&cuts).unwrap();
+        for cut in &cuts {
+            assert_eq!(batched[cut], store.projection_time_at(*cut).unwrap(), "cut {cut}");
+        }
+        assert_eq!(batched.len(), (0..=newest + 7).filter(|c| cuts.contains(c)).count());
+        assert!(store.projection_times_at(&[]).unwrap().is_empty());
+        // Acceptance times are per claim, not one shared value, once the clock moves.
+        assert!(batched[&newest] >= batched[&1]);
+    }
+
+    #[test]
+    fn projection_times_at_seeks_the_claim_index_once_per_cut() {
+        let store = roster_cache_store();
+        let connection = store.readers.get();
+        let plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT cut.value,
+                        (SELECT accepted_at_unix_ms FROM claims
+                         WHERE store_index <= cut.value ORDER BY store_index DESC LIMIT 1)
+                 FROM json_each(?1) AS cut",
+            )
+            .unwrap()
+            .query_map(["[1,2]"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("SEARCH claims USING INTEGER PRIMARY KEY"), "{plan}");
+        assert!(!plan.contains("SCAN claims"), "{plan}");
     }
 
     fn roster_cache_store() -> Store {

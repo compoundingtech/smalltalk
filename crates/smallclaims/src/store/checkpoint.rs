@@ -805,7 +805,9 @@ impl Store {
                         accepted_at_unix_ms: row
                             .get::<_, String>(3)?
                             .parse()
-                            .unwrap_or(u128::MAX),
+                            .map_err(|error| rusqlite::Error::FromSqlConversionFailure(
+                                3, rusqlite::types::Type::Text, Box::new(error),
+                            ))?,
                         records: row.get(4)?,
                     })
                 })?
@@ -841,6 +843,20 @@ impl Store {
             let page = connection
                 .prepare_cached(&records_sql)?
                 .query_map([after, upto], |row| {
+                    let accepted_at_unix_ms = match row.get::<_, String>(9)?.parse::<u128>() {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            let id = row.get::<_, String>(0)?;
+                            return Err(rusqlite::Error::FromSqlConversionFailure(
+                                9,
+                                rusqlite::types::Type::Text,
+                                Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    format!("invalid accepted time for checkpoint claim {id}: {error}"),
+                                )),
+                            ));
+                        }
+                    };
                     Ok((
                         (
                             row.get(14)?,
@@ -855,7 +871,7 @@ impl Store {
                             row.get(12)?,
                             row.get(21)?,
                         ),
-                        claim_from_row(row)?,
+                        claim_from_row_with_accepted_time(row, accepted_at_unix_ms)?,
                         EnvelopeKey {
                             writer: row.get(10)?,
                             sequence: row.get(11)?,

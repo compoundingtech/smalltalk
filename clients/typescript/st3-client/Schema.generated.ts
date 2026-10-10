@@ -528,6 +528,11 @@ export const AgentId = /*#__PURE__*/ (() => subjectRef(new RegExp("^(?:agent)/[^
 export type AgentId = typeof AgentId.Type
 export type AgentIdEncoded = typeof AgentId.Encoded
 
+/** Declared agent lifecycle. Publication accepts standing, owner, or bounded; clients retain future values as Unknown. */
+export const AgentLifecycle = /*#__PURE__*/ (() => openEnum(["standing","owner","bounded"]).annotate({ identifier: "AgentLifecycle", description: "Declared agent lifecycle. Publication accepts standing, owner, or bounded; clients retain future values as Unknown." }))()
+export type AgentLifecycle = typeof AgentLifecycle.Type
+export type AgentLifecycleEncoded = typeof AgentLifecycle.Encoded
+
 /** Whether the daemon can currently reach the agent runtime. */
 export const AgentReachability = /*#__PURE__*/ (() => openEnum(["local","remote","unreachable","unknown","reachable","indeterminate"]).annotate({ identifier: "AgentReachability", description: "Whether the daemon can currently reach the agent runtime." }))()
 export type AgentReachability = typeof AgentReachability.Type
@@ -737,6 +742,8 @@ export const Agent = /*#__PURE__*/ (() => Schema.Struct({
   "incarnation_id": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "kind": Schema.Literal("agent"),
   "last_activity_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
+  /** The selected agent declaration's optional KDL `lifecycle` child. Declared intent, not observed activity, runtime state, restart policy, or inferred ownership; omitted rather than null when undeclared. Absence means undeclared; a future string decodes as Unknown without discarding the row. */
+  "lifecycle": optionalKey(AgentLifecycle),
   "name": Schema.String,
   "next_work": Schema.OptionFromOptionalNullOr(WorkLabel, NULL_NONE),
   "next_work_id": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),
@@ -1557,7 +1564,7 @@ export type MissionRunOutcomeEncoded = typeof MissionRunOutcome.Encoded
 
 export const MissionWake = /*#__PURE__*/ (() => Schema.Struct({
   "acknowledged_by": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
-  "assignee": AgentId,
+  "assignee": ActorRef,
   "assignee_state": Schema.String,
   "attempts": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "failure": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -1569,12 +1576,12 @@ export type MissionWakeEncoded = typeof MissionWake.Encoded
 
 export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   "agentless": optionalKey(Schema.Boolean),
-  "assignee": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
+  "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE),
   "attempt": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "blocked_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "blockers": optionalKey(Schema.Array(Id)),
   "claim_expires_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
-  "claimant": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
+  "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE),
   "constraints": optionalKey(Schema.Array(Schema.String)),
   "goals": optionalKey(Schema.Array(Schema.String)),
   "id": Id,
@@ -1604,7 +1611,7 @@ export type MustActEncoded = typeof MustAct.Encoded
 export const MissionRunSummary = /*#__PURE__*/ (() => Schema.Struct({
   "after": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),
   "blocker": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE),
-  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE), "id": StepRunId, "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
+  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "id": StepRunId, "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
   "deadline": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "generation_id": optionalKey(RunGenerationId),
   "id": MissionRunId,

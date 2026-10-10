@@ -3,6 +3,10 @@
 //! reductions need in a few statements, and the shared folds reduce what it read.
 use super::*;
 
+#[path = "harness_health_capture.rs"]
+#[cfg(test)]
+mod health_capture;
+
 /// Subjects per statement, so that no single statement holds the reader for the whole fleet.
 const CHUNK: usize = 256;
 
@@ -559,9 +563,45 @@ pub(crate) struct AgentCardReads {
     activity: HashMap<String, Option<u128>>,
     suspensions: HashSet<String>,
     rollouts: HashSet<String>,
+    #[cfg(test)]
+    health: BTreeMap<String, health_capture::CardCapture>,
 }
 
 impl AgentCardReads {
+    /// Prepared input extension. Call only while `agent_card_reads` still holds
+    /// its snapshot connection, after selecting desired/runtime claims and the
+    /// harness at `self.index`. No caller is installed until native admission and
+    /// source qualification can consume these candidates honestly.
+    #[cfg(test)]
+    fn prepare_health_chunk(
+        &mut self,
+        connection: &Connection,
+        namespace: &str,
+        now_ms: u64,
+        selected: &[(&str, Option<&str>, Option<&str>)],
+    ) -> Result<()> {
+        let requests = selected.iter().map(|(subject, runtime_claim, desired_claim)| {
+            health_capture::Request {
+                subject,
+                runtime_claim: *runtime_claim,
+                desired_claim: *desired_claim,
+                harness_claim: self.harness.get(*subject).and_then(Option::as_ref)
+                    .map(|harness| harness.claim.as_str()),
+            }
+        }).collect::<Vec<_>>();
+        self.health.extend(health_capture::capture(
+            connection, namespace, self.index, now_ms, &requests,
+        )?);
+        Ok(())
+    }
+
+    /// There is no fallback reader acquisition or attempt to fill an absent input.
+    /// Candidate rows require native authority/coverage validation before reduction.
+    #[cfg(test)]
+    fn take_health(&mut self, subject: &str) -> Option<health_capture::CardCapture> {
+        self.health.remove(subject)
+    }
+
     /// [`Store::observed_harness_at`] of `subject`.
     pub(crate) fn take_harness(
         &mut self,
@@ -629,6 +669,8 @@ impl Store {
             activity: HashMap::new(),
             suspensions: HashSet::new(),
             rollouts: HashSet::new(),
+            #[cfg(test)]
+            health: BTreeMap::new(),
         };
         // A harness view needs a runtime observation naming an incarnation; then a running one,
         // or an admission refusal of that incarnation, is folded as `current_harness_fold_at`

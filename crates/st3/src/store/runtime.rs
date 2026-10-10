@@ -57,6 +57,9 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_roster_overdue_warned: std::sync::atomic::AtomicBool,
     /// Whether a reader asked for the history roster since the refresher last folded it.
     pub(crate) agent_roster_history_wanted: std::sync::atomic::AtomicBool,
+    /// Wakes a pausing refresher for a reader that waits for a fresh roster, so that read
+    /// waits for one fold rather than the rest of the minimum pause.
+    pub(crate) agent_roster_fresh_wanted: tokio::sync::Notify,
     /// Rosters assembled in chunks because no short fold could complete them, by why.
     pub(crate) agent_roster_chunked: Mutex<BTreeMap<String, u64>>,
     /// Counts complete current roster publications, same graph index or not, so collection
