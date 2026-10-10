@@ -1708,8 +1708,10 @@ list's refresher stops for good, a work window receives one `error` frame and en
 
 `GET /v1/client/work` (the current list, not `history=true`) answers the same way. A first
 page is a slice of the newest publication, under that publication's snapshot. A continuation
-is a slice of the same publication, even after a newer one, until its cursor expires or a
-replay, trim or heal replaced the projections behind it (`page-cursor-expired`). While there is
+is a slice of the same publication, even after a newer one, a withdrawal or the refresher's end
+(new first pages then refuse), until its cursor expires or a replay, trim or heal replaced the
+projections behind it (`page-cursor-expired`). Asking for the same first page again reuses its
+cursor and expiry. While there is
 no current publication, a first page answers HTTP 503, retryable, with
 `details.reason: "work-list-not-ready"`; after the refresher stops for good, HTTP 503, not
 retryable, with `details.reason: "work-list-ended"`. With `fresh=true`, the daemon waits up to

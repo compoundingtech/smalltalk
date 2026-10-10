@@ -1447,3 +1447,74 @@ async fn sustained_fresh_requests_fold_no_faster_than_the_fresh_floor() {
     assert!(folds <= most, "{folds} folds in {span:?}, at most {most}");
     assert!(folds >= 2, "fresh requests did cut the pause: {folds} folds in {span:?}");
 }
+
+/// Bring every cached page of `list` to expire `ms` from now, as if its TTL were that short.
+/// Returns the new expiry.
+fn expire_published_work_pages_in(list: u64, ms: u128) -> u128 {
+    let expires_at = client_now_ms() + ms;
+    let mut pages = published_work_pages().lock().unwrap();
+    for page in pages.iter_mut().filter(|page| page.id.list == list) {
+        page.expires_at_unix_ms = expires_at;
+    }
+    expires_at
+}
+
+#[tokio::test]
+async fn a_cached_work_page_keeps_its_expiry_on_reuse_and_is_released_once_it_passes() {
+    let root = tempfile::tempdir().unwrap();
+    let state = app_state(root.path());
+    let store = &state.store;
+    seat_mission(store, "garden/tend", "agent/garden/ash");
+    for n in 0..3 {
+        ready_run(store, "garden/tend", &format!("tend-{n}"));
+    }
+    let list = store.published_work_list();
+    list.start();
+    fold_work_checked(store);
+    let instance = list.instance();
+    work_page(&state, work_query(None, 1)).await.unwrap();
+    assert_eq!(published_work_pages_of(instance), 1);
+    // Shortly before its expiry, the same page asked again reuses the entry and its expiry.
+    let expires_at = expire_published_work_pages_in(instance, 200);
+    let reused = work_page(&state, work_query(None, 1)).await.unwrap();
+    assert_eq!(reused.page.cursor_expires_at, Some(client_timestamp(expires_at)), "not extended");
+    assert_eq!(published_work_pages_of(instance), 1);
+    let cursor = reused.page.next_cursor.unwrap();
+    // Past it, the continuation expires: its own expiry is checked before the cache is.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let expired = work_page(&state, ClientListQuery { cursor: Some(cursor), ..work_query(None, 1) }).await.unwrap_err();
+    assert_eq!((expired.status, expired.code.as_str()), (StatusCode::GONE, "page-cursor-expired"));
+    // The next cache access releases the expired entry, and that first page makes a new one,
+    // with a new expiry: one entry, not two.
+    let renewed = work_page(&state, work_query(None, 1)).await.unwrap();
+    assert_eq!(published_work_pages_of(instance), 1, "the expired entry was released");
+    assert_ne!(renewed.page.cursor_expires_at, Some(client_timestamp(expires_at)));
+    // A continuation outlives a withdrawal and the refresher's end until its expiry, while new
+    // first pages refuse; only a forget expires it.
+    let cursor = renewed.page.next_cursor.unwrap();
+    list.end();
+    assert_eq!(work_page(&state, work_query(None, 1)).await.unwrap_err().code, WORK_LIST_ENDED);
+    let next = work_page(&state, ClientListQuery { cursor: Some(cursor), ..work_query(None, 1) }).await.unwrap();
+    assert_eq!(next.items.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fresh_read_the_newest_publication_covers_asks_for_no_fold() {
+    let root = tempfile::tempdir().unwrap();
+    let state = app_state(root.path());
+    let store = &state.store;
+    seat_mission(store, "garden/tend", "agent/garden/ash");
+    ready_run(store, "garden/tend", "tend-1");
+    start_published_work(&state);
+    wait_published(store).await;
+    let list = store.published_work_list();
+    // Let any pause after the last fold run out, so a stray request would show as a fold.
+    tokio::time::sleep(REFRESH_PAUSE * 2).await;
+    let folds = list.folds();
+    let asked = tokio::time::Instant::now();
+    let page = work_page(&state, ClientListQuery { fresh: true, ..work_query(None, 200) }).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert!(asked.elapsed() < FRESH_PAUSE, "answered at once: {:?}", asked.elapsed());
+    tokio::time::sleep(REFRESH_PAUSE * 2).await;
+    assert_eq!(list.folds(), folds, "a covered fresh read asks for no fold");
+}
