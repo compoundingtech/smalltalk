@@ -1241,7 +1241,8 @@ fn request_latency() -> &'static Mutex<request_latency::Meter> {
 
 /// Count one agents roster stage's duration beside the request rows.
 fn record_roster_stage(stage: request_latency::RosterStage, elapsed: Duration) {
-    request_latency().lock().unwrap().record_roster_stage(stage, elapsed);
+    // A poisoned diagnostic lock must not stop the refresher that records into it.
+    request_latency().lock().unwrap_or_else(std::sync::PoisonError::into_inner).record_roster_stage(stage, elapsed);
 }
 
 fn request_latency_snapshot() -> Vec<Value> {
