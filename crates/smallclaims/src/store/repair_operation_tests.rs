@@ -591,7 +591,7 @@ fn complete_operation_reconciliation_finalizer_refusal_prevents_success_ack() {
         seen.store(true, Ordering::SeqCst);
         anyhow::bail!("operation fixture finalizer refuses outer commit")
     }).unwrap();
-    let result = store.connection.batched(|tx| rebuild_operations_tx(tx));
+    let result = store.connection.batched(rebuild_operations_tx);
     assert!(result.is_err()); // Outer commit/finalizer refusal, not a successful job ACK.
     assert!(finalized.load(Ordering::SeqCst));
     assert_eq!(raw_operation_rows_at(&store.readers.get()), before);
