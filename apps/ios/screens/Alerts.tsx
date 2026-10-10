@@ -3,7 +3,7 @@ import { Alert, Linking, Pressable, ScrollView, useWindowDimensions, View } from
 import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
-import { ANSWERS, alertsIn, cleanMessageText, isRequest, offeredAnswers, pendingCall, promptAnswers, report, spaced, yesNo, ago, type KeptAttention, type PendingCall } from '@smalltalk/st3-views';
+import { ANSWERS, alertsIn, cleanMessageText, isRequest, offeredAnswers, pendingCalls, promptAnswers, report, spaced, yesNo, ago, type KeptAttention, type PendingCall } from '@smalltalk/st3-views';
 import { agentName } from '../agentsView';
 import type { RootParams } from '../navigation';
 import { attentionKindLabel } from '../presentation';
@@ -21,17 +21,17 @@ export function AlertsStrip({ agentId, entries }: { agentId: string; entries: Re
   const { height } = useWindowDimensions();
   const alerts = useMemo(() => alertsIn(data.attention, agentId, caps?.session_actor), [data.attention, agentId, caps?.session_actor]);
   const [toggled, setToggled] = useState<ReadonlySet<string>>(new Set());
-  const call = useMemo(() => pendingCall(entries), [entries]);
+  const calls = useMemo(() => pendingCalls(entries), [entries]);
   if (!alerts.length) return null;
   // One alert starts open; with several, each opens on a tap.
   const isOpen = (id: string) => (alerts.length === 1) !== toggled.has(id);
   const toggle = (id: string) => setToggled(previous => { const next = new Set(previous); if (next.has(id)) next.delete(id); else next.add(id); return next; });
   return <ScrollView style={{ maxHeight: Math.round(height * 0.4), flexGrow: 0, backgroundColor: theme.mantle }} contentContainerStyle={{ padding: 8, gap: 6 }}>
-    {alerts.map(item => <AlertCard key={item.id} item={item} agentId={agentId} open={isOpen(item.id)} onToggle={() => toggle(item.id)} call={call} />)}
+    {alerts.map(item => <AlertCard key={item.id} item={item} agentId={agentId} open={isOpen(item.id)} onToggle={() => toggle(item.id)} calls={calls} />)}
   </ScrollView>;
 }
 
-function AlertCard({ item, agentId, open, onToggle, call }: { item: KeptAttention; agentId: string; open: boolean; onToggle: () => void; call: PendingCall | null }) {
+function AlertCard({ item, agentId, open, onToggle, calls }: { item: KeptAttention; agentId: string; open: boolean; onToggle: () => void; calls: PendingCall[] }) {
   const { data } = useStore();
   const navigation = useNavigation<NativeStackNavigationProp<RootParams>>();
   const seats = (item.conversation_ids ?? []).filter(id => id !== agentId).map(id => { const seat = data.agents.find(candidate => candidate.id === id); return seat ? agentName(seat) : id.replace(/^agent\//, ''); });
@@ -43,15 +43,15 @@ function AlertCard({ item, agentId, open, onToggle, call }: { item: KeptAttentio
     </Pressable>
     {open ? <View style={{ gap: 8 }}>
       <T dim>{attentionKindLabel(item.attention_kind)} · waited {ago(item.requested_at)}</T>
-      <AlertBody item={item} from={from} call={call} seats={seats} />
+      <AlertBody item={item} from={from} calls={calls} seats={seats} />
       <Button label="details" color={theme.subtext0} onPress={() => navigation.navigate('Attention', { id: item.id })} />
     </View> : null}
   </View>;
 }
 
-export function AlertBody({ item, from, call, seats }: { item: KeptAttention; from: string; call: PendingCall | null; seats: string[] }) {
+export function AlertBody({ item, from, calls, seats }: { item: KeptAttention; from: string; calls: PendingCall[]; seats: string[] }) {
   const prompt = promptAnswers(item);
-  if (prompt) return <PromptAnswerView item={item} call={call} />;
+  if (prompt) return <PromptAnswerView item={item} calls={calls} />;
   if (item.attention_kind === 'harness-prompt') return <View style={{ gap: 6 }}>
     {item.detail ? <Markdown text={spaced(cleanMessageText(item.detail))} color={theme.text} /> : null}
     <Note>This prompt is answered in the agent's terminal.</Note>
@@ -71,28 +71,31 @@ export function AlertBody({ item, from, call, seats }: { item: KeptAttention; fr
   </View>;
 }
 
-// A Claude permission prompt: the call it would allow, in full, beside the answers. Allow is
-// offered only when the call can be shown; deny always.
-function PromptAnswerView({ item, call }: { item: KeptAttention; call: PendingCall | null }) {
+// A Claude permission prompt: the call it would allow, in full, beside the answers. The prompt
+// names no call, so Allow is offered only when exactly one call is unanswered; with several, all
+// are listed and only Deny is offered, and the terminal shows which one Claude asks about.
+function PromptAnswerView({ item, calls }: { item: KeptAttention; calls: PendingCall[] }) {
   const { busy, status, actions } = useStore();
   const prompt = promptAnswers(item)!;
   const disabled = busy || status !== 'online';
-  const offered = offeredAnswers(prompt, call);
+  const offered = offeredAnswers(prompt, calls);
+  const call = calls.length === 1 ? calls[0] : null;
   const send = (answer: 'allow' | 'deny') => {
     const shown = call ? `${call.tool}${call.lines[0] ? `\n${call.lines[0]}` : ''}` : undefined;
-    Alert.alert(answer === 'allow' ? 'Allow this call?' : 'Deny this call?', shown, [
+    Alert.alert(answer === 'allow' ? 'Allow this call?' : calls.length > 1 ? 'Deny the prompt?' : 'Deny this call?', shown, [
       { text: 'Cancel', style: 'cancel' },
       { text: answer === 'allow' ? 'Allow' : 'Deny', style: answer === 'deny' ? 'destructive' : 'default', onPress: () => void actions.respondPrompt(item, answer) },
     ]);
   };
   return <View style={{ gap: 8 }}>
     {item.detail ? <T selectable>{cleanMessageText(item.detail)}</T> : null}
-    {call && call.lines.length
-      ? <View style={{ backgroundColor: theme.crust, borderRadius: 4, padding: 8, gap: 2 }}>
-          <T bold color={theme.person}>{call.tool}</T>
-          {call.lines.map((line, index) => <T key={index} selectable>{line}</T>)}
-        </View>
-      : <Note tone="warning">The call it would allow is not in the conversation yet, so only deny is offered. Allow it in the terminal.</Note>}
+    {calls.map(each => <View key={each.id} style={{ backgroundColor: theme.crust, borderRadius: 4, padding: 8, gap: 2 }}>
+      <T bold color={theme.person}>{each.tool}</T>
+      {each.lines.map((line, index) => <T key={index} selectable>{line}</T>)}
+    </View>)}
+    {calls.length === 0 ? <Note tone="warning">The call it would allow is not in the conversation yet, so only deny is offered. Allow it in the terminal.</Note> : null}
+    {calls.length > 1 ? <Note tone="warning">{calls.length} calls are waiting and the prompt does not say which one it is asking about, so only deny is offered. Allow it in the terminal, where Claude shows it.</Note> : null}
+    {calls.length === 1 && !offered.includes('allow') ? <Note tone="warning">The call cannot be shown in full, so only deny is offered. Allow it in the terminal.</Note> : null}
     <View style={{ flexDirection: 'row', gap: 8, flexWrap: 'wrap' }}>
       {offered.includes('allow') ? <Button label="Allow" color={theme.green} disabled={disabled} onPress={() => send('allow')} /> : null}
       {offered.includes('deny') ? <Button label="Deny" color={theme.red} disabled={disabled} onPress={() => send('deny')} /> : null}

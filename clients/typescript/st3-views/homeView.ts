@@ -196,26 +196,30 @@ function inputLines(args: unknown): string[] {
 }
 
 /**
- * The newest tool call with no result yet: what a Claude permission prompt is asking about.
- * Null when there is none to show; an allow is then not offered, since a person cannot see what it allows.
+ * Every tool call with no result yet, oldest first. A permission prompt asks about one of them,
+ * but the prompt carries no call ID, so with more than one unanswered a client cannot say which.
  */
-export function pendingCall(entries: ReadonlyArray<Pick<TimelineEntry, 'type' | 'body' | 'id'>>): PendingCall | null {
+export function pendingCalls(entries: ReadonlyArray<Pick<TimelineEntry, 'type' | 'body' | 'id'>>): PendingCall[] {
   const answered = new Set<string>();
   for (const entry of entries) {
     if (entry.type === 'tool_result') { const call = (entry.body as { call_id?: unknown }).call_id; if (typeof call === 'string') answered.add(call); }
   }
-  for (let index = entries.length - 1; index >= 0; index--) {
-    const entry = entries[index];
+  const open: PendingCall[] = [];
+  for (const entry of entries) {
     if (entry.type !== 'tool_call') continue;
     const body = entry.body as { call_id?: unknown; name?: unknown; arguments?: unknown };
     const call = typeof body.call_id === 'string' ? body.call_id : entry.id;
-    if (answered.has(call)) continue;
-    return { id: call, tool: typeof body.name === 'string' && body.name ? body.name : 'tool', lines: inputLines(body.arguments) };
+    if (answered.has(call) || open.some(other => other.id === call)) continue;
+    open.push({ id: call, tool: typeof body.name === 'string' && body.name ? body.name : 'tool', lines: inputLines(body.arguments) });
   }
-  return null;
+  return open;
 }
 
-/** The answers a client may offer: allow only with the call in view, deny always. */
-export function offeredAnswers(prompt: PromptAnswers, call: PendingCall | null): Array<'allow' | 'deny'> {
-  return prompt.answers.filter(answer => answer === 'deny' || (call !== null && call.lines.length > 0));
+/**
+ * The answers a client may offer: deny always; allow only when exactly one call is unanswered and
+ * it is shown in full, since only then is it certain what an allow allows.
+ */
+export function offeredAnswers(prompt: PromptAnswers, calls: readonly PendingCall[]): Array<'allow' | 'deny'> {
+  const certain = calls.length === 1 && calls[0].lines.length > 0;
+  return prompt.answers.filter(answer => answer === 'deny' || certain);
 }

@@ -172,7 +172,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
       <T bold selectable>{row.title}</T>
       {item.attention_kind === 'harness-prompt' || item.attention_kind === 'harness-login'
         // A prompt is allowed from its conversation, where the call it asks about is shown.
-        ? <AlertBody item={item} from={agent ? agentName(agent) : item.source_id} call={null} seats={[]} />
+        ? <AlertBody item={item} from={agent ? agentName(agent) : item.source_id} calls={[]} seats={[]} />
         : item.detail ? <Markdown text={item.detail} color={theme.subtext0} /> : null}
       {item.because ? <T soft>because {item.because}</T> : null}
       {row.waiting ? <T dim>{row.waiting}</T> : null}
