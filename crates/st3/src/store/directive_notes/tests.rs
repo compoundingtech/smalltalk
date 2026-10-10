@@ -39,6 +39,7 @@ fn sync(from: &Store, to: &Store) -> ReplicationAdmission {
         &to.replication_inventory().unwrap(), &to.replication_signature_requests().unwrap()).unwrap();
     to.receive_replication_exchange(&from.origin, FLEET, &exchange).unwrap();
     let admission = to.validate_replication_backlog().unwrap();
+    to.apply_replication_repairs().unwrap();
     assert!(to.project_replication_backlog().unwrap());
     admission
 }
@@ -266,6 +267,65 @@ fn directive_note_replication_out_of_order_clear_replay_and_reopen_agree() {
     assert_eq!(reopened.directive_notes("person/avery").unwrap(), vec![replacement]);
     reopened.rebuild_claim_projections().unwrap();
     assert_eq!(reopened.directive_notes("person/avery").unwrap()[0].text, "New context");
+}
+
+#[test]
+fn directive_note_repaired_original_is_excluded_after_round_trip_and_replay() {
+    let source = Store::open_memory("alder").unwrap();
+    let anchor = enable(&source);
+    let peer_key = Arc::new(MemberKey::generate().unwrap().0);
+    claim(&source, "host/birch", "fleet.member-admitted", None, json!({"fleet_id":FLEET,"member_key":peer_key.public(),"via":"invite","sponsor":"host/alder","mode":"listening"}));
+    let peer = Store::open_memory("birch").unwrap();
+    peer.bind_fleet(FLEET).unwrap();
+    peer.pin_fleet_anchor(anchor.public()).unwrap();
+    peer.set_member_key(Some(peer_key)).unwrap();
+    sync(&source, &peer);
+    advertise(&peer, true);
+    sync(&peer, &source);
+    let fallback = source.set_directive_note("person/avery", "person/avery", Some("Retained context"), None).unwrap().unwrap();
+    let original = source.set_directive_note("person/avery", "person/avery", Some("Rejected context"), None).unwrap().unwrap();
+    sync(&source, &peer);
+    assert_eq!(peer.directive_notes("person/avery").unwrap(), vec![original.clone()]);
+    // An upgraded receiver rejects an already-admitted record, then repairs it to an
+    // older valid claim. Other peers retain the original row when the repair arrives.
+    let record_ref: String = peer.readers.get().query_row(
+        "SELECT record_ref FROM replica_records WHERE claim_id=?1",
+        [&original.revision], |row| row.get(0),
+    ).unwrap();
+    peer.connection.batched(|tx| -> Result<()> {
+        tx.execute("UPDATE replica_records SET state='invalid' WHERE record_ref=?1", [&record_ref])?;
+        Ok(())
+    }).unwrap().unwrap();
+    peer.repair_replica_record(&record_ref, &fallback.revision,
+        "Receiver rejects the original after an upgrade", "person/operator", "repair-note").unwrap();
+    sync(&peer, &source);
+    for node in [&source, &peer] {
+        assert!(node.claim_by_id(&original.revision).unwrap().is_some());
+        assert_eq!(node.replica_record(&record_ref).unwrap().unwrap().state, "repaired");
+        assert_eq!(node.directive_notes("person/avery").unwrap(), vec![fallback.clone()]);
+        node.rebuild_claim_projections().unwrap();
+        assert_eq!(node.directive_notes("person/avery").unwrap(), vec![fallback.clone()]);
+        node.replay_replication_graph().unwrap();
+        assert_eq!(node.directive_notes("person/avery").unwrap(), vec![fallback.clone()]);
+    }
+    // Exercise the incremental dirty selector without the repair-triggered full replay.
+    source.connection.batched(|tx| -> Result<()> {
+        tx.execute("UPDATE replica_records SET state='valid',replacement_claim_id=NULL WHERE record_ref=?1", [&record_ref])?;
+        flush(tx)?;
+        assert_eq!(current(tx, "person/avery", now_ms()).unwrap(), Some(original.clone()));
+        tx.execute("UPDATE replica_records SET state='repaired',replacement_claim_id=?2 WHERE record_ref=?1",
+            params![record_ref, fallback.revision])?;
+        flush(tx)?;
+        assert_eq!(current(tx, "person/avery", now_ms()).unwrap(), Some(fallback.clone()));
+        tx.execute("UPDATE replica_records SET replacement_claim_id=NULL WHERE record_ref=?1", [&record_ref])?;
+        let dirty: usize = tx.query_row("SELECT COUNT(*) FROM local_directive_note_dirty WHERE subject='person/avery'", [], |row| row.get(0))?;
+        assert_eq!(dirty, 1, "replacement-only changes must invalidate the person's note");
+        tx.execute("UPDATE replica_records SET replacement_claim_id=?2 WHERE record_ref=?1",
+            params![record_ref, fallback.revision])?;
+        flush(tx)?;
+        assert_eq!(current(tx, "person/avery", now_ms()).unwrap(), Some(fallback.clone()));
+        Ok(())
+    }).unwrap().unwrap();
 }
 
 #[test]

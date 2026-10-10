@@ -52,6 +52,9 @@ The generated Rust `notes_list`, Swift `notesList` and TypeScript `notesList`
 methods use the identified local session or the paired person's read authority.
 The [wire fixture](fixtures/directive-notes.json) shows the current value. Clear
 and expiry both remove a note from reads; edits replace the current note.
+Operational repairs exclude the repaired original from current-note selection,
+even when its immutable claim row remains retained. Incremental reads and full
+replay both select the latest unrepaired revision.
 The text is advisory only: no approval, gate, ask or assignment reads it as evidence.
 
 The trusted local CLI writes with `PUT /v1/notes`, using a concrete person identity

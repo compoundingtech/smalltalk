@@ -72,33 +72,40 @@ WHEN OLD.id IS NOT NEW.id OR OLD.batch_id IS NOT NEW.batch_id
         AND NOT EXISTS (SELECT 1 FROM replica_records WHERE claim_id=claims.id)
         AND NOT EXISTS (SELECT 1 FROM local_directive_note_pending WHERE claim_id=claims.id);
 END;
+DROP TRIGGER IF EXISTS directive_note_record_insert;
 CREATE TRIGGER IF NOT EXISTS directive_note_record_insert AFTER INSERT ON replica_records
 WHEN NEW.claim_id IS NOT NULL BEGIN
     INSERT OR IGNORE INTO local_directive_note_dirty
     SELECT subject FROM claims WHERE id=NEW.claim_id AND kind='person.directive-note-set'
         AND NOT EXISTS (SELECT 1 FROM local_directive_note_pending WHERE claim_id=NEW.claim_id)
-        AND (SELECT MIN(position) FROM replica_records WHERE claim_id=NEW.claim_id)
+        AND (NEW.state='repaired'
+            OR (SELECT MIN(position) FROM replica_records WHERE claim_id=NEW.claim_id)
             IS NOT COALESCE(
                 (SELECT MIN(position) FROM replica_records
                     WHERE claim_id=NEW.claim_id AND record_ref<>NEW.record_ref),
                 (SELECT COUNT(*) FROM claims legacy_position
                     WHERE legacy_position.batch_id=claims.batch_id
-                        AND legacy_position.store_index<claims.store_index));
+                        AND legacy_position.store_index<claims.store_index)));
 END;
+DROP TRIGGER IF EXISTS directive_note_record_update;
 CREATE TRIGGER IF NOT EXISTS directive_note_record_update
-AFTER UPDATE OF position,claim_id ON replica_records
-WHEN OLD.position IS NOT NEW.position OR OLD.claim_id IS NOT NEW.claim_id BEGIN
+AFTER UPDATE OF position,claim_id,state,replacement_claim_id ON replica_records
+WHEN OLD.position IS NOT NEW.position OR OLD.claim_id IS NOT NEW.claim_id
+    OR OLD.state IS NOT NEW.state
+    OR OLD.replacement_claim_id IS NOT NEW.replacement_claim_id BEGIN
     INSERT OR IGNORE INTO local_directive_note_dirty
     SELECT subject FROM claims WHERE id IN (OLD.claim_id,NEW.claim_id)
         AND kind='person.directive-note-set'
         AND NOT EXISTS (SELECT 1 FROM local_directive_note_pending WHERE claim_id=claims.id);
 END;
+DROP TRIGGER IF EXISTS directive_note_record_delete;
 CREATE TRIGGER IF NOT EXISTS directive_note_record_delete AFTER DELETE ON replica_records
 WHEN OLD.claim_id IS NOT NULL BEGIN
     INSERT OR IGNORE INTO local_directive_note_dirty
     SELECT subject FROM claims WHERE id=OLD.claim_id AND kind='person.directive-note-set'
         AND NOT EXISTS (SELECT 1 FROM local_directive_note_pending WHERE claim_id=OLD.claim_id)
-        AND ((SELECT MIN(position) FROM replica_records WHERE claim_id=OLD.claim_id)>OLD.position
+        AND (OLD.state='repaired'
+            OR (SELECT MIN(position) FROM replica_records WHERE claim_id=OLD.claim_id)>OLD.position
             OR (NOT EXISTS (SELECT 1 FROM replica_records WHERE claim_id=OLD.claim_id)
                 AND OLD.position IS NOT (SELECT COUNT(*) FROM claims legacy_position
                     WHERE legacy_position.batch_id=claims.batch_id
@@ -124,7 +131,9 @@ pub(super) fn rebuild(tx: &Transaction<'_>) -> Result<()> {
     tx.execute_batch("DELETE FROM person_directive_notes;
         DELETE FROM local_directive_note_pending;
         DELETE FROM local_directive_note_dirty;
-        INSERT INTO local_directive_note_pending SELECT id FROM claims WHERE kind='person.directive-note-set';")?;
+        INSERT INTO local_directive_note_pending SELECT id FROM claims WHERE kind='person.directive-note-set'
+            AND NOT EXISTS (SELECT 1 FROM replica_records repaired
+                WHERE repaired.claim_id=claims.id AND repaired.state='repaired');")?;
     flush(tx)
 }
 
@@ -135,10 +144,15 @@ pub(super) fn flush(tx: &Transaction<'_>) -> Result<()> {
     for person in dirty {
         tx.execute("DELETE FROM person_directive_notes WHERE person=?1", [&person])?;
         let latest = tx.query_row(&canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='person.directive-note-set'
+            AND NOT EXISTS (SELECT 1 FROM replica_records repaired
+                WHERE repaired.claim_id=claims.id AND repaired.state='repaired')
             ORDER BY CANONICAL_DESC(claims) LIMIT 1"), [&person], |row| row.get::<_, String>(0)).optional()?;
         if let Some(id) = latest { project(tx, &person, &id)?; }
     }
-    let pending = tx.prepare("SELECT c.subject,c.id FROM local_directive_note_pending p JOIN claims c ON c.id=p.claim_id ORDER BY p.claim_id")?
+    let pending = tx.prepare("SELECT c.subject,c.id FROM local_directive_note_pending p JOIN claims c ON c.id=p.claim_id
+        WHERE NOT EXISTS (SELECT 1 FROM replica_records repaired
+            WHERE repaired.claim_id=c.id AND repaired.state='repaired')
+        ORDER BY p.claim_id")?
         .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (person, id) in pending { project(tx, &person, &id)?; }
