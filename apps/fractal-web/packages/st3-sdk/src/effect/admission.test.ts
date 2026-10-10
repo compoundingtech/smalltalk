@@ -116,7 +116,9 @@ const windowSpec = (collection: CollectionName): Extract<FollowSpec, { _tag: 'Wi
 const settle = Effect.promise(async () => {
   for (let round = 0; round < 10; round += 1) {
     await new Promise<void>((resolve) => setImmediate(resolve))
-    await vi.advanceTimersByTimeAsync(0)
+    // A yielded ingest slice schedules a nested zero-delay timer; fake timers defer it
+    // by 1ms. Move that task clock without jumping to follow/retry deadline timers.
+    await vi.advanceTimersByTimeAsync(1)
   }
 })
 
@@ -166,7 +168,7 @@ const run = (
 const tags = (consumer: Consumer) => consumer.events.map((event) => event._tag)
 
 describe('follow admission', () => {
-  beforeEach(() => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] }))
+  beforeEach(() => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] }))
   afterEach(() => vi.useRealTimers())
 
   it('correlates actual subscribe sends through queued open and reconnect', () =>
@@ -316,20 +318,22 @@ describe('follow admission', () => {
         yield* settle
         const resync = () =>
           gateway.send({ kind: 'resync', id: gateway.idOf('agents'), code: 'internal', message: 'Retry the read', retryable: true })
+        const firstRetryAt = Date.now() + 1000
         for (let attempt = 0; attempt < 5; attempt += 1) resync()
         yield* settle
         expect(gateway.subscribes('agents')).toBe(1)
         expect(agents.events.at(-1)).toMatchObject({ _tag: 'Stale', code: 'internal', message: 'Retry the read' })
-        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(999))
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(firstRetryAt - Date.now() - 1))
         expect(gateway.subscribes('agents')).toBe(1)
         yield* Effect.promise(() => vi.advanceTimersByTimeAsync(1))
         yield* settle
         expect(gateway.subscribes('agents')).toBe(2)
 
         // A sustained outage cannot bypass the next interval with another burst of resyncs.
+        const nextRetryAt = Date.now() + 1000
         for (let attempt = 0; attempt < 5; attempt += 1) resync()
         yield* settle
-        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(999))
+        yield* Effect.promise(() => vi.advanceTimersByTimeAsync(nextRetryAt - Date.now() - 1))
         expect(gateway.subscribes('agents')).toBe(2)
         yield* Effect.promise(() => vi.advanceTimersByTimeAsync(1))
         yield* settle
