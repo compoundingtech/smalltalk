@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep the agents roster available when a card-faults read reaches its deadline.",
+  "replay": {"status": "none", "detail": "No graph replay is requested. Full projection reset keeps its existing publication invalidation behavior."},
+  "schema": {"status": "none", "detail": "No database table, index, trigger or schema version changes."},
+  "rules": {"status": "none", "detail": "No claim kind, claim field, checkpoint rule or fleet coordination change."},
+  "compatibility": {"status": "changed", "detail": "Fresh agents reads wait only for a healthy refresh in flight. After failure or while idle, they return the last publication with its original snapshot cut and publication time. A card-faults deadline retains each previous fault value, or reports fault status unknown in the existing fault field, and retries on the next refresh. No response fields are added. Existing clients can read the unchanged response shape."},
+  "downtime": {"status": "none", "detail": "No extra service interruption beyond the normal binary restart is required. Restart timing has not been measured for this change."},
+  "manual": {"status": "none", "detail": "Existing stores need no migration or manual action. Install the updated binary to obtain the new read behavior; identity and stored claims are unchanged."},
+  "recovery": {"status": "none", "detail": "The changes are in memory only. Returning to the previous binary needs no data migration and restores its previous roster read behavior."}
+}
