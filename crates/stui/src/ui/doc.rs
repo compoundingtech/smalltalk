@@ -30,6 +30,8 @@ pub enum Hit {
     NewTerminal,
     /// A row of the Ctrl+S sidebar's list: select it and open it.
     SidebarRow(usize),
+    ResourceRow(usize),
+    ResourceFilter,
     /// One of the sidebar's sections across its top.
     SidebarSection(usize),
     /// Glasses: the top bar's usage slot, which shows and hides the sidebar's Usage.

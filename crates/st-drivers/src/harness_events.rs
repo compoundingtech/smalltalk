@@ -548,6 +548,21 @@ pub(crate) fn write_timeline(
         current_token(&tx)?.as_deref() == Some(&record.incarnation_id),
         "harness timeline owner was superseded"
     );
+    append_timeline_operations(&tx, record, new_operations)?;
+    tx.commit()?;
+    signal_wake(agent_dir);
+    Ok(())
+}
+
+// Append within an already admitted writer transaction. Each caller keeps its
+// own ownership checks and is responsible for commit and wake; this helper does
+// not acquire a connection or admit an owner. The test-only output prototype
+// shares this body so its timeline SQL cannot drift from the production writer.
+fn append_timeline_operations(
+    tx: &rusqlite::Transaction<'_>,
+    record: &Record,
+    new_operations: &[Operation],
+) -> Result<()> {
     tx.execute(
         "INSERT INTO metadata VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         params![
@@ -564,14 +579,12 @@ pub(crate) fn write_timeline(
                 serde_json::to_string(operation)?
             ],
         )?;
-        append_event(&tx, "harness-timeline", &serde_json::to_value(operation)?)?;
+        append_event(tx, "harness-timeline", &serde_json::to_value(operation)?)?;
     }
     tx.execute("DELETE FROM timeline WHERE id NOT IN (SELECT id FROM timeline ORDER BY id DESC LIMIT 4096)", [])?;
     tx.execute("DELETE FROM timeline WHERE id IN (
         SELECT id FROM (SELECT id, SUM(length(CAST(body AS BLOB))) OVER (ORDER BY id DESC) AS retained FROM timeline)
         WHERE retained > 2097152)", [])?;
-    tx.commit()?;
-    signal_wake(agent_dir);
     Ok(())
 }
 

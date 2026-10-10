@@ -820,11 +820,12 @@ fn main() -> Result<()> {
     let (updates, incoming) = mpsc::channel::<feed::Update>();
     let (commands, command_receiver) = tokio::sync::mpsc::unbounded_channel();
     // Missions are large: the UI asks for that window only while a mission list is on screen.
-    runtime.spawn(feed::run_members_with(
+    runtime.spawn(feed::run_members_with_sidebar(
         clients,
         profile.is_some(),
         ui::glass_request(&args).is_some(),
         false,
+        ui::glass_request(&args).is_some().then(|| person.clone()).flatten(),
         updates,
         command_receiver,
     ));

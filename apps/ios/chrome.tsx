@@ -18,7 +18,7 @@ function ageOf(ms: number): string | null {
 }
 
 export function StatusLine() {
-  const { status, hasSynced, gatewayHost, caps, snapshot } = useStore();
+  const { status, hasSynced, gatewayHost, caps, snapshot, data } = useStore();
   // Not live, what is shown is st's last snapshot: say how old it is.
   const age = snapshot ? ageOf(Date.now() - Date.parse(snapshot.created_at)) : null;
   const shown = age ? `showing data from ${age} ago` : 'showing last data';
@@ -26,9 +26,13 @@ export function StatusLine() {
     : status === 'connecting' ? ['◌', theme.waiting, hasSynced ? `updating · ${shown}` : 'connecting']
     : status === 'offline' ? ['✕', theme.fault, hasSynced ? `offline · ${shown}` : 'offline']
     : ['○', theme.quiet, 'not paired'];
-  return <View accessibilityLabel={`${word}${gatewayHost ? ` ${gatewayHost}` : ''}`} style={{ flexDirection: 'row', paddingHorizontal: 12, paddingTop: 6 }}>
+  const fresh = hasSynced && !data.attention.length && !data.agents.some(agent => agent.state === 'running' && agent.harness_state === 'working');
+  return <View accessibilityLabel={`${word}${gatewayHost ? ` ${gatewayHost}` : ''}`} style={{ paddingHorizontal: 12, paddingTop: 6 }}>
+    <View style={{ flexDirection: 'row' }}>
     <T color={color}>{glyph} {word}</T>
     {gatewayHost ? <T dim numberOfLines={1} style={{ flex: 1 }}>  {gatewayHost}{caps?.session_actor ? ` · ${caps.session_actor.replace(/^person\//, '')}` : ''}</T> : null}
+    </View>
+    {fresh ? <T dim>nothing running yet · Home → New → New terminal</T> : null}
   </View>;
 }
 

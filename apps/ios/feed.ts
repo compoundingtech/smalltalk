@@ -1,4 +1,4 @@
-import { applyWindow, isTransientCode, plainError, plainMessage, type Agent, type Attention, type CollectionFrame, type Glass, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { applyWindow, isTransientCode, plainError, plainMessage, type Agent, type Arrangement, type Attention, type CollectionFrame, type Glass, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
 import type { ConversationHeader, HeaderField } from '@smalltalk/st3-views';
 import { TERMINAL_RESTARTED, withFreshTerminalFence, type Foreground, type TerminalFollowHandlers } from './terminalControls';
 
@@ -12,7 +12,7 @@ export const FEED_WINDOWS = {
 export type FeedWindow = keyof typeof FEED_WINDOWS;
 export type FeedLists = { attention: Attention[]; missions: Mission[]; agents: Agent[] };
 const KINDS = { attention: 'attention', missions: 'mission', agents: 'agent' } as const;
-const TERMINAL = 'terminal', CONVERSATION = 'conversation', GLASSES = 'glasses';
+const TERMINAL = 'terminal', CONVERSATION = 'conversation', GLASSES = 'glasses', ARRANGEMENTS = 'arrangements';
 export const RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 
 export type FeedHandlers = {
@@ -34,6 +34,11 @@ export type FeedHandlers = {
 export type GlassesHandlers = {
   onGlasses: (glasses: Glass[]) => void;
   /** A problem to show; an empty string clears it. */
+  onIssue: (issue: string) => void;
+};
+
+export type ArrangementsHandlers = {
+  onArrangements: (arrangements: Arrangement[]) => void;
   onIssue: (issue: string) => void;
 };
 
@@ -106,8 +111,9 @@ export class Feed {
   private terminal: TerminalFollow | undefined;
   private conversation: { target: string; handlers: ConversationHandlers; failures: number; timer?: ReturnType<typeof setTimeout> } | undefined;
   private glasses: { handlers: GlassesHandlers; window?: CollectionWindow } | undefined;
+  private arrangements: { person: string; handlers: ArrangementsHandlers; window?: CollectionWindow } | undefined;
   /** Windows (and the glasses) st stopped sending: how often they failed, and the timer to ask again. */
-  private retries: Partial<Record<FeedWindow | typeof GLASSES, { failures: number; timer?: ReturnType<typeof setTimeout> }>> = {};
+  private retries: Partial<Record<FeedWindow | typeof GLASSES | typeof ARRANGEMENTS, { failures: number; timer?: ReturnType<typeof setTimeout> }>> = {};
   // A reason st gave for a window it cannot serve yet, said only once it has lasted a moment: a write
   // briefly revokes a source's readiness, and that blip is not worth a message.
   private reports: Partial<Record<FeedWindow, ReturnType<typeof setTimeout>>> = {};
@@ -197,6 +203,19 @@ export class Feed {
     return { close: () => { if (this.glasses !== follow) return; this.glasses = undefined; this.stream?.unsubscribe(GLASSES); } };
   }
 
+  /** One explicit person's sidebar, optional for older pairings and gateways. */
+  followArrangements(person: string, handlers: ArrangementsHandlers): Follow {
+    const follow = { person, handlers, window: undefined as CollectionWindow | undefined };
+    this.arrangements = follow;
+    this.stream?.subscribeArrangements(ARRANGEMENTS, person);
+    return { close: () => {
+      if (this.arrangements !== follow) return;
+      this.loaded(ARRANGEMENTS);
+      this.arrangements = undefined;
+      this.stream?.unsubscribe(ARRANGEMENTS);
+    } };
+  }
+
   private suspend(): void {
     this.attempt++;
     clearTimeout(this.timer);
@@ -240,7 +259,7 @@ export class Feed {
   }
 
   /** Ask again for a window st stopped sending, after a wait that grows; say so the first time only. */
-  private retryLater(name: FeedWindow | typeof GLASSES, again: () => void): boolean {
+  private retryLater(name: FeedWindow | typeof GLASSES | typeof ARRANGEMENTS, again: () => void): boolean {
     const retry = this.retries[name] ?? { failures: 0 };
     clearTimeout(retry.timer);
     const wait = this.retryDelaysMs[Math.min(retry.failures, this.retryDelaysMs.length - 1)];
@@ -252,10 +271,10 @@ export class Feed {
     return retry.failures === 1;
   }
 
-  private loaded(name: FeedWindow | typeof GLASSES): void {
+  private loaded(name: FeedWindow | typeof GLASSES | typeof ARRANGEMENTS): void {
     clearTimeout(this.retries[name]?.timer);
     delete this.retries[name];
-    if (name !== GLASSES) { clearTimeout(this.reports[name]); delete this.reports[name]; }
+    if (name !== GLASSES && name !== ARRANGEMENTS) { clearTimeout(this.reports[name]); delete this.reports[name]; }
   }
 
   private async connect(): Promise<void> {
@@ -275,6 +294,7 @@ export class Feed {
       if (this.conversation) opened.subscribeConversation(CONVERSATION, this.conversation.target);
       if (this.glasses) { this.glasses.window = undefined; opened.subscribeGlasses(GLASSES); }
       if (this.terminal) void this.terminal.attach();
+      if (this.arrangements) { this.arrangements.window = undefined; opened.subscribeArrangements(ARRANGEMENTS, this.arrangements.person); }
     } catch (error) { if (!stale()) this.dropped(error); }
   }
 
@@ -333,7 +353,16 @@ export class Feed {
 
   private frame(frame: CollectionFrame): void {
     const id = 'id' in frame ? frame.id : undefined;
-    if ((frame.kind === 'snapshot' || frame.kind === 'changes') && frame.id === GLASSES) {
+    if ((frame.kind === 'snapshot' || frame.kind === 'changes') && frame.id === ARRANGEMENTS) {
+      const follow = this.arrangements;
+      if (!follow) return;
+      const next = applyWindow(follow.window, frame);
+      if (!next) { follow.window = undefined; this.stream?.subscribeArrangements(ARRANGEMENTS, follow.person); return; }
+      follow.window = next;
+      this.loaded(ARRANGEMENTS);
+      follow.handlers.onIssue('');
+      follow.handlers.onArrangements(next.items.filter((item): item is Arrangement => item.kind === 'arrangement' && item.owner === follow.person));
+    } else if ((frame.kind === 'snapshot' || frame.kind === 'changes') && frame.id === GLASSES) {
       const follow = this.glasses;
       if (!follow) return;
       const next = applyWindow(follow.window, frame);
@@ -360,6 +389,7 @@ export class Feed {
       // st keeps a conversation's subscription and retries it itself; it says why, so the last
       // copy shown can say it is stale (the owner's host is away).
       if (id === CONVERSATION && this.conversation) { if (frame.message) this.conversation.handlers.onIssue(`${plainMessage(frame.code, frame.message)} · trying again`); }
+      else if (frame.id === ARRANGEMENTS && this.arrangements) { if (!frame.retryable) { this.arrangements.window = undefined; this.stream?.subscribeArrangements(ARRANGEMENTS, this.arrangements.person); } }
       else if (frame.id === GLASSES && this.glasses) { this.glasses.window = undefined; this.stream?.subscribeGlasses(GLASSES); }
       else if (frame.id in FEED_WINDOWS) {
         const name = frame.id as FeedWindow;
@@ -398,6 +428,12 @@ export class Feed {
         follow.timer = setTimeout(() => { if (this.conversation === follow) this.stream?.subscribeConversation(CONVERSATION, follow.target); }, delay);
         // A page that expired under a busy store is routine; say so only if it keeps happening.
         if (frame.code !== 'page-cursor-expired' || follow.failures > 2) follow.handlers.onIssue(`${plainMessage(frame.code, frame.message)} · trying again`);
+      }
+      else if (id === ARRANGEMENTS && this.arrangements) {
+        const follow = this.arrangements;
+        const plain = plainMessage(frame.code, frame.message);
+        if (!isTransientCode(frame.code)) follow.handlers.onIssue(plain);
+        else if (this.retryLater(ARRANGEMENTS, () => { if (this.arrangements === follow) this.stream?.subscribeArrangements(ARRANGEMENTS, follow.person); })) follow.handlers.onIssue(`${plain} · trying again`);
       }
       else if (id === GLASSES && this.glasses) {
         // st stopped sending the glasses; for what may clear, ask again later rather than leave them stale.

@@ -43,6 +43,8 @@ impl Ui {
             Hit::Alert(_, AlertTap::Open) => "open this alert in Now".into(),
             Hit::Voice => "start voice input".into(),
             Hit::NewTerminal => "new terminal".into(),
+            Hit::ResourceRow(_) => "open resource or toggle group".into(),
+            Hit::ResourceFilter => "filter sidebar".into(),
             Hit::SidebarRow(_) => "open item in tab".into(),
             Hit::SidebarSection(_) | Hit::Tab(_) => format!("show {label}"),
             Hit::Usage => "show/hide Usage".into(),

@@ -68,3 +68,16 @@ The target is `node=NODE_ID&service=NAME` (and an optional `addr=` hint): paste 
 If fabric cannot connect (no grant, member out of reach, no answer within four seconds) the app falls back to the saved gateway and names the route and the reason in Fleet › this connection; a member that refuses the grant is named as a refusal. Turn the fallback off under Fleet › carrier to see fabric fail instead. Fabric is not tried again for thirty seconds after it fails, and a lost connection is redialed three times before the app falls back. Nothing is queued while the bridge is down, and a mutation is never retried over a new connection.
 
 The Debug-only fabric proof (`fabric-proof` links, the separate offline Debug app and its isolated member helper) is unchanged; see [the module](modules/st-fabric/README.md).
+
+## Resource sidebar
+
+Home's Resources button opens shared folders followed by Everything else, grouped by
+Agents, Missions, Terminals and Machines. This read-only view follows the arrangements
+stream when the pairing grants it; older pairings retain the grouped resource browser.
+Tap a row to open it, a heading to collapse it, and use Filter sidebar to narrow the
+list. Folder groups start open; busy groups start collapsed above 30 items. Choices
+and previously seen rows are stored on this phone, scoped to the gateway and person.
+Missing rows stay marked unavailable. Spaces remain available as before.
+
+A fresh workspace names its host and points to Home → New → New terminal. Its empty
+resource browser welcomes the person and names New terminal and New agent.
