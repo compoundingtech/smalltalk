@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { ClientError, isTransient, isTransientCode, notApplied, plainError, plainMessage, retryTransient } from '../../clients/typescript/st3-client/index.ts';
+import { ClientError, appliedAnswer, isTransient, isTransientCode, notApplied, outcomeUnknown, plainError, plainMessage, retryTransient } from '../../clients/typescript/st3-client/index.ts';
 
 // st's errors read as sentences, as in the Rust client: no codes reach a person.
 assert.equal(plainMessage('stale-fence', 'the client snapshot changed before the action was submitted'), 'st changed while this was on its way, so it was not applied');
@@ -30,3 +30,17 @@ assert.equal(notApplied(refused('idempotency-key-expired')), false);
 let expiredTries = 0;
 await assert.rejects(retryTransient(8, async () => { expiredTries++; throw refused('idempotency-key-expired'); }));
 assert.equal(expiredTries, 1, 'an expired committed request must never be retried with a fresh key');
+
+// A send st may have taken, and one it never queued (the daemon says which in `details.applied`;
+// a code this client does not know is still an error with that answer).
+const answered = (code, applied, status = 503) => new ClientError({ api_version: 'st3.client.v0', error_version: 'st3.client.error.v0', request_id: 'request/x', code, message: 'the database has not confirmed the send', retryable: false, details: { applied, action_id: 'action/a', idempotency_key: 'key/a' } }, status);
+const unconfirmed = answered('message-send-unconfirmed', 'unknown');
+assert.equal(appliedAnswer(unconfirmed), 'unknown');
+assert.ok(outcomeUnknown(unconfirmed) && !notApplied(unconfirmed), 'it may still complete: repeat the identical request, never a new one');
+assert.equal(plainError(unconfirmed), 'st may have taken it and has not confirmed it yet; sending it again is safe');
+const queueFull = answered('rate-limited', 'none', 429);
+assert.ok(notApplied(queueFull) && !outcomeUnknown(queueFull), 'nothing was queued: a fresh request is safe');
+assert.ok(notApplied(answered('some-future-code', 'none')), 'the answer decides, not the code');
+assert.equal(appliedAnswer(refused('forbidden')), undefined);
+assert.ok(!outcomeUnknown(refused('forbidden')), 'a plain refusal is not an unknown outcome');
+assert.ok(outcomeUnknown(new TypeError('Network request failed')), 'a lost answer is an unknown outcome');

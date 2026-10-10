@@ -3,7 +3,7 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, isTransient, notApplied, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { API_VERSION, ClientError, St3Client, notApplied, outcomeUnknown, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { keepClosed, personAnswer, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
 import app from './app.json';
 import { canVerifyPairing, createDeviceKey, removeDeviceKey, signWithDeviceKey, verifyGrantSignature } from './modules/st-device-key';
@@ -422,9 +422,10 @@ function useAppStore(proof?: FabricProfile) {
           try {
             await client.messageSend(request);
           } catch (e) {
-            if (e instanceof ClientError || !isTransient(e)) throw e;
-            // st's answer was lost, so the message may have arrived. The identical request (same
-            // key, signature and nonce) gets st's first answer, never a second message.
+            if (!outcomeUnknown(e)) throw e;
+            // st's answer was lost, or st said it may still complete (`applied: "unknown"`), so the
+            // message may have arrived. The identical request (same key, signature and nonce) gets
+            // st's first answer, never a second message.
             await new Promise(resolve => setTimeout(resolve, 1000));
             await client.messageSend(request);
           }
