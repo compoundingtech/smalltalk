@@ -249,6 +249,7 @@ fn kinds(actions: &[CheckpointAction]) -> Vec<&'static str> {
             CheckpointAction::Trimmed { .. } => "trimmed",
             CheckpointAction::ManifestNeeded { .. } => "manifest-needed",
             CheckpointAction::TrimGraphChanged { .. } => "graph-changed",
+            CheckpointAction::SweptTrimmedClaimRows { .. } => "swept",
         })
         .collect()
 }

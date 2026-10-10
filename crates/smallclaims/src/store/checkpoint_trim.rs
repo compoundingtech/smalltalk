@@ -685,6 +685,72 @@ impl Store {
     }
 }
 
+/// How far the sweep of rows earlier trims left behind has gone: `after:CLAIM_ID`, or `done`.
+pub const TRIMMED_CLAIM_ROWS_SWEPT: &str = "checkpoint_trimmed_claim_rows_swept";
+
+/// How long one sweep transaction deletes before it commits. Its commit then writes and syncs
+/// the pages it changed, so this is well under the writer's 100 ms target.
+pub const SWEEP_CHUNK_BUDGET: std::time::Duration = std::time::Duration::from_millis(20);
+
+impl Store {
+    /// Delete the signature and verdict rows of every claim a checkpoint dropped that this store
+    /// still holds. Builds before this one deleted a dropped claim but not these rows. It walks
+    /// the claim tombstones once, in chunks that each commit after `SWEEP_CHUNK_BUDGET`, then
+    /// records that it is done, so a later pass reads one row. Returns the rows deleted.
+    pub fn sweep_trimmed_claim_rows(&self) -> Result<usize> {
+        let progress = {
+            let connection = self.readers.get();
+            super::fleet_meta(&connection, TRIMMED_CLAIM_ROWS_SWEPT)?
+        };
+        if progress.as_deref() == Some("done") {
+            return Ok(0);
+        }
+        let mut after = progress
+            .as_deref()
+            .and_then(|progress| progress.strip_prefix("after:"))
+            .unwrap_or_default()
+            .to_owned();
+        let mut rows = 0;
+        loop {
+            let mut connection = self.connection.write();
+            let transaction = connection.transaction()?;
+            let started = std::time::Instant::now();
+            let mut finished = false;
+            // One claim at a time: on a store larger than its page cache, each claim's deletes
+            // read pages from disk, so the budget is checked after every claim.
+            while started.elapsed() < SWEEP_CHUNK_BUDGET {
+                let Some(id) = transaction
+                    .prepare_cached("SELECT id FROM checkpoint_claims WHERE id > ?1 ORDER BY id LIMIT 1")?
+                    .query_row([&after], |row| row.get::<_, String>(0))
+                    .optional()?
+                else {
+                    finished = true;
+                    break;
+                };
+                // A claim held in two envelopes can be both kept and tombstoned.
+                let held: bool = transaction
+                    .prepare_cached("SELECT EXISTS(SELECT 1 FROM claims WHERE id=?1)")?
+                    .query_row([&id], |row| row.get(0))?;
+                if !held {
+                    rows += super::principals::forget_claim_tx(&transaction, &id)?;
+                }
+                after = id;
+            }
+            let progress = if finished { "done".to_owned() } else { format!("after:{after}") };
+            transaction.execute(
+                "INSERT INTO meta(key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![TRIMMED_CLAIM_ROWS_SWEPT, progress],
+            )?;
+            transaction.commit()?;
+            drop(connection);
+            if finished {
+                return Ok(rows);
+            }
+        }
+    }
+}
+
 /// Where a trim goes on from: the last envelope tombstone it read, then the last claim tombstone
 /// whose envelope was already gone. Each is read once, however many chunks the trim takes.
 #[derive(Default)]
