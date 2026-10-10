@@ -62,10 +62,13 @@ bounds. omp reports no tokens for a subagent, so its end carries none.
 
 An omp subagent also reports `progress` at each `turn_end`, at most every ten seconds at its
 messages and tool calls, and every minute while omp says its session is busy, as in a long tool
-call or a nested subagent, or while it waits for an `ask` answer or tool approval. A matching tool
-result or execution end clears the ask; an approval resolution clears the approval. These waits
-belong to the subagent, not to its seat or siblings. The driver ends a run that has not reported
-for five minutes as
+call, nested subagent, `ask` answer or tool approval within a foreground run. A matching tool
+result or execution end clears the ask; an approval resolution clears the approval. On every
+heartbeat the extension also checks the subagent's live `ctx.isIdle()`: without a positive busy
+proof it clears cached waits and stops reporting, even if a resolution event was lost. Cached
+events alone never renew a run. Detached waits in an idle session cannot be proven live through
+this API and follow the same silence bound. These waits belong to the subagent, not to its seat
+or siblings. The driver ends a run that has not reported for five minutes as
 `interrupted`, while the seat keeps running. This ends a subagent whose session stopped without
 its end. `ST3_SUBAGENT_SILENCE_MS` can only shorten the five minutes. The ledger forgets the run
 count of a subagent only after all of its runs have ended and been recorded, so a running

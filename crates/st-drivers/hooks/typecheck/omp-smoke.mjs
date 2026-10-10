@@ -604,46 +604,71 @@ assert.deepStrictEqual(
   "a heartbeat reports only the subagents whose sessions are busy",
 );
 
-// Human waits keep an idle subagent listed beyond the silence bound. The matching answer or
-// approval clears only that subagent's wait; an unrelated result must not clear an ask.
+// A foreground human wait stays busy in omp. Cached waits must stop reporting as soon as the
+// live session becomes idle, even if the extension lost the matching result or resolution.
 globalThis.setInterval = (callback, ms) => {
   heartbeats.push({ callback, ms });
   return realSetInterval(() => {}, 2 ** 30);
 };
+let waitIdle = false;
+const waitCtx = { ...quietCtx, isIdle: () => waitIdle };
 const framesBeforeWait = readFrames().length;
-await subHandlers.get("agent_start")({}, quietCtx);
+await subHandlers.get("agent_start")({}, waitCtx);
 globalThis.setInterval = realSetInterval;
 if (process.argv[2]?.includes("st-omp-channel")) {
   for (const name of ["tool_execution_start", "tool_approval_requested", "tool_approval_resolved"]) {
     assert.strictEqual(typeof subHandlers.get(name), "function", `${name} is registered`);
   }
 }
-await subHandlers.get("tool_call")({ toolName: "ask", toolCallId: "ask-child" }, quietCtx);
-await subHandlers.get("tool_execution_start")?.({ toolName: "ask", toolCallId: "ask-child" }, quietCtx);
-await subHandlers.get("agent_end")(successfulEnd, quietCtx);
-await subHandlers.get("tool_result")({ toolCallId: "unrelated" }, quietCtx);
+const tickWait = async (expected, label) => {
+  const before = readFrames().filter((frame) => frame.type === "subagent").length;
+  heartbeats.at(-1)?.callback();
+  await pause(30);
+  const after = readFrames().filter((frame) => frame.type === "subagent").length;
+  assert.strictEqual(after - before, process.argv[2]?.includes("st-omp-channel") ? expected : 0, label);
+};
+await pause(100);
+await subHandlers.get("tool_call")({ toolName: "ask", toolCallId: "ask-child" }, waitCtx);
+await subHandlers.get("tool_execution_start")?.({ toolName: "ask", toolCallId: "ask-child" }, waitCtx);
+await subHandlers.get("agent_end")(successfulEnd, waitCtx);
+await subHandlers.get("tool_result")({ toolCallId: "unrelated" }, waitCtx);
 const realNow = Date.now;
 let waitNow = realNow();
 Date.now = () => waitNow;
 for (let minute = 0; minute < 6; minute += 1) {
   waitNow += 60_000;
-  heartbeats.at(-1)?.callback();
+  await tickWait(1, "a live busy ask reports beyond the silence bound");
 }
-await subHandlers.get("tool_result")({ toolCallId: "ask-child" }, quietCtx);
-heartbeats.at(-1)?.callback();
-await subHandlers.get("tool_approval_requested")?.({ toolName: "bash" }, quietCtx);
-heartbeats.at(-1)?.callback();
-await subHandlers.get("tool_approval_resolved")?.({}, quietCtx);
-heartbeats.at(-1)?.callback();
+// The tool actually finished, but the extension never received its result.
+waitIdle = true;
+await tickWait(0, "a lost ask result and idle child stop reporting at the next heartbeat");
+waitIdle = false;
+await subHandlers.get("tool_call")({ toolName: "ask", toolCallId: "ask-next" }, waitCtx);
+await tickWait(1, "a new live ask reports");
+await subHandlers.get("tool_result")({ toolCallId: "ask-next" }, waitCtx);
+waitIdle = true;
+await tickWait(0, "a resolved and idle ask stops reporting");
+waitIdle = false;
+await subHandlers.get("tool_approval_requested")?.({ toolName: "bash" }, waitCtx);
+await tickWait(1, "a live approval reports");
+waitIdle = true;
+await tickWait(0, "a lost approval resolution and idle child stop reporting at the next heartbeat");
+waitIdle = false;
+await subHandlers.get("tool_approval_requested")?.({ toolName: "bash" }, waitCtx);
+await tickWait(1, "a new live approval reports");
+await subHandlers.get("tool_approval_resolved")?.({}, waitCtx);
+waitIdle = true;
+await tickWait(0, "a resolved and idle approval stops reporting");
+await tickWait(0, "a resolved idle child stays quiet");
 Date.now = realNow;
-await subHandlers.get("session_shutdown")({}, quietCtx);
+await subHandlers.get("session_shutdown")({}, waitCtx);
 await pause(300);
 assert.deepStrictEqual(
   readFrames().slice(framesBeforeWait).filter((frame) => frame.type === "subagent"),
   process.argv[2]?.includes("st-omp-channel")
-    ? [quiet("start"), ...Array.from({ length: 7 }, () => quiet("progress")), quiet("end", "interrupted")]
+    ? [quiet("start"), ...Array.from({ length: 9 }, () => quiet("progress")), quiet("end", "interrupted")]
     : [],
-  "an idle subagent waiting for a person reports until the matching answer or approval",
+  "human waits renew only while their own session has live busy evidence",
 );
 
 // Bounds are UTF-8 bytes, not characters. Oversized IDs are rejected, not truncated into an

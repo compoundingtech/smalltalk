@@ -1174,9 +1174,14 @@ export default function (pi: ExtensionAPI) {
   const heartbeat = () => {
     const now = Date.now();
     for (const [id, open] of state.subagents ?? []) {
-      if (open.pendingAsks.size || open.pendingApproval || subagentBusy(open.ctx)) {
-        reportSubagent(open, now);
+      // Native omp keeps foreground tools (including asks and approvals) inside the busy run.
+      // Event caches are not liveness evidence: a lost resolution must not renew an idle child.
+      const busy = subagentBusy(open.ctx);
+      if (!busy) {
+        open.pendingAsks.clear();
+        open.pendingApproval = false;
       }
+      if (busy) reportSubagent(open, now);
       // st has ended a run this quiet; forget it so the heartbeat stops with the last run.
       else if (now - open.reportedAt >= SUBAGENT_SILENT_MS) closeSubagent(id);
     }
@@ -1214,7 +1219,7 @@ export default function (pi: ExtensionAPI) {
       const end = record(payload) ?? {};
       if (end.willContinue === true) return;
       if (open && (open.pendingAsks.size || open.pendingApproval) &&
-        subagentOutcome(end) === "completed") return;
+        subagentBusy(ctx) && subagentOutcome(end) === "completed") return;
       closeSubagent(id);
       sendFrame({ ...frame, event: "end", outcome: subagentOutcome(end) });
     } else if (event === "session_shutdown" && closeSubagent(id)) {

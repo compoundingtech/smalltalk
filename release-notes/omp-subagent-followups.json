@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "omp subagents report while waiting for an ask answer or tool approval. A late turn event after the end no longer starts a run. IDs longer than 256 UTF-8 bytes are rejected, and names longer than 128 UTF-8 bytes are omitted. The extension changes take effect after the harness restarts."
+    "detail": "omp subagents report while their live session stays busy, including foreground asks and tool approvals. Each heartbeat clears cached waits without live busy evidence, even if a resolution event was lost. A late turn event after the end no longer starts a run. IDs longer than 256 UTF-8 bytes are rejected, and names longer than 128 UTF-8 bytes are omitted. The extension changes take effect after the harness restarts."
   },
   "downtime": {
     "status": "none",
