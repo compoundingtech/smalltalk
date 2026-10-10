@@ -412,7 +412,7 @@ fn benchmark_client_messages_selector_migration_copy() {
     assert_eq!(counts, source_counts, "migration cannot alter claim authority or message coverage");
     // Explicit rebuild separately isolates selector/header work from other Store
     // startup migrations. Both costs and their WAL are reported, not conflated.
-    store.client_messages_benchmark_prepare_io().unwrap();
+    store.client_messages_benchmark_checkpoint().unwrap();
     let start = Instant::now();
     let rebuild_backfill = store.client_messages_selector_benchmark_rebuild().unwrap();
     let rebuild = start.elapsed();

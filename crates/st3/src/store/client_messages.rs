@@ -234,6 +234,12 @@ struct FoldBudget {
     claims: usize,
     subjects: usize,
     scratch_rows: usize,
+    #[cfg(test)]
+    phase: &'static str,
+    #[cfg(test)]
+    work: std::time::Duration,
+    #[cfg(test)]
+    commit: std::time::Duration,
 }
 
 enum DesiredSelection { Absent, Parsed(Value), Malformed }
@@ -493,6 +499,12 @@ pub(crate) struct BackfillStats {
     pub(crate) max_claims_per_transaction: usize,
     pub(crate) malformed_desired: u64,
     pub(crate) longest_transaction: std::time::Duration,
+    #[cfg(test)]
+    longest_transaction_phase: &'static str,
+    #[cfg(test)]
+    longest_transaction_work: std::time::Duration,
+    #[cfg(test)]
+    longest_transaction_commit: std::time::Duration,
     pub(crate) checkpoint: std::time::Duration,
     pub(crate) total: std::time::Duration,
 }
@@ -507,6 +519,9 @@ impl BackfillStats {
             "max_claims_per_transaction": self.max_claims_per_transaction,
             "malformed_desired": self.malformed_desired,
             "longest_transaction_including_commit_ms": self.longest_transaction.as_secs_f64() * 1_000.0,
+            "longest_transaction_phase": self.longest_transaction_phase,
+            "longest_transaction_work_ms": self.longest_transaction_work.as_secs_f64() * 1_000.0,
+            "longest_transaction_commit_ms": self.longest_transaction_commit.as_secs_f64() * 1_000.0,
             "checkpoint_outside_transactions_ms": self.checkpoint.as_secs_f64() * 1_000.0,
             "total_ms": self.total.as_secs_f64() * 1_000.0,
         })
@@ -567,6 +582,8 @@ fn fold_incomplete(connection: &Connection) -> Result<bool> {
 /// One restart-safe transaction. `None` means a populated reopen did no work.
 /// Progress, headers, reminder winners and pending removal always commit together.
 fn backfill_chunk(connection: &mut Connection, reset: bool) -> Result<Option<(usize, bool, FoldBudget)>> {
+    #[cfg(test)]
+    let started = std::time::Instant::now();
     let transaction = connection.transaction()?;
     let saved: Option<String> = transaction.prepare_cached("SELECT value FROM meta WHERE key=?1")?
         .query_row([BACKFILL_MARKER], |row| row.get(0)).optional()?;
@@ -591,6 +608,12 @@ fn backfill_chunk(connection: &mut Connection, reset: bool) -> Result<Option<(us
     let mut processed = 0;
     let mut complete = false;
     let mut budget = FoldBudget::default();
+    #[cfg(test)]
+    { budget.phase = match progress.phase {
+        BackfillPhase::Clear => "clear",
+        BackfillPhase::Headers => "headers",
+        BackfillPhase::Pending => "pending",
+    }; }
     match progress.phase {
         BackfillPhase::Clear => {
             let removed = transaction.execute(
@@ -621,7 +644,11 @@ fn backfill_chunk(connection: &mut Connection, reset: bool) -> Result<Option<(us
             }
         }
         BackfillPhase::Pending => {
+            #[cfg(test)]
+            let phase = budget.phase;
             budget = flush_pending(&transaction, false)?;
+            #[cfg(test)]
+            { budget.phase = phase; }
             processed = budget.subjects;
             if !has_pending(&transaction)? && !fold_incomplete(&transaction)? {
                 // Publication and removal of the resume marker are one atomic commit.
@@ -632,29 +659,34 @@ fn backfill_chunk(connection: &mut Connection, reset: bool) -> Result<Option<(us
         }
     }
     if !complete { save_progress(&transaction, &progress)?; }
+    #[cfg(test)]
+    { budget.work = started.elapsed(); }
+    #[cfg(test)]
+    let commit_started = std::time::Instant::now();
     transaction.commit()?;
+    #[cfg(test)]
+    { budget.commit = commit_started.elapsed(); }
     Ok(Some((processed, complete, budget)))
 }
 
 fn open_chunks(connection: &mut Connection, reset: bool) -> Result<BackfillStats> {
     // SQLite's automatic checkpoint runs inside COMMIT and can make an otherwise
-    // bounded loan rewrite the entire preceding WAL. Startup has not exposed its
-    // reader pool yet: checkpoint after chunk transactions instead, retaining
-    // FULL synchronous commits and restoring the caller's checkpoint policy.
+    // bounded transaction rewrite the preceding WAL. Both startup and explicit
+    // rebuild share this driver: checkpoint after the chunks, retain FULL
+    // synchronous commits, and restore the caller's policy even on failure.
     let automatic: u32 = connection.pragma_query_value(None,"wal_autocheckpoint",|row|row.get(0))?;
     if automatic != 0 { connection.pragma_update(None,"wal_autocheckpoint",0)?; }
     let mut result = run_open_chunks(connection,reset);
-    if automatic != 0 {
+    let checkpoint = if result.as_ref().is_ok_and(|stats|stats.transactions>0) {
         let checkpoint_started = std::time::Instant::now();
-        let checkpoint = if result.as_ref().is_ok_and(|stats|stats.transactions>0) {
-            let checkpoint = connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
-            if let Ok(stats) = &mut result { stats.checkpoint = checkpoint_started.elapsed(); }
-            checkpoint
-        } else { Ok(()) };
-        let restore = connection.pragma_update(None,"wal_autocheckpoint",automatic);
-        checkpoint?;
-        restore?;
-    }
+        let checkpoint = connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
+        if let Ok(stats) = &mut result { stats.checkpoint = checkpoint_started.elapsed(); }
+        checkpoint
+    } else { Ok(()) };
+    // Attempt restoration before propagating either the run or checkpoint error.
+    let restore = connection.pragma_update(None,"wal_autocheckpoint",automatic);
+    checkpoint?;
+    restore?;
     result
 }
 
@@ -676,6 +708,12 @@ fn run_open_chunks(connection: &mut Connection, mut reset: bool) -> Result<Backf
         stats.subjects += subjects;
         stats.max_subjects_per_transaction = stats.max_subjects_per_transaction.max(subjects);
         stats.max_claims_per_transaction = stats.max_claims_per_transaction.max(budget.claims);
+        #[cfg(test)]
+        if elapsed > stats.longest_transaction {
+            stats.longest_transaction_phase = budget.phase;
+            stats.longest_transaction_work = budget.work;
+            stats.longest_transaction_commit = budget.commit;
+        }
         stats.longest_transaction = stats.longest_transaction.max(elapsed);
         if complete { break; }
     }
@@ -1719,13 +1757,16 @@ mod tests {
         let store = Store::open(&root.path().join("checkpoint-policy.sqlite"),"node").unwrap();
         seed_backfill(&store,64);
         let mut connection = store.connection.write();
-        connection.pragma_update(None,"wal_autocheckpoint",7).unwrap();
-        let stats = open_chunks(&mut connection,true).unwrap();
-        assert!(stats.transactions>1);
-        assert_eq!(connection.pragma_query_value(None,"wal_autocheckpoint",|row|row.get::<_,u32>(0)).unwrap(),7);
-        let checkpoint: (i64,i64,i64) = connection.query_row("PRAGMA wal_checkpoint(PASSIVE)",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
-        assert_eq!(checkpoint.0,0);
-        assert_eq!(checkpoint.1,checkpoint.2);
+        for automatic in [0,7] {
+            connection.pragma_update(None,"wal_autocheckpoint",automatic).unwrap();
+            let stats = open_chunks(&mut connection,true).unwrap();
+            assert!(stats.transactions>1);
+            assert!(!stats.checkpoint.is_zero(),"explicit rebuild checkpoints outside transactions even when automatic checkpoints were already off");
+            assert_eq!(connection.pragma_query_value(None,"wal_autocheckpoint",|row|row.get::<_,u32>(0)).unwrap(),automatic);
+            let checkpoint: (i64,i64,i64) = connection.query_row("PRAGMA wal_checkpoint(PASSIVE)",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            assert_eq!(checkpoint.0,0);
+            assert_eq!(checkpoint.1,checkpoint.2);
+        }
         let transaction = connection.transaction().unwrap();
         deferred_claim(&transaction,"message/backfill-0000","custom.test.recorded",json!({"note":"pending"}),None);
         transaction.execute("INSERT INTO meta(key,value) VALUES(?1,'{broken') ON CONFLICT(key) DO UPDATE SET value=excluded.value",[FOLD_MARKER]).unwrap();
