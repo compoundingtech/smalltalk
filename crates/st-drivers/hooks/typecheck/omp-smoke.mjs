@@ -613,7 +613,13 @@ globalThis.setInterval = (callback, ms) => {
 const framesBeforeWait = readFrames().length;
 await subHandlers.get("agent_start")({}, quietCtx);
 globalThis.setInterval = realSetInterval;
-await subHandlers.get("tool_execution_start")({ toolName: "ask", toolCallId: "ask-child" }, quietCtx);
+if (process.argv[2]?.includes("st-omp-channel")) {
+  for (const name of ["tool_execution_start", "tool_approval_requested", "tool_approval_resolved"]) {
+    assert.strictEqual(typeof subHandlers.get(name), "function", `${name} is registered`);
+  }
+}
+await subHandlers.get("tool_call")({ toolName: "ask", toolCallId: "ask-child" }, quietCtx);
+await subHandlers.get("tool_execution_start")?.({ toolName: "ask", toolCallId: "ask-child" }, quietCtx);
 await subHandlers.get("agent_end")(successfulEnd, quietCtx);
 await subHandlers.get("tool_result")({ toolCallId: "unrelated" }, quietCtx);
 const realNow = Date.now;
@@ -625,9 +631,9 @@ for (let minute = 0; minute < 6; minute += 1) {
 }
 await subHandlers.get("tool_result")({ toolCallId: "ask-child" }, quietCtx);
 heartbeats.at(-1)?.callback();
-await subHandlers.get("tool_approval_requested")({ toolName: "bash" }, quietCtx);
+await subHandlers.get("tool_approval_requested")?.({ toolName: "bash" }, quietCtx);
 heartbeats.at(-1)?.callback();
-await subHandlers.get("tool_approval_resolved")({}, quietCtx);
+await subHandlers.get("tool_approval_resolved")?.({}, quietCtx);
 heartbeats.at(-1)?.callback();
 Date.now = realNow;
 await subHandlers.get("session_shutdown")({}, quietCtx);
