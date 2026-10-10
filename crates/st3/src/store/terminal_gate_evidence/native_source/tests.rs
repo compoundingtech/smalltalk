@@ -1,5 +1,5 @@
 use super::*;
-use crate::graph::parse_intent;
+use crate::graph::{parse_execution_intent, parse_intent};
 use crate::store::{
     Store, append_claim_tx, project_mission_run_created, select_replicated_desired,
     select_replicated_mission,
@@ -29,7 +29,7 @@ impl Fixture {
                     step: "step-run/one/prepare".into(),
                     path: "prepare".into(),
                     gate: "prepared".into(),
-                    exec: "exec/probe".into(),
+                    exec: "exec/one/probe".into(),
                 },
             )
             .unwrap();
@@ -43,11 +43,11 @@ impl Fixture {
         let intent = parse_intent(
             r#"
 version 2
-exec "probe" { workspace "/tmp"; command "true"; restart "never" }
 mission "one" state="ready" {
  goal "Private source fixture."
  step "prepare" {
-   gate "prepared" { field "exit_code" "exec/probe" is 0 }
+   exec "probe" { workspace "/tmp"; command "true"; restart "never" }
+   gate "prepared" { field "exit_code" "exec/one/probe" is 0 }
  }
 }
 "#,
@@ -55,7 +55,18 @@ mission "one" state="ready" {
         )
         .unwrap();
         let mission = intent.missions.values().next().unwrap();
-        let mut desired = intent.subjects["exec/probe"].clone();
+        let execution = parse_execution_intent(
+            mission.steps["prepare"]
+                .declarations_kdl
+                .as_deref()
+                .unwrap(),
+            "node",
+            "one",
+        )
+        .unwrap();
+        let mut desired = execution.subjects["exec/one/probe"].clone();
+        assert_eq!(desired.subject, fixture.source.binding.exec);
+        assert_eq!(desired.owner_run.as_deref(), Some("mission-run/one"));
         desired.owner_run = Some(fixture.source.binding.run.clone());
         desired.owner_generation = Some(fixture.source.binding.generation.clone());
         desired.owner_step = Some(fixture.source.binding.step.clone());
@@ -96,7 +107,7 @@ mission "one" state="ready" {
         let declaration = append_claim_tx(
             &tx,
             "node",
-            "exec/probe",
+            "exec/one/probe",
             "intent.desired",
             Some("person/test"),
             &serde_json::to_value(&desired).unwrap(),
@@ -108,7 +119,7 @@ mission "one" state="ready" {
         append_claim_tx(
             &tx,
             "node",
-            "exec/probe",
+            "exec/one/probe",
             "runtime.observed",
             None,
             &json!({"fields":{"runtime_id":"fixture-probe","host":"node","terminal":false,
@@ -165,7 +176,7 @@ fn native_gate_derives_eight_native_facts_and_preserves_canonical_selection() {
         // A later arrival with an older canonical time must not replace the selected exit.
         tx.execute("INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
             SELECT 'late-old-observation',batch_id,subject,kind,origin,?1,'[]','0' FROM claims
-            WHERE subject='exec/probe' AND kind='runtime.observed'",
+            WHERE subject='exec/one/probe' AND kind='runtime.observed'",
             [json!({"fields":{"status":"exited","exit_code":3,"incarnation_id":"older"},"evidence":[]}).to_string()]).unwrap();
     });
     let mut writer = f.store.connection.write();
@@ -173,7 +184,7 @@ fn native_gate_derives_eight_native_facts_and_preserves_canonical_selection() {
     let facts = f.source.extract(&tx).unwrap().unwrap();
     let claim_id = facts["observed"]["claim"].as_str().unwrap();
     let key = smallclaims::store::canonical::claim_key(&tx, claim_id).unwrap();
-    let native = crate::store::latest_claim_of_kind_tx(&tx, "exec/probe", "runtime.observed")
+    let native = crate::store::latest_claim_of_kind_tx(&tx, "exec/one/probe", "runtime.observed")
         .unwrap()
         .unwrap();
     assert_eq!(native.id, claim_id);
@@ -198,7 +209,7 @@ fn native_gate_action_domain_refusal_and_recovery_preserve_unknown() {
             crate::store::append_claim_record_tx(
                 tx,
                 "node",
-                "exec/probe",
+                "exec/one/probe",
                 kind,
                 None,
                 &json!({"fields":{"status":"exited"}}),
@@ -213,7 +224,7 @@ fn native_gate_action_domain_refusal_and_recovery_preserve_unknown() {
         crate::store::append_claim_record_tx(
             tx,
             "node",
-            "exec/probe",
+            "exec/one/probe",
             "runtime.action.unlisted",
             None,
             &json!({"fields":{}}),
@@ -225,7 +236,7 @@ fn native_gate_action_domain_refusal_and_recovery_preserve_unknown() {
     assert_eq!(f.line()["status"], "unknown");
     f.edit(|tx| {
         tx.execute(
-            "DELETE FROM claims WHERE subject='exec/probe' AND kind='runtime.action.unlisted'",
+            "DELETE FROM claims WHERE subject='exec/one/probe' AND kind='runtime.action.unlisted'",
             [],
         )
         .unwrap();
@@ -238,7 +249,7 @@ fn native_gate_changed_declaration_and_generation_retract_without_read_repair() 
     let f = Fixture::seeded();
     f.edit(|tx| {
         tx.execute(
-            "UPDATE desired SET owner_generation='run-generation/other' WHERE subject='exec/probe'",
+            "UPDATE desired SET owner_generation='run-generation/other' WHERE subject='exec/one/probe'",
             [],
         )
         .unwrap();
@@ -246,7 +257,7 @@ fn native_gate_changed_declaration_and_generation_retract_without_read_repair() 
     assert_eq!(f.line()["status"], "unknown");
     f.edit(|tx| {
         tx.execute(
-            "UPDATE desired SET owner_generation='run-generation/one' WHERE subject='exec/probe'",
+            "UPDATE desired SET owner_generation='run-generation/one' WHERE subject='exec/one/probe'",
             [],
         )
         .unwrap();
@@ -264,10 +275,10 @@ fn native_gate_changed_declaration_and_generation_retract_without_read_repair() 
 
 #[test]
 fn native_gate_caps_complete_subject_and_related_batch_rows() {
-    for subject in ["exec/probe", "exec/same-batch"] {
+    for subject in ["exec/one/probe", "exec/same-batch"] {
         let f = Fixture::seeded();
         f.edit(|tx| {
-            let batch:String=tx.query_row("SELECT batch_id FROM claims WHERE subject='exec/probe' AND kind='runtime.observed'",[],|r|r.get(0)).unwrap();
+            let batch:String=tx.query_row("SELECT batch_id FROM claims WHERE subject='exec/one/probe' AND kind='runtime.observed'",[],|r|r.get(0)).unwrap();
             for n in 0..17 {
                 tx.execute("INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
                     VALUES(?1,?2,?3,'harness.observed','node','{}','[]','1')",
@@ -304,14 +315,14 @@ fn native_gate_octet_header_guard_refuses_oversize_and_proves_bundled_opcodes() 
         "{opcodes:?}"
     );
     tx.execute(
-        "UPDATE claims SET body=?1 WHERE subject='exec/probe' AND kind='runtime.observed'",
+        "UPDATE claims SET body=?1 WHERE subject='exec/one/probe' AND kind='runtime.observed'",
         ["x".repeat(RAW_BYTES + 1)],
     )
     .unwrap();
     let scope = SqliteWorkScope::start();
     let rowid = point(&tx, "claims", "id", &{
         tx.query_row(
-            "SELECT id FROM claims WHERE subject='exec/probe' AND kind='runtime.observed'",
+            "SELECT id FROM claims WHERE subject='exec/one/probe' AND kind='runtime.observed'",
             [],
             |r| r.get::<_, String>(0),
         )
@@ -339,9 +350,9 @@ fn native_gate_malformed_deep_and_wrong_type_source_is_visible_unknown() {
         let f = Fixture::seeded();
         f.edit(|tx| {
             if let Some(raw)=body.as_str() {
-                tx.execute("UPDATE claims SET body=?1 WHERE subject='exec/probe' AND kind='runtime.observed'",[raw]).unwrap();
+                tx.execute("UPDATE claims SET body=?1 WHERE subject='exec/one/probe' AND kind='runtime.observed'",[raw]).unwrap();
             } else {
-                tx.execute("UPDATE claims SET body=x'00' WHERE subject='exec/probe' AND kind='runtime.observed'",[]).unwrap();
+                tx.execute("UPDATE claims SET body=x'00' WHERE subject='exec/one/probe' AND kind='runtime.observed'",[]).unwrap();
             }
         });
         assert_eq!(f.line()["status"], "unknown");
@@ -352,16 +363,19 @@ fn native_gate_malformed_deep_and_wrong_type_source_is_visible_unknown() {
 #[test]
 fn native_gate_replace_on_each_protected_table_stays_pending_without_wrapper() {
     for (table, predicate) in [
-        ("desired", "subject='exec/probe'"),
+        ("desired", "subject='exec/one/probe'"),
         ("mission_revisions", "mission_id='one'"),
         ("mission_definitions", "mission_id='one'"),
         ("mission_runs", "id='one'"),
         ("run_generations", "id='one'"),
         ("step_runs", "subject='step-run/one/prepare'"),
-        ("claims", "subject='exec/probe' AND kind='runtime.observed'"),
+        (
+            "claims",
+            "subject='exec/one/probe' AND kind='runtime.observed'",
+        ),
         (
             "batches",
-            "id=(SELECT batch_id FROM claims WHERE subject='exec/probe' AND kind='runtime.observed')",
+            "id=(SELECT batch_id FROM claims WHERE subject='exec/one/probe' AND kind='runtime.observed')",
         ),
     ] {
         let f = Fixture::seeded();
@@ -385,7 +399,7 @@ fn native_gate_replace_on_each_protected_table_stays_pending_without_wrapper() {
         ("replica_records", "INSERT INTO replica_records(record_ref,writer,sequence,envelope_hash,position,raw,state,updated_at_unix_ms)
             VALUES('private-record','node',1,'private-envelope',0,x'00','repaired','1')"),
         ("checkpoint_claims", "INSERT INTO checkpoint_claims(id,writer,sequence,envelope_hash,subject,kind,predecessors,accepted_at_unix_ms,checkpoint)
-            VALUES('private-dropped','node',1,'private-envelope','exec/probe','runtime.observed','[]',1,'private-checkpoint')"),
+            VALUES('private-dropped','node',1,'private-envelope','exec/one/probe','runtime.observed','[]',1,'private-checkpoint')"),
         ("checkpoint_envelopes", "INSERT INTO checkpoint_envelopes(writer,sequence,envelope_hash,accepted_at_unix_ms,checkpoint)
             VALUES('node',1,'private-envelope',1,'private-checkpoint')"),
     ] {
@@ -418,7 +432,7 @@ fn native_gate_rowid_collision_after_extraction_refuses_final_publication() {
     // Same claim id / different subject: DELETE triggers cannot be relied upon.
     tx.execute("INSERT OR REPLACE INTO claims
         SELECT store_index,id,batch_id,'exec/replaced',kind,origin,actor,body,predecessors,accepted_at_unix_ms
-        FROM claims WHERE subject='exec/probe' AND kind='runtime.observed'",[]).unwrap();
+        FROM claims WHERE subject='exec/one/probe' AND kind='runtime.observed'",[]).unwrap();
     assert!(f.source.state(&tx).unwrap().0 > before);
     assert_eq!(f.source.doctor_line(&tx)["status"], "unknown");
     assert!(f.source.installer.root(&tx, VIEW).is_err());
@@ -585,7 +599,7 @@ fn native_gate_unrelated_and_noop_work_at_zero_1024_and_100000_rows() {
             assert_eq!(f.source.installer.root(&tx, VIEW).unwrap(), root);
         }
         let work=f.measured(|tx|{
-            tx.execute("UPDATE claims SET body=body WHERE subject='exec/probe' AND kind='runtime.observed'",[]).unwrap();
+            tx.execute("UPDATE claims SET body=body WHERE subject='exec/one/probe' AND kind='runtime.observed'",[]).unwrap();
         });
         eprintln!("native source full no-op path unrelated={n}: {work:?}");
         assert!(
@@ -637,7 +651,7 @@ fn native_gate_guard_binding_replacement_is_refused_or_sticky_unknown() {
     f.source.finish(&tx).unwrap();
     assert_eq!(f.source.doctor_line(&tx)["status"], "unknown");
     tx.execute(
-        "UPDATE test_native_terminal_guard SET exec='exec/probe' WHERE id=1",
+        "UPDATE test_native_terminal_guard SET exec='exec/one/probe' WHERE id=1",
         [],
     )
     .unwrap();
