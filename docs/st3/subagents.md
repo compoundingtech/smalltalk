@@ -1,9 +1,9 @@
 # Subagents
 
 A subagent is a helper that a seat's harness runs inside its own session: a Claude subagent
-started with the Agent tool, or a Codex subagent thread. It is not a seat or a mission. st records
-each subagent as claims on its parent seat, from the harness's hooks and events, and never asks the
-agent about it.
+started with the Agent tool, a Codex subagent thread, or an omp subagent session. It is not a seat
+or a mission. st records each subagent as claims on its parent seat, from the harness's hooks and
+events, and never asks the agent about it.
 
 ## Claims
 
@@ -48,6 +48,15 @@ A running seat keeps the settings it started with, so it records subagents from 
 after it completes, so each task is one run: `THREAD`, then `THREAD#2`, and so on. A run starts
 when its thread starts or takes a task while idle. It ends when the parent hears it completed or was
 interrupted, or when a collab call reports it errored, shut down or gone.
+
+**omp.** omp loads the seat's extension into each subagent session and names the subagent in
+`ctx.agent` (`id`, `name`). The extension reports that session's runs to the seat's channel, and
+the channel writes them into the same ledger, for the bound native session only. A run starts at
+`agent_start`, a `turn_end` starts a run the ledger missed, and the run ends at the `agent_end`
+that does not continue: `failed` after a provider error, `interrupted` after an abort, otherwise
+`completed`. A subagent session that shuts down first ends its run as `interrupted`. A subagent
+that runs again is a new run, `ID#2` and so on, as in Codex. The type is omp's agent name. omp
+reports no tokens for a subagent, so its end carries none.
 
 The seat's driver reads the ledger every second and records what changed. A subagent leaves the
 ledger only after its end is recorded, so a daemon outage delays these claims without losing any.
@@ -115,3 +124,7 @@ covers:
 
 `ST3_SUBAGENT_LEASE_MS` can only shorten the driver's lease, so these tests need not wait out ten
 minutes.
+
+`crates/st3/tests/subagent_publisher.rs` drives an omp seat's channel observer with the frames the
+extension sends and reads the agents list: a running subagent shows with its ID, type, driver and
+lease, and leaves the list at its end, or when its lease runs out without a renewal.

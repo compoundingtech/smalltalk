@@ -1,7 +1,7 @@
 //! A seat driver records its harness's subagents from the ledger on the seat: appearances with
 //! their description and session, ends with tokens, and a Codex subagent's tokens in its parent's
-//! usage. These run against the real API on a private socket; the seat-level proof is
-//! `subagents_seat`.
+//! usage. An omp seat's channel writes the ledger from the frames its extension sends. These run
+//! against the real API on a private socket; the seat-level proof is `subagents_seat`.
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +15,7 @@ use tokio::sync::{Notify, watch};
 
 const CODEX_SEAT: &str = "agent/example/codex";
 const CLAUDE_SEAT: &str = "agent/example/claude";
+const OMP_SEAT: &str = "agent/example/omp";
 
 async fn serve(
     root: &Path,
@@ -339,4 +340,133 @@ async fn a_codex_run_cut_short_by_its_harness_still_counts_its_tokens() {
     );
     assert!(ledger::read(&agent_dir).ended.is_empty());
     server.abort();
+}
+
+/// An omp seat's channel observer, as `st driver omp-channel` runs it, bound to native session
+/// `native-1`. The seat is declared, so the agents list shows it.
+fn omp_channel(store: &Store, agent_dir: &Path) -> st_drivers::pi_channel::EventObserver {
+    let intent = st3::parse_intent(
+        "version 2\nagent \"example/omp\" { workspace \"/tmp\"; command \"true\"; }",
+        "example",
+    )
+    .unwrap();
+    store.apply_internal(&intent, "seats").unwrap();
+    st_drivers::harness_events::enable(agent_dir, "runtime-1").unwrap();
+    let seq =
+        st_drivers::harness_state::claim(agent_dir, OMP_SEAT, "omp", "provider-1").unwrap();
+    let mut channel = st_drivers::pi_channel::EventObserver::new(
+        agent_dir, OMP_SEAT, "omp", "provider-1", seq, "runtime-1",
+    )
+    .unwrap();
+    channel
+        .observe(&json!({"type": "ready", "sessionId": "native-1"}))
+        .unwrap();
+    channel
+}
+
+/// The `subagents` of the omp seat's row in the agents list.
+async fn listed_subagents(client: &Client) -> Value {
+    let agents: Value = client.get("/v1/client/agents").await.unwrap();
+    agents["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["id"] == OMP_SEAT)
+        .unwrap_or_else(|| panic!("the omp seat is listed: {agents}"))["subagents"]
+        .clone()
+}
+
+fn subagent_frame(event: &str) -> Value {
+    json!({"type": "subagent", "event": event, "id": "0-Review", "name": "task"})
+}
+
+#[tokio::test]
+async fn an_omp_subagent_is_listed_on_its_seat_until_it_ends() {
+    let root = tempfile::tempdir().unwrap();
+    let (store, client, server) = serve(root.path()).await;
+    let agent_dir = root.path().join("agent");
+    let mut channel = omp_channel(&store, &agent_dir);
+    let mut publisher = st3::subagents::Publisher::start(
+        OMP_SEAT,
+        "omp",
+        "incarnation-1",
+        &agent_dir,
+        ledger::now_ms(),
+    );
+    assert_eq!(listed_subagents(&client).await, json!([]));
+
+    let before = ledger::now_ms();
+    channel.observe(&subagent_frame("start")).unwrap();
+    publisher.tick(&client).await.unwrap();
+    let listed = listed_subagents(&client).await;
+    let listed = listed.as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(listed[0]["id"], "0-Review");
+    assert_eq!(listed[0]["subagent_type"], "task");
+    assert_eq!(listed[0]["driver"], "omp");
+    assert_eq!(listed[0]["session_id"], "native-1");
+    assert!(listed[0]["lease_expires_at"].is_string(), "{listed:?}");
+    let appeared = fields(&store, OMP_SEAT, "subagent.appeared");
+    assert_eq!(appeared.len(), 1);
+    let lease = appeared[0]["lease_expires_at_unix_ms"].as_u64().unwrap();
+    assert!(
+        lease > before && lease <= ledger::now_ms() + st3::store::SUBAGENT_LEASE_MS,
+        "a finite lease from the appearance: {lease}"
+    );
+
+    // Progress is part of the same run.
+    channel.observe(&subagent_frame("progress")).unwrap();
+    publisher.tick(&client).await.unwrap();
+    assert_eq!(listed_subagents(&client).await.as_array().unwrap().len(), 1);
+    assert_eq!(fields(&store, OMP_SEAT, "subagent.appeared").len(), 1);
+
+    channel
+        .observe(&json!({"type": "subagent", "event": "end", "id": "0-Review",
+            "name": "task", "outcome": "completed"}))
+        .unwrap();
+    publisher.tick(&client).await.unwrap();
+    assert_eq!(listed_subagents(&client).await, json!([]));
+    let ended = fields(&store, OMP_SEAT, "subagent.ended");
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0]["subagent_id"], "0-Review");
+    assert_eq!(ended[0]["outcome"], "completed");
+    server.abort();
+}
+
+/// A harness that stops reporting, as a crashed one does, renews nothing: its subagent leaves the
+/// list when the lease runs out, though no end was recorded.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_omp_subagent_leaves_the_list_when_its_lease_runs_out() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    // SAFETY: the supervised process runs this test alone, and no other thread runs yet.
+    unsafe { std::env::set_var("ST3_SUBAGENT_LEASE_MS", "1500") };
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let (store, client, server) = serve(root.path()).await;
+            let agent_dir = root.path().join("agent");
+            let mut channel = omp_channel(&store, &agent_dir);
+            let mut publisher = st3::subagents::Publisher::start(
+                OMP_SEAT,
+                "omp",
+                "incarnation-1",
+                &agent_dir,
+                ledger::now_ms(),
+            );
+            channel.observe(&subagent_frame("start")).unwrap();
+            publisher.tick(&client).await.unwrap();
+            assert_eq!(listed_subagents(&client).await.as_array().unwrap().len(), 1);
+
+            tokio::time::sleep(Duration::from_millis(2_000)).await;
+            assert_eq!(listed_subagents(&client).await, json!([]));
+            assert!(fields(&store, OMP_SEAT, "subagent.ended").is_empty());
+            assert!(ledger::read(&agent_dir).running.contains_key("0-Review"));
+            server.abort();
+        });
 }

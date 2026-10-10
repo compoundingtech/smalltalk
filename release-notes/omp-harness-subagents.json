@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "omp seats list their running subagents on the agent, as Claude and Codex seats do",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes or triggers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged. omp seats write the existing subagent claim kinds with the existing fields."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The omp extension sends a new subagent frame on the seat's channel. A channel from an older st ignores it. Older peers accept the claims, because their kinds and fields do not change. A running omp seat starts to report subagents after its next restart."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover. A subagent that a stopped omp harness leaves open ends when its lease runs out."
+  }
+}

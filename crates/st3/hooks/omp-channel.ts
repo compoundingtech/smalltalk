@@ -134,6 +134,8 @@ type Stash = {
   holdTimer?: ReturnType<typeof setTimeout>;
   /** Serializes handoffs so omp receives messages in arrival order. */
   handoff?: Promise<void>;
+  /** Subagents of this process between their `agent_start` and their end. */
+  subagents?: Set<string>;
 };
 
 /**
@@ -194,6 +196,21 @@ const terminalProviderError = (event: AgentEndFrame): ProviderError | undefined 
     return error;
   }
   return undefined;
+};
+
+/** How a subagent's run ended: an error fails it, an abort interrupts it. */
+const subagentOutcome = (event: AgentEndFrame): "completed" | "failed" | "interrupted" => {
+  if (!Array.isArray(event.messages)) return "completed";
+  for (let index = event.messages.length - 1; index >= 0; index -= 1) {
+    const message = event.messages[index];
+    if (!message || typeof message !== "object") continue;
+    if (!("role" in message) || message.role !== "assistant") continue;
+    if (!("stopReason" in message)) return "completed";
+    if (message.stopReason === "error") return "failed";
+    if (message.stopReason === "aborted") return "interrupted";
+    return "completed";
+  }
+  return "completed";
 };
 
 /**
@@ -1100,6 +1117,31 @@ export default function (pi: ExtensionAPI) {
   // Keep delivery, receipt evidence and label authority on the top-level seat (#852).
   const isSubagent = (ctx: ExtensionContext | undefined): boolean =>
     (ctx as { agent?: { kind?: unknown } } | undefined)?.agent?.kind === "sub";
+  // A subagent session reports only its runs: st records them on the seat as its subagents, with
+  // a lease the seat's driver renews while the run lasts. A run starts at `agent_start`, makes
+  // progress at each `turn_end`, and ends at the `agent_end` that does not continue, or when its
+  // session shuts down first. omp names the subagent in `ctx.agent` (`id`, `name`).
+  const observeSubagent = (event: string, payload: unknown, ctx: ExtensionContext) => {
+    const agent = record(record(ctx)?.agent);
+    const id = typeof agent?.id === "string" ? agent.id.trim() : "";
+    if (!id) return;
+    const name = typeof agent?.name === "string" ? agent.name.trim() : "";
+    const frame = { type: "subagent", id, ...(name ? { name } : {}) };
+    const running = (state.subagents ??= new Set<string>());
+    if (event === "agent_start") {
+      running.add(id);
+      sendFrame({ ...frame, event: "start" });
+    } else if (event === "turn_end") {
+      sendFrame({ ...frame, event: "progress" });
+    } else if (event === "agent_end") {
+      const end = record(payload) ?? {};
+      if (end.willContinue === true) return;
+      running.delete(id);
+      sendFrame({ ...frame, event: "end", outcome: subagentOutcome(end) });
+    } else if (event === "session_shutdown" && running.delete(id)) {
+      sendFrame({ ...frame, event: "end", outcome: "interrupted" });
+    }
+  };
   const register = pi.on.bind(pi) as unknown as (
     event: string,
     handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
@@ -1108,7 +1150,14 @@ export default function (pi: ExtensionAPI) {
     event: string,
     handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
   ) => register(event, (payload, ctx) => {
-    if (isSubagent(ctx)) return;
+    if (isSubagent(ctx)) {
+      try {
+        observeSubagent(event, payload, ctx);
+      } catch {
+        // Observability fails open: a subagent's report never takes its session down.
+      }
+      return;
+    }
     jobContext = ctx;
     return handler(payload, ctx);
   });

@@ -115,10 +115,14 @@ message / delivered / failed / state / context frames, PROTOCOL constant). Diffe
   `session_shutdown` without a `reason` field and fires it on process exit, so every such event
   closes the current channel.
 - **Subagent sessions:** omp loads the extension into every in-process subagent (the `task`
-  tool, eval `agent()`, `/tan` clones), and each copy shares the process-wide stash. Every
-  handler ignores an event whose `ctx.agent.kind` is `"sub"`, so a subagent opens no channel,
-  closes none, emits no frame, and never receives the seat's mail; the channel stays bound to the
-  top-level session. omp exposes `ctx.agent` from 18.3.2; an earlier build reads as top-level.
+  tool, eval `agent()`, `/tan` clones), and each copy shares the process-wide stash. No handler
+  acts on an event whose `ctx.agent.kind` is `"sub"`, so a subagent opens no channel, closes none,
+  and never receives the seat's mail; the channel stays bound to the top-level session. The one
+  frame a subagent sends is `subagent`, on the seat's channel: `start` at `agent_start`,
+  `progress` at `turn_end`, and `end` with an outcome at the `agent_end` that does not continue,
+  or at `session_shutdown` before that. st records these as the seat's subagents
+  (`docs/st3/subagents.md`). omp exposes `ctx.agent` from 18.3.2; an earlier build reads as
+  top-level.
 - **Restored context:** seeding uses
   `sendMessage({customType:"st2-session-start", …}, {deliverAs:"nextTurn"})`.
 

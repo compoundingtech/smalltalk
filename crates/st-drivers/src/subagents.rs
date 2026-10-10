@@ -8,7 +8,8 @@
 //!
 //! Claude reports subagents to its hooks. Codex reports each subagent thread's tasks on the
 //! parent thread; a thread given a follow-up task after it completed runs again, and each run is
-//! one subagent here, `THREAD` and then `THREAD#2` and on.
+//! one subagent here, `THREAD` and then `THREAD#2` and on. omp loads the seat's extension into
+//! each subagent session, which reports the subagent's runs the same way.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -435,6 +436,28 @@ pub fn subagent_thread(id: &str) -> &str {
 
 const MAX_THREADS: usize = 1_024;
 
+/// The ID of thread `thread`'s current run: `THREAD`, then `THREAD#2` and on.
+fn run_id(ledger: &Ledger, thread: &str) -> String {
+    match ledger.runs.get(thread) {
+        Some(1) | None => thread.to_owned(),
+        Some(run) => format!("{thread}#{run}"),
+    }
+}
+
+/// Count a new run of thread `thread` and return its ID.
+fn next_run(ledger: &mut Ledger, thread: &str) -> String {
+    let run = ledger.runs.get(thread).map_or(1, |run| run + 1);
+    ledger.runs.insert(thread.to_owned(), run);
+    if ledger.runs.len() > MAX_THREADS {
+        let oldest = ledger.runs.keys().next().cloned();
+        if let Some(oldest) = oldest {
+            ledger.runs.remove(&oldest);
+            ledger.counted.remove(&oldest);
+        }
+    }
+    run_id(ledger, thread)
+}
+
 /// Record one Codex app-server notification from the parent thread `parent`. Each subagent
 /// thread's task is a run: it starts when the thread starts or takes a follow-up task while idle,
 /// and ends when the parent hears it completed or was interrupted, or a collab call reports it
@@ -460,10 +483,6 @@ pub fn observe_codex(agent_dir: &Path, message: &Value, parent: &str) -> Result<
 fn apply_codex(ledger: &mut Ledger, message: &Value, parent: &str, now: u64) {
     let item = message.pointer("/params/item").unwrap_or(&Value::Null);
     ledger.change_session(parent, now);
-    let run_id = |ledger: &Ledger, thread: &str| match ledger.runs.get(thread) {
-        Some(1) | None => thread.to_owned(),
-        Some(run) => format!("{thread}#{run}"),
-    };
     match item.get("type").and_then(Value::as_str) {
         Some("subAgentActivity") => {
             let Some(thread) = text(item, "agentThreadId") else {
@@ -476,16 +495,7 @@ fn apply_codex(ledger: &mut Ledger, message: &Value, parent: &str, now: u64) {
                         return;
                     }
                     // A thread seen before and idle now takes a new task.
-                    let run = ledger.runs.get(&thread).map_or(1, |run| run + 1);
-                    ledger.runs.insert(thread.clone(), run);
-                    if ledger.runs.len() > MAX_THREADS {
-                        let oldest = ledger.runs.keys().next().cloned();
-                        if let Some(oldest) = oldest {
-                            ledger.runs.remove(&oldest);
-                            ledger.counted.remove(&oldest);
-                        }
-                    }
-                    let id = run_id(ledger, &thread);
+                    let id = next_run(ledger, &thread);
                     // Codex names a subagent by its task path, such as `/root/review_docs`.
                     let description = text(item, "agentPath")
                         .and_then(|path| path.rsplit('/').next().map(str::to_owned))
@@ -530,6 +540,53 @@ fn apply_codex(ledger: &mut Ledger, message: &Value, parent: &str, now: u64) {
                 let current = run_id(ledger, thread);
                 ledger.end(&current, outcome, reason.and_then(one_line), now);
             }
+        }
+        _ => {}
+    }
+}
+
+/// Record one `subagent` frame from the omp extension, for the seat's native session `parent`.
+/// The extension reports a subagent's `start` and `progress` while it runs and its `end`. A
+/// subagent that runs again after its end is a new run, as in Codex.
+pub fn observe_omp(agent_dir: &Path, frame: &Value, parent: &str) -> Result<()> {
+    if frame.get("type").and_then(Value::as_str) != Some("subagent") {
+        return Ok(());
+    }
+    let now = now_ms();
+    update(agent_dir, |ledger| apply_omp(ledger, frame, parent, now))
+}
+
+fn apply_omp(ledger: &mut Ledger, frame: &Value, parent: &str, now: u64) {
+    let Some(thread) = text(frame, "id") else {
+        return;
+    };
+    ledger.change_session(parent, now);
+    let current = run_id(ledger, &thread);
+    match frame.get("event").and_then(Value::as_str) {
+        // A progress report starts a run whose start this ledger missed.
+        Some("start" | "progress") => {
+            if ledger.running.contains_key(&current) {
+                return;
+            }
+            let id = next_run(ledger, &thread);
+            ledger.start(Subagent {
+                id,
+                subagent_type: text(frame, "name"),
+                description: None,
+                session_id: Some(parent.into()),
+                started_at_ms: now,
+                transcript: None,
+                unlisted_since_ms: None,
+                parent_usage: false,
+            });
+        }
+        Some("end") => {
+            let outcome = frame
+                .get("outcome")
+                .and_then(Value::as_str)
+                .filter(|outcome| matches!(*outcome, "failed" | "interrupted"))
+                .unwrap_or("completed");
+            ledger.end(&current, outcome, None, now);
         }
         _ => {}
     }
@@ -1063,6 +1120,47 @@ mod tests {
             4,
         );
         assert_eq!(ledger.ended.last().unwrap().outcome, "session-ended");
+    }
+
+    #[test]
+    fn each_omp_subagent_run_starts_and_ends_once() {
+        let frame = |event: &str, extra: Value| {
+            let mut frame = json!({"type": "subagent", "event": event, "id": "0-Review", "name": "task"});
+            frame.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            frame
+        };
+        let mut ledger = Ledger::default();
+        // A progress report before any start starts the run; later ones are part of it.
+        apply_omp(&mut ledger, &frame("progress", json!({})), "native", 1);
+        apply_omp(&mut ledger, &frame("start", json!({})), "native", 2);
+        apply_omp(&mut ledger, &frame("progress", json!({})), "native", 3);
+        assert_eq!(ledger.running.len(), 1);
+        let run = &ledger.running["0-Review"];
+        assert_eq!(run.subagent_type.as_deref(), Some("task"));
+        assert_eq!(run.session_id.as_deref(), Some("native"));
+        assert_eq!(run.started_at_ms, 1);
+        apply_omp(&mut ledger, &frame("end", json!({"outcome": "failed"})), "native", 4);
+        assert!(ledger.running.is_empty());
+        assert_eq!(ledger.ended[0].outcome, "failed");
+        // A repeated end changes nothing; a new start is the subagent's second run.
+        apply_omp(&mut ledger, &frame("end", json!({})), "native", 5);
+        assert_eq!(ledger.ended.len(), 1);
+        apply_omp(&mut ledger, &frame("start", json!({})), "native", 6);
+        assert!(ledger.running.contains_key("0-Review#2"));
+        // An outcome the extension cannot report reads as completed.
+        apply_omp(&mut ledger, &frame("end", json!({"outcome": "expired"})), "native", 7);
+        assert_eq!(ledger.ended[1].subagent.id, "0-Review#2");
+        assert_eq!(ledger.ended[1].outcome, "completed");
+        // A new native session ends what the last one left running.
+        apply_omp(&mut ledger, &frame("start", json!({})), "native", 8);
+        apply_omp(&mut ledger, &json!({"type": "subagent", "event": "start", "id": "1-Next"}), "other", 9);
+        assert_eq!(ledger.ended[2].subagent.id, "0-Review#3");
+        assert_eq!(ledger.ended[2].outcome, "session-ended");
+        assert!(ledger.running.contains_key("1-Next"));
+        // A frame without an ID changes nothing.
+        let before = ledger.clone();
+        apply_omp(&mut ledger, &json!({"type": "subagent", "event": "end"}), "native", 10);
+        assert_eq!(ledger, before);
     }
 
     #[test]
