@@ -160,8 +160,35 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
     None
 }
 
+/// Whether Claude's own input box is on screen: a full-width rule, the `❯` prompt line and
+/// another rule, as at the end of every finished turn. Claude replaces the box with its dialog
+/// while a permission or question prompt is up, so the box being back means the prompt is gone,
+/// answered or dismissed in the terminal (measured on Claude Code 2.1.296: Esc or "No" ends the
+/// turn without any hook event, and the input box returns).
+pub fn claude_input_ready(screen: &str) -> bool {
+    let rule = |line: &str| line.chars().count() >= 20 && line.chars().all(|c| c == '─');
+    let lines = screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    lines
+        .windows(3)
+        .any(|window| rule(window[0]) && window[1].starts_with('❯') && rule(window[2]))
+}
+
 #[cfg(test)]
 mod tests {
+    const PERMISSION_DIALOG: &str = "❯ Run it.\n  ⎿  $ touch probe-file\n────────────────────────────────────────\n Bash command\n touch probe-file\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend\n";
+    const DENIED: &str = "❯ Run it.\n  ⎿  Interrupted · What should Claude do instead?\n────────────────────────────────────────\n❯ \n────────────────────────────────────────\n  ⏸ manual mode on · ? for shortcuts · ← for agents\n";
+
+    #[test]
+    fn claude_input_box_marks_a_prompt_gone_and_a_dialog_does_not() {
+        assert!(!super::claude_input_ready(PERMISSION_DIALOG));
+        assert!(super::claude_input_ready(DENIED));
+        assert!(!super::claude_input_ready(""));
+    }
+
     #[test]
     fn plain_followup_tool_lines_are_not_login_diagnostics() {
         for text in [

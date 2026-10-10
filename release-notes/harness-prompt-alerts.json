@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A native harness prompt (permission, question or review) is an alert in its seat's conversation while the harness waits on it, and clears when the prompt is gone; Claude prompts refused in the terminal clear from the screen",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or backfill. Prompt alerts are derived on read from each seat's newest harness.observed and runtime.observed claims."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database change. The client schema's attention_kind list gains harness-login and harness-prompt, which daemons already served or summary already counted; the contract digest changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint or authority rule change. The reconciler writes a harness.diagnostic with code native-prompt-gone once per Claude prompt it sees refused on screen."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Clients now receive attention rows with attention_kind harness-prompt and alert true; older stui builds drop unknown kinds as they drop harness-login, and the summary's alert count includes them. The rows carry no typed action yet: their action attaches to the seat's terminal."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swap back freely; an older daemon shows no prompt alerts and ignores the native-prompt-gone diagnostics."
+  }
+}

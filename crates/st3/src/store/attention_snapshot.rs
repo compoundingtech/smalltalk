@@ -53,6 +53,121 @@ impl Store {
         })))
     }
 
+    /// One alert per seat whose harness waits on a person at a native prompt: a permission, a
+    /// question or a review it shows in its terminal. It lives in the seat's conversation and
+    /// clears when the harness reports the prompt gone, however it was answered, or when the
+    /// seat's runtime ends. Each seat costs one indexed read of its newest harness observation,
+    /// and only a blocked seat reads its runtime and owner.
+    pub(super) fn harness_prompt_attention_items(
+        &self,
+        person: Option<&str>,
+    ) -> Result<Vec<AttentionItemView>> {
+        let connection = self.readers.get();
+        let seats = connection
+            .prepare_cached("SELECT subject FROM desired WHERE kind='agent' ORDER BY subject")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let newest = |subject: &str, kind: &str| -> Result<Option<(String, u128, Value)>> {
+            let row = connection
+                .prepare_cached(&format!(
+                    "{} LIMIT 1",
+                    newest_claims_of_kind_query(
+                        "claims.id, claims.accepted_at_unix_ms, claims.body",
+                        kind
+                    )
+                ))?
+                .query_row(params![subject, i64::MAX], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .optional()?;
+            row.map(|(id, at, body)| -> Result<(String, u128, Value)> {
+                let body: Value = serde_json::from_str(&body)?;
+                let fields = body.get("fields").cloned().unwrap_or(body);
+                Ok((id, at.parse()?, fields))
+            })
+            .transpose()
+        };
+        let mut items = Vec::new();
+        for seat in seats {
+            let Some((claim, at, harness)) = newest(&seat, "harness.observed")? else {
+                continue;
+            };
+            if harness["blocked_on"] != "human" {
+                continue;
+            }
+            // The prompt was refused in the terminal, which its harness did not report.
+            let gone: bool = connection
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='harness.diagnostic'
+                       AND json_extract(body, '$.fields.code')='native-prompt-gone'
+                       AND json_extract(body, '$.fields.observation')=?2)",
+                )?
+                .query_row(params![seat, claim], |row| row.get(0))?;
+            if gone {
+                continue;
+            }
+            // Only the running incarnation's prompt waits: a restarted seat's old prompt is gone.
+            let Some((_, _, runtime)) = newest(&seat, "runtime.observed")? else {
+                continue;
+            };
+            if runtime["status"] != "running"
+                || runtime["incarnation_id"] != harness["incarnation_id"]
+                || !person_work::declaration_live(&connection, &seat)?
+            {
+                continue;
+            }
+            let Some(owner) = self.agent_person(&seat)? else {
+                continue;
+            };
+            if person.is_some_and(|person| person != owner) {
+                continue;
+            }
+            let ask = harness["ask"].as_str().unwrap_or("unknown");
+            let what = match ask {
+                "permission" => "permission",
+                "question" => "an answer",
+                "review" => "a review",
+                _ => "you",
+            };
+            let prompt = harness["reason"]
+                .as_str()
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or("its terminal shows a prompt");
+            items.push(AttentionItemView {
+                episode: claim,
+                priority: "high".into(),
+                kind: "harness-prompt".into(),
+                review_mode: None,
+                subject: seat.clone(),
+                person: owner,
+                requester_id: None,
+                launch_id: None,
+                variant_id: None,
+                message_id: None,
+                conversation: Some(seat.clone()),
+                title: format!("{seat} is waiting for {what}"),
+                detail: format!(
+                    "{prompt}\n\nAnswer it in the seat's terminal (Ctrl+] in stui). This alert clears when the prompt is gone, however it was answered."
+                ),
+                request: None,
+                mission: None,
+                mission_run: None,
+                step: None,
+                targets: vec![seat.clone()],
+                requested_at_unix_ms: at,
+                actions: vec![attention_action(
+                    "Attach to answer",
+                    &["st", "terminals", "attach", &seat],
+                )],
+            });
+        }
+        Ok(items)
+    }
+
     pub(super) fn person_attention_items(
         &self,
         person: Option<&str>,

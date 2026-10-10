@@ -1065,7 +1065,7 @@ export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "actions": Schema.Array(Schema.Literals(["custom.reply","work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"])),
   /** Whether this item is an alert: it blocks or waits on its person (an ask, a human gate, a launch or revision approval, an agent or custom request, a harness prompt or login, or a broken gate the person published). An update is not one. Absent on daemons that predate alerts. */
   "alert": optionalKey(Schema.Boolean).annotate({ description: "Whether this item is an alert: it blocks or waits on its person (an ask, a human gate, a launch or revision approval, an agent or custom request, a harness prompt or login, or a broken gate the person published). An update is not one. Absent on daemons that predate alerts." }),
-  "attention_kind": Schema.Union([Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault"]), Schema.String.check(Schema.isPattern(new RegExp("^custom\\.[a-zA-Z0-9_.-]+$", "u")))]),
+  "attention_kind": Schema.Union([Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault","harness-login","harness-prompt"]), Schema.String.check(Schema.isPattern(new RegExp("^custom\\.[a-zA-Z0-9_.-]+$", "u")))]),
   "because": optionalKey(Schema.String),
   /** The mission step waiting on this ask, on an ask a mission step made; absent on a standalone ask. */
   "blocked": optionalKey(AttentionBlocked),

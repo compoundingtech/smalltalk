@@ -2626,6 +2626,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     &observation,
                                     screen.as_deref(),
                                 )?;
+                                self.reconcile_native_prompt_screen(
+                                    subject,
+                                    member,
+                                    &observation,
+                                    screen.as_deref(),
+                                )?;
                                 self.reconcile_claude_trust_screen(
                                     subject,
                                     member,
@@ -3414,6 +3420,57 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.incremental
             .saw_value(&key, screen_digest(&screen), now_ms());
         Ok(screen)
+    }
+
+    /// Claude ends a turn whose permission or question prompt was refused in its terminal (Esc or
+    /// "No") without any hook event, so the seat's last word says it still waits on a person.
+    /// Its input box being back on screen says the prompt is gone: record that once against the
+    /// observation that opened it, so the prompt's alert clears.
+    fn reconcile_native_prompt_screen(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: &RuntimeObservation,
+        screen: Option<&str>,
+    ) -> Result<()> {
+        let (Some("claude"), true, Some(incarnation), Some(screen)) = (
+            member.driver.as_deref(),
+            member.terminal && subject.kind == "agent",
+            observation.incarnation_id.as_deref(),
+            screen,
+        ) else {
+            return Ok(());
+        };
+        let Some(blocked) = self
+            .store
+            .latest_claim(&subject.subject, Some("harness.observed"))?
+        else {
+            return Ok(());
+        };
+        let fields = blocked.body.get("fields").unwrap_or(&blocked.body);
+        if fields["blocked_on"] != "human"
+            || fields["incarnation_id"] != incarnation
+            || !st_drivers::blocking_screen::claude_input_ready(screen)
+        {
+            return Ok(());
+        }
+        self.store.append_claim(&ClaimInput {
+            subject: subject.subject.clone(),
+            kind: "harness.diagnostic".into(),
+            actor: Some(subject.subject.clone()),
+            fields: BTreeMap::from([
+                ("code".into(), Value::String("native-prompt-gone".into())),
+                ("status".into(), Value::String("resolved".into())),
+                ("driver".into(), Value::String("claude".into())),
+                ("observation".into(), Value::String(blocked.id.clone())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ]),
+            evidence: vec![blocked.id.clone()],
+            expected_subject: None,
+            idempotency_key: Some(format!("native-prompt-gone:{}", blocked.id)),
+        })?;
+        self.signal_changed();
+        Ok(())
     }
 
     /// Extend the existing authentication fence with driver-specific screen variants and
