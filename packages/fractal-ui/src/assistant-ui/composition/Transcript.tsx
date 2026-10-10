@@ -191,10 +191,10 @@ const newestPageRows = 6
 const backfillChunkRows = 4
 const mountedStart = (mounted: MountedTurns, rows: readonly ConversationItem[]) =>
   mounted._tag === 'All' ? 0 : mounted._tag === 'NewestPage' ? Math.max(0, rows.length - newestPageRows) : Math.max(0, rows.findIndex(row => row.id === mounted.id))
-/** Keep the owning turn's identity and summary while revealing only the mounted suffix of its source rows. */
+/** Keep the owning turn's identity and summary, and the newest prompt even outside the source-row suffix. */
 const windowTurns = (turns: readonly TranscriptTurn[], start: number): readonly TranscriptTurn[] => {
   let offset = 0
-  return turns.flatMap(turn => {
+  return turns.flatMap((turn, index) => {
     const length = turn.items.length + (turn.prompt === undefined ? 0 : 1)
     const skip = Math.max(0, start - offset)
     offset += length
@@ -202,7 +202,7 @@ const windowTurns = (turns: readonly TranscriptTurn[], start: number): readonly 
     if (skip === 0) return [turn]
     const items = turn.items.slice(skip - (turn.prompt === undefined ? 0 : 1))
     const ids = new Set(items.map(item => item.id))
-    return [{ ...turn, prompt: undefined, items, work: { ...turn.work, calls: turn.work.calls.filter(call => ids.has(call.id)) } }]
+    return [{ ...turn, prompt: index === turns.length - 1 ? turn.prompt : undefined, items, work: { ...turn.work, calls: turn.work.calls.filter(call => ids.has(call.id)) } }]
   })
 }
 const whenIdle = (task: () => void): (() => void) => {
