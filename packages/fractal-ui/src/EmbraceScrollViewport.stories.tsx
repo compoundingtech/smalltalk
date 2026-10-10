@@ -1,7 +1,7 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import type { Meta, StoryObj } from '@storybook/react-vite'
-import { expect, userEvent, within } from 'storybook/test'
+import { expect, userEvent, waitFor, within } from 'storybook/test'
 import { Button } from 'react-aria-components'
 import { EmbraceScrollViewport } from './assistant-ui/EmbraceScrollViewport'
 import { baselineTheme } from './assistant-ui/neutral-theme'
@@ -21,6 +21,7 @@ const frame = () => new Promise<void>(resolve => requestAnimationFrame(() => req
 export const FollowingAndAnchored: Story = { play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const viewport = canvas.getByTestId('scroll-viewport')
+  await document.fonts.ready
   await frame()
   await expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(1)
   await userEvent.click(canvas.getByRole('button', { name: 'Append message' }))
@@ -42,7 +43,7 @@ export const FollowingAndAnchored: Story = { play: async ({ canvasElement }) => 
   await expect(Math.abs(anchor.getBoundingClientRect().top - viewport.getBoundingClientRect().top - offset)).toBeLessThanOrEqual(1)
   await userEvent.click(canvas.getByRole('button', { name: 'Scroll to end' }))
   await frame()
-  await expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(1)
+  await waitFor(() => expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(1))
   await expect(canvas.queryByRole('button', { name: 'Scroll to end' })).toBeNull()
 } }
 export const FollowingAndAnchoredLight: Story = { ...FollowingAndAnchored, args: { scheme: 'light' } }
