@@ -579,7 +579,7 @@ fn append_timeline_operations(
                 serde_json::to_string(operation)?
             ],
         )?;
-        append_event(&tx, "harness-timeline", &serde_json::to_value(operation)?)?;
+        append_event(tx, "harness-timeline", &serde_json::to_value(operation)?)?;
     }
     tx.execute("DELETE FROM timeline WHERE id NOT IN (SELECT id FROM timeline ORDER BY id DESC LIMIT 4096)", [])?;
     tx.execute("DELETE FROM timeline WHERE id IN (
