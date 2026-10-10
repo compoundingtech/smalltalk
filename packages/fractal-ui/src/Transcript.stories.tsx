@@ -235,6 +235,10 @@ function UnavailableComposerStory({ scheme = 'dark' }: { scheme?: Scheme }) {
     <div data-testid="host-composer" {...stylex.props(styles.composerDock)}><EmbraceComposer variant="C1" /></div>
   </section></EmbraceRuntimeProvider></main>
 }
+export const NotFoundWithComposer: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={noMessages}><section aria-label="Conversation" {...stylex.props(styles.thread)}>
+  <Transcript title="Row projection" turns={[]} sync={cases['sync-failed'].sync} now={now} observedAt={now} availability={{ _tag: 'Unavailable', reason: 'Conversation not found', action: { label: 'Try again', onPress: tryAgain } }} />
+  <div {...stylex.props(styles.composerDock)}><EmbraceComposer variant="C1" readingColumn disabledReason="Conversation not found" /></div>
+</section></EmbraceRuntimeProvider></main> }
 export const UnavailableWithComposer: Story = { render: args => <UnavailableComposerStory scheme={args.scheme} />, play: async ({ canvasElement }) => {
   tryAgain.mockClear()
   const state = await expectUnavailableState(canvasElement, 'Try again')
