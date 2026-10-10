@@ -116,6 +116,7 @@ pub use smallclaims::store::{
 mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
+pub(crate) use attention_snapshot::native_prompt_gone_key;
 // Registration stays opt-in until the shared installer certifies every source family.
 #[cfg_attr(
     not(test),
@@ -55084,10 +55085,20 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             json!({"state":"working", "incarnation_id":"one", "blocked_on":"human", "ask":"question"}),
         );
         assert_eq!(prompts()[0].episode, again.id);
-        append(
-            "harness.diagnostic",
-            json!({"code":"native-prompt-gone", "incarnation_id":"one", "observation": again.id}),
-        );
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: serde_json::from_value(
+                    json!({"code":"native-prompt-gone", "incarnation_id":"one"}),
+                )
+                .unwrap(),
+                evidence: vec![again.id.clone()],
+                expected_subject: None,
+                idempotency_key: Some(attention_snapshot::native_prompt_gone_key(&again.id)),
+            })
+            .unwrap();
         assert!(prompts().is_empty());
         // A prompt from an incarnation that is no longer running waits on nobody.
         append(

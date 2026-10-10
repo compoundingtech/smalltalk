@@ -99,14 +99,14 @@ impl Store {
             if harness["blocked_on"] != "human" {
                 continue;
             }
-            // The prompt was refused in the terminal, which its harness did not report.
+            // The prompt was refused in the terminal, which its harness did not report: the
+            // reconciler recorded that once, keyed by this observation.
             let gone: bool = connection
                 .prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='harness.diagnostic'
-                       AND json_extract(body, '$.fields.code')='native-prompt-gone'
-                       AND json_extract(body, '$.fields.observation')=?2)",
+                    "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_operation_index
+                       WHERE json_extract(body, '$._operation.id')=?1)",
                 )?
-                .query_row(params![seat, claim], |row| row.get(0))?;
+                .query_row([native_prompt_gone_operation(&claim)], |row| row.get(0))?;
             if gone {
                 continue;
             }
@@ -1386,4 +1386,13 @@ pub(super) fn conversation_agent(
             .optional()?
             .and_then(|header| agent(&header.requester)),
     )
+}
+
+/// The idempotency key of the record that a native prompt opened by `observation` is gone.
+pub(crate) fn native_prompt_gone_key(observation: &str) -> String {
+    format!("native-prompt-gone:{observation}")
+}
+
+fn native_prompt_gone_operation(observation: &str) -> String {
+    smallclaims::store::operation_id_for_key(&native_prompt_gone_key(observation))
 }

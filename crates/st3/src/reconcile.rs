@@ -3462,12 +3462,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 ("code".into(), Value::String("native-prompt-gone".into())),
                 ("status".into(), Value::String("resolved".into())),
                 ("driver".into(), Value::String("claude".into())),
-                ("observation".into(), Value::String(blocked.id.clone())),
                 ("incarnation_id".into(), Value::String(incarnation.into())),
             ]),
             evidence: vec![blocked.id.clone()],
             expected_subject: None,
-            idempotency_key: Some(format!("native-prompt-gone:{}", blocked.id)),
+            idempotency_key: Some(crate::store::native_prompt_gone_key(&blocked.id)),
         })?;
         self.signal_changed();
         Ok(())
