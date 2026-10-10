@@ -106,6 +106,9 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
     items: state._tag === 'Observed' ? state.items : [],
     refusal, onRefused: setRefusal,
   })
+  const composerHistory = React.useMemo(() => state._tag === 'Observed'
+    ? state.items.flatMap(item => item._tag === 'Text' && item.role === 'user' ? [item.text] : [])
+    : [], [state])
   const retryConversation = source.retryConversation
   return <EmbraceRuntimeProvider key={agentRef} options={{ ...binding.runtime, isRunning: state._tag === 'Observed' && state.isRunning }}>
     {/* Bound the 100%-height kit frame to the space left above the composer. */}
@@ -139,7 +142,7 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
     <LiveAgentTodos agentRef={agentRef} />
     {/* An unreadable conversation keeps its composer and draft; the binding names why sending waits. */}
     <div data-testid="conversation-composer-dock" style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', minHeight: `calc(${geometryVars.controlLg} + ${geometryVars.controlMd} + 3 * ${spaceVars.md} + 2 * ${geometryVars.hairline} + ${spaceVars.lg})`, paddingBottom: spaceVars.lg }}>
-      <EmbraceComposer variant="C1" readingColumn disabledReason={binding.disabledReason} />
+      <EmbraceComposer variant="C1" readingColumn showHistory history={composerHistory} disabledReason={binding.disabledReason} />
     </div>
   </EmbraceRuntimeProvider>
 })

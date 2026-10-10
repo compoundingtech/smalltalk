@@ -7,6 +7,11 @@ It has two layers:
 - `.` (`kit.tsx`, `tokens.css`): token-driven component families. The workshop renders them in three switchable visual directions (**Folio**, **Relay**, **Orbit**), each with light and dark palettes and two densities.
 - `./assistant-ui` and its subpaths: the dark-first application surfaces the web app composes, built on assistant-ui 0.15.25. They cover the transcript, composer, tool calls and previews, the sidebar agent row and status glyph, the thread header, resizable splits, resource cards, the work log, the sync line and the workbench layout model, plus rich markdown with highlighted code, the thinking disclosure and the dismissible failure layer. Every surface is controlled: the host supplies data, clock and transport, and unknown values render as unknown.
 
+`EmbraceComposer` hosts may enable `showHistory` and supply oldest-first `history`.
+The clock action remains beside Send while focused, restores the previous submitted
+draft, and is disabled for empty history or a read-only conversation. ArrowUp on
+an empty plain field recalls history; ArrowDown restores the original draft.
+
 ## Run
 
 ```sh
