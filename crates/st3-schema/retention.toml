@@ -34,6 +34,7 @@
 "checkpoint.excused" = { class = "durable" }
 "checkpoint.sealed" = { class = "durable" }
 "checkpoint.verified" = { class = "durable" }
+"condition.state" = { class = "durable" }
 "daemon.diagnostic" = { class = "current" }
 "daemon.started" = { class = "transition", window = "7d", pending = "restart windows read every start" }
 "delivery.hold" = { class = "durable" }
