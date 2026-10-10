@@ -1130,6 +1130,66 @@ so nothing loops. The fault is closed when the reporter is told, the run's repor
 A nested run reports only if its own mission asks. A run that is terminated because the run above
 it ended is reported through the run above it.
 
+## Idle holders
+
+A run report tells the run's reporter. An idle-hold nudge tells the seat that holds the work.
+
+A seat is idle-holding when it holds a claimed step, its harness has finished its turn, and nothing
+will wake it. Its harness has finished when the driver reports it idle and quiet: no turn in
+flight, no open prompt, no unsent input, no background jobs, and no subagents st records for it.
+Nothing will wake it when no message to it is waiting for delivery and none of its waits holds.
+
+A wait is anything the seat has subscribed to that will wake it. Each source records its waits
+with a subject, when the wait last woke the seat (or when the wait began), and sometimes a time it
+is expected by:
+
+| Source | Subject | Expected by |
+| --- | --- | --- |
+| gh watch | the watched issue or pull request | the watch's `--until` |
+| person ask | the person step an asking step waits on | none |
+| gate | a submitted step that is verifying, or a step with a predicate `depends-on` | none |
+| scheduled retry | the step | the retry's not-before time |
+| depends-on | a step another seat holds that one of the seat's steps waits for | none |
+| report-to | an open run that reports to the seat | none |
+
+A wait holds until its expected-by time when it has one. Otherwise it holds for the quiet window,
+2 hours by default, after it last woke the seat. Only an event delivered to the seat restarts the
+clock. A delivered event wakes the seat anyway, which ends its idle period. A movement the source
+saw but did not deliver never extends a hold: a merge queue reordering, a new head with no check
+verdict yet, or another seat's progress on a step this seat depends on.
+
+After 30 minutes idle-holding, st sends the seat one message from `daemon/runtime`. The message
+names each held step with its title, goals and last progress line, says how long the seat has been
+idle, and lists the waits that have gone quiet, with each wait's subject and when it last moved.
+It asks the seat to continue the work, set a watch on what it waits for, or release the step.
+
+Some movements a source saw but did not deliver mean the seat must act. Today one source can tell:
+a watched pull request that leaves the merge queue without merging and is still out of it 5
+minutes later. GitHub briefly reports a queued pull request as out of the queue while the queue
+rebuilds; the 5-minute settle skips those. When this happens, an idle seat is nudged at once,
+without waiting out the 30 minutes. The nudge names the pull request and asks the seat to check it:
+still queued, ejected, or stuck.
+
+Back-off: a step gets at most one nudge per idle period. After a nudge, the next one waits until
+the seat has taken a turn and gone idle again, and a quiet nudge comes no sooner than 2 hours after
+the step's last nudge. An action nudge is not held by the 2 hours, but each action nudges a step at
+most once. Every nudge is recorded on the step as a `work.nudged` claim that names the message,
+the idle period and the waits. `st work show` prints `Nudged:` while the step is held, and stui
+shows `nudged … ago` under the working step.
+
+Two daemon settings in `[reconcile]` tune this, and are read again without a restart:
+
+```toml
+[reconcile]
+idle_nudge_after = "30m"       # or "off"
+idle_nudge_quiet_watch = "2h"
+```
+
+The check runs inside the seat's existing wake evaluation, after the cheap conditions: a held
+step, an idle harness, the step's back-off, a quiet report, no subagents, no pending mail. It then
+reads each wait source, cheapest first, and stops at the first wait that holds. A seat that is not
+due yet records when it will be, so nothing polls.
+
 ## Runtime sequence
 
 Each run starts with all steps in pending state.
