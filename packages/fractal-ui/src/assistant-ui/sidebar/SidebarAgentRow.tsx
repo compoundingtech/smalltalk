@@ -148,18 +148,19 @@ export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, varia
   const spendFields = item.usage._tag === 'Unknown' ? null : <span {...stylex.props(styles.metric)}><span data-row-field="total-usd" title={`${usageScope}: $${usd}`} aria-label={`${usageScope}: $${usd}`}>{spendCount.format(item.usage.usd)}</span><span data-row-field="total-tokens" data-line1-drop="tokens" title={`${usageScope}: ${tokens} tokens`} aria-label={`${usageScope}: ${tokens} tokens`}>{tokenCount.format(item.usage.tokens)}</span></span>
   const durationField = item.duration._tag === 'Unknown' ? null : <span data-row-field="total-duration"><SidebarDuration row={item} /></span>
   const lastTurnField = item.lastTurn._tag === 'Unknown' ? null : <span data-row-field="last-turn"><SidebarTime at={item.lastTurn.at} {...clock} kind={item.lastTurn.kind === 'turn-completed' ? 'turn' : 'activity'} compact /></span>
-  // The status glyph and badges sit outside the row button; their reported facts join its content-derived name. The SG-2 status word and the SR2-C status label already show the status inside it.
+  // The status glyph and badges sit outside the row button; their reported facts join its content-derived name. The SG-2 status word already names the status.
+  // The SR2-C status label is a line-two signal the fit may drop, so it stays out of the name and the status remains a name fact.
   // The hidden span is block-level for accessible-name purposes, so browsers separate it from the title with a space: hence the parentheses.
   const statusNamed = item.statusLabel.trim() !== ''
   const needsNamed = extraSignals.includes('X-needs') && item.needsMe === true
   const unreadNamed = extraSignals.includes('X-unread') && (item.unread ?? 0) > 0
-  const nameFacts = [statusNamed && rowGlyph !== 'SG-2' && rowLayout !== 'SR2-C' ? item.statusLabel : undefined, needsNamed ? 'needs your attention' : undefined, unreadNamed ? `${item.unread} unread` : undefined].filter(fact => fact !== undefined)
+  const nameFacts = [statusNamed && rowGlyph !== 'SG-2' ? item.statusLabel : undefined, needsNamed ? 'needs your attention' : undefined, unreadNamed ? `${item.unread} unread` : undefined].filter(fact => fact !== undefined)
   // The button's description carries only what its name does not already say; hover, details and title keep the full metadata.
   const buttonDescription = React.useMemo(() => sidebarRowDescription(item, { title: true, status: statusNamed, needsMe: needsNamed, unread: unreadNamed }), [item, statusNamed, needsNamed, unreadNamed])
   const content = <>
     <span data-row-column="title" {...stylex.props(styles.title, variant === 'SR-2' && item.children.length > 0 && styles.hasChildren)} title={metadata}>{rowGlyph === 'SG-2' && <span {...stylex.props(styles.statusWord)}>{item.statusLabel}</span>}<span data-row-column="title-text" {...stylex.props(styles.name)}><Highlight value={title} query={query} />{nameFacts.length > 0 && <VisuallyHidden elementType="span" data-row-name-facts>({nameFacts.join(', ')})</VisuallyHidden>}</span></span>
     {variant !== 'SR-1' && <SidebarRowSignals>
-      {rowLayout === 'SR2-C' && <span data-row-field="status-label" data-row-retention="7" title={item.statusLabel}>{item.statusLabel}</span>}
+      {rowLayout === 'SR2-C' && <span data-row-field="status-label" data-row-retention="7" title={item.statusLabel} aria-hidden="true">{item.statusLabel}</span>}
       {extraSignals.includes('X-work') && item.description !== undefined && <span data-row-field="current-work" data-row-signal="X-work" data-row-retention="2" title={item.description}>{item.description}</span>}
       <span data-row-field="host" data-row-retention="3" title={`Host: ${host}`} aria-label={`Host ${host}`} aria-description={metadata}>{host}</span>
       {rowLayout === 'SR2-A' && <span data-row-retention="5">{spendFields}</span>}
