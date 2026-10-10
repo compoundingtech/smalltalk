@@ -192,7 +192,7 @@ done
 } >"$root/seats.kdl"
 cp "$root/seats.kdl" "$out/evidence/seats.kdl"
 started_at=$(now_ms)
-st3 agents apply "$root/seats.kdl" --as person/eval >"$out/evidence/apply.txt"
+st3 apply "$root/seats.kdl" --no-gate-check --as person/eval >"$out/evidence/apply.txt"
 
 declare -A idle_ok start_turns start_working st3_left exclude_left skill_ok
 for harness in "${harnesses[@]}"; do
@@ -228,7 +228,7 @@ done
   echo '}'
 } >"$root/mission.kdl"
 cp "$root/mission.kdl" "$out/evidence/mission.kdl"
-st3 missions publish "$root/mission.kdl" --as person/eval >"$out/evidence/publish.txt"
+st3 apply "$root/mission.kdl" --as person/eval >"$out/evidence/publish.txt"
 st3 --json missions start eval/no-boot --id nb --workspace "$root/ws" --as person/eval >"$out/evidence/start.json"
 declare -A message
 for harness in "${harnesses[@]}"; do

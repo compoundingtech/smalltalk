@@ -17,8 +17,8 @@ version 2
 //
 //   run_root="$(mktemp -d)"
 //   git clone git@example.invalid:example/app.git "$run_root/repo"
-//   st agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st missions publish examples/st3/fan-out.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/omp.kdl --as person/operator
+//   st apply examples/st3/fan-out.kdl --as person/operator
 //   st missions start example/fan-out --id example/fan-out/2026-10-01 \
 //     --workspace "$run_root" --as person/operator --follow
 //

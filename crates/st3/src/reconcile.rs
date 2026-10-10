@@ -20620,7 +20620,7 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
         }
     }
 
-    /// Publish `source` as `actor`, as `st missions publish --as ACTOR` records its publisher.
+    /// Publish `source` as `actor`, as `st apply FILE --as ACTOR` records its publisher.
     fn publish_as(
         store: &Store,
         source: &str,
