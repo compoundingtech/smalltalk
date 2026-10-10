@@ -1268,8 +1268,10 @@ mission "garden/proposed" state="ready" revisions="human-only" revision-reviewer
         }
         // `Store::work_action_with_handoff` follows a revision's carried claim to its successor
         // step; with no successor carrying it, a step of a superseded generation is refused as
-        // `stale-run-generation`, and this named input cannot change this way. Any other error
-        // is a mistake in this fixture, not that refusal.
+        // `stale-run-generation`. That proves only that this local route refuses this case; it
+        // does not exercise the index's coverage of named runs (the source argument and the
+        // shared oracle do), nor the replicated `handoff_to` projection, which does not check the
+        // generation. Any other error is a mistake in this fixture, not that refusal.
         Err(error) => assert_eq!(error.code, "stale-run-generation", "{error:?}"),
     }
 }
