@@ -568,7 +568,8 @@ describe('ConversationPane composition activation', () => {
       await mount()
     }
     await show(items)
-    expect(container.querySelectorAll('[data-testid="transcript-turn"]')).toHaveLength(6)
+    // The bounded branch mounts six source rows, not six complete turns.
+    expect(container.querySelectorAll('[data-testid="transcript-turn"]')).toHaveLength(2)
     expect(container.querySelector('[data-testid="user-message"][data-item-id="turn/0/p1"]')).toBeNull()
     const newest = container.querySelector('[data-testid="transcript-turn"][data-item-id="turn/11/p1"]')!
     await act(async () => { newest.querySelector<HTMLButtonElement>('[data-testid="work-log"] > button')!.click() })
