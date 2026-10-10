@@ -12,6 +12,31 @@
 use super::*;
 use std::time::{Duration, Instant};
 
+const CLAIM_REMAINDER_PAGE: &str =
+    "SELECT json_extract(body,'$._operation.id'),
+            json_extract(body,'$._operation.request_digest'), id, rowid
+     FROM claims INDEXED BY claims_operation_index
+     WHERE json_extract(body,'$._operation.id')=?1 AND rowid>?2 AND store_index<=?3
+       AND json_type(body,'$._operation.id')='text'
+       AND json_type(body,'$._operation.request_digest')='text'
+       AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
+     ORDER BY rowid LIMIT 128";
+const CLAIM_NEXT_PAGE: &str =
+    "SELECT json_extract(body,'$._operation.id'),
+            json_extract(body,'$._operation.request_digest'), id, rowid
+     FROM claims INDEXED BY claims_operation_index
+     WHERE json_extract(body,'$._operation.id')>?1 AND ?2 IS NOT NULL AND store_index<=?3
+       AND json_type(body,'$._operation.id')='text'
+       AND json_type(body,'$._operation.request_digest')='text'
+       AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
+     ORDER BY json_extract(body,'$._operation.id'),rowid LIMIT 128";
+const CHECKPOINT_PAGE: &str =
+    "SELECT rowid,operation_id,request_digest,id FROM checkpoint_claims
+     WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT 128";
+const ACTUAL_PAGE: &str =
+    "SELECT id,request_digest,canonical_claim_id,state FROM operations
+     WHERE id>=?1 AND (?2 OR id>?1) AND rowid<=?3 ORDER BY id LIMIT 128";
+
 // The callback consumes each row immediately. No body, page vector, or actual-table map
 // survives a page. The observer runs after ROLLBACK has released the read snapshot.
 fn page(
@@ -89,23 +114,9 @@ impl Store {
             // Separate seeks avoid a row-value SCAN and a UNION merge's unbounded
             // temporary sort for a single operation with many claims.
             let sql = if remainder {
-                "SELECT json_extract(body,'$._operation.id'),
-                        json_extract(body,'$._operation.request_digest'), id, rowid
-                 FROM claims INDEXED BY claims_operation_index
-                 WHERE json_extract(body,'$._operation.id')=?1 AND rowid>?2 AND store_index<=?3
-                   AND json_type(body,'$._operation.id')='text'
-                   AND json_type(body,'$._operation.request_digest')='text'
-                   AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
-                 ORDER BY rowid LIMIT 128"
+                CLAIM_REMAINDER_PAGE
             } else {
-                "SELECT json_extract(body,'$._operation.id'),
-                        json_extract(body,'$._operation.request_digest'), id, rowid
-                 FROM claims INDEXED BY claims_operation_index
-                 WHERE json_extract(body,'$._operation.id')>?1 AND ?2 IS NOT NULL AND store_index<=?3
-                   AND json_type(body,'$._operation.id')='text'
-                   AND json_type(body,'$._operation.request_digest')='text'
-                   AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
-                 ORDER BY json_extract(body,'$._operation.id'),rowid LIMIT 128"
+                CLAIM_NEXT_PAGE
             };
             let count = page(&connection, sql, &[&cursor, &rowid, &claim_cut], &mut |row| {
                 operation = row.get(0)?;
@@ -126,22 +137,21 @@ impl Store {
         loop {
             let cursor = tombstone_rowid;
             let count = page(&connection,
-                "SELECT rowid,operation_id,request_digest,id FROM checkpoint_claims
-                 WHERE rowid>?1 AND rowid<=?2 ORDER BY rowid LIMIT 128", &[&cursor, &checkpoint_cut], &mut |row| {
+                CHECKPOINT_PAGE, &[&cursor, &checkpoint_cut], &mut |row| {
                     let operation: Option<String> = row.get(1)?;
                     let digest: Option<String> = row.get(2)?;
-                    if let (Some(operation), Some(digest)) = (operation, digest) {
-                        if let Some(reduction) = expected.get_mut(&operation) {
-                            let id: String = row.get(3)?;
-                            let excluded: bool = connection.query_row(
-                                "SELECT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=?1)
-                                 OR EXISTS(SELECT 1 FROM claims WHERE id=?1
-                                   AND json_type(body,'$._operation.id')='text'
-                                   AND json_type(body,'$._operation.request_digest')='text'
-                                   AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id))",
-                                [&id], |row| row.get(0))?;
-                            if !excluded { reduction.include(digest, id, false); }
-                        }
+                    if let (Some(operation), Some(digest)) = (operation, digest)
+                        && let Some(reduction) = expected.get_mut(&operation)
+                    {
+                        let id: String = row.get(3)?;
+                        let excluded: bool = connection.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=?1)
+                             OR EXISTS(SELECT 1 FROM claims WHERE id=?1
+                               AND json_type(body,'$._operation.id')='text'
+                               AND json_type(body,'$._operation.request_digest')='text'
+                               AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id))",
+                            [&id], |row| row.get(0))?;
+                        if !excluded { reduction.include(digest, id, false); }
                     }
                     tombstone_rowid = row.get(0)?;
                     Ok(())
@@ -155,8 +165,7 @@ impl Store {
             let first = actual_cursor.is_none();
             let cursor = actual_cursor.clone().unwrap_or_default();
             let count = page(&connection,
-                "SELECT id,request_digest,canonical_claim_id,state FROM operations
-                 WHERE id>=?1 AND (?2 OR id>?1) AND rowid<=?3 ORDER BY id LIMIT 128", &[&cursor, &first, &operation_cut], &mut |row| {
+                ACTUAL_PAGE, &[&cursor, &first, &operation_cut], &mut |row| {
                     let id: String = row.get(0)?;
                     let actual = (row.get(1)?, row.get(2)?, row.get(3)?);
                     if expected.remove(&id).as_ref() != Some(&actual) { drift.push(id.clone()); }
@@ -191,5 +200,34 @@ impl Store {
     #[cfg(feature = "test-support")]
     pub fn operation_projection_drift_with_observer(&self, observer: &mut dyn FnMut(Duration)) -> Result<Vec<String>> {
         self.operation_audit(observer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operation_audit_pages_seek_their_indexes_without_full_scans_or_sorts() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.readers.get();
+        let cursor = "";
+        let rowid = 0_i64;
+        let cut = i64::MAX;
+        let first = true;
+        let cases: [(&str, &[&dyn rusqlite::ToSql], &str); 4] = [
+            (CLAIM_REMAINDER_PAGE, &[&cursor, &rowid, &cut], "SEARCH claims USING INDEX claims_operation_index"),
+            (CLAIM_NEXT_PAGE, &[&cursor, &rowid, &cut], "SEARCH claims USING INDEX claims_operation_index"),
+            (CHECKPOINT_PAGE, &[&rowid, &cut], "SEARCH checkpoint_claims USING INTEGER PRIMARY KEY"),
+            (ACTUAL_PAGE, &[&cursor, &first, &cut], "SEARCH operations USING INDEX sqlite_autoindex_operations_1"),
+        ];
+        for (sql, parameters, index) in cases {
+            let plan = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap()
+                .query_map(parameters, |row| row.get::<_, String>(3)).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap().join("; ");
+            assert!(plan.contains(index), "{plan}");
+            assert!(!plan.contains("SCAN "), "{plan}");
+            assert!(!plan.contains("USE TEMP B-TREE"), "{plan}");
+        }
     }
 }

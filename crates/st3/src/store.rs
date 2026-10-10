@@ -3740,14 +3740,19 @@ impl Store {
 
     /// Repair only keys found by an earlier audit, re-deriving them from current claims.
     /// A concurrent append cannot make an old finding overwrite the new canonical row.
+    /// At most 16 keys share a writer transaction; release the writer between batches.
+    /// This bounds the batch, not the work of one key with arbitrarily many source claims.
     pub fn repair_operation_projection_drift_from_audit(&self, drift: &[String]) -> Result<bool> {
         if drift.is_empty() {
             return Ok(false);
         }
-        let mut connection = self.connection.write();
-        let transaction = connection.transaction()?;
-        let changed = repair_operations_tx(&transaction, drift)?;
-        transaction.commit()?;
+        let mut changed = 0;
+        for batch in drift.chunks(16) {
+            let mut connection = self.connection.write();
+            let transaction = connection.transaction()?;
+            changed += repair_operations_tx(&transaction, batch)?;
+            transaction.commit()?;
+        }
         Ok(changed != 0)
     }
 

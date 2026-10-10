@@ -702,3 +702,25 @@ fn cancellation_between_units_stops_an_empty_audit() {
     assert!(result.is_err());
     assert_eq!(snapshots, 1, "cancellation must stop the next unit before its snapshot");
 }
+
+#[test]
+fn operation_audit_repair_commits_at_most_sixteen_keys_per_writer_transaction() {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    let directory = tempfile::tempdir().unwrap();
+    let EdgeStore { store, .. } = edge_store_in(&directory);
+    execute(&store, "UPDATE operations SET request_digest='d/corrupt'", []);
+    let drift = store.operation_projection_drift().unwrap();
+    assert!(drift.len() > 32, "the fixture must need several repair batches");
+    let commits = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&commits);
+    store.connection.write().commit_hook(Some(move || {
+        observed.fetch_add(1, Ordering::Relaxed);
+        false
+    }));
+    assert!(store.repair_operation_projection_drift_from_audit(&drift).unwrap());
+    store.connection.write().commit_hook(None::<fn() -> bool>);
+    assert_eq!(commits.load(Ordering::Relaxed), drift.len().div_ceil(16));
+    assert!(old_drift(&store).is_empty());
+    assert!(store.operation_projection_drift().unwrap().is_empty());
+}
