@@ -4,7 +4,7 @@ import { flushSync } from 'react-dom'
 import { ActionBarPrimitive, MessagePrimitive, ThreadPrimitive, useAuiState } from '@assistant-ui/react'
 import { Button, Disclosure, DisclosurePanel, ProgressBar } from 'react-aria-components'
 import type { ConversationItem, MessageItem, TextItem } from '../embrace-data/model'
-import { EmbraceScrollViewport, type ViewportAnchorHistory } from '../EmbraceScrollViewport'
+import { EmbraceScrollViewport, type EmbraceScrollViewportHandle, type ViewportAnchorHistory } from '../EmbraceScrollViewport'
 import { RuntimeAdoptedIds } from '../EmbraceRuntime'
 import { WorkLogV1 } from '../taste/WorkLogV1'
 import { formatWorkDuration, workLogOutputLanguage, type WorkLogCall, type WorkLogTurn } from '../taste/work-log'
@@ -289,6 +289,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     if (strandedIds !== '' && process.env.NODE_ENV !== 'production') console.warn(`Transcript: the runtime never adopted ${strandedIds}; showing a fallback row.`)
   }, [strandedIds])
   const timeline = React.useRef<HTMLDivElement>(null)
+  const viewport = React.useRef<EmbraceScrollViewportHandle>(null)
   const [proximity] = React.useState(() => new TurnProximity())
   React.useLayoutEffect(() => proximity.attach(scrollerOf(timeline.current)), [proximity, committed.length === 0])
   // Each commit mounts a bounded source-row suffix, including oversized single turns. Idle backfill
@@ -380,7 +381,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
       {committed.length > 0 && <SyncLine status={sync} label="conversation" now={now} observedAt={observedAt} onRetry={onRetrySync} />}
       {running !== undefined && <><div role="progressbar" aria-label="Run in progress" aria-valuetext="Running" data-testid="run-progress" {...stylex.props(styles.runningProgress)}><span {...stylex.props(styles.runningSegment)} /></div><span data-testid="run-elapsed">Running{Number.isFinite(started) && started <= now ? ` · ${formatWorkDuration(now - started) || '<1s'}` : ''}</span></>}
     </header>
-    <ErrorOverlayHost lane><EmbraceScrollViewport items={rows} anchorHistory={anchorHistory} stateKey={viewportKey} scrollToBottomKey={scrollToBottomKey} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
+    <ErrorOverlayHost lane><EmbraceScrollViewport ref={viewport} items={rows} anchorHistory={anchorHistory} stateKey={viewportKey} scrollToBottomKey={scrollToBottomKey} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
       {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
       {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(visibleTurns, 0, gridOrigin - turnStart).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
     </EmbraceScrollViewport>{failure?.tone === 'error' && <ErrorOverlay id={`sync-${failure.text}`} title={failure.text} detail="History stays on screen." onRetry={onRetrySync} />}</ErrorOverlayHost>
