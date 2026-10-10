@@ -1058,7 +1058,24 @@
             "last seen 2d ago"
           ]
         ],
-        "load": "2 agents",
+        "metrics": [
+          {
+            "id": "machine/lark#agents-running",
+            "kind": "agents_running",
+            "label": "agents",
+            "subject": "machine/lark",
+            "tone": "normal",
+            "value": "2 running"
+          },
+          {
+            "id": "machine/lark#load-1m",
+            "kind": "host_load",
+            "label": "load 1m",
+            "subject": "machine/lark",
+            "tone": "normal",
+            "value": "0.84 / 10 cpu"
+          }
+        ],
         "name": "lark",
         "platform": "macOS · arm64",
         "reach": "here",
@@ -1078,7 +1095,24 @@
             "last seen 2d ago"
           ]
         ],
-        "load": "6 agents · 41% cpu",
+        "metrics": [
+          {
+            "id": "machine/harbor#agents-running",
+            "kind": "agents_running",
+            "label": "agents",
+            "subject": "machine/harbor",
+            "tone": "normal",
+            "value": "6 running"
+          },
+          {
+            "id": "machine/harbor#load-1m",
+            "kind": "host_load",
+            "label": "load 1m",
+            "subject": "machine/harbor",
+            "tone": "busy",
+            "value": "17.20 / 16 cpu"
+          }
+        ],
         "name": "harbor",
         "platform": "linux · x86_64",
         "reach": "direct",
@@ -1087,7 +1121,24 @@
       },
       {
         "links": [],
-        "load": null,
+        "metrics": [
+          {
+            "id": "machine/wren#agents-running",
+            "kind": "agents_running",
+            "label": "agents",
+            "subject": "machine/wren",
+            "tone": "normal",
+            "value": "0 running"
+          },
+          {
+            "id": "machine/wren#load-1m",
+            "kind": "host_load",
+            "label": "load 1m",
+            "subject": "machine/wren",
+            "tone": "unknown",
+            "value": "not reported"
+          }
+        ],
         "name": "wren",
         "platform": "linux · arm64",
         "reach": "offline",
