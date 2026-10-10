@@ -938,9 +938,9 @@ async fn manual_authored_selection_publication(
     let subject = "agent/garden/orchard";
     let workspace = root.path().join("orchard");
     std::fs::create_dir_all(&workspace).unwrap();
-    let bundle = |model: &str, description: &str, manual: bool, authored: bool| {
+    let bundle = |model: &str, name: &str, manual: bool, authored: bool| {
         format!(
-            "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace {:?}; description {description:?}; {} harness \"claude\" {{ model {model:?}; {} }}; render {{ file \"active-model\" {model:?}; }} }}\n",
+            "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace {:?}; name {name:?}; {} harness \"claude\" {{ model {model:?}; {} }}; render {{ file \"active-model\" {model:?}; }} }}\n",
             workspace.display().to_string(),
             if manual { "rollout \"manual\";" } else { "" },
             if authored {
@@ -1042,11 +1042,24 @@ async fn manual_authored_selection_publication(
         // metadata-only assertion, without pretending the reconciler rolled it out.
         incarnation = "authored-orchard";
         launched_token = d.store.selected_desired_token(subject).unwrap().unwrap();
+        let authored_member = d
+            .store
+            .desired_subject_with_writer(subject)
+            .unwrap()
+            .unwrap()
+            .0
+            .member
+            .unwrap();
+        runtime
+            .observations
+            .lock()
+            .expect("fixture mutex")
+            .remove(&member.runtime_id);
         runtime.observations.lock().expect("fixture mutex").insert(
-            member.runtime_id.clone(),
+            authored_member.runtime_id.clone(),
             RuntimeObservation {
-                runtime_id: member.runtime_id.clone(),
-                terminal: true,
+                runtime_id: authored_member.runtime_id.clone(),
+                terminal: authored_member.terminal,
                 status: "running".into(),
                 incarnation_id: Some(incarnation.into()),
                 exit_code: None,
@@ -1062,12 +1075,13 @@ async fn manual_authored_selection_publication(
             &d.store,
             subject,
             "runtime.observed",
-            json!({"status":"running","host":"amber","runtime_id":member.runtime_id,"terminal":true,"incarnation_id":incarnation}),
+            json!({"status":"running","host":authored_member.host,"runtime_id":authored_member.runtime_id,"terminal":authored_member.terminal,"incarnation_id":incarnation}),
         );
         native_observation(&d.store, subject, incarnation);
         reconciler.reconcile_once().unwrap();
 
-        // Only the description changes; the authored selector and launch remain unchanged.
+        // Only the presentation name changes, which shares launch lineage with its
+        // predecessor; the authored selector and launch remain unchanged.
         let mut metadata = request(&d, 3, bundle("first", "metadata-only", true, true)).await;
         let metadata_preview = preview(&d, &mut metadata).await;
         assert_eq!(metadata_preview.changes[subject], "changed");
