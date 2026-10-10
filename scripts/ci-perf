@@ -66,7 +66,7 @@ PY
     printf '%s %s\n' "$((SECONDS - link_start))" "$link_status" > "$out/link-minutes.time"
     printf '| link-minutes quarantine (owner: merge-queue-flakes) | %s | %ss | %s |\n' "$link_result" "$((SECONDS - link_start))" "$link_status" >> "$GITHUB_STEP_SUMMARY"
     status=$link_status
-    rm -f "$out/cost.json"
+    rm -f "$out/cost.json" "$out/cost.conditions.json"
     # One st3 cargo invocation builds and runs. Counts do not depend on build speed, so
     # the job's lightly optimized build only makes the stores generate faster. Counts are the whole
     # process's, so nothing else may run beside the check.
