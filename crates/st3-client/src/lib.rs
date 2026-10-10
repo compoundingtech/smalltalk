@@ -1247,8 +1247,8 @@ impl Client {
         self.list_internal_with_filters("agents", cursor, limit, history, &[("status", status)])
             .await
     }
-    /// Best-effort fresh agents: wait briefly for a healthy in-flight refresh, otherwise
-    /// return the newest publication with its original snapshot cut and publication time.
+    /// Fresh agents: request a refresh and wait briefly for its publication. Return the last
+    /// publication at once only after a failed latest attempt with no newer attempt in flight.
     pub async fn agents_list_fresh(
         &self,
         status: Option<&str>,

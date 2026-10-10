@@ -3434,9 +3434,9 @@ impl Store {
         }
     }
 
-    /// Only a healthy attempt already in flight can satisfy a fresh read's bounded wait.
-    pub(crate) fn agent_roster_refresh_can_answer(&self) -> bool {
-        self.smalltalk.agent_roster_attempt.load(std::sync::atomic::Ordering::Acquire) == 1
+    /// Only a failed latest attempt with no newer attempt in flight permits immediate fallback.
+    pub(crate) fn agent_roster_refresh_failed(&self) -> bool {
+        self.smalltalk.agent_roster_attempt.load(std::sync::atomic::Ordering::Acquire) == 2
     }
 
     pub(crate) fn previous_agent_faults(

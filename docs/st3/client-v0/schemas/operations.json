@@ -40,7 +40,7 @@
     { "id": "work.list", "method": "GET", "path": "/v1/client/work", "response": "Page" },
     { "id": "work.get", "method": "GET", "path": "/v1/client/work/{id}", "response": "Resource" },
     { "id": "resources.list", "method": "GET", "path": "/v1/client/resources", "response": "ResourcesPage" },
-    { "id": "agents.list", "method": "GET", "path": "/v1/client/agents", "response": "Page", "query": { "fresh": "optional true: wait up to two seconds for a healthy in-flight refresh; return the newest publication at once after failure or while idle" } },
+    { "id": "agents.list", "method": "GET", "path": "/v1/client/agents", "response": "Page", "query": { "fresh": "optional true: request a refresh and wait up to two seconds; return the newest publication at once only if the latest attempt failed and no newer attempt is in flight" } },
     { "id": "agents.get", "method": "GET", "path": "/v1/client/agents/{id}", "response": "Resource" },
     { "id": "agent-workspace.get", "method": "GET", "path": "/v1/client/agent-workspaces/{id}", "response": "AgentWorkspace", "scope": "read.projections" },
     { "id": "agent-declaration.get", "method": "GET", "path": "/v1/client/agent-declarations/{id}", "response": "AgentDeclaration", "scope": "read.declarations" },

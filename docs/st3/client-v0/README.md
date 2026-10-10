@@ -1673,11 +1673,12 @@ that roster's own cut in its `snapshot` (`store_index`, `created_at`) and when i
 (`published_at`). That cut can be older than the request, by about a second plus one fold.
 
 A first page answers at once. A client that prefers to see what was written before its request
-passes `fresh=true`. The daemon waits up to two seconds when a healthy refresh is in flight.
-If the last attempt failed, no attempt is in flight, or a waiting attempt fails, it returns
-the newest publication at once and asks for a refresh. Its original `store_index` and
-`published_at` show the age of those rows. `st agents ls` and `st agents tree` ask for this
-best-effort fresh read; Rust exposes `agents_list_fresh`.
+passes `fresh=true`. The daemon requests a refresh and waits up to two seconds for a publication
+at or after the request's cut, including while the refresher is idle. It returns the newest
+publication at once only if the latest attempt failed and no newer attempt is in flight.
+A failure while the read waits also wakes it. The retained publication's original `store_index`
+and `published_at` show its age. `st agents ls` and `st agents tree` ask for this fresh read;
+Rust exposes `agents_list_fresh`.
 
 A read returns a retryable 503 (the stream sends `resync`) only before a usable roster of
 the requested mode has been published, or after a full projection reset clears it. Current

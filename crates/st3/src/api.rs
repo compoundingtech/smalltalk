@@ -177,7 +177,7 @@ struct ClientListQuery {
     state: Option<String>,
     #[serde(default)]
     native_only: bool,
-    /// Agents only: best-effort fresh; await a healthy refresh, otherwise serve its last publication.
+    /// Agents only: await a fresh publication unless the latest refresh failed and none is in flight.
     #[serde(default)]
     fresh: bool,
 }
@@ -4683,7 +4683,7 @@ async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) {
     let _ = tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
         while published(store).is_none_or(|cut| cut < wanted) {
             store.request_fresh_agent_roster(history);
-            if published(store).is_some() && !store.agent_roster_refresh_can_answer() {
+            if published(store).is_some() && store.agent_roster_refresh_failed() {
                 return;
             }
             // Claims on unrelated subjects move the cut all the time; the paced refresher
@@ -24062,41 +24062,49 @@ mission "wake" state="ready" {
     }
 
     #[tokio::test]
-    async fn roster_resilience_fresh_idle_returns_but_healthy_inflight_waits_for_new_publication() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let store = &state.store;
-        let _wake = store.start_agent_roster_refresher().unwrap();
-        roster_resilience_runtime(store, "agent/retained", "old");
-        refresh_agent_roster(store, false).unwrap();
-        let old_cut = store.index().unwrap();
-        roster_resilience_runtime(store, "agent/retained", "new");
-        let query = ClientListQuery { fresh: true, ..ClientListQuery::default() };
-        // Idle is not in flight: a pending request alone cannot promise a publication.
-        let (Extension(snapshot), _) = tokio::time::timeout(Duration::from_millis(200),
-            client_agents(State(state.clone()), Extension(new_client_snapshot(&state)), Query(query.clone())))
-            .await.expect("an idle refresher must answer from the last publication").unwrap();
-        assert_eq!(snapshot.store_index, old_cut);
-        let reader = Arc::clone(store);
-        let (started, ready) = tokio::sync::oneshot::channel();
-        let (release, proceed) = std::sync::mpsc::channel();
-        let worker = tokio::task::spawn_blocking(move || reader.answer_agent_roster_requests(|| {
-            started.send(()).unwrap();
-            proceed.recv().unwrap();
-            refresh_agent_roster(&reader, false)
-        }));
-        ready.await.unwrap();
-        let read = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)), Query(query));
-        tokio::pin!(read);
-        assert!(tokio::time::timeout(Duration::from_millis(30), &mut read).await.is_err(),
-            "a healthy in-flight refresh must be awaited, not answered with old cards");
-        release.send(()).unwrap();
-        let (Extension(snapshot), Json(page)) = tokio::time::timeout(Duration::from_millis(200), read)
-            .await.expect("successful publication must wake the fresh reader").unwrap();
-        worker.await.unwrap().unwrap();
-        assert_eq!(snapshot.store_index, store.index().unwrap());
-        assert!(snapshot.store_index > old_cut);
-        assert_eq!(page.items[0]["runtime_ids"], json!(["runtime/new"]));
+    async fn roster_resilience_fresh_idle_and_new_attempt_after_failure_wait_for_written_cards() {
+        for history in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let state = state(root.path());
+            let store = &state.store;
+            let _wake = store.start_agent_roster_refresher().unwrap();
+            roster_resilience_runtime(store, "agent/retained", "old");
+            refresh_agent_roster(store, history).unwrap();
+            for failed in [false, true] {
+                let old_cut = store.index().unwrap();
+                let runtime = if failed { "after-failure" } else { "after-idle" };
+                roster_resilience_runtime(store, "agent/retained", runtime);
+                if failed {
+                    assert!(store.answer_agent_roster_requests::<()>(||
+                        anyhow::bail!("injected previous refresh failure")).is_err());
+                }
+                let read = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+                    Query(ClientListQuery { history, fresh: true, ..ClientListQuery::default() }));
+                tokio::pin!(read);
+                if !failed {
+                    assert!(tokio::time::timeout(Duration::from_millis(30), &mut read).await.is_err(),
+                        "an idle refresher must not answer a post-write fresh read with old cards");
+                }
+                let reader = Arc::clone(store);
+                let (started, ready) = tokio::sync::oneshot::channel();
+                let (release, proceed) = std::sync::mpsc::channel();
+                let worker = tokio::task::spawn_blocking(move || reader.answer_agent_roster_requests(|| {
+                    started.send(()).unwrap();
+                    proceed.recv().unwrap();
+                    refresh_agent_roster(&reader, history)
+                }));
+                ready.await.unwrap();
+                assert!(tokio::time::timeout(Duration::from_millis(30), &mut read).await.is_err(),
+                    "a newer in-flight attempt must be awaited even after a previous failure");
+                release.send(()).unwrap();
+                let (Extension(snapshot), Json(page)) = tokio::time::timeout(Duration::from_millis(200), read)
+                    .await.expect("successful publication must wake the fresh reader").unwrap();
+                worker.await.unwrap().unwrap();
+                assert_eq!(snapshot.store_index, store.index().unwrap());
+                assert!(snapshot.store_index > old_cut);
+                assert_eq!(page.items[0]["runtime_ids"], json!([format!("runtime/{runtime}")]));
+            }
+        }
     }
 
 

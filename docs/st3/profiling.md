@@ -14,10 +14,11 @@ route totals, so do not add counts across scopes. The seven action buckets are i
 
 `GET /v1/client/agents` also gets `scope: "agents-read"` rows, `method: "GET"`, with `read` set to
 `first-page`, `fresh` or `continuation` (any page with a `cursor`). A `fresh=true` first page waits
-up to two seconds for a healthy in-flight refresh to publish at or after the read's own cut.
-If the last attempt failed or none is in flight, it serves the newest publication at once.
-Its original snapshot cut and publication time show its age. The other two answer at once
-from a published roster. Count the fresh row against its own target: the route total includes it.
+up to two seconds for a refresh to publish at or after the read's own cut, including when the
+refresher is idle. Only a failed latest attempt with no newer attempt in flight returns the
+newest publication at once. Its original snapshot cut and publication time show its age.
+The other two answer at once from a published roster. Count the fresh row against its own
+target: the route total includes it.
 
 `scope: "agents-roster"` rows (also under route `/v1/client/agents`) time where that wait goes,
 each in its own last-512 sample, `duration_scope: "roster-stage"`. Stage `refresh` is one refresher
