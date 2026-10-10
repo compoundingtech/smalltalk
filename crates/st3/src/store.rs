@@ -42595,6 +42595,117 @@ version 2
     }
 
     #[test]
+    fn chunked_catch_up_current_claims_match_full_replay() {
+        let (controller, worker, step) = replicated_step_pair();
+        worker
+            .append_claim(&ClaimInput {
+                subject: "agent/worker.one".into(),
+                kind: "workspace.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    json!({"host": "worker", "workspace": "/tmp/chunked-current"}),
+                )
+                .unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        // Like the actual chunked-window regression, admit enough simple claims for
+        // multiple incremental commits, with projection health already initialized.
+        for index in 0..300 {
+            controller
+                .append_claim(&ClaimInput {
+                    subject: format!("custom/current-catch-up/{index}"),
+                    kind: "custom.current-catch-up.note".into(),
+                    actor: None,
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            if index == 200 {
+                controller
+                    .set_step_state(&step, "blocked", Some("blocked after the first prefix"))
+                    .unwrap();
+            }
+        }
+        let exchange = exchange_from(&controller, &worker.replication_inventory().unwrap());
+        worker
+            .receive_replication_exchange("controller", TEST_FLEET, &exchange)
+            .unwrap();
+        worker.validate_replication_backlog().unwrap();
+        let admitted = worker.index().unwrap();
+        let mut frontiers = Vec::new();
+        FULL_REPLAYS.with(|count| count.set(0));
+        assert!(
+            worker
+                .project_replication_backlog_with_yield(|| {
+                    let through = worker.projected_through();
+                    assert!(through < admitted);
+                    assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
+                    assert!(frontiers.last().is_none_or(|last| through > *last));
+                    assert!(
+                        !worker.smalltalk.subject_cache.lock().unwrap_or_else(PoisonError::into_inner)
+                            .statuses.contains_key(&step),
+                        "a committed incremental chunk must invalidate the preceding prefix reduction"
+                    );
+                    frontiers.push(through);
+                    // A reader pins the admitted index while only a projection prefix
+                    // is committed. The later chunks must invalidate this reduction.
+                    worker.status_at(Some(&step), None, Some(admitted)).unwrap();
+                    assert!(worker.smalltalk.subject_cache.lock().unwrap_or_else(PoisonError::into_inner)
+                        .statuses.contains_key(&step));
+                })
+                .unwrap()
+        );
+        assert!(frontiers.len() >= 2, "exercise multiple incremental chunks");
+        assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
+        assert_eq!(worker.projected_through(), admitted);
+        assert!(!worker.replication_projection_deferred());
+        assert!(
+            !worker.smalltalk.subject_cache.lock().unwrap_or_else(PoisonError::into_inner)
+                .statuses.contains_key(&step),
+            "the final incremental chunk must invalidate the preceding prefix reduction"
+        );
+        let rows = |table: &str, columns: usize| {
+            let connection = worker.readers.get();
+            let mut statement = connection.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let mut rows = statement
+                .query_map([], |row| {
+                    (0..columns)
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            // Preserve every column and duplicate row; only row order is irrelevant.
+            rows.sort_by_cached_key(|row| format!("{row:?}"));
+            rows
+        };
+        let current = rows("current_claims", 10);
+        let registers = rows("latest_values", 10);
+        assert!(!registers.is_empty(), "include register-backed current claims");
+        let status = serde_json::to_value(
+            worker.status_at(Some(&step), None, Some(admitted)).unwrap(),
+        )
+        .unwrap();
+        worker.replay_replication_graph().unwrap();
+        assert_eq!(current, rows("current_claims", 10));
+        assert_eq!(registers, rows("latest_values", 10));
+        assert_eq!(
+            status,
+            serde_json::to_value(
+                worker.status_at(Some(&step), None, Some(admitted)).unwrap(),
+            )
+            .unwrap(),
+            "a current-claims reduction cached at a committed prefix must match full replay"
+        );
+    }
+
+    #[test]
     fn a_run_tree_with_only_this_nodes_new_claims_is_not_rebuilt_by_a_projection_pass() {
         let (_controller, worker, step) = replicated_step_pair();
         worker_work(&worker, &step, "claim", None, "local-only-claim");
