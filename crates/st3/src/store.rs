@@ -326,11 +326,6 @@ WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT N
 -- of other kinds plan as they did.
 CREATE INDEX IF NOT EXISTS claims_runtime_subject_index ON claims(subject, store_index)
 WHERE kind='runtime.observed';
--- Resource ids contain the observed runtime id, which need not equal the owner subject.
-CREATE INDEX IF NOT EXISTS claims_runtime_id_subject_index
-ON claims(json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-    THEN '$.runtime_id' ELSE '$.fields.runtime_id' END), subject, store_index)
-WHERE kind='runtime.observed';
 -- An already-open raw stream revalidates the original paired actor, never a full graph scan.
 CREATE INDEX IF NOT EXISTS claims_client_pairing_actor_index
 ON claims(json_extract(body, '$.fields.session_actor'))
@@ -850,6 +845,28 @@ const STATUS_WORKERS: usize = 4;
 const ACTUAL_STATE_CLAIM: &str = "(claims.kind<'harness.' OR claims.kind>='harness/')
      AND claims.kind NOT IN ('intent.desired', 'runtime.readiness-deadline-reached',
                              'reconcile.fault')";
+
+// Both discovery and index installation share the actual fold's open-ended kind predicate.
+// Custom actual-state kinds can also supply a runtime id; a fixed kind allowlist is incomplete.
+const RUNTIME_ID_FIELD: &str = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+    THEN '$.runtime_id' ELSE '$.fields.runtime_id' END)";
+static RUNTIME_ID_INDEX: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(
+    "CREATE INDEX IF NOT EXISTS claims_runtime_id_subject_index
+     ON claims({RUNTIME_ID_FIELD}, subject, store_index)
+     WHERE {ACTUAL_STATE_CLAIM} AND typeof({RUNTIME_ID_FIELD})='text'"
+));
+static RUNTIME_ID_SUBJECTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(
+    "SELECT subject FROM claims INDEXED BY claims_runtime_id_subject_index
+     WHERE {ACTUAL_STATE_CLAIM} AND typeof({RUNTIME_ID_FIELD})='text'
+       AND {RUNTIME_ID_FIELD}=?1 AND store_index<=?2
+       AND EXISTS (SELECT 1 FROM claims observed INDEXED BY claims_runtime_subject_index
+                   WHERE observed.kind='runtime.observed' AND observed.subject=claims.subject
+                     AND observed.store_index<=?2)
+     UNION
+     SELECT subject FROM claims INDEXED BY claims_runtime_subject_index
+     WHERE kind='runtime.observed' AND subject=?3 AND store_index<=?2
+     ORDER BY subject"
+));
 
 /// The predicate of `claims_current_view_index`, word for word, so SQLite can use the index.
 const CURRENT_VIEW_CLAIM: &str = "(kind='intent.desired'
@@ -11424,17 +11441,8 @@ impl Store {
         store_index: u64,
     ) -> Result<BTreeSet<String>> {
         let connection = self.readers.get();
-        let subjects = connection.prepare_cached(
-            "SELECT subject FROM claims INDEXED BY claims_runtime_id_subject_index
-             WHERE kind='runtime.observed'
-               AND json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-                   THEN '$.runtime_id' ELSE '$.fields.runtime_id' END)=?1
-               AND store_index<=?2
-             UNION
-             SELECT subject FROM claims INDEXED BY claims_runtime_subject_index
-             WHERE kind='runtime.observed' AND subject=?3 AND store_index<=?2
-             ORDER BY subject",
-        )?.query_map(params![runtime_id, store_index, owner], |row| row.get::<_, String>(0))?
+        let subjects = connection.prepare_cached(&RUNTIME_ID_SUBJECTS)?
+            .query_map(params![runtime_id, store_index, owner], |row| row.get::<_, String>(0))?
             .collect::<Result<BTreeSet<_>, _>>()?;
         Ok(subjects)
     }

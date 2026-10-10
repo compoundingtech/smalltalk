@@ -3002,8 +3002,8 @@ fn terminal_resources_for_owner(
 }
 
 #[cfg(test)]
-static RUNTIME_DETAIL_SUBJECT_COUNTS: parking_lot::Mutex<BTreeMap<String, usize>> =
-    parking_lot::Mutex::new(BTreeMap::new());
+static RUNTIME_DETAIL_SUBJECT_COUNTS: std::sync::Mutex<BTreeMap<String, usize>> =
+    std::sync::Mutex::new(BTreeMap::new());
 
 fn runtime_resources_from_status(
     state: &AppState,
@@ -3012,7 +3012,8 @@ fn runtime_resources_from_status(
     status: crate::model::StatusResponse,
 ) -> anyhow::Result<Vec<Value>> {
     #[cfg(test)]
-    if let Some(count) = RUNTIME_DETAIL_SUBJECT_COUNTS.lock().get_mut(&snapshot.id) {
+    if let Some(count) = RUNTIME_DETAIL_SUBJECT_COUNTS.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(&snapshot.id) {
         *count += status.subjects.len();
     }
     // Each runtime's declaration and observation time, in one statement apiece for the list.
@@ -19760,6 +19761,100 @@ mission "example/zero-run" state="ready" {
     }
 
     #[tokio::test]
+    async fn runtime_detail_by_id_preserves_folded_ids_reuse_duplicates_and_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "runtime-parity");
+        let source = "version 2\nagent \"first\" { workspace \"/tmp\"; command \"true\" }\nagent \"second\" { workspace \"/tmp\"; command \"true\" }\n";
+        let intent = crate::graph::parse_intent(source, "runtime-parity").unwrap();
+        let planned = state.store.mission(&intent, IntentInput {
+            kdl: source.into(), source_name: None,
+        }).unwrap();
+        state.store.apply(&intent, &planned.subject_tokens, "runtime-parity-declaration").unwrap();
+        let mut owners = state.store.desired_subjects().unwrap().into_iter()
+            .filter(|desired| desired.kind == "agent").map(|desired| desired.subject)
+            .collect::<Vec<_>>();
+        owners.sort();
+        assert_eq!(owners.len(), 2);
+        let observe = |owner: &str, id: &str, incarnation: &str| {
+            state.store.append_claim(&ClaimInput {
+                subject: owner.into(), kind: "runtime.observed".into(), actor: Some(owner.into()),
+                fields: serde_json::from_value(json!({
+                    "runtime_id": id, "incarnation_id": incarnation, "status": "running",
+                    "terminal": false,
+                })).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        observe(&owners[0], "original", "first-incarnation");
+        state.store.append_claim(&ClaimInput {
+            subject: owners[0].clone(), kind: "runtime.action.requested".into(),
+            actor: Some("person/alex".into()),
+            fields: serde_json::from_value(json!({
+                "action": "suspend", "runtime_id": "shared", "incarnation_id": "first-incarnation",
+            })).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        observe(&owners[1], "shared", "second-incarnation");
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/action-only".into(), kind: "runtime.action.requested".into(),
+            actor: Some("person/alex".into()),
+            fields: serde_json::from_value(json!({
+                "action": "suspend", "runtime_id": "shared", "incarnation_id": "action-only",
+            })).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let pinned = new_client_snapshot(&state);
+        let all = runtime_resources(&state, true, &pinned, &session).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0]["id"], "runtime/shared", "the actual fold reads the action's id");
+        assert_eq!(runtime_resources_for_id(
+            &state, &pinned, &session, "runtime/shared", false,
+        ).unwrap(), all);
+        let expected = client_detail(all.clone(), "runtime", "runtime/shared").unwrap().0;
+        assert_eq!(runtime_detail(
+            State(state.clone()), Extension(pinned.clone()), Extension(session.clone()),
+            AxumPath("shared".into()),
+        ).await.unwrap().0, expected);
+        let request_for = |target: &str, selected: &Value| ActionRequest {
+            api_version: CLIENT_API_VERSION.into(), id: "action/runtime-parity".into(),
+            action_type: "runtime.stop".into(), idempotency_key: "runtime-parity-control".into(),
+            fence: Fence {
+                snapshot_id: pinned.id.clone(),
+                runtime_incarnation: selected["incarnation_id"].as_str().map(str::to_owned),
+                runtime_desired_revision: selected["desired_revision"].as_str().map(str::to_owned),
+                ..Fence::default()
+            },
+            parameters: json!({"target_id": target}),
+        };
+        assert_eq!(runtime_control_target(
+            &state, &pinned, &session, &request_for("runtime/shared", &all[0]),
+        ).unwrap(), all[0], "duplicate ids preserve the full scan's owner ordering");
+        assert_eq!(runtime_control_target(
+            &state, &pinned, &session, &request_for(&owners[1], &all[1]),
+        ).unwrap(), all[1]);
+        assert!(runtime_resources_for_id(
+            &state, &pinned, &session, "runtime/original", false,
+        ).unwrap().is_empty());
+        observe(&owners[0], "replacement", "replacement-incarnation");
+        let current = new_client_snapshot(&state);
+        let current_all = runtime_resources(&state, true, &current, &session).unwrap();
+        for id in ["runtime/original", "runtime/shared", "runtime/replacement"] {
+            let expected = current_all.iter().filter(|resource| resource["id"] == id)
+                .cloned().collect::<Vec<_>>();
+            assert_eq!(runtime_resources_for_id(
+                &state, &current, &session, id, false,
+            ).unwrap(), expected);
+        }
+        assert_eq!(runtime_resources_for_id(
+            &state, &pinned, &session, "runtime/shared", false,
+        ).unwrap(), all, "later owner reuse must not change a pinned snapshot");
+        assert_eq!(runtime_detail(
+            State(state), Extension(pinned), Extension(session), AxumPath("shared".into()),
+        ).await.unwrap().0, expected);
+    }
+
+    #[tokio::test]
     async fn runtime_detail_by_id_matches_history_and_reduces_only_its_owner() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "runtime-test");
@@ -19787,12 +19882,14 @@ mission "example/zero-run" state="ready" {
                 runtime_resources_for_id(&state, &snapshot, &session, &id, false).unwrap(),
                 vec![expected.clone()],
             );
-            RUNTIME_DETAIL_SUBJECT_COUNTS.lock().insert(snapshot.id.clone(), 0);
+            RUNTIME_DETAIL_SUBJECT_COUNTS.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).insert(snapshot.id.clone(), 0);
             let actual = runtime_detail(
                 State(state.clone()), Extension(snapshot.clone()), Extension(session.clone()),
                 AxumPath(id),
             ).await.unwrap().0;
-            let reduced = RUNTIME_DETAIL_SUBJECT_COUNTS.lock().remove(&snapshot.id).unwrap();
+            let reduced = RUNTIME_DETAIL_SUBJECT_COUNTS.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner).remove(&snapshot.id).unwrap();
             assert_eq!(actual, expected);
             assert_eq!(reduced, 1, "detail must not reduce unrelated runtime subjects");
         }
