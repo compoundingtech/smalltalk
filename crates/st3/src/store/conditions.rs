@@ -1,0 +1,792 @@
+//! Declared conditions, the state the graph holds for each instance, and what the evaluator
+//! writes: one `condition.state` claim when something changed, and a message to an agent owner on
+//! a transition.
+//!
+//! Two local tables serve the readers and the evaluator. `local_condition_heads` points at the
+//! newest state claim of each instance, so a read finds it with one lookup however long the
+//! history; the evaluator folds new claims into it, its own and replicated ones, each tick.
+//! `local_condition_claim_bytes` counts, per hour, the bytes of claims this member wrote, for
+//! `db.growth-bytes-per-day`. Neither replicates: the claims are the authority.
+
+use super::*;
+use crate::conditions::{
+    ConditionDecl, Phase, Recorded, Tracker, Transition, parse_condition,
+};
+
+pub(super) const SCHEMA: &str = r#"
+CREATE INDEX IF NOT EXISTS desired_condition_index ON desired(subject) WHERE kind='condition';
+CREATE TABLE IF NOT EXISTS local_condition_heads (
+    subject TEXT NOT NULL,
+    instance TEXT NOT NULL,
+    store_index INTEGER NOT NULL,
+    PRIMARY KEY (subject, instance)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS local_condition_claim_bytes (
+    hour_unix_ms INTEGER PRIMARY KEY,
+    claims INTEGER NOT NULL,
+    bytes INTEGER NOT NULL
+);
+"#;
+
+const HEADS_CURSOR: &str = "condition_heads_cursor";
+const BYTES_CURSOR: &str = "condition_bytes_cursor";
+const BYTES_SINCE: &str = "condition_bytes_since";
+/// State claims one fold reads at most.
+const HEADS_PAGE: i64 = 500;
+/// Claims one byte-count read covers, by store index. A read of this many rows takes a few
+/// milliseconds, so no read holds its connection long.
+const BYTES_PAGE: i64 = 2_000;
+/// Reads one tick makes at most while catching up on byte counts.
+const BYTES_PAGES_PER_TICK: usize = 25;
+const HOUR_MS: u128 = 3_600_000;
+const DAY_MS: u128 = 24 * HOUR_MS;
+
+/// A declared condition, or why its body no longer parses.
+#[derive(Clone, Debug)]
+pub struct DeclaredCondition {
+    pub subject: String,
+    pub decl: Result<ConditionDecl, String>,
+}
+
+/// The newest state the graph holds for one instance of a condition.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConditionInstanceView {
+    pub instance: String,
+    pub host: String,
+    pub phase: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<f64>,
+    pub values: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase_since: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breach_since: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured_at: Option<u64>,
+    /// The state claim this view reads.
+    pub claim: String,
+}
+
+/// A condition and the state of each of its instances.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConditionView {
+    pub subject: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hosts: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid: Option<String>,
+    pub instances: Vec<ConditionInstanceView>,
+}
+
+/// What one evaluation writes for an instance.
+pub struct ConditionRecord<'a> {
+    pub decl: &'a ConditionDecl,
+    pub host: &'a str,
+    pub instance: &'a str,
+    pub tracker: &'a Tracker,
+    pub transition: Option<Transition>,
+    pub now: u128,
+}
+
+fn meta_integer(connection: &Connection, key: &str) -> Result<Option<i64>> {
+    Ok(connection
+        .query_row("SELECT value FROM meta WHERE key=?1", [key], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .and_then(|value| value.parse().ok()))
+}
+
+fn set_meta_integer(transaction: &Transaction<'_>, key: &str, value: i64) -> rusqlite::Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value.to_string()],
+        )
+        .map(|_| ())
+}
+
+impl Store {
+    /// Every declared condition, in name order.
+    pub fn declared_conditions(&self) -> Result<Vec<DeclaredCondition>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, body FROM desired WHERE kind='condition' ORDER BY subject",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut conditions = Vec::new();
+        for row in rows {
+            let (subject, body) = row?;
+            let decl = serde_json::from_str::<Value>(&body)
+                .map_err(|error| error.to_string())
+                .and_then(|desired| parse_condition(&subject, &desired));
+            conditions.push(DeclaredCondition { subject, decl });
+        }
+        Ok(conditions)
+    }
+
+    /// Point each instance's head at its newest state claim, a page of new claims at a time.
+    /// Returns how many claims it read; fewer than a page means it has caught up.
+    pub fn fold_condition_heads(&self) -> Result<usize> {
+        let (cursor, rows) = {
+            let connection = self.readers.get();
+            let cursor = meta_integer(&connection, HEADS_CURSOR)?.unwrap_or(0);
+            let mut statement = connection.prepare_cached(
+                "SELECT store_index, subject, json_extract(body, '$.fields.instance')
+                   FROM claims
+                  WHERE kind='condition.state' AND store_index > ?1
+                  ORDER BY store_index LIMIT ?2",
+            )?;
+            let rows = statement
+                .query_map(params![cursor, HEADS_PAGE], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            (cursor, rows)
+        };
+        let Some(last) = rows.last().map(|(index, ..)| *index) else {
+            return Ok(0);
+        };
+        let count = rows.len();
+        self.connection
+            .batched(move |transaction| {
+                for (index, subject, instance) in &rows {
+                    let Some(instance) = instance else { continue };
+                    transaction.execute(
+                        "INSERT INTO local_condition_heads(subject, instance, store_index)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(subject, instance) DO UPDATE
+                           SET store_index=max(store_index, excluded.store_index)",
+                        params![subject, instance, index],
+                    )?;
+                }
+                set_meta_integer(transaction, HEADS_CURSOR, last.max(cursor))
+            })
+            .map_err(|error| anyhow::anyhow!("{error}"))??;
+        Ok(count)
+    }
+
+    /// The newest state claim of every instance of `subject`, from the heads the evaluator keeps.
+    fn condition_instances(
+        &self,
+        connection: &Connection,
+        subject: &str,
+    ) -> Result<Vec<ConditionInstanceView>> {
+        let mut statement = connection.prepare_cached(
+            "SELECT claims.id, claims.body
+               FROM local_condition_heads heads
+               JOIN claims ON claims.store_index=heads.store_index
+              WHERE heads.subject=?1
+              ORDER BY heads.instance",
+        )?;
+        let rows = statement.query_map([subject], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut instances = Vec::new();
+        for row in rows {
+            let (claim, body) = row?;
+            let Ok(body) = serde_json::from_str::<Value>(&body) else {
+                continue;
+            };
+            let fields = &body["fields"];
+            let text = |name: &str| fields[name].as_str().map(str::to_owned);
+            instances.push(ConditionInstanceView {
+                instance: text("instance").unwrap_or_default(),
+                host: text("host").unwrap_or_default(),
+                phase: text("phase").unwrap_or_default(),
+                transition: text("transition"),
+                value: fields["value"].as_f64(),
+                values: fields["values"].as_array().cloned().unwrap_or_default(),
+                phase_since: fields["phase_since"].as_u64(),
+                breach_since: fields["breach_since"].as_u64(),
+                measured_at: fields["measured_at"].as_u64(),
+                claim,
+            });
+        }
+        Ok(instances)
+    }
+
+    /// Every declared condition with the newest state of each instance. A read: it writes
+    /// nothing, and an instance whose claim has not been folded yet shows once the evaluator has.
+    pub fn conditions(&self) -> Result<Vec<ConditionView>> {
+        let declared = self.declared_conditions()?;
+        let connection = self.readers.get();
+        let mut views = Vec::new();
+        for condition in declared {
+            let instances = self.condition_instances(&connection, &condition.subject)?;
+            let view = match &condition.decl {
+                Ok(decl) => ConditionView {
+                    subject: condition.subject.clone(),
+                    metric: Some(decl.metric.as_str().into()),
+                    scope: Some(decl.scope.as_str().into()),
+                    rule: Some(decl.describe_rule()),
+                    owner: Some(decl.owner.clone()),
+                    hosts: (!decl.hosts.is_empty()).then(|| decl.hosts.clone()),
+                    invalid: None,
+                    instances,
+                },
+                Err(error) => ConditionView {
+                    subject: condition.subject.clone(),
+                    metric: None,
+                    scope: None,
+                    rule: None,
+                    owner: None,
+                    hosts: None,
+                    invalid: Some(error.clone()),
+                    instances,
+                },
+            };
+            views.push(view);
+        }
+        Ok(views)
+    }
+
+    /// What the graph last recorded for each instance `host` evaluates, so a restarted
+    /// evaluator continues instead of announcing a breach again.
+    pub fn condition_trackers(&self, host: &str) -> Result<BTreeMap<(String, String), Tracker>> {
+        let mut trackers = BTreeMap::new();
+        for condition in self.conditions()? {
+            for instance in condition.instances {
+                if instance.host != host {
+                    continue;
+                }
+                let Some(phase) = Phase::parse(&instance.phase) else {
+                    continue;
+                };
+                let recorded = Recorded {
+                    at: u128::from(instance.measured_at.unwrap_or(0)),
+                    phase,
+                    value: instance.value.unwrap_or(f64::NAN),
+                };
+                trackers.insert(
+                    (condition.subject.clone(), instance.instance.clone()),
+                    Tracker::restore(phase, instance.breach_since.map(u128::from), recorded),
+                );
+            }
+        }
+        Ok(trackers)
+    }
+
+    /// Write one instance's state, with its transition when it has one. Returns the claim.
+    pub fn record_condition_state(&self, record: &ConditionRecord<'_>) -> Result<ClaimRecord> {
+        let ConditionRecord {
+            decl,
+            host,
+            instance,
+            tracker,
+            transition,
+            now,
+        } = record;
+        let number = |value: f64| {
+            serde_json::Number::from_f64(value)
+                .map(Value::Number)
+                .unwrap_or(Value::Null)
+        };
+        let mut fields = BTreeMap::from([
+            ("instance".to_owned(), Value::String((*instance).into())),
+            ("host".to_owned(), Value::String((*host).into())),
+            (
+                "phase".to_owned(),
+                Value::String(tracker.phase.as_str().into()),
+            ),
+            ("metric".to_owned(), Value::String(decl.metric.as_str().into())),
+            (
+                "comparison".to_owned(),
+                Value::String(decl.comparison.as_str().into()),
+            ),
+            ("threshold".to_owned(), number(decl.threshold)),
+            ("recover_at".to_owned(), number(decl.recover_at)),
+            ("owner".to_owned(), Value::String(decl.owner.clone())),
+            (
+                "phase_since".to_owned(),
+                Value::from(u64::try_from(tracker.phase_since).unwrap_or(u64::MAX)),
+            ),
+            (
+                "measured_at".to_owned(),
+                Value::from(u64::try_from(*now).unwrap_or(u64::MAX)),
+            ),
+            (
+                "values".to_owned(),
+                Value::Array(
+                    tracker
+                        .values
+                        .iter()
+                        .map(|(at, value)| {
+                            json!([u64::try_from(*at).unwrap_or(u64::MAX), number(*value)])
+                        })
+                        .collect(),
+                ),
+            ),
+        ]);
+        if let Some((_, value)) = tracker.values.back() {
+            fields.insert("value".into(), number(*value));
+        }
+        if let Some(since) = tracker.breach_since {
+            fields.insert(
+                "breach_since".into(),
+                Value::from(u64::try_from(since).unwrap_or(u64::MAX)),
+            );
+        }
+        if let Some(transition) = transition {
+            fields.insert(
+                "transition".into(),
+                Value::String(transition.as_str().into()),
+            );
+        }
+        let claim = self.append_claim(&ClaimInput {
+            subject: decl.subject(),
+            kind: "condition.state".into(),
+            actor: None,
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            // A retried write after a timeout lands once.
+            idempotency_key: Some(format!(
+                "condition-state:{}:{instance}:{now}",
+                decl.subject()
+            )),
+        })?;
+        Ok(claim)
+    }
+
+    /// Tell an agent owner of a transition, once: the message's subject and idempotency key are
+    /// the transition's, so a retry after a failed write sends nothing twice.
+    pub fn send_condition_message(
+        &self,
+        decl: &ConditionDecl,
+        instance: &str,
+        transition: Transition,
+        breach_since: u128,
+        title: &str,
+        body: &str,
+        evidence: Option<&str>,
+    ) -> Result<Option<String>> {
+        if !decl.owner.starts_with("agent/") {
+            return Ok(None);
+        }
+        let key = format!(
+            "condition:{}:{instance}:{}:{breach_since}",
+            decl.subject(),
+            transition.as_str()
+        );
+        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        let subject = format!("message/condition-{}", &digest[..20]);
+        if self.latest_claim(&subject, Some("message.sent"))?.is_some() {
+            return Ok(Some(subject));
+        }
+        self.append_claim(&ClaimInput {
+            subject: subject.clone(),
+            kind: "message.sent".into(),
+            actor: Some("daemon/runtime".into()),
+            fields: BTreeMap::from([
+                ("from".into(), Value::String("daemon/runtime".into())),
+                ("to".into(), Value::String(decl.owner.clone())),
+                ("content".into(), Value::String(body.into())),
+                ("status".into(), Value::String("sent".into())),
+                ("title".into(), Value::String(title.into())),
+                ("in_reply_to".into(), Value::Null),
+                (
+                    "tags".into(),
+                    json!([
+                        format!("st3-condition:{}", decl.subject()),
+                        format!("st3-condition-transition:{}", transition.as_str()),
+                    ]),
+                ),
+            ]),
+            evidence: evidence.into_iter().map(str::to_owned).collect(),
+            expected_subject: None,
+            idempotency_key: Some(key),
+        })?;
+        Ok(Some(subject))
+    }
+
+    /// A breach owned by a person is an alert on their home while it lasts. It is derived from
+    /// the newest state claim, so it clears when the condition recovers, and a read never writes.
+    pub(crate) fn condition_attention_items(
+        &self,
+        person: Option<&str>,
+    ) -> Result<Vec<AttentionItemView>> {
+        let mut items = Vec::new();
+        for condition in self.conditions()? {
+            let Some(owner) = condition.owner.as_deref() else {
+                continue;
+            };
+            if !owner.starts_with("person/") || person.is_some_and(|person| person != owner) {
+                continue;
+            }
+            for instance in &condition.instances {
+                if !Phase::parse(&instance.phase).is_some_and(Phase::in_breach) {
+                    continue;
+                }
+                let since = instance.breach_since.unwrap_or_default();
+                let episode = hex::encode(sha2::Sha256::digest(
+                    format!("{}:{}:{since}", condition.subject, instance.instance).as_bytes(),
+                ));
+                let value = instance
+                    .value
+                    .map(|value| format!("{value}"))
+                    .unwrap_or_else(|| "unknown".into());
+                let name = condition
+                    .subject
+                    .strip_prefix("condition/")
+                    .unwrap_or(&condition.subject);
+                items.push(AttentionItemView {
+                    episode: format!("condition/{}", &episode[..32]),
+                    priority: "high".into(),
+                    kind: "condition".into(),
+                    review_mode: None,
+                    subject: condition.subject.clone(),
+                    person: owner.to_owned(),
+                    requester_id: None,
+                    launch_id: None,
+                    variant_id: None,
+                    message_id: None,
+                    conversation: None,
+                    title: format!("Condition breached: {name} on {}", instance.instance),
+                    detail: format!(
+                        "{} is {value} on {} since {}. Rule: {}. It clears once the condition recovers; `st conditions show {name}` shows the recent values.",
+                        condition.metric.as_deref().unwrap_or("the metric"),
+                        instance.instance,
+                        crate::conditions::utc(u128::from(since)),
+                        condition.rule.as_deref().unwrap_or("unknown"),
+                    ),
+                    request: None,
+                    mission: None,
+                    mission_run: None,
+                    step: None,
+                    targets: vec![condition.subject.clone()],
+                    requested_at_unix_ms: u128::from(since),
+                    actions: Vec::new(),
+                });
+            }
+        }
+        Ok(items)
+    }
+
+    /// Count the bytes of claims this member wrote since the last count, a bounded number of short
+    /// reads per call. The first count starts a day back.
+    pub fn fold_condition_claim_bytes(&self, now: u128) -> Result<()> {
+        let origin = self.origin().to_owned();
+        let (mut cursor, since) = {
+            let connection = self.readers.get();
+            (
+                meta_integer(&connection, BYTES_CURSOR)?,
+                meta_integer(&connection, BYTES_SINCE)?,
+            )
+        };
+        let mut since = since;
+        if cursor.is_none() {
+            let start = now.saturating_sub(DAY_MS);
+            let first = self
+                .readers
+                .get()
+                .query_row(
+                    "SELECT store_index FROM claims
+                      WHERE length(accepted_at_unix_ms) >= length(?1)
+                        AND (length(accepted_at_unix_ms) > length(?1) OR accepted_at_unix_ms >= ?1)
+                      ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, store_index
+                      LIMIT 1",
+                    [start.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            cursor = Some(first.map_or(self.index()? as i64, |index| index - 1));
+            since = Some(i64::try_from(start).unwrap_or(i64::MAX));
+        }
+        let mut cursor = cursor.unwrap_or(0);
+        let top = self.index()? as i64;
+        let mut hours = BTreeMap::<i64, (i64, i64)>::new();
+        for _ in 0..BYTES_PAGES_PER_TICK {
+            if cursor >= top {
+                break;
+            }
+            let end = (cursor + BYTES_PAGE).min(top);
+            let connection = self.readers.get();
+            let mut statement = connection.prepare_cached(
+                "SELECT accepted_at_unix_ms,
+                        length(body) + length(id) + length(subject) + length(kind) + length(predecessors)
+                   FROM claims
+                  WHERE store_index > ?1 AND store_index <= ?2 AND origin=?3",
+            )?;
+            let rows = statement.query_map(params![cursor, end, origin], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (accepted, bytes) = row?;
+                let accepted = accepted.parse::<i64>().unwrap_or(0);
+                let hour = accepted - accepted.rem_euclid(HOUR_MS as i64);
+                let entry = hours.entry(hour).or_default();
+                entry.0 += 1;
+                entry.1 += bytes;
+            }
+            cursor = end;
+        }
+        let since = since.unwrap_or(0);
+        let oldest = i64::try_from(now.saturating_sub(2 * DAY_MS)).unwrap_or(0);
+        self.connection
+            .batched(move |transaction| {
+                for (hour, (claims, bytes)) in &hours {
+                    transaction.execute(
+                        "INSERT INTO local_condition_claim_bytes(hour_unix_ms, claims, bytes)
+                         VALUES (?1, ?2, ?3)
+                         ON CONFLICT(hour_unix_ms) DO UPDATE
+                           SET claims=claims+excluded.claims, bytes=bytes+excluded.bytes",
+                        params![hour, claims, bytes],
+                    )?;
+                }
+                transaction.execute(
+                    "DELETE FROM local_condition_claim_bytes WHERE hour_unix_ms < ?1",
+                    [oldest],
+                )?;
+                set_meta_integer(transaction, BYTES_CURSOR, cursor)?;
+                set_meta_integer(transaction, BYTES_SINCE, since)
+            })
+            .map_err(|error| anyhow::anyhow!("{error}"))??;
+        Ok(())
+    }
+
+    /// Bytes of claims this member wrote in the last 24 hours. Until a day has been counted, the
+    /// hours counted so far are scaled to a day; under an hour of counting has no reading, and
+    /// neither has a count still catching up.
+    pub fn condition_claim_bytes_per_day(&self, now: u128) -> Result<Option<f64>> {
+        let connection = self.readers.get();
+        let (Some(cursor), Some(since)) = (
+            meta_integer(&connection, BYTES_CURSOR)?,
+            meta_integer(&connection, BYTES_SINCE)?,
+        ) else {
+            return Ok(None);
+        };
+        if (cursor as u64) + (BYTES_PAGE as u64) < self.index()? {
+            return Ok(None);
+        }
+        let start = now.saturating_sub(DAY_MS);
+        let counted_from = start.max(u128::try_from(since).unwrap_or(0));
+        let covered = now.saturating_sub(counted_from);
+        if covered < HOUR_MS {
+            return Ok(None);
+        }
+        // The hour that holds the start counts whole: hourly buckets cannot split it.
+        let first_hour = start - start % HOUR_MS;
+        let bytes: i64 = connection.query_row(
+            "SELECT coalesce(sum(bytes), 0) FROM local_condition_claim_bytes WHERE hour_unix_ms >= ?1",
+            [i64::try_from(first_hour).unwrap_or(0)],
+            |row| row.get(0),
+        )?;
+        Ok(Some(bytes as f64 * DAY_MS as f64 / covered as f64))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conditions::{Phase, Tracker};
+    use crate::graph::parse_test_intent as parse_intent;
+
+    const SOURCE: &str = r#"version 2
+condition "fleet/disk" {
+  metric "disk.free-percent"
+  scope "host"
+  below 15
+  recover 18
+  for "10m"
+  owner "agent/ops"
+}
+condition "fleet/collector-cpu" {
+  metric "process.cpu-cores"
+  scope "process"
+  process "collector"
+  host "alder"
+  above 1.5
+  for "5m"
+  owner "person/ada"
+}
+"#;
+
+    fn store() -> (tempfile::TempDir, Store) {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("claims.sqlite3"), "alder").unwrap();
+        let intent = parse_intent(SOURCE, "alder").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: SOURCE.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+        store
+            .apply_as(&intent, &plan.subject_tokens, "conditions", Some("person/ada"))
+            .unwrap();
+        (directory, store)
+    }
+
+    fn decl(store: &Store, subject: &str) -> ConditionDecl {
+        store
+            .declared_conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.subject == subject)
+            .unwrap()
+            .decl
+            .unwrap()
+    }
+
+    fn record(store: &Store, decl: &ConditionDecl, instance: &str, tracker: &Tracker, transition: Option<Transition>, now: u128) -> ClaimRecord {
+        store
+            .record_condition_state(&ConditionRecord {
+                decl,
+                host: "alder",
+                instance,
+                tracker,
+                transition,
+                now,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_declared_condition_reads_back_with_no_state_until_one_is_recorded() {
+        let (_directory, store) = store();
+        let conditions = store.conditions().unwrap();
+        assert_eq!(
+            conditions.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(),
+            ["condition/fleet/collector-cpu", "condition/fleet/disk"]
+        );
+        assert!(conditions.iter().all(|c| c.instances.is_empty()));
+        assert_eq!(
+            conditions[1].rule.as_deref(),
+            Some("disk.free-percent below 15% (recovers at 18%) for 10m")
+        );
+        assert_eq!(conditions[0].hosts.as_deref(), Some(&["alder".to_owned()][..]));
+    }
+
+    #[test]
+    fn the_newest_state_of_each_instance_is_found_after_a_fold_and_a_read_writes_nothing() {
+        let (_directory, store) = store();
+        let disk = decl(&store, "condition/fleet/disk");
+        let mut root = Tracker::default();
+        root.observe(&disk, 40.0, 1_000);
+        record(&store, &disk, "alder:/", &root, None, 1_000);
+        let mut data = Tracker::default();
+        data.observe(&disk, 10.0, 1_000);
+        record(&store, &disk, "alder:/data", &data, None, 1_000);
+        data.observe(&disk, 9.0, 700_000);
+        let entered = record(&store, &disk, "alder:/data", &data, Some(Transition::Enter), 700_000);
+        assert_eq!(store.fold_condition_heads().unwrap(), 3);
+        assert_eq!(store.fold_condition_heads().unwrap(), 0);
+
+        let before = store.index().unwrap();
+        let conditions = store.conditions().unwrap();
+        assert_eq!(store.index().unwrap(), before, "a condition read must not write");
+        let instances = &conditions[1].instances;
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].instance, "alder:/");
+        assert_eq!(instances[0].phase, "clear");
+        assert_eq!(instances[1].instance, "alder:/data");
+        assert_eq!(instances[1].claim, entered.id);
+        assert_eq!(instances[1].phase, "breach");
+        assert_eq!(instances[1].transition.as_deref(), Some("enter"));
+        assert_eq!(instances[1].value, Some(9.0));
+        assert_eq!(instances[1].breach_since, Some(1_000));
+        assert_eq!(instances[1].values.len(), 2);
+
+        let trackers = store.condition_trackers("alder").unwrap();
+        let restored = &trackers[&("condition/fleet/disk".to_owned(), "alder:/data".to_owned())];
+        assert_eq!(restored.phase, Phase::Breach);
+        assert_eq!(restored.breach_since, Some(1_000));
+        assert!(store.condition_trackers("birch").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_agent_owner_gets_one_message_per_transition_and_a_person_an_alert_while_it_lasts() {
+        let (_directory, store) = store();
+        let disk = decl(&store, "condition/fleet/disk");
+        let message = |transition, since| {
+            store
+                .send_condition_message(&disk, "alder:/", transition, since, "Condition breached: fleet/disk on alder:/", "body", None)
+                .unwrap()
+                .unwrap()
+        };
+        let first = message(Transition::Enter, 5);
+        assert_eq!(message(Transition::Enter, 5), first, "a retry sends nothing new");
+        let sent = store.claims_for(&first, Some("message.sent")).unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].fields["to"], "agent/ops");
+        assert_ne!(message(Transition::Recover, 5), first);
+        assert_ne!(message(Transition::Enter, 6), first, "a later breach is a new message");
+
+        // A person's condition never messages anyone; it shows as an alert on their home.
+        let cpu = decl(&store, "condition/fleet/collector-cpu");
+        assert_eq!(
+            store
+                .send_condition_message(&cpu, "alder", Transition::Enter, 5, "t", "b", None)
+                .unwrap(),
+            None
+        );
+        let mut tracker = Tracker::default();
+        tracker.observe(&cpu, 3.0, 1_000);
+        tracker.observe(&cpu, 3.0, 301_000);
+        assert_eq!(tracker.phase, Phase::Breach);
+        record(&store, &cpu, "alder", &tracker, Some(Transition::Enter), 301_000);
+        store.fold_condition_heads().unwrap();
+        let items = store.condition_attention_items(Some("person/ada")).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, "condition");
+        assert_eq!(items[0].person, "person/ada");
+        assert_eq!(items[0].title, "Condition breached: fleet/collector-cpu on alder");
+        assert!(items[0].is_alert());
+        assert!(store.condition_attention_items(Some("person/bo")).unwrap().is_empty());
+        let snapshot = store.attention_snapshot(Some("person/ada"), now_ms()).unwrap();
+        assert!(snapshot.iter().any(|item| item.kind == "condition"), "{snapshot:?}");
+
+        tracker.observe(&cpu, 0.5, 302_000);
+        tracker.observe(&cpu, 0.5, 602_000);
+        assert_eq!(tracker.phase, Phase::Clear);
+        record(&store, &cpu, "alder", &tracker, Some(Transition::Recover), 602_000);
+        store.fold_condition_heads().unwrap();
+        assert!(store.condition_attention_items(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn claim_bytes_count_only_this_members_claims_in_the_last_day() {
+        let (_directory, store) = store();
+        let now = now_ms();
+        assert_eq!(store.condition_claim_bytes_per_day(now).unwrap(), None);
+        store.fold_condition_claim_bytes(now).unwrap();
+        // A day back from now covers every claim the test wrote, all from this member.
+        let counted = store.condition_claim_bytes_per_day(now).unwrap().unwrap();
+        assert!(counted > 0.0);
+        let disk = decl(&store, "condition/fleet/disk");
+        let mut tracker = Tracker::default();
+        tracker.observe(&disk, 40.0, now);
+        record(&store, &disk, "alder:/", &tracker, None, now);
+        store.fold_condition_claim_bytes(now).unwrap();
+        let more = store.condition_claim_bytes_per_day(now).unwrap().unwrap();
+        assert!(more > counted, "{more} > {counted}");
+        // An hour later the same bytes are scaled over a longer covered span.
+        let later = store
+            .condition_claim_bytes_per_day(now + 3_600_000)
+            .unwrap()
+            .unwrap();
+        assert!(later <= more);
+    }
+}

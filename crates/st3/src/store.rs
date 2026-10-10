@@ -116,6 +116,8 @@ pub use smallclaims::store::{
 
 mod accounts;
 mod adhoc_work;
+mod conditions;
+pub use conditions::{ConditionInstanceView, ConditionRecord, ConditionView, DeclaredCondition};
 mod attention_snapshot;
 pub(crate) use attention_snapshot::native_prompt_gone_key;
 // Registration stays opt-in until the shared installer certifies every source family.
@@ -14410,6 +14412,7 @@ impl Store {
         items.extend(self.harness_login_attention_items(person)?);
         items.extend(self.harness_prompt_attention_items(person)?);
         items.extend(self.custom_attention_items(person)?);
+        items.extend(self.condition_attention_items(person)?);
         // A person who published a broken gate is the one to correct it.
         items.extend(
             self.broken_gate_items(person, as_of)?

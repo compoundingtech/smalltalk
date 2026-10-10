@@ -15,6 +15,7 @@ use crate::model::{
 
 const ROOT_NODES: &[&str] = &[
     "account",
+    "condition",
     "agent",
     "exec",
     "pty",
@@ -439,6 +440,12 @@ fn parse_desired_node(
         return Err(St3Error::new(
             "account-inside-mission",
             "an account declaration must be at the root",
+        ));
+    }
+    if kind == "condition" && context.owner_run.is_some() {
+        return Err(St3Error::new(
+            "condition-inside-mission",
+            "a condition declaration must be at the root",
         ));
     }
     match kind {
@@ -1624,6 +1631,7 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
     validate_name(&name, false)?;
     match kind {
         "account" => validate_account(node)?,
+        "condition" => validate_condition(node, &name)?,
         "doc" => validate_doc(node)?,
         "resource" => validate_resource(node)?,
         "observer" => validate_observer(node)?,
@@ -1669,6 +1677,22 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
         context.document_refs.insert(format!("doc/{name}@{hash}"));
     }
     Ok(())
+}
+
+/// A condition is checked by the same parser the daemon evaluates it with, so a published
+/// condition is one st can evaluate.
+fn validate_condition(node: &KdlNode, name: &str) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    one_string_with_children(node)?;
+    if node.children().is_none() {
+        return Err(St3Error::new(
+            "missing-condition-body",
+            "a condition needs a body",
+        ));
+    }
+    crate::conditions::parse_condition(&namespaced("condition", name), &canonical_node(node)?)
+        .map(|_| ())
+        .map_err(|message| St3Error::new("invalid-condition", message))
 }
 
 fn validate_account(node: &KdlNode) -> Result<(), St3Error> {
@@ -4305,6 +4329,12 @@ pub(crate) fn validate_deferred_declaration(node: &KdlNode) -> Result<(), St3Err
         return Err(St3Error::new(
             "account-inside-mission",
             "an account declaration must be at the root",
+        ));
+    }
+    if node.name().value() == "condition" {
+        return Err(St3Error::new(
+            "condition-inside-mission",
+            "a condition declaration must be at the root",
         ));
     }
     if node.name().value() == "env" {

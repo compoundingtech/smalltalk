@@ -731,6 +731,12 @@ fn build_registry() -> Registry {
             false,
         ),
         (
+            "condition",
+            "condition/NAME",
+            "A threshold on a metric the daemon measures, with its owner; its state is a claim on it.",
+            false,
+        ),
+        (
             "agent",
             "agent/RUN/LOCAL_ID",
             "A mission-run agent runtime.",
@@ -1224,6 +1230,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[
                 "account",
                 "agent",
+                "condition",
                 "doc",
                 "exec",
                 "host",
@@ -2380,6 +2387,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "condition.state",
+            &["condition"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("conditions"),
+            false,
+            &[],
+        ),
+        (
             "operational.failure",
             &[
                 "agent",
@@ -3006,6 +3022,25 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("targets", array()),
             ("source_revision", string()),
             ("incarnation", string()),
+        ],
+        "condition.state" => &[
+            ("instance", required_string()),
+            ("host", required_string()),
+            (
+                "phase",
+                required_enum(&["clear", "pending", "breach", "recovering"]),
+            ),
+            ("transition", enumeration(&["enter", "recover"])),
+            ("value", number()),
+            ("threshold", number()),
+            ("recover_at", number()),
+            ("comparison", enumeration(&["above", "below"])),
+            ("metric", string()),
+            ("owner", string()),
+            ("phase_since", integer()),
+            ("breach_since", integer()),
+            ("measured_at", integer()),
+            ("values", array()),
         ],
         "operational.recovered" => &[
             ("episode", string()),
@@ -4034,6 +4069,7 @@ mod tests {
                 "attention",
                 "checkpoint",
                 "checkpoint-excusal",
+                "condition",
                 "custom",
                 "daemon",
                 "doc",
@@ -4117,6 +4153,7 @@ mod tests {
                 "checkpoint.excused",
                 "checkpoint.sealed",
                 "checkpoint.verified",
+                "condition.state",
                 "daemon.diagnostic",
                 "daemon.started",
                 "delivery.hold",
