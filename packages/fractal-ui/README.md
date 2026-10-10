@@ -83,7 +83,7 @@ The adoption subscription uses the same snapshot getter for server and client re
 
 Sender captions are paragraphs (`message-sender`), not headings, so embedding a transcript inside a Details surface never introduces a skipped heading level. `SemanticItems` checks the Host and Review delegate captions in both schemes.
 Transcript examples use uniquely labeled state regions so `AllStates` owns the only page main landmark. Its dark/light plays assert one main and nine distinctly named conversation regions. `Expanded` asserts exactly two populated tool-detail previews (read and run), including highlighted read source, rather than assuming that a work log has only one preview. Opening the read detail checks the exact source bytes in its `<pre>`, preserving whitespace.
-Adjacent reasoning entries share one **Thinking** disclosure. Expanding it keeps each original entry and Markdown body in source order; any intervening tool, text or semantic entry starts a separate disclosure.
+A turn's reasoning entries share one **Thinking** disclosure in its work log, because the work log lists tool calls separately. Expanding it keeps each original entry and Markdown body in source order.
 
 Runtime snapshot updates preserve the same runtime and composer instances across loading, observation and unavailability. Before classifying a missing id as stranded, `Transcript` waits for the adoption store to confirm that id's source snapshot actually reached the runtime. A host can pass `loadingState` to keep the lane empty until that publication; the live app does so, reserves the history-control slot and composer dock, and retains its unsent draft, focus and caret without a remount. Hosts that omit `loadingState` retain the kit skeleton.
 

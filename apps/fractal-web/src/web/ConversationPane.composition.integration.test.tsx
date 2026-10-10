@@ -256,7 +256,7 @@ describe('ConversationPane composition activation', () => {
     } finally { height.mockRestore(); client.mockRestore(); bounds.mockRestore() }
   })
 
-  it.each([false, true])('groups eleven adjacent reasoning entries, respecting tool boundaries (separated=%s)', async separated => {
+  it.each([false, true])('groups all eleven reasoning entries of a work log into one disclosure (tool between=%s)', async separated => {
     const reasoning: ConversationItem[] = Array.from({ length: 11 }, (_, index) => ({
       _tag: 'Reasoning', id: `thought-${index}`, text: `Thought number ${index + 1}.`, streaming: false, at: at(index + 1),
     }))
@@ -267,10 +267,10 @@ describe('ConversationPane composition activation', () => {
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => setTimeout(() => callback(0), 0))
     await mount()
     await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')!.click() })
-    // Grouping is asserted on the complete turn, after idle backfill.
-    await vi.waitFor(() => expect(container.querySelectorAll('[data-testid="thinking-entry"] button')).toHaveLength(separated ? 2 : 1))
+    // Grouping is asserted on the complete turn, after idle backfill; frames are timers here, so a loaded worker needs more than the 1 s default.
+    await vi.waitFor(() => expect(container.querySelectorAll('[data-testid="thinking-entry"] button')).toHaveLength(1), { timeout: 5000 })
     const disclosures = [...container.querySelectorAll<HTMLButtonElement>('[data-testid="thinking-entry"] button')]
-    expect(disclosures).toHaveLength(separated ? 2 : 1)
+    expect(disclosures).toHaveLength(1)
     expect(disclosures.every(button => button.getAttribute('aria-expanded') === 'false')).toBe(true)
     expect(text()).not.toContain('Thought number 1.')
     for (const button of disclosures) await act(async () => { button.click() })
