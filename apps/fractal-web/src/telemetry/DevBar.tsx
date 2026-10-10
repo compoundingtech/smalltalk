@@ -1,14 +1,25 @@
 import { RegistryContext, useAtomValue } from '@effect/atom-react'
+import { Devbar } from '@overeng/devbar'
+import type { DevbarPanel, DevbarSegment } from '@overeng/devbar'
+import { darkDevbarTheme, lightDevbarTheme } from '@overeng/devbar/themes'
+import { makeMeters, makeSeries } from '@overeng/meters'
+import type { FpsValue } from '@overeng/meters'
+import { darkMeterTheme, frameBlock, heapBlock, jankBlock, lightMeterTheme } from '@overeng/meters/canvas'
+import { makeBrowserPlatform } from '@overeng/meters/platform/browser'
+import { MetersProvider, MeterStrip } from '@overeng/meters/react'
+import { frameSource } from '@overeng/meters/sources/frame'
+import { longFramesSource } from '@overeng/meters/sources/long-frames'
+import type { LongFrameValue } from '@overeng/meters/sources/long-frames'
+import { heapSource } from '@overeng/meters/sources/memory'
+import type { HeapMemory } from '@overeng/meters/sources/memory'
 import * as stylex from '@stylexjs/stylex'
 import { Schema } from 'effect'
 import * as Atom from 'effect/reactivity/Atom'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import * as React from 'react'
-import { Button } from 'react-aria-components'
 import { buildIdentity, deploymentId } from 'virtual:build-identity'
 
 import { counters } from './measurement/index.ts'
-import { acquireMeasurementEngine } from './meters.tsx'
 import { persistedAtom } from '../state/persistence.ts'
 import { transportSnapshot } from './transport.ts'
 
@@ -32,79 +43,43 @@ export const DevBar = (props: { readonly defaultVisible?: boolean }) => (
 )
 
 const styles = stylex.create({
-  root: {
-    position: 'fixed',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    zIndex: 1000,
-    color: '#e5e7eb',
-    backgroundColor: '#111827',
-    borderTopWidth: 1,
-    borderTopStyle: 'solid',
-    borderTopColor: '#374151',
-    fontFamily: 'ui-monospace, monospace',
-    fontSize: 10,
-  },
-  row: {
-    display: 'flex',
-    alignItems: 'center',
-    height: 24,
-    gap: 8,
-    paddingInline: 8,
-    overflowX: 'auto',
-  },
-  transport: {
-    display: 'flex',
-    gap: 12,
-    whiteSpace: 'nowrap',
-    flexShrink: 0,
-    fontVariantNumeric: 'tabular-nums',
-  },
-  version: {
-    flexShrink: 0,
-    whiteSpace: 'nowrap',
-    maxWidth: 180,
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-  },
+  root: { zIndex: 1000 },
+  segment: { whiteSpace: 'nowrap', fontVariantNumeric: 'tabular-nums', fontFamily: 'ui-monospace, monospace' },
+  version: { maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis' },
   error: { color: '#f87171' },
-  details: {
-    display: 'none',
-    padding: 8,
-    color: '#ededed',
-    backgroundColor: '#030712',
-    borderBottom: '1px solid #374151',
-    overflowX: 'auto',
-  },
-  expanded: { display: 'block' },
-  trigger: {
-    minHeight: 20,
-    height: 20,
-    paddingBlock: 0,
-    paddingInline: 4,
-    fontSize: 10,
-    flexShrink: 0,
-    color: 'inherit',
-    backgroundColor: 'transparent',
-    borderWidth: 0,
-    borderRadius: 4,
-    cursor: 'pointer',
-  },
-  hidden: { display: 'none' },
-  description: { marginBottom: 6 },
+  panel: { padding: 12, color: 'inherit', fontFamily: 'ui-monospace, monospace' },
+  description: { marginTop: 0, marginBottom: 10, lineHeight: 1.5 },
   counters: { whiteSpace: 'pre-wrap', lineHeight: 1.5, fontVariantNumeric: 'tabular-nums' },
 })
 
-const keyboardShortcut = Atom.make((get) => {
+// Definitions are inert; the one MetersProvider owns the kit's scoped collector lease.
+const frames = makeSeries<FpsValue>({ id: 'wf.frames', label: 'Frame rate', unit: 'fps', capacity: 1200 })
+const longFrames = makeSeries<LongFrameValue>({ id: 'wf.longFrames', label: 'Long frames', unit: 'ms', capacity: 256 })
+const memory = makeSeries<HeapMemory>({ id: 'wf.memory', label: 'JS heap (approx.)', unit: 'bytes', capacity: 120 })
+const meters = makeMeters({
+  platform: makeBrowserPlatform(),
+  sources: [
+    frameSource({ id: 'frame', series: frames }),
+    longFramesSource({ id: 'long-frames', series: longFrames }),
+    heapSource({ id: 'memory', series: memory, everyMs: 1000 }),
+  ],
+})
+const compactBlocks = [
+  frameBlock({ id: 'frame', series: frames, widthPx: 80 }),
+  jankBlock({ id: 'long-frames', series: longFrames, widthPx: 90 }),
+  heapBlock({ id: 'memory', series: memory, widthPx: 110 }),
+]
+const detailBlocks = [
+  frameBlock({ id: 'frame', series: frames, widthPx: 180 }),
+  jankBlock({ id: 'long-frames', series: longFrames, widthPx: 180 }),
+  heapBlock({ id: 'memory', series: memory, widthPx: 180 }),
+]
+
+/** The visibility shortcut outlives panel selection and the collector lease. */
+const diagnosticLifetime = Atom.make((get) => {
   if (typeof window === 'undefined') return
   const keydown = (event: KeyboardEvent) => {
-    if (
-      !event.defaultPrevented &&
-      (event.metaKey || event.ctrlKey) &&
-      event.shiftKey &&
-      event.code === 'KeyB'
-    ) {
+    if (!event.defaultPrevented && (event.metaKey || event.ctrlKey) && event.shiftKey && event.code === 'KeyB') {
       event.preventDefault()
       toggleDevBar()
     }
@@ -113,87 +88,130 @@ const keyboardShortcut = Atom.make((get) => {
   get.addFinalizer(() => window.removeEventListener('keydown', keydown))
 })
 
-/** Sampled transport diagnostics stay outside the workbench render tree. */
-const TransportStatus = () => {
-  const transport = useAtomValue(transportSnapshot)
-  return (
-    <div {...stylex.props(styles.transport)} aria-label="st3 SDK transport">
-      <span>st3 SDK · WS {transport.socketLive ? 'live' : 'offline'}</span>
-      <span>HTTP {transport.requests} active</span>
-      <span title="Completed fetch latency through response headers, latest 256 requests">
-        p50 {transport.p50Ms.toFixed(0)} · p95 {transport.p95Ms.toFixed(0)}ms
-      </span>
-      <span {...stylex.props(transport.errors > 0 && styles.error)}>
-        HTTP errors {transport.errors}
-      </span>
-      <span>Subs {transport.subscriptions}/{transport.subscriptionCap}</span>
-      <span>{transport.messagesPerSecond.toFixed(1)} messages/s</span>
-    </div>
-  )
-}
+const counterSnapshot = Atom.make((get) => {
+  const timer = setInterval(() => get.setSelf(counters.snapshot()), 250)
+  get.addFinalizer(() => clearInterval(timer))
+  return counters.snapshot()
+})
 
-/** Compact status row with a counter snapshot in the expanded panel. */
-const DevBarContent = ({
-  defaultVisible = import.meta.env?.DEV ?? false,
-}: {
-  readonly defaultVisible?: boolean
-}) => {
-  defaultPreference = defaultVisible
-  const shown = useAtomValue(visibility) ?? defaultVisible
-  const [hovered, setHovered] = React.useState(false)
-  const [pinned, setPinned] = React.useState(false)
-  const [snapshot, setSnapshot] = React.useState<Readonly<Record<string, number>>>(() => counters.snapshot())
-  useAtomValue(keyboardShortcut)
-  React.useEffect(() => acquireMeasurementEngine(), [])
-  React.useEffect(() => {
-    const timer = window.setInterval(() => setSnapshot(counters.snapshot()), 250)
-    return () => window.clearInterval(timer)
-  }, [])
-  const expanded = hovered || pinned
+const CountersPanel = () => {
+  const snapshot = useAtomValue(counterSnapshot)
   const counterText = Object.entries(snapshot)
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, value]) => `${key}  ${value}`)
     .join('\n') || 'No measurement counters recorded.'
-
   return (
-    <aside
-      hidden={!shown}
-      {...stylex.props(styles.root, !shown && styles.hidden)}
-      aria-label="Developer transport and performance"
-      data-testid="wf-devbar"
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-    >
-      <div id="wf-devbar-details" {...stylex.props(styles.details, expanded && styles.expanded)}>
-        <p {...stylex.props(styles.description)}>
-          Counter totals are process-local values recorded by the app measurement instrumentation.
-          Transport latency uses completed SDK fetches through response headers.
-        </p>
-        <p {...stylex.props(styles.description)}>
-          {buildIdentity.displayVersion ?? buildIdentity.machineVersion} · Machine: {buildIdentity.machineVersion} · Source:{' '}
-          {buildIdentity.sourceKind} · Revision: {buildIdentity.rev ?? 'unavailable'} · Dirty:{' '}
-          {buildIdentity.dirty ? 'yes' : 'no'} · Commit timestamp:{' '}
-          {buildIdentity.commitTs ?? 'unavailable'} · Build timestamp:{' '}
-          {buildIdentity.buildTs ?? 'unavailable'} · Deployment: {deploymentId ?? 'unavailable'}
-        </p>
-        <pre {...stylex.props(styles.counters)} aria-label="Measurement counters">{counterText}</pre>
-      </div>
-      <div {...stylex.props(styles.row)}>
-        <Button
-          {...stylex.props(styles.trigger)}
-          aria-label="Expand developer transport details"
-          aria-expanded={expanded}
-          aria-controls="wf-devbar-details"
-          onPress={() => setPinned(!pinned)}
-        >
-          wf · {pinned ? '−' : '+'}
-        </Button>
-        <span {...stylex.props(styles.version)} title={buildIdentity.displayVersion ?? buildIdentity.machineVersion}>
-          {buildIdentity.displayVersion ?? buildIdentity.machineVersion}
-        </span>
-        {buildIdentity.dirty && <span {...stylex.props(styles.transport)}>dirty</span>}
-        <TransportStatus />
-      </div>
-    </aside>
+    <div {...stylex.props(styles.panel)}>
+      <p {...stylex.props(styles.description)}>
+        Counter totals are process-local values recorded by the app measurement instrumentation.
+        Transport latency uses completed SDK fetches through response headers.
+      </p>
+      <p {...stylex.props(styles.description)}>
+        {buildIdentity.displayVersion ?? buildIdentity.machineVersion} · Machine: {buildIdentity.machineVersion} · Source:{' '}
+        {buildIdentity.sourceKind} · Revision: {buildIdentity.rev ?? 'unavailable'} · Dirty:{' '}
+        {buildIdentity.dirty ? 'yes' : 'no'} · Commit timestamp: {buildIdentity.commitTs ?? 'unavailable'} · Build timestamp:{' '}
+        {buildIdentity.buildTs ?? 'unavailable'} · Deployment: {deploymentId ?? 'unavailable'}
+      </p>
+      <pre {...stylex.props(styles.counters)} aria-label="Measurement counters">{counterText}</pre>
+    </div>
+  )
+}
+
+/** Subscribe only the transport slot that consumes each sampled field. */
+const WebSocketSegment = () => {
+  const live = useAtomValue(transportSnapshot, (snapshot) => snapshot.socketLive)
+  return <span {...stylex.props(styles.segment)}>WS {live ? 'live' : 'offline'}</span>
+}
+const HttpSegment = () => {
+  const requests = useAtomValue(transportSnapshot, (snapshot) => snapshot.requests)
+  const p50Ms = useAtomValue(transportSnapshot, (snapshot) => snapshot.p50Ms)
+  const p95Ms = useAtomValue(transportSnapshot, (snapshot) => snapshot.p95Ms)
+  const errors = useAtomValue(transportSnapshot, (snapshot) => snapshot.errors)
+  return (
+    <span {...stylex.props(styles.segment, errors > 0 && styles.error)} title="Completed fetch latency through response headers, latest 256 requests">
+      HTTP {requests} active · p50 {p50Ms.toFixed(0)} · p95 {p95Ms.toFixed(0)}ms · errors {errors}
+    </span>
+  )
+}
+const SubscriptionsSegment = () => {
+  const subscriptions = useAtomValue(transportSnapshot, (snapshot) => snapshot.subscriptions)
+  const cap = useAtomValue(transportSnapshot, (snapshot) => snapshot.subscriptionCap)
+  return <span {...stylex.props(styles.segment)}>Subs {subscriptions}/{cap}</span>
+}
+const MessageRateSegment = () => {
+  const rate = useAtomValue(transportSnapshot, (snapshot) => snapshot.messagesPerSecond)
+  return <span {...stylex.props(styles.segment)}>{rate.toFixed(1)} msg/s</span>
+}
+const segments: readonly DevbarSegment[] = [
+  { id: 'version', render: () => (
+    <span {...stylex.props(styles.segment, styles.version)} title={buildIdentity.displayVersion ?? buildIdentity.machineVersion}>
+      {buildIdentity.displayVersion ?? buildIdentity.machineVersion}{buildIdentity.dirty ? ' · dirty' : ''}
+    </span>
+  ) },
+  { id: 'websocket', render: () => <WebSocketSegment /> },
+  { id: 'http', render: () => <HttpSegment /> },
+  { id: 'subscriptions', render: () => <SubscriptionsSegment /> },
+  { id: 'message-rate', render: () => <MessageRateSegment /> },
+]
+
+const subscribeScheme = (notify: () => void): (() => void) => {
+  if (typeof document === 'undefined') return () => {}
+  const observer = new MutationObserver(notify)
+  observer.observe(document.documentElement, { attributes: true, subtree: true, attributeFilter: ['data-scheme'] })
+  return () => observer.disconnect()
+}
+const readDarkScheme = (): boolean => {
+  if (typeof document === 'undefined') return false
+  // The live workbench owns its palette locally, overriding the document's system preference.
+  const host = document.querySelector<HTMLElement>('[data-testid="live-agent-workspace"]')
+  return (host?.dataset.scheme ?? document.documentElement.dataset.scheme) === 'dark'
+}
+const readServerScheme = (): boolean => false
+
+const MeterView = ({ dark, expanded = false, onOpenDetail }: {
+  readonly dark: boolean
+  readonly expanded?: boolean
+  readonly onOpenDetail: (selection: { readonly id: string }) => void
+}) => {
+  const [frozen, setFrozen] = React.useState(false)
+  return <MeterStrip meters={meters} blocks={expanded ? detailBlocks : compactBlocks}
+    theme={dark ? darkMeterTheme : lightMeterTheme} frozen={frozen} onFrozenChange={setFrozen}
+    onOpenDetail={onOpenDetail} heightPx={expanded ? 64 : 28} />
+}
+
+const meterDescriptions: Readonly<Record<string, string>> = {
+  frame: 'Frame rate is observed rAF timing. The kit calibrates skipped-frame evidence separately; pending or unsupported calibration is not treated as a measured zero.',
+  'long-frames': 'Long-animation-frame durations use PerformanceObserver, with an explicitly tagged long-task fallback on browsers without LoAF support. NoSamples means no event has been observed, not a measured zero.',
+  memory: 'JS heap is an approximate shared-heap measurement from performance.memory, not total app memory. Unsupported capabilities are shown as n/a, not zero.',
+}
+const MetersPanel = ({ dark }: { readonly dark: boolean }) => {
+  const [detail, setDetail] = React.useState('frame')
+  return (
+    <div {...stylex.props(styles.panel)}>
+      <p {...stylex.props(styles.description)}>Frame, long-frame, and memory histories share one scoped session. Click a meter for its measurement semantics; freeze each strip independently.</p>
+      <MeterView dark={dark} expanded onOpenDetail={({ id }) => setDetail(id)} />
+      <p {...stylex.props(styles.description)}>{meterDescriptions[detail]}</p>
+    </div>
+  )
+}
+
+const DevBarContent = ({ defaultVisible = import.meta.env?.DEV ?? false }: { readonly defaultVisible?: boolean }) => {
+  defaultPreference = defaultVisible
+  const shown = useAtomValue(visibility) ?? defaultVisible
+  useAtomValue(diagnosticLifetime)
+  const dark = React.useSyncExternalStore(subscribeScheme, readDarkScheme, readServerScheme)
+  const [openPanel, setOpenPanel] = React.useState<string | undefined>(undefined)
+  const panels = React.useMemo<readonly DevbarPanel[]>(() => [
+    { id: 'counters', label: 'Counters', render: () => <CountersPanel /> },
+    { id: 'meters', label: 'Meters', render: () => <MetersPanel dark={dark} /> },
+  ], [dark])
+  if (!shown) return null
+  return (
+    <div data-testid="wf-devbar" {...stylex.props(dark ? darkDevbarTheme : lightDevbarTheme)}>
+      <MetersProvider meters={meters}>
+        <Devbar panels={panels} segments={segments} openPanel={openPanel} onOpenPanelChange={setOpenPanel}
+          strip={<MeterView dark={dark} onOpenDetail={() => setOpenPanel('meters')} />} style={styles.root} />
+      </MetersProvider>
+    </div>
   )
 }

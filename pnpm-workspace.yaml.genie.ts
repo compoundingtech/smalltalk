@@ -13,4 +13,9 @@ export default pnpmWorkspaceYaml.root({
   extraMembers: workspaceMembers,
   ...pnpmPolicy,
   nodeLinker: 'hoisted',
+  // effect-utils members resolve their devDependencies through this lock, not effect-utils' own.
+  peerDependencyRules: {
+    ...pnpmPolicy.peerDependencyRules,
+    allowedVersions: { ...pnpmPolicy.peerDependencyRules?.allowedVersions, '@effect/platform-node-shared>effect': '4.0.0' },
+  },
 })

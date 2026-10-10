@@ -429,6 +429,16 @@ export const perfStoresCache = (stage: string) => ({
 /** pnpm's store under the runner's temporary directory, which only step-level env can name. */
 export const pnpmStoreEnv = { pnpm_config_store_dir: '${{ runner.temp }}/pnpm-store' } as const
 
+/**
+ * Materializes megarepo.lock's members under repos/ before any shell that reads them. `mr`
+ * comes from the flake's effect-utils pin; the store stays job-local.
+ */
+export const megarepoApplyStep = {
+  name: 'Materialize megarepo members',
+  env: { MEGAREPO_STORE: '${{ runner.temp }}/megarepo' },
+  run: `nix run "github:overengineeringstudio/effect-utils/$(jq -r '.nodes["effect-utils"].locked.rev' flake.lock)#megarepo" -- apply --worktree-mode commit --git-protocol https`,
+} as const
+
 /** The web lane's pnpm store, keyed by its lock and toolchain; only main upkeep fills it. */
 export const fractalWebStoreCache = {
   path: pnpmStoreEnv.pnpm_config_store_dir,
@@ -475,6 +485,7 @@ export const fractalWebJobs = {
     steps: [
       { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
       ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+      megarepoApplyStep,
       { name: 'Restore the pnpm store', id: 'pnpm-store', uses: 'actions/cache/restore@v4', with: fractalWebStoreCache },
       {
         ...nixDevelopStep({ name: 'Run the fractal-web lanes and dependency license check', flake: '.#web', command: ['bash', 'scripts/ci-fractal-web'] }),

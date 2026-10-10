@@ -9,23 +9,30 @@ packages:
   - clients/typescript/st3-scenarios
   - clients/typescript/st3-views
   - packages/fractal-ui
+  - repos/effect-utils/packages/@overeng/content-address
+  - repos/effect-utils/packages/@overeng/devbar
+  - repos/effect-utils/packages/@overeng/effect-distributed-lock
+  - repos/effect-utils/packages/@overeng/effect-rpc-explorer
+  - repos/effect-utils/packages/@overeng/effect-rpc-explorer-react
+  - repos/effect-utils/packages/@overeng/effect-rpc-observer
+  - repos/effect-utils/packages/@overeng/effect-rust
+  - repos/effect-utils/packages/@overeng/meters
+  - repos/effect-utils/packages/@overeng/otel-browser
+  - repos/effect-utils/packages/@overeng/otel-contract
+  - repos/effect-utils/packages/@overeng/rpc-devtools
+  - repos/effect-utils/packages/@overeng/stylex-tokens
+  - repos/effect-utils/packages/@overeng/utils
+  - repos/effect-utils/packages/@overeng/utils-dev
+  - repos/effect-utils/packages/@overeng/utils-storybook
 
 peerDependencyRules:
   allowedVersions:
     typescript: ">=6.0.0"
     vitest: ">=4.0.0"
     unplugin: ">=3.0.0"
+    "@effect/platform-node-shared>effect": 4.0.0
 
-minimumReleaseAgeExclude:
-  - "@types/node"
-  - effect
-  - "@effect/ai-openai-compat"
-  - "@effect/ai-typesafe"
-  - "@effect/platform-node"
-  - "@effect/vitest"
-  - "@effect/opentelemetry"
-  - "@effect/atom-react"
-  - "@effect/platform-node-shared"
+minimumReleaseAgeExclude: ["@types/node"]
 
 supportedArchitectures:
   os: [linux, darwin]

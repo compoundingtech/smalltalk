@@ -13,6 +13,25 @@ export const workspaceMembers = [
   'packages/fractal-ui',
   'apps/fractal-web',
   'apps/fractal-web/packages/st3-sdk',
+  // Megarepo member (megarepo.kdl): fractal-web's diagnostics packages, resolved from source.
+  // pnpm installs every member's devDependencies, so devbar's whole `workspace:^` closure joins.
+  ...[
+    'content-address',
+    'devbar',
+    'effect-distributed-lock',
+    'effect-rpc-explorer',
+    'effect-rpc-explorer-react',
+    'effect-rpc-observer',
+    'effect-rust',
+    'meters',
+    'otel-browser',
+    'otel-contract',
+    'rpc-devtools',
+    'stylex-tokens',
+    'utils',
+    'utils-dev',
+    'utils-storybook',
+  ].map((name) => `repos/effect-utils/packages/@overeng/${name}` as const),
 ] as const
 
 export default packageJson.aggregateFromPackages({

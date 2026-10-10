@@ -26,14 +26,14 @@ export default defineConfig({
     },
     extensionBuild({ entry: '../src/extensions/app-public.ts', privateBuild: false }),
     ...createStylexVitePlugins({
-      externalPackages: ['@smalltalk/fractal-ui'],
+      externalPackages: ['@smalltalk/fractal-ui', '@overeng/devbar', '@overeng/meters', '@overeng/stylex-tokens'],
       entries: [new URL('./src/web/main.tsx', import.meta.url).pathname],
     }),
     react(),
     webfractalGateway(),
   ],
   server: { strictPort: true, host: '127.0.0.1', allowedHosts: (process.env.WF_ALLOWED_HOSTS ?? '127.0.0.1,localhost').split(',') },
-  resolve: { dedupe: ['effect', 'react', 'react-dom'] },
+  resolve: { dedupe: ['effect', 'react', 'react-dom', '@stylexjs/stylex'] },
   build: {
     outDir: '../../dist/web',
     emptyOutDir: true,

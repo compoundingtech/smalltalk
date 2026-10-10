@@ -1,0 +1,4 @@
+// fractal-web resolves @overeng/devbar, meters and stylex-tokens from this member.
+members {
+  effect-utils "overengineeringstudio/effect-utils#schickling-assistant/2026-10-08-devbar"
+}
