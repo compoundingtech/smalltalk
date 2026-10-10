@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Request latency reports where agents roster time goes: refresher folds and their admission wait, and a fresh read's wait for a publication and its page build",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digests change."},
+  "compatibility": {"status": "changed", "detail": "GET /v1/client/request-latency adds scope=agents-roster rows (stage=refresh|refresh-admission|fresh-wait|fresh-page) to its routes array. Existing rows and fields are unchanged; consumers must not sum across scopes."},
+  "downtime": {"status": "none", "detail": "No startup work."},
+  "manual": {"status": "none", "detail": "No operator steps."},
+  "recovery": {"status": "none", "detail": "In-memory counters reset on restart; a rollback removes the rows without changing durable state."}
+}
