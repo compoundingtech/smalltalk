@@ -435,6 +435,10 @@ impl Default for ProcessSampler {
 }
 
 impl ProcessSampler {
+    pub(crate) fn retain_names(&mut self, names: &std::collections::HashSet<&str>) {
+        self.last.retain(|name, _| names.contains(name.as_str()));
+    }
+
     pub fn new(root: PathBuf, ticks_per_second: f64, page_size: f64) -> Self {
         Self {
             root,

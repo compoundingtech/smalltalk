@@ -368,10 +368,10 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                 "condition" => (
                     Tier::Today,
                     AttentionKind::Fault {
-                        what: clean_message_text(&item.title),
-                        because: clean_message_text(&item.detail),
+                        what: if item.title.trim().is_empty() { "Condition breached".into() } else { clean_message_text(&item.title) },
+                        because: if item.detail.trim().is_empty() { "The condition clears when its metric recovers.".into() } else { clean_message_text(&item.detail) },
                         fix: None,
-                        source: item.source_id.clone(),
+                        source: if item.source_id.is_empty() { "condition/unknown".into() } else { item.source_id.clone() },
                     },
                 ),
                 custom if custom.starts_with("custom.") => (
@@ -935,6 +935,13 @@ mod tests {
         assert!(what.contains("Disk breached") && because.contains("Free disk"));
         assert!(fix.is_none());
         assert!(items[0].actions.is_empty());
+        let st3_client::Resource::Attention(item) = &mut model.now.items[0] else { panic!("attention resource") };
+        item.title.clear(); item.detail.clear(); item.source_id.clear();
+        let empty = attention(&model, &Extras::default());
+        assert_eq!(empty.len(),1);
+        let AttentionKind::Fault { what,because,fix,.. } = &empty[0].kind else { panic!("empty condition remains visible") };
+        assert!(!what.is_empty() && !because.is_empty() && fix.is_none());
+        assert!(empty[0].actions.is_empty());
     }
 
     #[test]

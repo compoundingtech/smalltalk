@@ -16,7 +16,7 @@ export function tierTitle(tier: Tier): string {
   }
 }
 
-export type HomeKind = 'review' | 'launch' | 'revision' | 'request' | 'update';
+export type HomeKind = 'review' | 'launch' | 'revision' | 'request' | 'update' | 'condition';
 /** Semantic colors; renderers resolve them through their own palette. */
 export type HomeColor = 'person' | 'green';
 export type HomeRow = {
@@ -38,6 +38,7 @@ export function homeKind(item: Kindish): { tier: Tier; kind: HomeKind } | null {
     case 'human-gate': return { tier: 'stopped', kind: 'review' };
     // Information the person asked for (`st work update`): nothing waits on it.
     case 'person-step': return item.update ? { tier: 'later', kind: 'update' } : { tier: 'stopped', kind: 'request' };
+    case 'condition': return { tier: 'today', kind: 'condition' };
     case 'agent-request': return { tier: 'stopped', kind: 'request' };
     case 'launch-approval': return { tier: 'today', kind: 'launch' };
     case 'revision-approval': return { tier: 'today', kind: 'revision' };
@@ -95,7 +96,7 @@ export function homeRows(items: KeptAttention[], actor: string | undefined, now 
     const place = homeKind(item);
     if (!place) return [];
     const step = item.step_run_id?.split('/').pop();
-    return [{ item, ...place, ...kindGlyph(place.kind), title: cleanTitle(item.title), waiting: item.closedElsewhere ? 'closed; stays until you clear it' : step ? `step ${step}` : null, age: ago(item.requested_at, now) }];
+    return [{ item, ...place, ...kindGlyph(place.kind), title: cleanTitle(item.title) || (item.attention_kind === 'condition' ? 'Condition breached' : item.title), waiting: item.closedElsewhere ? 'closed; stays until you clear it' : step ? `step ${step}` : null, age: ago(item.requested_at, now) }];
   });
   // A stable sort by tier keeps st's order within each tier; what st closed sits last, apart.
   const rank = (row: HomeRow) => (row.item.closedElsewhere ? TIERS.length : 0) + TIERS.indexOf(row.tier);

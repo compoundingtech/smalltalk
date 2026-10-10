@@ -21,10 +21,15 @@ CREATE TABLE IF NOT EXISTS local_condition_observations (
 CREATE INDEX IF NOT EXISTS desired_condition_index ON desired(subject) WHERE kind='condition';
 CREATE TABLE IF NOT EXISTS local_condition_heads (
     subject TEXT NOT NULL,
+    origin TEXT NOT NULL,
     instance TEXT NOT NULL,
     store_index INTEGER NOT NULL,
-    PRIMARY KEY (subject, instance)
+    breached INTEGER NOT NULL,
+    accepted_key TEXT NOT NULL,
+    PRIMARY KEY (subject, origin, instance)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS local_condition_heads_origin ON local_condition_heads(subject,origin,breached,accepted_key);
+CREATE INDEX IF NOT EXISTS local_condition_heads_member ON local_condition_heads(origin,subject);
 CREATE TABLE IF NOT EXISTS local_condition_notifications (
     store_index INTEGER PRIMARY KEY
 );
@@ -39,7 +44,7 @@ const HEADS_CURSOR: &str = "condition_heads_cursor";
 const BYTES_CURSOR: &str = "condition_bytes_cursor";
 const BYTES_SINCE: &str = "condition_bytes_since";
 /// State claims one fold reads at most.
-const HEADS_PAGE: i64 = 500;
+const HEADS_PAGE: i64 = 50;
 /// Claims one byte-count read covers, by store index. A read of this many rows takes a few
 /// milliseconds, so no read holds its connection long.
 const BYTES_PAGE: i64 = 2_000;
@@ -47,6 +52,22 @@ const BYTES_PAGE: i64 = 2_000;
 const BYTES_PAGES_PER_TICK: usize = 25;
 const HOUR_MS: u128 = 3_600_000;
 const DAY_MS: u128 = 24 * HOUR_MS;
+
+pub(super) fn create_schema(connection: &Connection) -> Result<()> {
+    // An earlier development cache has no origin key. Rebuild only this disposable cache.
+    let old: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('local_condition_heads')) AND NOT EXISTS(SELECT 1 FROM pragma_table_info('local_condition_heads') WHERE name='origin')", [], |row| row.get(0))?;
+    if old {
+        connection.execute_batch("DROP TABLE local_condition_heads; DELETE FROM meta WHERE key IN ('condition_heads_declared_digest_v3','condition_heads_cursor');")?;
+    }
+    connection.execute_batch(SCHEMA)?;
+    Ok(())
+}
+
+#[derive(Default, Debug)]
+pub struct ConditionNotificationReport {
+    pub messages: Vec<String>,
+    pub errors: Vec<String>,
+}
 
 /// A declared condition, or why its body no longer parses.
 #[derive(Clone, Debug)]
@@ -239,48 +260,91 @@ fn valid_notification_owner(owner: &str) -> bool {
         })
 }
 
-/// Keep the newest eight transition heads of each origin. A new mount must replace an
-/// older retired mount, rather than being hidden forever behind its host's old heads.
+/// Keep eight heads per origin, preferring standing breaches over Clear retired instances.
 fn upsert_condition_head(
     tx: &Transaction<'_>,
     condition: &str,
     instance: &str,
     index: i64,
 ) -> rusqlite::Result<()> {
-    let exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM local_condition_heads WHERE subject=?1 AND instance=?2)",
-        params![condition, instance],
-        |row| row.get(0),
+    let (origin, accepted, id, body): (String, String, String, String) = tx.query_row(
+        "SELECT origin,accepted_at_unix_ms,id,body FROM claims WHERE store_index=?1",
+        [index],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
+    let phase = serde_json::from_str::<Value>(&body)
+        .ok()
+        .and_then(|body| Phase::parse(body["fields"]["phase"].as_str()?));
+    let breached = phase.is_some_and(Phase::in_breach);
+    let key = format!("{:02}:{accepted}:{id}", accepted.len());
+    let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM local_condition_heads WHERE subject=?1 AND origin=?2 AND instance=?3)", params![condition,origin,instance], |row| row.get(0))?;
     if !exists {
-        let origin: String = tx.query_row(
-            "SELECT origin FROM claims WHERE store_index=?1",
-            [index],
+        let count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM local_condition_heads WHERE subject=?1 AND origin=?2",
+            params![condition, origin],
             |row| row.get(0),
         )?;
-        let count: i64 = tx.query_row("SELECT COUNT(*) FROM local_condition_heads h JOIN claims c ON c.store_index=h.store_index WHERE h.subject=?1 AND c.origin=?2", params![condition, origin], |row| row.get(0))?;
-        if count >= crate::conditions::MAX_INSTANCES as i64 {
-            let (victim, victim_index): (String, i64) = tx.query_row("SELECT h.instance,h.store_index FROM local_condition_heads h JOIN claims c ON c.store_index=h.store_index WHERE h.subject=?1 AND c.origin=?2 ORDER BY length(c.accepted_at_unix_ms),c.accepted_at_unix_ms,c.id LIMIT 1", params![condition, origin], |row| Ok((row.get(0)?,row.get(1)?)))?;
-            let newest: i64 = tx.query_row(&canonical_sql("SELECT claims.store_index FROM claims WHERE claims.store_index IN (?1,?2) ORDER BY CANONICAL_DESC(claims) LIMIT 1"), params![victim_index,index], |row| row.get(0))?;
-            if newest != index {
-                return Ok(());
-            }
-            tx.execute(
-                "DELETE FROM local_condition_heads WHERE subject=?1 AND instance=?2",
-                params![condition, victim],
-            )?;
-        } else {
-            let total: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM local_condition_heads WHERE subject=?1",
-                [condition],
-                |row| row.get(0),
-            )?;
-            if total >= crate::conditions::MAX_REMOTE_INSTANCES as i64 {
-                return Ok(());
+        let total: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM local_condition_heads WHERE subject=?1",
+            [condition],
+            |row| row.get(0),
+        )?;
+        if count >= crate::conditions::MAX_INSTANCES as i64
+            || total >= crate::conditions::MAX_REMOTE_INSTANCES as i64
+        {
+            let same_origin = count >= crate::conditions::MAX_INSTANCES as i64;
+            let read_victim = |row: &rusqlite::Row<'_>| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            };
+            let victim = if same_origin {
+                tx.query_row("SELECT origin,instance,store_index,breached,accepted_key FROM local_condition_heads WHERE subject=?1 AND origin=?2 ORDER BY breached,accepted_key,origin,instance LIMIT 1", params![condition,origin],read_victim).optional()?
+            } else {
+                tx.query_row("SELECT origin,instance,store_index,breached,accepted_key FROM local_condition_heads WHERE subject=?1 ORDER BY breached,accepted_key,origin,instance LIMIT 1", [condition],read_victim).optional()?
+            };
+            if let Some((old_origin, old_instance, old_index, old_breach, old_key)) = victim {
+                let replace =
+                    (!old_breach && breached) || (old_breach == breached && key > old_key);
+                if !replace {
+                    head_capacity_error(
+                        tx,
+                        &format!(
+                            "{condition}: {} {origin}/{instance} omitted at the instance/head limit; withdraw or narrow the declaration",
+                            if breached {
+                                "standing breach"
+                            } else {
+                                "instance"
+                            }
+                        ),
+                    )?;
+                    return Ok(());
+                }
+                if old_breach {
+                    head_capacity_error(
+                        tx,
+                        &format!(
+                            "{condition}: standing breach {old_origin}/{old_instance} evicted at the instance/head limit by {origin}/{instance}; withdraw or narrow the declaration"
+                        ),
+                    )?;
+                }
+                tx.execute("DELETE FROM local_condition_heads WHERE subject=?1 AND origin=?2 AND instance=?3 AND store_index=?4", params![condition,old_origin,old_instance,old_index])?;
             }
         }
     }
-    tx.execute(&canonical_sql("INSERT INTO local_condition_heads(subject,instance,store_index) VALUES (?1,?2,?3) ON CONFLICT(subject,instance) DO UPDATE SET store_index=(SELECT claims.store_index FROM claims WHERE claims.store_index IN (local_condition_heads.store_index,excluded.store_index) ORDER BY CANONICAL_DESC(claims) LIMIT 1)"), params![condition,instance,index])?;
+    let newest: i64 = tx.query_row(&canonical_sql("SELECT claims.store_index FROM claims WHERE claims.store_index IN (?1,COALESCE((SELECT store_index FROM local_condition_heads WHERE subject=?2 AND origin=?3 AND instance=?4),?1)) ORDER BY CANONICAL_DESC(claims) LIMIT 1"), params![index,condition,origin,instance], |row| row.get(0))?;
+    if newest == index {
+        tx.execute("INSERT INTO local_condition_heads(subject,origin,instance,store_index,breached,accepted_key) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(subject,origin,instance) DO UPDATE SET store_index=excluded.store_index,breached=excluded.breached,accepted_key=excluded.accepted_key", params![condition,origin,instance,index,breached,key])?;
+    }
+    Ok(())
+}
+
+fn head_capacity_error(tx: &Transaction<'_>, detail: &str) -> rusqlite::Result<()> {
+    tx.execute("INSERT INTO meta(key,value) VALUES ('condition_heads_error',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [detail])?;
     Ok(())
 }
 
@@ -302,7 +366,7 @@ impl Store {
                 .and_then(|desired| parse_condition(&subject, &desired));
             if conditions.len() >= crate::conditions::MAX_CONDITIONS {
                 decl = Err(
-                    "fleet condition limit (32) exceeded; this declaration is not evaluated".into(),
+                    format!("fleet condition limit (32) exceeded; all remaining declarations are not evaluated (at least {} omitted)",connection.query_row("SELECT COUNT(*) FROM (SELECT 1 FROM desired WHERE kind='condition' LIMIT 1024)", [], |row| row.get::<_,i64>(0))?.saturating_sub(32)),
                 );
             }
             conditions.push(DeclaredCondition { subject, decl });
@@ -314,7 +378,30 @@ impl Store {
     /// State subjects have one instance each; existing subject indexes skip its entire history.
     pub fn seed_condition_heads(&self, refresh: bool) -> Result<()> {
         let declarations = self.declared_conditions()?;
-        let digest = hex::encode(sha2::Sha256::digest(format!("{declarations:?}").as_bytes()));
+        let membership = self.fleet_membership()?;
+        let members = membership
+            .incarnations()
+            .map(|member| member.name.clone())
+            .chain(membership.legacy_removed_names())
+            .collect::<BTreeSet<_>>();
+        let departed = members
+            .iter()
+            .filter(|name| {
+                matches!(
+                    membership.state(name),
+                    smallclaims::fleet::MemberState::Ended(_)
+                        | smallclaims::fleet::MemberState::LegacyRemoved(_)
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let current = members
+            .difference(&departed.iter().cloned().collect())
+            .cloned()
+            .collect::<Vec<_>>();
+        let digest = hex::encode(sha2::Sha256::digest(
+            format!("{declarations:?}{current:?}{departed:?}").as_bytes(),
+        ));
         let seeded: Option<String> = self
             .readers
             .get()
@@ -327,34 +414,116 @@ impl Store {
         if !refresh && seeded.as_deref() == Some(&digest) {
             return Ok(());
         }
-        let captured = i64::try_from(self.index()?)?;
+        let progress: Option<String> = self
+            .readers
+            .get()
+            .query_row(
+                "SELECT value FROM meta WHERE key='condition_heads_seed_progress'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let progress = progress
+            .and_then(|value| serde_json::from_str::<Value>(&value).ok())
+            .filter(|value| !refresh && value["digest"].as_str() == Some(digest.as_str()));
+        let captured = progress
+            .as_ref()
+            .and_then(|value| value["captured"].as_i64())
+            .unwrap_or(i64::try_from(self.index()?)?);
+        let resume_condition = progress
+            .as_ref()
+            .and_then(|value| value["condition"].as_u64())
+            .unwrap_or(0) as usize;
+        let resume_origin = progress
+            .as_ref()
+            .and_then(|value| value["origin"].as_u64())
+            .unwrap_or(0) as usize;
+        let resume_previous = progress
+            .as_ref()
+            .and_then(|value| value["previous"].as_str())
+            .map(str::to_owned);
+        let seed_started = std::time::Instant::now();
+        let mut origin_work = 0;
+        let mut next_progress = None;
         let mut heads = Vec::new();
+        let mut diagnostics = Vec::new();
         let now = condition_now();
-        for condition in declarations
+        let beginning = progress.is_none();
+        self.connection
+            .batched(move |tx| {
+                for origin in departed {
+                    tx.execute(
+                        "DELETE FROM local_condition_heads WHERE origin=?1",
+                        [origin],
+                    )?;
+                }
+                if beginning {
+                    tx.execute("DELETE FROM meta WHERE key='condition_heads_error'", [])?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })
+            .map_err(|error| anyhow::anyhow!("{error}"))??;
+        'conditions: for (condition_slot, condition) in declarations
             .into_iter()
             .take(crate::conditions::MAX_CONDITIONS)
+            .enumerate()
+            .skip(resume_condition)
         {
             let prefix = crate::conditions::instance_subject_prefix(&condition.subject);
             let upper = format!("{prefix}~");
-            let mut previous_origin = prefix.clone();
-            // Skip an origin's entire namespace after eight instances. Excess claims from
-            // one authenticated member cannot consume another member's startup seek budget.
-            for _ in 0..(crate::conditions::MAX_REMOTE_INSTANCES / crate::conditions::MAX_INSTANCES)
-            {
-                let first: Option<String> = self.readers.get().query_row(
-                    "SELECT subject FROM claims INDEXED BY claims_subject_kind_accepted_index
-                     WHERE subject>?1 AND subject<?2 AND kind='condition.state' ORDER BY subject LIMIT 1",
-                    params![previous_origin, upper], |row| row.get(0)).optional()?;
-                let Some(first) = first else { break };
-                let Some((origin_hash, _)) = first
-                    .strip_prefix(&prefix)
-                    .and_then(|rest| rest.split_once('/'))
-                else {
-                    break;
+            let first_slot = if condition_slot == resume_condition {
+                resume_origin
+            } else {
+                0
+            };
+            let mut previous_origin = if first_slot > 0 {
+                resume_previous.clone().unwrap_or(prefix.clone())
+            } else {
+                prefix.clone()
+            };
+            // Keyed fleets seek their current members directly: departed namespaces cannot
+            // consume discovery slots. Legacy fleets have a larger bounded origin allowance.
+            let known = membership.anchor().is_some();
+            if known && current.len() > crate::conditions::MAX_REMOTE_INSTANCES {
+                diagnostics.push(format!(
+                    "{}: {} members exceed the 256-origin discovery limit",
+                    condition.subject,
+                    current.len()
+                ));
+            }
+            for slot in first_slot..crate::conditions::MAX_REMOTE_INSTANCES {
+                if origin_work >= 128
+                    || (origin_work > 0
+                        && seed_started.elapsed() >= std::time::Duration::from_secs(1))
+                {
+                    next_progress = Some(
+                        json!({"digest":digest,"captured":captured,"condition":condition_slot,"origin":slot,"previous":previous_origin}),
+                    );
+                    break 'conditions;
+                }
+                origin_work += 1;
+                let origin_prefix = if known {
+                    let Some(origin) = current.get(slot) else {
+                        break;
+                    };
+                    crate::conditions::instance_origin_prefix(&condition.subject, origin)
+                } else {
+                    let first: Option<String> = self.readers.get().query_row(
+                        "SELECT subject FROM claims INDEXED BY claims_subject_kind_accepted_index WHERE subject>?1 AND subject<?2 AND kind='condition.state' ORDER BY subject LIMIT 1",
+                        params![previous_origin,upper], |row| row.get(0)).optional()?;
+                    let Some(first) = first else { break };
+                    let Some((origin_hash, _)) = first
+                        .strip_prefix(&prefix)
+                        .and_then(|rest| rest.split_once('/'))
+                    else {
+                        previous_origin = first;
+                        continue;
+                    };
+                    let origin_prefix = format!("{prefix}{origin_hash}/");
+                    previous_origin = format!("{origin_prefix}~");
+                    origin_prefix
                 };
-                let origin_prefix = format!("{prefix}{origin_hash}/");
                 let origin_upper = format!("{origin_prefix}~");
-                previous_origin = origin_upper.clone();
                 let mut previous_instance = origin_prefix;
                 let mut candidates = Vec::new();
                 // A bounded discovery allowance includes retired instance namespaces.
@@ -384,7 +553,16 @@ impl Store {
                             .is_some_and(|owner| owner.starts_with("agent/"))
                         && claim.accepted_at_unix_ms <= now
                         && now.saturating_sub(claim.accepted_at_unix_ms) <= 3_600_000;
+                    if matches!(
+                        membership.state(&claim.origin),
+                        smallclaims::fleet::MemberState::Ended(_)
+                            | smallclaims::fleet::MemberState::LegacyRemoved(_)
+                    ) {
+                        continue;
+                    }
                     candidates.push((
+                        Phase::parse(fields["phase"].as_str().unwrap_or(""))
+                            .is_some_and(Phase::in_breach),
                         claim.accepted_at_unix_ms,
                         claim.id.clone(),
                         (
@@ -395,19 +573,36 @@ impl Store {
                         ),
                     ));
                 }
-                candidates.sort_by(|left, right| (right.0, &right.1).cmp(&(left.0, &left.1)));
+                let more: bool = self.readers.get().query_row("SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_subject_kind_accepted_index WHERE subject>?1 AND subject<?2 AND kind='condition.state')", params![previous_instance,origin_upper], |row| row.get(0))?;
+                if more {
+                    diagnostics.push(format!("{}: instance discovery exceeds 64 namespaces in an origin; additional instances are not reconstructed; narrow or replace the declaration",condition.subject));
+                }
+                candidates.sort_by(|left, right| {
+                    (right.0, right.1, &right.2).cmp(&(left.0, left.1, &left.2))
+                });
+                if candidates.iter().filter(|candidate| candidate.0).count()
+                    > crate::conditions::MAX_INSTANCES
+                {
+                    diagnostics.push(format!("{}: standing breaches exceed eight instances in an origin; some are omitted; withdraw or narrow the declaration",condition.subject));
+                }
                 heads.extend(
                     candidates
                         .into_iter()
                         .take(crate::conditions::MAX_INSTANCES)
-                        .map(|(_, _, head)| head),
+                        .map(|(_, _, _, head)| head),
                 );
+            }
+            if !known {
+                let more: bool = self.readers.get().query_row("SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_subject_kind_accepted_index WHERE subject>?1 AND subject<?2 AND kind='condition.state')", params![previous_origin,upper], |row| row.get(0))?;
+                if more {
+                    diagnostics.push(format!("{}: legacy origin discovery exceeds 256 namespaces; additional origins are not reconstructed",condition.subject));
+                }
             }
         }
         self.connection
             .batched(|tx| tx.execute("DELETE FROM local_condition_heads WHERE subject NOT IN (SELECT subject FROM desired WHERE kind='condition')", []))
             .map_err(|error| anyhow::anyhow!("{error}"))??;
-        for page in heads.chunks(256) {
+        for page in heads.chunks(HEADS_PAGE as usize) {
             let page = page.to_vec();
             self.connection.batched(move |tx| {
                 for (subject, instance, index, notify) in page {
@@ -419,11 +614,28 @@ impl Store {
         }
         self.connection
             .batched(move |tx| {
-                set_meta_integer(tx, HEADS_CURSOR, captured)?;
-                tx.execute("INSERT INTO meta(key,value) VALUES ('condition_heads_declared_digest_v3',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [digest]).map(|_| ())
+                if let Some(detail) = diagnostics.last() { head_capacity_error(tx,detail)?; }
+                if let Some(progress) = next_progress {
+                    tx.execute("INSERT INTO meta(key,value) VALUES ('condition_heads_seed_progress',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [progress.to_string()])?;
+                    tx.execute("INSERT INTO meta(key,value) VALUES ('condition_heads_discovery','indexed condition discovery continues on the next tick') ON CONFLICT(key) DO UPDATE SET value=excluded.value", [])?;
+                } else {
+                    let current_cursor: Option<i64> = tx.query_row("SELECT CAST(value AS INTEGER) FROM meta WHERE key=?1", [HEADS_CURSOR], |row| row.get(0)).optional()?;
+                    set_meta_integer(tx, HEADS_CURSOR, captured.max(current_cursor.unwrap_or(0)))?;
+                    tx.execute("DELETE FROM meta WHERE key IN ('condition_heads_seed_progress','condition_heads_discovery')", [])?;
+                    tx.execute("INSERT INTO meta(key,value) VALUES ('condition_heads_declared_digest_v3',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [digest])?;
+                }
+                Ok::<_,rusqlite::Error>(())
             })
             .map_err(|error| anyhow::anyhow!("{error}"))??;
         Ok(())
+    }
+
+    pub fn condition_heads_seed_pending(&self) -> Result<bool> {
+        Ok(self.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='condition_heads_seed_progress')",
+            [],
+            |row| row.get(0),
+        )?)
     }
 
     /// Latest routine values are local, fixed-size rows rather than replicated claims.
@@ -472,7 +684,9 @@ impl Store {
             tx.execute("DELETE FROM local_condition_observations WHERE subject NOT IN (SELECT subject FROM desired WHERE kind='condition')", [])?;
             tx.execute("DELETE FROM local_condition_observations WHERE (subject,instance) IN (
                 SELECT subject,instance FROM (SELECT subject,instance,ROW_NUMBER() OVER (PARTITION BY subject ORDER BY json_extract(body,'$.fields.measured_at') DESC,instance) AS rank FROM local_condition_observations) WHERE rank>8)", [])?;
-            tx.execute("DELETE FROM local_condition_heads WHERE subject NOT IN (SELECT subject FROM desired WHERE kind='condition')", [])?;
+            if tx.execute("DELETE FROM local_condition_heads WHERE subject NOT IN (SELECT subject FROM desired WHERE kind='condition')", [])? > 0 {
+                tx.execute("DELETE FROM meta WHERE key IN ('condition_heads_declared_digest_v3','condition_heads_seed_progress')", [])?;
+            }
             Ok::<_, rusqlite::Error>(())
         }).map_err(|error| anyhow::anyhow!("{error}"))??;
         Ok(())
@@ -481,7 +695,7 @@ impl Store {
     pub fn condition_evaluator_status(&self) -> Result<(Option<i64>, Option<String>)> {
         let connection = self.readers.get();
         let at = meta_integer(&connection, "condition_evaluator_completed")?;
-        let error = connection.query_row("SELECT value FROM meta WHERE key IN ('condition_evaluator_error','condition_notification_last_error') ORDER BY key LIMIT 1", [], |row| row.get(0)).optional()?;
+        let error = connection.query_row("SELECT value FROM meta WHERE key IN ('condition_evaluator_error','condition_notification_last_error','condition_heads_error','condition_heads_discovery','condition_notification_discarded') AND (key!='condition_notification_discarded' OR ?1-CAST((SELECT value FROM meta WHERE key='condition_notification_discarded_at') AS INTEGER)<3600000) ORDER BY key LIMIT 1", [i64::try_from(condition_now()).unwrap_or(i64::MAX)], |row| row.get(0)).optional()?;
         Ok((at, error))
     }
 
@@ -505,7 +719,7 @@ impl Store {
             let connection = self.readers.get();
             let cursor = meta_integer(&connection, HEADS_CURSOR)?.unwrap_or(0);
             let mut statement = connection.prepare_cached(
-                "SELECT store_index, json_extract(body, '$.fields.condition'), json_extract(body, '$.fields.instance'), body, origin, accepted_at_unix_ms
+                "SELECT store_index, CASE WHEN json_valid(body) THEN json_extract(body, '$.fields.condition') END, CASE WHEN json_valid(body) THEN json_extract(body, '$.fields.instance') END, body, origin, accepted_at_unix_ms, subject
                    FROM claims
                   WHERE kind='condition.state' AND store_index > ?1
                   ORDER BY store_index LIMIT ?2",
@@ -514,11 +728,12 @@ impl Store {
                 .query_map(params![cursor, HEADS_PAGE], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -529,6 +744,18 @@ impl Store {
         };
         let count = rows.len();
         let host = self.origin().to_owned();
+        let membership = self.fleet_membership()?;
+        let departed = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    membership.state(&row.4),
+                    smallclaims::fleet::MemberState::Ended(_)
+                        | smallclaims::fleet::MemberState::LegacyRemoved(_)
+                )
+            })
+            .map(|row| row.4.clone())
+            .collect::<BTreeSet<_>>();
         let declared = self
             .declared_conditions()?
             .into_iter()
@@ -537,17 +764,16 @@ impl Store {
             .collect::<BTreeSet<_>>();
         self.connection
             .batched(move |transaction| {
-                for (index, subject, instance, body, origin, accepted) in &rows {
-                    let Some(instance) = instance else { continue };
-                    if !declared.contains(subject) { continue; }
-                    if let Ok(body) = serde_json::from_str::<Value>(body) {
-                        let fields = &body["fields"];
-                        if !crate::conditions::valid_state_identity(&crate::conditions::instance_subject_with_origin(subject, origin, instance), origin, fields) { continue; }
-                        if origin == &host && fields["host"] == host
-                            && accepted.parse::<u128>().is_ok_and(|at| at <= condition_now() && condition_now().saturating_sub(at) <= 3_600_000) && fields["transition"].is_string()
-                            && fields["owner"].as_str().is_some_and(|owner| owner.starts_with("agent/")) {
-                            transaction.execute("INSERT OR IGNORE INTO local_condition_notifications(store_index) VALUES (?1)", [index])?;
-                        }
+                for (index, subject, instance, body, origin, accepted, claim_subject) in &rows {
+                    let (Some(subject),Some(instance)) = (subject,instance) else { continue };
+                    if !declared.contains(subject) || departed.contains(origin) { continue; }
+                    let Ok(body) = serde_json::from_str::<Value>(body) else { continue };
+                    let fields = &body["fields"];
+                    if !crate::conditions::valid_state_identity(claim_subject, origin, fields) { continue; }
+                    if origin == &host && fields["host"] == host
+                        && accepted.parse::<u128>().is_ok_and(|at| at <= condition_now() && condition_now().saturating_sub(at) <= 3_600_000) && fields["transition"].is_string()
+                        && fields["owner"].as_str().is_some_and(|owner| owner.starts_with("agent/")) {
+                        transaction.execute("INSERT OR IGNORE INTO local_condition_notifications(store_index) VALUES (?1)", [index])?;
                     }
                     upsert_condition_head(transaction, subject, instance, *index)?;
                 }
@@ -570,8 +796,8 @@ impl Store {
             "SELECT claims.id, claims.body
                FROM local_condition_heads heads
                JOIN claims ON claims.store_index=heads.store_index
-              WHERE heads.subject=?1 AND claims.origin=json_extract(claims.body,'$.fields.host') AND (heads.instance=claims.origin OR substr(heads.instance,1,length(claims.origin)+1)=claims.origin||':') AND (?2 IS NULL OR heads.instance=?2 OR (heads.instance>=?2||':' AND heads.instance<?2||';'))
-              AND (?3=0 OR json_extract(claims.body,'$.fields.phase') IN ('breach','recovering')) ORDER BY heads.instance LIMIT 256",
+              WHERE heads.subject=?1 AND heads.origin=claims.origin AND claims.origin=json_extract(claims.body,'$.fields.host') AND (heads.instance=claims.origin OR substr(heads.instance,1,length(claims.origin)+1)=claims.origin||':') AND (?2 IS NULL OR heads.origin=?2)
+              AND (?3=0 OR heads.breached=1) ORDER BY heads.instance LIMIT 256",
         )?;
         let mut rows = statement
             .query_map(params![subject, host, breached_only], |row| {
@@ -593,17 +819,33 @@ impl Store {
             let fields = &body["fields"];
             let text = |name: &str| fields[name].as_str().map(str::to_owned);
             let instance = text("instance").unwrap_or_default();
+            let key = (text("host").unwrap_or_default(), instance.clone());
             let local_observation = claim.is_empty();
+            let old_breach = instances
+                .get(&key)
+                .is_some_and(|view: &ConditionInstanceView| {
+                    Phase::parse(&view.phase).is_some_and(Phase::in_breach)
+                });
+            let stale_observation = fields["measured_at"].as_u64().is_some_and(|at| {
+                condition_now().saturating_sub(u128::from(at)) > crate::conditions::STALE_AFTER_MS
+            });
+            if local_observation
+                && old_breach
+                && stale_observation
+                && fields["phase"].as_str() == Some("pending")
+            {
+                continue;
+            }
             let claim = if claim.is_empty() {
                 instances
-                    .get(&instance)
+                    .get(&key)
                     .map(|view: &ConditionInstanceView| view.claim.clone())
                     .unwrap_or_default()
             } else {
                 claim
             };
             instances.insert(
-                instance,
+                key,
                 ConditionInstanceView {
                     instance: text("instance").unwrap_or_default(),
                     host: text("host").unwrap_or_default(),
@@ -835,11 +1077,15 @@ impl Store {
             valid_notification_owner(owner),
             "invalid condition notification owner"
         );
-        let key = format!(
-            "condition:{}:{instance}:{}:{breach_since}",
+        let key = json!([
+            "condition",
             condition,
-            transition.as_str()
-        );
+            self.origin(),
+            instance,
+            transition.as_str(),
+            breach_since
+        ])
+        .to_string();
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
         let subject = format!("message/condition-{}", &digest[..20]);
         if self.latest_claim(&subject, Some("message.sent"))?.is_some() {
@@ -874,24 +1120,32 @@ impl Store {
     /// Replay recorded transitions after a restart. Sending and queue removal may be interrupted;
     /// the deterministic message key prevents a second wake when that happens.
     pub fn flush_condition_notifications(&self) -> Result<Vec<String>> {
+        let report = self.flush_condition_notifications_report()?;
+        if report.messages.is_empty() && !report.errors.is_empty() {
+            anyhow::bail!("{}", report.errors.join("; "));
+        }
+        Ok(report.messages)
+    }
+
+    pub fn flush_condition_notifications_report(&self) -> Result<ConditionNotificationReport> {
         let rows = {
             let connection = self.readers.get();
             let mut statement = connection.prepare_cached(
-                "SELECT c.store_index, c.id, json_extract(c.body,'$.fields.condition'), c.body FROM local_condition_notifications n
-                 JOIN claims c ON c.store_index=n.store_index ORDER BY c.store_index LIMIT 16",
+                "WITH queued AS (SELECT c.store_index,c.id,CASE WHEN json_valid(c.body) THEN json_extract(c.body,'$.fields.condition') END AS condition,c.body,ROW_NUMBER() OVER (PARTITION BY CASE WHEN json_valid(c.body) THEN COALESCE(json_extract(c.body,'$.fields.owner'),c.id) ELSE c.id END ORDER BY c.store_index) AS owner_rank FROM local_condition_notifications n JOIN claims c ON c.store_index=n.store_index) SELECT store_index,id,condition,body FROM queued WHERE owner_rank<=4 ORDER BY store_index LIMIT 16",
             )?;
             statement
                 .query_map([], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(2)?,
                         row.get::<_, String>(3)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut messages = Vec::new();
+        let mut errors = Vec::new();
         let mut had_error = false;
         let mut owner_counts = BTreeMap::<String, usize>::new();
         for (index, claim, subject, body) in rows {
@@ -936,7 +1190,7 @@ impl Store {
                     anyhow::bail!("invalid condition notification owner");
                 }
                 self.send_condition_notification(&Notification {
-                    condition: &subject,
+                    condition: subject.as_deref().unwrap_or("condition/unknown"),
                     owner: fields["owner"].as_str().unwrap_or(""),
                     instance: fields["instance"].as_str().unwrap_or(""),
                     transition,
@@ -956,13 +1210,27 @@ impl Store {
                 Ok(message) => messages.extend(message),
                 Err(error) => {
                     had_error = true;
+                    malformed |= error.downcast_ref::<St3Error>().is_some_and(|error| {
+                        error.code.starts_with("invalid-")
+                            || matches!(
+                                error.code,
+                                "rule-denied"
+                                    | "operation-conflict"
+                                    | "unknown-subject-family"
+                                    | "idempotency-conflict"
+                            )
+                    });
                     if !malformed {
-                        // Storage failures cannot establish that this notification's data
-                        // is poison. Retain it and report the failure for the next tick.
-                        return Err(error);
+                        errors.push(format!("condition notification {claim}: {error:#}"));
+                        continue;
                     }
-                    let attempts =
-                        meta_integer(&self.readers.get(), &attempt_key)?.unwrap_or(0) + 1;
+                    let attempts = match meta_integer(&self.readers.get(), &attempt_key) {
+                        Ok(value) => value.unwrap_or(0) + 1,
+                        Err(error) => {
+                            errors.push(format!("notification attempt read: {error:#}"));
+                            continue;
+                        }
+                    };
                     remove = attempts >= 3;
                     let detail = format!(
                         "condition notification {claim}: {error:#}; attempt {attempts}/3{}",
@@ -974,15 +1242,23 @@ impl Store {
                     );
                     tracing::warn!(%detail, "condition notification");
                     let key = attempt_key.clone();
-                    self.connection.batched(move |tx| {
+                    let discarded = remove;
+                    let update = self.connection.batched(move |tx| {
                         set_meta_integer(tx, &key, attempts)?;
-                        tx.execute("INSERT INTO meta(key,value) VALUES ('condition_notification_last_error',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [detail])?;
+                        let error_key = if discarded { "condition_notification_discarded" } else { "condition_notification_last_error" };
+                        tx.execute("INSERT INTO meta(key,value) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![error_key,detail])?;
+                        if discarded { set_meta_integer(tx,"condition_notification_discarded_at",i64::try_from(condition_now()).unwrap_or(i64::MAX))?; }
                         Ok::<_, rusqlite::Error>(())
-                    }).map_err(|error| anyhow::anyhow!("{error}"))??;
+                    }).map_err(|error| anyhow::anyhow!("{error}")).and_then(|result| result.map_err(Into::into));
+                    if let Err(error) = update {
+                        errors.push(format!("notification retry update: {error:#}"));
+                        continue;
+                    }
                 }
             }
             if remove {
-                self.connection
+                let removed = self
+                    .connection
                     .batched(move |tx| {
                         tx.execute(
                             "DELETE FROM local_condition_notifications WHERE store_index=?1",
@@ -991,20 +1267,40 @@ impl Store {
                         tx.execute("DELETE FROM meta WHERE key=?1", [attempt_key])?;
                         Ok::<_, rusqlite::Error>(())
                     })
-                    .map_err(|error| anyhow::anyhow!("{error}"))??;
+                    .map_err(|error| anyhow::anyhow!("{error}"))
+                    .and_then(|result| result.map_err(Into::into));
+                if let Err(error) = removed {
+                    errors.push(format!("notification queue cleanup: {error:#}"));
+                }
             }
         }
-        if !had_error {
-            self.connection
+        let has_transient = match self.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM meta WHERE key='condition_notification_last_error')",
+            [],
+            |row| row.get::<_, bool>(0),
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(format!("notification diagnostic read: {error:#}"));
+                false
+            }
+        };
+        if !had_error && has_transient {
+            let cleared = self
+                .connection
                 .batched(|tx| {
                     tx.execute(
                         "DELETE FROM meta WHERE key='condition_notification_last_error'",
                         [],
                     )
                 })
-                .map_err(|error| anyhow::anyhow!("{error}"))??;
+                .map_err(|error| anyhow::anyhow!("{error}"))
+                .and_then(|result| result.map_err(Into::into));
+            if let Err(error) = cleared {
+                errors.push(format!("notification diagnostic cleanup: {error:#}"));
+            }
         }
-        Ok(messages)
+        Ok(ConditionNotificationReport { messages, errors })
     }
 
     /// A breach owned by a person is an alert on their home while it lasts. It is derived from
@@ -1027,7 +1323,9 @@ impl Store {
                 }
                 let since = instance.breach_since.unwrap_or_default();
                 let episode = hex::encode(sha2::Sha256::digest(
-                    format!("{}:{}:{since}", condition.subject, instance.instance).as_bytes(),
+                    json!([condition.subject, instance.host, instance.instance, since])
+                        .to_string()
+                        .as_bytes(),
                 ));
                 let value = instance
                     .value
@@ -1061,7 +1359,7 @@ impl Store {
                         instance.instance,
                         crate::conditions::utc(u128::from(since)),
                         condition.rule.as_deref().unwrap_or("unknown"),
-                        if stale { "; this observation is stale; check the evaluating host" } else { "" },
+                        if stale { "; this instance is absent or its observation is stale; inspect the evaluating host; withdrawing or retargeting the declaration clears it" } else { "" },
                     ),
                     request: None,
                     answers: Vec::new(),
@@ -1228,6 +1526,307 @@ condition "fleet/collector-cpu" {
 }
 "#;
 
+    fn fold_all(store: &Store) {
+        for _ in 0..100 {
+            if store.fold_condition_heads().unwrap() < HEADS_PAGE as usize {
+                return;
+            }
+        }
+        panic!("test fold did not catch up");
+    }
+
+    #[test]
+    fn discovery_includes_more_than_thirty_two_origins() {
+        let (_directory, target) = store();
+        let disk = decl(&target, "condition/fleet/disk");
+        let mut tracker = Tracker::default();
+        tracker.observe(&disk, 10.0, 0);
+        let transition = tracker.observe(&disk, 10.0, 600_000);
+        for number in 0..40 {
+            let origin = format!("member-{number:02}");
+            let remote = Store::open_memory(&origin).unwrap();
+            remote
+                .record_condition_state(&ConditionRecord {
+                    decl: &disk,
+                    host: &origin,
+                    instance: &origin,
+                    tracker: &tracker,
+                    transition,
+                    now: 600_000,
+                })
+                .unwrap();
+            replicate(&remote, &target);
+        }
+        target.seed_condition_heads(true).unwrap();
+        while target.condition_heads_seed_pending().unwrap() {
+            target.seed_condition_heads(false).unwrap();
+        }
+        let view = target
+            .conditions()
+            .unwrap()
+            .into_iter()
+            .find(|view| view.subject == disk.subject())
+            .unwrap();
+        assert_eq!(view.instances.len(), 40);
+        assert!(
+            view.instances
+                .iter()
+                .all(|instance| instance.phase == "breach")
+        );
+    }
+
+    #[test]
+    fn clear_head_eviction_preserves_a_standing_breach_and_breach_loss_warns() {
+        let (_directory, store) = store();
+        let disk = decl(&store, "condition/fleet/disk");
+        let mut breach = Tracker::default();
+        breach.observe(&disk, 10.0, 0);
+        let enter = breach.observe(&disk, 10.0, 600_000);
+        record(&store, &disk, "alder:/standing", &breach, enter, 600_000);
+        let clear = Tracker::default();
+        for number in 0..8 {
+            record(
+                &store,
+                &disk,
+                &format!("alder:/clear-{number}"),
+                &clear,
+                None,
+                700_000 + number,
+            );
+        }
+        fold_all(&store);
+        let view = store
+            .conditions()
+            .unwrap()
+            .into_iter()
+            .find(|view| view.subject == disk.subject())
+            .unwrap();
+        assert_eq!(view.instances.len(), 8);
+        assert!(
+            view.instances
+                .iter()
+                .any(|instance| instance.instance == "alder:/standing")
+        );
+        for number in 0..9 {
+            record(
+                &store,
+                &disk,
+                &format!("alder:/breach-{number}"),
+                &breach,
+                enter,
+                800_000 + number,
+            );
+        }
+        fold_all(&store);
+        assert!(
+            store
+                .condition_evaluator_status()
+                .unwrap()
+                .1
+                .unwrap()
+                .contains("standing breach")
+        );
+    }
+
+    #[test]
+    fn origin_is_part_of_the_head_and_attention_identity() {
+        let (_directory, target) = store();
+        let mut disk = decl(&target, "condition/fleet/disk");
+        disk.owner = "person/ada".into();
+        let source = SOURCE.replace("owner \"agent/ops\"", "owner \"person/ada\"");
+        let intent = parse_intent(&source, "alder").unwrap();
+        let plan = target
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.clone(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        target
+            .apply_as(
+                &intent,
+                &plan.subject_tokens,
+                "conditions-origin-identity",
+                Some("person/ada"),
+            )
+            .unwrap();
+        let mut tracker = Tracker::default();
+        tracker.observe(&disk, 10.0, 0);
+        let transition = tracker.observe(&disk, 10.0, 600_000);
+        for origin in ["a", "a:b"] {
+            let remote = Store::open_memory(origin).unwrap();
+            remote
+                .record_condition_state(&ConditionRecord {
+                    decl: &disk,
+                    host: origin,
+                    instance: "a:b:c",
+                    tracker: &tracker,
+                    transition,
+                    now: 600_000,
+                })
+                .unwrap();
+            replicate(&remote, &target);
+        }
+        fold_all(&target);
+        let view = target
+            .conditions()
+            .unwrap()
+            .into_iter()
+            .find(|view| view.subject == disk.subject())
+            .unwrap();
+        assert_eq!(view.instances.len(), 2);
+        let items = target
+            .condition_attention_items(Some("person/ada"))
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_ne!(items[0].episode, items[1].episode);
+    }
+
+    #[test]
+    fn withdrawal_between_seed_ticks_invalidates_the_digest() {
+        let (_directory, store) = store();
+        let disk = decl(&store, "condition/fleet/disk");
+        let mut tracker = Tracker::default();
+        tracker.observe(&disk, 10.0, 0);
+        let enter = tracker.observe(&disk, 10.0, 600_000);
+        record(&store, &disk, "alder:/", &tracker, enter, 600_000);
+        store.seed_condition_heads(true).unwrap();
+        let body: String = store
+            .readers
+            .get()
+            .query_row(
+                "SELECT body FROM desired WHERE subject=?1",
+                [disk.subject()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store
+            .connection
+            .batched(|tx| {
+                tx.execute(
+                    "DELETE FROM desired WHERE subject='condition/fleet/disk'",
+                    [],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        store.record_condition_observations(&[]).unwrap();
+        store.connection.batched(move |tx|tx.execute("INSERT INTO desired(subject,kind,revision,claim_id,body) SELECT subject,'condition',id,id,?1 FROM claims WHERE subject='condition/fleet/disk' AND kind='intent.desired' ORDER BY store_index DESC LIMIT 1",[body])).unwrap().unwrap();
+        store.seed_condition_heads(false).unwrap();
+        assert_eq!(
+            store
+                .conditions()
+                .unwrap()
+                .into_iter()
+                .find(|view| view.subject == disk.subject())
+                .unwrap()
+                .instances
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_notification_backlog_for_one_owner_does_not_starve_another_owner() {
+        let (_directory, store) = store();
+        let disk = decl(&store, "condition/fleet/disk");
+        let mut tracker = Tracker::default();
+        tracker.observe(&disk, 10.0, 0);
+        let enter = tracker.observe(&disk, 10.0, 600_000);
+        for number in 0..20 {
+            record(
+                &store,
+                &disk,
+                &format!("alder:/busy-{number}"),
+                &tracker,
+                enter,
+                600_000 + number,
+            );
+        }
+        let mut other = disk.clone();
+        other.owner = "agent/other".into();
+        record(&store, &other, "alder:/other", &tracker, enter, 600_100);
+        fold_all(&store);
+        let messages = store.flush_condition_notifications().unwrap();
+        assert_eq!(messages.len(), 5);
+        assert!(messages.iter().any(|subject| {
+            store
+                .latest_claim(subject, Some("message.sent"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["to"]
+                == "agent/other"
+        }));
+    }
+
+    #[test]
+    fn malformed_and_mismatched_head_rows_do_not_stall_the_fold() {
+        let (_directory, store) = store();
+        let disk = decl(&store, "condition/fleet/disk");
+        let mut tracker = Tracker::default();
+        tracker.observe(&disk, 10.0, 0);
+        let enter = tracker.observe(&disk, 10.0, 600_000);
+        let missing = record(&store, &disk, "alder:/missing", &tracker, enter, 600_000);
+        let mismatch = record(&store, &disk, "alder:/mismatch", &tracker, enter, 600_001);
+        record(&store, &disk, "alder:/good", &tracker, enter, 600_002);
+        store
+            .connection
+            .batched(move |tx| {
+                tx.execute(
+                    "UPDATE claims SET body='{}' WHERE store_index=?1",
+                    [missing.store_index],
+                )?;
+                tx.execute(
+                    "UPDATE claims SET subject='condition-instance/wrong' WHERE store_index=?1",
+                    [mismatch.store_index],
+                )?;
+                Ok::<_, rusqlite::Error>(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.fold_condition_heads().unwrap(), 3);
+        assert_eq!(store.fold_condition_heads().unwrap(), 0);
+        let view = store
+            .conditions()
+            .unwrap()
+            .into_iter()
+            .find(|view| view.subject == disk.subject())
+            .unwrap();
+        assert_eq!(view.instances.len(), 1);
+        assert_eq!(view.instances[0].instance, "alder:/good");
+    }
+
+    #[test]
+    fn condition_seed_fold_and_local_head_queries_use_bounded_indexes() {
+        let (_directory, store) = store();
+        let connection = store.readers.get();
+        for sql in [
+            "SELECT subject FROM claims INDEXED BY claims_subject_kind_accepted_index WHERE subject>'condition-instance/a/' AND subject<'condition-instance/a/~' AND kind='condition.state' ORDER BY subject LIMIT 1",
+            "SELECT subject FROM claims INDEXED BY claims_subject_kind_accepted_index WHERE subject>'condition-instance/a/b/' AND subject<'condition-instance/a/b/~' AND kind='condition.state' ORDER BY subject LIMIT 1",
+            "SELECT store_index FROM claims WHERE kind='condition.state' AND store_index>1 ORDER BY store_index LIMIT 50",
+            "SELECT c.id,c.body FROM local_condition_heads h JOIN claims c ON c.store_index=h.store_index WHERE h.subject='condition/a' AND h.origin='alder' LIMIT 256",
+            "SELECT COUNT(*) FROM local_condition_heads WHERE subject='condition/a' AND origin='alder'",
+            "SELECT origin,instance,store_index,breached,accepted_key FROM local_condition_heads WHERE subject='condition/a' AND origin='alder' ORDER BY breached,accepted_key,origin,instance LIMIT 1",
+            "SELECT origin,instance,store_index,breached,accepted_key FROM local_condition_heads WHERE subject='condition/a' ORDER BY breached,accepted_key,origin,instance LIMIT 1",
+        ] {
+            let plan = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("; ");
+            assert!(
+                !plan.contains("SCAN claims") && !plan.contains("SCAN c"),
+                "{sql}: {plan}"
+            );
+            assert!(plan.contains("SEARCH"), "{sql}: {plan}");
+        }
+    }
+
     fn store() -> (tempfile::TempDir, Store) {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(&directory.path().join("claims.sqlite3"), "alder").unwrap();
@@ -1295,7 +1894,7 @@ condition "fleet/collector-cpu" {
         // The state write committed but the evaluator has not folded or sent anything.
         drop(store);
         let store = Store::open(&directory.path().join("claims.sqlite3"), "alder").unwrap();
-        store.fold_condition_heads().unwrap();
+        fold_all(&store);
         let messages = store.flush_condition_notifications().unwrap();
         assert_eq!(messages.len(), 1);
         let sent = store
@@ -1431,7 +2030,7 @@ condition "fleet/collector-cpu" {
             .unwrap()
             .unwrap();
         target.seed_condition_heads(true).unwrap();
-        target.fold_condition_heads().unwrap();
+        fold_all(&target);
         target.connection.batched(move |tx| tx.execute("INSERT INTO desired(subject,kind,revision,claim_id,body) SELECT subject,'condition',id,id,?1 FROM claims WHERE subject='condition/fleet/disk' AND kind='intent.desired' ORDER BY store_index DESC LIMIT 1", [body])).unwrap().unwrap();
         target.seed_condition_heads(false).unwrap();
         let disk = target
@@ -1475,7 +2074,7 @@ condition "fleet/collector-cpu" {
                 now: 600_001,
             })
             .unwrap();
-        target.fold_condition_heads().unwrap();
+        fold_all(&target);
         let assert_hosts = || {
             let disk = target
                 .conditions()
@@ -1621,7 +2220,7 @@ condition "fleet/collector-cpu" {
         tracker.observe(&cpu, 3.0, 0);
         let transition = tracker.observe(&cpu, 3.0, 300_000);
         record(&store, &cpu, "alder", &tracker, transition, 300_000);
-        store.fold_condition_heads().unwrap();
+        fold_all(&store);
         assert!(
             !store.condition_attention_items(Some("person/ada")).unwrap()[0]
                 .detail
@@ -1705,7 +2304,7 @@ condition "fleet/collector-cpu" {
         tracker.observe(&disk, 10.0, 0);
         let transition = tracker.observe(&disk, 10.0, 600_000);
         record(&store, &disk, "alder:/", &tracker, transition, 600_000);
-        store.fold_condition_heads().unwrap();
+        fold_all(&store);
         store
             .connection
             .batched(|tx| tx.execute_batch("PRAGMA busy_timeout=0"))
@@ -1757,12 +2356,12 @@ condition "fleet/collector-cpu" {
                 1,
             );
         }
-        store.fold_condition_heads().unwrap();
+        fold_all(&store);
         let mut breached = Tracker::default();
         breached.observe(&disk, 10.0, 0);
         let transition = breached.observe(&disk, 10.0, 600_000);
         record(&store, &disk, "alder:/new", &breached, transition, 600_000);
-        store.fold_condition_heads().unwrap();
+        fold_all(&store);
         store.seed_condition_heads(true).unwrap();
         let view = store
             .conditions()
@@ -1810,7 +2409,7 @@ condition "fleet/collector-cpu" {
                 600_000,
             );
         }
-        store.fold_condition_heads().unwrap();
+        fold_all(&store);
         assert_eq!(store.flush_condition_notifications().unwrap().len(), 4);
         assert_eq!(store.flush_condition_notifications().unwrap().len(), 4);
         assert!(store.flush_condition_notifications().unwrap().is_empty());
@@ -1859,6 +2458,19 @@ condition "fleet/collector-cpu" {
                 .contains("discarded")
         );
         store.flush_condition_notifications().unwrap();
+        assert!(
+            store
+                .condition_evaluator_status()
+                .unwrap()
+                .1
+                .unwrap()
+                .contains("discarded")
+        );
+        store
+            .connection
+            .batched(|tx| set_meta_integer(tx, "condition_notification_discarded_at", 0))
+            .unwrap()
+            .unwrap();
         assert!(store.condition_evaluator_status().unwrap().1.is_none());
     }
 
@@ -1880,7 +2492,7 @@ condition "fleet/collector-cpu" {
         let enter = tracker.observe(&disk, 10.0, 601_000).unwrap();
         assert_eq!(store.index().unwrap(), before);
         record(&store, &disk, "alder:/", &tracker, Some(enter), 601_000);
-        store.fold_condition_heads().unwrap();
+        fold_all(&store);
         let before = store.index().unwrap();
         let lines = crate::conditions::doctor_lines(&store.conditions().unwrap());
         assert!(
@@ -2027,7 +2639,7 @@ condition "fleet/collector-cpu" {
             Some(Transition::Enter),
             301_000,
         );
-        store.fold_condition_heads().unwrap();
+        fold_all(&store);
         let items = store.condition_attention_items(Some("person/ada")).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "condition");
@@ -2062,7 +2674,7 @@ condition "fleet/collector-cpu" {
             Some(Transition::Recover),
             602_000,
         );
-        store.fold_condition_heads().unwrap();
+        fold_all(&store);
         assert!(store.condition_attention_items(None).unwrap().is_empty());
     }
 

@@ -168,6 +168,11 @@ impl Probe for HostProbe {
         self.disks.errors()
     }
     fn prepare(&mut self, decls: &[ConditionDecl]) {
+        let names = decls
+            .iter()
+            .filter_map(|decl| decl.process.as_deref())
+            .collect::<std::collections::HashSet<_>>();
+        self.processes.retain_names(&names);
         self.disks.configure(
             decls.iter().any(|decl| {
                 matches!(decl.metric, Metric::DiskFreePercent | Metric::DiskFreeBytes)
@@ -252,9 +257,9 @@ impl Evaluator {
             report.errors.push(format!("condition heads: {error:#}"));
         }
         // Folding other members' new transitions does not gate local evaluation.
-        for _ in 0..4 {
+        for _ in 0..40 {
             match store.fold_condition_heads() {
-                Ok(count) if count < 500 => break,
+                Ok(count) if count < 50 => break,
                 Ok(_) => {}
                 Err(error) => {
                     report.errors.push(format!("condition fold: {error:#}"));
@@ -286,8 +291,11 @@ impl Evaluator {
                 report
                     .errors
                     .push(format!("condition declarations: {error:#}"));
-                match store.flush_condition_notifications() {
-                    Ok(messages) => report.messages.extend(messages),
+                match store.flush_condition_notifications_report() {
+                    Ok(flush) => {
+                        report.messages.extend(flush.messages);
+                        report.errors.extend(flush.errors);
+                    }
                     Err(error) => report.errors.push(format!("notifications: {error:#}")),
                 }
                 return Ok(report);
@@ -457,9 +465,9 @@ impl Evaluator {
             }
         }
         // Fold freshly written claims before draining the durable notification queue.
-        for _ in 0..4 {
+        for _ in 0..40 {
             match store.fold_condition_heads() {
-                Ok(count) if count < 500 => break,
+                Ok(count) if count < 50 => break,
                 Ok(_) => {}
                 Err(error) => {
                     report.errors.push(format!("condition fold: {error:#}"));
@@ -467,8 +475,11 @@ impl Evaluator {
                 }
             }
         }
-        match store.flush_condition_notifications() {
-            Ok(messages) => report.messages.extend(messages),
+        match store.flush_condition_notifications_report() {
+            Ok(flush) => {
+                report.messages.extend(flush.messages);
+                report.errors.extend(flush.errors);
+            }
             Err(error) => report.errors.push(format!("notifications: {error:#}")),
         }
         report.errors.extend(self.probe.errors());

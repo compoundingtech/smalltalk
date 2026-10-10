@@ -14422,7 +14422,14 @@ impl Store {
         items.extend(self.custom_attention_items(person)?);
         match self.condition_attention_items(person) {
             Ok(conditions) => items.extend(conditions),
-            Err(error) => tracing::warn!(%error, "condition attention unavailable; other attention remains available"),
+            Err(error) => {
+                static LAST_WARNING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = u64::try_from(as_of).unwrap_or(u64::MAX);
+                let previous = LAST_WARNING.load(std::sync::atomic::Ordering::Relaxed);
+                if now.saturating_sub(previous)>=60_000 && LAST_WARNING.compare_exchange(previous,now,std::sync::atomic::Ordering::Relaxed,std::sync::atomic::Ordering::Relaxed).is_ok() {
+                    tracing::warn!(%error, "condition attention unavailable; other attention remains available");
+                }
+            },
         }
         // A person who published a broken gate is the one to correct it.
         items.extend(
@@ -26254,6 +26261,33 @@ mod fleet_admission_tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn departed_members_condition_heads_are_pruned_and_not_refolded() {
+        let member_key = key();
+        let (_anchor, a, members) = fleet(&[("laptop", &member_key)]);
+        let laptop = &members[0];
+        let source = "version 2\ncondition \"fleet/disk\" { metric \"disk.free-percent\"; scope \"host\"; below 15; for \"1m\"; owner \"person/ada\" }";
+        let intent = crate::graph::parse_test_intent(source, "a").unwrap();
+        let plan = a.mission(&intent, IntentInput { kdl: source.into(), source_name: None }).unwrap();
+        a.apply_as(&intent, &plan.subject_tokens, "condition-membership", Some("person/ada")).unwrap();
+        let decl = a.declared_conditions().unwrap().remove(0).decl.unwrap();
+        let mut tracker = crate::conditions::Tracker::default();
+        tracker.observe(&decl, 10.0, 0);
+        let transition = tracker.observe(&decl, 10.0, 60_000);
+        laptop.record_condition_state(&crate::store::ConditionRecord {
+            decl: &decl, host: "laptop", instance: "laptop:/", tracker: &tracker,
+            transition, now: 60_000,
+        }).unwrap();
+        sync(laptop, &a);
+        a.seed_condition_heads(true).unwrap();
+        assert_eq!(a.conditions().unwrap()[0].instances.len(), 1);
+        laptop.leave_fleet("person/test").unwrap();
+        sync(laptop, &a);
+        a.seed_condition_heads(false).unwrap();
+        a.fold_condition_heads().unwrap();
+        assert!(a.conditions().unwrap()[0].instances.is_empty());
     }
 
     /// The anchor `a` founds the fleet and admits each named member.

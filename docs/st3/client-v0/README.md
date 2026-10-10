@@ -603,6 +603,9 @@ shows in, starting with `conversation_id`: a harness login alert is one alert pe
 and host, naming every seat that shares it, since one sign-in answers them all. Daemons that
 predate alerts omit these fields.
 
+A `condition` attention item describes a standing metric breach and clears after recovery. It has no human resolution action. stui and the shared TypeScript Home model display its title and detail on home. Deploy current clients before person-owned declarations: older strict clients do not receive a compatibility downgrade for this new kind.
+
+
 A `harness-prompt` alert is a native prompt a seat's harness shows in its terminal and waits on:
 a permission, a question or a review. Its `source_id` and `conversation_id` are the seat, its
 `episode` is the harness observation that opened the prompt, and its detail carries the prompt

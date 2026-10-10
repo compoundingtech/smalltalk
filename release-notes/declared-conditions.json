@@ -7,15 +7,15 @@
   },
   "schema": {
     "status": "changed",
-    "detail": "Adds condition declarations and condition-instance/condition-hash/origin-hash/instance-hash subjects with authenticated system-only durable transitions. Storage version stays 18; four local cache tables and a desired-condition partial index are created on open, without a global claims-index build."
+    "detail": "Adds condition declarations and condition-instance/condition-hash/origin-hash/instance-hash subjects with authenticated system-only durable transitions. Storage version stays 18; four local cache tables and a desired-condition partial index are created on open, without a global claims-index build. Heads are keyed by declaration/origin/instance with local origin/phase/order indexes; disposable development caches with the older key rebuild on open."
   },
   "rules": {
     "status": "none",
-    "detail": "condition.state is durable and never trimmed: no checkpoint rule changes. Only entry/recovery append; routine and hold phases stay local. At minimum holds plus cooldown, flapping can append about two claims per seven minutes (~411/day/instance), at most 32 declarations x eight local instances. This is a worst-case transition bound, not a steady-sample stream."
+    "detail": "condition.state is durable and never trimmed: no checkpoint rule changes. Only entry/recovery append; routine and hold phases stay local. At minimum holds plus cooldown, flapping can append about two claims per seven minutes (~411/day/instance), at most 32 declarations x eight local instances. This is a worst-case transition bound, not a steady-sample stream. At the full 32 x 8 local-instance bound this is about 105,000 claims/day/host, roughly 100\u2013200 MB/day for typical 1\u20132 KB claims, replicated and retained on each member; maximum bounded identities/payloads can be larger. There is no daily byte quota."
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Adds /v1/conditions and st conditions ls/show. Client-v0 adds condition attention kind; generated clients/digest change and stui renders these alerts. Deploy all daemons before facts, daemon before CLI, and clients before person-owned declarations. Old daemons mark condition intent.desired invalid (degraded envelope) and condition.state unknown; these heal once after upgrade without replication repair."
+    "detail": "Adds /v1/conditions and st conditions ls/show. Client-v0 adds condition attention kind; generated clients/digest change and stui renders these alerts. Deploy all daemons before facts, daemon before CLI, and clients before person-owned declarations. Old daemons mark condition intent.desired invalid (degraded envelope) and condition.state unknown; these heal once after upgrade without replication repair. Shared TypeScript Home includes condition cards; stui does not offer human resolution controls or manual-clear guidance for these self-clearing alerts."
   },
   "downtime": {
     "status": "none",
@@ -23,10 +23,10 @@
   },
   "manual": {
     "status": "changed",
-    "detail": "Operations must deploy all fleet daemons before publishing the first conditions. Keep existing watches until real-host breach/recovery verification and operations approval. Publication caps subtract same-apply stops; out-of-band replicated over-cap declarations produce an explicit invalid-declaration diagnostic. Missing breached instances remain last-known breach until measured recovery; absence cannot prove recovery. Process PID enumeration is bounded and may miss processes beyond the cap. Background tasks stop when the daemon runtime shuts down; an uninterruptible kernel call may delay shutdown."
+    "detail": "Operations must deploy all fleet daemons before publishing the first conditions. Keep existing watches until real-host breach/recovery verification and operations approval. Publication caps subtract same-apply stops; out-of-band replicated over-cap declarations produce an explicit invalid-declaration diagnostic. Missing breached instances remain last-known breach until measured recovery; absence cannot prove recovery. Process PID enumeration is bounded and may miss processes beyond the cap. Background tasks stop when the daemon runtime shuts down; an uninterruptible kernel call may delay shutdown. More than eight filesystems fails strict doctor until explicit path declarations cover them; list/show does not display evaluator diagnostics. Clear heads are evicted first; capacity omissions or breach evictions are diagnosed. Keyed fleets reconstruct current members and prune departed ones; legacy discovery caps at 256 origin and 64 instance namespaces with diagnostics. Discovery resumes across ticks, with a one-second/128-origin budget checked between origins. Global heads remain capped at 256 per condition, so excessive simultaneous breaches need narrower declarations. Full conditions responses remain bounded at 8,192 instances; pagination is deferred. The declaration cap reports all remaining omitted declarations (count bounded to 1,024)."
   },
   "recovery": {
     "status": "changed",
-    "detail": "Roll forward after declarations exist. An older daemon cannot evaluate them. Unknown-family records rejected by old registries heal on an upgraded schema; other invalid records require normal replication repair. Durable notification retries are idempotent, limited to three failures per row, and visible in doctor."
+    "detail": "Roll forward after declarations exist. An older daemon cannot evaluate them. Unknown-family records rejected by old registries heal on an upgraded schema; other invalid records require normal replication repair. Notification storage failures retain rows, deterministic validation failures consume three attempts, partial successful deliveries remain visible, and discarded rows leave a diagnostic for one hour."
   }
 }

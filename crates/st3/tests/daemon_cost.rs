@@ -1053,7 +1053,7 @@ const ARRANGEMENT_FOLDER: &str = "019a0000-0000-7000-8000-000000000010";
 const ARRANGEMENT_PLACEMENT: &str = "agent/fleet/fixture-cost-arrangements/seat";
 
 /// Keep 256 remote breached instances per condition while eight histories grow tenfold.
-fn seed_condition(store: &Store, scale: f64) {
+fn seed_condition(store: &Store, scale: f64, dense: bool) {
     let mut source = "version 2\n".to_owned();
     for number in 0..4 {
         source.push_str(&format!(r#"condition "bench/cost/disk-{number}" {{
@@ -1072,12 +1072,14 @@ fn seed_condition(store: &Store, scale: f64) {
     let declarations = store.declared_conditions().unwrap().into_iter().map(|condition| condition.decl.unwrap()).collect::<Vec<_>>();
     // 32 authenticated remote origins x eight breached instances per declaration.
     // History for eight instances grows tenfold; all other live heads stay fixed.
-    for host_number in 0..32 {
+    let origins = if dense { 32 } else { 2 };
+    let volumes = if dense { 8 } else { 1 };
+    for host_number in 0..origins {
         let origin = format!("cost-remote-{host_number:02}");
         let remote = Store::open_memory(&origin).unwrap();
         remote.bind_fleet(FLEET).unwrap();
         for decl in &declarations {
-            for volume in 0..8 {
+            for volume in 0..volumes {
                 let instance = format!("{origin}:/volume{volume}");
                 let mut tracker = st3::conditions::Tracker::default();
                 assert!(tracker.observe(decl, 30.0, 0).is_none());
@@ -1095,12 +1097,99 @@ fn seed_condition(store: &Store, scale: f64) {
         sync(&remote, &origin, store);
     }
     store.seed_condition_heads(true).unwrap();
+    while store.condition_heads_seed_pending().unwrap() { store.seed_condition_heads(false).unwrap(); }
     let views = store.conditions().unwrap();
     assert_eq!(views.len(), 4);
     for view in views {
-        assert_eq!(view.instances.len(), 256);
+        assert_eq!(view.instances.len(), origins * volumes);
         assert!(view.instances.iter().all(|instance| instance.phase == "breach" && instance.host != NODE));
     }
+}
+
+
+/// Capacity is measured separately so its constant work cannot mask legacy history growth.
+#[tokio::test]
+async fn condition_capacity_and_five_hundred_new_heads_stay_bounded() {
+    use axum::{body::Body,http::Request};
+    use tower::ServiceExt;
+    let mut measurements=Vec::new();
+    for scale in [0.01,0.1] {
+        let root=tempfile::tempdir().unwrap();
+        let store=Arc::new(Store::open(&root.path().join("claims.sqlite3"),NODE).unwrap());
+        store.bind_fleet(FLEET).unwrap();
+        seed_condition(&store,scale,true);
+        let app=st3::api::router(AppState {
+            store:store.clone(),notify:Arc::new(Notify::new()),event_notify:watch::channel(0_u64).0,
+            node:NODE.into(),state_dir:root.path().join("state"),pty_root:root.path().join("pty"),pty_binary:stub_pty(root.path()),
+            fleet_id:Some(FLEET.into()),configured_peers:Vec::new(),client_relay:None,native_session_home:Some(root.path().join("home")),planner_default:Default::default(),
+        });
+        let mut costs=BTreeMap::new();
+        for route in ["/v1/conditions","/v1/attention?person=person%2Fada","/v1/client/attention?person=person%2Fada&limit=50","/v1/doctor"] {
+            let mut samples=Vec::new();
+            for _ in 0..4 {
+                let before=work::total();
+                let response=app.clone().oneshot(Request::builder().uri(route).body(Body::empty()).unwrap()).await.unwrap();
+                assert_eq!(response.status(),axum::http::StatusCode::OK,"{route}");
+                let bytes=axum::body::to_bytes(response.into_body(),usize::MAX).await.unwrap();
+                let envelope:Value=serde_json::from_slice(&bytes).unwrap();
+                let value=&envelope["value"];
+                if route=="/v1/conditions" {
+                    assert_eq!(value.as_array().unwrap_or_else(||panic!("condition response shape: {value}")).len(),4);
+                    assert!(value.as_array().unwrap().iter().all(|view|view["instances"].as_array().unwrap().len()==256));
+                } else if route.starts_with("/v1/attention?") {
+                    assert_eq!(value.as_array().unwrap().iter().filter(|item|item["kind"]=="condition").count(),1024);
+                }
+                let mut cost=Cost::from_work(work::total()-before,bytes.len() as u64,None);
+                cost.items=item_count(value);cost.item_units=item_units(value);
+                samples.push(cost);
+            }
+            costs.insert(route.to_owned(),Cost::least(&samples[1..]));
+        }
+        measurements.push(costs);
+    }
+    let mut failures=Vec::new();
+    for (route,before) in &measurements[0] {
+        let after=&measurements[1][route];
+        if after.vm_steps>before.vm_steps*3+SLACK { failures.push(format!("{route}: history VM growth")); }
+        if after.fullscan_steps>before.fullscan_steps*3+SLACK { failures.push(format!("{route}: history scan growth")); }
+    }
+    // Five hundred distinct instances from 63 origins enter a previously empty heads cache.
+    // Timing each complete call bounds its writer transaction from above, including queueing.
+    let root=tempfile::tempdir().unwrap();
+    let target=Store::open(&root.path().join("fold.sqlite3"),NODE).unwrap();target.bind_fleet(FLEET).unwrap();
+    let source="version 2\ncondition \"bench/fold\" { metric \"disk.free-percent\"; scope \"host\"; below 15; for \"1m\"; owner \"person/ada\" }";
+    let intent=st3::parse_intent(source,NODE).unwrap();
+    let plan=target.mission(&intent,st3::model::IntentInput { kdl:source.into(),source_name:None }).unwrap();
+    target.apply_as(&intent,&plan.subject_tokens,"fold-declaration",Some("person/ada")).unwrap();
+    target.seed_condition_heads(true).unwrap();
+    let decl=target.declared_conditions().unwrap().remove(0).decl.unwrap();
+    let mut tracker=st3::conditions::Tracker::default();tracker.observe(&decl,10.0,0);let transition=tracker.observe(&decl,10.0,60_000);
+    for origin_number in 0..63 {
+        let origin=format!("fold-origin-{origin_number:02}");let remote=Store::open_memory(&origin).unwrap();remote.bind_fleet(FLEET).unwrap();
+        for volume in 0..8 {
+            if origin_number*8+volume>=500 { break; }
+            let instance=format!("{origin}:/volume-{volume}");
+            remote.record_condition_state(&st3::store::ConditionRecord { decl:&decl,host:&origin,instance:&instance,tracker:&tracker,transition,now:60_000 }).unwrap();
+        }
+        sync(&remote,&origin,&target);
+    }
+    let mut times=Vec::new();let mut counts=Vec::new();
+    loop {
+        let start=Instant::now();let count=target.fold_condition_heads().unwrap();
+        if count==0 { break; }
+        times.push(start.elapsed().as_secs_f64()*1000.0);counts.push(count);
+    }
+    assert_eq!(counts.iter().sum::<usize>(),500);
+    assert!(counts.iter().all(|count|*count<=50));
+    let mut sorted=times.clone();sorted.sort_by(f64::total_cmp);
+    let max=*sorted.last().unwrap();let p99=sorted[((sorted.len() as f64*0.99).ceil() as usize-1).min(sorted.len()-1)];
+    println!("condition fold 500 distinct instances: pages={}, p99={p99:.3}ms max={max:.3}ms (complete calls, upper bounds on writer holds)",times.len());
+    let report=json!({"instances_per_condition":256,"declarations":4,"small":measurements[0],"large":measurements[1],"failures":failures,"fold":{"distinct_new_instances":500,"rows_per_page":counts,"complete_call_ms":times,"writer_hold_upper_bound_p99_ms":p99,"writer_hold_upper_bound_max_ms":max}});
+    if let Some(path)=std::env::var_os("ST_COST_REPORT") {
+        let path=PathBuf::from(path).with_extension("conditions.json");std::fs::write(path,serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+    assert!(failures.is_empty(),"condition capacity work grows with history: {failures:?}");
+    assert!(max<100.0,"condition fold writer-hold upper bound {max:.3}ms exceeds the 100ms rule");
 }
 
 /// Grow only durable history, not the live answer, to catch reads that fold old edits.
@@ -1754,7 +1843,6 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     let arrangement_revision = {
         let store = store.clone();
         tokio::task::spawn_blocking(move || {
-            seed_condition(&store, scale);
             seed_arrangement(&store, scale)
         })
             .await

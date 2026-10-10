@@ -18,7 +18,7 @@ condition "fleet/disk" {
 }
 ```
 
-This checks up to eight local data filesystems on every host. An overflow is reported in doctor; use explicit path declarations for additional data mounts. Add `host "alder"` to
+This checks up to eight local data filesystems on every host. A host with more than eight filesystems fails strict doctor until explicit paths cover the additional data mounts. The condition list/show reads cached instances; evaluator and overflow diagnostics are shown by doctor. An overflow is reported in doctor; use explicit path declarations for additional data mounts. Add `host "alder"` to
 restrict evaluation to that member, or several `host` children for several
 members. Each matching host evaluates and notifies independently. Add `path "/srv/data"` to check the filesystem containing one absolute
 path. A process condition needs `process "collector"`; a route condition needs
@@ -97,11 +97,11 @@ only the evaluating daemon has fresh routine values.
 The daemon accepts at most 32 declarations, 32 host selectors per declaration,
 and eight local instances per condition. Its transition budget is 16 attempted
 writes per tick, with deferred transitions retained for later ticks. Local
-heads retain eight instances per authenticated origin and at most 256 total per declaration. Startup skips the remainder of each origin namespace so excess instances cannot hide another host. A changed declaration set re-seeds indexed state, including transitions received before declarations. Rebuild discovery considers at most 64 instance namespaces per origin, keeping eight newest candidates and retaining newer cached heads; it does not scan their history. Names, selectors,
+heads retain eight instances per authenticated origin and at most 256 total per declaration. Their key includes origin, and local covering indexes hold phase and accepted order. Clear heads are evicted before standing breaches; any omitted or evicted breach leaves a doctor diagnostic. Keyed fleets seek current members directly and prune departed origins; legacy discovery considers up to 256 origins and reports overflow. A changed declaration or membership set re-seeds indexed state, including transitions received before declarations. Discovery resumes across ticks after 128 origins or one second of work, checked between origins; doctor reports incomplete reconstruction. Each origin considers at most 64 instance namespaces, prioritizing breaches before newer Clear heads; overflow is diagnosed. Each fold/seed write contains at most 50 rows; a tick folds at most 2,000 rows. It does not scan their history. Names, selectors,
 links, notification text and sample rings have fixed size limits. Retired
 conditions lose their local caches. Vanished instances leave the active tracker
 set; an established breach remains as a stale last-known breach within the bounded instance budget, since absence
-cannot prove recovery. Current local observations and newer transition heads have priority when retired mounts exhaust that budget. A returning instance restores that breach silently.
+cannot prove recovery. Current local observations and newer transition heads have priority when retired mounts exhaust that budget. A returning instance restores that breach silently. Inspect the evaluating host to distinguish an absent instance from a stalled observation; withdrawing the declaration or retargeting it to another host clears its alert without inventing measured recovery.
 
 `st doctor` checks the local evaluator heartbeat and sample age. Breaches,
 recovering states, invalid declarations and stale data warn; a pending hold or
@@ -111,8 +111,8 @@ do not fail the local strict doctor check. Person attention labels stale local b
 The durable notification queue retries recorded transitions across restarts;
 deterministic message identities prevent duplicate wakeups. Startup only queues
 own-host transitions accepted in the last hour. A failing notification receives
-three data-validation attempts, then leaves the queue with a diagnostic visible in doctor, so
-it cannot block other owners. Writer contention keeps the row without consuming attempts; a clean flush clears the transient diagnostic. At most four notifications per owner and 16 total are attempted per tick. Authenticated claim origin and instance identity
+three data or deterministic append-validation attempts, then leaves the queue with a diagnostic visible in doctor for one hour, so
+it cannot block other owners. Writer contention keeps the row without consuming attempts; a clean flush clears the transient diagnostic. At most four notifications per owner are selected before the global 16-row limit. A failing row preserves partial deliveries and does not block another owner. Authenticated claim origin and instance identity
 must agree with the host fields; received state cannot send as this member.
 
 The per-instance state subject and the condition root field are the seam for
@@ -124,3 +124,5 @@ retried once when its schema digest changes; genuinely invalid subjects remain
 invalid. Operations publishes declarations after confirming every member runs
 the new schema. Existing disk and watchdog missions remain until a real host
 has fired and recovered and operations agrees to retire them.
+
+The complete conditions endpoint remains bounded to 32 declarations x 256 heads (8,192 instances). Pagination is deferred; the capacity cost fixture measures 1,024 remote breached instances with tenfold history independently of the existing history-growth guard. Deployments with large caches should account for the full response size. Condition transitions are durable and never trimmed: simultaneous minimum-hold flapping can write about 105,000 claims/day/host. At typical 1–2 KB per claim that is roughly 100–200 MB/day from each host, replicated and retained by every member; longer bounded identities and payloads can increase it. This is a conservative workload estimate, not a storage quota.

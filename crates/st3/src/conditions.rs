@@ -942,6 +942,7 @@ pub(crate) fn valid_state_identity(subject: &str, origin: &str, fields: &Value) 
                 .is_some_and(|suffix| suffix.starts_with(':')))
         && subject == instance_subject_with_origin(condition, origin, instance)
         && text("owner").len() <= 256
+        && Phase::parse(text("phase")).is_some()
         && text("notification_title").len() <= 512
         && text("notification_body").len() <= 3500
         && fields
@@ -1018,7 +1019,7 @@ pub fn doctor_lines_at(
                         "{} {}{} (value {})",
                         display_text(&instance.instance),
                         instance.phase,
-                        if stale(instance) { "; stale" } else { "" },
+                        if stale(instance) { "; absent or stale; inspect the host, or withdraw/retarget the declaration" } else { "" },
                         instance
                             .value
                             .map(|v| v.to_string())
@@ -1339,9 +1340,12 @@ mod tests {
 
     #[test]
     fn state_identity_is_bound_to_the_authenticated_host_and_is_bounded() {
-        let mut fields = json!({"condition":"condition/fleet/disk", "host":"alder", "instance":"alder:/srv", "owner":"agent/ops", "values":[]});
+        let mut fields = json!({"condition":"condition/fleet/disk", "host":"alder", "instance":"alder:/srv", "phase":"clear", "owner":"agent/ops", "values":[]});
         let subject = instance_subject("condition/fleet/disk", "alder:/srv");
         assert!(valid_state_identity(&subject, "alder", &fields));
+        fields["phase"] = json!("breach\u{1b}[31m");
+        assert!(!valid_state_identity(&subject, "alder", &fields));
+        fields["phase"] = json!("clear");
         assert!(!valid_state_identity(&subject, "birch", &fields));
         fields["host"] = json!("birch");
         assert!(!valid_state_identity(&subject, "birch", &fields));
