@@ -40,8 +40,15 @@ it.each(['plain', 'markdown', 'diff'] as const)('shows failed tool diagnostics b
   expect([...container.querySelectorAll('pre')].filter(pre => !raw.contains(pre)).map(pre => pre.textContent)).toContain(diagnostic)
 })
 
-it('shows failed transcript tool diagnostics without opening the raw disclosure', async () => {
-  await act(async () => root.render(<ToolDetailPreview call={{ id: 'failed-call', kind: 'run', title: 'Checking rows', status: 'error', startedAt: '2026-01-15T12:00:00Z', detail: diagnostic }} />))
-  expect(container.querySelector('button')?.getAttribute('aria-expanded')).toBe('false')
-  expect(container.querySelector('pre')?.textContent).toBe(diagnostic)
+it('shows a failed transcript tool as its summary and one-line reason; the path dump waits for the raw disclosure', async () => {
+  const dump = "Error: ENOENT: no such file or directory, open '/srv/example/workspace/apps/rows/src/rows.ts'\n    at open (/srv/example/workspace/node_modules/loader/index.js:12:3)"
+  await act(async () => root.render(<ToolDetailPreview call={{ id: 'failed-call', kind: 'read', title: 'Reading rows', summary: 'Read rows.ts', status: 'error', startedAt: '2026-01-15T12:00:00Z', detail: dump }} />))
+  const trigger = container.querySelector('button')!
+  expect(trigger.getAttribute('aria-expanded')).toBe('false')
+  expect(container.querySelector('p')?.textContent).toBe('Read rows.ts · error')
+  expect(container.querySelector('[data-testid="tool-error-reason"]')?.textContent).toBe("Error: ENOENT: no such file or directory, open '…/rows.ts'")
+  expect(container.textContent).not.toContain('/srv/example')
+  expect(container.querySelector('pre')).toBeNull()
+  await act(async () => trigger.click())
+  expect(container.querySelector('pre')?.textContent).toBe(dump)
 })

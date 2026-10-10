@@ -80,7 +80,10 @@ export function AgentMessage({ item, senderLine }: { readonly item: (TextItem & 
     {!streaming && <div data-testid="answer-meta" {...stylex.props(styles.answerMeta)}><ActionBarPrimitive.Copy aria-label="Copy answer" {...stylex.props(styles.copy)}><Icon name="copy" size={14} /></ActionBarPrimitive.Copy>{Number.isFinite(completed) && <time dateTime={new Date(completed).toISOString()}>{new Date(completed).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>}</div>}
   </MessagePrimitive.Root>
 }
-/** Human intent first; failures stay visible, routine diagnostics require a second disclosure. */
+/** First line of a failure with absolute paths cut to their last segment; the full diagnostic stays behind the raw disclosure. */
+export const errorReason = (detail: string): string =>
+  (detail.split('\n').find(line => line.trim() !== '') ?? '').trim().replace(/(?:~|[A-Za-z]:)?(?:[\\/][^\s\\/:'"`]+){2,}[\\/]([^\s\\/:'"`]+)/g, '…/$1')
+/** Human intent first; a failure shows its one-line reason, the diagnostic itself requires a second disclosure. */
 export function ToolDetailPreview({ call, onOpen }: { readonly call: WorkLogCall; readonly onOpen?: (call: WorkLogCall) => void }) {
   const [rawOpen, setRawOpen] = React.useState(false)
   const output = call.detail ?? (call.status === 'running' ? 'No output received yet.' : 'No output recorded.')
@@ -88,7 +91,7 @@ export function ToolDetailPreview({ call, onOpen }: { readonly call: WorkLogCall
   const remaining = Math.max(0, lines.length - Number(output.endsWith('\n')) - 4)
   return <div data-testid="tool-detail-preview" {...stylex.props(styles.preview)}>
     <p>{call.summary ?? call.title} · {call.status}</p>
-    {call.status === 'error' && call.detail !== undefined && <pre {...stylex.props(styles.output)}>{call.detail}</pre>}
+    {call.status === 'error' && call.detail !== undefined && <p data-testid="tool-error-reason" {...stylex.props(styles.errorReason)}>{errorReason(call.detail)}</p>}
     <Disclosure isExpanded={rawOpen} onExpandedChange={setRawOpen}>
       <Button slot="trigger" {...stylex.props(styles.previewOpen)}>Show raw input/output</Button>
       <DisclosurePanel>{rawOpen && <>
@@ -248,6 +251,7 @@ const styles = stylex.create({
   liveActivity: { display: 'flex', alignItems: 'center', gap: s.sm, minHeight: g.toolRow, color: ink.fgMuted, fontSize: t.uiSize },
   preview: { display: 'flex', flexDirection: 'column', alignItems: 'flex-start', marginBlock: s.sm, marginInlineStart: s.md, backgroundColor: surface.codeBg, borderRadius: r.sm, padding: s.md, gap: s.xs },
   output: { margin: 0, width: '100%', minWidth: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontFamily: t.fontMono, fontSize: t.codeSize, lineHeight: t.metaLeading, color: ink.fgSoft }, outputCode: { fontFamily: t.fontMono, fontSize: t.codeSize },
+  errorReason: { margin: 0, maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: ink.fgSoft, fontSize: t.metaSize },
   previewActions: { display: 'flex', alignItems: 'center', gap: s.xs, minHeight: g.toolRow, color: ink.fgMuted, fontSize: t.metaSize }, previewOpen: { minHeight: g.toolRow, padding: 0, borderWidth: 0, backgroundColor: surface.transparent, color: ink.fgSoft, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { color: ink.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
   placeholder: { display: 'flex', flexDirection: 'column', gap: s.lg }, skeletonPrompt: { width: '100%', height: `calc(${t.bodyLeading} + ${s.md})`, borderLeftWidth: g.focusRing, borderLeftStyle: 'solid', borderLeftColor: accent.primary, backgroundColor: surface.rowActive }, skeletonWork: { height: g.toolRow, width: '30%', borderRadius: r.sm, backgroundColor: surface.rowActive }, skeletonAnswer: { height: g.resourceCard, width: '80%', borderRadius: r.sm, backgroundColor: surface.rowHover },
   empty: { backgroundColor: surface.washSubtle },
