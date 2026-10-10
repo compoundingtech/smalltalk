@@ -306,7 +306,7 @@ impl Ui {
             Hit::Connection => "Show connection",
             Hit::Home => "Show or hide Now [Ctrl+H]",
             Hit::Usage => "Show or hide Usage",
-            Hit::PaletteSection(0) => "Open needs you [Ctrl+1]",
+            Hit::PaletteSection(0) => "Open alerts [Ctrl+1]",
             Hit::PaletteSection(1) => "Open agents [Ctrl+2]",
             Hit::PaletteSection(2) => "Open missions [Ctrl+3]",
             Hit::PaletteSection(3) => "Open fleet [Ctrl+4]",

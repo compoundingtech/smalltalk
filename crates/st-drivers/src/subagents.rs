@@ -600,23 +600,36 @@ pub fn observe_omp(agent_dir: &Path, frame: &Value, parent: &str) -> Result<()> 
     update(agent_dir, |ledger| apply_omp(ledger, frame, parent, now))
 }
 
+/// Bound omp's producer strings before copying them into the ledger. Never truncate an ID:
+/// distinct IDs with the same prefix must not share a run.
+fn omp_text<'a>(frame: &'a Value, key: &str, max_bytes: usize) -> Option<&'a str> {
+    frame.get(key)?.as_str().map(str::trim)
+        .filter(|text| !text.is_empty() && text.len() <= max_bytes)
+}
+
 fn apply_omp(ledger: &mut Ledger, frame: &Value, parent: &str, now: u64) {
-    let Some(thread) = text(frame, "id") else {
+    let Some(thread) = omp_text(frame, "id", 256) else {
         return;
     };
     ledger.change_session(parent, now);
-    let current = run_id(ledger, &thread);
+    let current = run_id(ledger, thread);
     match frame.get("event").and_then(Value::as_str) {
-        // A progress report starts a run whose start this ledger missed.
+        // A progress report starts a run whose start this ledger missed, but never resurrects
+        // an ended run. Only an explicit start can run a known, finished thread again.
         Some("start" | "progress") => {
             if let Some(running) = ledger.running.get_mut(&current) {
                 running.reported_at_ms = Some(now);
                 return;
             }
-            let id = next_run(ledger, &thread);
+            if frame.get("event").and_then(Value::as_str) == Some("progress")
+                && ledger.runs.contains_key(thread)
+            {
+                return;
+            }
+            let id = next_run(ledger, thread);
             ledger.start(Subagent {
                 id,
-                subagent_type: text(frame, "name"),
+                subagent_type: omp_text(frame, "name", 128).map(str::to_owned),
                 description: None,
                 session_id: Some(parent.into()),
                 started_at_ms: now,
@@ -1191,6 +1204,9 @@ mod tests {
         // A repeated end changes nothing; a new start is the subagent's second run.
         apply_omp(&mut ledger, &frame("end", json!({})), "native", 5);
         assert_eq!(ledger.ended.len(), 1);
+        apply_omp(&mut ledger, &frame("progress", json!({})), "native", 5);
+        assert!(ledger.running.is_empty(), "late progress must not start a phantom run");
+        assert_eq!(ledger.runs["0-Review"], 1);
         apply_omp(&mut ledger, &frame("start", json!({})), "native", 6);
         assert!(ledger.running.contains_key("0-Review#2"));
         // An outcome the extension cannot report reads as completed.
@@ -1207,6 +1223,22 @@ mod tests {
         let before = ledger.clone();
         apply_omp(&mut ledger, &json!({"type": "subagent", "event": "end"}), "native", 10);
         assert_eq!(ledger, before);
+    }
+
+    #[test]
+    fn omp_strings_are_bounded_in_bytes_without_truncating_ids() {
+        let mut ledger = Ledger::default();
+        let id = "é".repeat(128);
+        let frame = json!({"type": "subagent", "event": "start", "id": id, "name": "é".repeat(64)});
+        apply_omp(&mut ledger, &frame, "native", 1);
+        assert_eq!(ledger.running[&id].subagent_type.as_ref().unwrap().len(), 128);
+        let before = ledger.clone();
+        apply_omp(&mut ledger, &json!({"type": "subagent", "event": "start",
+            "id": format!("{id}x")}), "other", 2);
+        assert_eq!(ledger, before, "an oversized ID changes nothing, including the session");
+        apply_omp(&mut ledger, &json!({"type": "subagent", "event": "start",
+            "id": "no-type", "name": format!("{}x", "é".repeat(64))}), "native", 2);
+        assert_eq!(ledger.running["no-type"].subagent_type, None);
     }
 
     #[test]

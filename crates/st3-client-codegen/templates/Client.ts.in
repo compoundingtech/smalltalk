@@ -146,7 +146,7 @@ export class St3Client {
         this.baseUrl = options.baseUrl.replace(/\/+$/, '');
         this.credential = options.credential;
         this.traceContext = options.traceContext;
-        this.client = options.client;
+        if (options.client !== undefined) this.client = options.client;
         this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     }
 

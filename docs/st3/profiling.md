@@ -20,7 +20,10 @@ its own target rather than leaving it out: the route total still includes it.
 
 `scope: "agents-roster"` rows (also under route `/v1/client/agents`) time where that wait goes,
 each in its own last-512 sample, `duration_scope: "roster-stage"`. Stage `refresh` is one refresher
-fold and `refresh-admission` its wait for roster admission (`population: "refresher-folds"`).
+fold from the previous publication, `refresh-cold` one with no publication to start from, which
+refolds every card from the log (the daemon's first complete roster, or after a chunked
+replication projection, a trim or a repair forgot every kept reduction), and `refresh-admission`
+its wait for roster admission (`population: "refresher-folds"`).
 Stage `fresh-wait` is a fresh read's wait for a publication at its cut (2 s at most), and
 `fresh-page` the page it then builds (`population: "fresh-reads"`). Stages are not requests: they
 add no route or path rows.
@@ -37,7 +40,7 @@ route durations include deliberate waiting.
 
 [`slo/targets.toml`](../../slo/targets.toml) holds the daemon's targets: reads a person waits on,
 writes and acks, terminal attach to first screen, one SQL statement, any transaction or hold of
-the writer, and daemon CPU. Every daemon builds the file in. CI's daemon_load reads the same file.
+the writer, daemon CPU, and this member's database size. Every daemon builds the file in. CI's daemon_load reads the same file.
 A target describes what we aim for and gates nothing by itself.
 
 The request-latency read adds `targets` and `paths` to `routes`. Each target and each path keeps
@@ -54,6 +57,15 @@ target and counts toward no other: a first page is held to the 100 ms of `person
 list to 300 ms. The `sql-statement`, `transaction` (`read`, `write`, `writer_hold`) and `cpu`
 rows cover the store's statements, its read and write transactions, each hold of its single
 writer, and the process's CPU in cores.
+
+The `database` row is this member's store: `max_live_gb` for the pages in use (the file less its
+free pages, which SQLite reuses before the file grows) and `max_growth_mb_per_day` for their net
+daily growth, what is written less what checkpoints and retention free. The daemon samples the
+store hourly, after its local trims, by reading three pragmas, and keeps two days of samples in
+`meta` (`database_size_samples`), so a restart does not lose the growth. Growth is measured from
+the newest sample at least a day old, or extrapolated from the oldest once there is an hour of
+samples; `size` says over what span. [Retention](retention.md) explains what keeps the store
+within it.
 
 The windows live in memory. Each is a ring of slots (12 of 5 seconds, 10 of 30 seconds, 12 of 5
 minutes). Each slot is a sparse histogram with 16 buckets per doubling, so a percentile is

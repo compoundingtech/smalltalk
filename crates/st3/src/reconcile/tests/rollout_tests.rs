@@ -67,6 +67,16 @@ struct Seat {
     runtime: Arc<Runtime>,
 }
 const SUBJECT: &str = "agent/garden/orchard";
+
+fn assert_launch(actual: &MemberSpec, expected: &MemberSpec) {
+    let (crate::model::LaunchSpec::Argv(actual), crate::model::LaunchSpec::Argv(expected)) =
+        (&actual.launch, &expected.launch) else {
+            panic!("the fixture uses an argv native launch");
+        };
+    // The owner resolves the wrapper executable at launch; all authored arguments stay exact.
+    assert_eq!(&actual[1..], &expected[1..]);
+}
+
 impl Seat {
     fn new() -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -251,6 +261,73 @@ impl Seat {
     }
     fn reopen(&mut self) {
         self.store = Arc::new(Store::open(&self.root.path().join("graph.db"), "amber").unwrap());
+    }
+
+    fn suspension_claim(
+        &self,
+        kind: &str,
+        fields: Value,
+        evidence: Vec<String>,
+        key: Option<String>,
+    ) -> crate::model::ClaimRecord {
+        self.store
+            .append_claim(&ClaimInput {
+                subject: SUBJECT.into(),
+                kind: kind.into(),
+                actor: Some("person/operator".into()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence,
+                expected_subject: None,
+                idempotency_key: key,
+            })
+            .unwrap()
+    }
+
+    fn snapshotting(&self) -> (String, String, MemberSpec) {
+        self.busy(false);
+        let (token, old) = rollout::launched_member(&self.store, SUBJECT, "original-1")
+            .unwrap()
+            .unwrap();
+        let request = self.suspension_claim(
+            "runtime.action.requested",
+            json!({"action":"suspend","incarnation_id":"original-1"}),
+            vec![token.clone()],
+            None,
+        );
+        // Seed the captured phase, not a workspace archive: these tests exercise launch
+        // continuity and source-stop completion, not snapshot filesystem capture.
+        self.suspension_claim(
+            "runtime.action.succeeded",
+            json!({"action":"suspend","operation_status":"snapshotting","harness":"claude","native_session_id":"native-one","source_host":"amber"}),
+            vec![request.id.clone()],
+            Some(crate::suspension::suspend_snapshot_key(&request.id)),
+        );
+        (request.id, token, old)
+    }
+
+    fn reconcile(&self) {
+        Reconciler::new(
+            self.store.clone(),
+            self.runtime.clone(),
+            "amber".into(),
+            Arc::new(Notify::new()),
+        )
+        .reconcile_once()
+        .unwrap();
+    }
+
+    fn finish_suspend(&self) -> (String, String, MemberSpec) {
+        let captured = self.snapshotting();
+        self.reconcile();
+        self.reconcile();
+        assert_eq!(
+            crate::suspension::current(&self.store, SUBJECT)
+                .unwrap()
+                .unwrap()
+                .phase,
+            "suspended"
+        );
+        captured
     }
 }
 
@@ -1173,4 +1250,159 @@ fn manual_rollout_does_not_apply_a_pending_change_after_incumbent_exit() {
     assert_eq!(seat.operation().phase, "running");
     assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
     assert!(seat.runtime.stops.lock().unwrap().is_empty());
+}
+
+#[test]
+fn manual_publication_preserves_completed_suspension_across_reopens() {
+    let mut seat = Seat::new();
+    let (operation, _, _) = seat.finish_suspend();
+    seat.publish_mode(2, "second", None, false, true);
+    for _ in 0..3 {
+        seat.reopen();
+        let suspended = crate::suspension::current(&seat.store, SUBJECT)
+            .unwrap()
+            .expect("manual publication must preserve completed suspension");
+        assert_eq!(suspended.phase, "suspended");
+        assert_eq!(suspended.operation_id, operation);
+        seat.reconcile();
+        assert!(seat.runtime.starts.lock().unwrap().is_empty());
+        assert_eq!(rollout::status(&seat.store, SUBJECT).unwrap().unwrap()["mode"], "manual");
+        assert!(rollout::hold_render(&seat.store, &seat.desired()).unwrap());
+        assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
+    }
+}
+
+#[test]
+fn immediate_publication_ends_completed_suspension() {
+    let seat = Seat::new();
+    seat.finish_suspend();
+    seat.publish(2, "second", None, false);
+    assert!(crate::suspension::current(&seat.store, SUBJECT).unwrap().is_none());
+    seat.reconcile();
+    let starts = seat.runtime.starts.lock().unwrap();
+    assert_eq!(starts.len(), 1);
+    assert_launch(&starts[0], &seat.desired().member.unwrap());
+    assert!(!starts[0].environment.contains_key(crate::suspension::RESUME_ENV));
+}
+
+#[test]
+fn manual_publication_allows_in_flight_suspension_to_complete() {
+    let mut seat = Seat::new();
+    let (operation, _, _) = seat.snapshotting();
+    seat.publish_mode(2, "second", None, false, true);
+    assert_eq!(
+        crate::suspension::current(&seat.store, SUBJECT)
+            .unwrap()
+            .expect("manual publication must preserve in-flight suspension")
+            .phase,
+        "snapshotting"
+    );
+    seat.reconcile();
+    assert_eq!(*seat.runtime.stops.lock().unwrap(), vec!["original-1"]);
+    seat.reopen();
+    seat.reconcile();
+    let suspended = crate::suspension::current(&seat.store, SUBJECT).unwrap().unwrap();
+    assert_eq!(suspended.phase, "suspended");
+    assert_eq!(suspended.operation_id, operation);
+    assert!(seat.runtime.starts.lock().unwrap().is_empty());
+}
+
+#[test]
+fn suspended_manual_rollout_refuses_then_resumes_old_before_explicit_cutover() {
+    let mut seat = Seat::new();
+    let (suspend, old_token, old) = seat.finish_suspend();
+    seat.publish_mode(2, "second", None, false, true);
+    let selected = seat.store.rollout_selection(SUBJECT).unwrap().unwrap();
+    let policy = Policy::when_idle(1_800_000, false);
+    let error = seat.store.request_rollout(
+        SUBJECT, &selected.desired_token, &old, "original-1",
+        "person/operator", &policy, "while-suspended",
+    ).expect_err("explicit rollout must refuse a suspended seat");
+    assert!(format!("{error:#}").contains("rollout-suspended"), "{error:#}");
+    assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
+    // Resume is fenced to the incumbent launch, not the pending declaration.
+    seat.suspension_claim(
+        "runtime.action.requested", json!({"action":"resume"}),
+        vec![old_token.clone(), suspend], None,
+    );
+    seat.reopen();
+    seat.reconcile();
+    {
+        let starts = seat.runtime.starts.lock().unwrap();
+        assert_eq!(starts.len(), 1);
+        assert_launch(&starts[0], &old);
+        assert_eq!(starts[0].environment[crate::suspension::RESUME_ENV], "native-one");
+        assert!(!starts[0].environment.contains_key(crate::suspension::CONTINUE_ENV));
+    }
+    seat.binding("replacement-1", "native-one");
+    seat.reconcile();
+    assert_eq!(
+        crate::suspension::current(&seat.store, SUBJECT).unwrap().unwrap().phase,
+        "resumed"
+    );
+    let (resumed_token, resumed) =
+        rollout::launched_member(&seat.store, SUBJECT, "replacement-1").unwrap().unwrap();
+    assert_eq!(resumed_token, old_token, "resume must record the old launch token");
+    assert_eq!(resumed.launch, old.launch);
+    assert!(rollout::hold_render(&seat.store, &seat.desired()).unwrap());
+    assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
+    seat.append("harness.observed", json!({"state":"idle","driver":"claude","incarnation_id":"replacement-1","quiescent":true,"blocking":[]}));
+    seat.store.request_rollout(
+        SUBJECT, &selected.desired_token, &resumed, "replacement-1",
+        "person/operator", &policy, "after-resume",
+    ).unwrap();
+    seat.step();
+    seat.ack();
+    for _ in 0..5 {
+        seat.reopen();
+        seat.step();
+    }
+    {
+        let starts = seat.runtime.starts.lock().unwrap();
+        assert_eq!(starts.len(), 2);
+        assert_launch(&starts[1], &seat.desired().member.unwrap());
+        assert_eq!(starts[1].environment[crate::suspension::RESUME_ENV], "native-one");
+        assert!(!starts[1].environment.contains_key(crate::suspension::CONTINUE_ENV));
+    }
+    seat.binding("replacement-2", "native-one");
+    seat.step();
+    assert_eq!(seat.operation().phase, "running");
+    assert!(!rollout::hold_render(&seat.store, &seat.desired()).unwrap());
+}
+
+#[test]
+fn resume_with_pending_manual_publication_launches_old_and_keeps_pending() {
+    let mut seat = Seat::new();
+    let (suspend, old_token, old) = seat.finish_suspend();
+    seat.publish_mode(2, "second", None, false, true);
+    seat.suspension_claim(
+        "runtime.action.requested",
+        json!({"action":"resume"}),
+        vec![old_token.clone(), suspend],
+        None,
+    );
+    seat.reopen();
+    seat.reconcile();
+    {
+        let starts = seat.runtime.starts.lock().unwrap();
+        assert_eq!(starts.len(), 1, "resume must launch the old declaration");
+        assert_launch(&starts[0], &old);
+        assert_eq!(starts[0].environment[crate::suspension::RESUME_ENV], "native-one");
+        assert!(!starts[0].environment.contains_key(crate::suspension::CONTINUE_ENV));
+    }
+    seat.binding("replacement-1", "native-one");
+    seat.reopen();
+    seat.reconcile();
+    assert_eq!(
+        crate::suspension::current(&seat.store, SUBJECT).unwrap().unwrap().phase,
+        "resumed"
+    );
+    let (token, member) =
+        rollout::launched_member(&seat.store, SUBJECT, "replacement-1").unwrap().unwrap();
+    assert_eq!(token, old_token);
+    assert_eq!(member.launch, old.launch);
+    assert!(rollout::hold_render(&seat.store, &seat.desired()).unwrap());
+    assert!(seat.store.rollout(SUBJECT).unwrap().is_none());
+    seat.reconcile();
+    assert_eq!(seat.runtime.starts.lock().unwrap().len(), 1);
 }

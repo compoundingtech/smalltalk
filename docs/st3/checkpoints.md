@@ -282,16 +282,22 @@ second as evidence, the evidence guard would keep that one too.
 
 A stable checkpoint is trimmed in two steps, and a crash between them is safe.
 
-1. **Tombstones, in one transaction.** For every dropped envelope and claim the node records a
-   tombstone: writer, sequence, hash and, for a claim, its ID, subject, kind, actor, predecessors,
-   operation and request digest. It marks the checkpoint `trimming`. The tombstones, not the
-   deleted rows, are now what the node's replication inventory lists for those envelopes.
+1. **Tombstones, in chunks.** The node marks the checkpoint `recording`, then for every dropped
+   envelope and claim records a tombstone: writer, sequence, hash and, for a claim, its ID,
+   subject, kind, actor, predecessors, operation and request digest. Each transaction stops
+   recording after 20 ms (`TRIM_CHUNK_BUDGET`). When every tombstone is recorded it marks the
+   checkpoint `trimming`. The tombstones, not the deleted rows, are now what the node's
+   replication inventory lists for those envelopes; a tombstone and the envelope it stands for
+   have one identity, so the inventory is the same while both exist.
 2. **Deletions, in chunks.** For each dropped envelope the node deletes its claims, their events,
    records, signatures, operations and the envelope row. After the last chunk it marks the
    checkpoint `trimmed`.
 
-A crash leaves either nothing recorded, in which case the next pass starts again, or every
-tombstone recorded with some rows still present, in which case the next pass deletes what is left.
+A crash while the checkpoint is `recording` leaves some tombstones recorded and every row still
+present. A sealed set never reads the tombstones of a checkpoint that is `recording`, so the next
+pass plans exactly the drop it verified, records what is missing (recording a tombstone again
+changes nothing) and goes on. A crash after that leaves every tombstone recorded with some rows
+still present, and the next pass deletes what is left.
 At every point the node's inventory, authority digest and graph are the same, so peers cannot tell a
 node mid-trim from one that has not started.
 
@@ -381,6 +387,22 @@ transaction repeatedly spilled SQLite statement journals and sustained 42–51 M
 writes before the trim even started (#1145). The Linux regression
 `production_history_has_bounded_journal_writes` forces spill with a small cache and bounds the
 setup's write-syscall bytes, without reducing the production-sized trim proof.
+
+## The 2026-10-10 lesson: tombstones in one transaction
+
+The deletions were chunked, but the tombstones still went in one transaction: every dropped
+envelope and claim, recorded while holding the writer. A daily checkpoint drops 100,000 to
+180,000 claims, so that transaction held the writer for seconds every day. Measured on a copy of a
+production member, a rules-15 checkpoint that drops 468,134 claims and 462,689 envelopes held it
+for 53 seconds. Tombstones are now recorded in chunks of 20 ms, like the deletions, under a
+`recording` state that sealed sets ignore, so a crash part way through plans the same drop and
+records the rest. The deletion budget is 20 ms as well: a chunk's commit writes and syncs the
+pages it changed, and on a busy disk that costs more than the chunk. The same trim on the same
+copy then held the writer at a median of 41 ms and a 99th percentile of 229 ms over 33,660
+transactions, with the disk's own sync time included. On that host, at that load, a one-row
+commit took a median of 28 ms and a 99th percentile of 311 ms. The test
+`a_trim_that_stops_anywhere_finishes_the_same_after_a_restart` now also stops part way through
+recording.
 
 ## Where the proof lives
 

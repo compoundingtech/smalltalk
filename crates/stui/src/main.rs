@@ -523,6 +523,21 @@ async fn act_on_card(
                 )
                 .await?
         }
+        "prompt.respond" => {
+            let answer = answer.ok_or_else(|| anyhow::anyhow!("choose allow or deny"))?;
+            client
+                .prompt_respond(
+                    id,
+                    idem,
+                    fence,
+                    st3_client::PromptRespondParameters {
+                        target_id: source,
+                        episode: attention.episode.clone(),
+                        answer,
+                    },
+                )
+                .await?
+        }
         "review.approve" => {
             client
                 .review_approve(

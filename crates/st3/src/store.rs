@@ -134,6 +134,8 @@ pub(crate) use mission_eligibility::MISSING_AGENT_CONDITION;
 mod revision_seats;
 pub(crate) mod delegation;
 mod limits;
+mod database_size;
+pub use database_size::DatabaseSize;
 mod person_work;
 pub(crate) mod work_summaries_ivm;
 mod subagents;
@@ -3517,6 +3519,11 @@ impl Store {
             Ok(delta) => delta.subjects.is_empty() && !delta.queues && !delta.membership,
             Err(_) => false,
         })
+    }
+
+    /// Note that an agents list read asked for the roster now, so a forget refolds it at once.
+    pub(crate) fn note_agent_roster_read(&self) {
+        self.smalltalk.agent_roster_read_at.store(now_ms() as u64, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether a refresher keeps the roster published, so readers must never fold it.
@@ -14698,6 +14705,11 @@ impl Store {
         launch_lineage_tx(&connection, subject)
     }
 
+    /// Presentation-only lineage of a recorded launch, even when it is no longer desired.
+    pub(crate) fn launch_lineage_from(&self, token: &str) -> Result<Vec<String>> {
+        launch_lineage_from_tx(&self.readers.get(), token.to_owned())
+    }
+
     /// Only seats whose durable resume requests name this host need transfer reconciliation.
     pub(crate) fn cross_host_resume_targets(&self, host: &str) -> Result<BTreeSet<String>> {
         smallclaims::touched::note_read(|| "kind:runtime.action.requested".to_owned());
@@ -21315,8 +21327,11 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
     let Some(row) = current_desired_row(connection, subject)? else {
         return Ok(Vec::new());
     };
-    let mut lineage = vec![row.claim_id.clone()];
-    let mut current = row.claim_id;
+    launch_lineage_from_tx(connection, row.claim_id)
+}
+
+fn launch_lineage_from_tx(connection: &Connection, mut current: String) -> Result<Vec<String>> {
+    let mut lineage = vec![current.clone()];
     while let Some(claim) = claim_by_id_tx(connection, &current)? {
         // A claim that merges concurrent revisions has one predecessor per fork; follow the
         // first one that is still the same launch.
@@ -21327,7 +21342,7 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
             }
             if let Some(previous) = claim_by_id_tx(connection, predecessor)?
                 && previous.kind == "intent.desired"
-                && previous.subject == subject
+                && previous.subject == claim.subject
                 && presentation_only_change(&previous.body, &claim.body)
             {
                 next = Some(previous.id);

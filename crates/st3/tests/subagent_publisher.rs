@@ -430,6 +430,15 @@ async fn an_omp_subagent_is_listed_on_its_seat_until_it_ends() {
     assert_eq!(ended.len(), 1);
     assert_eq!(ended[0]["subagent_id"], "0-Review");
     assert_eq!(ended[0]["outcome"], "completed");
+    // The end has been recorded and removed from the ledger's pending ends. A delayed turn
+    // report still cannot resurrect it, but an explicit start can launch a second run.
+    channel.observe(&subagent_frame("progress")).unwrap();
+    publisher.tick(&client).await.unwrap();
+    assert_eq!(listed_subagents(&client).await, json!([]));
+    assert_eq!(fields(&store, OMP_SEAT, "subagent.appeared").len(), 1);
+    channel.observe(&subagent_frame("start")).unwrap();
+    publisher.tick(&client).await.unwrap();
+    assert_eq!(listed_subagents(&client).await[0]["id"], "0-Review#2");
     server.abort();
 }
 
