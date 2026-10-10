@@ -81,6 +81,42 @@ pub async fn migrate_event_payloads(store: Arc<Store>) -> Result<EventMigrationR
     }
 }
 
+/// Source transactions do only one bounded fold. This weakly owned daemon worker
+/// completes queued folds in later writer loans, including queues left by trimming.
+pub async fn run_client_message_selectors(
+    store: std::sync::Weak<Store>,
+    notify: Arc<tokio::sync::Notify>,
+    events: tokio::sync::watch::Sender<u64>,
+) {
+    loop {
+        let Some(current) = store.upgrade() else { return; };
+        let result = tokio::task::spawn_blocking(move || {
+            let pending = current.client_message_selectors_pending()?;
+            let more = current.maintain_client_message_selectors()?;
+            let remaining = current.client_message_selectors_pending()?;
+            Ok::<_, anyhow::Error>((pending, remaining, more))
+        }).await;
+        let more = match result {
+            Ok(Ok((pending, remaining, more))) => {
+                if pending && !remaining {
+                    events.send_modify(|generation| *generation = generation.saturating_add(1));
+                    notify.notify_one();
+                }
+                more
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "message selector maintenance deferred");
+                false
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "message selector maintenance task failed");
+                false
+            }
+        };
+        tokio::time::sleep(if more { Duration::from_millis(20) } else { Duration::from_secs(1) }).await;
+    }
+}
+
 fn contention(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         matches!(cause.downcast_ref::<rusqlite::Error>(),
@@ -199,5 +235,50 @@ mod tests {
         .unwrap();
         assert!(result.is_err());
         assert!(store.event_payload_migration_pending().unwrap());
+    }
+
+    #[tokio::test]
+    async fn selector_worker_drains_committed_pending_claims_notifies_and_releases_store() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&root.path().join("selectors.sqlite"),"node").unwrap());
+        {
+            let mut connection = store.connection.write();
+            let transaction = connection.transaction().unwrap();
+            for index in 0..32 {
+                smallclaims::store::append_claim_record_tx(
+                    &transaction,"node",&format!("message/maintenance-{index:02}"),"message.sent",Some("person/sender"),
+                    &serde_json::json!({"fields":{"from":"person/sender","to":"person/recipient","content":"queued","status":"sent","tags":[]}}),
+                    &[],None,
+                ).unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        assert!(store.client_message_selectors_pending().unwrap());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let (events,observed) = tokio::sync::watch::channel(0);
+        let weak = Arc::downgrade(&store);
+        let worker = tokio::spawn(run_client_message_selectors(weak.clone(),notify.clone(),events));
+        tokio::time::timeout(Duration::from_secs(5),notify.notified()).await.unwrap();
+        assert!(!store.client_message_selectors_pending().unwrap());
+        assert_eq!(*observed.borrow(),1);
+        let rows = store.read_snapshot(|through|store.client_messages_page(None,None,true,through,None,32)).unwrap();
+        assert_eq!(rows.len(),32);
+        assert!(rows.iter().all(|row|row.0.content=="queued"));
+        drop(store);
+        tokio::time::timeout(Duration::from_secs(3),worker).await.unwrap().unwrap();
+        assert!(weak.upgrade().is_none(), "idle worker must not keep its store alive");
+    }
+
+    #[test]
+    fn idle_selector_maintenance_never_borrows_or_commits_the_writer() {
+        let store = Store::open_memory("node").unwrap();
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = commits.clone();
+        let _observer = store.connection.observe_commits(move |_| {
+            count.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        });
+        assert!(!store.maintain_client_message_selectors().unwrap());
+        assert!(!store.maintain_client_message_selectors().unwrap());
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed),0);
     }
 }

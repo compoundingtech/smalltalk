@@ -19,6 +19,7 @@ struct TransactionHooks {
 #[derive(Default)]
 pub(super) struct TransactionFinalizers {
     hooks: OnceLock<TransactionHooks>,
+    runtime: OnceLock<TransactionCallback>,
 }
 
 impl TransactionFinalizers {
@@ -39,6 +40,17 @@ impl TransactionFinalizers {
         Ok(())
     }
 
+    pub(super) fn install_runtime(
+        &self,
+        callback: impl Fn(&Transaction<'_>) -> Result<()> + Send + Sync + 'static,
+    ) -> Result<()> {
+        ensure!(
+            self.runtime.set(Arc::new(callback)).is_ok(),
+            "runtime transaction finalizer is already installed"
+        );
+        Ok(())
+    }
+
     pub(super) fn prepare(&self, transaction: &Transaction<'_>) -> Result<()> {
         if let Some(hooks) = self.hooks.get() {
             Self::invoke(&hooks.prepare, transaction, "prepare")?;
@@ -47,6 +59,11 @@ impl TransactionFinalizers {
     }
 
     pub(super) fn run(&self, transaction: &Transaction<'_>) -> Result<()> {
+        // Runtime projections precede the optional source adapter, so its finalizer
+        // observes all surviving source and projection mutations in this transaction.
+        if let Some(runtime) = self.runtime.get() {
+            Self::invoke(runtime, transaction, "runtime finalizer")?;
+        }
         if let Some(hooks) = self.hooks.get() {
             Self::invoke(&hooks.finalize, transaction, "finalizer")?;
         }
@@ -180,6 +197,47 @@ mod tests {
         }
         tx.execute("DELETE FROM delta", [])?;
         Ok(())
+    }
+
+    #[test]
+    fn runtime_finalizer_composes_with_adapter_once_per_outer_transaction() {
+        let writer = writer();
+        let calls = Arc::new(AtomicU64::new(0));
+        let called = calls.clone();
+        writer.install_runtime_finalizer(move |tx| {
+            called.fetch_add(1, Ordering::Relaxed);
+            drain(tx)
+        }).unwrap();
+        writer.install_transaction_hooks(
+            |_| Ok(()),
+            |tx| {
+                ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM delta)", [], |row| row.get::<_, bool>(0))?,
+                    "runtime projection must precede adapter finalization");
+                Ok(())
+            },
+        ).unwrap();
+        writer.batched(|tx| {
+            free_write(tx, 1, "first")?;
+            free_write(tx, 2, "second")
+        }).unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        {
+            let mut guard = writer.write();
+            let tx = guard.transaction().unwrap();
+            free_write(&tx, 3, "lent first").unwrap();
+            free_write(&tx, 4, "lent second").unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        {
+            let mut guard = writer.write();
+            let tx = guard.transaction().unwrap();
+            free_write(&tx, 5, "rolled back").unwrap();
+            tx.rollback().unwrap();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let guard = writer.write();
+        assert_eq!(guard.query_row("SELECT COUNT(*) FROM output", [], |row| row.get::<_, usize>(0)).unwrap(), 4);
     }
 
     // A free transaction helper knows no runtime, writer or view registry.

@@ -21,6 +21,9 @@ mod owned_sets_tests;
 mod resources;
 mod github_workflow_failures;
 pub(crate) mod message_subscriptions;
+mod client_messages;
+#[cfg(test)]
+mod client_messages_version_benchmark;
 mod rollouts;
 mod seat_status;
 mod card_fold;
@@ -12896,10 +12899,11 @@ impl Store {
     }
 
     pub fn discard_desired_owned_by(&self, owner_run: &str) -> Result<usize> {
-        let connection = self.connection.write();
-        connection
-            .execute("DELETE FROM desired WHERE owner_run=?1", [owner_run])
-            .map_err(Into::into)
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        let removed = transaction.execute("DELETE FROM desired WHERE owner_run=?1", [owner_run])?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     pub fn eval_runtime_records(&self, run: &str) -> Result<Vec<(String, bool)>> {
@@ -19437,7 +19441,19 @@ fn desired_row_at(
     let Some(at_index) = at_index else {
         return current_desired_row(connection, subject);
     };
-    if owned_sets::owner(connection, subject, Some(at_index)).map_err(anyhow::Error::new)?.is_some() {
+    // Owned sets admit only top-level agents, missions and schedules, never messages.
+    // Keep the hot message-page path on the desired primary key; older cuts only
+    // fold this subject's declaration claims, not every owned-set receipt.
+    if subject.starts_with("message/") {
+        if let Some(row) = current_desired_row(connection, subject)? {
+            let unchanged: bool = connection.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM claims INDEXED BY claims_subject_kind_index
+                 WHERE subject=?1 AND kind='intent.desired' AND store_index>?2)",
+                params![subject,at_index], |row| row.get(0),
+            )?;
+            if unchanged { return Ok(Some(row)); }
+        }
+    } else if owned_sets::owner(connection, subject, Some(at_index)).map_err(anyhow::Error::new)?.is_some() {
         return owned_sets::desired_at(connection, subject, at_index);
     }
     let mut statement = connection.prepare_cached(&canonical_sql(
@@ -22039,9 +22055,25 @@ fn message_view_tx(
     subject: &str,
     created_index: u64,
 ) -> Result<MessageView> {
-    let actual = latest_actual(connection, subject)?.unwrap_or(Value::Null);
-    let desired = current_desired_row(connection, subject)?
-        .and_then(|row| serde_json::from_str::<Value>(&row.body).ok());
+    message_view_at(connection, subject, created_index, None)
+}
+
+fn message_view_at(
+    connection: &Connection,
+    subject: &str,
+    created_index: u64,
+    through: Option<u64>,
+) -> Result<MessageView> {
+    let actual = latest_actual_at(connection, subject, through)?.unwrap_or(Value::Null);
+    // Deletion of the current projection retires the declaration. A retained
+    // intent.desired claim is not permission to resurrect it in a fresh page.
+    let desired = if through.is_some() && !connection.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM desired WHERE subject=?1)",
+    )?.query_row([subject], |row|row.get::<_,bool>(0))? {
+        None
+    } else {
+        desired_row_at(connection, subject, through)?
+    }.and_then(|row| serde_json::from_str::<Value>(&row.body).ok());
     let field = |name: &str| actual.get(name).and_then(Value::as_str).map(str::to_owned);
     let child = |name: &str| {
         desired

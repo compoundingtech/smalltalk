@@ -1160,6 +1160,27 @@ fleet, see `sync`) or `unverified`, and the `reason` the owner was not asked, su
 `timed-out`. A client renders that as waiting, not as no messages. A list that names no remote
 agent has no `replicated`. Page cursors of a relayed list belong to the owner.
 
+Message list pages select the recipient and actor, newest `sent_at` first with ascending message
+ID ties, before loading message bodies. A cursor retains the first page's server-issued cut
+and request time: later writes cannot change the traversal's message fields, current/history
+classification, or delivery age. Current lists omit closed and superseded reminder messages;
+history lists retain them with the same operational reasons. Reminder winners are selected in
+the recipient scope before the actor filter. Cursors remain opaque and expire after five minutes.
+The server retains only bounded cursor metadata, not message bodies; the cut, expiry, filters,
+snapshot and keyset must exactly match an issued cursor. Tampering, metadata eviction or restart,
+and repair/checkpoint deletion that makes the cut unavailable return `page-cursor-expired`
+(HTTP 410), never a successful incomplete page. A web client restarts pagination on that error.
+Fresh pages also respect current desired-projection availability: removing a desired-only
+declaration does not restore its recipient or content from retained `intent.desired` history.
+The local body-free selector projection maintains ordered recipient/actor ranges and current
+eligibility before the page limit. Opening an older store transactionally backfills these
+headers; changed ordering or eligibility creates a temporal header, but body-only writes do
+not copy bodies or churn header versions. Initial selector backfill completes before readers
+are exposed. While later selector maintenance lags, pages and issued cursors pin the last fully
+published frontier; pending rows are invisible rather than making message lists fail.
+Recipient delivery presence is live process evidence, not graph state: each page reassesses
+`recipient_delivery`, including its observation age, rather than retaining a stale report.
+
 A read that no peer can carry fails with `remote-unavailable`, and its `details` say why, so a
 client can tell a host nobody reaches from a slow or refusing one: `reason` is `no-route` (this node
 cannot dial the owner and no peer reaches it), `dial-failed`, `timed-out`, `refused` (a peer does

@@ -16,6 +16,10 @@ pub struct SmalltalkRuntime {
     pub(crate) mailbox_wakes: std::sync::OnceLock<Arc<mailbox_wakes::Wakes>>,
     #[cfg(test)]
     pub(crate) work_extension_roots_rebuilt: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) client_message_backfill_stats: Mutex<client_messages::BackfillStats>,
+    #[cfg(test)]
+    pub(crate) client_message_commit_budget: Mutex<client_messages::FoldBudget>,
     /// Simulate different build registries on isolated nodes in compatibility tests.
     #[cfg(test)]
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,
@@ -182,6 +186,7 @@ impl Runtime for SmalltalkRuntime {
         resources::create_schema(connection)?;
         custom::create_schema(connection)?;
         agent_messages::create_schema(connection)?;
+        client_messages::create_schema(connection)?;
         glass_heads::create_schema(connection)?;
         limits::create_limits_schema(connection)?;
         if let Some(views) = &self.ivm_views {
@@ -253,6 +258,17 @@ impl Runtime for SmalltalkRuntime {
             let _ = rebuilt;
         }
         migrate_occurrence_creation_projections_tx(transaction)?;
+        Ok(())
+    }
+
+    fn finish_open_projections(&self, connection: &mut Connection) -> Result<()> {
+        let stats = client_messages::open(connection)?;
+        #[cfg(test)]
+        {
+            *self.client_message_backfill_stats.lock().unwrap_or_else(PoisonError::into_inner) = stats;
+        }
+        #[cfg(not(test))]
+        let _ = stats;
         Ok(())
     }
 
@@ -339,6 +355,17 @@ impl Runtime for SmalltalkRuntime {
         reapply_local_work_lease_renewals_tx(transaction)
     }
 
+    fn before_commit(&self, transaction: &Transaction<'_>) -> Result<()> {
+        let budget = client_messages::finalize_commit(transaction)?;
+        #[cfg(test)]
+        {
+            *self.client_message_commit_budget.lock().unwrap_or_else(PoisonError::into_inner) = budget;
+        }
+        #[cfg(not(test))]
+        let _ = budget;
+        Ok(())
+    }
+
     fn forget_views(&self) {
         let mut cache = self
             .subject_cache
@@ -389,7 +416,8 @@ impl Runtime for SmalltalkRuntime {
     }
 
     fn replay_checkpoint_projections(&self, transaction: &Transaction<'_>) -> Result<()> {
-        checkpoint_rules::replay_from_nothing(transaction)
+        checkpoint_rules::replay_from_nothing(transaction)?;
+        Ok(())
     }
 
     fn checkpoint_subject_answers(

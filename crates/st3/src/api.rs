@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
@@ -112,9 +112,9 @@ const CLIENT_PROJECTION_VERSION: &str = "client-projection.v0";
 const CLIENT_DEFAULT_PAGE_ITEMS: usize = 50;
 const CLIENT_MAX_PAGE_ITEMS: usize = 200;
 const CLIENT_MAX_RESPONSE_BYTES: usize = 1_048_576;
-// Keep complete result sets briefly so fleet writes cannot reorder or invalidate a traversal.
-// Cursors expire after this bounded window or if the daemon restarts/evicts their snapshot.
-const CLIENT_PAGE_TTL_MS: u128 = 300_000;
+// Other collections retain complete result sets briefly. Message pages retain only
+// issued cursor metadata; either kind expires on restart, eviction, or the TTL.
+pub(crate) const CLIENT_PAGE_TTL_MS: u128 = 300_000;
 const CLIENT_PAGE_CACHE_CAPACITY: usize = 32;
 
 struct CachedClientPage {
@@ -146,7 +146,7 @@ impl ClientTransportBoundary {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct ClientSnapshot {
     id: String,
     host_id: String,
@@ -183,7 +183,7 @@ struct ClientListQuery {
     fresh: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct ClientPageCursor {
     snapshot: ClientSnapshot,
     collection: String,
@@ -207,6 +207,20 @@ struct ClientPageCursor {
     after_key: Option<(u128, String)>,
     expires_at_unix_ms: u128,
 }
+
+// Each receipt binds one server-issued continuation, not the message bodies. Bounding
+// receipts also bounds replay retention; eviction explicitly requires a fresh traversal.
+const CLIENT_MESSAGE_CUT_CAPACITY: usize = 256;
+
+struct IssuedClientMessageCut {
+    store: std::sync::Weak<Store>,
+    cursor: ClientPageCursor,
+    cut_epoch: u64,
+    request_time: u128,
+}
+
+static CLIENT_MESSAGE_CUTS: LazyLock<parking_lot::Mutex<VecDeque<Arc<IssuedClientMessageCut>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(VecDeque::new()));
 
 fn signal_changed(state: &AppState) {
     crate::performance::record_wake("api", None);
@@ -1279,7 +1293,7 @@ pub(crate) fn new_request_id() -> String {
     )
 }
 
-fn client_now_ms() -> u128 {
+pub(crate) fn client_now_ms() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -3496,11 +3510,73 @@ fn client_attachment(attachment: &crate::model::MessageAttachment) -> Value {
     })
 }
 
+fn client_message_resource(
+    message: crate::model::MessageView,
+    metadata: &Value,
+    current: bool,
+    now: u128,
+) -> anyhow::Result<Value> {
+    let sent_at = metadata["sent_at"].as_str().unwrap_or("0").parse::<u128>()?;
+    let updated_at = metadata["updated_at"].as_str().unwrap_or("0").parse::<u128>()?;
+    let reasons = if message.status == "closed" {
+        vec!["closed"]
+    } else if !current {
+        vec!["superseded"]
+    } else {
+        Vec::new()
+    };
+    let current = reasons.is_empty();
+    Ok(json!({
+        "id": message.subject,
+        "kind": "message",
+        "revision": metadata["revision"],
+        "updated_at": client_timestamp(updated_at),
+        "from": message.from,
+        "to": message.to,
+        "title": message.title,
+        "content": message.content,
+        "state": message.status,
+        "delivery": message_delivery_value(&message.to, &message.status, sent_at, now),
+        "sent_at": client_timestamp(sent_at),
+        "session_id": metadata["session_id"],
+        "in_reply_to": message.in_reply_to,
+        "tags": message.tags,
+        "attachments": message.attachments.iter().map(client_attachment).collect::<Vec<_>>(),
+        "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
+    }))
+}
+
 fn client_message_resources(
     store: &Store,
     person: Option<&str>,
     history: bool,
     peer: Option<&str>,
+) -> anyhow::Result<Vec<Value>> {
+    store.read_snapshot(|through| {
+        let now = client_now_ms();
+        let mut after = None;
+        let mut resources = Vec::new();
+        loop {
+            let mut page = store.client_messages_page(person, peer, history, through, after.as_ref(), CLIENT_MAX_PAGE_ITEMS)?;
+            let more = page.len() > CLIENT_MAX_PAGE_ITEMS;
+            page.truncate(CLIENT_MAX_PAGE_ITEMS);
+            for (message, metadata, current) in page {
+                let sent_at = metadata["sent_at"].as_str().unwrap_or("0").parse::<u128>()?;
+                after = Some((sent_at, message.subject.clone()));
+                resources.push(client_message_resource(message, &metadata, current, now)?);
+            }
+            if !more { return Ok(resources); }
+        }
+    })
+}
+
+#[cfg(test)]
+fn client_message_resources_at(
+    store: &Store,
+    person: Option<&str>,
+    history: bool,
+    peer: Option<&str>,
+    now: u128,
 ) -> anyhow::Result<Vec<Value>> {
     let current = store.operational_messages(person, false)?;
     let current_ids = current
@@ -3553,7 +3629,7 @@ fn client_message_resources(
             "title": message.title,
             "content": message.content,
             "state": message.status,
-            "delivery": message_delivery_value(&message.to, &message.status, sent_at, client_now_ms()),
+            "delivery": message_delivery_value(&message.to, &message.status, sent_at, now),
             "sent_at": client_timestamp(sent_at),
             "session_id": session_id,
             "in_reply_to": message.in_reply_to,
@@ -5065,7 +5141,7 @@ async fn client_messages(
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
-    let (history, actor) = (query.history, query.actor.clone());
+    let actor = query.actor.clone();
     // An agent another host owns is listed by that host: its messages can reach this node late,
     // and a list that shows only what has arrived reads as empty while the replica lags.
     let owner = match actor.as_deref() {
@@ -5103,19 +5179,142 @@ async fn client_messages(
             Err(error) => return Err(error),
         }
     }
-    let (snapshot, Json(mut page)) = client_snapshot_page(
-        &state,
-        snapshot,
-        "messages",
-        &effective_query,
-        move |state, _| {
-            client_message_resources(&state.store, person.as_deref(), history, actor.as_deref())
-        },
-    )
-    .await
+    let (snapshot, Json(mut page)) =
+        client_messages_sql_page(&state, snapshot, &effective_query).await
     .map(|(Extension(snapshot), page)| (snapshot, page))?;
     page.replicated = replicated;
     Ok((Extension(snapshot), Json(page)))
+}
+
+/// SQL pages retain only issued cut metadata, not a materialized JSON collection.
+/// Appends preserve the cut; deletion invalidates it. Delivery age stays at issuance
+/// while recipient delivery presence is assessed afresh on each page.
+async fn client_messages_sql_page(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    query: &ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    client_messages_sql_page_at(state, snapshot, query, client_now_ms()).await
+}
+
+async fn client_messages_sql_page_at(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    query: &ClientListQuery,
+    request_time: u128,
+) -> Result<ClientPageResponse, ApiError> {
+    let cursor = query.cursor.as_deref().map(decode_client_cursor).transpose()?;
+    let cut = if let Some(cursor) = &cursor {
+        if cursor.collection != "messages"
+            || cursor.snapshot != snapshot
+            || cursor.history != query.history
+            || cursor.person != query.person
+            || cursor.actor != query.actor
+            || cursor.owner_run != query.owner_run
+            || cursor.status != query.status
+            || cursor.owner != query.owner
+            || cursor.state != query.state
+            || cursor.native_only != query.native_only
+            || query.limit.is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
+        {
+            return Err(client_page_expired("the page cursor does not match this collection, snapshot, or filter"));
+        }
+        let cuts = CLIENT_MESSAGE_CUTS.lock();
+        let store = Arc::downgrade(&state.store);
+        let cut = cuts.iter().find(|cut| {
+            cut.store.ptr_eq(&store) && cut.cursor == *cursor
+        }).cloned().ok_or_else(|| {
+            client_page_expired("the message page cut is no longer available; restart pagination")
+        })?;
+        if request_time >= cut.cursor.expires_at_unix_ms {
+            return Err(client_page_expired("the page cursor expired"));
+        }
+        Some(cut)
+    } else {
+        None
+    };
+    let (limit, expires_at, through, after, offset, now, expected_epoch) = if let Some(cut) = &cut {
+        (
+            cut.cursor.limit, cut.cursor.expires_at_unix_ms, cut.cursor.before_index,
+            cut.cursor.after_key.clone(), cut.cursor.offset, cut.request_time, Some(cut.cut_epoch),
+        )
+    } else {
+        (
+            query.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS).clamp(1, CLIENT_MAX_PAGE_ITEMS),
+            request_time.saturating_add(CLIENT_PAGE_TTL_MS), None, None, 0, request_time, None,
+        )
+    };
+    let reader = state.clone();
+    let person = query.person.clone();
+    let actor = query.actor.clone();
+    let history = query.history;
+    let continuing = cut.is_some();
+    let (cut_epoch, read) = blocking_store(move || {
+        reader.store.clone().read_snapshot(|index| {
+            // Check the deletion fence in the same SQLite snapshot as selection/folding.
+            let cut_epoch = reader.store.client_messages_cut_epoch()?;
+            if expected_epoch.is_some_and(|expected| expected != cut_epoch) {
+                return Ok((cut_epoch, None));
+            }
+            let through = through.unwrap_or(reader.store.client_messages_page_cut(index)?);
+            let snapshot = if continuing { snapshot } else { client_snapshot_at(&reader, through) };
+            let rows = reader.store.client_messages_page(
+                person.as_deref(), actor.as_deref(), history, through, after.as_ref(), limit,
+            )?;
+            Ok((cut_epoch, Some((snapshot, through, rows))))
+        })
+    }).await?;
+    // Retire every affected receipt for this store, not just the cursor that
+    // noticed deletion. Keep newer concurrent reads' receipts intact.
+    {
+        let store = Arc::downgrade(&state.store);
+        CLIENT_MESSAGE_CUTS.lock().retain(|cut| {
+            !cut.store.ptr_eq(&store) || cut.cut_epoch >= cut_epoch
+        });
+    }
+    let Some((snapshot, through, mut rows)) = read else {
+        return Err(client_page_expired("the message page cut was invalidated; restart pagination"));
+    };
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    let after = rows.last().map(|(message, metadata, _)| {
+        Ok::<_, anyhow::Error>((metadata["sent_at"].as_str().unwrap_or("0").parse::<u128>()?, message.subject.clone()))
+    }).transpose().map_err(ApiError::internal)?;
+    let items = rows.into_iter().map(|(message, metadata, current)| {
+        client_message_resource(message, &metadata, current, now)
+    }).collect::<anyhow::Result<Vec<_>>>().map_err(ApiError::internal)?;
+    let next_cursor = if has_more {
+        let cursor = ClientPageCursor {
+            snapshot: snapshot.clone(), collection: "messages".into(),
+            offset: offset.saturating_add(items.len()), limit, history,
+            person: query.person.clone(), actor: query.actor.clone(),
+            owner_run: query.owner_run.clone(), status: query.status.clone(),
+            owner: query.owner.clone(), state: query.state.clone(), native_only: query.native_only,
+            // The shared cursor field names the retained receipt for message pages.
+            items_digest: format!("message-cut/{}", uuid::Uuid::now_v7()), before_index: Some(through),
+            after_key: after, expires_at_unix_ms: expires_at,
+        };
+        let encoded = encode_client_cursor(&cursor)?;
+        let mut cuts = CLIENT_MESSAGE_CUTS.lock();
+        let current_time = client_now_ms();
+        cuts.retain(|cut| cut.cursor.expires_at_unix_ms > current_time && cut.store.strong_count() != 0);
+        while cuts.len() >= CLIENT_MESSAGE_CUT_CAPACITY {
+            cuts.pop_front();
+        }
+        cuts.push_back(Arc::new(IssuedClientMessageCut {
+            store: Arc::downgrade(&state.store), cursor, cut_epoch, request_time: now,
+        }));
+        Some(encoded)
+    } else { None };
+    Ok((Extension(snapshot), Json(ClientResourcePage {
+        kind: "page".into(), collection: "messages".into(),
+        filters: client_page_filters("messages", query), items,
+        page: ClientPageInfo {
+            limit, has_more, next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at)),
+        },
+        sync: client_sync_notice(state), replicated: None,
+    })))
 }
 
 /// The host that owns `actor`'s runtime, when that is another host.
@@ -26331,3 +26530,9 @@ agent "seat" { workspace "/tmp"; command "true" }
 
 #[cfg(test)]
 mod work_incarnation_tests;
+#[cfg(test)]
+mod client_messages_tests;
+#[cfg(test)]
+mod client_messages_cursor_tests;
+#[cfg(test)]
+mod client_messages_selector_tests;

@@ -857,6 +857,7 @@ impl Store {
             runtime.open_projections(&transaction, false)?;
             transaction.commit()?;
         }
+        runtime.finish_open_projections(&mut connection)?;
         let readers = ReadPool::new(path, false)?;
         Self::from_connection(
             connection,
@@ -892,6 +893,7 @@ impl Store {
             runtime.open_projections(&transaction, true)?;
             transaction.commit()?;
         }
+        runtime.finish_open_projections(&mut connection)?;
         let readers = ReadPool::new(&uri, true)?;
         Self::from_connection(connection, readers, origin, uri, true, runtime)
     }
@@ -979,8 +981,13 @@ impl Store {
             [index.to_string()],
         )?;
         let committed_index = Arc::new(AtomicU64::new(index));
+        let connection = WriterConnection::new(connection, committed_index.clone());
+        let finalizing_runtime = runtime.clone();
+        connection.install_runtime_finalizer(move |transaction| {
+            finalizing_runtime.before_commit(transaction)
+        })?;
         Ok(Self {
-            connection: WriterConnection::new(connection, committed_index.clone()),
+            connection,
             readers,
             committed_index,
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
