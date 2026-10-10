@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "fractal-ui ships a Transcript composition and a plain-language sync line, with consent-gated Markdown images and a host-owned retry for a failed send. Both scroll lanes offer Scroll to end only when detached more than 40 px; focus and input signals without movement preserve following, no-op explicit navigation preserves its mode, native focus navigation is measured against the observed scroll coordinate, virtual resize pins before paint and detached virtual history compensates growth or shrink above the reader, and momentum reaching the end resumes following.",
+  "summary": "fractal-ui ships a Transcript composition and a plain-language sync line, with consent-gated Markdown images and a host-owned retry for a failed send. Both scroll lanes offer Scroll to end only when detached more than 40 px; focus and input signals without movement preserve following, no-op explicit navigation preserves its mode, native focus navigation is measured against the observed scroll coordinate, virtual resize pins before paint and detached virtual history compensates growth or shrink above the reader, momentum reaching the end resumes following, and attached virtual lanes repin non-reader displacement even when a same-height acknowledgement does not trigger resize.",
   "replay": {
     "status": "none",
     "detail": "No replay or rebuild."

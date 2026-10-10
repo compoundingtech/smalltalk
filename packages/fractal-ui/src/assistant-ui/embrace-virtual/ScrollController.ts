@@ -138,14 +138,20 @@ export class ScrollController {
         return
       }
       if (this.restoring || this.pendingAnchor !== undefined) return
-      if (!this.userScrolling && performance.now() - this.userInputAt > USER_SCROLL_WINDOW_MS)
+      if (!this.userScrolling && performance.now() - this.userInputAt > USER_SCROLL_WINDOW_MS) {
+        // RAC can move an attached lane without resizing it (for example, an ack
+        // re-key). Correct the delivered displacement rather than waiting for RO.
+        if (this.following) this.writeTop(element.scrollHeight)
+        this.dock()
         return
+      }
       this.captureAnchor()
       this.following = false
       this.dock()
       this.savePosition()
     }
     const onScrollEnd = () => {
+      if (this.following && !this.userScrolling && !this.restoring && this.pendingAnchor === undefined) this.writeTop(element.scrollHeight)
       if (this.userScrolling || (!this.restoring && this.pendingAnchor === undefined && this.atEnd())) {
         this.following = this.atEnd()
         if (this.following) {
