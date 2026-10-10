@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Forget refused reconciliation context fingerprints before the next evaluation",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or durable-state change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No DDL, index, migration or storage-format change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission, canonical ordering, checkpoint and effect authority are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "After an oversized or unencodable context is refused, a later encodable context is compared afresh even if it matches an older fingerprint; after that evaluation unchanged context can skip normally."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No added downtime; no deployment is implied."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No configuration or budget changes."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Refusal removes only its retained digest and keeps the existing dirty/fallback and context byte/count limits. An evaluation that succeeds against refused input cannot cause an older digest to skip the next changed evaluation. Unrelated readers remain clean; no new queue, timer or writer work."
+  }
+}
