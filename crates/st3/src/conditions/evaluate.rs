@@ -565,7 +565,11 @@ condition "fleet/elsewhere" {
         let start = 1_760_000_000_000u128;
         let mut transitions = Vec::new();
         let mut messages = Vec::new();
-        let mut run = |evaluator: &mut Evaluator, from: u128, to: u128| {
+        let run = |evaluator: &mut Evaluator,
+                   from: u128,
+                   to: u128,
+                   transitions: &mut Vec<_>,
+                   messages: &mut Vec<_>| {
             let mut at = from;
             while at <= to {
                 let report = evaluator.tick(&store, start + at * S).unwrap();
@@ -577,7 +581,7 @@ condition "fleet/elsewhere" {
         };
         // Two minutes under 15% on /data enters breach; / is fine; the other host's condition
         // is never evaluated here.
-        run(&mut evaluator, 0, 150);
+        run(&mut evaluator, 0, 150, &mut transitions, &mut messages);
         assert_eq!(
             transitions,
             [(
@@ -611,22 +615,22 @@ condition "fleet/elsewhere" {
 
         // A restarted evaluator continues from the graph and does not announce it again.
         let mut evaluator = Evaluator::new("alder", Box::new(fake.clone()));
-        run(&mut evaluator, 180, 600);
+        run(&mut evaluator, 180, 600, &mut transitions, &mut messages);
         assert_eq!(transitions.len(), 1);
 
         // Climbing to 17% is not recovery; holding 20% for a minute is, once.
         fake.free.lock().unwrap().insert("/data".into(), (17, 100));
-        run(&mut evaluator, 630, 900);
+        run(&mut evaluator, 630, 900, &mut transitions, &mut messages);
         assert_eq!(transitions.len(), 1);
         fake.free.lock().unwrap().insert("/data".into(), (20, 100));
-        run(&mut evaluator, 930, 1200);
+        run(&mut evaluator, 930, 1200, &mut transitions, &mut messages);
         assert_eq!(transitions.len(), 2);
         assert_eq!(transitions[1].2, Transition::Recover);
         assert_eq!(messages.len(), 2);
 
         // A person's breach messages no one: it is an alert on their home until it recovers.
         *fake.cpu.lock().unwrap() = Some(3.0);
-        run(&mut evaluator, 1230, 1320);
+        run(&mut evaluator, 1230, 1320, &mut transitions, &mut messages);
         assert_eq!(transitions.len(), 3);
         assert_eq!(messages.len(), 2);
         let alerts = store
@@ -638,7 +642,7 @@ condition "fleet/elsewhere" {
             "Condition breached: fleet/collector-cpu on alder"
         );
         *fake.cpu.lock().unwrap() = Some(0.5);
-        run(&mut evaluator, 1350, 1440);
+        run(&mut evaluator, 1350, 1440, &mut transitions, &mut messages);
         assert_eq!(transitions.len(), 4);
         assert!(
             store
