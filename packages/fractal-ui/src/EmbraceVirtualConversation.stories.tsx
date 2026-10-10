@@ -4,6 +4,7 @@ import { flushSync } from 'react-dom'
 import type { Meta, StoryObj } from '@storybook/react-vite'
 import { expect, userEvent, waitFor, within } from 'storybook/test'
 import { EmbraceVirtualConversation } from './assistant-ui/EmbraceVirtualConversation'
+import { proveAffordanceMotion } from './follow-affordance-play'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
 import { darkTheme as embraceDarkTheme } from './assistant-ui/embrace-theme'
@@ -161,7 +162,8 @@ async function provePill(canvasElement: HTMLElement, insideBand = false, activat
   await expect(document.activeElement).toBe(pill)
   if (activate) await userEvent.keyboard('{Enter}')
   await settle()
-  await expect(gap(lane), 'keyboard pill activation must reach the virtual end').toBeLessThanOrEqual(1)
+  if (activate) await waitFor(() => expect(gap(lane), 'keyboard pill activation must reach the virtual end').toBeLessThanOrEqual(1))
+  else await expect(gap(lane), 'keyboard pill activation must reach the virtual end').toBeLessThanOrEqual(1)
   await expect(canvas.queryByRole('button', { name: pillName })).toBeNull()
   await expect(document.activeElement).toBe(draft)
 }
@@ -226,6 +228,28 @@ export const AckRekeyReaderInputControl: Story = { play: async ({ canvasElement 
   await expect(proveAckRekey(canvasElement, true)).rejects.toThrow(/non-reader virtual scroll displacement must repin/)
 } }
 export const AckRekeyReaderInputControlLight: Story = { ...AckRekeyReaderInputControl, args: { scheme: 'light' } }
+
+async function proveReturnMotion(canvasElement: HTMLElement, options: { cancel?: boolean; fault?: 'instant' | 'late-hide' | 'omit-input' } = {}) {
+  const { canvas, lane } = await ready(canvasElement)
+  await readerScrollsUp(lane, 400)
+  await proveAffordanceMotion({ lane, pill: canvas.getByRole('button', { name: pillName }) as HTMLButtonElement, stream: () => stream!(), ...options })
+}
+export const AffordanceClickMotion: Story = { play: async ({ canvasElement }) => { await proveReturnMotion(canvasElement) } }
+export const AffordanceClickMotionLight: Story = { ...AffordanceClickMotion, args: { scheme: 'light' } }
+export const InstantAffordanceMotionControl: Story = { play: async ({ canvasElement }) => {
+  await expect(proveReturnMotion(canvasElement, { fault: 'instant' })).rejects.toThrow(/at least three intermediate/)
+} }
+export const InstantAffordanceMotionControlLight: Story = { ...InstantAffordanceMotionControl, args: { scheme: 'light' } }
+export const LateAffordanceHideControl: Story = { play: async ({ canvasElement }) => {
+  await expect(proveReturnMotion(canvasElement, { fault: 'late-hide' })).rejects.toThrow(/hide the follow pill within/)
+} }
+export const LateAffordanceHideControlLight: Story = { ...LateAffordanceHideControl, args: { scheme: 'light' } }
+export const ReaderCancelsAffordanceMotion: Story = { play: async ({ canvasElement }) => { await proveReturnMotion(canvasElement, { cancel: true }) } }
+export const ReaderCancelsAffordanceMotionLight: Story = { ...ReaderCancelsAffordanceMotion, args: { scheme: 'light' } }
+export const MissingReaderCancelControl: Story = { play: async ({ canvasElement }) => {
+  await expect(proveReturnMotion(canvasElement, { cancel: true, fault: 'omit-input' })).rejects.toThrow(/reader input must cancel/)
+} }
+export const MissingReaderCancelControlLight: Story = { ...MissingReaderCancelControl, args: { scheme: 'light' } }
 
 export const AllStates: Story = { render: args => <VirtualStory {...args} /> }
 export const AllStatesLight: Story = { ...AllStates, args: { scheme: 'light' } }

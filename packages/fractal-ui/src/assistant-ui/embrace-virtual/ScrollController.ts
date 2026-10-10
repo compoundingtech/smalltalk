@@ -1,6 +1,7 @@
 import type { ListLayout } from 'react-aria-components'
 import { geometryNumbers } from '../composition-tokens.stylex'
 import { returnAffordanceFocus } from './AffordancePosition'
+import { FollowAnimation } from './FollowAnimation'
 
 /** The source transcript persists a mode or a stable entry, never a numeric bottom. */
 export type ScrollAnchor =
@@ -37,6 +38,7 @@ export class ScrollController {
   private firstKey: string | undefined
   private rows: readonly Row[] = []
   private rowKeys = new Set<string>()
+  private readonly followAnimation = new FollowAnimation(top => { this.writeTop(top) })
 
   constructor(
     private readonly options: {
@@ -95,7 +97,10 @@ export class ScrollController {
   }
 
   readonly jump = () => {
-    if (this.jumpButton !== null) returnAffordanceFocus(this.jumpButton, this.element)
+    if (this.jumpButton !== null) {
+      returnAffordanceFocus(this.jumpButton, this.element)
+      this.jumpButton.hidden = true
+    }
     this.userScrolling = false
     this.userInputAt = -Infinity
     this.anchor = undefined
@@ -104,7 +109,7 @@ export class ScrollController {
     this.pendingAnchor = undefined
     if (this.restoreFrame !== undefined) cancelAnimationFrame(this.restoreFrame)
     this.restoreFrame = undefined
-    if (this.element !== null) this.writeTop(this.element.scrollHeight)
+    if (this.element !== null) this.followAnimation.start(this.element)
     this.dock()
     this.options.save({ _tag: 'Following' })
   }
@@ -115,6 +120,12 @@ export class ScrollController {
     this.element = element
     const onUserInput = (event: Event) => {
       if (event instanceof KeyboardEvent && (navigationKeys[event.key] !== true || (event.target instanceof HTMLElement && event.target.closest('input,textarea,[contenteditable="true"]')))) return
+      if (this.followAnimation.cancel()) {
+        this.following = false
+        this.captureAnchor()
+        this.dock()
+        this.savePosition()
+      }
       this.userInputAt = performance.now()
       this.userScrolling = true
       this.programmaticTop = undefined
@@ -137,6 +148,7 @@ export class ScrollController {
         this.programmaticTop = undefined
         return
       }
+      if (this.followAnimation.active) return
       if (this.restoring || this.pendingAnchor !== undefined) return
       if (!this.userScrolling && performance.now() - this.userInputAt > USER_SCROLL_WINDOW_MS) {
         // RAC can move an attached lane without resizing it (for example, an ack
@@ -151,6 +163,7 @@ export class ScrollController {
       this.savePosition()
     }
     const onScrollEnd = () => {
+      if (this.followAnimation.active) return
       if (this.following && !this.userScrolling && !this.restoring && this.pendingAnchor === undefined) this.writeTop(element.scrollHeight)
       if (this.userScrolling || (!this.restoring && this.pendingAnchor === undefined && this.atEnd())) {
         this.following = this.atEnd()
@@ -170,8 +183,9 @@ export class ScrollController {
       if (this.restoreFrame !== undefined) cancelAnimationFrame(this.restoreFrame)
       this.restoreFrame = undefined
       if (this.pendingAnchor !== undefined || this.restoring) this.restore()
-      else if (this.following) this.writeTop(element.scrollHeight)
-      else this.compensateAnchor()
+      else if (this.following) {
+        if (!this.followAnimation.active) this.writeTop(element.scrollHeight)
+      } else this.compensateAnchor()
       this.dock()
     })
     observer.observe(element)
@@ -203,6 +217,7 @@ export class ScrollController {
     element.addEventListener('scroll', onScroll, { passive: true })
     element.addEventListener('scrollend', onScrollEnd, { passive: true })
     return () => {
+      this.followAnimation.cancel()
       observer.disconnect()
       mutations.disconnect()
       if (this.restoreFrame !== undefined) cancelAnimationFrame(this.restoreFrame)
@@ -308,7 +323,7 @@ export class ScrollController {
     }
     if (this.restoring && this.element !== null && rows.length > 0) this.restore()
     if (this.following) {
-      if (this.element !== null) this.writeTop(this.element.scrollHeight)
+      if (this.element !== null && !this.followAnimation.active) this.writeTop(this.element.scrollHeight)
       this.dock()
       return
     }

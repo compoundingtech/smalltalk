@@ -17,7 +17,7 @@ export const FollowAffordance = React.memo(function FollowAffordance({ buttonRef
     const disconnect = observeAffordancePosition(button)
     return () => { returnAffordanceFocus(button); disconnect?.(); buttonRef?.(null) }
   }, [buttonRef])
-  return <Button ref={attach} hidden={hidden} aria-label="Scroll to end" onPointerDown={event => event.preventDefault()} onPress={onPress} {...stylex.props(styles.button)}><span {...stylex.props(styles.content)}><Icon name="chevron-down" size={14} />Scroll to end</span></Button>
+  return <Button ref={attach} hidden={hidden} aria-label="Scroll to end" onPointerDown={event => event.preventDefault()} onPressStart={onPress} {...stylex.props(styles.button)}><span {...stylex.props(styles.content)}><Icon name="chevron-down" size={14} />Scroll to end</span></Button>
 })
 const styles = stylex.create({
   button: {
