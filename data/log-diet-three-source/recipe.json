@@ -82,7 +82,7 @@
       "--no-run",
       "--message-format=json"
     ],
-    "no_extra_compile": "No cargo-nextest list/build, no fallback or second Cargo invocation after a failed build; resolved feature metadata read-only cargo metadata --locked --offline after successful compile, charged to same budget.",
+    "no_extra_compile": "One unchanged integration build per arm. After successful compile, cargo metadata --no-deps --locked --offline describes workspace manifests only, charged to the same budget. No dependency-resolution graph or fallback/fetch is requested.",
     "actual_executable": "parse exactly one matching Cargo compiler-artifact packageid st3/target integration/test-profile executable; hash actual binary and record profile/features/tool/env; no source-name-as-binary inventory inference",
     "actual_inventory": [
       "{actual_binary}",
@@ -157,7 +157,19 @@
     "source_build_identity": "Record original source/tree and corrected overlay effective commit/tree/blob manifest, automation separate. Cargo manifests/toolchains differ across main and historical arms; record per-arm actual toolchain/libclosure/features, do not assert build parity.",
     "cache": "Normal existing Nix/cache configuration only, no new shared snapshot writer/restore or sccache bypass",
     "stores": "Fixture retains private memoryStore and TempDir as source; guardian-owned HOME/TMPDIR preserved on success/failure, no fixture behavior change",
-    "devshell": "Actual frozen devShells.default for each arm; actual devShells.genie for automation preflight. Prior proposed #ci did not exist and is superseded."
+    "devshell": "Actual frozen devShells.default for each arm; actual devShells.genie for automation preflight. Prior proposed #ci did not exist and is superseded.",
+    "manifest_metadata_argv": [
+      "cargo",
+      "metadata",
+      "--no-deps",
+      "--locked",
+      "--offline",
+      "--format-version",
+      "1",
+      "--features",
+      "st3/test-support"
+    ],
+    "metadata_evidence_scope": "Require exactly one workspace st3 package/manifest/integration target in actual arm source, resolve=null. Actual integration compiler-artifact emitted test-support is target feature evidence. Record dependency_resolution=NOT_REQUESTED; no synthetic node or full compiled graph/equality claim."
   },
   "terminal": {
     "source_outcome": "Each actual initial named PASS or FAIL only; build failure/zero selection/timeouts/cleanup incomplete/missing diagnostics are incomplete, never PASS",

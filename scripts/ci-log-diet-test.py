@@ -162,14 +162,15 @@ class Control(unittest.TestCase):
         code, report, commands, windows = self.caller(setup_time=601)
         self.assertEqual(code, 1); self.assertEqual(windows, [])
 
-    def arm_caller(self, case_raw, code=101, clean=True, delay=0):
+    def arm_caller(self, case_raw, code=101, clean=True, delay=0, metadata_fail=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); source = root / 'source'; source.mkdir()
             (source / 'scripts').mkdir()
             # Ordinary source bytes only. Never execute this pinned guardian or mock binary.
             guardian = Path(__file__).resolve().parents[1] / 'data/log-diet-three-source/guardian.py'
             (source / 'scripts/st3_test_process.py').write_bytes(guardian.read_bytes())
-            binary = source / 'mock-binary'; binary.write_text('synthetic data; never executable')
+            (source / 'target').mkdir()
+            binary = source / 'target/mock-binary'; binary.write_text('synthetic data; never executable')
             now = [10]; record = self.record(0); window = c.arm_window(record, IDENTITY, 10)
             for name, value in [('deadline',record),('window',window),('caller',IDENTITY),('plan',{'name':'mock','files':[]})]:
                 c.write_json(root/(name+'.json'), value)
@@ -181,13 +182,17 @@ class Control(unittest.TestCase):
                     value = 'synthetic tool receipt'
                     if label == 'build':
                         value = json.dumps({'reason':'compiler-artifact','package_id':'mock-st3',
-                            'target':{'name':'integration','kind':['test']},'profile':{'test':True},
+                            'target':{'name':'integration','kind':['test'],'src_path':str(source/'crates/st3/tests/integration.rs')},'profile':{'test':True},
                             'features':['test-support'],'executable':str(binary)})
                         now[0] += delay
-                    if label == 'features':
-                        value = json.dumps({'packages':[{'name':'st3','id':'mock-st3'}],
-                            'resolve':{'nodes':[{'id':'mock-st3','features':['test-support']}]},
-                            'target_directory':str(source)})
+                    if label == 'manifest-metadata':
+                        if metadata_fail: raise ValueError('synthetic metadata failure')
+                        value = json.dumps({'version':1, 'packages':[{'name':'st3','id':'mock-st3',
+                            'manifest_path':str(source/'crates/st3/Cargo.toml'),
+                            'features':{'test-support':[]}, 'targets':[{'name':'integration','kind':['test'],
+                            'test':True,'src_path':str(source/'crates/st3/tests/integration.rs')}]}],
+                            'workspace_members':['mock-st3'],'workspace_root':str(source),'resolve':None,
+                            'target_directory':str(source/'target')})
                     if label == 'inventory': value = c.CASE + ': test\n'
                     if label == 'inventory-ignored': value = ''
                     (self.root/(label+'.stdout')).write_text(value)
@@ -203,7 +208,9 @@ class Control(unittest.TestCase):
                     patch.object(a.c,'cleanup',return_value=clean), patch.object(a.signal,'signal'), \
                     patch.object(a.shutil,'which',return_value=str(binary)):
                 status = a.run_arm(args, FakeRunner, lambda:now[0])
-            return status, c.load(root/'arm-terminal.json')
+            report = c.load(root/'arm-terminal.json')
+            if (root/'binary.json').exists(): report['synthetic_binary_receipt'] = c.load(root/'binary.json')
+            return status, report
 
     def test_actual_arm_caller_interleaved_success_and_failure(self):
         for value, code, initial in [(raw(),0,'PASS'),(raw(False,diagnostic=witness(0)+witness(1)),101,'FAIL')]:
@@ -225,13 +232,82 @@ class Control(unittest.TestCase):
         self.assertEqual(status,1)
         self.assertNotIn('case',[row['label'] for row in report['commands']])
 
+    def artifact_inputs(self):
+        source = Path('/synthetic/arm-source')
+        target = {'name':'integration','kind':['test'],'test':True,
+                  'src_path':str(source/'crates/st3/tests/integration.rs')}
+        package = {'name':'st3','id':'st3-actual','manifest_path':str(source/'crates/st3/Cargo.toml'),
+                   'features':{'test-support':[]},'targets':[dict(target)]}
+        metadata = {'version':1,'packages':[package],'workspace_members':['st3-actual'],
+                    'workspace_root':str(source),'resolve':None,'target_directory':str(source/'target')}
+        row = {'reason':'compiler-artifact','package_id':'st3-actual','target':dict(target),
+               'profile':{'test':True},'features':['test-support'],'executable':str(source/'target/mock-binary')}
+        return source, metadata, row
+
     def test_exact_compiled_artifact_feature_inventory_refusals(self):
-        m = {'packages':[{'name':'st3','id':'st3-actual'}], 'resolve':{'nodes':[{'id':'st3-actual','features':['test-support']}]}}
-        row = {'reason':'compiler-artifact','package_id':'st3-actual', 'target':{'name':'integration','kind':['test']},
-               'profile':{'test':True},'features':['test-support'],'executable':'mock-binary'}
-        self.assertEqual(a.artifact(json.dumps(row), m)[0], row)
+        source, m, row = self.artifact_inputs()
+        self.assertEqual(a.artifact(json.dumps(row), m, source), (row, m['packages'][0]))
         for lines in ('', json.dumps(row)+'\n'+json.dumps(row), json.dumps(dict(row, features=[]))):
-            with self.assertRaises(ValueError): a.artifact(lines, m)
+            with self.assertRaises(ValueError): a.artifact(lines, m, source)
+
+    def test_manifest_only_null_resolution_no_synthetic_feature_node(self):
+        source, m, row = self.artifact_inputs()
+        for change in ({'resolve':{}}, {'resolve':{'nodes':[{'id':'st3-actual','features':['test-support']}]}},
+                       {'version':2}, {'workspace_root':'/other/source'}):
+            with self.assertRaises(ValueError): a.artifact(json.dumps(row), dict(m, **change), source)
+        del m['resolve']
+        with self.assertRaises(ValueError): a.artifact(json.dumps(row), m, source)
+
+    def test_manifest_package_member_identity_refusals(self):
+        source, m, row = self.artifact_inputs()
+        for change in ({'packages':[]},{'packages':m['packages']*2},{'workspace_members':[]},
+                       {'packages':[dict(m['packages'][0], manifest_path='/other/Cargo.toml')]},
+                       {'packages':[dict(m['packages'][0], id='different-package')]}):
+            with self.assertRaises(ValueError): a.artifact(json.dumps(row), dict(m, **change), source)
+
+    def test_manifest_integration_target_identity_refusals(self):
+        source, m, row = self.artifact_inputs(); target=m['packages'][0]['targets'][0]
+        for targets in ([],[target,target],[dict(target,kind=['bin'])],[dict(target,test=False)],
+                        [dict(target,src_path='/other/integration.rs')]):
+            bad=dict(m,packages=[dict(m['packages'][0],targets=targets)])
+            with self.assertRaises(ValueError): a.artifact(json.dumps(row), bad, source)
+
+    def test_compiler_target_identity_never_substitutes_manifest_feature(self):
+        source, m, row = self.artifact_inputs()
+        for change in ({'package_id':'wrong'},{'features':[]},{'profile':{'test':False}},
+                       {'target':dict(row['target'],kind=['bin'])},
+                       {'target':dict(row['target'],src_path='/other/integration.rs')}, {'executable':None}):
+            with self.assertRaises(ValueError): a.artifact(json.dumps(dict(row,**change)), m, source)
+
+    def test_binary_confined_to_actual_metadata_and_arm_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source=Path(tmp)/'source';target=source/'target';target.mkdir(parents=True)
+            binary=target/'mock';binary.write_text('synthetic data; never executable')
+            m={'target_directory':str(target)};row={'executable':str(binary)}
+            self.assertEqual(a.binary_path(row,m,source),binary)
+            other=Path(tmp)/'other';other.mkdir();outside=other/'mock';outside.write_text('data')
+            for executable, directory in ((outside,other),(binary,other)):
+                with self.assertRaises(ValueError): a.binary_path({'executable':str(executable)}, {'target_directory':str(directory)},source)
+            alias=target/'escape';alias.symlink_to(outside)
+            with self.assertRaises(ValueError): a.binary_path({'executable':str(alias)},m,source)
+
+    def test_actual_arm_manifest_caller_exact_argv_labels_and_metadata_stop(self):
+        status, report=self.arm_caller(raw(),0)
+        self.assertEqual(status,0)
+        metadata=[x for x in report['commands'] if x['label']=='manifest-metadata']
+        self.assertEqual(len(metadata),1)
+        self.assertEqual(metadata[0]['argv'][1:],['metadata','--no-deps','--locked','--offline','--format-version','1','--features','st3/test-support'])
+        receipt=report['synthetic_binary_receipt']
+        self.assertEqual(receipt['dependency_resolution'],'NOT_REQUESTED')
+        self.assertIsNone(receipt['metadata_resolve'])
+        self.assertEqual(receipt['compiled_target_features'],['test-support'])
+        self.assertNotIn('resolved_node',receipt)
+        status, report=self.arm_caller(raw(),0,metadata_fail=True)
+        self.assertEqual(status,1);self.assertEqual(report['initial'],'UNKNOWN')
+        self.assertEqual(report['commands'][-1]['label'],'manifest-metadata')
+        self.assertNotIn('inventory',[x['label'] for x in report['commands']])
+        self.assertNotIn('case',[x['label'] for x in report['commands']])
+        self.assertNotIn('synthetic_binary_receipt',report)
 
     def retention_caller(self, mode='complete', now=100):
         with tempfile.TemporaryDirectory() as tmp:

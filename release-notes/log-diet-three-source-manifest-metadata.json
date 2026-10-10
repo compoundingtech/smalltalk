@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Describe diagnostic workspace manifests without resolving unused dependency sources",
+  "replay": {
+    "status": "none",
+    "detail": "No replay implementation change; the original test oracles remain unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim rules or authority change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Qualification-only automation on the frozen main snapshot; ordinary Performance events retain their existing path."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No production runtime or deployment change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Source preparation does not authorize dispatch; a separately reviewed immutable execution assignment is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "After one unchanged integration build, metadata uses --no-deps/locked/offline; actual compiler-artifact supplies target feature evidence. Metadata failure or missing package/target/features/binary/inventory stops with no native case or automatic retry."
+  }
+}

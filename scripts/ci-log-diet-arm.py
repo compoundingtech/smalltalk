@@ -15,24 +15,43 @@ spec = importlib.util.spec_from_file_location('diet', Path(__file__).with_name('
 c = importlib.util.module_from_spec(spec); spec.loader.exec_module(c)
 
 
-def artifact(raw, metadata):
-    package = [p for p in metadata['packages'] if p['name'] == 'st3']
-    if len(package) != 1: raise ValueError('not one actual st3 package')
-    package = package[0]
-    nodes = [n for n in metadata['resolve']['nodes'] if n['id'] == package['id']]
-    if len(nodes) != 1 or 'test-support' not in nodes[0]['features']:
-        raise ValueError('missing actual test-support feature resolution')
+def artifact(raw, metadata, source):
+    source = Path(source).resolve()
+    manifest = source / 'crates/st3/Cargo.toml'
+    integration = source / 'crates/st3/tests/integration.rs'
+    if metadata.get('version') != 1 or 'resolve' not in metadata or metadata['resolve'] is not None:
+        raise ValueError('not manifest-only metadata with null resolve')
+    if Path(metadata['workspace_root']).resolve() != source:
+        raise ValueError('metadata workspace differs from actual arm source')
+    packages = [p for p in metadata['packages'] if p['name'] == 'st3']
+    if len(packages) != 1: raise ValueError('not one actual workspace st3 package')
+    package = packages[0]
+    if package['id'] not in metadata['workspace_members'] or Path(package['manifest_path']).resolve() != manifest:
+        raise ValueError('st3 package or manifest outside actual workspace')
+    targets = [t for t in package['targets'] if t['name'] == 'integration']
+    if (len(targets) != 1 or targets[0]['kind'] != ['test'] or targets[0].get('test') is not True
+            or Path(targets[0]['src_path']).resolve() != integration):
+        raise ValueError('not one manifest integration test target in actual source')
     rows = []
     for line in raw.splitlines():
         obj = json.loads(line)
         if (obj.get('reason') == 'compiler-artifact' and obj.get('package_id') == package['id']
-                and obj.get('target', {}).get('name') == 'integration'
-                and obj.get('target', {}).get('kind') == ['test']
-                and obj.get('profile', {}).get('test') is True and obj.get('executable')):
+                and obj.get('target', {}).get('name') == 'integration'):
             rows.append(obj)
-    if len(rows) != 1 or 'test-support' not in rows[0].get('features', []):
-        raise ValueError('not one compiled integration test artifact with requested features')
-    return rows[0], nodes[0], package
+    if (len(rows) != 1 or rows[0]['target'].get('kind') != ['test']
+            or Path(rows[0]['target']['src_path']).resolve() != integration
+            or rows[0].get('profile', {}).get('test') is not True or not rows[0].get('executable')
+            or 'test-support' not in rows[0].get('features', [])):
+        raise ValueError('not one compiled integration test artifact with emitted test-support')
+    return rows[0], package
+
+
+def binary_path(row, metadata, source):
+    binary = Path(row['executable']).resolve(strict=True)
+    target = Path(metadata['target_directory']).resolve(strict=True)
+    if not binary.is_relative_to(target) or not binary.is_relative_to(Path(source).resolve() / 'target'):
+        raise ValueError('binary outside actual metadata and arm source target trees')
+    return binary
 
 
 def run_arm(args, runner_factory=c.Runner, clock=time.monotonic):
@@ -65,16 +84,16 @@ def run_arm(args, runner_factory=c.Runner, clock=time.monotonic):
         runner.checked('build', [paths['cargo'], 'test', '-p', 'st3', '--features', 'test-support',
                        '--test', 'integration', '--locked', '--no-run', '--message-format=json'],
                        source, window['active'], window['end'])
-        runner.checked('features', [paths['cargo'], 'metadata', '--locked', '--offline', '--format-version', '1',
+        runner.checked('manifest-metadata', [paths['cargo'], 'metadata', '--no-deps', '--locked', '--offline', '--format-version', '1',
                        '--features', 'st3/test-support'], source, window['active'], window['end'])
-        metadata = c.load(root / 'features.stdout')
-        row, node, package = artifact(c.text(root / 'build.stdout'), metadata)
-        binary = Path(row['executable']).resolve(strict=True)
-        if not binary.is_relative_to(Path(metadata['target_directory']).resolve()):
-            raise ValueError('binary outside actual arm source target tree')
-        c.write_json(root / 'binary.json', {'compiler_artifact': row, 'resolved_package': package,
-                                           'metadata_scope': 'Actual cargo metadata --locked --offline --format-version 1 --features st3/test-support invocation resolution; not complete compiled-graph equality',
-                                           'resolved_node': node, 'path': str(binary), 'sha256': c.sha(binary)})
+        metadata = c.load(root / 'manifest-metadata.stdout')
+        row, package = artifact(c.text(root / 'build.stdout'), metadata, source)
+        binary = binary_path(row, metadata, source)
+        c.write_json(root / 'binary.json', {'compiler_artifact': row, 'manifest_package': package,
+                                           'metadata_scope': 'Actual cargo metadata --no-deps --locked --offline --format-version 1 --features st3/test-support: workspace manifest description only',
+                                           'dependency_resolution': 'NOT_REQUESTED', 'metadata_resolve': None,
+                                           'compiled_target_features': row['features'],
+                                           'path': str(binary), 'sha256': c.sha(binary)})
         runner.checked('inventory', [str(binary), '--exact', c.CASE, '--list', '--format', 'terse'],
                        source, window['active'], window['end'])
         runner.checked('inventory-ignored', [str(binary), '--exact', c.CASE, '--list', '--ignored', '--format', 'terse'],

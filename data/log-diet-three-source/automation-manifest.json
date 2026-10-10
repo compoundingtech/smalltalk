@@ -21,8 +21,8 @@
     },
     {
       "path": "scripts/ci-log-diet-arm.py",
-      "bytes": 8619,
-      "sha256": "ac0b612eb01cf5bb3af37c54460264f42e4e550e5321429c2db9b35d9e2e3fa4"
+      "bytes": 9870,
+      "sha256": "b83c9dcd49e1f9368863d786b91c438ccf44bdfbd6f6c1587861b4460b180382"
     },
     {
       "path": "scripts/ci-log-diet-common.py",
@@ -36,8 +36,8 @@
     },
     {
       "path": "scripts/ci-log-diet-test.py",
-      "bytes": 27817,
-      "sha256": "722736d4360bd14e9c6e6557d269bcfe99dab40e46c74bb4cdffd599ea68230c"
+      "bytes": 33186,
+      "sha256": "a130a3e0219de056cf7b36bb8bcdb4ee1f338fc5722955489218f5c0d3021026"
     },
     {
       "path": "data/log-diet-three-source/actionlint.yaml",
@@ -61,8 +61,8 @@
     },
     {
       "path": "data/log-diet-three-source/recipe.json",
-      "bytes": 11906,
-      "sha256": "8c8e65fa75412faabb13b9d8836fe8564ee735122bbda9d1f27ea021798186a8"
+      "bytes": 12471,
+      "sha256": "befbb705facf63daee6e23bc63152643680bc3ccdf3bdfab37d01e34002dfa22"
     },
     {
       "path": "data/log-diet-three-source/source.bundle",
@@ -83,6 +83,11 @@
       "path": "release-notes/log-diet-three-source-deadline-guards.json",
       "bytes": 1081,
       "sha256": "8b41fecfa3e95dbb78f87be8a29417ca1a22a409be2aafa671120dfbb2cea11a"
+    },
+    {
+      "path": "release-notes/log-diet-three-source-manifest-metadata.json",
+      "bytes": 1194,
+      "sha256": "ce258951a82f448ddf604813cb07996fd5a1a3c28f53a939765a15d18999dab0"
     }
   ],
   "manifest_self_hash_excluded": true,
@@ -104,5 +109,7 @@
   "deadline_correction_review_request": "message/cc84016babefca14",
   "setup_actions": "Actual checkout and Install Nix each require immutable first-step admission; minute timeout floors remaining setup minus60s dispatch/return margin; insufficient/future/reset/cross-identity refuse. Subsequent controller refuses phase overrun.",
   "retention": "Owned hashing child, fixed upload_end; active=min(now+300,upload_end-120), cleanup<=upload_end-90; partial JSONL and explicit INCOMPLETE retained on interruption. No reset/retry.",
-  "metadata_scope": "Actual cargo metadata invocation resolution and separate compiler-artifact features; no complete compiled dependency-graph equality claim."
+  "metadata_scope": "Actual cargo metadata --no-deps --locked --offline invocation describes workspace manifests only; resolve=null and dependency_resolution=NOT_REQUESTED. Selected compiler-artifact emitted test-support supplies compiled target feature evidence. No synthetic resolve node or full graph equality.",
+  "metadata_plan_review": "doc/fleet/smalltalk/speed/2026-10-10/log-diet-metadata-plan-review@8120e9e77df89e4259b0d176fdfa976c3dc19193c666c8f2ecc915464910ed3a",
+  "consumed_prior_assignment": "e0fc one-shot consumed: main compile0 then offline dependency-resolution metadata101; all3 native cases UNRUN. New source preparation gives no execution assignment."
 }
