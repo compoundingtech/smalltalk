@@ -194,9 +194,14 @@ const PUBLISHED_PERIOD_MS: u128 = 30_000;
 /// compute a summary themselves; each selection costs one computation per change, however many
 /// windows show it. A selection whose inputs (cut, attention, roster, clock period) are unchanged
 /// is not computed again. A selection that fails is not published, and its windows read for
-/// themselves; the others are unaffected. Returns whether any selection's counts changed.
-pub(in crate::api) fn refresh_published(state: &AppState, idle_ms: u64) -> anyhow::Result<bool> {
-    let (generation, selections) = state.store.summary_selections(idle_ms);
+/// themselves; the others are unaffected. With `waiting_only`, only the selections a window is
+/// waiting for. Returns whether any selection's counts changed.
+pub(in crate::api) fn refresh_published(
+    state: &AppState,
+    idle_ms: u64,
+    waiting_only: bool,
+) -> anyhow::Result<bool> {
+    let (generation, selections) = state.store.summary_selections(idle_ms, waiting_only);
     let attention = state.store.attention_list_revision();
     let roster = *state.store.subscribe_agent_roster().borrow();
     let mut changed = false;

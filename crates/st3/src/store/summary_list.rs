@@ -97,14 +97,22 @@ impl Store {
     }
 
     /// The selections windows read within `within_ms`, forgetting older ones, each with the
-    /// inputs its row was computed from, and the generation to publish under.
-    pub(crate) fn summary_selections(&self, within_ms: u64) -> (u64, Vec<SummarySelection>) {
+    /// inputs its row was computed from, and the generation to publish under. With
+    /// `waiting_only`, only the selections a window waits for (see `summary_selection_waiting`).
+    pub(crate) fn summary_selections(
+        &self,
+        within_ms: u64,
+        waiting_only: bool,
+    ) -> (u64, Vec<SummarySelection>) {
         let list = &self.smalltalk.summary_list;
         let now = now_ms() as u64;
         let mut selections = list.selections.lock().unwrap_or_else(PoisonError::into_inner);
         selections.retain(|_, selection| now.saturating_sub(selection.read_at) <= within_ms);
         let mut keys = selections
             .iter()
+            .filter(|(_, selection)| {
+                !waiting_only || selection.row.is_none() && !selection.failed
+            })
             .map(|(key, selection)| {
                 (key.clone(), selection.row.as_ref().map(|row| row.inputs.clone()))
             })
