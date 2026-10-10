@@ -144,6 +144,9 @@ export const motionVars = stylex.defineVars({
   ease: 'ease', linear: 'linear',
 })
 
+/** Numeric twin for imperative motion that shares the standard duration. */
+export const motionNumbers = { standard: 200 } as const
+
 export const elevationVars = stylex.defineVars({
   popover: '0 18px 44px -18px rgb(0 0 0 / 80%)',
   dialog: '0 24px 64px -24px rgb(0 0 0 / 65%)',

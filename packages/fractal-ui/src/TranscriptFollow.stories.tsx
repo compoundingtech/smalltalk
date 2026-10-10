@@ -5,6 +5,7 @@ import type { Meta, StoryObj } from '@storybook/react-vite'
 import { expect, userEvent, waitFor, within } from 'storybook/test'
 import { Button } from 'react-aria-components'
 import { EmbraceScrollViewport, type EmbraceScrollViewportHandle } from './assistant-ui/EmbraceScrollViewport'
+import { proveAffordanceMotion } from './follow-affordance-play'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
 import { surfaceVars as surface, textVars as ink, borderVars as border, spaceVars as s, typeVars as t, geometryVars as g } from './assistant-ui/composition-tokens.stylex'
@@ -313,7 +314,7 @@ export const PillReattaches: Story = { play: async ({ canvasElement }) => {
   await expect(Math.abs(placed.left + placed.width / 2 - (box.left + box.width / 2)), 'pill must be centred on the lane').toBeLessThanOrEqual(1)
   await userEvent.click(pill)
   await settle()
-  await expectAttached(canvasElement, lane)
+  await waitFor(() => expectAttached(canvasElement, lane))
 } }
 export const PillReattachesLight: Story = { ...PillReattaches, args: { scheme: 'light' } }
 /** Visibility has its own 40px band; it must not borrow the 1px end/rounding tolerance. */
@@ -381,7 +382,8 @@ async function proveKeyboardPill(canvasElement: HTMLElement, activate = true) {
   await expect(document.activeElement).toBe(pill)
   if (activate) await userEvent.keyboard('{Enter}')
   await settle()
-  await expectAttached(canvasElement, lane)
+  if (activate) await waitFor(() => expectAttached(canvasElement, lane))
+  else await expectAttached(canvasElement, lane)
   await expect(document.activeElement).toBe(draft)
 }
 export const KeyboardPillReattaches: Story = { play: async ({ canvasElement }) => { await proveKeyboardPill(canvasElement) } }
@@ -446,6 +448,29 @@ export const FocusPreventScrollControl: Story = { play: async ({ canvasElement }
   await expect(proveNativeFocusNavigation(canvasElement, true)).rejects.toThrow(/native focus navigation must detach/)
 } }
 export const FocusPreventScrollControlLight: Story = { ...FocusPreventScrollControl, args: { scheme: 'light' } }
+
+/** Pointer intent hides the pill immediately; eased motion tracks streaming and yields to reader input. */
+async function proveReturnMotion(canvasElement: HTMLElement, options: { cancel?: boolean; fault?: 'instant' | 'late-hide' | 'omit-input' } = {}) {
+  const { canvas, lane } = await ready(canvasElement)
+  await readerScrollsUp(lane, 400)
+  await proveAffordanceMotion({ lane, pill: canvas.getByRole('button', { name: pillName }) as HTMLButtonElement, stream: () => drive().stream(), ...options })
+}
+export const AffordanceClickMotion: Story = { play: async ({ canvasElement }) => { await proveReturnMotion(canvasElement) } }
+export const AffordanceClickMotionLight: Story = { ...AffordanceClickMotion, args: { scheme: 'light' } }
+export const InstantAffordanceMotionControl: Story = { play: async ({ canvasElement }) => {
+  await expect(proveReturnMotion(canvasElement, { fault: 'instant' })).rejects.toThrow(/at least three intermediate/)
+} }
+export const InstantAffordanceMotionControlLight: Story = { ...InstantAffordanceMotionControl, args: { scheme: 'light' } }
+export const LateAffordanceHideControl: Story = { play: async ({ canvasElement }) => {
+  await expect(proveReturnMotion(canvasElement, { fault: 'late-hide' })).rejects.toThrow(/hide the follow pill within/)
+} }
+export const LateAffordanceHideControlLight: Story = { ...LateAffordanceHideControl, args: { scheme: 'light' } }
+export const ReaderCancelsAffordanceMotion: Story = { play: async ({ canvasElement }) => { await proveReturnMotion(canvasElement, { cancel: true }) } }
+export const ReaderCancelsAffordanceMotionLight: Story = { ...ReaderCancelsAffordanceMotion, args: { scheme: 'light' } }
+export const MissingReaderCancelControl: Story = { play: async ({ canvasElement }) => {
+  await expect(proveReturnMotion(canvasElement, { cancel: true, fault: 'omit-input' })).rejects.toThrow(/reader input must cancel/)
+} }
+export const MissingReaderCancelControlLight: Story = { ...MissingReaderCancelControl, args: { scheme: 'light' } }
 
 export const AllStates: Story = { render: args => <FollowStory {...args} /> }
 

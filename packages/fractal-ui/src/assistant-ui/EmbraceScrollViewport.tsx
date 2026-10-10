@@ -3,6 +3,7 @@ import * as stylex from '@stylexjs/stylex'
 import { geometryNumbers } from './composition-tokens.stylex'
 import { returnAffordanceFocus } from './embrace-virtual/AffordancePosition'
 import { FollowAffordance } from './embrace-virtual/FollowAffordance'
+import { FollowAnimation } from './embrace-virtual/FollowAnimation'
 
 const rowSelector = '[data-item-id], [data-embrace-entry-id]'
 const navigationKeys: Readonly<Record<string, true>> = { PageUp: true, PageDown: true, Home: true, End: true, ArrowUp: true, ArrowDown: true, ' ': true }
@@ -60,6 +61,7 @@ class ViewportController {
   private readonly readerPointers = new Set<number>()
   private pressedAnchor: { pointerId: number; element: HTMLElement; scrollOwner: HTMLElement; top: number } | undefined
   private warnedScrollOwner = false
+  private readonly followAnimation = new FollowAnimation(top => { this.writeTop(top) })
 
   constructor(saved?: ViewportState) {
     if (saved !== undefined && !saved.following) {
@@ -86,6 +88,7 @@ class ViewportController {
 
   /** Swaps a reused viewport to another conversation without carrying its unread mark across. */
   readonly resume = (saved?: ViewportState) => {
+    this.followAnimation.cancel()
     this.readerInputAt = -Infinity
     this.readerGesture = false
     this.unread = saved !== undefined && !saved.following && saved.unread
@@ -163,8 +166,9 @@ class ViewportController {
     if (element === null) return
     // The pressed row takes precedence over the reader's history anchor.
     if (this.preservePress()) return
-    if (this.following) this.writeTop(element.scrollHeight)
-    else if (this.pendingTop !== undefined) {
+    if (this.following) {
+      if (!this.followAnimation.active) this.writeTop(element.scrollHeight)
+    } else if (this.pendingTop !== undefined) {
       this.writeTop(this.pendingTop)
       if (Math.abs(element.scrollTop - Math.max(0, Math.min(this.pendingTop, element.scrollHeight - element.clientHeight))) < geometryNumbers.scrollEndTolerance) {
         this.pendingTop = undefined
@@ -185,7 +189,10 @@ class ViewportController {
   }
 
   readonly jump = () => {
-    if (this.jumpButton !== null) returnAffordanceFocus(this.jumpButton, this.element)
+    if (this.jumpButton !== null) {
+      returnAffordanceFocus(this.jumpButton, this.element)
+      this.jumpButton.hidden = true
+    }
     this.readerInputAt = -Infinity
     this.readerGesture = false
     this.following = true
@@ -193,10 +200,11 @@ class ViewportController {
     this.anchor = undefined
     this.pendingTop = undefined
     this.dock()
-    this.schedule()
+    if (this.element !== null) this.followAnimation.start(this.element)
   }
 
   readonly scrollTo = (top: number) => {
+    this.followAnimation.cancel()
     if (!this.writeTop(top)) return
     this.following = false
     this.readerInputAt = -Infinity
@@ -223,8 +231,9 @@ class ViewportController {
     const element = this.element
     if (element === null) return
     if (!this.preservePress()) {
-      if (this.following) this.writeTop(element.scrollHeight)
-      else if (this.anchor?.element.isConnected) {
+      if (this.following) {
+        if (!this.followAnimation.active) this.writeTop(element.scrollHeight)
+      } else if (this.anchor?.element.isConnected) {
         this.writeTop(element.scrollTop + this.anchor.element.getBoundingClientRect().top - element.getBoundingClientRect().top - this.anchor.offset)
       }
     }
@@ -237,6 +246,12 @@ class ViewportController {
     this.observedTop = element.scrollTop
     const manual = (event: Event) => {
       if (event instanceof KeyboardEvent && (navigationKeys[event.key] !== true || (event.target instanceof HTMLElement && event.target.closest('input,textarea,[contenteditable="true"]')))) return
+      if (this.followAnimation.cancel()) {
+        this.following = false
+        this.lastTop = element.scrollTop
+        this.dock()
+        this.scheduleCapture()
+      }
       if (event.type === 'wheel' || event.type === 'touchmove' || event.type === 'keydown') {
         this.readerInputAt = performance.now()
         this.readerGesture = true
@@ -251,6 +266,7 @@ class ViewportController {
       const previousTop = this.observedTop
       queueMicrotask(() => {
         if (this.element !== element || Math.abs(element.scrollTop - previousTop) < geometryNumbers.scrollEndTolerance || element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.scrollEndTolerance) return
+        this.followAnimation.cancel()
         this.following = false
         this.pendingTop = undefined
         this.programmaticTop = undefined
@@ -276,6 +292,7 @@ class ViewportController {
         this.programmaticTop = undefined
         return
       }
+      if (this.followAnimation.active) return
       if (Math.abs(element.scrollTop - this.lastTop) < geometryNumbers.scrollEndTolerance) return
       if (this.pendingTop !== undefined) {
         this.writeTop(this.pendingTop)
@@ -366,6 +383,7 @@ class ViewportController {
     this.schedule()
     return () => {
       observer.disconnect()
+      this.followAnimation.cancel()
       if (this.frame !== undefined) cancelAnimationFrame(this.frame)
       this.frame = undefined
       if (this.captureFrame !== undefined) cancelAnimationFrame(this.captureFrame)
