@@ -307,7 +307,7 @@ fn preceding_operations(
             SELECT MAX(id) FROM timeline WHERE incarnation=?1
             AND source IN (SELECT value FROM json_each(?2)) GROUP BY source)",
     )?;
-    let operations = query
+    query
         .query_map(
             params![batch.provider_incarnation, serde_json::to_string(&sources)?],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
@@ -316,8 +316,7 @@ fn preceding_operations(
             let (source, body) = row?;
             Ok((source, serde_json::from_str(&body)?))
         })
-        .collect();
-    operations
+        .collect()
 }
 
 fn payload_changed(previous: Option<&Operation>, current: &Operation) -> bool {
@@ -341,8 +340,15 @@ mod tests {
     fn prepare(root: &Path, driver: &'static str) -> (Writer, Record, Operation, u64) {
         super::super::enable(root, "runtime-a").unwrap();
         let seq = claim(root, "agent/example", driver, "provider-a").unwrap();
-        let mut writer =
-            Writer::new(root, "agent/example", driver, None).with_ownership("provider-a", seq);
+        // Required by the live-observation writer. This label is an authored
+        // private fixture input, not a checked physical PTY/process witness.
+        let mut writer = Writer::new(
+            root,
+            "agent/example",
+            driver,
+            Some("private-control-pty".into()),
+        )
+        .with_ownership("provider-a", seq);
         writer
             .observe(Observation::new(
                 Activity::Active,
@@ -758,8 +764,13 @@ mod tests {
         .unwrap();
         assert_eq!(image().output.last_output.unwrap().at_unix_ms, 10);
         let successor = claim(root.path(), "agent/example", "claude", "provider-a").unwrap();
-        let mut writer = Writer::new(root.path(), "agent/example", "claude", None)
-            .with_ownership("provider-a", successor);
+        let mut writer = Writer::new(
+            root.path(),
+            "agent/example",
+            "claude",
+            Some("private-control-pty".into()),
+        )
+        .with_ownership("provider-a", successor);
         writer
             .observe(Observation::new(
                 Activity::Active,
