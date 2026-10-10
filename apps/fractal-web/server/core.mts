@@ -100,6 +100,8 @@ const makeBoundary = (options: MiddlewareOptions, assets?: { root: string; ident
       await run(dispatch, res)
     }
     const upgrade = (req: IncomingMessage, socket: Duplex, head: Buffer): void => {
+      // As dev middleware the host server (Vite HMR) owns every other upgrade; answering it here would close that socket.
+      if (assets === undefined && !clientRoute(req.url ?? '')) return
       // Node relinquishes HTTP error handling as soon as it emits upgrade.
       // Cover pending admission and rejected shutdown, not only admitted tunnels.
       const onError = () => socket.destroy()
