@@ -3210,6 +3210,11 @@ impl Store {
         if let Some(hook) = hook { hook(index); }
     }
 
+    #[cfg(test)]
+    pub(crate) fn invalidate_incremental_roster_for_test(&self) {
+        self.smalltalk.forget_incremental_views();
+    }
+
     /// Never waits; multi-gate readers release unrelated guards before queuing on a miss.
     pub(crate) fn try_admit_agent_resources(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         self.smalltalk.agent_resources_admission.clone().try_lock_owned().ok()
@@ -3470,11 +3475,15 @@ impl Store {
     ) -> Option<(u64, Arc<Vec<Value>>, u128)> {
         self.smalltalk.agent_roster_refresh.get()?;
         self.warn_if_agent_roster_overdue();
-        self.smalltalk.agent_resources_cache.lock()
+        let current = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
-            .max_by_key(|entry| (entry.index, entry.local))
-            .map(|entry| (entry.index, Arc::clone(&entry.items), entry.published_at_unix_ms))
+            .max_by_key(|entry| (entry.index, entry.local, entry.published_at_unix_ms))
+            .map(runtime::PublishedRoster::from);
+        let previous = self.smalltalk.roster_fallback.lock().expect("roster fallback poisoned")
+            .complete[usize::from(history)].as_ref().filter(|entry| entry.index <= index).cloned();
+        current.into_iter().chain(previous).max_by_key(runtime::PublishedRoster::position)
+            .map(|entry| (entry.index, entry.items, entry.at))
     }
 
     /// Bounded cache metadata for the opted-in private load recorder; no SQL or card copies.
@@ -3502,6 +3511,15 @@ impl Store {
             return true;
         }
         drop(cache);
+        let fallback = self.smalltalk.roster_fallback.lock().expect("roster fallback poisoned");
+        if fallback.complete[usize::from(history)].as_ref().is_some_and(|entry| entry.index > index) {
+            return true;
+        }
+        if !history && head_count.is_some_and(|count| count <= crate::api::CLIENT_MAX_PAGE_ITEMS + 1)
+            && fallback.head.as_ref().is_some_and(|(entry, _)| entry.index > index) {
+            return true;
+        }
+        drop(fallback);
         let Some(count) = head_count else { return false; };
         let refs = self.smalltalk.agent_page_refs_cache.lock()
             .expect("agent page refs cache poisoned").iter()
@@ -3516,6 +3534,23 @@ impl Store {
                     reference["id"].as_str().is_some_and(|id| covered.contains(id)))))
     }
 
+    /// Fresh reads require a live fold-cache publication; an old immutable fallback is
+    /// deliberately excluded even when its admitted index equals the current graph clock.
+    pub(crate) fn agent_roster_publication_is_current(
+        &self, cut: u64, history: bool, head_count: Option<usize>,
+    ) -> bool {
+        let cards = self.smalltalk.agent_resources_cache.lock().expect("agent resources cache poisoned");
+        if cards.iter().any(|entry| entry.index == cut && entry.history == history && entry.covered.is_none()) {
+            return true;
+        }
+        let Some(count) = head_count.filter(|_| !history) else { return false; };
+        let refs = self.smalltalk.agent_page_refs_cache.lock().expect("agent page refs cache poisoned");
+        refs.iter().filter(|entry| !entry.history && entry.index == cut).any(|reference|
+            cards.iter().filter(|entry| !entry.history && entry.index == cut).any(|entry|
+                entry.covered.as_ref().is_none_or(|covered| reference.items.iter().take(count)
+                    .all(|row| row["id"].as_str().is_some_and(|id| covered.contains(id))))))
+    }
+
     /// The complete roster published at exactly `cut`, for a page continuing from a first page
     /// served at that cut, with when it was published.
     pub(crate) fn published_agent_roster_at(
@@ -3524,11 +3559,15 @@ impl Store {
         history: bool,
     ) -> Option<(Arc<Vec<Value>>, u128)> {
         self.smalltalk.agent_roster_refresh.get()?;
-        self.smalltalk.agent_resources_cache.lock()
+        let current = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index == cut)
-            .max_by_key(|entry| entry.local)
-            .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms))
+            .max_by_key(|entry| (entry.local, entry.published_at_unix_ms))
+            .map(runtime::PublishedRoster::from);
+        let previous = self.smalltalk.roster_fallback.lock().expect("roster fallback poisoned")
+            .complete[usize::from(history)].as_ref().filter(|entry| entry.index == cut).cloned();
+        current.into_iter().chain(previous).max_by_key(runtime::PublishedRoster::position)
+            .map(|entry| (entry.items, entry.at))
     }
 
     /// When no complete roster is published yet: the newest current refs at or before `index`
@@ -3536,30 +3575,32 @@ impl Store {
     /// `count` agents, all at that one cut. The refresher publishes this head first as the
     /// daemon starts, so a window or first page need not wait for every card to fold.
     pub(crate) fn published_agent_roster_head(
-        &self,
-        index: u64,
-        count: usize,
+        &self, index: u64, count: usize,
     ) -> Option<PublishedRosterHead> {
         self.smalltalk.agent_roster_refresh.get()?;
         self.warn_if_agent_roster_overdue();
-        let (cut, refs) = self.smalltalk.agent_page_refs_cache.lock()
-            .expect("agent page refs cache poisoned").iter()
-            .filter(|entry| !entry.history && entry.index <= index)
-            .max_by_key(|entry| entry.index)
-            .map(|entry| (entry.index, Arc::clone(&entry.items)))?;
-        let cache = self.smalltalk.agent_resources_cache.lock()
-            .expect("agent resources cache poisoned");
-        let head = cache.iter().filter(|entry| entry.index == cut && !entry.history)
-            .find_map(|entry| {
-                let cards = entry.items.iter()
-                    .filter_map(|card| Some((card["id"].as_str()?, card)))
-                    .collect::<HashMap<_, _>>();
-                refs.iter().take(count)
-                    .map(|reference| cards.get(reference["id"].as_str()?).map(|card| (*card).clone()))
-                    .collect::<Option<Vec<_>>>()
-                    .map(|head| (head, entry.published_at_unix_ms))
-            })?;
-        Some((cut, refs, head.0, head.1))
+        let assemble = |entry: &runtime::PublishedRoster, refs: &Arc<Vec<Value>>| {
+            let cards = entry.items.iter().filter_map(|card| Some((card["id"].as_str()?, card)))
+                .collect::<HashMap<_, _>>();
+            let head = refs.iter().take(count)
+                .map(|reference| cards.get(reference["id"].as_str()?).map(|card| (*card).clone()))
+                .collect::<Option<Vec<_>>>()?;
+            Some((entry.index, Arc::clone(refs), head, entry.at))
+        };
+        let reference = self.smalltalk.agent_page_refs_cache.lock().expect("agent page refs cache poisoned")
+            .iter().filter(|entry| !entry.history && entry.index <= index).max_by_key(|entry| entry.index)
+            .map(|entry| (entry.index, Arc::clone(&entry.items)));
+        let current = reference.and_then(|(cut, refs)| {
+            self.smalltalk.agent_resources_cache.lock().expect("agent resources cache poisoned")
+                .iter().filter(|entry| !entry.history && entry.index == cut)
+                .filter_map(|entry| assemble(&runtime::PublishedRoster::from(entry), &refs)
+                    .map(|head| ((entry.local, entry.published_at_unix_ms), head)))
+                .max_by_key(|(position, _)| *position).map(|(_, head)| head)
+        });
+        let previous = self.smalltalk.roster_fallback.lock().expect("roster fallback poisoned")
+            .head.as_ref().filter(|(entry, _)| entry.index <= index).cloned();
+        current.into_iter().chain(previous.and_then(|(entry, refs)| assemble(&entry, &refs)))
+            .max_by_key(|(cut, _, _, at)| (*cut, *at))
     }
 
     /// Follows the revision of complete current roster publications: it rises with every one,
@@ -3596,6 +3637,7 @@ impl Store {
         history: bool,
         build: impl FnOnce() -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        let epoch = self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire);
         let now = now_ms();
         let valid = |entry: &&runtime::AgentResourcesEntry| {
             entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
@@ -3618,6 +3660,9 @@ impl Store {
         };
         let mut cache = self.smalltalk.agent_page_refs_cache.lock()
             .expect("agent page refs cache poisoned");
+        if self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch {
+            return Ok((*items).clone());
+        }
         cache.push_back(runtime::AgentResourcesEntry {
             index, local: 0, history, covered: None, valid_until_unix_ms, items: Arc::clone(&items),
             published_at_unix_ms: now,
@@ -3661,6 +3706,7 @@ impl Store {
         chunk: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        let epoch = self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire);
         // Cold presentation reads current desired/queue tables even for historical status
         // cuts. Do not reuse rows from an older physical projection for those requests.
         if index < current_index(&self.readers.get())? {
@@ -3846,6 +3892,9 @@ impl Store {
         })?;
         let mut cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
+        if self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch {
+            return Ok(select(&entry.items));
+        }
         // All endpoint callers hold admission. Direct internal readers may still race; never
         // replace a complete published projection with a partial one.
         let published = cache.iter().filter(valid).find(|entry| {
@@ -3868,6 +3917,11 @@ impl Store {
             }
             items
         };
+        {
+            let refs = self.smalltalk.agent_page_refs_cache.lock().expect("agent page refs cache poisoned");
+            self.smalltalk.roster_fallback.lock().expect("roster fallback poisoned")
+                .discard_superseded(&cache, &refs);
+        }
         drop(cache);
         if complete {
             self.smalltalk.agent_roster_published.send_modify(|revision| *revision += 1);
@@ -34263,6 +34317,65 @@ mod tests {
         other.join().unwrap();
         assert_eq!(completed.unwrap().unwrap()[0]["id"], "agent/cached");
         assert_eq!(resumed, published.unwrap());
+    }
+
+    #[test]
+    fn incremental_projection_preserves_a_publication_without_preserving_fold_caches() {
+        let (controller, worker, _) = replicated_step_pair();
+        worker.start_agent_roster_refresher().unwrap();
+        crate::api::refresh_agent_roster(&worker, false).unwrap();
+        let (cut, rows, at) = worker.published_agent_roster(worker.index().unwrap(), false).unwrap();
+        for n in 0..300 {
+            controller.append_claim(&ClaimInput { subject: format!("custom/roster-prefix/{n}"),
+                kind: "custom.test.marker".into(), actor: None, fields: BTreeMap::new(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None }).unwrap();
+        }
+        let exchange = exchange_from(&controller, &worker.replication_inventory().unwrap());
+        worker.receive_replication_exchange("controller", TEST_FLEET, &exchange).unwrap();
+        worker.validate_replication_backlog().unwrap();
+        let mut yields = 0;
+        worker.project_replication_backlog_with_yield(|| {
+            yields += 1;
+            let (old_cut, old_rows, old_at) = worker.published_agent_roster(worker.index().unwrap(), false)
+                .expect("a committed incremental prefix must not empty the publication");
+            assert_eq!((old_cut, old_at), (cut, at));
+            assert!(Arc::ptr_eq(&old_rows, &rows));
+            assert!(worker.smalltalk.agent_resources_cache.lock().unwrap().is_empty());
+            assert!(worker.smalltalk.agent_page_refs_cache.lock().unwrap().is_empty());
+        }).unwrap();
+        assert!(yields >= 2, "exercise multiple committed projection chunks");
+        assert!(worker.published_agent_roster_at(cut, false).is_some());
+        crate::api::refresh_agent_roster(&worker, false).unwrap();
+        assert_eq!(worker.published_agent_roster(worker.index().unwrap(), false).unwrap().0,
+            worker.index().unwrap());
+        assert!(worker.smalltalk.roster_fallback.lock().unwrap().complete[0].is_none(),
+            "a new coherent publication releases its fallback");
+        worker.smalltalk.forget_views();
+        assert!(worker.published_agent_roster(worker.index().unwrap(), false).is_none());
+        assert!(worker.published_agent_roster_at(cut, false).is_none());
+    }
+
+    #[test]
+    fn an_inflight_roster_fold_cannot_republish_after_a_full_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&root.path().join("graph.sqlite"), "node").unwrap());
+        store.start_agent_roster_refresher().unwrap();
+        let (entered, building) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let other = store.clone();
+        let thread = std::thread::spawn(move || other.read_snapshot(|index| {
+            other.cached_agent_resources(index, false, |_| {
+                entered.send(()).unwrap();
+                released.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                Ok(vec![json!({"id":"agent/old-epoch"})])
+            })
+        }).unwrap());
+        building.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        store.smalltalk.forget_views();
+        release.send(()).unwrap();
+        assert_eq!(thread.join().unwrap()[0]["id"], "agent/old-epoch");
+        assert!(store.published_agent_roster(store.index().unwrap(), false).is_none());
+        assert!(store.smalltalk.agent_resources_cache.lock().unwrap().is_empty());
     }
 
     #[test]

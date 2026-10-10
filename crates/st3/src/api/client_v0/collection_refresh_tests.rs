@@ -149,6 +149,84 @@ fn counts(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
     pairs.iter().map(|(id, count)| ((*id).to_owned(), *count)).collect()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunked_replication_keeps_agents_pages_and_a_followed_window_until_a_fresh_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "prefix-roster");
+    let fleet = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    state.store.bind_fleet(fleet).unwrap();
+    state.store.append_claim(&ClaimInput {
+        subject: "agent/prefix-roster".into(), kind: "runtime.observed".into(), actor: None,
+        fields: serde_json::from_value(json!({"status":"running", "runtime_id":"prefix-roster",
+            "incarnation_id":"one"})).unwrap(), evidence: vec![],
+        expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let source = Store::open_memory("prefix-source").unwrap();
+    source.bind_fleet(fleet).unwrap();
+    for n in 0..300 {
+        source.append_claim(&ClaimInput { subject: format!("custom/prefix/{n}"),
+            kind:"custom.test.marker".into(), actor:None, fields:BTreeMap::new(),
+            evidence:vec![], expected_subject:None, idempotency_key:None }).unwrap();
+    }
+    // Initialize the projection frontier before admitting the new backlog, so this
+    // exercises incremental chunks rather than the missing-health full replay path.
+    state.store.project_replication_backlog().unwrap();
+    state.store.start_agent_roster_refresher().unwrap();
+    crate::api::refresh_agent_roster(&state.store, false).unwrap();
+    let (cut, _, at) = state.store.published_agent_roster(state.store.index().unwrap(), false).unwrap();
+    let mut publications = state.store.subscribe_agent_roster();
+    let revision = *publications.borrow_and_update();
+    let mut fixture = Fixture::open(state.clone(), true, None, &["agents"]).await;
+    let initial = fixture.frame().await;
+    assert_eq!(initial["kind"], "snapshot", "{initial}");
+    let exchange = source.export_replication_exchange(fleet,
+        &state.store.replication_inventory().unwrap()).unwrap();
+    state.store.receive_replication_exchange("prefix-source", fleet, &exchange).unwrap();
+    state.store.validate_replication_backlog().unwrap();
+    let (entered, chunk) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let projecting = state.store.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut entered = Some(entered);
+        let mut chunks = 0;
+        projecting.project_replication_backlog_with_yield(|| {
+            chunks += 1;
+            if let Some(entered) = entered.take() {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        }).unwrap();
+        chunks
+    });
+    tokio::time::timeout(Duration::from_secs(5), chunk).await.unwrap().unwrap();
+    assert_eq!(*publications.borrow(), revision, "fallback retention is no publication");
+    let (Extension(snapshot), Json(page)) = client_agents(State(state.clone()),
+        Extension(new_client_snapshot(&state)), Query(ClientListQuery::default())).await.unwrap();
+    assert_eq!(snapshot.store_index, cut);
+    assert_eq!(snapshot.published_at, Some(client_timestamp(at)));
+    assert_eq!(page.items, initial["items"].as_array().unwrap().clone());
+    fixture.subscribe("across-prefix", "agents").await;
+    let across = fixture.frame().await;
+    assert_eq!(across["kind"], "snapshot", "a boundary must not resync: {across}");
+    assert_eq!(across["items"], initial["items"]);
+    fixture.quiet().await;
+    let error = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+        Query(ClientListQuery { fresh:true, ..ClientListQuery::default() })).await.unwrap_err();
+    assert_eq!(error.code, "agent-roster-not-ready", "fresh cannot serve the fallback");
+    release.send(()).unwrap();
+    assert!(worker.await.unwrap() >= 2, "exercise real multiple projection chunks");
+    crate::api::refresh_agent_roster(&state.store, false).unwrap();
+    let (_, Json(fresh)) = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+        Query(ClientListQuery { fresh:true, ..ClientListQuery::default() })).await.unwrap();
+    // Canonical whole replay gives the same cards as incremental projection and its fallback.
+    state.store.replay_replication_graph().unwrap();
+    crate::api::refresh_agent_roster(&state.store, false).unwrap();
+    let (_, Json(replayed)) = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+        Query(ClientListQuery { fresh:true, ..ClientListQuery::default() })).await.unwrap();
+    assert_eq!(fresh.items, replayed.items);
+    assert_eq!(fresh.items, page.items);
+}
+
 #[tokio::test]
 async fn a_retry_reads_only_the_failed_subscription() {
     let root = tempfile::tempdir().unwrap();

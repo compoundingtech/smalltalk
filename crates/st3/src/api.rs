@@ -109,7 +109,7 @@ pub struct AppState {
 const CLIENT_API_VERSION: &str = "st3.client.v0";
 const CLIENT_PROJECTION_VERSION: &str = "client-projection.v0";
 const CLIENT_DEFAULT_PAGE_ITEMS: usize = 50;
-const CLIENT_MAX_PAGE_ITEMS: usize = 200;
+pub(crate) const CLIENT_MAX_PAGE_ITEMS: usize = 200;
 const CLIENT_MAX_RESPONSE_BYTES: usize = 1_048_576;
 // Keep complete result sets briefly so fleet writes cannot reorder or invalidate a traversal.
 // Cursors expire after this bounded window or if the daemon restarts/evicts their snapshot.
@@ -4702,7 +4702,7 @@ const AGENT_ROSTER_ASSEMBLY_ROUNDS: usize = 3;
 /// whose claims changed, and completion is tried again. Readers keep the previous complete
 /// roster meanwhile, with its own cut and publication time; if it cannot be assembled, the
 /// refresh fails and is tried again on the next request.
-fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
+pub(crate) fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
     if store.read_snapshot(|index| store.agent_roster_current(index, history))? {
         return Ok(());
     }
@@ -4754,9 +4754,11 @@ async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) {
     let Ok(wanted) = store.index() else { return };
     let published = |store: &Store| {
         let index = store.index().ok()?;
-        store.published_agent_roster(index, history).map(|(cut, _, _)| cut).or_else(|| {
+        store.published_agent_roster(index, history).map(|(cut, _, _)| cut)
+            .filter(|cut| store.agent_roster_publication_is_current(*cut, history, None)).or_else(|| {
             (!history).then(|| store.published_agent_roster_head(index, 1)).flatten()
                 .map(|(cut, _, _, _)| cut)
+                .filter(|cut| store.agent_roster_publication_is_current(*cut, history, Some(1)))
         })
     };
     let mut publications = store.subscribe_agent_roster();
@@ -4823,6 +4825,9 @@ fn client_agents_published_page_at(
         else {
             return Ok(None);
         };
+        if query.fresh && !store.agent_roster_publication_is_current(index, false, Some(CLIENT_MAX_PAGE_ITEMS + 1)) {
+            return Ok(None);
+        }
         store.request_agent_roster_refresh();
         let snapshot = roster_snapshot(state, index, published_at);
         let mut page = client_page_read(state, &snapshot, "agents", (*refs).clone(), query, true)?;
@@ -4831,6 +4836,9 @@ fn client_agents_published_page_at(
         )?;
         return Ok(Some((Extension(snapshot), Json(page))));
     };
+    if query.fresh && !store.agent_roster_publication_is_current(index, query.history, None) {
+        return Ok(None);
+    }
     // A roster older than the current cut, its local activity or its queue deadline needs a
     // refresh; the newest one needs none.
     if index < current || !store.agent_roster_current(current, query.history).map_err(ApiError::internal)? {

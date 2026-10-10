@@ -6739,8 +6739,10 @@ impl Store {
                     // Readers may have cached the preceding prefix at the same admitted store
                     // index. Its projection changed even when no additional claim arrived.
                     chunked |= through < target;
-                    if replayed || chunked {
+                    if replayed {
                         self.runtime.forget_views();
+                    } else if chunked {
+                        self.runtime.forget_incremental_views();
                     }
                     if through < target {
                         between();

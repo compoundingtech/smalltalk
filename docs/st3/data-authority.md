@@ -29,15 +29,27 @@ of the same node as evidence; a claim can cite only claims.
 
 Current categorical status, context occupancy, todo, workspace availability and peer connectivity
 are replaceable values in `latest_values`. There is one row per subject and kind (per observing
-host for connectivity). A separate SQLite connection uses the remaining current attempt for write admission,
-reserving 10 ms for register work (at most 90 ms admission). It retries only a busy BEGIN
-with sleeps capped at 1 ms within that attempt, avoiding SQLite busy backoff that can miss
-brief gaps between managed transactions; validation and mutation run once after admission.
-The immediate transaction keeps its 100 ms SQLite
-progress deadline, with explicit deadline checks before beginning and committing. A longer
-collision drops the attempt without entering the ordered graph writer or retaining a later retry. A new
+host for connectivity). A separate SQLite connection prepares its schema before reserving an
+empty managed-writer turn within the same 100 ms attempt, with 10 ms reserved for register
+work. Foreground reservations retain arrival order; housekeeping uses the existing background
+admission policy. The reservation carries no sample, caller closure or SQLite connection.
+A zero-capacity rendezvous makes expiration cancelable: an expired turn runs no SQL and
+cannot publish later. Release queries no database and sends no commit notification. Only
+successful register commits publish current-value hooks. Validation and mutation run once
+inside the fresh immediate transaction, with the unchanged deadline checks before work and
+commit. External SQLite contention still retries only BEGIN at intervals capped at 1 ms
+inside the remaining admission bound. Expiration drops the attempt without retaining a later retry. A new
 sample replaces the previous value and its local feed row. Status keeps the current episode's
 start time and a current-incarnation readiness bit; it retains no transition history.
+
+Incremental replication projection clears roster fold caches after each committed prefix,
+while retaining one immutable publication per current/history mode as a fallback. A current
+head and a complete current roster share that slot. Every fallback read uses its original
+cut and publication time; the fallback never becomes a fold source, changes a frontier, or
+advances the roster publication revision. Fresh reads exclude it even if its admitted index
+matches the current graph clock. A coherent replacement releases the fallback. Full replay,
+heal and reset clear it, and a cache epoch prevents an in-flight fold from republishing after
+invalidation. Requests still perform no writes or roster folds.
 
 New peer register keys have a separate 10,000-key admission cap for each observation kind;
 existing keys remain replaceable. Exhaustion returns HTTP 503 `current-value-capacity`, which

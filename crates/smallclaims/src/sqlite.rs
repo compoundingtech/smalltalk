@@ -355,6 +355,13 @@ pub enum WriterJob {
         lent: std::sync::mpsc::SyncSender<Connection>,
         returned: std::sync::mpsc::Receiver<Connection>,
     },
+    /// An empty, cancelable scheduling reservation. The managed connection stays here;
+    /// no caller closure or sample is queued, and an expired rendezvous executes no work.
+    #[doc(hidden)]
+    Reserve {
+        ready: std::sync::mpsc::SyncSender<()>,
+        released: std::sync::mpsc::Receiver<()>,
+    },
     /// Hands the connection to a caller until its guard gives it back.
     Lend {
         lent: std::sync::mpsc::SyncSender<Connection>,
@@ -382,6 +389,20 @@ pub struct WriterGuard<'a> {
     /// The connection's changed-row count when it was lent, so the rows this thread changed are
     /// noted for it when it gives the connection back; see `touched::writes`.
     pub changes_at_lend: u64,
+}
+
+/// Excludes managed writes until a separate short transaction ends. Carries no SQLite
+/// connection and does not notify commit observers or query the database on release.
+pub struct WriterReservation<'a> {
+    release: std::sync::mpsc::SyncSender<()>,
+    acquired: Option<std::time::Instant>,
+    _writer: std::marker::PhantomData<&'a WriterConnection>,
+}
+impl Drop for WriterReservation<'_> {
+    fn drop(&mut self) {
+        crate::profile::writer_released(self.acquired.take());
+        let _ = self.release.send(());
+    }
 }
 
 impl WriterConnection {
@@ -528,6 +549,42 @@ impl WriterConnection {
     /// authority and prepared CAS evidence after acquisition. No operator work belongs here.
     pub fn write_background(&self) -> WriterGuard<'_> {
         self.lend_writer(writer_queue::LoanClass::Background)
+    }
+
+    /// Reserve one foreground turn without lending the connection or queuing a write.
+    /// Cancellation before the rendezvous leaves nothing that can run after the deadline.
+    pub fn reserve_writer_until(&self, deadline: std::time::Instant)
+        -> std::result::Result<WriterReservation<'_>, std::sync::mpsc::RecvTimeoutError> {
+        self.reserve_until(deadline, false)
+    }
+
+    /// Same bounded reservation through the existing background admission policy.
+    pub fn reserve_background_writer_until(&self, deadline: std::time::Instant)
+        -> std::result::Result<WriterReservation<'_>, std::sync::mpsc::RecvTimeoutError> {
+        self.reserve_until(deadline, true)
+    }
+
+    fn reserve_until(&self, deadline: std::time::Instant, background: bool)
+        -> std::result::Result<WriterReservation<'_>, std::sync::mpsc::RecvTimeoutError> {
+        debug_assert_no_pinned_read();
+        if deadline <= std::time::Instant::now() {
+            return Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+        }
+        let wait = crate::profile::writer_waiting();
+        // Zero capacity is essential: send succeeds only when recv_timeout accepted it.
+        // A buffered ready token could outlive timeout and strand the writer on release.
+        let (ready, receiver) = std::sync::mpsc::sync_channel(0);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let job = WriterJob::Reserve { ready, released };
+        if background { self.enqueue_background(job); } else { self.send(job); }
+        receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))?;
+        // A thread paused at the rendezvous must not admit work after its bound. Dropping
+        // the release sender also unblocks the worker if the rendezvous just succeeded.
+        if std::time::Instant::now() >= deadline {
+            return Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+        }
+        Ok(WriterReservation { release, acquired: crate::profile::writer_acquired(wait),
+            _writer: std::marker::PhantomData })
     }
 
     fn write_fence(&self) -> WriterGuard<'_> {
@@ -726,6 +783,10 @@ fn write_queue(
                     Ok(back) => connection = back,
                     Err(_) => return,
                 }
+            }
+            WriterJob::Reserve { ready, released } => {
+                let _hold = crate::windows::Timer::start(crate::windows::StoreWork::WriterHold);
+                if ready.send(()).is_ok() { let _ = released.recv(); }
             }
             WriterJob::BackgroundReady(_) => unreachable!("admission consumes notifications"),
             batched => {
@@ -2128,6 +2189,48 @@ mod commit_observer_tests {
             done,
         });
         answer
+    }
+
+    #[test]
+    fn empty_writer_reservation_excludes_writes_without_sql_or_commit_notifications() {
+        let writer = writer();
+        let (notified, observations) = mpsc::channel();
+        let _observer = writer.observe_commits(move |_| { notified.send(()).unwrap(); });
+        let reservation = writer.reserve_writer_until(std::time::Instant::now()
+            + std::time::Duration::from_secs(2)).unwrap();
+        let answer = queued_claim(&writer);
+        assert!(matches!(answer.try_recv(), Err(TryRecvError::Empty)));
+        assert!(matches!(observations.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(writer.committed_index.load(Ordering::Acquire), 0);
+        drop(reservation);
+        answer.recv_timeout(std::time::Duration::from_secs(2)).unwrap().unwrap();
+        observations.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(matches!(observations.try_recv(), Err(TryRecvError::Empty)),
+            "only the actual claim transaction notifies");
+        assert_eq!(writer.committed_index.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn timed_out_writer_reservation_leaves_no_late_loan_or_observer_notification() {
+        let writer = writer();
+        let (notified, observations) = mpsc::channel();
+        let _observer = writer.observe_commits(move |_| { notified.send(()).unwrap(); });
+        let reservation = writer.reserve_writer_until(std::time::Instant::now()
+            + std::time::Duration::from_secs(2)).unwrap();
+        for background in [false, true] {
+            let result = writer.reserve_until(std::time::Instant::now()
+                + std::time::Duration::from_millis(10), background);
+            assert!(matches!(result, Err(mpsc::RecvTimeoutError::Timeout)));
+        }
+        drop(reservation);
+        let next = writer.reserve_writer_until(std::time::Instant::now()
+            + std::time::Duration::from_secs(2)).expect("expired rendezvous must not strand the writer");
+        drop(next);
+        // A real claim behind both expired jobs proves they were drained without SQL.
+        queued_claim(&writer).recv_timeout(std::time::Duration::from_secs(2)).unwrap().unwrap();
+        observations.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(matches!(observations.try_recv(), Err(TryRecvError::Empty)));
+        assert_eq!(writer.committed_index.load(Ordering::Acquire), 1);
     }
 
     #[test]

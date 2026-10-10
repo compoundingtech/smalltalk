@@ -12377,25 +12377,34 @@ mission "queue-parity" state="ready" {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agent_window_survives_publications_that_overtake_its_read_snapshot() {
-        agent_window_overtaken_by_publication(false, false).await;
+        agent_window_overtaken_by_publication(false, false, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agent_window_survives_heads_that_overtake_its_read_snapshot() {
-        agent_window_overtaken_by_publication(true, false).await;
+        agent_window_overtaken_by_publication(true, false, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agent_page_survives_publications_that_overtake_its_cut() {
-        agent_window_overtaken_by_publication(false, true).await;
+        agent_window_overtaken_by_publication(false, true, false).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn agent_page_survives_heads_that_overtake_its_cut() {
-        agent_window_overtaken_by_publication(true, true).await;
+        agent_window_overtaken_by_publication(true, true, false).await;
     }
 
-    async fn agent_window_overtaken_by_publication(head_only: bool, http_page: bool) {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_windows_and_pages_keep_complete_and_head_publications_across_prefix_invalidation() {
+        for head_only in [false, true] {
+            for http_page in [false, true] {
+                agent_window_overtaken_by_publication(head_only, http_page, true).await;
+            }
+        }
+    }
+
+    async fn agent_window_overtaken_by_publication(head_only: bool, http_page: bool, incremental: bool) {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
         state.store.append_claim(&ClaimInput {
@@ -12453,12 +12462,20 @@ mission "queue-parity" state="ready" {
                     crate::api::refresh_agent_roster(&publisher, false).unwrap();
                 }
             }
+            if incremental {
+                publisher.invalidate_incremental_roster_for_test();
+            }
             assert!(publisher.published_agent_roster(captured, false).is_none()
                 && publisher.published_agent_roster_head(captured, 201).is_none(),
                 "the captured cut must really have lost its publication");
         }).await.unwrap();
         let index = state.store.index().unwrap();
         let folds = state.store.agent_resources_refolded_cards_for_test();
+        if incremental {
+            assert!(crate::api::client_agents_published_page_at(&state,
+                &ClientListQuery { fresh:true, ..ClientListQuery::default() }, index)
+                .unwrap().is_none(), "fallback at the admitted target is not fresh-ready");
+        }
         resume.send(()).unwrap();
         let (snapshot, rows, more) = tokio::time::timeout(Duration::from_secs(5), read).await
             .expect("the reader must release its old snapshot and use a current publication")

@@ -160,6 +160,11 @@ pub trait Runtime: Send + Sync {
     /// Projections changed beneath whatever the runtime keeps in memory about them.
     fn forget_views(&self);
 
+    /// Incremental catch-up changed a projected prefix at the admitted cut. Fold caches
+    /// must be invalidated; runtimes may retain immutable prior publications as stale
+    /// fallbacks. Full replay/reset continues through forget_views and clears them.
+    fn forget_incremental_views(&self) { self.forget_views(); }
+
     /// Shared tables the projection digest covers, with the columns each leaves out.
     fn digest_tables(&self) -> &'static [(&'static str, &'static [&'static str])];
 

@@ -56,12 +56,15 @@ after the next one.
 ## Writes since 2026-09-30
 
 One thread owns the managed writer connection. Durable writes queue in arrival order.
-Replaceable current registers use a separate connection with zero busy timeout and a 100 ms
-transaction deadline. They never queue or retry: contention drops that sample. A register
-commit can briefly hold SQLite's write lock while a managed write attempts admission; budgeted
-callers can receive `database-busy` and retain their existing retry policy. Reads remain read-only.
+Replaceable current registers use a separate connection and one 100 ms attempt. They reserve
+an empty managed-writer turn within that bound, with 10 ms reserved for work; the turn carries
+no sample, SQL or caller closure. Foreground arrival order and background admission remain
+unchanged. An expired rendezvous drains without any late write, and releasing a reservation
+does not notify commit observers. External contention retries only BEGIN within the remaining
+bound. Validation and mutation run once, under the same transaction deadline; a timed-out
+sample leaves no retry obligation. Reads remain read-only.
 Durable peer errors and `replication_refusals` still use the managed writer. Bounded current-value
-housekeeping uses another zero-wait connection with the same 100 ms deadline: a pass inspects
+housekeeping reserves a background turn for its separate connection with the same 100 ms deadline: a pass inspects
 at most 64 register keys and retires at most 256 local history rows. An empty pass stays
 read-only. Obsolete seat and host payloads release capacity; semantic clocks retain a small
 tombstone per subject so removal cannot rewind a reader frontier.

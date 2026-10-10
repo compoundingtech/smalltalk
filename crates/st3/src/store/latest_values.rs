@@ -329,6 +329,7 @@ const CURRENT_WRITER_WAIT: std::time::Duration =
 /// Preserve ownership/protocol errors; do not infer interruption from an error's text.
 fn current_transaction<T>(
     connection: &mut Connection,
+    writer: Option<(&smallclaims::sqlite::WriterConnection, bool)>,
     work: impl FnOnce(&Transaction<'_>) -> Result<T, St3Error>,
 ) -> Result<T, St3Error> {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -379,6 +380,21 @@ fn current_transaction<T>(
         let native_control = NATIVE_ADMISSION_CONTROL.with(std::cell::Cell::get);
         #[cfg(not(any(test, feature = "test-support")))]
         let native_control = false;
+        // Reserve only this attempt's turn, with no sample or mutation queued. Foreground
+        // traffic stays FIFO and maintenance keeps the existing background lane. Schema
+        // preparation precedes admission, and every validation still runs inside the fresh tx.
+        let _reservation = if !native_control {
+            writer.map(|(writer, background)| {
+                let result = if background { writer.reserve_background_writer_until(admission_deadline) }
+                    else { writer.reserve_writer_until(admission_deadline) };
+                result.map_err(|error| match error {
+                    std::sync::mpsc::RecvTimeoutError::Timeout =>
+                        St3Error::new("database-busy", "current writer admission exceeded its remaining bound"),
+                    std::sync::mpsc::RecvTimeoutError::Disconnected =>
+                        St3Error::new("internal", "the managed writer stopped during current admission"),
+                })
+            }).transpose()?
+        } else { None };
         let tx = if native_control {
             connection.busy_timeout(admission_deadline.saturating_duration_since(std::time::Instant::now())).map_err(internal)?;
             Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate).map_err(internal)?
@@ -730,7 +746,7 @@ pub(super) fn append(
         .busy_timeout(CURRENT_WRITER_WAIT)
         .map_err(internal)?;
     let mut semantic_changed = false;
-    let result = current_transaction(&mut connection, |tx| {
+    let result = current_transaction(&mut connection, Some((&graph.connection, false)), |tx| {
         // A bound driver announces starting before reconciliation records runtime.running.
         // This hint only permits mailbox startup to wait; it grants no delivery or ready authority.
         if input.fields.get("state").and_then(Value::as_str) != Some("starting") {
@@ -1230,7 +1246,7 @@ impl Store {
         let (removed, kinds) = if obsolete.is_empty() {
             (0, BTreeSet::new())
         } else {
-            current_transaction(&mut connection, |tx| {
+            current_transaction(&mut connection, Some((&self.graph.connection, true)), |tx| {
                 let mut removed = 0;
                 let mut kinds = BTreeSet::new();
                 let mut deleted_subjects = BTreeSet::new();
@@ -1286,7 +1302,7 @@ impl Store {
         let history = match history_work {
             Err(error) => Err(error),
             Ok(None) => Ok(0),
-            Ok(Some(job)) => current_transaction(&mut connection, |tx| {
+            Ok(Some(job)) => current_transaction(&mut connection, Some((&self.graph.connection, true)), |tx| {
                 let bounds: Option<(i64, i64)> = tx
                     .query_row(
                         "SELECT cursor,cutoff FROM current_value_retirements
@@ -1425,7 +1441,7 @@ impl Store {
             .busy_timeout(CURRENT_WRITER_WAIT)
             .map_err(internal)?;
         let mut semantic_changed = false;
-        let changed = current_transaction(&mut connection, |tx| {
+        let changed = current_transaction(&mut connection, Some((&self.graph.connection, false)), |tx| {
             let mut incarnation_bound = false;
             if record.kind != "transport.observed" {
                 let owner: Option<String> = tx
@@ -3300,7 +3316,7 @@ mod tests {
         let before = revisions();
         let mut connection = Connection::open(&path).unwrap();
         connection.busy_timeout(std::time::Duration::ZERO).unwrap();
-        let error = current_transaction(&mut connection, |tx| {
+        let error = current_transaction(&mut connection, None, |tx| {
             tx.execute("UPDATE latest_values SET source_id='timed-out-source' WHERE subject='agent/example/cedar'", [])
                 .map_err(internal)?;
             tx.execute("INSERT INTO latest_values SELECT 'agent/pine',kind,slot,origin,source_at,
@@ -3335,13 +3351,13 @@ mod tests {
         assert_eq!(revisions(), before);
         // Clearing this connection's callback permits its next transaction; arbitrary faults
         // and ownership refusals never become a deadline merely because they contain that word.
-        current_transaction(&mut connection, |tx| {
+        current_transaction(&mut connection, None, |tx| {
             tx.execute("INSERT INTO meta VALUES('after-deadline','1')", [])
                 .map_err(internal)
         })
         .unwrap();
         for code in ["internal", "stale-harness-event-session"] {
-            let error = current_transaction::<()>(&mut connection, |_| {
+            let error = current_transaction::<()>(&mut connection, None, |_| {
                 Err(St3Error::new(code, "interrupted"))
             })
             .unwrap_err();
@@ -3391,7 +3407,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = Store::open(&root.path().join("graph.sqlite"), "owner").unwrap();
         let mut connection = Connection::open(&store.graph.path).unwrap();
-        let error = current_transaction(&mut connection, |tx| {
+        let error = current_transaction(&mut connection, None, |tx| {
             tx.execute("INSERT INTO meta VALUES ('late-current-test','1')", [])
                 .map_err(internal)?;
             std::thread::sleep(

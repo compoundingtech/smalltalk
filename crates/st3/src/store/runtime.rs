@@ -47,6 +47,9 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
     pub(crate) latest_cache_id: Mutex<u64>,
     pub(crate) agent_resources_cache: Mutex<VecDeque<AgentResourcesEntry>>,
+    pub(crate) roster_cache_epoch: std::sync::atomic::AtomicU64,
+    /// Last immutable publications across incremental prefix invalidation; never fold sources.
+    pub(crate) roster_fallback: Mutex<RosterFallback>,
     #[cfg(test)]
     pub(crate) roster_window_snapshot_hook: Mutex<Option<RosterWindowSnapshotHook>>,
     /// Ordering and queue metadata for lazy HTTP pages, shared at the same graph cuts.
@@ -95,7 +98,110 @@ pub(crate) struct AgentResourcesEntry {
     pub(crate) published_at_unix_ms: u128,
 }
 
+#[derive(Clone)]
+pub(crate) struct PublishedRoster {
+    pub(crate) index: u64,
+    pub(crate) local: u64,
+    pub(crate) items: Arc<Vec<Value>>,
+    pub(crate) at: u128,
+}
+impl PublishedRoster {
+    pub(crate) fn from(entry: &AgentResourcesEntry) -> Self {
+        Self { index: entry.index, local: entry.local, items: Arc::clone(&entry.items), at: entry.published_at_unix_ms }
+    }
+    pub(crate) fn position(&self) -> (u64, u64, u128) { (self.index, self.local, self.at) }
+}
+#[derive(Default)]
+pub(crate) struct RosterFallback {
+    pub(crate) complete: [Option<PublishedRoster>; 2],
+    pub(crate) head: Option<(PublishedRoster, Arc<Vec<Value>>)>,
+}
+impl RosterFallback {
+    fn retain_publications(&mut self, cards: &VecDeque<AgentResourcesEntry>, refs: &VecDeque<AgentResourcesEntry>) {
+        for history in [false, true] {
+            if let Some(entry) = cards.iter().filter(|entry| entry.history == history && entry.covered.is_none())
+                .max_by_key(|entry| (entry.index, entry.local, entry.published_at_unix_ms)) {
+                let value = PublishedRoster::from(entry);
+                let slot = &mut self.complete[usize::from(history)];
+                if slot.as_ref().is_none_or(|old| value.position() > old.position()) { *slot = Some(value); }
+            }
+        }
+        // Capture only a coherent, bounded first-page head; no card copies or SQL.
+        for reference in refs.iter().filter(|entry| !entry.history) {
+            for entry in cards.iter().filter(|entry| !entry.history && entry.index == reference.index) {
+                if entry.covered.as_ref().is_some_and(|covered| reference.items.iter()
+                    .take(crate::api::CLIENT_MAX_PAGE_ITEMS + 1)
+                    .all(|row| row["id"].as_str().is_some_and(|id| covered.contains(id)))) {
+                    let value = PublishedRoster::from(entry);
+                    if self.head.as_ref().is_none_or(|(old, _)| value.position() > old.position()) {
+                        self.head = Some((value, Arc::clone(&reference.items)));
+                    }
+                }
+            }
+        }
+        // Current complete rows and a current head are two forms of the same slot.
+        // Retain only its newest coherent publication; history owns its independent slot.
+        if let (Some(complete), Some((head, _))) = (&self.complete[0], &self.head) {
+            if complete.position() >= head.position() { self.head = None; }
+            else { self.complete[0] = None; }
+        }
+    }
+    pub(crate) fn discard_superseded(&mut self, cards: &VecDeque<AgentResourcesEntry>, refs: &VecDeque<AgentResourcesEntry>) {
+        let mut newest = Self::default();
+        newest.retain_publications(cards, refs);
+        for mode in [0, 1] {
+            let current = newest.complete[mode].as_ref().map(PublishedRoster::position)
+                .into_iter().chain((mode == 0).then(|| newest.head.as_ref()
+                    .map(|(entry, _)| entry.position())).flatten()).max();
+            if current.is_some_and(|position| self.complete[mode].as_ref()
+                .is_some_and(|old| position >= old.position())) { self.complete[mode] = None; }
+            if mode == 0 && current.is_some_and(|position| self.head.as_ref()
+                .is_some_and(|(old, _)| position >= old.position())) { self.head = None; }
+        }
+    }
+
+}
+
 impl SmalltalkRuntime {
+    fn forget_cached_views(&self, incremental: bool) {
+        #[cfg(any(test, feature = "test-support"))]
+        if smallclaims::sqlite::transaction_trace::is_active() {
+            crate::performance::record_request("roster/cache-reset", None, std::time::Duration::ZERO);
+            eprintln!("published roster cache reset incremental={incremental} at trace_ms={:.3}", smallclaims::sqlite::transaction_trace::elapsed_ms());
+        }
+        let mut cache = self
+            .subject_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        cache.views.clear();
+        cache.statuses.clear();
+        cache.card_statuses.clear();
+        drop(cache);
+        let mut owners = self.conversation_owners.lock().unwrap_or_else(PoisonError::into_inner);
+        self.conversation_owner_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        owners.clear();
+        drop(owners);
+        self.agent_status_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        let mut cards = self.agent_resources_cache.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut refs = self.agent_page_refs_cache.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut fallback = self.roster_fallback.lock().unwrap_or_else(PoisonError::into_inner);
+        self.roster_cache_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if incremental { fallback.retain_publications(&cards, &refs); }
+        else { *fallback = RosterFallback::default(); }
+        cards.clear();
+        refs.clear();
+        drop(fallback);
+        drop(refs);
+        drop(cards);
+        // Retaining an older publication is not a new publication or a new roster revision.
+        // Actual publication wakes followers once its fresh fold is ready.
+        if !incremental { self.agent_roster_published.send_modify(|revision| *revision += 1); }
+        self.published_views.invalidate();
+    }
+
     /// Explicitly register shadow views without changing the production readers.
     /// The source adapter must initialize/install and certify them separately.
     pub fn with_ivm_views(views: Arc<smallclaims::ivm::Views>) -> Self {
@@ -400,39 +506,8 @@ impl Runtime for SmalltalkRuntime {
         reapply_local_work_lease_renewals_tx(transaction)
     }
 
-    fn forget_views(&self) {
-        #[cfg(any(test, feature = "test-support"))]
-        if smallclaims::sqlite::transaction_trace::is_active() {
-            crate::performance::record_request("roster/cache-reset", None, std::time::Duration::ZERO);
-            eprintln!("published roster cache reset at trace_ms={:.3}", smallclaims::sqlite::transaction_trace::elapsed_ms());
-        }
-        let mut cache = self
-            .subject_cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        cache.views.clear();
-        cache.statuses.clear();
-        cache.card_statuses.clear();
-        drop(cache);
-        let mut owners = self.conversation_owners.lock().unwrap_or_else(PoisonError::into_inner);
-        self.conversation_owner_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        owners.clear();
-        drop(owners);
-        self.agent_status_cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        self.agent_resources_cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-        self.agent_roster_published.send_modify(|revision| *revision += 1);
-        self.published_views.invalidate();
-        self.agent_page_refs_cache
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-    }
+    fn forget_views(&self) { self.forget_cached_views(false); }
+    fn forget_incremental_views(&self) { self.forget_cached_views(true); }
 
     fn digest_tables(&self) -> &'static [(&'static str, &'static [&'static str])] {
         PROJECTION_DIGEST_TABLES
