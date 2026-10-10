@@ -4,7 +4,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
 import { submitAnswer } from './answer';
-import { API_VERSION, ClientError, St3Client, notApplied, outcomeUnknown, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { API_VERSION, ClientError, St3Client, isTransient, notApplied, outcomeUnknown, plainError, retryTransient, type Arrangement, type Runtime, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { keepClosed, personAnswer, promptAnswers, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
 import app from './app.json';
 import { canVerifyPairing, createDeviceKey, removeDeviceKey, signWithDeviceKey, verifyGrantSignature } from './modules/st-device-key';
@@ -24,6 +24,7 @@ import type { FabricProfile } from './fabricProof';
 import { gatewayFetch } from './gatewayFetch';
 import { normalizeGatewayUrl } from './gatewayUrl';
 import { tabOrder, type Tab } from './tabs';
+import type { SidebarResource } from './sidebarView';
 import { fetch as expoFetch } from 'expo/fetch';
 import { decodeBase64, encodeBase64, type Picked } from './images';
 
@@ -126,8 +127,11 @@ function useAppStore(proof?: FabricProfile) {
   // Spaces are how stui works, so the tab is on unless this phone turned it off.
   const [glassesOn, setGlassesOn] = useState(true);
   const [simpleOn, setSimpleOn] = useState(true);
+  const [arrangements, setArrangements] = useState<Arrangement[]>([]), [arrangementsIssue, setArrangementsIssue] = useState('');
+  const [sidebarTerminals, setSidebarTerminals] = useState<Runtime[]>([]), [sidebarTerminalsIssue, setSidebarTerminalsIssue] = useState('');
   const [glasses, setGlasses] = useState<Glass[]>([]), [glassesIssue, setGlassesIssue] = useState('');
   const [scrollRequest, setScrollRequest] = useState<{ y: number; at: number } | null>(null);
+  const sidebarSeen = useRef(new Map<string, SidebarResource>());
   const cachedActor = useRef(''), cacheSavedAt = useRef(0), cacheGeneration = useRef(0);
   const conversationCache = useRef(new Map<string, Conversation<TimelineEntry>>()), draftCache = useRef(new Map<string, string>());
   // Images messages carry, as data URIs, so a conversation scrolled back to does not read them again.
@@ -259,8 +263,10 @@ function useAppStore(proof?: FabricProfile) {
   }, [proof?.url, proof?.credential]);
 
   function clearCaches() {
+    sidebarSeen.current.clear();
     cachedActor.current = ''; cacheSavedAt.current = 0;
     conversationCache.current.clear(); draftCache.current.clear(); missionDetailCache.current.clear();
+    setArrangements([]); setArrangementsIssue(''); setSidebarTerminals([]);
     setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null);
   }
   async function clearCachedProjection() { cacheGeneration.current++; clearCaches(); if (!proof) await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
@@ -353,6 +359,23 @@ function useAppStore(proof?: FabricProfile) {
   // Glasses: followed on the feed's socket while the experiment is on and the gateway grants them.
   useEffect(() => { void AsyncStorage.getItem(GLASSES_KEY).then(value => setGlassesOn(value !== '0')).catch(() => {}); }, []);
   useEffect(() => { void AsyncStorage.getItem(SIMPLE_KEY).then(value => setSimpleOn(value !== '0')).catch(() => {}); }, []);
+  const arrangementPerson = caps?.session_actor.match(/^person\/[^/]+/)?.[0];
+  const arrangementsGranted = caps?.capabilities.some(capability => capability.id === 'arrangements' && capability.version >= 1 && capability.state === 'granted') ?? false;
+  useEffect(() => {
+    if (!feed || !arrangementsGranted || !arrangementPerson) { setArrangements([]); setArrangementsIssue(''); return; }
+    const follow = feed.followArrangements(arrangementPerson, { onArrangements: setArrangements, onIssue: setArrangementsIssue });
+    return () => follow.close();
+  }, [feed, arrangementPerson, arrangementsGranted]);
+  const loadSidebarTerminals = useCallback(async () => {
+    if (!client) return;
+    const generation = cacheGeneration.current;
+    try {
+      const result = await listCollectionPages(options => client.terminalsList({ ...options, history: false }), 200);
+      if (generation !== cacheGeneration.current) return;
+      setSidebarTerminals(result.pages.flatMap(page => page.value.items.filter((item): item is Runtime => item.kind === 'runtime' && !!item.terminal_id)));
+      setSidebarTerminalsIssue(result.truncated ? 'More terminals exist beyond this window.' : '');
+    } catch (error) { if (generation === cacheGeneration.current) setSidebarTerminalsIssue(errorText(error)); }
+  }, [client]);
   // Version 1 glasses are splits of tab groups; an earlier member's glasses are a shape this app no longer reads.
   const glassesGranted = caps?.capabilities.some(capability => capability.id === 'glasses' && capability.version >= 1 && capability.state === 'granted') ?? false;
   useEffect(() => {
@@ -752,6 +775,7 @@ function useAppStore(proof?: FabricProfile) {
     treeView, setTreeView, scrollRequest, requestScroll: (y: number) => setScrollRequest({ y, at: Date.now() }),
     glassesOn, glassesGranted, glasses, glassesIssue, simpleOn,
     carrierInfo: { choice: carrierChoice, built: fabricBuilt, target: fabricTarget, fallback: fallbackOn, route: selected.route, routeText: routeLabel(selected.route), pending: selected.pending, issue: selected.issue, fabric: fabricSnapshot, node: fabricNode, path: fabricPath },
+    sidebarSeen, arrangements, arrangementsIssue, sidebarTerminals, sidebarTerminalsIssue, loadSidebarTerminals,
   };
 }
 

@@ -31,6 +31,7 @@ pub mod layout;
 pub mod live;
 pub mod pane;
 mod prefs;
+mod resource_sidebar;
 mod pty;
 pub mod screens;
 pub mod text;
@@ -321,6 +322,7 @@ pub struct Ui {
     tick: u64,
     help: bool,
     sidebar: bool,
+    resource_sidebar: resource_sidebar::Sidebar,
     system: bool,
     frame: RefCell<FrameInfo>,
     hover: hover::Hover,
@@ -515,6 +517,8 @@ impl Ui {
         self.frame.borrow().read_messages.clone()
     }
     pub fn new(world: World) -> Self {
+        let mut resource_sidebar = resource_sidebar::Sidebar::default();
+        resource_sidebar.observe(&world);
         Self {
             world,
             tab: 0,
@@ -530,6 +534,7 @@ impl Ui {
             tick: 0,
             help: false,
             sidebar: true,
+            resource_sidebar,
             system: false,
             frame: RefCell::new(FrameInfo::default()),
             hover: hover::Hover::default(),
@@ -661,6 +666,14 @@ impl Ui {
         } else {
             Vec::new()
         };
+        self.resource_sidebar.observe(&world);
+        if world.agents.ready().is_some_and(|agents| agents.is_empty())
+            && world.missions.ready().is_some_and(|missions| missions.is_empty())
+            && world.attention.ready().is_some_and(|attention| attention.is_empty())
+            && let Some(glasses) = self.glasses.as_mut()
+            && !glasses.sidebar.configured {
+            glasses.sidebar.shown = true;
+        }
         self.world = world;
         self.keep_closed_attention(before);
         for (index, id) in chosen.into_iter().enumerate() {
@@ -3643,6 +3656,8 @@ impl Ui {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
+        if self.glasses.is_none() && self.resource_sidebar.focused && self.resource_sidebar_key(key) { return; }
+
         let ctrl_t = key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL;
         if self.terminal_hold.is_some() {
             if ctrl_t && key.kind != KeyEventKind::Press {
@@ -5083,6 +5098,18 @@ impl Ui {
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent) {
+        if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+            && self.frame.borrow().hits.iter().rev().any(|(rect, hit)| {
+                contains(*rect, mouse.column, mouse.row) && matches!(hit, Hit::ResourceRow(_) | Hit::ResourceFilter)
+            }) {
+            self.resource_sidebar.selected = if mouse.kind == MouseEventKind::ScrollUp {
+                self.resource_sidebar.selected.saturating_sub(3)
+            } else {
+                (self.resource_sidebar.selected + 3).min(self.resource_sidebar.rows().len().saturating_sub(1))
+            };
+            return;
+        }
+
         if mouse.kind == MouseEventKind::Moved {
             self.mouse_moved(mouse);
             return;
@@ -5506,6 +5533,12 @@ impl Ui {
             Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
             Hit::NewTerminal => self.open_new_terminal(),
+            Hit::ResourceRow(index) => self.open_resource_row(index),
+            Hit::ResourceFilter => {
+                self.resource_sidebar.focused = true;
+                self.resource_sidebar.filtering = true;
+                if let Some(glasses) = self.glasses.as_mut() { glasses.sidebar.focused = true; }
+            }
             Hit::SidebarRow(index) => {
                 if let Some(glasses) = self.glasses.as_mut() {
                     let sidebar = &mut glasses.sidebar;
