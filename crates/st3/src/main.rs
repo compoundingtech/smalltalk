@@ -18512,8 +18512,9 @@ async fn drive_st2_native(
     let mut replacement = DriverReplacement::new();
     let mut binding_watch = ClaudeBindingWatch::default();
     let mut reported_session = None;
-    // Claude's hooks keep the subagent ledger; this driver records it on the seat.
-    let mut subagents = (driver == "claude").then(|| {
+    // Claude's hooks and omp's extension keep the subagent ledger; this driver records it on the
+    // seat.
+    let mut subagents = matches!(driver, "claude" | "omp").then(|| {
         st3::subagents::Publisher::start(
             subject,
             driver,
@@ -20194,7 +20195,7 @@ fn accept_managed_channel_frame(
         let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("unknown");
         let handled = match frame_type {
             "state" | "session" | "ready" | "delivered" | "read" | "failed" | "todo" => true,
-            "timeline" | "context" | "turn" => observer.is_some(),
+            "timeline" | "context" | "turn" | "subagent" => observer.is_some(),
             // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
             "delivery_ready" | "retry_pending_ask" | "diagnostic" => true,
             // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
