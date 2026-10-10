@@ -81,6 +81,7 @@ jsonschema = { version = "0.33", default-features = false }
 portable-pty = "0.9"
 predicates = "3"
 proptest = "1"
+parking_lot = "0.12"
 
 [[example]]
 name = "reader_cache"

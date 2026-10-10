@@ -326,6 +326,11 @@ WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT N
 -- of other kinds plan as they did.
 CREATE INDEX IF NOT EXISTS claims_runtime_subject_index ON claims(subject, store_index)
 WHERE kind='runtime.observed';
+-- Resource ids contain the observed runtime id, which need not equal the owner subject.
+CREATE INDEX IF NOT EXISTS claims_runtime_id_subject_index
+ON claims(json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+    THEN '$.runtime_id' ELSE '$.fields.runtime_id' END), subject, store_index)
+WHERE kind='runtime.observed';
 -- An already-open raw stream revalidates the original paired actor, never a full graph scan.
 CREATE INDEX IF NOT EXISTS claims_client_pairing_actor_index
 ON claims(json_extract(body, '$.fields.session_actor'))
@@ -11408,6 +11413,30 @@ impl Store {
         };
         drop(connection);
         self.status_for_subject_names_at(subjects, store_index, include_history)
+    }
+
+    /// Candidate owners of a runtime resource at a snapshot. Retain historical observations:
+    /// the canonical status fold, not the latest ingested claim, selects the current id.
+    pub(crate) fn runtime_subjects_for_id_at(
+        &self,
+        runtime_id: Option<&str>,
+        owner: Option<&str>,
+        store_index: u64,
+    ) -> Result<BTreeSet<String>> {
+        let connection = self.readers.get();
+        let subjects = connection.prepare_cached(
+            "SELECT subject FROM claims INDEXED BY claims_runtime_id_subject_index
+             WHERE kind='runtime.observed'
+               AND json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                   THEN '$.runtime_id' ELSE '$.fields.runtime_id' END)=?1
+               AND store_index<=?2
+             UNION
+             SELECT subject FROM claims INDEXED BY claims_runtime_subject_index
+             WHERE kind='runtime.observed' AND subject=?3 AND store_index<=?2
+             ORDER BY subject",
+        )?.query_map(params![runtime_id, store_index, owner], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        Ok(subjects)
     }
 
     /// Of `subjects`, those a current view can show at `store_index`. A runtime that nothing

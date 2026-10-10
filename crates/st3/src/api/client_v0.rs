@@ -2969,6 +2969,25 @@ fn runtime_resources_for_owner(
     runtime_resources_from_status(state, snapshot, session, status)
 }
 
+fn runtime_resources_for_id(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    id: &str,
+    include_owner: bool,
+) -> anyhow::Result<Vec<Value>> {
+    let subjects = state.store.runtime_subjects_for_id_at(
+        id.strip_prefix("runtime/"),
+        include_owner.then_some(id),
+        snapshot.store_index,
+    )?;
+    let status = state.store.status_for_subject_names_at(subjects, snapshot.store_index, true)?;
+    Ok(runtime_resources_from_status(state, snapshot, session, status)?
+        .into_iter()
+        .filter(|runtime| runtime["id"] == id || (include_owner && runtime["owner_id"] == id))
+        .collect())
+}
+
 fn terminal_resources_for_owner(
     state: &AppState,
     history: bool,
@@ -2982,12 +3001,20 @@ fn terminal_resources_for_owner(
     runtime_resources_from_status(state, snapshot, session, status)
 }
 
+#[cfg(test)]
+static RUNTIME_DETAIL_SUBJECT_COUNTS: parking_lot::Mutex<BTreeMap<String, usize>> =
+    parking_lot::Mutex::new(BTreeMap::new());
+
 fn runtime_resources_from_status(
     state: &AppState,
     snapshot: &ClientSnapshot,
     session: &ClientSession,
     status: crate::model::StatusResponse,
 ) -> anyhow::Result<Vec<Value>> {
+    #[cfg(test)]
+    if let Some(count) = RUNTIME_DETAIL_SUBJECT_COUNTS.lock().get_mut(&snapshot.id) {
+        *count += status.subjects.len();
+    }
     // Each runtime's declaration and observation time, in one statement apiece for the list.
     let desired_tokens = state.store.selected_desired_tokens(
         &status
@@ -4227,11 +4254,12 @@ pub(super) async fn runtime_detail(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
-    client_detail(
-        runtime_resources(&state, true, &snapshot, &session).map_err(ApiError::internal)?,
-        "runtime",
-        &id,
-    )
+    let selected = client_detail_id("runtime", &id);
+    let items = super::blocking_store(move || {
+        runtime_resources_for_id(&state, &snapshot, &session, &selected, false)
+    })
+    .await?;
+    client_detail(items, "runtime", &id)
 }
 
 pub(super) async fn operations(
@@ -9003,7 +9031,7 @@ fn runtime_control_target(
     request: &ActionRequest,
 ) -> Result<Value, ApiError> {
     let target = parameter_string(&request.parameters, "target_id")?;
-    let runtime = runtime_resources(state, true, snapshot, session)
+    let runtime = runtime_resources_for_id(state, snapshot, session, &target, true)
         .map_err(ApiError::internal)?
         .into_iter()
         .find(|runtime| runtime["id"] == target || runtime["owner_id"] == target)
@@ -10225,7 +10253,13 @@ async fn dispatch_action(
             Ok(vec![response.lane.subject])
         }
         action @ ("runtime.stop" | "runtime.restart" | "runtime.reset") => {
-            let runtime = runtime_control_target(state, snapshot, session, request)?;
+            let lookup_state = state.clone();
+            let lookup_snapshot = snapshot.clone();
+            let lookup_session = session.clone();
+            let lookup_request = request.clone();
+            let runtime = super::blocking_api(move || {
+                runtime_control_target(&lookup_state, &lookup_snapshot, &lookup_session, &lookup_request)
+            }).await?;
             let owner = runtime["owner_id"]
                 .as_str()
                 .ok_or_else(|| ApiError::internal("runtime has no owner"))?;
@@ -19725,6 +19759,66 @@ mission "example/zero-run" state="ready" {
         }
     }
 
+    #[tokio::test]
+    async fn runtime_detail_by_id_matches_history_and_reduces_only_its_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "runtime-test");
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        for index in 0..32 {
+            state.store.append_claim(&ClaimInput {
+                subject: format!("agent/owner-{index}"),
+                kind: "runtime.observed".into(),
+                actor: Some(format!("agent/owner-{index}")),
+                fields: serde_json::from_value(json!({
+                    "runtime_id": format!("independent-{index}"),
+                    "incarnation_id": format!("incarnation-{index}"),
+                    "status": if index == 1 { "exited" } else { "running" },
+                    "terminal": true,
+                })).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let snapshot = new_client_snapshot(&state);
+        let all = runtime_resources(&state, true, &snapshot, &session).unwrap();
+        for index in [0, 1, 31] {
+            let id = format!("runtime/independent-{index}");
+            let expected = client_detail(all.clone(), "runtime", &id).unwrap().0;
+            assert_eq!(
+                runtime_resources_for_id(&state, &snapshot, &session, &id, false).unwrap(),
+                vec![expected.clone()],
+            );
+            RUNTIME_DETAIL_SUBJECT_COUNTS.lock().insert(snapshot.id.clone(), 0);
+            let actual = runtime_detail(
+                State(state.clone()), Extension(snapshot.clone()), Extension(session.clone()),
+                AxumPath(id),
+            ).await.unwrap().0;
+            let reduced = RUNTIME_DETAIL_SUBJECT_COUNTS.lock().remove(&snapshot.id).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(reduced, 1, "detail must not reduce unrelated runtime subjects");
+        }
+        let mut restricted = session.clone();
+        restricted.scopes = BTreeSet::from(["read.projections".into()]);
+        let expected = client_detail(
+            runtime_resources(&state, true, &snapshot, &restricted).unwrap(),
+            "runtime", "runtime/independent-0",
+        ).unwrap().0;
+        assert_eq!(runtime_detail(
+            State(state.clone()), Extension(snapshot.clone()), Extension(restricted.clone()),
+            AxumPath("runtime/independent-0".into()),
+        ).await.unwrap().0, expected);
+        restricted.scopes.clear();
+        let error = runtime_detail(
+            State(state.clone()), Extension(snapshot.clone()), Extension(restricted),
+            AxumPath("runtime/independent-0".into()),
+        ).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        let error = runtime_detail(
+            State(state), Extension(snapshot), Extension(session),
+            AxumPath("runtime/unknown".into()),
+        ).await.unwrap_err();
+        assert_eq!(error.code, "not-found");
+    }
+
     /// A member one build behind still routes to a terminal on a newer member whose seat reports
     /// a claim kind it does not know yet (`harness.limits`): the valid runtime observation
     /// decides, and the unknown claim waits for an upgrade.
@@ -19978,6 +20072,11 @@ mission "example/zero-run" state="ready" {
             .unwrap();
         assert_eq!(exited["state"], "exited");
         assert_eq!(exited["terminal_access"]["read"], "unavailable");
+        let snapshot = new_client_snapshot(&owner);
+        assert_eq!(
+            runtime_resources_for_id(&owner, &snapshot, &session, "runtime/same-runtime-id", false).unwrap(),
+            runtime_resources(&owner, true, &snapshot, &session).unwrap(),
+        );
 
         let stale_root = tempfile::tempdir().unwrap();
         let stale = test_state_named(stale_root.path(), "stale-node");
@@ -20007,6 +20106,14 @@ mission "example/zero-run" state="ready" {
         assert_eq!(lean, runtime_resources_for_owner(&owner, true, &snapshot, &session, Some(subject)).unwrap());
         assert_eq!(lean[0]["state"], "unreachable");
         assert_eq!(lean[0]["terminal_access"]["read"], "unavailable");
+        assert_eq!(
+            runtime_resources_for_id(&owner, &snapshot, &session, "runtime/same-runtime-id", false).unwrap(),
+            runtime_resources(&owner, true, &snapshot, &session).unwrap(),
+        );
+        assert_eq!(
+            runtime_resources_for_id(&owner, &snapshot, &session, subject, true).unwrap(),
+            runtime_resources(&owner, true, &snapshot, &session).unwrap(),
+        );
     }
     #[test]
     fn status_freshness_uses_cached_card_time_without_resetting_since() {

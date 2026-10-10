@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Read one runtime by id without reducing every runtime",
+  "replay": { "status": "none", "detail": "Existing claims and projections are read unchanged. No replay is required." },
+  "schema": { "status": "changed", "detail": "Add a local SQLite index on observed runtime ids and owner subjects. The index is created automatically when the store opens. Replicated claims are unchanged." },
+  "rules": { "status": "none", "detail": "Runtime detail and control resolve candidate owners by indexed runtime id, then use the existing canonical status reduction at the requested snapshot. Detail reads run on a blocking worker." },
+  "compatibility": { "status": "none", "detail": "Runtime resources, unknown-id responses, history and authorization semantics are unchanged." },
+  "downtime": { "status": "none", "detail": "No interruption beyond the ordinary restart. Initial index creation reads retained runtime observations." },
+  "manual": { "status": "none", "detail": "No manual migration is required." },
+  "recovery": { "status": "none", "detail": "Older binaries can read the unchanged claims without recovery." }
+}
