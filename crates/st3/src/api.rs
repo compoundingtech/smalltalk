@@ -23762,6 +23762,78 @@ mission "wake" state="ready" {
         assert!(store.agent_resources_largest_fold_for_test() <= AGENT_ROSTER_WARM_CHUNK);
     }
 
+    /// What one roster refresh costs on a copy of a real or generated store: the first full
+    /// fold, a fold after a claim that changes one card, and one after a claim no card reads.
+    /// `ST_ROSTER_FOLD_STORE` names the store; the copy stays in `TMPDIR` and only timings print.
+    #[test]
+    #[ignore = "roster fold timing on a store copy; set ST_ROSTER_FOLD_STORE and run with --ignored --nocapture"]
+    fn agent_roster_fold_timing_on_a_store_copy() {
+        let Some(source) = std::env::var_os("ST_ROSTER_FOLD_STORE").map(PathBuf::from) else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("claims.sqlite3");
+        for suffix in ["", "-wal"] {
+            let from = PathBuf::from(format!("{}{suffix}", source.display()));
+            if from.exists() {
+                fs::copy(&from, format!("{}{suffix}", database.display())).unwrap();
+            }
+        }
+        // With ST3_PROFILE_DIR set, each fold's statements land in its slow.jsonl.
+        smallclaims::profile::init_from_env();
+        let store = Store::open(&database, "bench-host").unwrap();
+        let timed = |label: &str, samples: &mut Vec<f64>, work: &dyn Fn()| {
+            let before = smallclaims::sqlite::work::total();
+            let started = Instant::now();
+            smallclaims::profile::task("roster-fold-timing", work);
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            samples.push(ms);
+            println!("roster fold {label}: {ms:.1} ms; sqlite_work={:?}",
+                smallclaims::sqlite::work::total() - before);
+        };
+        let mut cold = Vec::new();
+        timed("cold", &mut cold, &|| refresh_agent_roster(&store, false).unwrap());
+        let agents = store.read_snapshot(|index| Ok(client_agent_page_refs(&store, false, index)?
+            .iter().filter_map(|card| card["id"].as_str().map(str::to_owned)).collect::<Vec<_>>()))
+            .unwrap();
+        println!("roster fold agents={}", agents.len());
+        assert!(!agents.is_empty());
+        let append = |subject: &str, kind: &str, fields: Value| {
+            store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        let mut changed = Vec::new();
+        let mut unrelated = Vec::new();
+        for turn in 0..30 {
+            let agent = &agents[turn % agents.len()];
+            append(agent, "harness.observed", json!({"state": if turn % 2 == 0 { "working" } else { "idle" },
+                "driver":"codex", "incarnation_id": format!("fold-timing-{turn}")}));
+            timed(&format!("one card changed (agent #{})", turn % agents.len()), &mut changed,
+                &|| refresh_agent_roster(&store, false).unwrap());
+            append(&format!("custom/fold-timing/{turn}"), "custom.test.marker", json!({}));
+            timed("no card changed", &mut unrelated, &|| refresh_agent_roster(&store, false).unwrap());
+        }
+        let summary = |label: &str, samples: &mut Vec<f64>| {
+            samples.sort_by(f64::total_cmp);
+            let at = |q: f64| samples[((samples.len() as f64 * q).ceil() as usize).saturating_sub(1)];
+            println!("roster fold summary {label}: n={} p50={:.1} p90={:.1} max={:.1} ms",
+                samples.len(), at(0.5), at(0.9), samples[samples.len() - 1]);
+        };
+        summary("cold", &mut cold);
+        summary("one card changed", &mut changed);
+        summary("no card changed", &mut unrelated);
+        let performance = smallclaims::performance::snapshot();
+        for row in performance["requests"].as_array().into_iter().flatten()
+            .filter(|row| row["kind"].as_str().is_some_and(|kind| kind.starts_with("roster/")))
+        {
+            println!("roster fold task {}: n={} total_ms={} max_ms={}",
+                row["kind"], row["count"], row["total_ms"], row["max_ms"]);
+        }
+    }
+
     #[test]
     #[ignore = "focused roster timing fixture; run explicitly with --ignored --nocapture"]
     fn agent_roster_snapshot_fixture_timing() {
