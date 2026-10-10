@@ -4659,7 +4659,8 @@ mod tests {
                 normalize_omp(driver, &record, sequence, "2026-10-06T00:00:00Z", &mut items);
                 let blocks: Vec<_> = items[first..]
                     .iter()
-                    .flat_map(|item| item["body"]["blocks"].as_array().unwrap())
+                    .filter_map(|item| item["body"]["blocks"].as_array())
+                    .flatten()
                     .collect();
                 let owner = blocks.last().unwrap();
                 assert_eq!(owner["metadata"]["usage"]["cost_usd"], usd);
