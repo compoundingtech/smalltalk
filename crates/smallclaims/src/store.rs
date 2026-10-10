@@ -36,6 +36,8 @@ use crate::sqlite::{
     STATEMENT_CACHE_CAPACITY, WriterConnection,
 };
 
+mod operation_metadata;
+pub use operation_metadata::OperationMetadata;
 #[cfg(test)]
 mod projection_busy_tests;
 #[cfg(test)]
@@ -7912,81 +7914,52 @@ pub fn checkpointed_operation_outcome(
     .with_detail("claim_id", claim_id.clone()))
 }
 
-/// The claims every stored operation row must come from, in canonical order. The partial
-/// operation index names exactly the claims this scan keeps, so the audit walks it instead of
-/// evaluating json_extract over every claim in the store.
+/// The narrow metadata every stored operation row must come from. The partial operation
+/// index names exactly the claims this scan keeps. Canonical reduction is order-independent;
+/// neither bodies nor a temporary sort of the claim table are needed.
 pub const EXPECTED_OPERATIONS_QUERY: &str =
-    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+    "SELECT json_extract(body, '$._operation.id'),
+            json_extract(body, '$._operation.request_digest'), id
      FROM claims INDEXED BY claims_operation_index
      WHERE json_extract(body, '$._operation.id') IS NOT NULL
-       AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
-     ORDER BY id";
+       AND json_type(body, '$._operation.id')='text'
+       AND json_type(body, '$._operation.request_digest')='text'
+       AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)";
 
 pub fn expected_operations(
     connection: &Connection,
 ) -> Result<BTreeMap<String, (String, String, String)>> {
     let mut statement = connection.prepare(EXPECTED_OPERATIONS_QUERY)?;
-    let claims = statement
-        .query_map([], claim_from_row)?
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut grouped = BTreeMap::<String, Vec<(String, String)>>::new();
-    let mut stored = BTreeSet::new();
-    for claim in claims {
-        if let Some((operation_id, request_digest)) = operation_parts(&claim.body) {
-            grouped
-                .entry(operation_id.to_owned())
-                .or_default()
-                .push((request_digest.to_owned(), claim.id.clone()));
-            stored.insert(claim.id);
-        }
+    let mut grouped = BTreeMap::<String, OperationMetadata>::new();
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let operation_id: String = row.get(0)?;
+        let request_digest: String = row.get(1)?;
+        let claim_id: String = row.get(2)?;
+        grouped.entry(operation_id).or_default().include(request_digest, claim_id, true);
     }
     // Claims a checkpoint dropped still decide an operation's digest and state. An operation
     // left with no stored claim has no row, since the row must name a stored claim; a retry
     // finds its tombstones instead.
-    let mut dropped = BTreeMap::<String, Vec<(String, String)>>::new();
-    for (operation_id, request_digest, claim_id) in checkpoint::checkpointed_operations(connection)?
-    {
-        if !stored.contains(&claim_id) {
-            dropped
-                .entry(operation_id)
-                .or_default()
-                .push((request_digest, claim_id));
+    let mut statement = connection.prepare(CHECKPOINT_OPERATION_METADATA_QUERY)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let operation_id: String = row.get(0)?;
+        if let Some(operation) = grouped.get_mut(&operation_id) {
+            operation.include(row.get(1)?, row.get(2)?, false);
         }
     }
-    Ok(grouped
-        .into_iter()
-        .map(|(operation_id, stored_claims)| {
-            let dropped = dropped.remove(&operation_id).unwrap_or_default();
-            (operation_id, operation_row(&stored_claims, dropped))
-        })
-        .collect())
+    Ok(grouped.into_iter().filter_map(|(id, value)| value.row().map(|row| (id, row))).collect())
 }
 
-/// One operation's row from its stored claims and the claims a checkpoint dropped, each as
-/// `(request digest, claim)`: `(request digest, canonical claim, state)`.
-fn operation_row(
-    stored_claims: &[(String, String)],
-    dropped: Vec<(String, String)>,
-) -> (String, String, String) {
-    let mut claims = stored_claims.to_vec();
-    claims.extend(dropped);
-    claims.sort();
-    let request_digest = claims[0].0.clone();
-    let state = if claims.iter().all(|(digest, _)| digest == &request_digest) {
-        "active"
-    } else {
-        "conflict"
-    };
-    let canonical_claim_id = stored_claims
-        .iter()
-        .filter(|(digest, _)| digest == &request_digest)
-        .map(|(_, claim)| claim)
-        .min()
-        .or_else(|| stored_claims.iter().map(|(_, claim)| claim).min())
-        .expect("an operation has at least one stored claim")
-        .clone();
-    (request_digest, canonical_claim_id, state.into())
-}
+const CHECKPOINT_OPERATION_METADATA_QUERY: &str =
+    "SELECT operation_id,request_digest,id FROM checkpoint_claims
+     WHERE operation_id IS NOT NULL AND request_digest IS NOT NULL
+       AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=checkpoint_claims.id)
+       AND NOT EXISTS(SELECT 1 FROM claims WHERE id=checkpoint_claims.id
+         AND json_type(body,'$._operation.id')='text'
+         AND json_type(body,'$._operation.request_digest')='text'
+         AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id))";
 
 /// What `expected_operations` holds for one operation, read through the operation index.
 pub fn expected_operation(
@@ -7994,29 +7967,33 @@ pub fn expected_operation(
     operation_id: &str,
 ) -> Result<Option<(String, String, String)>> {
     let mut statement = connection.prepare_cached(
-        "SELECT id, body FROM claims
+        "SELECT id, json_extract(body, '$._operation.request_digest') FROM claims INDEXED BY claims_operation_index
          WHERE json_extract(body, '$._operation.id')=?1
-           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
-         ORDER BY id",
+           AND json_type(body, '$._operation.id')='text'
+           AND json_type(body, '$._operation.request_digest')='text'
+           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)",
     )?;
-    let mut stored = Vec::new();
+    let mut operation = OperationMetadata::default();
     for row in statement.query_map([operation_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })? {
-        let (claim_id, body) = row?;
-        let body: Value = serde_json::from_str(&body)?;
-        if let Some((_, request_digest)) = operation_parts(&body) {
-            stored.push((request_digest.to_owned(), claim_id));
-        }
+        let (claim_id, request_digest) = row?;
+        operation.include(request_digest, claim_id, true);
     }
-    if stored.is_empty() {
-        return Ok(None);
+    let mut statement = connection.prepare_cached(
+        "SELECT request_digest,id FROM checkpoint_claims
+         WHERE operation_id=?1 AND request_digest IS NOT NULL
+           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=checkpoint_claims.id)
+           AND NOT EXISTS(SELECT 1 FROM claims WHERE id=checkpoint_claims.id
+             AND json_type(body,'$._operation.id')='text'
+             AND json_type(body,'$._operation.request_digest')='text'
+             AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id))",
+    )?;
+    for row in statement.query_map([operation_id], |row| Ok((row.get(0)?, row.get(1)?)))? {
+        let (request_digest, claim_id) = row?;
+        operation.include(request_digest, claim_id, false);
     }
-    let dropped = checkpoint::checkpointed_operation(connection, operation_id)?
-        .into_iter()
-        .filter(|(_, claim_id)| !stored.iter().any(|(_, stored)| stored == claim_id))
-        .collect();
-    Ok(Some(operation_row(&stored, dropped)))
+    Ok(operation.row())
 }
 
 /// Bring the rows of `operation_ids` to what their claims say, and leave every other row alone.
