@@ -2203,6 +2203,14 @@ impl<R: RuntimeControl> Reconciler<R> {
             if !eligible(subject) || !self.owned_desired_ready(subject) {
                 continue;
             }
+            // The pending declaration must not prepare a different workspace or block
+            // resuming the incumbent. Cutover prepares it after the explicit request.
+            if subject.kind == "agent"
+                && crate::rollout::manual(subject)
+                && crate::rollout::pending_manual_launch(&self.store, &subject.subject)?.is_some()
+            {
+                continue;
+            }
             let workspace = Path::new(&member.workspace);
             let checkout = (subject.kind == "agent")
                 .then(|| Checkout::from_desired(&subject.desired))
@@ -2497,7 +2505,19 @@ impl<R: RuntimeControl> Reconciler<R> {
                         // A workspace or render failure blocks only a start or restart. A running member
                         // is still observed, checked, and given its work.
                         let mut blocked = member_errors.remove(&subject.subject);
-                        let Some(member) = &subject.member else {
+                        let suspension = if subject.kind == "agent" {
+                            crate::suspension::current(&self.store, &subject.subject)?
+                                .filter(crate::suspension::Suspension::holds_seat)
+                        } else {
+                            None
+                        };
+                        let pending_launch = if suspension.is_some() {
+                            crate::rollout::pending_manual_launch(&self.store, &subject.subject)?
+                        } else {
+                            None
+                        };
+                        let Some(member) = pending_launch.as_ref().map(|(_, member)| member)
+                            .or(subject.member.as_ref()) else {
                             return Ok(());
                         };
                         if member.host != self.host {
@@ -2531,6 +2551,16 @@ impl<R: RuntimeControl> Reconciler<R> {
                             }
                             return Ok(());
                         }
+                        // A pending publication must not orphan a suspend or block its resume.
+                        if let Some(suspension) = &suspension {
+                            return self.reconcile_suspension(
+                                subject,
+                                member,
+                                observed.as_ref(),
+                                blocked,
+                                suspension,
+                            );
+                        }
                         if self.reconcile_rollout(subject, observed.as_ref(), blocked.as_ref())? {
                             if subject.kind == "agent"
                                 && let Some(observation) =
@@ -2555,19 +2585,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 ));
                             }
                             return Ok(());
-                        }
-                        if subject.kind == "agent"
-                            && let Some(suspension) =
-                                crate::suspension::current(&self.store, &subject.subject)?
-                            && suspension.holds_seat()
-                        {
-                            return self.reconcile_suspension(
-                                subject,
-                                member,
-                                observed.as_ref(),
-                                blocked,
-                                &suspension,
-                            );
                         }
                         if self.reconcile_claude_channel_recovery(
                             subject,
@@ -4460,6 +4477,11 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// The desired revision whose launch configuration is current. Launch records, restart
     /// budgets, and crash-loop parking key on it, so a label-only revision inherits them.
     fn launch_token(&self, subject: &str) -> Result<String> {
+        if let Some((incumbent, _)) =
+            crate::rollout::pending_manual_launch(&self.store, subject)?
+        {
+            return Ok(incumbent);
+        }
         Ok(self.store.launch_lineage(subject)?.pop().unwrap_or_default())
     }
 
@@ -5517,6 +5539,12 @@ impl<R: RuntimeControl> Reconciler<R> {
         let desired_token = self.launch_token(&subject.subject)?;
         let guard = || -> Result<()> {
             self.store.owned_desired_guard(subject)?;
+            if member.environment.contains_key(crate::suspension::RESUME_ENV) {
+                anyhow::ensure!(
+                    self.launch_token(&subject.subject)? == desired_token,
+                    "the suspended launch changed before resume"
+                );
+            }
             if let Some(request) = request {
                 anyhow::ensure!(
                     self.store.selected_desired_token(&subject.subject)?.as_deref()
@@ -5798,7 +5826,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     }
                     return Ok(());
                 };
-                self.record_member(subject, observation, true)?;
+                self.record_member_as(subject, member, observation, true)?;
                 let incarnation = observation.incarnation_id.as_deref().unwrap_or_default();
                 let blocking = suspended::blockers(&self.store, agent, incarnation)?;
                 if !blocking.is_empty() {
@@ -5847,7 +5875,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             "snapshotting" => {
                 if let Some(observation) = running {
-                    self.record_member(subject, observation, true)?;
+                    self.record_member_as(subject, member, observation, true)?;
                     stop(observation)?;
                     return Ok(());
                 }
@@ -5855,7 +5883,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     return Ok(());
                 }
                 if let Some(observation) = observation {
-                    self.record_member(subject, observation, false)?;
+                    self.record_member_as(subject, member, observation, false)?;
                 }
                 self.reconcile_runtime_stop(
                     agent,
@@ -5895,7 +5923,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             "suspended" | "fencing-source" | "transferring" => {
                 // A resume that failed after its launch leaves a process to end.
                 if let Some(observation) = running {
-                    self.record_member(subject, observation, true)?;
+                    self.record_member_as(subject, member, observation, true)?;
                     stop(observation)?;
                 } else if ended {
                     self.reconcile_runtime_stop(
@@ -5992,7 +6020,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let overdue = now_ms().saturating_sub(suspension.updated_at_unix_ms)
                     > suspended::VERIFY_TIMEOUT_MS;
                 if let Some(observation) = running {
-                    self.record_member(subject, observation, true)?;
+                    self.record_member_as(subject, member, observation, true)?;
                     let incarnation = observation.incarnation_id.as_deref().unwrap_or_default();
                     match suspended::bound_session(&self.store, agent, incarnation)? {
                         Some((_, live)) if Some(&live) == suspension.native_session_id.as_ref() => {
@@ -6035,7 +6063,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     }
                 } else if ended {
                     if let Some(observation) = observation {
-                        self.record_member(subject, observation, false)?;
+                        self.record_member_as(subject, member, observation, false)?;
                     }
                     let diagnostic = self
                         .store
@@ -6953,6 +6981,16 @@ impl<R: RuntimeControl> Reconciler<R> {
             .member
             .as_ref()
             .context("member observation lacks member")?;
+        self.record_member_as(subject, member, observation, adopted)
+    }
+
+    fn record_member_as(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: &RuntimeObservation,
+        adopted: bool,
+    ) -> Result<()> {
         let mut fields = member_fields(
             member,
             &observation.status,

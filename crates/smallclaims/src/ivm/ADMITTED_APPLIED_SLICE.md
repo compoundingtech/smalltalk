@@ -308,3 +308,48 @@ positive/128SQL/50000VM/zeroautoindex assertions and measured interval are uncha
 All26successor names/work outcomes areUNRUN; no general schema-scale work bound,
 authority/lifetime proof or activation follows. Current-main hosted/Intake and
 curator eligibility remain required; the curator owns the next queue action.
+
+
+## Fixture-only retained-prefix reclamation controls
+
+The next slice uses the same single-consumer file-backed/WAL Store fixture,
+with 32 admitted inputs, 16 applied and 16 pending. The ordinary prune helper now
+delegates its identical transaction body to a private helper shared by fault
+and crash controls; no production Installer, capture, prepared-page, Runtime,
+schema, scheduling or writer/reader finalizer changes. Existing strict/growth
+control bodies and their 128 SQL / 50,000 VM / zero-autoindex assertions stay unchanged.
+
+New controls independently copy image/reference/native/output rows and reconcile
+actual retained and journal byte sums, row counters and lifetime total. They
+witness actual image and journal DELETEs before outer rollback or a refused
+COMMIT, remove fixture hooks before returning the writer (including a caught
+panic), require an idle writer and check the specific SQLite commit-hook error.
+SQLite documents that a nonzero commit hook converts COMMIT to rollback:
+https://www.sqlite.org/c3ref/commit_hook.html and
+https://www.sqlite.org/rescode.html#constraint_commithook. The manifest, hooks
+and oracle remain fixture-owned, not a production fatal-cleanup contract.
+
+Separate exact-name child controls terminate the process before/after prune
+COMMIT. A flushed stdout marker and a file+parent-directory-synced phase artifact
+identify the phase; the parent requires both marker and distinct exit code
+before reopening. A synced pre-prune oracle checks all rows and counters after
+reopen, including retained_bytes and total_rows. Open performs no derived
+replay or counter repair; remaining pending inputs must still publish correctly.
+This does not upgrade the existing sidecar lifetime manifest to production
+all-instance restore/replacement authority.
+
+One maintenance scope covers the ordinary background prune acquisition, SQL,
+COMMIT and physical writer return, ending before diagnostic/oracle queries. It
+prints actual SQL/VM/fullscan/sort/autoindex work and removed rows/image bytes,
+and requires positive SQL and VM, <=128 SQL, <=50,000 VM and zero-autoindex. A
+same-name no-feature twin fails rather than omits the requirement. The only new
+nextest override exposes successful output; no retry/selection/thread/budget
+changes. All five new unique names are UNRUN at source authoring, including
+both actual crash phases; arithmetic is not a successful work tuple.
+
+These controls do not fix metadata inventory growth: #2173 measured whole-page
+128/129/136/160/256 statements at 0/1/8/32/128 added unrelated tables, with
+zero headroom at the base. Reusable schema/lifetime authority, multi-consumer
+retention, native/canonical mutation closure, physical-schema/work-at-scale,
+unsafe cleanup/quarantine, hold/CPU and production opt-in remain open. No new
+factory, worker, proof capability, admission policy or source activation.
