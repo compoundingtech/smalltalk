@@ -230,8 +230,13 @@ export const InitialFollowWithoutLayoutShift: Story = { args: { turns: 50, initi
   layout.observe({ type: 'layout-shift' })
   const initial = new Map<Element, number>()
   const observed = new Set<Element>()
+  const zeroRects = new Set<Element>()
   const witness = new IntersectionObserver(entries => {
-    for (const entry of entries) if (!initial.has(entry.target)) initial.set(entry.target, entry.boundingClientRect.height)
+    for (const entry of entries) {
+      // A skipped ancestor can report a zero child rectangle: it is not a rendered intrinsic-height sample.
+      if (entry.boundingClientRect.height === 0) zeroRects.add(entry.target)
+      else if (!initial.has(entry.target)) initial.set(entry.target, entry.boundingClientRect.height)
+    }
   })
   let beforePaint: ResizeObserver | undefined
   let prePaintFollowGap = 0
@@ -244,7 +249,8 @@ export const InitialFollowWithoutLayoutShift: Story = { args: { turns: 50, initi
       })
       beforePaint.observe(scroll.firstElementChild)
     }
-    for (const turn of canvasElement.querySelectorAll('[data-testid="transcript-turn"]')) if (!observed.has(turn)) {
+    // Bounded row backfill grows a turn's prefix. Compare the same complete fixture content, not two different prefixes.
+    for (const turn of canvasElement.querySelectorAll('[data-testid="transcript-turn"]')) if (!observed.has(turn) && turn.querySelector('[data-testid="user-message"]') !== null) {
       observed.add(turn)
       witness.observe(turn)
     }
@@ -252,17 +258,19 @@ export const InitialFollowWithoutLayoutShift: Story = { args: { turns: 50, initi
   mutations.observe(canvasElement, { childList: true, subtree: true })
   try {
     window.__transcriptBench!.mount()
+    while (canvasElement.querySelectorAll('[data-testid="user-message"]').length < args.turns) await frame()
     await settled(canvasElement, args.turns)
     for (let index = 0; index < 8; index++) await frame()
     const scroll = scroller(canvasElement)
     const distant = [...initial.keys()].filter(turn => turn.hasAttribute('data-distant'))
-    await expect(initial.size).toBe(args.turns)
+    await expect(observed.size).toBe(args.turns)
+    await expect(initial.size).toBeGreaterThan(0)
     await expect(distant.length).toBeGreaterThan(0)
     const skipped = distant.filter(turn => !turn.checkVisibility({ contentVisibilityAuto: true }))
     await expect(skipped.length).toBeGreaterThan(0)
     const drift = Math.max(...distant.map(turn => Math.abs(turn.getBoundingClientRect().height - initial.get(turn)!)))
     recordShifts(layout.takeRecords())
-    const proof = { turns: args.turns, distantTurns: distant.length, skippedTurns: skipped.length, drift, viewportHeight: scroll.clientHeight, prePaintFollowGap, followGap: followGap(scroll), rawCls: shifts.reduce((total, value) => total + value, 0), shifts }
+    const proof = { turns: args.turns, observedTurns: observed.size, measuredTurns: initial.size, zeroRectTurns: zeroRects.size, distantTurns: distant.length, skippedTurns: skipped.length, drift, viewportHeight: scroll.clientHeight, prePaintFollowGap, followGap: followGap(scroll), rawCls: shifts.reduce((total, value) => total + value, 0), shifts }
     canvasElement.dataset.layoutProof = JSON.stringify(proof)
     console.info('transcript-initial-follow-layout', proof)
     await expect(drift).toBeLessThanOrEqual(1)

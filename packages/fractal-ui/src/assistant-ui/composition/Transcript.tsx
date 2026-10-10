@@ -142,7 +142,8 @@ const turnGroupSize = 16
  * turn while it stays in the transcript, so neither prepended history nor new turns move an existing turn to another
  * group: turns keep their React identity, disclosure state and focus. A distant full group skips as one box:
  * revealing a pane styles the groups, not every turn. A partial group (the oldest one while older turns backfill or
- * history is prepended, the newest one while turns arrive) is not observed, so it never skips as a whole; once full
+ * history is prepended, the newest one while turns arrive) is not observed and has no layout box: its children
+ * participate in the outer timeline, avoiding a moving aggregate box during bounded prefix backfill. Once full
  * it renders a frame at its full height before its first report can mark it distant.
  */
 const turnGroups = (turns: readonly TranscriptTurn[], start: number, origin: number) => {
@@ -152,7 +153,7 @@ const turnGroups = (turns: readonly TranscriptTurn[], start: number, origin: num
 }
 function TurnGroup({ full, children }: { readonly full: boolean; readonly children: React.ReactNode }) {
   const observe = React.useContext(TurnProximityRef)
-  return <div ref={full ? observe : undefined} {...stylex.props(styles.timeline, styles.turnSkip)}>{children}</div>
+  return <div ref={full ? observe : undefined} {...stylex.props(styles.timeline, styles.turnSkip, !full && styles.partialGroup)}>{children}</div>
 }
 /** Fallback for an item the runtime never adopted: visible in place, never silently dropped. */
 function StrandedItem({ item }: { readonly item: ConversationItem }) {
@@ -395,6 +396,7 @@ const styles = stylex.create({
   lane: { flex: '1 1 0', minHeight: 0, minWidth: 0, overflowY: 'auto', overflowX: 'hidden', overflowAnchor: 'none' },
   // The shared reading column keeps rows and a reading-column composer on the same bounds.
   content: { paddingBlock: s.lg }, timeline: { display: 'flex', flexDirection: 'column', gap: s.xl, minWidth: 0 }, turn: { display: 'flex', flexDirection: 'column', gap: s.md, minWidth: 0 },
+  partialGroup: { display: 'contents' },
   workList: { maxHeight: 'none', overflowY: 'visible', overscrollBehavior: 'auto' },
   // Turns and full turn groups far from the reader skip style, layout and paint; `auto` keeps each box's last rendered
   // height as its placeholder, recorded while the box renders.
