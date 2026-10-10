@@ -402,9 +402,12 @@ export type Attention = ResourceHeader & {
 
 };
   actions: Array<"custom.reply" | "work.done" | "review.approve" | "review.reject" | "review.request-changes" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
+  alert?: boolean;
   attention_kind: ("human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault" | string);
   because?: string;
   blocked?: AttentionBlocked;
+  conversation_id?: Id;
+  conversation_ids?: Array<Id>;
   custom_form?: {
 
 };
@@ -1527,6 +1530,7 @@ export type Summary = ResourceHeader & {
   published_at: Timestamp;
   store_index: number;
 };
+  alerts?: number;
   kind: "summary";
   machines: SummaryMachines;
   needs_you: number;

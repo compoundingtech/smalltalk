@@ -143,6 +143,10 @@ mod checkpoint_agreement_tests;
 #[cfg(test)]
 mod checkpoint_tests;
 #[cfg(test)]
+mod checkpoint_capture_epoch_tests;
+#[cfg(test)]
+mod checkpoint_replication_capture_tests;
+#[cfg(test)]
 mod convergence;
 #[cfg(test)]
 mod document_index_tests;
@@ -1669,6 +1673,7 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
         || version == 15
         || version == 16
         || version == 17
+        || version == 18
     {
         return Ok(());
     }
@@ -3645,7 +3650,16 @@ impl Store {
             cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
             let items = Arc::clone(&entry.items);
             cache.push_back(entry);
-            if cache.len() > 8 { cache.pop_front(); }
+            if cache.len() > 8 {
+                // Keep the newest complete publication of each mode, even while the other
+                // mode republishes or this one is still assembling partial chunks.
+                let oldest = cache.iter().position(|entry| entry.covered.is_some()
+                    || cache.iter().any(|newer| newer.history == entry.history
+                        && newer.covered.is_none()
+                        && (newer.index, newer.local) > (entry.index, entry.local)))
+                    .expect("only two complete roster publications can be protected");
+                cache.remove(oldest);
+            }
             items
         };
         drop(cache);
@@ -13965,7 +13979,29 @@ impl Store {
     fn mission_run_attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
         let mut items = Vec::new();
         let reviews = self.pending_human_reviews(person)?;
-        items.extend(reviews.into_iter().map(attention_item_from_review));
+        {
+            let connection = self.readers.get();
+            for review in reviews {
+                // The gate's owner is the step whose work it reviews, a loop whose step runs
+                // it, or its run.
+                let step = if review.owner.starts_with("step-run/") {
+                    Some(review.owner.clone())
+                } else if review.owner.starts_with("loop-run/") {
+                    loop_step_tx(&connection, &review.owner)?.map(|step| step.subject)
+                } else {
+                    None
+                };
+                let conversation = attention_snapshot::conversation_agent(
+                    &connection,
+                    step.as_deref(),
+                    Some(&review.mission_run),
+                )?;
+                items.push(AttentionItemView {
+                    conversation,
+                    ..attention_item_from_review(review)
+                });
+            }
+        }
 
         {
             let connection = self.readers.get();
@@ -14170,7 +14206,7 @@ impl Store {
                     ),
                     launch_id: None,
                     variant_id: None,
-                    message_id: None,
+                    message_id: None, conversation: None,
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -17032,11 +17068,20 @@ impl Store {
 
     /// A login is work only the seat's person can do. Project it from the current canonical
     /// condition, rather than raising an agent-owned fault or a legacy attention request.
+    /// One alert per login that needs a person: seats that share a login directory on a host
+    /// fail together and one sign-in fixes them all, so they share an alert that names each seat
+    /// and shows in each one's conversation. It clears when the login works again.
     fn harness_login_attention_items(
         &self,
         person: Option<&str>,
     ) -> Result<Vec<AttentionItemView>> {
-        let mut items = Vec::new();
+        struct Seat {
+            subject: String,
+            driver: String,
+            episode: String,
+            requested_at: u128,
+        }
+        let mut logins: BTreeMap<(String, String, String), Vec<Seat>> = BTreeMap::new();
         for desired in self.desired_harness_login_candidates()? {
             if !person_work::declaration_live(&self.readers.get(), &desired.subject)? {
                 continue;
@@ -17057,13 +17102,37 @@ impl Store {
                 .member
                 .as_ref()
                 .and_then(|m| m.driver.as_deref())
-                .unwrap_or("harness");
+                .unwrap_or("harness")
+                .to_owned();
             let host = desired
                 .member
                 .as_ref()
-                .map(|m| m.host.as_str())
-                .unwrap_or("unknown");
-            let login = match driver {
+                .map(|m| m.host.clone())
+                .unwrap_or_else(|| "unknown".into());
+            let login = self.seat_login(&desired, &host, &driver)?;
+            let (fence, episode) =
+                self.harness_login_episode_key(&desired.subject, &harness.incarnation_id)?;
+            let requested_at = fence.as_ref().map_or(harness.observed_at_unix_ms, |claim| {
+                claim.accepted_at_unix_ms
+            });
+            logins.entry((owner, host, login)).or_default().push(Seat {
+                subject: desired.subject,
+                driver,
+                episode,
+                requested_at,
+            });
+        }
+        let mut items = Vec::new();
+        for ((owner, host, login), mut seats) in logins {
+            // The seat that failed first stands for the login: its terminal is where to sign in,
+            // and its episode is the alert's. If it recovers before the others, the next seat
+            // stands for the login and the alert's ID changes with it: a login episode of its
+            // own would have to be written, and a read never writes.
+            seats.sort_by(|left, right| {
+                (left.requested_at, &left.subject).cmp(&(right.requested_at, &right.subject))
+            });
+            let first = &seats[0];
+            let how = match first.driver.as_str() {
                 "claude" | "pi" | "omp" => "run /login",
                 "codex" => {
                     "complete the sign-in prompt or run codex login in a shell using this seat's account configuration"
@@ -17073,24 +17142,62 @@ impl Store {
                 }
                 _ => "use this harness's login command",
             };
-            let (fence, key) =
-                self.harness_login_episode_key(&desired.subject, &harness.incarnation_id)?;
-            let requested_at = fence.as_ref().map_or(harness.observed_at_unix_ms, |claim| {
-                claim.accepted_at_unix_ms
-            });
+            let names = seats
+                .iter()
+                .map(|seat| seat.subject.as_str())
+                .collect::<Vec<_>>();
+            let (title, detail) = if let [seat] = names.as_slice() {
+                (
+                    format!("{seat} on {host} needs you to log in"),
+                    format!("{seat} on {host} needs you to log in: attach (Ctrl+] in stui) and {how}. A successful authenticated turn clears this alert automatically."),
+                )
+            } else {
+                (
+                    format!("{} seats on {host} need you to log in to {login}", names.len()),
+                    format!("{} on {host} share the login {login}, which needs you to sign in again: attach to {} (Ctrl+] in stui) and {how}. One sign-in fixes every seat; each clears when its next authenticated turn succeeds.", names.join(", "), first.subject),
+                )
+            };
             items.push(AttentionItemView {
-                episode: key, priority: "high".into(), kind: "harness-login".into(), review_mode: None,
-                subject: desired.subject.clone(), person: owner, requester_id: None, launch_id: None,
-                variant_id: None, message_id: None,
-                title: format!("{} on {host} needs you to log in", desired.subject),
-                detail: format!("{} on {host} needs you to log in: attach (Ctrl+] in stui) and {login}. A successful authenticated turn clears this item automatically.", desired.subject),
+                episode: first.episode.clone(), priority: "high".into(), kind: "harness-login".into(), review_mode: None,
+                subject: first.subject.clone(), person: owner, requester_id: None, launch_id: None,
+                variant_id: None, message_id: None, conversation: Some(first.subject.clone()),
+                title, detail,
                 request: None, mission: None, mission_run: None, step: None,
-                targets: vec![desired.subject.clone()], requested_at_unix_ms: requested_at,
+                targets: names.iter().map(|name| (*name).to_owned()).collect(),
+                requested_at_unix_ms: first.requested_at,
                 actions: vec![crate::model::AttentionActionView { label: "Attach to log in".into(),
-                    argv: vec!["st".into(), "terminals".into(), "attach".into(), desired.subject] }],
+                    argv: vec!["st".into(), "terminals".into(), "attach".into(), first.subject.clone()] }],
             });
         }
         Ok(items)
+    }
+
+    /// The login directory a seat's harness runs with on `host`: its account's, or the pool
+    /// account this node placed it on, else the harness's own default login on that host. Only
+    /// the seat's own node knows which pool account it chose, so a pooled seat on another node
+    /// stands alone rather than being merged with seats that may use another login.
+    fn seat_login(&self, desired: &DesiredSubject, host: &str, driver: &str) -> Result<String> {
+        let account = match crate::accounts::harness_binding(&desired.desired).map(|b| b.binding) {
+            Some(crate::accounts::Binding::Account(name)) => name,
+            Some(crate::accounts::Binding::Pool(_)) if host == self.origin => {
+                match self.seat_account_choice(&desired.subject)? {
+                    Some(name) => name,
+                    None => return Ok(format!("the login of {}", desired.subject)),
+                }
+            }
+            Some(crate::accounts::Binding::Pool(_)) => {
+                return Ok(format!("the login of {}", desired.subject));
+            }
+            None => return Ok(format!("the default {driver} login")),
+        };
+        // One declaration read by its key, not a scan of every declared subject.
+        Ok(self
+            .desired_subject_with_writer(&format!("account/{account}"))?
+            .and_then(|(declared, _)| {
+                crate::accounts::parse_account(&declared.subject, &declared.desired)
+            })
+            .and_then(|declared| declared.login_for(host).map(str::to_owned))
+            .unwrap_or(account))
     }
 
     pub(crate) fn harness_login_episode_key(
@@ -21081,16 +21188,18 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute("DELETE FROM planning_candidates", [])?;
     transaction.execute("DELETE FROM planning_sessions", [])?;
     let mut statement = transaction.prepare(
-        &canonical_sql("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+        &canonical_sql("SELECT id
          FROM claims WHERE kind >= 'planning-session.' AND kind < 'planning-session/'
          ORDER BY CANONICAL_ASC(claims)"),
     )?;
-    let claims = statement
-        .query_map([], claim_from_row)?
+    let claim_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     clear_quarantined_claims_tx(transaction, "projection:planning")?;
-    for claim in claims {
+    for id in claim_ids {
+        let claim = claim_by_id_tx(transaction, &id)?
+            .context("a planning claim disappeared during replay")?;
         // A claim admission accepted but this projection cannot read, such as one from a faulty
         // or older producer, is quarantined alone instead of failing the whole graph.
         project_claim_isolated_tx(transaction, "projection:planning", &claim, || {
@@ -24228,7 +24337,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
         requester_id: None,
         launch_id: None,
         variant_id: None,
-        message_id: None,
+        message_id: None, conversation: None,
         title: review
             .title
             .clone()
@@ -24295,6 +24404,7 @@ fn attention_item_from_planning(
             session.id, candidate.variant
         )),
         message_id: None,
+        conversation: attention_snapshot::agent(&session.planner),
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
         mission: Some(format!("mission/{}", session.mission)),
@@ -24353,6 +24463,7 @@ fn attention_item_from_revision(
         launch_id: None,
         variant_id: None,
         message_id: None,
+        conversation: attention_snapshot::agent(&proposal.actor),
         title: format!("Approve a revision of {}", run.mission),
         detail: proposal.reason.clone(),
         mission: Some(run.mission.clone()),
@@ -24412,7 +24523,7 @@ fn attention_item_from_failure(request: AttentionRequestView) -> AttentionItemVi
         requester_id: Some(request.actor),
         launch_id: None,
         variant_id: None,
-        message_id: None,
+        message_id: None, conversation: None,
         title: request.title,
         detail: request.reason,
         mission: None,
@@ -28918,6 +29029,7 @@ fn project_replicated_base_claims_with_progress(
         )
         .map_err(internal)?;
     clear_quarantined_claims_tx(transaction, "projection:base")?;
+
     progress(ReplayProgress {
         phase: "full-replay/base-claims",
         processed: Some(0),
@@ -29159,20 +29271,22 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
         };
         let mut statement = transaction
             .prepare(&canonical_sql(&format!(
-                "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
-                        claims.origin, claims.actor, claims.body, claims.predecessors,
-                        claims.accepted_at_unix_ms
+                "SELECT claims.id
                  FROM claims JOIN batches ON batches.id=claims.batch_id WHERE {filter}
                  ORDER BY CANONICAL_ASC(claims)"
             )))
             .map_err(internal)?;
-        let claims = statement
-            .query_map([], claim_from_row)
+        let claim_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
             .map_err(internal)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal)?;
         drop(statement);
-        for claim in claims {
+        for id in claim_ids {
+            let claim = claim_by_id_tx(transaction, &id)
+                .map_err(internal)?
+                .context("a mission run claim disappeared during replay")
+                .map_err(internal)?;
             project_claim_isolated_tx(transaction, "projection:runs", &claim, || match pass {
                 0 => project_mission_run_created(transaction, &claim),
                 1 => project_mission_run_update(transaction, &claim),
@@ -44858,7 +44972,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            17
+            st3_schema::STORAGE_VERSION
         );
         assert_eq!(
             connection
@@ -44932,7 +45046,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            17
+            st3_schema::STORAGE_VERSION
         );
     }
 
@@ -44965,7 +45079,7 @@ version 2
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
         assert_eq!(planner_column, 1);
     }
 
@@ -47030,9 +47144,19 @@ version 2
                 child_step,
             ))
             .unwrap();
+        // This repair touches run-state projections and appends new history, not any
+        // captured body, canonical key or protection reference.
+        store.checkpoint_sealed_set(now_ms() + 1_000).unwrap();
         let before_dry_run = store.index().unwrap();
+        let capture_epoch =
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap();
         let repair = store.operational_repair_plan().unwrap();
         assert_eq!(store.index().unwrap(), before_dry_run);
+        assert_eq!(
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap(),
+            capture_epoch,
+            "planning a repair must not invalidate checkpoint capture"
+        );
         assert_eq!(repair.status, "changes");
         assert!(repair.items.iter().any(|item| {
             item.class == "terminal-descendants"
@@ -47043,9 +47167,21 @@ version 2
         let applied = store.apply_operational_repair(&repair.token).unwrap();
         assert!(applied.applied >= 1);
         assert!(!applied.already_applied);
+        let repaired_epoch =
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap();
+        assert_eq!(
+            repaired_epoch,
+            capture_epoch,
+            "unrelated operational-state repair must not invalidate captured history"
+        );
         let duplicate = store.apply_operational_repair(&repair.token).unwrap();
         assert_eq!(duplicate.applied, 0);
         assert!(duplicate.already_applied);
+        assert_eq!(
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap(),
+            repaired_epoch,
+            "an already-applied repair must not invalidate checkpoint capture"
+        );
         assert_eq!(store.operational_repair_plan().unwrap().status, "clean");
         let history = store.work(None, true).unwrap();
         let nested = history
@@ -54598,13 +54734,18 @@ message "human-attention" {
             "harness.observed",
             json!({"state":"idle", "incarnation_id":"current", "provider_auth":null}),
         );
+        // These seats share the harness's default login on one host, so one alert names them all.
         let login_subjects = || {
-            store
+            let logins = store
                 .attention_items(Some("person/avery"))
                 .unwrap()
                 .into_iter()
                 .filter(|item| item.kind == "harness-login")
-                .map(|item| item.subject)
+                .collect::<Vec<_>>();
+            assert!(logins.len() <= 1, "{logins:?}");
+            logins
+                .into_iter()
+                .flat_map(|item| item.targets)
                 .collect::<BTreeSet<_>>()
         };
         let (items, reads) = smallclaims::touched::record(login_subjects);
@@ -54650,6 +54791,73 @@ message "human-attention" {
         assert_eq!(
             login_subjects(),
             BTreeSet::from(["agent/node.healthy".into()])
+        );
+    }
+
+    #[test]
+    fn one_login_alert_per_login_directory_names_every_seat_that_shares_it() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().display().to_string();
+        let source = format!(
+            r#"version 2
+account "avery/one" {{ provider "anthropic"; owner "person/avery"; plan "max"; login "/logins/one"; }}
+account "avery/two" {{ provider "anthropic"; owner "person/avery"; plan "max"; login "/logins/two"; }}
+agent "first" {{ workspace {workspace:?}; harness "claude" {{ account "avery/one"; }} }}
+agent "second" {{ workspace {workspace:?}; harness "claude" {{ account "avery/one"; }} }}
+agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two"; }} }}
+"#
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &preview.subject_tokens, "logins", Some("person/avery"))
+            .unwrap();
+        for name in ["first", "second", "third"] {
+            for (kind, fields) in [
+                ("runtime.observed", json!({"status":"running", "incarnation_id":"current"})),
+                ("harness.diagnostic", json!({"code":"provider-auth-expired", "incarnation_id":"current", "driver":"claude"})),
+            ] {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: format!("agent/node.{name}"),
+                        kind: kind.into(),
+                        actor: Some(format!("agent/node.{name}")),
+                        fields: serde_json::from_value(fields).unwrap(),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            }
+        }
+        let logins = store
+            .attention_items(Some("person/avery"))
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == "harness-login")
+            .map(|item| (item.targets.clone(), (item.is_alert(), item.conversations())))
+            .collect::<BTreeMap<_, _>>();
+        let seats = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| format!("agent/node.{name}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            logins,
+            BTreeMap::from([
+                (seats(&["first", "second"]), (true, seats(&["first", "second"]))),
+                (seats(&["third"]), (true, seats(&["third"]))),
+            ])
         );
     }
 

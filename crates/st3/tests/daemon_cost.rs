@@ -91,6 +91,15 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
 /// Routes the check does not measure, and why. Keep this list short: a route here can grow with
 /// the store unnoticed.
 const NOT_MEASURED: &[(&str, &str)] = &[
+    // Aliases: the same handler as a measured route under the name a person reads.
+    (
+        "GET /v1/client/alerts",
+        "the GET /v1/client/attention handler, which is measured",
+    ),
+    (
+        "GET /v1/client/alerts/{*id}",
+        "the GET /v1/client/attention/{*id} handler, which is measured",
+    ),
     // Sekrets: neither reads the claim store beyond one primary-key lookup.
     (
         "POST /v1/sekrets/attest",

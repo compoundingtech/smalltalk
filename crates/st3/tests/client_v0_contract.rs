@@ -1266,6 +1266,25 @@ async fn attention_socket_evicts_completed_sources_and_reconnects_without_cached
         .iter()
         .find(|c| c["source_id"] == ask.subject)
         .unwrap();
+    // The ask is an alert in its asker's conversation.
+    assert_eq!(card["alert"], true, "{card}");
+    assert_eq!(
+        card["conversation_id"],
+        format!("agent/{}.asker", state.store.origin())
+    );
+    // `alerts` is the same collection under the name a person reads.
+    stream
+        .subscribe("alerts", "alerts", 20, None, None)
+        .await
+        .unwrap();
+    let alerts = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(alerts["id"], "alerts");
+    assert_eq!(alerts["items"], first["items"]);
+    stream.unsubscribe("alerts").await.unwrap();
     let card_id = card["id"].clone();
     let revision = card["revision"].clone();
     let app = st3::api::router(state.clone());
@@ -2203,10 +2222,15 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
     assert_eq!(capability_state("mission.cancel-revision"), "ungranted");
     assert_eq!(capability_state("launch.create"), "granted");
     assert_eq!(capability_state("message.send"), "ungranted");
+    assert_eq!(capability_state("alerts"), "granted");
 
     let (status, attention) =
         client_json_auth(fabric.clone(), "/v1/client/attention", credential).await;
     assert_eq!(status, StatusCode::OK, "{attention}");
+    let (status, alerts) =
+        client_json_auth(fabric.clone(), "/v1/client/alerts", credential).await;
+    assert_eq!(status, StatusCode::OK, "{alerts}");
+    assert_eq!(alerts["value"]["items"], attention["value"]["items"]);
     let item = |id: &str| {
         attention["value"]["items"]
             .as_array()

@@ -1795,6 +1795,40 @@ mod retry_tests {
             // reach the stable servers. Both queues drain despite server hour-long backoff.
             outbound = vec![start(2, 0), start(2, 1)];
             converge(&stores).await;
+            // The stores agreeing does not mean each server's last answer to the traveller
+            // carried its final inventory: a server that relays the traveller's own claims from
+            // the other server after answering has a changed inventory, which asks its worker to
+            // push to the traveller one coalescing interval later. That push is the policy for
+            // new local envelopes, not a redundant connection. Wake the traveller so both servers
+            // answer once more with the settled inventory, and measure only after they have.
+            wakes[2].send_modify(|generation| *generation += 1);
+            let settled_by = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let mut settled = true;
+                for index in 0..2 {
+                    let current = Local(stores[index].clone())
+                        .export(fleet_id, &ReplicationInventory::default(), true, &[])
+                        .await
+                        .unwrap()
+                        .exchange
+                        .authority_digest;
+                    let answered = contexts[index]
+                        .inbound_authority
+                        .read()
+                        .unwrap()
+                        .get("traveller")
+                        .cloned();
+                    settled &= answered.as_deref() == Some(current.as_str());
+                }
+                if settled {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < settled_by,
+                    "the servers did not answer the traveller with their settled inventory within ten seconds"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             let before = attempts.load(Ordering::Relaxed);
             tokio::time::sleep(Duration::from_secs(2)).await;
             assert_eq!(
