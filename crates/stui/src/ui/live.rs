@@ -48,6 +48,51 @@ struct Pending {
     /// When it was last sent (or sent again): one st has not answered for a while is said to be
     /// unconfirmed, so it can be sent again or cleared rather than wait forever.
     since: Instant,
+    /// The marks of this send for the local timing file.
+    marks: super::submit_timing::Marks,
+}
+
+/// Write the timing line for a send that ended, once.
+fn finish_timing(
+    log: Option<&std::path::Path>,
+    entry: &mut Pending,
+    outcome: super::submit_timing::Outcome,
+) {
+    if entry.marks.logged {
+        return;
+    }
+    entry.marks.logged = true;
+    if let Some(path) = log {
+        let line = entry.marks.line(
+            outcome,
+            entry.message_id.as_deref(),
+            &crate::version::short(crate::version::now()),
+        );
+        super::submit_timing::append(path, &line);
+    }
+}
+
+/// Drop the sends `keep` does not keep, writing each one's timing line.
+fn drop_finished(
+    log: Option<&std::path::Path>,
+    pending: &mut Vec<Pending>,
+    keep: impl Fn(&Pending) -> bool,
+) {
+    use super::submit_timing::Outcome;
+    let mut kept = Vec::with_capacity(pending.len());
+    for mut entry in std::mem::take(pending) {
+        if keep(&entry) {
+            kept.push(entry);
+        } else {
+            let outcome = if entry.failed.is_some() {
+                Outcome::Failed
+            } else {
+                Outcome::Delivered
+            };
+            finish_timing(log, &mut entry, outcome);
+        }
+    }
+    *pending = kept;
 }
 
 /// How long a message waits for st's answer before it says st has not confirmed it.
@@ -319,6 +364,8 @@ pub fn run(context: Context) -> Result<()> {
     let mut preview_requested: HashSet<String> = HashSet::new();
     let mut body_requested: HashSet<String> = HashSet::new();
     let mut read_receipts = ReadReceipts::default();
+    // Where this device keeps what each send cost (milliseconds and ids only).
+    let submit_log = super::submit_timing::path();
     // Messages sent from here, shown at once until st reports them back.
     let mut pending: Vec<Pending> = Vec::new();
     let mut ui = Ui::new(adapt::world(&model, &person, &extras));
@@ -526,7 +573,7 @@ pub fn run(context: Context) -> Result<()> {
                             session_id: Some(session_id),
                         });
                     // A message sent from here is done once st shows it in the conversation.
-                    pending.retain(|pending| {
+                    drop_finished(submit_log.as_deref(), &mut pending, |pending| {
                         pending.message_id.as_ref().is_none_or(|id| {
                             !timelines.values().flat_map(|timeline| &timeline.items).any(|entry| {
                                 matches!(&entry.body, TimelineBody::Message(message) if &message.message_id == id)
@@ -637,6 +684,7 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 Fetched::Sent(token, outcome) => {
                     if let Some(entry) = pending.iter_mut().find(|entry| entry.token == token) {
+                        entry.marks.acked();
                         match outcome {
                             Ok(id) => {
                                 entry.message_id = id;
@@ -646,12 +694,13 @@ pub fn run(context: Context) -> Result<()> {
                             Err((error, unconfirmed)) => {
                                 entry.failed = Some(error);
                                 entry.unconfirmed = unconfirmed;
+                                finish_timing(submit_log.as_deref(), entry, super::submit_timing::Outcome::Failed);
                             }
                         }
                     }
                     // st took it. The copy here gives way once the conversation shows it, which
                     // may already have happened; with no id to look for, at once.
-                    pending.retain(|entry| {
+                    drop_finished(submit_log.as_deref(), &mut pending, |entry| {
                         entry.token != token
                             || entry.failed.is_some()
                             || entry.message_id.as_ref().is_some_and(|id| {
@@ -1250,6 +1299,9 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 Effect::Forget { entry } => {
                     let token = entry.trim_start_matches("pending:");
+                    for gone in pending.iter_mut().filter(|pending| pending.token == token) {
+                        finish_timing(submit_log.as_deref(), gone, super::submit_timing::Outcome::Cleared);
+                    }
                     pending.retain(|pending| pending.token != token);
                     changed = true;
                     continue;
@@ -1293,6 +1345,7 @@ pub fn run(context: Context) -> Result<()> {
                         effect: effect.clone(),
                         sent: sent.clone(),
                         since: Instant::now(),
+                        marks: super::submit_timing::Marks::begin(),
                     });
                     changed = true;
                     (effect, Some(token), Some(sent))
@@ -1388,6 +1441,10 @@ pub fn run(context: Context) -> Result<()> {
             cursor_style = style;
         }
         execute!(io::stdout(), EndSynchronizedUpdate)?;
+        // A send's pending copy is on screen from this draw on.
+        for entry in pending.iter_mut() {
+            entry.marks.drawn();
+        }
         let visible = ui.visible_messages();
         let incoming: HashSet<_> = timelines
             .values()
@@ -2858,6 +2915,57 @@ mod tests {
         ));
     }
 
+    fn a_pending_entry(token: &str) -> Pending {
+        Pending {
+            token: token.into(),
+            agent: "agent/example/worker".into(),
+            text: "hello".into(),
+            at: "12:00".into(),
+            message_id: None,
+            failed: None,
+            unconfirmed: false,
+            effect: Effect::Send {
+                agent: "agent/example/worker".into(),
+                text: "hello".into(),
+                in_reply_to: None,
+                tags: vec![],
+                images: vec![],
+            },
+            sent: Arc::new(Mutex::new(None)),
+            since: Instant::now(),
+            marks: super::super::submit_timing::Marks::begin(),
+        }
+    }
+
+    #[test]
+    fn a_finished_send_is_logged_once_with_milliseconds_and_ids_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("submit-timing.jsonl");
+        let mut pending = vec![a_pending_entry("one"), a_pending_entry("two")];
+        for entry in pending.iter_mut() {
+            entry.marks.drawn();
+            entry.marks.acked();
+        }
+        pending[0].message_id = Some("message/abc".into());
+        // The delivered entry showed: "one" gives way and is logged; "two" stays.
+        drop_finished(Some(&log), &mut pending, |entry| entry.token != "one");
+        assert_eq!(pending.len(), 1);
+        // A failed send is logged when st answers, and not a second time when it is cleared.
+        finish_timing(Some(&log), &mut pending[0], super::super::submit_timing::Outcome::Failed);
+        finish_timing(Some(&log), &mut pending[0], super::super::submit_timing::Outcome::Cleared);
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["outcome"], "delivered");
+        assert_eq!(lines[0]["message_id"], "message/abc");
+        assert_eq!(lines[1]["outcome"], "failed");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(!text.contains("hello") && !text.contains("agent/example/worker"), "{text}");
+    }
+
     #[test]
     fn read_receipt_retries_survive_navigation_and_serialize_snapshot_changes() {
         let now = Instant::now();
@@ -3213,6 +3321,7 @@ mod tests {
     fn a_message_st_has_not_answered_becomes_unconfirmed_so_it_can_go_again() {
         let pending = |since: Instant| Pending {
             token: "t".into(),
+            marks: super::super::submit_timing::Marks::begin(),
             agent: "agent/example/cos".into(),
             text: "hello".into(),
             at: "10:29".into(),

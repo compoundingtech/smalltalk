@@ -30,6 +30,7 @@ pub mod layout;
 pub mod live;
 pub mod pane;
 mod prefs;
+mod submit_timing;
 mod pty;
 pub mod screens;
 pub mod text;
