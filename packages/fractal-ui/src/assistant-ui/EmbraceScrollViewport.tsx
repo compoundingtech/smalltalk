@@ -77,7 +77,7 @@ class ViewportController {
     if (element === null) return
     element.dataset.followState = this.following ? 'attached' : 'detached'
     if (this.jumpButton === null || this.pressed.size > 0) return
-    this.jumpButton.hidden = this.following || element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.scrollEndTolerance
+    this.jumpButton.hidden = this.following || element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.followAffordanceBand
   }
 
   readonly released = (): ViewportState => ({ top: this.lastTop, following: this.following, unread: this.unread })
@@ -331,7 +331,6 @@ class ViewportController {
     element.addEventListener('touchmove', manual, { passive: true })
     element.addEventListener('keydown', manual)
     element.addEventListener('pointerdown', manual, { passive: true })
-    element.addEventListener('focusin', manual)
     element.addEventListener('scroll', scroll, { passive: true })
     element.addEventListener('scrollend', scrollend, { passive: true })
     page.addEventListener('pointerdown', press, true)
@@ -359,7 +358,6 @@ class ViewportController {
       element.removeEventListener('touchmove', manual)
       element.removeEventListener('keydown', manual)
       element.removeEventListener('pointerdown', manual)
-      element.removeEventListener('focusin', manual)
       element.removeEventListener('scroll', scroll)
       element.removeEventListener('scrollend', scrollend)
       page.removeEventListener('pointerdown', press, true)

@@ -3,6 +3,7 @@ import * as stylex from '@stylexjs/stylex'
 import { flushSync } from 'react-dom'
 import type { Meta, StoryObj } from '@storybook/react-vite'
 import { expect, userEvent, waitFor, within } from 'storybook/test'
+import { Button } from 'react-aria-components'
 import { EmbraceScrollViewport, type EmbraceScrollViewportHandle } from './assistant-ui/EmbraceScrollViewport'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
@@ -51,6 +52,7 @@ function FollowStory({ scheme = 'dark', lane = 'kit' }: { scheme?: Scheme; lane?
   const content = rows.map(row => <article key={row.id} data-item-id={row.id} {...stylex.props(styles.row)}>
     <p {...stylex.props(styles.text)}>{row.text}</p>
     {row.id === 'history-3' && expanded && <pre data-testid="expanded-above" {...stylex.props(styles.expanded)}>{'An expanded observation above the reading line.\n'.repeat(10)}</pre>}
+    {row.id === latestKey && <Button>Reply action</Button>}
   </article>)
   return <main {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
     {lane === 'kit'
@@ -308,6 +310,76 @@ export const PillReattaches: Story = { play: async ({ canvasElement }) => {
   await expectAttached(canvasElement, lane)
 } }
 export const PillReattachesLight: Story = { ...PillReattaches, args: { scheme: 'light' } }
+/** Visibility has its own 40px band; it must not borrow the 1px end/rounding tolerance. */
+async function provePillBand(canvasElement: HTMLElement, revealInsideBand = false) {
+  const { canvas, lane } = await ready(canvasElement)
+  await readerScrollsUp(lane, 20)
+  await expect(lane.dataset['followState']).toBe('detached')
+  if (revealInsideBand) canvasElement.querySelector<HTMLButtonElement>('[aria-label="Scroll to end"]')!.hidden = false
+  await expect(canvas.queryByRole('button', { name: pillName }), '20px is inside the pill visibility band').toBeNull()
+  await readerScrollsUp(lane, 20)
+  await expect(canvas.queryByRole('button', { name: pillName }), '40px is inside the pill visibility band').toBeNull()
+  await readerScrollsUp(lane, 1)
+  await expect(canvas.getByRole('button', { name: pillName })).toBeVisible()
+  await readerScrollsUp(lane, 359)
+  await expect(Math.round(gap(lane))).toBe(400)
+  await expect(canvas.getByRole('button', { name: pillName })).toBeVisible()
+}
+export const PillVisibilityBand: Story = { play: async ({ canvasElement }) => { await provePillBand(canvasElement) } }
+export const PillVisibilityBandLight: Story = { ...PillVisibilityBand, args: { scheme: 'light' } }
+export const PillInsideBandControl: Story = { play: async ({ canvasElement }) => {
+  await expect(provePillBand(canvasElement, true)).rejects.toThrow(/20px is inside/)
+} }
+export const PillInsideBandControlLight: Story = { ...PillInsideBandControl, args: { scheme: 'light' } }
+
+/** Tabbing to the lane or a row action is focus, not a request to read history. */
+async function proveFocusKeepsFollowing(canvasElement: HTMLElement, navigation = false) {
+  const { canvas, lane } = await ready(canvasElement)
+  if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
+  await userEvent.tab()
+  await expect(document.activeElement).toBe(lane)
+  if (navigation) lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageUp', bubbles: true }))
+  for (let chunk = 0; chunk < 4; chunk++) {
+    const painted = await paintedAfter(() => drive().stream(), () => gap(lane))
+    await expect(painted, 'focus alone must keep streaming at the end').toBeLessThanOrEqual(1)
+  }
+  await expectAttached(canvasElement, lane)
+  await userEvent.tab()
+  await expect(document.activeElement).toBe(canvas.getByRole('button', { name: 'Reply action' }))
+  for (let chunk = 0; chunk < 4; chunk++) {
+    const painted = await paintedAfter(() => drive().stream(), () => gap(lane))
+    await expect(painted, 'row-action focus alone must keep streaming at the end').toBeLessThanOrEqual(1)
+  }
+  await expectAttached(canvasElement, lane)
+}
+export const TabKeepsFollowing: Story = { play: async ({ canvasElement }) => { await proveFocusKeepsFollowing(canvasElement) } }
+export const TabKeepsFollowingLight: Story = { ...TabKeepsFollowing, args: { scheme: 'light' } }
+export const NavigationIntentControl: Story = { play: async ({ canvasElement }) => {
+  await expect(proveFocusKeepsFollowing(canvasElement, true)).rejects.toThrow(/focus alone must keep/)
+} }
+export const NavigationIntentControlLight: Story = { ...NavigationIntentControl, args: { scheme: 'light' } }
+
+/** Shift+Tab reaches the detached pill; Enter returns to the end and hands focus back to the draft. */
+async function proveKeyboardPill(canvasElement: HTMLElement, activate = true) {
+  const { canvas, lane } = await ready(canvasElement)
+  await readerScrollsUp(lane, 400)
+  const pill = canvas.getByRole('button', { name: pillName })
+  const draft = canvas.getByRole('textbox', { name: 'Message' })
+  draft.focus({ preventScroll: true })
+  await userEvent.tab({ shift: true })
+  await expect(document.activeElement).toBe(pill)
+  if (activate) await userEvent.keyboard('{Enter}')
+  await settle()
+  await expectAttached(canvasElement, lane)
+  await expect(document.activeElement).toBe(draft)
+}
+export const KeyboardPillReattaches: Story = { play: async ({ canvasElement }) => { await proveKeyboardPill(canvasElement) } }
+export const KeyboardPillReattachesLight: Story = { ...KeyboardPillReattaches, args: { scheme: 'light' } }
+export const KeyboardPillNotActivatedControl: Story = { play: async ({ canvasElement }) => {
+  await expect(proveKeyboardPill(canvasElement, false)).rejects.toThrow()
+} }
+export const KeyboardPillNotActivatedControlLight: Story = { ...KeyboardPillNotActivatedControl, args: { scheme: 'light' } }
+
 export const AllStates: Story = { render: args => <FollowStory {...args} /> }
 
 const styles = stylex.create({

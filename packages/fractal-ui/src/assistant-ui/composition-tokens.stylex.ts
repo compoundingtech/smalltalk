@@ -134,7 +134,7 @@ export const geometryNumbers = {
   footer: 40,
   drawerMin: 120, drawerMax: 600,
   resizeStep: 8, resizeStepLarge: 32, splitMinRatio: 0.1, splitMaxRatio: 0.9,
-  tooltipOffset: 6, contextOffset: 8, scrollEndTolerance: 1,
+  tooltipOffset: 6, contextOffset: 8, scrollEndTolerance: 1, followAffordanceBand: 40,
   estimatedMessageHeight: 160,
   threadViewportMin: 96,
 } as const
