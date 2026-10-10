@@ -70,7 +70,7 @@ pub use checkpoint::{
     CHECKPOINT_MANIFEST_PAGE_LIMIT, CheckpointManifest, CheckpointManifestCursor,
     CheckpointManifestPage, CheckpointManifestRequest, CheckpointPlanRequest, CheckpointPlanView,
     CheckpointProof, ClaimTombstone, DropCount, DropPlan, EnvelopeKey, EnvelopeTombstone,
-    SealedSet, checkpoint_cut, checkpoint_name, drop_digest, newest_due_cut,
+    SealedSet, StoreCopy, checkpoint_cut, checkpoint_name, drop_digest, newest_due_cut,
     verify_checkpoint_manifest,
 };
 pub use checkpoint_agreement::write_time;

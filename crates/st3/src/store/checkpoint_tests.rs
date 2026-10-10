@@ -1936,35 +1936,76 @@ fn ancestry_walks_through_a_dropped_claim() {
     );
 }
 
-/// Plans a checkpoint over a copy of a real store and prints the dry run:
+/// Free bytes on the filesystem that holds `path`.
+fn free_bytes(path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stat` is written before it is read.
+    assert_eq!(unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) }, 0);
+    let stat = unsafe { stat.assume_init() };
+    stat.f_bavail as u64 * stat.f_frsize as u64
+}
+
+/// Run `work`, sampling the free space on `path`'s filesystem every 10 ms: its result and
+/// the most space it took at once.
+fn peak_use_while<T>(path: &Path, work: impl FnOnce() -> T) -> (T, u64) {
+    let before = free_bytes(path);
+    let least = std::sync::atomic::AtomicU64::new(before);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                least.fetch_min(free_bytes(path), std::sync::atomic::Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        let result = work();
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        result
+    });
+    least.fetch_min(free_bytes(path), std::sync::atomic::Ordering::Relaxed);
+    (result, before.saturating_sub(least.into_inner()))
+}
+
+/// Plans a checkpoint over a copy of a real store and prints the dry run, with the most disk
+/// space opening the store (its schema upgrade) and the proof each took at once:
 /// `ST3_CHECKPOINT_STORE=/var/tmp/copy.sqlite3 ST3_CHECKPOINT_ORIGIN=example-linux
 /// ST3_CHECKPOINT_DAY=2026-09-27 cargo test -p st3 --lib plan_a_copy_of_a_real_store --
-/// --ignored --nocapture`. The copy is changed; the store it came from is not read.
+/// --ignored --nocapture`. Without `ST3_CHECKPOINT_DAY` it plans the newest due checkpoint.
+/// The copy is changed; the store it came from is not read.
 #[test]
 #[ignore = "reads the store copy named by ST3_CHECKPOINT_STORE"]
 fn plan_a_copy_of_a_real_store() {
     let path = PathBuf::from(std::env::var("ST3_CHECKPOINT_STORE").unwrap());
     let origin = std::env::var("ST3_CHECKPOINT_ORIGIN").unwrap_or_else(|_| "example-linux".into());
-    let day = std::env::var("ST3_CHECKPOINT_DAY").unwrap();
+    let cut = std::env::var("ST3_CHECKPOINT_DAY")
+        .map_or_else(|_| newest_due_cut(now_ms()), |day| checkpoint_cut(&day).unwrap());
+    let directory = path.parent().unwrap();
+    let mib = |bytes: u64| bytes / (1024 * 1024);
+    eprintln!("store {} MiB", mib(fs::metadata(&path).unwrap().len()));
     let started = std::time::Instant::now();
-    let store = Store::open(&path, origin).unwrap();
-    eprintln!("opened in {:?}", started.elapsed());
+    let (store, opening) = peak_use_while(directory, || Store::open(&path, origin).unwrap());
+    eprintln!("opened in {:?}, peak use {} MiB", started.elapsed(), mib(opening));
     let scratch = path.parent().unwrap().join("proof");
-    let plan = if std::env::var("ST3_CHECKPOINT_SKIP_PROOF").is_ok() {
-        None
-    } else {
-        Some(
-            store
-                .checkpoint_plan_view(checkpoint_cut(&day).unwrap(), &scratch)
-                .unwrap(),
-        )
-    };
+    fs::create_dir_all(&scratch).unwrap();
+    let probe = scratch.join("copy-probe.sqlite3");
+    let copying = std::time::Instant::now();
+    let method = store.copy_store_to(&probe).unwrap();
+    eprintln!("copied by {method:?} in {:?}", copying.elapsed());
+    for suffix in ["", "-journal", "-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", probe.display()));
+    }
+    let started = std::time::Instant::now();
+    let (plan, proving) = peak_use_while(directory, || {
+        (std::env::var("ST3_CHECKPOINT_SKIP_PROOF").is_err())
+            .then(|| store.checkpoint_plan_view(cut, &scratch).unwrap())
+    });
+    eprintln!("proof peak use {} MiB", mib(proving));
     eprintln!("planned and proved in {:?}", started.elapsed());
     println!("{}", serde_json::to_string_pretty(&plan).unwrap());
     if let Ok(subject) = std::env::var("ST3_CHECKPOINT_SUBJECT") {
-        let sealed = store
-            .checkpoint_sealed_set(checkpoint_cut(&day).unwrap())
-            .unwrap();
+        let sealed = store.checkpoint_sealed_set(cut).unwrap();
         let plan = plan_drops(&sealed);
         let dropped = dropped(&plan);
         for claim in sealed

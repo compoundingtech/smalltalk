@@ -604,6 +604,50 @@ pub fn answer_mismatches(
     mismatches
 }
 
+/// How `copy_store_to` copied the store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreCopy {
+    /// A copy-on-write clone: it costs only the pages the proof then rewrites.
+    Clone,
+    /// A full `VACUUM INTO` copy, where the filesystem cannot clone.
+    Full,
+}
+
+/// Clone `source` to a new file at `target`: APFS `clonefile`, or a reflink on Linux. An error
+/// where the filesystem cannot clone, as on ext4.
+#[cfg(target_os = "macos")]
+fn clone_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+    let target = std::ffi::CString::new(target.as_os_str().as_bytes())?;
+    // SAFETY: both paths are NUL-terminated and outlive the call.
+    if unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn clone_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let source = fs::File::open(source)?;
+    let file = fs::OpenOptions::new().write(true).create_new(true).open(target)?;
+    // SAFETY: both descriptors are open for the length of the call.
+    if unsafe { libc::ioctl(file.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    drop(file);
+    let _ = fs::remove_file(target);
+    Err(error)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn clone_file(_source: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 fn open_checkpoint_copy(copy: &Path) -> Result<Connection> {
     let connection = Connection::open(copy)?;
     projection_digest::register(&connection)?;
@@ -1243,8 +1287,12 @@ impl Store {
             .collect()
     }
 
-    /// Copy this store to `copy` from one consistent snapshot, while the writer carries on.
-    pub fn copy_store_to(&self, copy: &Path) -> Result<()> {
+    /// Copy this store to `copy` from one consistent snapshot, while the writer carries on: a
+    /// filesystem clone where the filesystem can make one, otherwise a full `VACUUM INTO` copy.
+    pub fn copy_store_to(&self, copy: &Path) -> Result<StoreCopy> {
+        if !self.shared_memory && self.clone_store_to(copy)? {
+            return Ok(StoreCopy::Clone);
+        }
         // `VACUUM INTO` reads the whole store in one transaction on a connection of its own, which
         // holds the WAL pinned for as long as the copy takes. Register it, so a pinned-WAL
         // report can name it: it was the one pin with no live read to blame.
@@ -1258,7 +1306,34 @@ impl Store {
         let connection = Connection::open_with_flags(&self.path, flags)?;
         connection.execute_batch("PRAGMA busy_timeout = 5000;")?;
         connection.execute("VACUUM INTO ?1", [copy.to_string_lossy()])?;
-        Ok(())
+        Ok(StoreCopy::Full)
+    }
+
+    /// Clone the store file and its WAL to `copy` under one read snapshot, held only while the
+    /// filesystem clones them. While a snapshot is open no checkpoint copies a frame past it into
+    /// the store file, and the frames it reads stay in the WAL, so the two clones open as the
+    /// snapshot or a later commit. The `-shm` index is not copied: opening the copy rebuilds it
+    /// from the WAL. False, with nothing left at `copy`, where the filesystem cannot clone.
+    fn clone_store_to(&self, copy: &Path) -> Result<bool> {
+        let wal = PathBuf::from(format!("{}-wal", self.path.display()));
+        let copy_wal = PathBuf::from(format!("{}-wal", copy.display()));
+        let connection = self.readers.get();
+        let snapshot = connection.unchecked_transaction()?;
+        snapshot.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0))?;
+        let cloned = clone_file(&self.path, copy).and_then(|()| match clone_file(&wal, &copy_wal) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !wal.exists() => Ok(()),
+            result => result,
+        });
+        snapshot.commit()?;
+        drop(connection);
+        if cloned.is_err() {
+            let _ = fs::remove_file(copy);
+            let _ = fs::remove_file(&copy_wal);
+            return Ok(false);
+        }
+        // Fold the cloned WAL into the copy, so it is one file, as a `VACUUM INTO` copy is.
+        Connection::open(copy)?.query_row("PRAGMA journal_mode = DELETE", [], |_| Ok(()))?;
+        Ok(true)
     }
 
     /// Plan the drop for `cut_unix_ms` and prove it on a copy of this store in `scratch`, which
@@ -1303,7 +1378,7 @@ impl Store {
         let copy = scratch.join(format!("proof-{}.sqlite3", Uuid::now_v7().simple()));
         let result = self
             .copy_store_to(&copy)
-            .and_then(|()| prove_on_copy(&*self.runtime, &copy, sealed, plan));
+            .and_then(|_| prove_on_copy(&*self.runtime, &copy, sealed, plan));
         for suffix in ["", "-journal", "-wal", "-shm"] {
             let _ = fs::remove_file(format!("{}{suffix}", copy.display()));
         }
