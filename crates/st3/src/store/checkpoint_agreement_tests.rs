@@ -922,6 +922,7 @@ fn participants_trim_the_stable_checkpoint_and_keep_every_identity() {
 #[test]
 fn a_trim_that_stops_anywhere_finishes_the_same_after_a_restart() {
     for fault in [
+        TrimFault::AfterTombstoneChunk(1),
         TrimFault::AfterTombstones,
         TrimFault::AfterChunk(1),
         TrimFault::AfterChunk(2),
@@ -935,9 +936,24 @@ fn a_trim_that_stops_anywhere_finishes_the_same_after_a_restart() {
         stable_pair(&alder, &birch, &context);
         assert_eq!(kinds(&step(&birch, &context)), ["trimmed"]);
         alder.set_trim_chunk_envelopes(2);
+        if fault == TrimFault::AfterTombstoneChunk(1) {
+            // Slow enough that recording takes several chunks, so the crash leaves some
+            // tombstones recorded and others not.
+            alder.set_trim_row_cost(std::time::Duration::from_millis(12));
+        }
         alder.set_trim_fault(Some(fault));
         let reclaim_before = smallclaims::store::checkpoint::allocator_reclaim_stats_for_test();
         assert!(alder.checkpoint_step(&context).is_err(), "{fault:?}");
+        if fault == TrimFault::AfterTombstoneChunk(1) {
+            let count = |sql: &str| -> u64 { alder.readers.get().query_row(sql, [], |row| row.get(0)).unwrap() };
+            let recorded = count("SELECT (SELECT COUNT(*) FROM checkpoint_envelopes) + (SELECT COUNT(*) FROM checkpoint_claims)");
+            let deleted = count("SELECT COUNT(*) FROM checkpoint_envelopes AS tombstone WHERE NOT EXISTS (
+                SELECT 1 FROM replica_envelopes AS held WHERE held.writer=tombstone.writer
+                  AND held.sequence=tombstone.sequence AND held.envelope_hash=tombstone.envelope_hash)");
+            assert!(recorded > 0 && deleted == 0, "some tombstones are recorded and nothing is deleted");
+            let manifest = birch.checkpoint_manifest(&checkpoint_name(newest_due_cut(context.now_unix_ms)), newest_due_cut(context.now_unix_ms)).unwrap();
+            assert!((recorded as usize) < manifest.claims.len() + manifest.envelopes.len(), "the crash came part way through");
+        }
         assert_eq!(smallclaims::store::checkpoint::allocator_reclaim_stats_for_test().0 - reclaim_before.0, 1);
         drop(alder);
 
