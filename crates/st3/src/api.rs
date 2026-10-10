@@ -17604,11 +17604,21 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         let wake_file = root.path().join("replication.wake");
         let mut client_feed = state.event_notify.subscribe();
         let subject = "agent/node.worker";
-        state.store.append_claim(&ClaimInput {
-            subject: subject.into(), kind: "runtime.observed".into(), actor: None,
-            fields: serde_json::from_value(json!({"status":"running","runtime_id":"node.worker","incarnation_id":"inc-1"})).unwrap(),
-            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    json!({"status":"running","runtime_id":"node.worker","incarnation_id":"inc-1"}),
+                )
+                .unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         let observed = |state_name: &str, observed_at_ms: u64| ClaimInput {
             subject: subject.into(),
             kind: "harness.observed".into(),
@@ -17663,17 +17673,21 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             changed
         };
 
-        let change = post(observed("working", 1)).await.unwrap().0;
+        let now = st_drivers::message::now_ms();
+        let change = post(observed("working", now)).await.unwrap().0;
         assert!(crate::store::local_observation_position(&change).is_some());
         assert!(reconciler_woke().await);
         assert!(!wake_file.exists());
         assert!(client_feed_woke());
 
-        let heartbeat = post(observed("working", 300_001)).await.unwrap().0;
+        let heartbeat = post(observed("working", now + 1)).await.unwrap().0;
         assert!(crate::store::local_observation_position(&heartbeat).is_some());
         assert!(!reconciler_woke().await, "a heartbeat does not reconcile");
         assert!(!wake_file.exists(), "a heartbeat does not wake replication");
-        assert!(client_feed_woke(), "clients still see the observation");
+        assert!(
+            !client_feed_woke(),
+            "unchanged restamps do not invalidate client windows"
+        );
 
         let first_usage = post(usage(10)).await.unwrap().0;
         assert!(crate::store::local_observation_position(&first_usage).is_some());

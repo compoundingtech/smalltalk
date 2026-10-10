@@ -74,6 +74,8 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_latest_slots",
         "latest_values",
         "latest_readiness",
+        "current_value_frontiers",
+        "current_value_retirements",
         "local_resource_projection_pending",
         "local_glass_head_pending",
         "local_glass_head_dirty",

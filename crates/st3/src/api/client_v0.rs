@@ -11886,8 +11886,10 @@ mission "queue-parity" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
         let subject = "agent/fresh-pause";
+        // Exercise graph-cut pause behavior with durable legacy observations.
+        // Current register revisions are tested separately at the same graph cut.
         let append = |fields: Value| {
-            state.store.append_claim(&ClaimInput {
+            state.store.append_legacy_claim(&ClaimInput {
                 subject: subject.into(), kind: "harness.observed".into(), actor: None,
                 fields: serde_json::from_value(fields).unwrap(),
                 evidence: Vec::new(), expected_subject: None, idempotency_key: None,

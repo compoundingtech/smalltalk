@@ -11518,6 +11518,11 @@ impl Store {
             {
                 let mut result = (**status).clone();
                 result.store_index = index;
+                drop(cache);
+                let connection = self.readers.get();
+                for status in &mut result.subjects {
+                    self.refresh_kept_harness_source(&connection, status, revision)?;
+                }
                 return Ok(result);
             }
             let projection_index = self.agent_status_index(index)?;
@@ -11533,6 +11538,11 @@ impl Store {
                 *cached_index = index;
                 let mut result = (**status).clone();
                 result.store_index = index;
+                drop(cache);
+                let connection = self.readers.get();
+                for status in &mut result.subjects {
+                    self.refresh_kept_harness_source(&connection, status, revision)?;
+                }
                 return Ok(result);
             }
             let status =
@@ -11693,7 +11703,8 @@ impl Store {
         current_revision: u64,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
         let mode = SubjectStatusMode::Full;
-        if let Some(kept) = self.kept_subject_status(subject, store_index, mode, current_revision) {
+        if let Some(mut kept) = self.kept_subject_status(subject, store_index, mode, current_revision) {
+            self.refresh_kept_harness_source(connection, &mut kept.0, current_revision)?;
             return Ok(kept);
         }
         let (status, action) =
@@ -11710,6 +11721,41 @@ impl Store {
             );
         }
         Ok((status, action))
+    }
+
+    // A semantic cache hit keeps the reduction, while source identity/time follow the
+    // replaceable register. A semantic commit after the cache lookup keeps the old source
+    // with its old state; diagnostic/runtime fences also keep their own source claims.
+    fn refresh_kept_harness_source(
+        &self,
+        connection: &Connection,
+        status: &mut SubjectStatus,
+        current_revision: u64,
+    ) -> Result<()> {
+        let Some(harness) = status.harness.as_mut() else {
+            return Ok(());
+        };
+        if !harness.claim.starts_with(LOCAL_OBSERVATION_ID_PREFIX) {
+            return Ok(());
+        };
+        let current: Option<(String, String, u64)> = connection
+            .query_row(
+                "SELECT source_id,coalesce(json_extract(body,'$.fields.incarnation_id'),''),
+            min(source_at,coalesce(json_extract(body,'$.fields.observed_at_ms'),source_at))
+            FROM latest_values WHERE subject=?1 AND kind='harness.observed' AND slot=''
+            AND coalesce((SELECT revision FROM current_value_frontiers WHERE subject=?1),0)<=?2",
+                params![status.subject, current_revision],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((claim, incarnation, observed_at)) = current
+            && incarnation == harness.incarnation_id
+            && u128::from(observed_at) >= harness.observed_at_unix_ms
+        {
+            harness.claim = claim;
+            harness.observed_at_unix_ms = u128::from(observed_at);
+        }
+        Ok(())
     }
 
     /// `subject`'s kept status reduction, if one holds at `store_index`.
@@ -26013,9 +26059,15 @@ mod fleet_admission_tests {
 
     /// A modern live observation travels separately from signed durable inventory.
     fn sync_transport(from: &Store, to: &Store, peer: &str) {
-        sync(from,to);
+        sync(from, to);
         let record = from.own_transport_value(peer).unwrap().unwrap();
-        to.receive_current_value(&record).unwrap();
+        // This fixture configures its live hosts explicitly; it has no sealed membership.
+        let hosts = BTreeSet::from([
+            from.origin().to_owned(),
+            to.origin().to_owned(),
+            peer.to_owned(),
+        ]);
+        to.receive_current_value_for_hosts(&record, &hosts).unwrap();
     }
 
     fn admitted(store: &Store, claim: &ClaimRecord) -> bool {

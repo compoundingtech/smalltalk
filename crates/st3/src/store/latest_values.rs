@@ -1526,6 +1526,98 @@ mod tests {
     }
 
     #[test]
+    fn cached_full_status_refreshes_restamps_without_mixing_semantic_sources() {
+        let store = Store::open_memory("owner").unwrap();
+        declare(&store, "owner");
+        let mut runtime = state("idle", "one", 1);
+        runtime.kind = "runtime.observed".into();
+        runtime.fields =
+            serde_json::from_value(json!({"status":"running","incarnation_id":"one"})).unwrap();
+        store.append_claim(&runtime).unwrap();
+        let first = store
+            .append_claim(&state("idle", "one", now_ms() as u64))
+            .unwrap();
+        let kept = store
+            .status_for_subject_prefix_at("agent/", None, false)
+            .unwrap();
+        let revision = store.current_cache_revision().unwrap();
+        let mut old = kept
+            .subjects
+            .iter()
+            .find(|s| s.subject == first.subject)
+            .unwrap()
+            .clone();
+        assert_eq!(old.harness.as_ref().unwrap().claim, first.id);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let restamp = store
+            .append_claim(&state("idle", "one", now_ms() as u64))
+            .unwrap();
+        assert_ne!(restamp.id, first.id);
+        assert_eq!(store.current_cache_revision().unwrap(), revision);
+        let prefix = store
+            .status_for_subject_prefix_at("agent/", None, false)
+            .unwrap();
+        let kinds = store
+            .status_for_claim_kind_at("runtime.observed", None, false)
+            .unwrap();
+        for answer in [&prefix, &kinds] {
+            let harness = answer
+                .subjects
+                .iter()
+                .find(|s| s.subject == first.subject)
+                .unwrap()
+                .harness
+                .as_ref()
+                .unwrap();
+            assert_eq!(harness.claim, restamp.id);
+            assert_eq!(harness.state, "idle");
+        }
+        store.forget_current_views();
+        assert_eq!(
+            serde_json::to_value(&prefix).unwrap(),
+            serde_json::to_value(
+                store
+                    .status_for_subject_prefix_at("agent/", None, false)
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&kinds).unwrap(),
+            serde_json::to_value(
+                store
+                    .status_for_claim_kind_at("runtime.observed", None, false)
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let working = store
+            .append_claim(&state("working", "one", now_ms() as u64))
+            .unwrap();
+        assert!(store.current_cache_revision().unwrap() > revision);
+        // Deterministically place a semantic commit between cache lookup and source overlay.
+        store
+            .refresh_kept_harness_source(&store.readers.get(), &mut old, revision)
+            .unwrap();
+        assert_eq!(old.harness.as_ref().unwrap().claim, first.id);
+        assert_eq!(old.harness.as_ref().unwrap().state, "idle");
+        let current = store
+            .status_for_subject_prefix_at("agent/", None, false)
+            .unwrap();
+        let harness = current
+            .subjects
+            .iter()
+            .find(|s| s.subject == first.subject)
+            .unwrap()
+            .harness
+            .as_ref()
+            .unwrap();
+        assert_eq!(harness.claim, working.id);
+        assert_eq!(harness.state, "working");
+    }
+
+    #[test]
     fn first_context_sample_with_twenty_thousand_numeric_rows_has_bounded_request_work() {
         let store = Store::open_memory("owner").unwrap();
         declare(&store, "owner");

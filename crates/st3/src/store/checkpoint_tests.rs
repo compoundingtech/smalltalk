@@ -436,11 +436,11 @@ fn sealed_capture_rejects_invalid_times_even_when_another_claim_excludes_the_env
     for malformed in ["not-a-time", "-1", "340282366920938463463374607431768211456"] {
         let store = Store::open_memory("alder").unwrap();
         store.set_write_clock_at(100).unwrap();
-        let broken = store.append_claim(&input(
+        let broken = store.append_legacy_claim(&input(
             AGENT, "harness.observed", Some(AGENT),
             json!({"state":"idle", "incarnation_id":"broken"}), "broken",
         )).unwrap();
-        let later = store.append_claim(&input(
+        let later = store.append_legacy_claim(&input(
             AGENT, "harness.observed", Some(AGENT),
             json!({"state":"idle", "incarnation_id":"later"}), "later",
         )).unwrap();
@@ -477,7 +477,7 @@ fn sealed_capture_rejects_invalid_envelope_times_at_first_use() {
     for malformed in ["not-a-time", "-1", "340282366920938463463374607431768211456"] {
         let store = Store::open_memory("alder").unwrap();
         store.set_write_clock_at(100).unwrap();
-        store.append_claim(&input(
+        store.append_legacy_claim(&input(
             AGENT, "harness.observed", Some(AGENT),
             json!({"state":"idle", "incarnation_id":"broken"}), "broken",
         )).unwrap();

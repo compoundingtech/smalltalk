@@ -258,7 +258,16 @@ agent "native-seat" {{
         def read():
             current_card()
             view = node.api("/v1/messages/read/" + message)
-            return view if (view or {}).get("status") in ("read", "closed") else None
+            if (view or {}).get("status") in ("read", "closed"):
+                checks.setdefault("native_read_ack_at_ms", int(time.time() * 1000))
+            # The native channel can acknowledge read before the provider's turn ends.
+            # Require the stub's explicit read after Stop before timing the idle pickup;
+            # otherwise one working heartbeat can consume most of the idle allowance.
+            completed = next((row for row in receipts(node) if row.get("event") == "read"
+                              and row.get("reference") == message and row.get("exit") == 0), None)
+            if completed:
+                checks["turn_completed_at_ms"] = int(completed["at"] * 1000)
+            return view if completed and (view or {}).get("status") in ("read", "closed") else None
         checks["message_status"] = until(read, 90, f"{message} was never read")["status"]
         until(lambda: current_card().get("harness_state") == "idle" and {"working", "idle"} <= observed_states,
               45, "current client cards never showed both working and idle during delivery")
