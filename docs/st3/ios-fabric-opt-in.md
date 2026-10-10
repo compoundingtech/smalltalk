@@ -109,7 +109,7 @@ targets.
 2. The app: the opt-in setting, the saved fabric target, the carrier selection in the store, the
    recorder and the reporter, with their tests (`stui` lane; Node tests on Linux).
 3. The Apple host: build the XCFramework, link it in the ordinary build, measure the Release size,
-   install on the owner's phone (the Silber app builders; the owner reinstalls).
+   install on the owner's phone (the Apple-host app builders; the owner reinstalls).
 4. Operations: expose the client gateway and grant the owner's phone on the members the owner chooses.
 5. The owner: send the phone's node ID, opt in, and run the cellular and Wi-Fi trials.
 
