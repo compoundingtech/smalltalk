@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A seat that is compacting its conversation shows as compacting (agent activity), not as working or stuck and never as an alert, for Claude Code, Codex and omp (#1934)",
+  "replay": {
+    "status": "none",
+    "detail": "No replay. The status derives from the harness reason the drivers already publish."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database change. The client schema's Agent gains optional activity; the contract digest changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint or authority rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Additive optional Agent.activity ('compacting'); older clients ignore it. The Claude driver now records reason compaction at PreCompact, and the omp channel from its pre_compact frame to its compaction context frame; pi reports only the end and shows no status. Codex already reported reason compaction. st agents ls (enriched) prints the activity line."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; seats pick up the driver change on their next start."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swap back freely; an older daemon omits activity."
+  }
+}

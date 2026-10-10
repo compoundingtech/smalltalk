@@ -406,6 +406,9 @@ fn channel_loop(
     // `agent_start` also precedes that write; the first `idle` lifecycle edge proves the boot turn
     // and transcript have both completed. Startup mail then begins a clean provider turn.
     let mut delivery_ready = false;
+    // Whether this channel saw a compaction start and not yet its end. pi reports only the end,
+    // so it never shows as compacting rather than showing a status it cannot clear.
+    let mut compacting = false;
     let label = kind.label;
     let mut next_heartbeat = Instant::now() + heartbeat_every;
     loop {
@@ -471,7 +474,33 @@ fn channel_loop(
                 // a producer holding no fresh reading must write nothing at all, so the record
                 // ages visibly through `ageMs` instead of looking refreshed. Every frame is handed
                 // to the guard, which decides bucket, compaction edge, or heartbeat.
-                if let Some(context) = frame.as_ref().and_then(context_frame)
+                let context = frame.as_ref().and_then(context_frame);
+                // A compaction is the seat's status from its start to its end.
+                let compaction = if frame.as_ref().is_some_and(|frame| {
+                    frame.get("type").and_then(Value::as_str) == Some("pre_compact")
+                }) {
+                    compacting = true;
+                    Some(harness_state::Activity::Active)
+                } else if compacting && context.as_ref().is_some_and(|(_, edge)| edge.is_some()) {
+                    compacting = false;
+                    Some(harness_state::Activity::Idle)
+                } else {
+                    None
+                };
+                if let Some(activity) = compaction {
+                    let mut observation = harness_state::Observation::new(
+                        activity,
+                        harness_state::BlockedOn::None,
+                        harness_state::InputBuffer::Unknown,
+                    );
+                    if activity == harness_state::Activity::Active {
+                        observation = observation.with_reason("compaction");
+                    }
+                    if let Err(error) = writer.observe_unless_ended(observation) {
+                        tracing::warn!("st {label} channel: recording compaction failed: {error}");
+                    }
+                }
+                if let Some(context) = context
                     && let Some(context_writer) = context_writer.as_deref_mut()
                     && let Err(error) = write_context(context_writer, context)
                 {
@@ -1346,6 +1375,53 @@ mod tests {
         .unwrap();
         assert_eq!(raw["state"], "active");
         assert_eq!(raw["reason"], PRE_COMPACT_ERROR_REASON);
+    }
+
+    /// Compacting is the seat's status from omp's compaction start to its end, and a channel that
+    /// saw no start (pi reports only the end) leaves the status alone.
+    #[test]
+    fn compacting_runs_from_the_start_edge_to_the_end_edge() {
+        let run = |frames: &[&str]| -> Option<Value> {
+            let tmp = tempfile::tempdir().unwrap();
+            let agent_dir = tmp.path();
+            let inbox = message::inbox_dir(agent_dir);
+            std::fs::create_dir_all(&inbox).unwrap();
+            context::write_now(&context::context_dir(agent_dir), "Authored state.\n").unwrap();
+            let mut writer =
+                harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()));
+            let mut timeline = crate::harness_timeline::Writer::new(agent_dir, "omp", "test");
+            let (tx, rx) = mpsc::channel();
+            for frame in frames {
+                tx.send(Ok((*frame).to_string())).unwrap();
+            }
+            drop(tx);
+            channel_loop(
+                &rx,
+                &mut Vec::new(),
+                &inbox,
+                agent_dir,
+                &mut writer,
+                None,
+                &mut timeline,
+                "h.worker",
+                &OMP_KIND,
+                Duration::from_millis(1),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            std::fs::read(harness_state::harness_state_path(agent_dir))
+                .ok()
+                .map(|raw| serde_json::from_slice(&raw).unwrap())
+        };
+        let start = r#"{"type":"pre_compact"}"#;
+        let end = r#"{"type":"context","compaction":{"trigger":null,"count":1}}"#;
+        let compacting = run(&[start]).unwrap();
+        assert_eq!(compacting["state"], "active");
+        assert_eq!(compacting["reason"], "compaction");
+        let done = run(&[start, end]).unwrap();
+        assert_eq!(done["state"], "idle");
+        assert!(done["reason"].is_null(), "{done}");
+        assert!(run(&[end]).is_none(), "an end alone writes no status");
     }
 
     /// The stdio connection is the evidence. While it lives, the record's heartbeat advances
