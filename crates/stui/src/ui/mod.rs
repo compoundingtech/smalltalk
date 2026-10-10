@@ -766,6 +766,42 @@ impl Ui {
         }
     }
 
+    /// A terminal's tab is never left dead (Nathan, 2026-10-10): once the agents are known, each
+    /// terminal tab in front attaches (stui reopened with the tab saved, or a terminal that was
+    /// let go), or turns back into the agent's conversation when the agent has no terminal.
+    pub(crate) fn step_terminal_tabs(&mut self) {
+        if self.glasses.is_none() || self.home_open() {
+            return;
+        }
+        let Some(agents) = self.world.agents.ready() else {
+            return;
+        };
+        let loose: Vec<(usize, String)> = self
+            .shown_panes()
+            .into_iter()
+            .filter_map(|(group, pane)| match pane {
+                Pane::Terminal(id) if self.terminal_view(&id).is_none() => Some((group, id)),
+                _ => None,
+            })
+            .collect();
+        let without: Vec<(usize, String)> = loose
+            .iter()
+            .filter(|(_, id)| {
+                !id.starts_with("terminal/")
+                    && !agents.iter().any(|agent| agent.id == *id && agent.terminal)
+            })
+            .cloned()
+            .collect();
+        for (_, id) in loose {
+            if !without.iter().any(|(_, other)| *other == id) {
+                self.attach_terminal(&id);
+            }
+        }
+        for (group, id) in without {
+            self.swap_shown_pane(group, Pane::Agent(Some(id)));
+        }
+    }
+
     /// Every conversation simplified (a tool call to a line, a run of calls to one line) or in
     /// full: this device's choice, remembered.
     pub(crate) fn toggle_simple(&mut self) {
@@ -4307,8 +4343,14 @@ impl Ui {
         if self.glasses.is_some() {
             match self.focused_pane() {
                 Some(Pane::Terminal(id)) if id == agent.id => {}
+                // One tab for each thing: a terminal already open in a tab is focused, not
+                // opened a second time.
                 Some(Pane::Agent(Some(id))) if id == agent.id => {
-                    self.swap_focused_pane(Pane::Terminal(agent.id.clone()))
+                    if self.shows_in_glass(&Pane::Terminal(agent.id.clone())) {
+                        self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab)
+                    } else {
+                        self.swap_focused_pane(Pane::Terminal(agent.id.clone()))
+                    }
                 }
                 _ => self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab),
             }

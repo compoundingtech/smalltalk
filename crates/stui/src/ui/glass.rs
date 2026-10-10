@@ -2712,6 +2712,13 @@ impl Ui {
         self.show_focused();
     }
 
+    /// Whether `pane` is already open in a tab of the glass in front.
+    pub(crate) fn shows_in_glass(&self, pane: &Pane) -> bool {
+        self.glasses
+            .as_ref()
+            .is_some_and(|glasses| glasses.glass().find(&pane.key()).is_some())
+    }
+
     pub(crate) fn home_open(&self) -> bool {
         self.glasses.as_ref().is_some_and(|glasses| glasses.home)
     }
@@ -3675,24 +3682,47 @@ impl Ui {
     /// Show `pane` in the focused tab in place of what it shows: an agent's conversation and
     /// its terminal are one tab, switched by Ctrl+] and Ctrl+\.
     pub(crate) fn swap_focused_pane(&mut self, pane: Pane) {
+        let Some(focus) = self.glasses.as_ref().map(|glasses| glasses.glass().focus) else {
+            return;
+        };
+        self.swap_shown_pane(focus, pane);
+    }
+
+    /// Show `pane` in place of what the split `group` shows.
+    pub(crate) fn swap_shown_pane(&mut self, group: usize, pane: Pane) {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
         };
         let glass = glasses.glass_mut();
-        let focus = glass.focus;
-        let Some(group) = glass.layout.group_mut(focus) else {
+        let Some(split) = glass.layout.group_mut(group) else {
             return;
         };
-        let Some(tab) = group
+        let Some(tab) = split
             .current
-            .checked_sub(offset(focus))
-            .and_then(|index| group.tabs.get_mut(index))
+            .checked_sub(offset(group))
+            .and_then(|index| split.tabs.get_mut(index))
         else {
             return;
         };
         tab.pane = pane.key();
         let id = glass.id.clone();
         self.glass_changed(&id);
+    }
+
+    /// The pane each split of the glass in front shows, with the split's index.
+    pub(crate) fn shown_panes(&self) -> Vec<(usize, Pane)> {
+        let Some(glasses) = self.glasses.as_ref() else {
+            return Vec::new();
+        };
+        let glass = glasses.glass();
+        (0..glass.layout.groups().len())
+            .filter_map(|group| {
+                glass
+                    .shown(group)
+                    .and_then(|tab| Pane::parse(&tab.pane))
+                    .map(|pane| (group, pane))
+            })
+            .collect()
     }
 
     /// Whether the new mission form takes the keys: in a glass only while its tab has focus.
@@ -6495,6 +6525,72 @@ mod tests {
         // A focus with nothing in it (a group showing Home) moves focus and nothing else.
         ui.show_focused();
         assert!(ui.terminal.is_some());
+    }
+
+    /// The ids of the panes open in the glass in front, in tab order.
+    fn open_panes(ui: &Ui) -> Vec<String> {
+        tabs(ui).2.into_iter().flatten().collect()
+    }
+
+    #[test]
+    fn a_terminal_tab_in_front_with_nothing_attached_attaches() {
+        let mut ui = glass();
+        let agent = ui
+            .world
+            .agents
+            .items()
+            .iter()
+            .find(|agent| agent.terminal)
+            .cloned()
+            .unwrap();
+        ui.open_in_glass(Pane::Terminal(agent.id.clone()), Open::Tab);
+        assert!(ui.terminal_view(&agent.id).is_none());
+        ui.step_terminal_tabs();
+        assert!(ui.terminal_view(&agent.id).is_some(), "attached, not dead");
+        assert_eq!(ui.focused_pane(), Some(Pane::Terminal(agent.id)));
+    }
+
+    #[test]
+    fn a_terminal_tab_for_an_agent_without_a_terminal_shows_its_conversation() {
+        let mut ui = glass();
+        let mut agent = ui.world.agents.items()[0].clone();
+        agent.terminal = false;
+        if let Load::Ready(items) = &mut ui.world.agents {
+            items[0] = agent.clone();
+        }
+        ui.open_in_glass(Pane::Terminal(agent.id.clone()), Open::Tab);
+        ui.step_terminal_tabs();
+        assert!(ui.terminal.is_none());
+        assert_eq!(ui.focused_pane(), Some(Pane::Agent(Some(agent.id))));
+    }
+
+    #[test]
+    fn attaching_from_the_agents_tab_focuses_its_terminal_tab_instead_of_opening_another() {
+        let mut ui = glass();
+        let agent = ui
+            .world
+            .agents
+            .items()
+            .iter()
+            .find(|agent| agent.terminal)
+            .cloned()
+            .unwrap();
+        ui.open_in_glass(Pane::Agent(Some(agent.id.clone())), Open::Tab);
+        ui.open_in_glass(Pane::Terminal(agent.id.clone()), Open::Right);
+        ui.open_in_glass(Pane::Agent(Some(agent.id.clone())), Open::Tab);
+        let before = open_panes(&ui);
+        ui.open_terminal();
+        let after = open_panes(&ui);
+        assert_eq!(before.len(), after.len(), "{before:?} → {after:?}");
+        assert_eq!(
+            after
+                .iter()
+                .filter(|pane| **pane == Pane::Terminal(agent.id.clone()).key())
+                .count(),
+            1,
+            "{after:?}"
+        );
+        assert_eq!(ui.focused_pane(), Some(Pane::Terminal(agent.id)));
     }
 
     #[test]

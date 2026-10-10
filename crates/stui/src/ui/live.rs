@@ -1366,6 +1366,7 @@ pub fn run(context: Context) -> Result<()> {
         ui.step_voice();
         ui.step_terminal_hold();
         ui.step_default_view();
+        ui.step_terminal_tabs();
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         let mut links = Vec::new();
         terminal.draw(|frame| {
