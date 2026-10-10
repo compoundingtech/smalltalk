@@ -10,7 +10,7 @@ if (typeof document !== 'undefined') {
     media,
     matches: false,
     onchange: null,
-    addListener(listener: EventListener) { this.addEventListener('change', listener) },
-    removeListener(listener: EventListener) { this.removeEventListener('change', listener) },
+    addListener(this: EventTarget, listener: EventListener) { this.addEventListener('change', listener) },
+    removeListener(this: EventTarget, listener: EventListener) { this.removeEventListener('change', listener) },
   })
 }
