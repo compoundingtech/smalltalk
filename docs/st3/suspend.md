@@ -76,9 +76,18 @@ resume:  restoring -> verifying   -> resumed
 move:    fencing-source -> transferring -> restoring -> verifying -> resumed        (failed: back to suspended, with a code)
 ```
 
-A suspension belongs to the launch it was taken under. Stopping the seat, or applying a
-declaration that changes how it launches, ends the suspension, and the next start follows the
-usual rules. A label change does not end it.
+A suspension belongs to the launch it was taken under. Stopping the seat or immediately applying
+a non-manual declaration that changes its launch ends the suspension. A label change does not end it.
+
+Publishing a changed launch for an owned seat with `rollout "manual"` keeps the suspension,
+including a suspend that is still in flight. Publication does not start the seat or replace its
+saved native session. Same-host resume runs the incumbent declaration on that exact session;
+the new declaration stays pending. An explicit rollout while the suspension holds the seat
+refuses with `rollout-suspended`. Resume first, then request the rollout to apply the pending
+declaration through strict native resume. See [owned-seat rollout](owned-seat-cutover.md).
+
+While the manual launch change is pending, resume on the current host. Apply the rollout
+before requesting a cross-host move. This keeps resume from applying part of the pending launch.
 
 ## Cross-host continuation
 

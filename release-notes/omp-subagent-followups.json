@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "omp subagents stay listed while waiting for a person, and late turn events do not start new runs",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes or triggers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged. Claim kinds and fields are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "omp subagents report while their live session stays busy, including foreground asks and tool approvals. Each heartbeat clears cached waits without live busy evidence, even if a resolution event was lost. A late turn event after the end no longer starts a run. IDs longer than 256 UTF-8 bytes are rejected, and names longer than 128 UTF-8 bytes are omitted. The extension changes take effect after the harness restarts."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover. Existing claims are unchanged."
+  }
+}

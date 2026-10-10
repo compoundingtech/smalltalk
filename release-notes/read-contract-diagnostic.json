@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add a nonrequired, fail-closed source diagnostic for read-contract coverage.",
+  "replay": {"status": "none", "detail": "No store replay or startup path changes; the diagnostic runs only when invoked explicitly."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, or schema version changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules, digests, or sealing behavior changes."},
+  "compatibility": {"status": "none", "detail": "No client, peer, wire, or CLI runtime contract changes."},
+  "downtime": {"status": "none", "detail": "No daemon or deployment path changes; the diagnostic is not a required CI gate."},
+  "manual": {"status": "none", "detail": "No action is required for existing installations. Developers may invoke the diagnostic with their own historical ledger and manifest inputs."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change; removing the diagnostic files restores the prior tooling set."}
+}

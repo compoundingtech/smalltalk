@@ -3,6 +3,7 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
+import { submitAnswer } from './answer';
 import { API_VERSION, ClientError, St3Client, notApplied, outcomeUnknown, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { keepClosed, personAnswer, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
 import app from './app.json';
@@ -525,7 +526,25 @@ function useAppStore(proof?: FabricProfile) {
       acted.current.add(item.id);
       const typed = personAnswer(item.request, answer, summary);
       if (typeof typed === 'string') { setError(typed); return false; }
-      return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }); });
+      if (status !== 'online' || (proof && !proof.ready)) { setError('Still connecting; try again in a moment.'); return false; }
+      setBusy(true);
+      try {
+        // An answer that landed is an answer, however the reply came back (Cos, 2026-10-10: the app
+        // said it failed for a decision that was recorded, and Nathan answered it again).
+        const outcome = await submitAnswer({
+          build: async () => { const id = actionId(); return { id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }; },
+          send: request => client.workDone(request),
+          stillWaiting: async () => {
+            try { const current = (await client.attentionGet(item.id)).value; return current.kind !== 'attention' || current.state === 'open'; }
+            catch (e) { if (e instanceof ClientError && e.response.code === 'not-found') return false; throw e; }
+          },
+          wait: ms => new Promise(resolve => setTimeout(resolve, ms)),
+        });
+        if (!outcome.ok) { setError(errorText(outcome.error)); return false; }
+        setError('');
+        await loadLists([]);
+        return true;
+      } finally { setBusy(false); }
     },
     /** Clear an item st closed: only the person's own word removes it from Home. */
     clearClosed(id: string) {

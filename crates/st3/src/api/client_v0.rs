@@ -444,6 +444,7 @@ async fn collection_items_with_windows(
                 let mut published = None;
                 let mut published_at = None;
                 let cached_agents = if collection == "agents" {
+                    store.note_agent_roster_read();
                     match store.agent_resources_published_at(index, false, None)? {
                         Some((cards, at)) => {
                             published_at = Some(at);
@@ -1542,6 +1543,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 reread_due.extend(others);
                 if reread_due.is_empty() && !roster_wanted || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
                 if std::mem::take(&mut roster_wanted) {
+                    state.store.note_agent_roster_read();
                     state.store.request_agent_roster_refresh();
                     last_reread = tokio::time::Instant::now();
                 }
@@ -12303,6 +12305,101 @@ mission "queue-parity" state="ready" {
             .collect::<BTreeSet<_>>();
         for stage in ["fresh-wait", "fresh-page", "refresh"] {
             assert!(stages.contains(stage), "{stage} recorded: {stages:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forgotten_agent_roster_is_refolded_before_any_read_asks() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/forgotten".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"forgotten", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        let complete = {
+            let store = state.store.clone();
+            move |_: &u64| store.published_agent_roster(store.index().unwrap(), false).is_some()
+        };
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(complete.clone()))
+            .await.expect("the refresher publishes the roster as it starts").unwrap();
+        let plain = || client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default()));
+
+        // A chunked replication projection, a trim or a repair forgets every kept reduction,
+        // the published roster with them. Where no agents list was read lately, the roster
+        // folds again only when a read asks: a catch-up that forgets per chunk refolds nothing.
+        state.store.forget_current_views();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), published.wait_for(complete.clone()))
+                .await.is_err(),
+            "a forget on a node nobody reads must not refold the roster",
+        );
+        assert!(plain().await.is_err(), "the first read after that finds no roster yet");
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(complete.clone()))
+            .await.expect("the read's request republishes the roster").unwrap();
+
+        // Once agents are being read, the refresher folds it again on its own: no read asks,
+        // so none finds the roster missing and waits for a fold from the log.
+        let cold_folds = || crate::api::request_latency_snapshot().into_iter()
+            .find(|row| row["scope"] == "agents-roster" && row["stage"] == "refresh-cold")
+            .map_or(0, |row| row["count"].as_u64().unwrap());
+        let before = cold_folds();
+        state.store.forget_current_views();
+        assert!(state.store.published_agent_roster(state.store.index().unwrap(), false).is_none());
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(complete))
+            .await.expect("the refresher republishes a forgotten roster unasked").unwrap();
+        assert!(cold_folds() > before, "the refold from the log lands in the refresh-cold row");
+        let (Extension(_), Json(page)) = plain().await.expect("a plain read after the refold finds a roster");
+        assert_eq!(page.items[0]["id"], "agent/forgotten");
+    }
+
+    /// What agents reads cost after every kept reduction was forgotten, on a disposable copy of
+    /// a real store (`ST_ROSTER_BACKLOG_STORE`, opened in place): a fresh and a plain first page
+    /// `ST_ROSTER_FORGET_DELAY_MS` after each forget, as a reader arriving then would see them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "agents reads after a forget on a store copy; set ST_ROSTER_BACKLOG_STORE and run with --ignored --nocapture"]
+    async fn agent_reads_after_a_forget_timing_on_a_store_copy() {
+        let Some(database) = std::env::var_os("ST_ROSTER_BACKLOG_STORE").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let delay = Duration::from_millis(std::env::var("ST_ROSTER_FORGET_DELAY_MS").ok()
+            .map_or(3000, |ms| ms.parse().unwrap()));
+        let root = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: Arc::new(Store::open(&database, "bench-host").unwrap()),
+            ..test_state(root.path())
+        };
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        let complete = {
+            let store = state.store.clone();
+            move |_: &u64| store.published_agent_roster(u64::MAX, false).is_some()
+        };
+        tokio::time::timeout(Duration::from_secs(600), published.wait_for(complete))
+            .await.expect("the refresher publishes the roster as it starts").unwrap();
+        let read = |fresh: bool| {
+            let state = state.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let answer = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+                    Query(ClientListQuery { fresh, limit: Some(50), ..ClientListQuery::default() })).await;
+                (started.elapsed().as_secs_f64() * 1000.0, answer.is_ok())
+            }
+        };
+        // Agents are being read, as on a node people watch.
+        let _ = read(false).await;
+        for round in 0..5 {
+            state.store.forget_current_views();
+            tokio::time::sleep(delay).await;
+            let (fresh_ms, fresh_ok) = read(true).await;
+            let (plain_ms, plain_ok) = read(false).await;
+            println!("forget round {round}: {delay:?} later fresh {fresh_ms:.1} ms ok={fresh_ok}; \
+                plain {plain_ms:.1} ms ok={plain_ok}");
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
 

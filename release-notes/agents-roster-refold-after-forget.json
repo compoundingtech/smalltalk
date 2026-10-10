@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Where agents lists were read in the last five minutes, the roster refresher refolds a forgotten roster at once instead of when the next agents read finds none and waits for it; request latency reports such folds as stage refresh-cold",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digests change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "GET /v1/client/request-latency adds stage=refresh-cold to its scope=agents-roster rows; a refresh with no publication to start from now lands there instead of in stage=refresh. Existing fields are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No startup work."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator steps."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "In-memory behavior only; a rollback restores refolding on the next agents read without changing durable state."
+  }
+}

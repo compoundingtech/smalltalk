@@ -328,6 +328,13 @@ type ProofSources = BTreeMap<(String, String), Vec<CheckpointItemSource>>;
 // No source/subject IDs are keys, and suppressed failures have no flush, queue or retry.
 static CHECKPOINT_DIAGNOSTICS: std::sync::OnceLock<std::sync::Mutex<super::ProjectionDiagnosticState>> = std::sync::OnceLock::new();
 
+/// The tombstones a sealed set reads: those before the cut, but none of a checkpoint whose trim
+/// is still recording them. A trim records tombstones in chunks, so after a crash part way
+/// through, the plan made again reads only what earlier checkpoints dropped, as it did the first
+/// time, and records the rest.
+const RECORDED_TOMBSTONE_FILTER: &str = "accepted_at_unix_ms < ?3
+    AND checkpoint NOT IN (SELECT id FROM checkpoints WHERE state='recording')";
+
 /// Record the tombstones of a checkpoint's drop. Recording them again changes nothing.
 pub fn record_checkpoint_tombstones_tx(
     transaction: &Transaction<'_>,
@@ -1026,7 +1033,7 @@ impl Store {
             CheckpointCaptureQuery {
                 table: "checkpoint_envelopes",
                 columns: "writer, sequence, envelope_hash, accepted_at_unix_ms",
-                filter: "accepted_at_unix_ms < ?3",
+                filter: RECORDED_TOMBSTONE_FILTER,
             },
             cut, record_page, |row| {
                 Ok(EnvelopeTombstone {
@@ -1043,7 +1050,7 @@ impl Store {
                 table: "checkpoint_claims",
                 columns: "id, writer, sequence, envelope_hash, subject, kind, actor, predecessors,
                           operation_id, request_digest, accepted_at_unix_ms",
-                filter: "accepted_at_unix_ms < ?3",
+                filter: RECORDED_TOMBSTONE_FILTER,
             },
             cut, record_page, |row| {
                 Ok(ClaimTombstone {
