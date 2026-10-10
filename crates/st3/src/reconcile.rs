@@ -34193,9 +34193,9 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
                 .unwrap()
                 .iter()
                 .any(|claim| {
-                    claim.body.pointer("/fields/code") == Some(&json!("native-prompt-gone"))
+                    claim.body.pointer("/fields/code") == Some(&serde_json::json!("native-prompt-gone"))
                         && claim.body.pointer("/_operation/id")
-                            == Some(&json!(smallclaims::store::operation_id_for_key(
+                            == Some(&serde_json::json!(smallclaims::store::operation_id_for_key(
                                 &crate::store::native_prompt_gone_key(observation)
                             )))
                 })
