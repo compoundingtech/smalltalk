@@ -1164,6 +1164,7 @@ fn delivery_config(root: &Path) -> CodexDeliveryConfig {
         supervisor: None,
         producer_version: Some("codex-cli 0.153.0".into()),
         model: None,
+        prompt_answers: None,
     }
 }
 
@@ -5501,6 +5502,182 @@ fn an_unclassified_item_holds_until_the_next_idle_status() {
             .unwrap()
     );
     assert_eq!(state.observed(), &CodexObservedState::Idle);
+}
+
+#[test]
+fn a_persons_answer_takes_each_approval_methods_own_decision_words() {
+    let none = Value::Null;
+    for (method, allow, deny) in [
+        (
+            "item/commandExecution/requestApproval",
+            json!({"decision": "accept"}),
+            json!({"decision": "decline"}),
+        ),
+        (
+            "item/fileChange/requestApproval",
+            json!({"decision": "accept"}),
+            json!({"decision": "decline"}),
+        ),
+        (
+            "execCommandApproval",
+            json!({"decision": "approved"}),
+            json!({"decision": {"denied": {"rejection": "The person denied this from st."}}}),
+        ),
+        (
+            "applyPatchApproval",
+            json!({"decision": "approved"}),
+            json!({"decision": {"denied": {"rejection": "The person denied this from st."}}}),
+        ),
+    ] {
+        assert_eq!(
+            approval_decision(method, &none, "allow"),
+            Some(allow),
+            "{method}"
+        );
+        assert_eq!(
+            approval_decision(method, &none, "deny"),
+            Some(deny),
+            "{method}"
+        );
+    }
+    // A permissions request is granted exactly what it asked for, or nothing.
+    let asked = json!({"threadId": "thread-main", "permissions": {"network": {"enabled": true}}});
+    assert_eq!(
+        approval_decision("item/permissions/requestApproval", &asked, "allow"),
+        Some(json!({"permissions": {"network": {"enabled": true}}, "scope": "turn"}))
+    );
+    assert_eq!(
+        approval_decision("item/permissions/requestApproval", &asked, "deny"),
+        Some(json!({"permissions": {}}))
+    );
+    assert_eq!(
+        approval_decision("item/commandExecution/requestApproval", &none, "maybe"),
+        None
+    );
+    assert_eq!(
+        approval_decision("item/tool/requestUserInput", &none, "allow"),
+        None
+    );
+}
+
+#[test]
+fn an_approval_answered_in_st_is_sent_once_and_only_for_this_thread() {
+    use crate::session_control::PromptAnswer;
+    let answered = |answer: &str| {
+        let answer = answer.to_owned();
+        move |_: u128| {
+            Some(PromptAnswer::Answered {
+                answer: answer.clone(),
+            })
+        }
+    };
+    let request = |id: u64, thread: &str| {
+        json!({"id": id, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": thread, "turnId": "turn-1", "command": "make"}})
+    };
+    let start = Instant::now();
+    let mut approval = CodexApprovalAnswer::default();
+
+    // Another thread's request, or one without an id, is never answered.
+    approval.observe(&request(7, "thread-other"), "thread-main", 1_000);
+    approval.observe(
+        &json!({"method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-main"}}),
+        "thread-main",
+        1_000,
+    );
+    assert_eq!(approval.answer_if_due(start, answered("allow")), None);
+
+    // Open: st is asked from when the request was seen, and again only a second later.
+    approval.observe(&request(8, "thread-main"), "thread-main", 2_000);
+    let mut asked = Vec::new();
+    assert_eq!(
+        approval.answer_if_due(start, |since| {
+            asked.push(since);
+            Some(PromptAnswer::Open)
+        }),
+        None
+    );
+    assert_eq!(asked, vec![2_000]);
+    assert_eq!(
+        approval.answer_if_due(start + Duration::from_millis(500), |_| unreachable!()),
+        None
+    );
+    // A request for another thread does not replace this one.
+    approval.observe(&request(9, "thread-other"), "thread-main", 2_500);
+    assert_eq!(
+        approval.answer_if_due(start + APPROVAL_ANSWER_POLL, answered("deny")),
+        Some(json!({"id": 8, "result": {"decision": "decline"}}))
+    );
+    assert_eq!(
+        approval.answer_if_due(start + APPROVAL_ANSWER_POLL * 3, answered("deny")),
+        None,
+        "an answer is sent once"
+    );
+
+    // Answered in the TUI first: the resolution forgets the request.
+    approval.observe(&request(10, "thread-main"), "thread-main", 3_000);
+    approval.observe(
+        &json!({"method": "serverRequest/resolved",
+            "params": {"threadId": "thread-main", "requestId": 9}}),
+        "thread-main",
+        3_100,
+    );
+    assert!(
+        approval.pending.is_some(),
+        "another request's resolution is not this one's"
+    );
+    approval.observe(
+        &json!({"method": "serverRequest/resolved",
+            "params": {"threadId": "thread-main", "requestId": 10}}),
+        "thread-main",
+        3_100,
+    );
+    assert_eq!(approval.answer_if_due(start, answered("allow")), None);
+
+    // The thread moving on forgets it too: a status without the flag, a completed turn, or st
+    // reporting the prompt gone.
+    approval.observe(&request(11, "thread-main"), "thread-main", 4_000);
+    approval.observe(
+        &json!({"method": "thread/status/changed", "params": {"threadId": "thread-main",
+            "status": {"type": "active", "activeFlags": ["waitingOnApproval"]}}}),
+        "thread-main",
+        4_100,
+    );
+    assert!(approval.pending.is_some());
+    approval.observe(
+        &json!({"method": "thread/status/changed", "params": {"threadId": "thread-main",
+            "status": {"type": "active", "activeFlags": []}}}),
+        "thread-main",
+        4_200,
+    );
+    assert!(approval.pending.is_none());
+    approval.observe(&request(12, "thread-main"), "thread-main", 5_000);
+    approval.observe(
+        &json!({"method": "turn/completed", "params": {"threadId": "thread-main",
+            "turn": {"id": "turn-1", "status": "completed"}}}),
+        "thread-main",
+        5_100,
+    );
+    assert!(approval.pending.is_none());
+    approval.observe(&request(13, "thread-main"), "thread-main", 6_000);
+    assert_eq!(
+        approval.answer_if_due(start, |_| Some(PromptAnswer::Gone)),
+        None
+    );
+    assert!(approval.pending.is_none());
+
+    // A legacy request names its thread as a conversation and takes its own words.
+    approval.observe(
+        &json!({"id": "legacy-1", "method": "execCommandApproval",
+            "params": {"conversationId": "thread-main"}}),
+        "thread-main",
+        7_000,
+    );
+    assert_eq!(
+        approval.answer_if_due(start, answered("allow")),
+        Some(json!({"id": "legacy-1", "result": {"decision": "approved"}}))
+    );
 }
 
 #[test]

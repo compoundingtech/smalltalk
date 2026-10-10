@@ -87,6 +87,37 @@ impl DeliveryGate {
     }
 }
 
+/// Where a native prompt stands in st: still open, answered by the seat's person (and how), or
+/// gone. The same shape as the daemon's `GET /v1/harness-prompts/state`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum PromptAnswer {
+    Open,
+    Answered { answer: String },
+    Gone,
+}
+
+/// How a native driver reads a person's answer to the prompt it saw open at a unix-ms time. The
+/// owning control plane supplies it; `None` means st could not say this time.
+#[derive(Clone)]
+pub struct PromptAnswers(Arc<dyn Fn(u128) -> Option<PromptAnswer> + Send + Sync>);
+
+impl PromptAnswers {
+    pub fn new(read: impl Fn(u128) -> Option<PromptAnswer> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    pub(crate) fn read(&self, since_unix_ms: u128) -> Option<PromptAnswer> {
+        (self.0)(since_unix_ms)
+    }
+}
+
+impl std::fmt::Debug for PromptAnswers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PromptAnswers")
+    }
+}
+
 /// Catalog drivers retain their product's status transport. Native drivers take graph control.
 #[derive(Clone, Debug, Default)]
 pub enum SessionControl {
