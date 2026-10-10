@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Refresh the published attention list when a harness is blocked on a person and when that prompt clears",
+  "replay": {"status": "none", "detail": "No claim replay or stored history changes."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."},
+  "compatibility": {"status": "none", "detail": "Attention rows are unchanged; the published list only refreshes on more claims."},
+  "downtime": {"status": "none", "detail": "No service interruption."},
+  "manual": {"status": "none", "detail": "No action is required."},
+  "recovery": {"status": "none", "detail": "Only when the in-memory published attention list refreshes changes; reverting restores the previous refresh rules."}
+}
