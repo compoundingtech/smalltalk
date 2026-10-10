@@ -1972,6 +1972,21 @@ pub fn mission_detail(
                 None,
             ));
         }
+        // A step whose holder sat idle with nothing set to wake it says when st nudged it.
+        if step.state == StepState::Working
+            && let Some(nudged) = mission
+                .step_metadata
+                .get(&step.id)
+                .and_then(|metadata| metadata.nudged.as_deref())
+        {
+            steps.line(Line::from(vec![
+                span("      ", theme::dim()),
+                span(
+                    format!("nudged {nudged} ago: idle holding it, nothing set to wake it"),
+                    theme::soft(),
+                ),
+            ]));
+        }
         if open {
             let pad = "      ";
             let mut field = |label: &str, values: &[String], style: Style| {
@@ -3290,6 +3305,51 @@ pub fn devices_card(world: &World, width: usize) -> Doc {
 #[cfg(test)]
 mod tree_tests {
     use super::*;
+
+    #[test]
+    fn a_working_step_says_when_its_idle_holder_was_nudged() {
+        let mut world = crate::ui::demo::world();
+        let Load::Ready(missions) = &mut world.missions else {
+            panic!("the demo world has missions");
+        };
+        let mission = missions
+            .iter_mut()
+            .find(|mission| mission.steps.iter().any(|step| step.state == StepState::Working))
+            .unwrap();
+        let step = mission
+            .steps
+            .iter()
+            .find(|step| step.state == StepState::Working)
+            .unwrap()
+            .id
+            .clone();
+        let id = mission.id.clone();
+        let shown = |world: &World| {
+            mission_detail(world, Some(&id), 120, "", None, &Default::default())
+                .lines
+                .iter()
+                .map(text::plain)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(!shown(&world).contains("nudged"));
+        let Load::Ready(missions) = &mut world.missions else {
+            unreachable!()
+        };
+        missions
+            .iter_mut()
+            .find(|mission| mission.id == id)
+            .unwrap()
+            .step_metadata
+            .entry(step)
+            .or_default()
+            .nudged = Some("40m".into());
+        let detail = shown(&world);
+        assert!(
+            detail.contains("nudged 40m ago: idle holding it, nothing set to wake it"),
+            "{detail}"
+        );
+    }
 
     #[test]
     fn a_request_holding_a_json_report_shows_what_happened_and_folds_the_rest() {

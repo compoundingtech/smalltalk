@@ -2931,6 +2931,7 @@ fn mission_resources_filtered(
                                         .or_else(|| step.wake.as_ref().and_then(|wake| wake.failure.as_deref())),
                                     "wake": wake,
                                     "claim_expires_at": step.claim_expires_at_unix_ms.map(client_timestamp),
+                                    "nudged_at": step.nudged_at_unix_ms.map(client_timestamp),
                                 })
                             })
                             .collect::<Vec<_>>()

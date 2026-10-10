@@ -34,9 +34,13 @@ use crate::resource::{
 use crate::store::Store;
 
 mod channel_recovery;
+mod idle_nudge;
 mod placement;
 mod run_report;
 mod start_spacing;
+mod waits;
+
+pub use idle_nudge::{IDLE_NUDGE_AFTER_MS, IDLE_NUDGE_QUIET_WATCH_MS, IdleNudgeSettings};
 
 /// The actor of every attention request the reconciler raises.
 const RECONCILER_ACTOR: &str = "agent/st3/reconciler";
@@ -770,6 +774,8 @@ pub struct Reconciler<R = NativeRuntime> {
     notify: Arc<Notify>,
     event_notify: watch::Sender<u64>,
     start_spacing: start_spacing::StartSpacing,
+    /// When an idle seat that holds work is nudged; see `idle_nudge`.
+    idle_nudge: Mutex<IdleNudgeSettings>,
     #[cfg(test)]
     background_dispatch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -933,6 +939,7 @@ impl Reconciler<NativeRuntime> {
             notify,
             event_notify,
             start_spacing: Default::default(),
+            idle_nudge: Mutex::default(),
             #[cfg(test)]
             background_dispatch_hook: Default::default(),
             #[cfg(test)]
@@ -1009,6 +1016,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             notify,
             event_notify: watch::channel(0_u64).0,
             start_spacing: Default::default(),
+            idle_nudge: Mutex::default(),
             #[cfg(test)]
             background_dispatch_hook: Default::default(),
             #[cfg(test)]
@@ -4457,6 +4465,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 }
             }
         }
+        self.nudge_idle_holder(agent, &work, harness.as_ref(), now)?;
         anyhow::ensure!(
             message_errors.is_empty(),
             "close work messages: {}",
@@ -7175,7 +7184,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         // it read, so the next pass evaluates it again and takes the new times.
                         due = crate::incremental::run_due(&run, now_ms());
                         // Telling a run's reporter never holds the run back or fails it.
-                        match self.run_report(&run).and_then(|report| {
+                        match self.run_report(&run.subject).and_then(|report| {
                             report
                                 .map(|report| self.report_run(&run, &report, now_ms()))
                                 .transpose()
@@ -10545,6 +10554,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         blocked_reason: None,
                         blockers: Vec::new(),
                         not_before_unix_ms: None,
+                        nudged_at_unix_ms: None,
                         created_at_unix_ms: run.created_at_unix_ms,
                         updated_at_unix_ms: run.updated_at_unix_ms,
                         person_answers: Vec::new(),
@@ -36207,6 +36217,7 @@ mission "ios-proof-blocked" state="ready" {
             blocked_reason: None,
             blockers: Vec::new(),
             not_before_unix_ms: None,
+            nudged_at_unix_ms: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             person_answers: Vec::new(),
@@ -36366,6 +36377,7 @@ mission "ios-proof-blocked" state="ready" {
             blocked_reason: None,
             blockers: Vec::new(),
             not_before_unix_ms: None,
+            nudged_at_unix_ms: None,
             created_at_unix_ms: 10,
             updated_at_unix_ms: 10,
             person_answers: Vec::new(),
@@ -36756,6 +36768,7 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
             blocked_reason: None,
             blockers: Vec::new(),
             not_before_unix_ms: None,
+            nudged_at_unix_ms: None,
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
             person_answers: Vec::new(),
@@ -37109,6 +37122,7 @@ mission "gated" state="ready" {
 "#;
 
     mod ready_wake_fault_notice;
+    mod idle_nudge_tests;
 
     struct SeatQueueFixture {
         store: Arc<Store>,

@@ -2472,6 +2472,10 @@ pub struct StepRunView {
     pub progress_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_at_unix_ms: Option<u128>,
+    /// When st last nudged this attempt's holder for idling with nothing set to wake it, while
+    /// the step is held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nudged_at_unix_ms: Option<u128>,
     /// The `work complete` summary for the current attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_summary: Option<String>,
