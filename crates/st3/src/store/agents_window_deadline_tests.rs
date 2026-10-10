@@ -5,6 +5,8 @@ fn agents_window_partial_projection_supplies_its_queue_deadline() {
     let store = Store::open_memory("node").unwrap();
     let entry = |index, history, covered, deadline| runtime::AgentResourcesEntry {
         index, local: 0, history, covered, valid_until_unix_ms: deadline,
+        publication_revision: 0,
+        publication_items: None,
         items: Arc::new(Vec::new()), published_at_unix_ms: 0,
     };
     let Ok(mut cache) = store.smalltalk.agent_resources_cache.lock() else {

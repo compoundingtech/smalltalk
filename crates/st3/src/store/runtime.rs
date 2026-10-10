@@ -54,6 +54,7 @@ pub struct SmalltalkRuntime {
     /// Counts complete current roster publications, same graph index or not, so collection
     /// streams that read an earlier one reread the newer.
     pub(crate) agent_roster_published: tokio::sync::watch::Sender<u64>,
+    pub(crate) agent_roster_epoch: std::sync::OnceLock<String>,
     /// Every other collection's published view revisions, for the same rereads.
     pub(crate) published_views: published_views::PublishedViews,
     #[cfg(test)]
@@ -68,6 +69,9 @@ pub struct SmalltalkRuntime {
 pub(crate) struct AgentResourcesEntry {
     pub(crate) index: u64,
     pub(crate) local: u64,
+    pub(crate) publication_revision: u64,
+    /// Client-ready, frozen presentation for revision-fenced prototype transports.
+    pub(crate) publication_items: Option<Arc<Vec<Value>>>,
     pub(crate) history: bool,
     /// None certifies the whole roster; Some records the lazily materialized page subjects.
     pub(crate) covered: Option<BTreeSet<String>>,

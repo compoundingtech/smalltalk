@@ -1262,6 +1262,27 @@ const AGENT_CARD_STATUS_LIMIT: usize = 4096;
 /// A roster head: its cut, every agent's refs, the first cards in order, and when published.
 pub(crate) type PublishedRosterHead = (u64, Arc<Vec<Value>>, Vec<Value>, u128);
 
+/// Identity and the exact graph/local evidence frontier folded into a publication's rows.
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct AgentsPublication {
+    pub(crate) node_epoch: String,
+    pub(crate) revision: u64,
+    pub(crate) status_watermark: AgentsStatusWatermark,
+    pub(crate) materialized_at_ms: u128,
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) struct AgentsStatusWatermark {
+    pub(crate) store_index: u64,
+    pub(crate) local_frontier: u64,
+}
+
+impl AgentsStatusWatermark {
+    pub(crate) fn covers(self, requested: Self) -> bool {
+        self.store_index >= requested.store_index && self.local_frontier >= requested.local_frontier
+    }
+}
+
 /// How long a roster refresh request may go unanswered before the daemon warns about it.
 const AGENT_ROSTER_OVERDUE_MS: u64 = 30_000;
 
@@ -3667,6 +3688,43 @@ impl Store {
         self.smalltalk.agent_roster_published.subscribe()
     }
 
+    /// Current-roster invalidation frontier, excluding unrelated history publications.
+    pub(crate) fn agent_roster_revision(&self) -> u64 {
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| !entry.history && entry.covered.is_none())
+            .map(|entry| entry.publication_revision).max().unwrap_or(0)
+    }
+
+    pub(crate) fn agent_roster_epoch(&self) -> &str {
+        self.smalltalk.agent_roster_epoch.get_or_init(|| uuid::Uuid::now_v7().to_string())
+    }
+
+    /// One short SQLite snapshot; callers drop it before awaiting.
+    pub(crate) fn agent_status_watermark(&self) -> Result<AgentsStatusWatermark> {
+        self.read_snapshot(|index| Ok(AgentsStatusWatermark {
+            store_index: index,
+            local_frontier: roster_local_frontier(&self.readers.get(), index)?,
+        }))
+    }
+
+    /// Metadata and rows come from the same immutable entry under one lock.
+    pub(crate) fn agents_publication(&self, index: u64) -> Option<(AgentsPublication, Arc<Vec<Value>>)> {
+        self.smalltalk.agent_roster_refresh.get()?;
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| !entry.history && entry.covered.is_none() && entry.index <= index)
+            .max_by_key(|entry| entry.publication_revision)
+            .and_then(|entry| Some((AgentsPublication {
+                node_epoch: self.agent_roster_epoch().to_owned(),
+                revision: entry.publication_revision,
+                status_watermark: AgentsStatusWatermark {
+                    store_index: entry.index, local_frontier: entry.local,
+                },
+                materialized_at_ms: entry.published_at_unix_ms,
+            }, Arc::clone(entry.publication_items.as_ref()?))))
+    }
+
     /// Queue selection changes at lease expiry even when the claim frontier is unchanged.
     /// Scan only on a cache miss, inside the same SQLite snapshot as the queue projection.
     fn agent_queue_valid_until(&self, now: u128) -> Result<Option<u128>> {
@@ -3719,6 +3777,8 @@ impl Store {
             .expect("agent page refs cache poisoned");
         cache.push_back(runtime::AgentResourcesEntry {
             index, local: 0, history, covered: None, valid_until_unix_ms, items: Arc::clone(&items),
+            publication_revision: 0,
+            publication_items: None,
             published_at_unix_ms: now,
         });
         let evicted = if cache.len() > 8 { cache.pop_front() } else { None };
@@ -3800,7 +3860,7 @@ impl Store {
             .filter(|entry| entry.index <= index && entry.local <= local && entry.history == history)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         drop(cache);
-        let entry = crate::performance::task("roster/build",
+        let mut entry = crate::performance::task("roster/build",
         || -> Result<runtime::AgentResourcesEntry> {
         let previous = match previous {
             Some(entry) if entry.index == index => Some((entry, AgentResourcesDelta::default())),
@@ -3896,6 +3956,8 @@ impl Store {
                 if changed.is_empty() && deferred.is_empty() {
                     return Ok(runtime::AgentResourcesEntry {
                         index, local, history, covered,
+                        publication_revision: 0,
+                        publication_items: None,
                         valid_until_unix_ms,
                         items: Arc::clone(&previous.items),
                         published_at_unix_ms: now_ms(),
@@ -3918,6 +3980,8 @@ impl Store {
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
                 Ok(runtime::AgentResourcesEntry {
                     index, local, history, covered,
+                    publication_revision: 0,
+                    publication_items: None,
                     valid_until_unix_ms,
                     items: Arc::new(items),
                     published_at_unix_ms: now_ms(),
@@ -3934,6 +3998,8 @@ impl Store {
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
                 Ok(runtime::AgentResourcesEntry {
                     index, local, history, covered: selected.cloned(),
+                    publication_revision: 0,
+                    publication_items: None,
                     valid_until_unix_ms: self.agent_queue_valid_until(now)?,
                     items: Arc::new(items),
                     published_at_unix_ms: now_ms(),
@@ -3941,6 +4007,14 @@ impl Store {
             }
         }
         })?;
+        if !entry.history && entry.covered.is_none() {
+            // Freeze every client-facing field in the same read snapshot as the raw cards.
+            // Keep raw rows separately for incremental folds and ordinary live-overlay reads.
+            entry.publication_items = Some(crate::api::materialize_agents_publication(
+                self, &entry.items, entry.published_at_unix_ms,
+            )?);
+            entry.published_at_unix_ms = now_ms();
+        }
         let mut cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
         // All endpoint callers hold admission. Direct internal readers may still race; never
@@ -3952,6 +4026,14 @@ impl Store {
         let items = if let Some(published) = published { published } else {
             cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
             let items = Arc::clone(&entry.items);
+            if complete {
+                // Serialize identity assignment and rows under the cache mutex. Awakened
+                // readers cannot observe this revision without its exact materialization.
+                self.smalltalk.agent_roster_published.send_modify(|revision| {
+                    *revision += 1;
+                    entry.publication_revision = *revision;
+                });
+            }
             cache.push_back(entry);
             if cache.len() > 8 {
                 // Keep the newest complete publication of each mode, even while the other
@@ -3966,9 +4048,6 @@ impl Store {
             items
         };
         drop(cache);
-        if complete {
-            self.smalltalk.agent_roster_published.send_modify(|revision| *revision += 1);
-        }
         Ok(select(&items))
     }
 

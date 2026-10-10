@@ -65,6 +65,7 @@ mod terminal_gate_evidence;
 mod client_adapters;
 mod client_presence;
 mod client_v0;
+mod agents_poll;
 mod custom;
 mod delivery_presence;
 pub(crate) mod agent_harness;
@@ -156,6 +157,8 @@ struct ClientSnapshot {
     /// For rows a background refresher folded: when it published them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     published_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    publication: Option<crate::store::AgentsPublication>,
 }
 
 /// A client page and the snapshot it was read in, which the envelope names.
@@ -559,6 +562,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/work", get(client_work))
         .route("/v1/client/work/{*id}", get(client_work_detail))
         .route("/v1/client/agents", get(client_agents))
+        .route("/v1/client/agents/poll", get(agents_poll::poll))
         .route("/v1/client/resources", get(client_v0::resources::list))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
         .route(
@@ -1435,6 +1439,7 @@ fn client_snapshot_with_time(state: &AppState, store_index: u64, unix_ms: u128) 
         projection_version: CLIENT_PROJECTION_VERSION.into(),
         created_at,
         published_at: None,
+        publication: None,
     }
 }
 
@@ -2547,6 +2552,16 @@ fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Re
         );
     }
     Ok(())
+}
+
+pub(crate) fn materialize_agents_publication(
+    store: &Store,
+    rows: &[Value],
+    published_at_ms: u128,
+) -> anyhow::Result<Arc<Vec<Value>>> {
+    let mut items = rows.to_vec();
+    overlay_agent_resources(store, &mut items, &client_timestamp(published_at_ms))?;
+    Ok(Arc::new(items))
 }
 
 fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
@@ -26644,6 +26659,96 @@ agent "seat" { workspace "/tmp"; command "true" }
         stale["runtime_incarnation"] = json!("retired-runtime");
         let (status, body) = json_request(app, "/v1/harness-events", stale).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    }
+
+    #[tokio::test]
+    async fn agents_poll_binds_exact_publication_and_times_out_without_stale_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let _wake = state.store.start_agent_roster_refresher().unwrap();
+        refresh_agent_roster(&state.store, false).unwrap();
+        let (publication, _) = state.store.agents_publication(u64::MAX).unwrap();
+        let app = router(state.clone());
+        let response = app.clone().oneshot(Request::builder()
+            .uri("/v1/client/agents/poll?after_revision=0&min_store_index=0&min_local_frontier=0&wait_ms=0")
+            .body(Body::empty()).unwrap()).await.unwrap();
+        let status = response.status();
+        let first: Value = serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["value"]["kind"], "snapshot");
+        assert_eq!(first["value"]["publication"]["revision"], publication.revision);
+        assert_eq!(first["snapshot"]["publication"], first["value"]["publication"]);
+        assert_eq!(first["snapshot"]["store_index"], publication.status_watermark.store_index);
+        let (status, unchanged) = get_request(app.clone(), &format!(
+            "/v1/client/agents/poll?node_epoch={}&after_revision={}&wait_ms=0",
+            publication.node_epoch, publication.revision)).await;
+        assert_eq!(status, StatusCode::OK, "{unchanged}");
+        assert_eq!(unchanged["kind"], "unchanged");
+        assert_eq!(unchanged["reason"], "timeout");
+        assert!(unchanged.get("items").is_none());
+        let (status, uncovered) = get_request(app.clone(), &format!(
+            "/v1/client/agents/poll?after_revision=0&min_store_index={}&min_local_frontier={}&wait_ms=0",
+            publication.status_watermark.store_index + 1, publication.status_watermark.local_frontier)).await;
+        assert_eq!(status, StatusCode::OK, "{uncovered}");
+        assert_eq!(uncovered["kind"], "unchanged");
+        assert!(uncovered.get("items").is_none());
+        let (status, resync) = get_request(app,
+            "/v1/client/agents/poll?node_epoch=retired-daemon&after_revision=999&wait_ms=0").await;
+        assert_eq!(status, StatusCode::OK, "{resync}");
+        assert_eq!(resync["kind"], "resync");
+        assert_eq!(resync["node_epoch"], publication.node_epoch);
+        assert!(resync.get("items").is_none());
+    }
+
+    #[test]
+    fn agents_poll_watermark_requires_both_graph_and_local_evidence() {
+        use crate::store::AgentsStatusWatermark;
+        let required = AgentsStatusWatermark { store_index: 10, local_frontier: 20 };
+        assert!(!AgentsStatusWatermark { store_index: 11, local_frontier: 19 }.covers(required));
+        assert!(!AgentsStatusWatermark { store_index: 9, local_frontier: 21 }.covers(required));
+        assert!(AgentsStatusWatermark { store_index: 10, local_frontier: 20 }.covers(required));
+        assert!(AgentsStatusWatermark { store_index: 11, local_frontier: 21 }.covers(required));
+    }
+
+    #[test]
+    fn agents_publication_local_only_revision_is_bound_to_immutable_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let subject = "agent/lp-local";
+        for (kind, fields) in [
+            ("runtime.observed", json!({"status":"running","runtime_id":"lp-local","incarnation_id":"one"})),
+            ("harness.observed", json!({"state":"working","driver":"codex","incarnation_id":"one"})),
+        ] {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: Some(subject.into()),
+                fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+                expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        }
+        let _wake = state.store.start_agent_roster_refresher().unwrap();
+        refresh_agent_roster(&state.store, false).unwrap();
+        let (old, old_rows) = state.store.agents_publication(u64::MAX).unwrap();
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "harness.timeline".into(), actor: Some(subject.into()),
+            fields: serde_json::from_value(json!({"operation":"append","entry_id":"lp-local",
+                "source_id":"fixture/lp-local","sequence":1,"revision":1,"role":"assistant",
+                "entry_type":"message","final":true,"driver":"codex","incarnation_id":"one",
+                "observed_at_unix_ms":client_now_ms(),"body":{"text":"local activity"}})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert_eq!(state.store.index().unwrap(), old.status_watermark.store_index);
+        let required = state.store.agent_status_watermark().unwrap();
+        assert!(!old.status_watermark.covers(required));
+        refresh_agent_roster(&state.store, false).unwrap();
+        let (new, new_rows) = state.store.agents_publication(u64::MAX).unwrap();
+        assert_eq!(new.node_epoch, old.node_epoch);
+        assert!(new.revision > old.revision);
+        assert!(new.status_watermark.covers(required));
+        assert!(old_rows[0]["last_activity_at"].is_null());
+        assert!(!new_rows[0]["last_activity_at"].is_null());
+        assert!(old_rows[0].get("_status_source").is_none());
+        let another = Store::open_memory("same-node").unwrap();
+        assert_ne!(another.agent_roster_epoch(), state.store.agent_roster_epoch());
     }
 }
 

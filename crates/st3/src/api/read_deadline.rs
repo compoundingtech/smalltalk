@@ -91,6 +91,9 @@ fn deadline(request: &Request<Body>) -> Option<Duration> {
                 .unwrap_or(MAX_WAIT_MS)
                 .clamp(10, MAX_WAIT_MS),
         )
+    } else if path == "/v1/client/agents/poll" {
+        Some(parameter("wait_ms").and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(25_000).min(MAX_WAIT_MS))
     } else if path == "/v1/client/events"
         || (path.starts_with("/v1/client/conversations/") && path.ends_with("/changes"))
         || (path.starts_with("/v1/client/terminals/")
@@ -129,6 +132,7 @@ fn long_poll_route(route: &str) -> bool {
         || route == "/v1/events"
         || route == "/v1/events/page"
         || route == "/v1/client/events"
+        || route == "/v1/client/agents/poll"
         || (route.starts_with("/v1/client/conversations/") && route.ends_with("/changes"))
         || (route.starts_with("/v1/client/terminals/") && route.ends_with("/screen"))
         || route.starts_with("/v1/sessions/logs/")
@@ -2036,6 +2040,14 @@ mod tests {
             "/v1/client/events",
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn an_idle_agents_publication_poll_is_not_cut_at_the_ordinary_deadline() {
+        idle_long_poll_keeps_its_normal_empty_answer(
+            "/v1/client/agents/poll?wait_ms=30000",
+            "/v1/client/agents/poll",
+        ).await;
     }
     #[tokio::test]
     async fn an_idle_screen_poll_is_not_cut_at_the_ordinary_deadline() {

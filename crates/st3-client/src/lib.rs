@@ -1512,6 +1512,24 @@ impl Client {
         .await
     }
 
+    /// Prototype agents publication long poll. `unchanged` and `resync` carry no rows.
+    pub async fn agents_poll(
+        &self,
+        node_epoch: Option<&str>,
+        after_revision: u64,
+        min_store_index: u64,
+        min_local_frontier: u64,
+    ) -> Result<Envelope<serde_json::Value>, ClientError> {
+        let mut path = format!(
+            "/v1/client/agents/poll?after_revision={after_revision}&min_store_index={min_store_index}&min_local_frontier={min_local_frontier}&wait_ms=25000"
+        );
+        if let Some(epoch) = node_epoch {
+            path.push_str("&node_epoch=");
+            path.push_str(&percent_encode(epoch));
+        }
+        self.get(&path).await
+    }
+
     pub async fn custom_subjects_list(
         &self,
         kind: Option<&str>,

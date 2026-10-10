@@ -81,8 +81,7 @@ struct CollectionSubscription {
     cursor: Option<collection_ivm::Delivered>,
     order: Vec<String>,
     has_more: bool,
-    /// The roster publication revision when this window's last read began. An agents window
-    /// rereads once a later roster is published, even at the same graph index.
+    /// Exact revision of the materialization delivered, not the revision when a read began.
     roster_revision: u64,
     /// The same for every other published view: its revision when this window's last read began.
     view_revision: u64,
@@ -441,8 +440,18 @@ async fn collection_items_with_windows(
                 // Every served roster says when it was published.
                 let mut published = None;
                 let mut published_at = None;
+                let mut publication = None;
                 let cached_agents = if collection == "agents" {
-                    match store.agent_resources_published_at(index, false, None)? {
+                    if let Some((metadata, cards)) = store.agents_publication(index) {
+                        published = Some(metadata.status_watermark.store_index);
+                        published_at = Some(metadata.materialized_at_ms);
+                        publication = Some(metadata);
+                        Some(cards)
+                    } else { match store.agent_resources_published_at(index, false, None)? {
+                        None if store.agent_roster_refresher_running() => {
+                            store.request_fresh_agent_roster(false);
+                            return Ok(Err(super::agent_roster_not_ready()));
+                        }
                         Some((cards, at)) => {
                             published_at = Some(at);
                             Some(cards)
@@ -473,14 +482,15 @@ async fn collection_items_with_windows(
                                 && client_agent_window_is_cached(&store, index, limit)? => None,
                             None => return Ok(Ok(None)),
                         },
-                    }
+                    } }
                 } else {
                     None
                 };
-                let snapshot = match published_at {
+                let mut snapshot = match published_at {
                     Some(at) => super::roster_snapshot(&state, published.unwrap_or(index), at),
                     None => client_snapshot_at(&state, index),
                 };
+                snapshot.publication = publication;
                 let at = snapshot.created_at.clone();
                 let compute = || {
                     let mut items = match collection.as_str() {
@@ -564,10 +574,11 @@ async fn collection_items_with_windows(
                     None => compute()?,
                 };
                 if collection == "agents" {
-                    // The window's shared rows are in hand; each reader's live overlay runs
-                    // beside the others instead of behind them.
+                    // Prototype publications already contain their exact frozen presentation.
                     drop(admission.take());
-                    overlay_agent_resources(&store, &mut items, &at)?;
+                    if snapshot.publication.is_none() {
+                        overlay_agent_resources(&store, &mut items, &at)?;
+                    }
                     if let Some(status) = &status {
                         items.retain(|item| item["state"].as_str() == Some(status.as_str()));
                     }
@@ -688,6 +699,11 @@ async fn deliver_collection(
             };
         }
     };
+    let publication = snapshot.publication.clone();
+    let previous_revision = subscription.roster_revision;
+    if let Some(publication) = &publication {
+        subscription.roster_revision = publication.revision;
+    }
     if request.collection == "summary" {
         summary::retain_timestamp(&mut items, &subscription.previous);
     }
@@ -700,7 +716,7 @@ async fn deliver_collection(
         .filter_map(|item| Some((item["id"].as_str()?.to_owned(), item.clone())))
         .collect();
     let sent = if !subscription.delivered {
-        send_collection(socket, json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more})).await
+        send_collection(socket, json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "publication":publication, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more})).await
     } else {
         let upserts = current
             .iter()
@@ -717,10 +733,11 @@ async fn deliver_collection(
             && removes.is_empty()
             && order == subscription.order
             && has_more == subscription.has_more
+            && publication.as_ref().is_none_or(|p| p.revision == previous_revision)
         {
             true
         } else {
-            send_collection(socket, json!({"kind":"changes", "id":request.id, "collection":request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more})).await
+            send_collection(socket, json!({"kind":"changes", "id":request.id, "collection":request.collection, "publication":publication, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more})).await
         }
     };
     if !sent {
@@ -1310,6 +1327,8 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut ivm_notices = sources.as_ref().map(|sources| sources.subscribe());
     let mut changed = state.event_notify.subscribe();
     let mut roster = state.store.subscribe_agent_roster();
+    // Scratch treatment only: compare publication-driven WS without the legacy held-window delay.
+    let immediate_agents = std::env::var_os("ST_BAKEOFF_AGENTS_WS_IMMEDIATE").is_some();
     let mut views = state.store.subscribe_collection_views();
     let windows = collection_windows::Windows::attach(&state.store);
     let mut window_revisions = [0; 8];
@@ -1456,7 +1475,12 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                     CollectionRead::Ivm(result) => deliver_ivm_collection(&mut socket, subscription, *result, &mut refresh).await,
                 };
                 match refreshed {
-                    Refreshed::Current => {}
+                    Refreshed::Current => {
+                        if subscription.request.collection == "agents"
+                            && subscription.roster_revision < state.store.agent_roster_revision() {
+                            refresh.push(id.clone());
+                        }
+                    }
                     Refreshed::Retry => {
                         if subscription.ivm.is_some() { subscription.dirty = true; }
                         else { reread_due.insert(id.clone()); }
@@ -1548,10 +1572,15 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
             result = roster.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 // A window read before this roster was published rereads it.
-                let published = *roster.borrow_and_update();
+                roster.borrow_and_update();
+                let published = state.store.agent_roster_revision();
                 let stale = subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
                     && s.request.collection == "agents" && s.roster_revision < published);
-                if publication_rereads(stale, &mut reread_due, &mut refresh, last_reread) { continue; }
+                if immediate_agents {
+                    refresh.extend(stale.map(|(id, _)| id.clone()));
+                } else if publication_rereads(stale, &mut reread_due, &mut refresh, last_reread) {
+                    continue;
+                }
             }
             result = views.changed(), if !command_waiting => {
                 if result.is_err() { return; }
@@ -1635,7 +1664,6 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 continue;
             }
             subscription.dirty = false;
-            subscription.roster_revision = *roster.borrow();
             subscription.view_revision =
                 crate::store::published_views::revision(&views.borrow(), &subscription.request.collection);
             let (cancel, canceled) = tokio::sync::oneshot::channel::<()>();
@@ -2429,7 +2457,7 @@ fn paired_client_session(
 
 /// Held collection sockets carry no bearer secret. Re-resolve their session grant at each
 /// arrangement read, using the same expiration/revocation checks as HTTP authentication.
-fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<ClientSession, ApiError> {
+pub(super) fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<ClientSession, ApiError> {
     if session.transport == "unix" && acting_party(session) {
         return Ok(session.clone());
     }
