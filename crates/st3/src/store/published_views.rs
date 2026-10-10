@@ -15,8 +15,10 @@ pub(crate) struct View {
     /// Rises with every publication, withdrawal and invalidation, and never goes back, so a
     /// window can tell any later change from the one it read.
     revision: u64,
-    /// Whether a refresher serves this view now. Until it does, and after it withdraws, the
-    /// collection's windows follow commits.
+    /// Whether a refresher serves or governs this view now. Until it does, and after it
+    /// withdraws, the collection's windows follow commits. A held view is governed even before
+    /// its first publication and while it has nothing current: its windows wait for its next
+    /// change instead (see [`PublishedViews::hold`]).
     published: bool,
 }
 
@@ -59,10 +61,21 @@ impl PublishedViews {
     }
 
     /// `collection`'s refresher no longer serves its view: its windows read it once more the
-    /// unpublished way, then follow commits again until the next publication.
+    /// unpublished way, then follow commits again until the next publication. A refresher that
+    /// governs its view holds it instead while it runs (see [`PublishedViews::hold`]); it is
+    /// withdrawn only when that refresher ends.
     #[cfg_attr(not(test), allow(dead_code, reason = "the missions, work and attention refreshers call it"))]
     pub(crate) fn withdraw(&self, collection: &str) {
         self.change(collection, false);
+    }
+
+    /// `collection`'s running refresher governs its view though it has nothing to serve yet, or
+    /// no longer: before its first publication, or after it withdrew rows it could not keep
+    /// current. Its windows read once more, then wait for the view's next change instead of
+    /// following commits, which would read nothing new.
+    #[cfg_attr(not(test), allow(dead_code, reason = "the work refresher calls it"))]
+    pub(crate) fn hold(&self, collection: &str) {
+        self.change(collection, true);
     }
 
     /// Every published view was discarded, as on rollback or reopen: each window that reads one
@@ -101,8 +114,14 @@ impl Store {
         self.smalltalk.published_views.withdraw(collection);
     }
 
-    /// Whether a refresher serves `collection`'s view: its windows then reread only when it
-    /// publishes again.
+    /// Say that `collection`'s running refresher governs its view while it has nothing to serve:
+    /// see [`PublishedViews::hold`].
+    pub(crate) fn hold_collection_view(&self, collection: &str) {
+        self.smalltalk.published_views.hold(collection);
+    }
+
+    /// Whether a refresher serves or governs `collection`'s view: its windows then reread only
+    /// when the view changes again.
     pub(crate) fn collection_view_published(&self, collection: &str) -> bool {
         self.smalltalk.published_views.published(collection)
     }
@@ -142,5 +161,9 @@ mod tests {
         views.publish("work");
         assert!(views.published("work"));
         assert_eq!(revision(&receiver.borrow_and_update(), "work"), 5, "revisions never go back");
+        // A held view is a change every window sees once; it then follows the view, not commits.
+        views.hold("work");
+        assert!(views.published("work"));
+        assert_eq!(revision(&receiver.borrow_and_update(), "work"), 6);
     }
 }

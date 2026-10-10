@@ -56,12 +56,27 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_roster_published: tokio::sync::watch::Sender<u64>,
     /// Every other collection's published view revisions, for the same rereads.
     pub(crate) published_views: published_views::PublishedViews,
+    /// The current missions list, while a refresher keeps it published.
+    pub(crate) published_missions: published_list::PublishedList<mission_list::MissionRows>,
+    /// The current work list, while a refresher keeps it published.
+    pub(crate) published_work: published_list::PublishedList<work_list::WorkRows>,
     #[cfg(test)]
     pub(crate) agent_resources_builds: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) agent_resources_refolded_cards: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) agent_resources_largest_fold: std::sync::atomic::AtomicUsize,
+    /// Direct current-work reads, which an enabled work list never makes.
+    #[cfg(test)]
+    pub(crate) direct_work_reads: std::sync::atomic::AtomicUsize,
+    /// Seats whose queue order a work fold read; runs a warm fold looked up in its reverse
+    /// index; and the seats the last fold read.
+    #[cfg(test)]
+    pub(crate) seat_order_reads: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) seat_lookups: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) last_seats_read: std::sync::Mutex<BTreeSet<String>>,
 }
 
 #[derive(Clone)]
@@ -366,6 +381,10 @@ impl Runtime for SmalltalkRuntime {
             .clear();
         *self.usage_folds.lock().unwrap_or_else(PoisonError::into_inner) = UsageFolds::default();
         self.agent_roster_published.send_modify(|revision| *revision += 1);
+        // Projections replaced without a new claim: the lists fold from nothing, dropping any
+        // fold under way, before the windows that read them are told to reread.
+        self.published_missions.forget();
+        self.published_work.forget();
         self.published_views.invalidate();
         self.agent_page_refs_cache
             .lock()

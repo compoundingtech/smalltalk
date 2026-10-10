@@ -25,6 +25,14 @@ Stage `fresh-wait` is a fresh read's wait for a publication at its cut (2 s at m
 `fresh-page` the page it then builds (`population: "fresh-reads"`). Stages are not requests: they
 add no route or path rows.
 
+`scope: "work-list"` rows (under route `/v1/client/work`) time a current-work read served from
+the published work list, `duration_scope: "work-stage"`. Stage `fresh-wait` is a fresh read's wait
+for a publication at its cut (2 s at most, `population: "fresh-reads"`); `page` a first page served
+from a publication, and `actor-build` one whose read built its actor's order in that publication
+(`population: "first-pages"`). They add no route or path rows. A fresh work read, which `st work ls`
+sends, still counts in full, wait included, under the `GET /v1/client/work` route and its
+`person-read` target: it has no `(fresh)` path or target of its own.
+
 Each row's `count` is its completed-response count since this process started, including error
 responses. Percentiles use its last at most 512 completions (`recent_count`), in whole milliseconds.
 Renew and claim have separate counts and percentile samples. `duration_scope: "response-envelope"`
