@@ -520,6 +520,8 @@ describe('ConversationPane composition activation', () => {
   it.each([
     ['/tmp/example/ready-step-test.fixture\nPermissionError: cannot read /tmp/example/check.py', 'PermissionError: cannot read …/check.py'],
     ['/tmp/example/ready-step-test.fixture', 'Tool failed; no readable reason was recorded.'],
+    ['Traceback (most recent call last):\n  File "/app/command.py", line 571, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\nsubprocess.TimeoutExpired: Command \'sleep 60\' timed out after 30 seconds', "subprocess.TimeoutExpired: Command 'sleep 60' timed out after 30 seconds"],
+    ['Traceback (most recent call last):\n  File "/app/check.py", line 4\n    run_check()\nProcess exited with code 2', 'Exited with code 2'],
   ])('uses a readable failed tool reason instead of a path tail: %s', async (diagnostic, reason) => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: {
       items: [scenario[0]!, { _tag: 'ToolCall', id: 'failed-run', callId: 'failed-call', name: 'run',
@@ -529,6 +531,7 @@ describe('ConversationPane composition activation', () => {
     } }
     source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
     await mount()
+    expect(container.querySelector('[data-error-overlay]')?.textContent).toContain(reason)
     const fold = container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')!
     await act(async () => { fold.click() })
     const row = container.querySelector<HTMLElement>('[data-tool-status="error"]')!

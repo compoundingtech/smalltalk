@@ -46,14 +46,25 @@ const summarizeArgs = (input: unknown): string | undefined => {
   }
   return undefined
 }
-/** Prefer a named error over trace frames or path dumps; keep diagnostics out of the reason line. */
+/** A traceback's last exception is the reason, never its frame or source statements. */
 export function errorReason(detail: string): string {
-  const lines = detail.split('\n').map(line => line.trim()).filter(line =>
+  const rawLines = detail.split('\n')
+  // Python exception names need not end in Error/Exception (e.g. TimeoutExpired).
+  // Source is indented; retain indentation until after selecting an exception.
+  let exception: string | undefined
+  for (let index = rawLines.length - 1; index >= 0; index--) {
+    const line = rawLines[index]!
+    if (/^(?:[A-Za-z_]\w*\.)*[A-Z]\w*:\s*/.test(line)) { exception = line; break }
+  }
+  const exit = detail.match(/\b(?:exited with code|exit code|exit status)\s*:?\s*(-?\d+)\b/i)
+  const traceback = rawLines.some(line => /^\s*(?:Traceback\b|File ["'])/.test(line))
+  const lines = traceback ? [] : rawLines.map(line => line.trim()).filter(line =>
     line !== '' &&
-    !/^(?:Traceback\b|File ["']|at\s+\S+|[\^~]+$)/.test(line) &&
+    !/^(?:at\s+\S+|[\^~]+$)/.test(line) &&
     !/^["']?(?:[A-Za-z]:[\\/]|[~/\\]|\.{1,2}[\\/]|…[\\/])\S*["']?$/.test(line),
   )
-  const reason = lines.find(line => /^(?:[\w.]+(?:Error|Exception)|error|fatal|failed|failure)\b/i.test(line)) ?? lines[0]
+  const reason = exception ?? (exit === null ? undefined : `Exited with code ${exit[1]}`) ??
+    lines.find(line => /^(?:[\w.]+(?:Error|Exception)|error|fatal|failed|failure)\b/i.test(line)) ?? lines[0]
   return reason === undefined ? 'Tool failed; no readable reason was recorded.' :
     reason.replace(/(?:~|[A-Za-z]:)?(?:[\\/][^\s\\/:'"`]+){2,}[\\/]([^\s\\/:'"`]+)/g, '…/$1')
 }

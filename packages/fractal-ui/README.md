@@ -107,6 +107,7 @@ Hosts must bound the lane so it owns scrolling; following and ordinary history a
 
 Work-log detail uses the same `toolOutput` extraction as tool previews: strings and native content arrays preserve their text parts in order; empty and non-text results have no detail. `Transcript/NativeToolOutput` covers the expanded row, and `pnpm test:work-log` covers strings, arrays, empty output and ignored non-text parts.
 The shared Markdown boundary keeps exactly one streaming caret on the final paragraph line, or immediately after another terminal block. Tool output uses the exported `HighlightedSource` boundary. Failure banners optionally expose a host-owned **Open output** action without clearing or reflowing history.
+Failed-command reason lines select the final top-level named exception from a traceback (including names such as `subprocess.TimeoutExpired`), then a recorded exit code, then the readable-output fallback. Traceback frames and indented Python source are never presented as reasons; full diagnostics remain in tool output. `test:work-log` covers timeout and chained JSON errors, truncated traces, exit codes and unchanged path redaction.
 
 ### Thread header
 
