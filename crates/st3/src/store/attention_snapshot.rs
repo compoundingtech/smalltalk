@@ -73,18 +73,22 @@ impl Store {
             return Err(St3Error::new("missing-evidence", "the prompt observation is not stored"));
         }
         let episode = Self::native_prompt_episode(observation);
-        let reference = hex::encode(sha2::Sha256::digest(episode.as_bytes()));
+        let mut fields = BTreeMap::from([
+            ("code".into(), json!("native-prompt-gone")),
+            ("status".into(), json!("resolved")),
+            ("driver".into(), json!("claude")),
+            ("incarnation_id".into(), json!(incarnation)),
+        ]);
+        // Keep legacy graph clears byte-identical for their existing idempotency keys.
+        if !durable {
+            let reference = hex::encode(sha2::Sha256::digest(episode.as_bytes()));
+            fields.insert("reason".into(), json!(format!("The native prompt was refused in the terminal. Reference: {reference}.")));
+        }
         self.append_claim(&ClaimInput {
             subject: observation.subject.clone(),
             kind: "harness.diagnostic".into(),
             actor: Some(observation.subject.clone()),
-            fields: BTreeMap::from([
-                ("code".into(), json!("native-prompt-gone")),
-                ("status".into(), json!("resolved")),
-                ("driver".into(), json!("claude")),
-                ("incarnation_id".into(), json!(incarnation)),
-                ("reason".into(), json!(format!("The native prompt was refused in the terminal. Reference: {reference}."))),
-            ]),
+            fields,
             evidence: if durable { vec![observation.id.clone()] } else { vec![] },
             expected_subject: None,
             idempotency_key: Some(native_prompt_gone_key(&episode)),

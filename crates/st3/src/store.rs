@@ -56287,7 +56287,16 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         }).unwrap();
         assert!(checkpoint::claim_or_tombstone_exists(&store.readers.get(), &observation.id).unwrap());
         assert_eq!(Store::native_prompt_episode(&observation), observation.id);
+        let old_clear = store.append_claim(&ClaimInput {
+            subject: observation.subject.clone(), kind: "harness.diagnostic".into(),
+            actor: Some(observation.subject.clone()),
+            fields: serde_json::from_value(json!({"code":"native-prompt-gone", "status":"resolved",
+                "driver":"claude", "incarnation_id":"one"})).unwrap(),
+            evidence: vec![observation.id.clone()], expected_subject: None,
+            idempotency_key: Some(native_prompt_gone_key(&observation.id)),
+        }).unwrap();
         let clear = store.record_native_prompt_gone(&observation, "one").unwrap();
+        assert_eq!(clear.id, old_clear.id, "an existing graph clear keeps its original payload and key");
         assert_eq!(clear.body["evidence"], json!([observation.id]));
     }
 
