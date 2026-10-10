@@ -18,6 +18,10 @@ its cutover without an apply-time flag. New seats start normally; unchanged laun
 keep their original launch lineage. Missions and schedules keep their existing semantics, including
 preserving active runs after omission.
 
+A seat's nested `exec` and `pty` tasks follow its cutover. While the seat holds its incumbent,
+a running task keeps its incarnation, even when its own launch changed or it was omitted. The
+task restarts with its new launch, or stops, once the seat's cutover starts.
+
 The initial supported cutover is a top-level native PTY seat on its existing host, harness family and native login account.
 Authored session selectors and unsupported native launches are refused before publication. Every
 active admitted daemon must advertise seat-rollout support before the policy can be activated.

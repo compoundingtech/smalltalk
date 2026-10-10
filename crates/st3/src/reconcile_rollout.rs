@@ -32,6 +32,38 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
+    /// A nested exec or PTY follows its seat's cutover: while the seat holds its incumbent,
+    /// the task keeps its running incarnation instead of a restart or a stop.
+    fn attached_cutover_hold(
+        &self,
+        subject: &DesiredSubject,
+        observed: Option<&RuntimeObservation>,
+    ) -> Result<bool> {
+        let Some(observation) = observed.filter(|o| o.status == "running") else {
+            return Ok(false);
+        };
+        let Some(seat) = rollout::attached_agent(&subject.subject) else {
+            return Ok(false);
+        };
+        if !rollout::hold_subject(&self.store, &seat)? {
+            return Ok(false);
+        }
+        if subject.kind == "stop" {
+            // A retiring task keeps running until the seat's cutover starts.
+            return Ok(true);
+        }
+        let Some(new) = subject.member.as_ref() else {
+            return Ok(false);
+        };
+        let Some(incarnation) = observation.incarnation_id.as_deref() else {
+            return Ok(false);
+        };
+        Ok(
+            rollout::launched_member(&self.store, &subject.subject, incarnation)?
+                .is_some_and(|(_, old)| !new.launch_changes(&old).is_empty()),
+        )
+    }
+
     /// Own the entire cutover before ordinary restart, suspension or restart policy can act.
     pub(super) fn reconcile_rollout(
         &self,
@@ -40,7 +72,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         blocked: Option<&anyhow::Error>,
     ) -> Result<bool> {
         let Some(selected) = self.store.rollout_selection(&subject.subject)? else {
-            return Ok(false);
+            return self.attached_cutover_hold(subject, observed);
         };
         self.store.owned_desired_guard(subject)?;
         let mut operation = self.store.rollout(&subject.subject)?;

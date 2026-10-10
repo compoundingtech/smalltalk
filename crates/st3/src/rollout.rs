@@ -151,12 +151,26 @@ pub fn phase(
     Ok(())
 }
 
+/// The seat that declares a nested exec or PTY task. The parser names such a task
+/// `<kind>/<seat>/<task>` and tags its member with the seat subject.
+pub fn attached_agent(subject: &str) -> Option<String> {
+    let rest = subject
+        .strip_prefix("exec/")
+        .or_else(|| subject.strip_prefix("pty/"))?;
+    let (seat, _task) = rest.rsplit_once('/')?;
+    Some(format!("agent/{seat}"))
+}
+
 /// Before cutover begins, a changed launch must not rewrite the running seat's files.
 pub fn hold_render(store: &Store, desired: &DesiredSubject) -> Result<bool> {
-    let Some(selection) = store.rollout_selection(&desired.subject)? else {
+    hold_subject(store, &desired.subject)
+}
+
+pub fn hold_subject(store: &Store, subject: &str) -> Result<bool> {
+    let Some(selection) = store.rollout_selection(subject)? else {
         return Ok(false);
     };
-    if let Some(operation) = store.rollout(&desired.subject)?
+    if let Some(operation) = store.rollout(subject)?
         && operation.phase != "superseded"
     {
         return Ok(!matches!(
@@ -164,7 +178,7 @@ pub fn hold_render(store: &Store, desired: &DesiredSubject) -> Result<bool> {
             "starting" | "verifying" | "running" | "retired"
         ));
     }
-    let Some(actual) = store.latest_actual_value(&desired.subject)? else {
+    let Some(actual) = store.latest_actual_value(subject)? else {
         return Ok(false);
     };
     let Some(incarnation) = actual["incarnation_id"].as_str() else {
@@ -179,7 +193,7 @@ pub fn hold_render(store: &Store, desired: &DesiredSubject) -> Result<bool> {
     {
         return Ok(false);
     }
-    let old = launched_member(store, &desired.subject, incarnation)?;
+    let old = launched_member(store, subject, incarnation)?;
     Ok(old.is_none_or(|(_, old)| {
         selection
             .desired

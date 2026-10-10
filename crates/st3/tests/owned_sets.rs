@@ -605,6 +605,137 @@ fn native_observation(store: &Store, subject: &str, incarnation: &str) {
     );
 }
 
+
+async fn attached_rollout_case(manual: bool, retire: bool) {
+    use st3::reconcile::{Reconciler, RuntimeObservation};
+    let root = tempfile::tempdir().unwrap();
+    let anchor = Arc::new(MemberKey::generate().unwrap().0);
+    let d = daemon(root.path(), "amber", anchor.clone(), &anchor).await;
+    append(
+        &d.store,
+        "daemon/amber",
+        "daemon.started",
+        json!({"status":"running", "features":{"owned_sets":1,"owned_set_tasks":1,"seat_rollout":1,"seat_rollout_manual":1}}),
+    );
+    let runtime = Arc::new(RolloutRuntime::default());
+    let reconciler = Reconciler::new(
+        d.store.clone(), runtime.clone(), "amber".into(), Arc::new(Notify::new()),
+    );
+    let seat = "agent/garden/orchard";
+    let task = "exec/garden/orchard/build";
+    let workspace = root.path().join("orchard");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let source = |model: &str, command: &str| format!(
+        "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace {:?}; {} harness \"claude\" {{ model {model:?}; }}; exec \"build\" {{ command {command:?}; }}; }}",
+        workspace.display().to_string(), if manual { "rollout \"manual\";" } else { "" },
+    );
+    let mut initial = request(&d, 1, source("first", "sleep 100")).await;
+    preview(&d, &mut initial).await;
+    d.client.post::<_, Value>("/v1/sets/apply", &initial).await.unwrap();
+    for subject in [seat, task] {
+        let member = d.store.desired_subject_with_writer(subject).unwrap().unwrap().0.member.unwrap();
+        let incarnation = format!("original-{subject}");
+        runtime.observations.lock().unwrap().insert(
+            member.runtime_id.clone(),
+            RuntimeObservation {
+                runtime_id: member.runtime_id.clone(),
+                terminal: member.terminal,
+                status: "running".into(),
+                incarnation_id: Some(incarnation.clone()),
+                exit_code: None,
+            },
+        );
+        append(&d.store, subject, "runtime.action.succeeded",
+            json!({"action":"start","desired_token":d.store.selected_desired_token(subject).unwrap().unwrap(),"incarnation_id":incarnation}));
+        append(&d.store, subject, "runtime.observed",
+            json!({"status":"running","host":"amber","runtime_id":member.runtime_id,"terminal":member.terminal,"incarnation_id":incarnation}));
+        if subject == seat {
+            native_observation(&d.store, subject, &incarnation);
+        }
+    }
+    reconciler.reconcile_once().unwrap();
+    assert!(runtime.starts.lock().unwrap().is_empty());
+    assert!(runtime.stops.lock().unwrap().is_empty());
+    let old_task = d.store.desired_subject_with_writer(task).unwrap().unwrap().0.member.unwrap();
+    let mut change = request(&d, 2, if retire { "version 2".into() } else { source("second", "sleep 200") }).await;
+    change.options.allow_empty = retire;
+    let plan = preview(&d, &mut change).await;
+    if retire {
+        change.options.confirm_retire = Some(plan.digest);
+    }
+    d.client.post::<_, Value>("/v1/sets/apply", &change).await.unwrap();
+    for _ in 0..4 {
+        reconciler.reconcile_once().unwrap();
+    }
+    if manual {
+        assert!(runtime.starts.lock().unwrap().is_empty(), "attached task restarted before explicit rollout");
+        assert!(runtime.stops.lock().unwrap().is_empty(), "attached task stopped before explicit rollout");
+        assert_eq!(runtime.observations.lock().unwrap()[&old_task.runtime_id].status, "running");
+        assert!(d.store.rollout(seat).unwrap().is_none());
+        let status: Value = d.client.get(&format!("/v1/client/sets/garden?sha={:040x}", 2)).await.unwrap();
+        let parent = status["members_status"].as_array().unwrap().iter()
+            .find(|member| member["subject"] == seat).unwrap();
+        assert_eq!(parent["rollout"], "pending");
+        let socket = d.client.socket_path().unwrap().to_path_buf();
+        let output = tokio::task::spawn_blocking(move || {
+            st3::test_support::command(test_bin!("st3-fixture"))
+                .env_remove("ST_AGENT").env_remove("ST_MISSION_RUN")
+                .arg("--endpoint").arg(socket)
+                .args(["--json", "agents", "rollout", seat, "--as", "person/operator"])
+                .output().unwrap()
+        }).await.unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        // Enter drain without acknowledging it: attached work must still be held.
+        reconciler.reconcile_once().unwrap();
+        let operation = d.store.rollout(seat).unwrap().unwrap();
+        assert!(operation.drain_ack.is_none());
+        assert!(runtime.starts.lock().unwrap().is_empty());
+        assert!(runtime.stops.lock().unwrap().is_empty());
+        st3::rollout::phase(&d.store, seat, &operation, "drain-ack", None, &[]).unwrap();
+        let mut reached_starting = false;
+        for _ in 0..8 {
+            reconciler.reconcile_once().unwrap();
+            let operation = d.store.rollout(seat).unwrap().unwrap();
+            reached_starting |= matches!(operation.phase.as_str(), "starting" | "running" | "retired");
+            if let Some(incarnation) = operation.replacement_incarnation {
+                native_observation(&d.store, seat, &incarnation);
+            }
+        }
+        assert!(reached_starting, "explicit rollout did not release the cutover");
+    }
+    assert!(runtime.stops.lock().unwrap().contains(&format!("original-{task}")));
+    let starts = runtime.starts.lock().unwrap();
+    let task_starts: Vec<_> = starts.iter()
+        .filter(|member| member.tags.get("st3.subject").is_some_and(|subject| subject == task))
+        .collect();
+    if retire {
+        assert!(task_starts.is_empty(), "retired attached task must not restart");
+        assert_eq!(runtime.observations.lock().unwrap()[&old_task.runtime_id].status, "exited");
+    } else {
+        assert_eq!(task_starts.len(), 1);
+        let desired = d.store.desired_subject_with_writer(task).unwrap().unwrap().0.member.unwrap();
+        assert_ne!(desired, old_task);
+        // The start wraps the command in st's exec driver, so compare its runtime and command.
+        assert_eq!(task_starts[0].runtime_id, desired.runtime_id);
+        assert!(format!("{:?}", task_starts[0].launch).contains("\"sleep 200\""));
+        assert_eq!(runtime.observations.lock().unwrap()[&desired.runtime_id].status, "running");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attached_exec_waits_for_manual_parent_cutover_then_restarts_with_new_launch() {
+    attached_rollout_case(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attached_exec_waits_for_manual_parent_retirement_then_stops() {
+    attached_rollout_case(true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attached_exec_restarts_immediately_when_parent_has_no_rollout_policy() {
+    attached_rollout_case(false, false).await;
+}
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manual_rollout_publishes_with_automatic_member_and_only_moves_on_explicit_cli_request() {
     use st3::reconcile::{Reconciler, RuntimeControl, RuntimeObservation};
@@ -615,7 +746,7 @@ async fn manual_rollout_publishes_with_automatic_member_and_only_moves_on_explic
         &d.store,
         "daemon/amber",
         "daemon.started",
-        json!({"status":"running", "features":{"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1}}),
+        json!({"status":"running", "features":{"owned_sets":1,"owned_set_tasks":1,"seat_rollout":1,"seat_rollout_manual":1}}),
     );
     let runtime = Arc::new(RolloutRuntime::default());
     let reconciler = Reconciler::new(

@@ -67,6 +67,187 @@ fn share(from: &Store, to: &Store) {
         .unwrap();
 }
 
+fn attached_bundle(pty: bool) -> NormalizedIntent {
+    parse_intent(
+        &format!(
+            "version 2\nagent \"garden/orchard\" {{ command \"true\"; exec \"build\" {{ command \"sleep 100\"; }}; {} }}",
+            if pty { "pty \"console\" { command \"sleep 100\"; };" } else { "" }
+        ),
+        "amber",
+    )
+    .unwrap()
+}
+
+fn advertise_attached_tasks(store: &Store) {
+    store.append_claim(&ClaimInput {
+        subject: format!("daemon/{}", store.origin),
+        kind: "daemon.started".into(),
+        actor: None,
+        fields: serde_json::from_value(
+            json!({"status":"running","features":{"owned_sets":1,"owned_set_tasks":1}}),
+        ).unwrap(),
+        evidence: vec![],
+        expected_subject: None,
+        idempotency_key: None,
+    }).unwrap();
+}
+
+#[test]
+fn attached_tasks_require_every_active_daemon_to_advertise_task_support() {
+    let stores = signed_fleet();
+    let publisher = &stores[0];
+    let input = attached_bundle(true);
+    let opts = options(publisher, 10);
+    for (upgraded, store) in stores.iter().enumerate() {
+        let preview = publisher.owned_set_preview(&input, &opts).unwrap();
+        for (index, peer) in stores.iter().enumerate() {
+            let blocker = format!(
+                "host/{} has not advertised owned-set exec and PTY task support; upgrade before publishing nested tasks",
+                peer.origin,
+            );
+            assert_eq!(preview.blockers.contains(&blocker), index >= upgraded, "{:?}", preview.blockers);
+        }
+        assert_eq!(
+            publisher.apply_owned_set(&input, &opts, "unsupported-tasks", "person/operator")
+                .unwrap_err().code,
+            "owned-set-refused"
+        );
+        advertise_attached_tasks(store);
+        if store.origin != publisher.origin {
+            signed_share(store, publisher);
+        }
+    }
+    let preview = publisher.owned_set_preview(&input, &opts).unwrap();
+    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+    apply(publisher, &input, 10);
+    assert_eq!(publisher.owned_sets().unwrap()[0].receipt.members.len(), 3);
+}
+
+#[test]
+fn attached_task_receipt_replicates_to_an_upgraded_peer() {
+    let stores = signed_fleet();
+    for store in &stores {
+        advertise_attached_tasks(store);
+    }
+    for from in &stores {
+        for to in &stores {
+            if from.origin != to.origin {
+                signed_share(from, to);
+            }
+        }
+    }
+    apply(&stores[0], &attached_bundle(true), 10);
+    signed_share(&stores[0], &stores[1]);
+    let view = stores[1].owned_sets().unwrap().remove(0);
+    assert!(view.blockers.is_empty(), "{:?}", view.blockers);
+    assert_eq!(view.receipt.members["exec/garden/orchard/build"].kind, "exec");
+    assert_eq!(view.receipt.members["pty/garden/orchard/console"].kind, "pty");
+    assert_eq!(stores[1].selected_desired_kind("exec/garden/orchard/build").unwrap().as_deref(), Some("exec"));
+}
+
+#[test]
+fn attached_exec_and_pty_publish_with_their_native_receipt_kinds() {
+    let store = Store::open_memory("amber").unwrap();
+    apply(&store, &attached_bundle(true), 10);
+    let receipt = store.owned_sets().unwrap().remove(0).receipt;
+    assert_eq!(receipt.members.len(), 3);
+    assert_eq!(receipt.members["exec/garden/orchard/build"].kind, "exec");
+    assert_eq!(receipt.members["pty/garden/orchard/console"].kind, "pty");
+    assert_eq!(receipt.members["agent/garden/orchard"].kind, "agent");
+}
+
+#[test]
+fn attached_support_does_not_admit_top_level_exec() {
+    let store = Store::open_memory("amber").unwrap();
+    assert_eq!(
+        parse_intent("version 2\nexec \"build\" { command \"true\"; }", "amber")
+            .unwrap_err().code,
+        "runtime-outside-mission"
+    );
+    let mut input = attached_bundle(false);
+    input.subjects.remove("agent/garden/orchard");
+    assert_eq!(
+        store.apply_owned_set(&input, &options(&store, 10), "unsupported", "person/operator")
+            .unwrap_err().code,
+        "unsupported-set-member"
+    );
+    assert!(store.owned_sets().unwrap().is_empty());
+}
+
+#[test]
+fn attached_tasks_are_adopted_by_adopting_only_the_seat() {
+    let store = Store::open_memory("amber").unwrap();
+    let input = attached_bundle(true);
+    direct(&store, &input, "unmanaged").unwrap();
+    let mut opts = options(&store, 10);
+    assert!(store.owned_set_preview(&input, &opts).unwrap().blockers
+        .iter().any(|blocker| blocker.contains("adoption")));
+    opts.adopt.insert("agent/garden/orchard".into());
+    let preview = store.owned_set_preview(&input, &opts).unwrap();
+    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+    opts.expected_subjects = preview.expected_subjects;
+    store.apply_owned_set(&input, &opts, "adopt-attached", "person/operator").unwrap();
+    let receipt = store.owned_sets().unwrap().remove(0).receipt;
+    for subject in ["agent/garden/orchard", "exec/garden/orchard/build", "pty/garden/orchard/console"] {
+        assert!(receipt.adoptions.contains_key(subject), "{subject}");
+        assert!(receipt.members.contains_key(subject), "{subject}");
+    }
+    assert_eq!(opts.adopt.len(), 1);
+}
+
+#[test]
+fn attached_task_owned_by_another_set_blocks_seat_adoption() {
+    let store = Store::open_memory("amber").unwrap();
+    let input = attached_bundle(true);
+    apply(&store, &input, 10);
+    let mut opts = options(&store, 20);
+    opts.set = "other".into();
+    opts.expected_set = "absent".into();
+    opts.adopt.insert("agent/garden/orchard".into());
+    let preview = store.owned_set_preview(&input, &opts).unwrap();
+    assert!(preview.blockers.iter().any(|blocker|
+        blocker == "exec/garden/orchard/build belongs to another set"), "{:?}", preview.blockers);
+}
+
+#[test]
+fn attached_seat_omission_retires_the_seat_and_all_tasks() {
+    let store = Store::open_memory("amber").unwrap();
+    apply(&store, &attached_bundle(true), 10);
+    let input = crate::graph::parse_owned_set_intent("version 2", "amber").unwrap();
+    let mut opts = options(&store, 20);
+    opts.allow_empty = true;
+    let preview = store.owned_set_preview(&input, &opts).unwrap();
+    opts.expected_subjects = preview.expected_subjects;
+    opts.confirm_retire = Some(preview.digest);
+    store.apply_owned_set(&input, &opts, "retire-attached", "person/operator").unwrap();
+    let receipt = store.owned_sets().unwrap().remove(0).receipt;
+    assert!(receipt.members.is_empty());
+    assert_eq!(receipt.retired.len(), 3);
+    for subject in ["agent/garden/orchard", "exec/garden/orchard/build", "pty/garden/orchard/console"] {
+        assert!(receipt.retired.contains_key(subject), "{subject}");
+        assert_eq!(store.selected_desired_kind(subject).unwrap().as_deref(), Some("stop"));
+    }
+}
+
+#[test]
+fn attached_task_omission_retires_only_that_task() {
+    let store = Store::open_memory("amber").unwrap();
+    apply(&store, &attached_bundle(true), 10);
+    let input = attached_bundle(false);
+    let mut opts = options(&store, 20);
+    let preview = store.owned_set_preview(&input, &opts).unwrap();
+    opts.expected_subjects = preview.expected_subjects;
+    opts.confirm_retire = Some(preview.digest);
+    store.apply_owned_set(&input, &opts, "retire-console", "person/operator").unwrap();
+    let receipt = store.owned_sets().unwrap().remove(0).receipt;
+    assert_eq!(receipt.members.len(), 2);
+    assert_eq!(receipt.retired.len(), 1);
+    assert!(receipt.retired.contains_key("pty/garden/orchard/console"));
+    assert_eq!(store.selected_desired_kind("pty/garden/orchard/console").unwrap().as_deref(), Some("stop"));
+    assert_eq!(store.selected_desired_kind("agent/garden/orchard").unwrap().as_deref(), Some("agent"));
+    assert_eq!(store.selected_desired_kind("exec/garden/orchard/build").unwrap().as_deref(), Some("exec"));
+}
+
 fn assert_pass_candidates_match_effect_guards(store: &Store, desired: &[DesiredSubject]) {
     let (expected, effect_reads) = smallclaims::touched::record(|| {
         desired
