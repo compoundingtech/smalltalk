@@ -450,9 +450,15 @@ fn pooled_current_transaction<T>(
     work: impl FnOnce(&Transaction<'_>) -> Result<T, St3Error>,
 ) -> Result<T, St3Error> {
     let deadline = std::time::Instant::now() + crate::client::LATEST_VALUE_TIMEOUT;
+    // Wait for the managed turn before taking the sole connection. In particular,
+    // maintenance waiting in the background lane must leave it available to a
+    // foreground sample. Both waits consume this same attempt's deadline.
+    let _reservation = if native_current_admission() { None } else {
+        Some(reserve_current_writer(&graph.connection, background, deadline - CURRENT_WRITE_RESERVE)?)
+    };
     let mut loan = pool.checkout(&graph.path, deadline - CURRENT_WRITE_RESERVE)?;
     let result = current_transaction_until(loan.connection.as_mut().unwrap(),
-        Some((&graph.connection, background)), deadline, Some(&mut loan.schema), work);
+        None, deadline, Some(&mut loan.schema), work);
     // A successful commit still succeeds if this housekeeping check cannot finish.
     // Discard its connection rather than carrying changed schema or an expired loan
     // into the next attempt. The check uses only this attempt's remaining time.
@@ -467,6 +473,13 @@ fn pooled_current_transaction<T>(
         }
     }
     result
+}
+
+fn native_current_admission() -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    { NATIVE_ADMISSION_CONTROL.with(std::cell::Cell::get) }
+    #[cfg(not(any(test, feature = "test-support")))]
+    { false }
 }
 
 fn reserve_current_writer(
@@ -558,13 +571,11 @@ fn current_transaction_until<T>(
         // transactions. Retry only BEGIN at short intervals within this same attempt; no
         // mutation or ownership validation runs until admission, and no sample is queued.
         let admission_deadline = deadline - CURRENT_WRITE_RESERVE;
-        #[cfg(any(test, feature = "test-support"))]
-        let native_control = NATIVE_ADMISSION_CONTROL.with(std::cell::Cell::get);
-        #[cfg(not(any(test, feature = "test-support")))]
-        let native_control = false;
+        let native_control = native_current_admission();
         // Reserve only this attempt's turn, with no sample or mutation queued. Foreground
         // traffic stays FIFO and maintenance keeps the existing background lane. Schema
-        // preparation precedes admission, and every validation still runs inside the fresh tx.
+        // preparation precedes the SQLite write lock, and every validation still runs
+        // inside the fresh tx. Pooled callers already own their managed turn.
         let _reservation = if !native_control {
             writer.map(|(writer, background)| reserve_current_writer(writer, background, admission_deadline)).transpose()?
         } else { None };
