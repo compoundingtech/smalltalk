@@ -15,6 +15,7 @@ import { wantsScreenSequence, withFreshTerminalFence, type TerminalFence } from 
 import { sendFences } from './sendFence';
 import { Feed } from './feed';
 import { FabricCarrier, routeLabel, selectRoute, type CarrierChoice, type FabricSnapshot, type Route } from './carrier';
+import { Observations, type Context } from './observations';
 import { buildFabricDefault, decodeFabricTarget, encodeFabricTarget, fabricTargetFromText, type FabricTarget } from './fabricTarget';
 import { fabricAvailable, fabricIdentity, fabricPathInUse, nativeCarrierPorts } from './fabricBridge';
 import { ForegroundGate } from './foreground';
@@ -48,6 +49,7 @@ const GLASSES_KEY = 'st3.experiments.glasses';
 const SIMPLE_KEY = 'st3.conversation.simple';
 // The carrier: the saved gateway (default) or fabric, an opt-in; the saved fabric target; and whether
 // a fabric that cannot be used falls back to the saved gateway.
+const OBSERVATIONS_KEY = 'st3.observations';
 const CARRIER_KEY = 'st3.carrier', FABRIC_TARGET_KEY = 'st3.fabric.target', FABRIC_FALLBACK_KEY = 'st3.fabric.fallback';
 
 /** An error as a person reads it: st's errors in plain words (the SDK's plainError). */
@@ -83,6 +85,16 @@ function items<K extends Resource['kind']>(page: { items: Resource[] }, kind: K)
   return page.items.filter((item): item is Extract<Resource, { kind: K }> => item.kind === kind);
 }
 function actionId() { return `action/ios-${Crypto.randomUUID()}`; }
+
+/** Where a measurement was served from: the route it ran over and, for fabric, the path once measured. */
+function observedContext(route: Route, fabricPath: 'direct' | 'relay' | 'unknown'): Context {
+  switch (route.kind) {
+    case 'fabric': return { carrier: 'fabric', ...(fabricPath === 'direct' || fabricPath === 'relay' ? { path: fabricPath } : {}) };
+    case 'lan': return { carrier: 'lan' };
+    case 'https': return { carrier: 'https' };
+    default: return { carrier: 'tailscale' };
+  }
+}
 
 function useAppStore(proof?: FabricProfile) {
   const proofRef = useRef(proof); proofRef.current = proof;
@@ -152,6 +164,47 @@ function useAppStore(proof?: FabricProfile) {
   );
   const routeRef = useRef<Route>(selected.route); routeRef.current = selected.route;
   const feedMisses = useRef(0);
+  // What the phone measures of its own service (see observations.ts): timed where the app already
+  // waits, kept on the device, and reported to the member by the reporter.
+  const fabricPathRef = useRef<'direct' | 'relay' | 'unknown'>('unknown');
+  fabricPathRef.current = selected.route.kind === 'fabric' ? fabricPath : 'unknown';
+  const observationsRef = useRef<Observations | null>(null);
+  if (!observationsRef.current) {
+    observationsRef.current = new Observations(
+      { read: () => AsyncStorage.getItem(OBSERVATIONS_KEY), write: value => AsyncStorage.setItem(OBSERVATIONS_KEY, value) },
+      { now: () => Date.now(), id: () => Crypto.randomUUID() },
+      () => observedContext(routeRef.current, fabricPathRef.current),
+    );
+  }
+  const observations = observationsRef.current;
+  const timers = useRef<{ openToLive: number | null; connect: number | null; recover: number | null; everLive: boolean }>({ openToLive: null, connect: null, recover: null, everLive: false });
+  useEffect(() => { if (!proof) void observations.load(); }, [proof, observations]);
+  useEffect(() => {
+    if (proof) return;
+    const gate = foreground.current;
+    const changed = (active: boolean) => {
+      observations.setForeground(active);
+      const held = timers.current;
+      if (active) {
+        if (held.openToLive === null) held.openToLive = observations.begin('ios-open-to-live');
+      } else {
+        // A foreground that ended before the feed was live, a connection that was never made, and a
+        // recovery that was cut off are not measurements.
+        for (const key of ['openToLive', 'connect', 'recover'] as const) { const token = held[key]; if (token !== null) { observations.cancel(token); held[key] = null; } }
+        observations.setLive(false);
+        void observations.flush();
+      }
+    };
+    changed(gate.active);
+    return gate.subscribe(changed);
+  }, [proof, observations]);
+  // Fabric dialing begins the connection; with the saved gateway it begins when its feed is made.
+  useEffect(() => {
+    if (proof || fabricSnapshot.phase !== 'dialing') return;
+    const held = timers.current;
+    if (held.connect !== null) observations.cancel(held.connect);
+    held.connect = observations.begin('ios-connect');
+  }, [proof, observations, fabricSnapshot.phase]);
   const connectUrl = selected.baseUrl ?? '';
   const client = useMemo(() => connectUrl ? new St3Client({ baseUrl: connectUrl, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(), client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) }) : null, [connectUrl, credential]);
   // Image bytes go up through Expo's fetch: React Native's cannot send a byte array as a body.
@@ -229,6 +282,7 @@ function useAppStore(proof?: FabricProfile) {
     const generation = cacheGeneration.current;
     const current = () => generation === cacheGeneration.current;
     attentionLive.current = false;
+    if (!proofRef.current && timers.current.connect === null) timers.current.connect = observations.begin('ios-connect');
     const opened = new Feed(client, {
       onWindow: (name, rows, hasMore, at) => {
         if (!current()) return;
@@ -250,6 +304,20 @@ function useAppStore(proof?: FabricProfile) {
         proofRef.current?.record('feed', { state });
         setStatus(state === 'live' ? 'online' : state === 'connecting' ? 'connecting' : 'offline');
         setConnectionIssue(issue ?? '');
+        if (!proofRef.current) {
+          const held = timers.current;
+          if (state === 'live') {
+            observations.setLive(true);
+            for (const key of ['openToLive', 'connect', 'recover'] as const) { const token = held[key]; if (token !== null) { observations.end(token); held[key] = null; } }
+            held.everLive = true;
+            // The path a fabric connection took is known once it carries traffic: read it once, now.
+            if (routeRef.current.kind === 'fabric') void fabricPathInUse().then(path => setFabricPath(path));
+          } else {
+            observations.setLive(false);
+            // A dropped connection that had been live starts a recovery, timed until it is live again.
+            if (state === 'reconnecting' && held.everLive && held.recover === null) held.recover = observations.begin('ios-recover');
+          }
+        }
         if (state === 'live') { setError(''); void loadCapabilities(); carrier.feedLive(); feedMisses.current = 0; }
         // The bridge's own connection failing twice running (one dropped socket the feed mends itself):
         // a refusal ends the trial, anything else is redialed.
@@ -259,12 +327,13 @@ function useAppStore(proof?: FabricProfile) {
       // The missions window is followed only while a missions screen shows: what it held is out of date.
       onWindowStopped: name => { if (current() && name === 'missions') { setData(previous => ({ ...previous, missions: [] })); setMissionsLoaded(false); } },
       onConversationFrame: (rows, replace) => { if (current()) proofRef.current?.record('conversation', { rows, replace }); },
+      onTiming: (target, ms) => { if (current() && !proofRef.current) observations.observe(target, ms); },
     }, foreground.current, actionId, undefined, undefined, false);
     // Paired: connecting from here on, even while the app waits to be active before it dials.
     setStatus(previous => previous === 'setup' ? 'connecting' : previous);
     setFeed(opened);
     return () => { opened.close(); setFeed(held => held === opened ? null : held); };
-  }, [client, credential, loadCapabilities]);
+  }, [client, credential, loadCapabilities, observations, carrier]);
   // No client yet: either nothing is paired, fabric is opening, or neither route can be used.
   useEffect(() => {
     if (client || proof) return;
@@ -515,6 +584,8 @@ function useAppStore(proof?: FabricProfile) {
           }
         }, notApplied);
         proof?.record('message-accepted', { elapsedMs: performance.now() - began });
+        // The person's wait, fence read and any repeat included, to st's acknowledgement.
+        if (!proof) observations.observe('ios-message-ack', performance.now() - began);
         return null;
       } catch (e) { proof?.record('message-failed', { elapsedMs: performance.now() - began }); return errorText(e); }
     },

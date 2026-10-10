@@ -1,14 +1,32 @@
 {
   "version": 1,
-  "summary": "The ordinary iOS app can reach its member over Fabric as an opt-in carrier, with a saved Fabric target, an explicit fallback to the saved gateway and the live route named; builds that do not link the native bridge are unchanged",
-  "replay": { "status": "none", "detail": "No replay, backfill, stored data or transcript change." },
-  "schema": { "status": "none", "detail": "No schema, operation or contract digest change. The phone uses the existing client gateway through a loopback listener its own native bridge opens." },
-  "rules": { "status": "none", "detail": "No claim, checkpoint, retention or authority rule change. The paired bearer and enrolled signing key are the saved gateway's own, and a member still checks pairing and scopes after fabric admits the stream." },
+  "summary": "The ordinary iOS app can reach its member over Fabric as an opt-in carrier, with a saved Fabric target, an explicit fallback to the saved gateway and the live route named, and it measures its own service (open to live, connect, message acknowledgement, conversation and terminal open, recovery, live share) in bounded on-device one-minute intervals; builds that do not link the native bridge keep their saved gateway",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, stored data or transcript change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, operation or contract digest change. The phone uses the existing client gateway through a loopback listener its own native bridge opens."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change. The paired bearer and enrolled signing key are the saved gateway's own, and a member still checks pairing and scopes after fabric admits the stream."
+  },
   "compatibility": {
     "status": "changed",
-    "detail": "A phone build made with ST3_FABRIC=1 links the bridge, outside Debug too, and offers a Fabric setting that is off unless the person or the build turns it on. A build without ST3_FABRIC=1 shows no carrier setting and is unchanged. The member must expose its paired-only client socket as a fabric service and grant the phone's node ID that service; fabric 0.2.31 or later ends admitted sessions when a grant is removed. The Debug fabric proof is unchanged."
+    "detail": "A phone build made with ST3_FABRIC=1 links the bridge, outside Debug too, and offers a Fabric setting that is off unless the person or the build turns it on. A build without ST3_FABRIC=1 shows no carrier setting and is unchanged. The member must expose its paired-only client socket as a fabric service and grant the phone's node ID that service; fabric 0.2.31 or later ends admitted sessions when a grant is removed. The Debug fabric proof is unchanged. The phone also keeps counts and latency histograms of those measurements on the device, with the route they ran over (no content, addresses, node IDs or credentials), for a later report to the member; nothing is sent yet."
   },
-  "downtime": { "status": "none", "detail": "Ordinary rolling deployment; no data conversion or extra startup work. The native path monitor starts only while a bridge is open." },
-  "manual": { "status": "none", "detail": "No manual action is required to keep the saved gateway. Using Fabric needs the member's exposure and grant, done by its operator, and the person turning Fabric on." },
-  "recovery": { "status": "none", "detail": "No recovery, durable payload or initialization changes. Turning Fabric off returns to the saved gateway." }
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; no data conversion or extra startup work. The native path monitor starts only while a bridge is open."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required to keep the saved gateway. Using Fabric needs the member's exposure and grant, done by its operator, and the person turning Fabric on."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, durable payload or initialization changes. Turning Fabric off returns to the saved gateway."
+  }
 }
