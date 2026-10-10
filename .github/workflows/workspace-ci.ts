@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave, optionalQueueCacheSave } from './build-snapshot.ts'
 import {
   defaultActionlintConfig,
@@ -7,7 +8,8 @@ import {
 } from '../../repos/effect-utils/genie/external.ts'
 
 // Profiles require controls inline; namespace-features labels apply only to shape labels.
-// Namespace serves queued merge-group jobs before PR, optional and manual jobs.
+// Generic workflows retain merge-first ordering. Required Workspace PR checks use
+// the first class too, through namespaceLabels below, rather than sharing benchmarks.
 // This orders waiting jobs; it does not preempt active jobs or reserve a runner.
 const linuxJobPriority = "${{ github.event_name == 'merge_group' && 1 || 2 }}"
 export const linuxRunnerProfile = `namespace-profile-linux-x86-64;job.priority=${linuxJobPriority}`
@@ -38,8 +40,9 @@ export const linuxActionlintConfig = {
  * overflow between runner labels, so the `pick-runner` job asks the
  * GitHub API how many ci1 runners are idle before the other jobs start, and their `runs-on` reads its
  * output. Trusted PRs labelled `ci-priority` use the reserved `ci1-priority` lane.
- * Merge-queue runs always use the reserved `ci1-merge` label and wait for that pool,
- * instead of moving to a busy Namespace pool when a reserved runner is occupied.
+ * Merge groups use the local pool only when five workers are idle and two general
+ * workers remain for PRs; otherwise the whole group uses Namespace. Explicit
+ * CI_MERGE_CI1=on retains the incident's forced-local override.
  *
  * Off unless the repository variable `CI1_RUNNERS` is `on`: then `pick-runner` is skipped, its output
  * is empty and every workload job runs on Namespace. A pull request from a fork never runs on
@@ -61,6 +64,7 @@ export const pickRunnerJob = {
     ci1: '${{ steps.pick.outputs.ci1 }}',
     ci1_secondary: '${{ steps.pick.outputs.ci1_secondary }}',
     ci1_mail: '${{ steps.pick.outputs.ci1_mail }}',
+    merge_ci1: '${{ steps.pick.outputs.merge_ci1 }}',
   },
   steps: [
     {
@@ -74,6 +78,7 @@ export const pickRunnerJob = {
         HEAD_REPOSITORY: '${{ github.event.pull_request.head.repo.full_name }}',
         PR_LABELS: '${{ toJSON(github.event.pull_request.labels.*.name) }}',
         OWNER: '${{ github.repository_owner }}',
+        MERGE_LOCAL_ONLY: '${{ vars.CI_MERGE_CI1 }}',
         NEED: `\${{ vars.CI1_MIN_IDLE || '${ci1MinIdle}' }}`,
       },
       run: `primary_label=
@@ -94,6 +99,29 @@ if [ "$EVENT" = pull_request ] && jq -e 'index("ci-priority") != null' <<< "$PR_
   primary ci1-priority
   echo "priority PR: reserved ci1-priority capacity"
   printf 'Runner: **ci1** (ci1-priority, ahead of ordinary PRs)\\n' >> "$GITHUB_STEP_SUMMARY"
+fi
+if [ "$EVENT" = merge_group ] && [ "$MERGE_LOCAL_ONLY" != on ]; then
+  # Choose once for the whole group. Five simultaneous workload jobs fit locally
+  # only if two general workers remain; priority-only workers are never borrowed.
+  # This is an admission snapshot, not an atomic runner reservation.
+  [ -n "$GH_TOKEN" ] || namespace "merge overflow: no runner status token"
+  if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>/dev/null); then
+    namespace "merge overflow: runner status unavailable"
+  fi
+  if ! capacity=$(jq -er '
+    [.[].runners[] | select(.status == "online" and .busy == false)] | unique_by(.id) |
+    def has($label): any(.labels[]; .name == $label);
+    ([.[] | select(has("ci1-merge") and (has("ci1-priority") | not))]) as $merge |
+    ([.[] | select(has("ci1") and (has("ci1-priority") | not))] | length) as $general |
+    ([$merge[] | select(has("ci1") | not)] | length) as $dedicated |
+    if ($merge | length) >= 5 and ($general - ([0, 5 - $dedicated] | max)) >= 2
+    then "local" else "namespace" end' <<< "$runners"); then
+    namespace "merge overflow: invalid runner status"
+  fi
+  [ "$capacity" = local ] || namespace "merge overflow: retain two PR slots or wait for local capacity"
+  printf 'merge_ci1=["ci1-merge"]\\n' >> "$GITHUB_OUTPUT"
+  printf 'Merge group: **ci1** (five idle workers, two general PR slots retained)\\n' >> "$GITHUB_STEP_SUMMARY"
+  exit 0
 fi
 if [ "$EVENT" = merge_group ]; then
   # Merge groups never borrow the PR priority lane: it can have PR work ahead of them.
@@ -137,19 +165,21 @@ done`,
   ],
 } as const
 
-// Enable only after Ops confirms the dedicated ci1 pool is provisioned. This
-// override comes before the general-slot picker so every merge job uses the reserve.
-const mergeCi1Labels = `github.event_name == 'merge_group' && vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]'`
+// Merge routing applies to the whole group. The explicit local override is retained;
+// otherwise the picker may admit a local group only with room left for PR checks.
+const mergeCi1Labels = `github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1)`
 const pickedOr = (namespaceLabels: string, output = 'ci1') =>
-  `\${{ fromJSON(${mergeCi1Labels} || needs.${pickRunnerJobId}.outputs.${output} || ${namespaceLabels}) }}`
+  `\${{ fromJSON(${mergeCi1Labels} || (github.event_name != 'merge_group' && needs.${pickRunnerJobId}.outputs.${output}) || ${namespaceLabels}) }}`
 
-// Keep run affinity within each event class. Merge groups take the first Namespace
-// queue class; optional/manual and PR work retain the same second class.
+// Required PR and merge checks share the first class. PR checks are prerequisites
+// for the merge queue: serving every new merge ahead of them can starve that input.
+// Optional/manual work retains linuxJobPriority and the second class.
+const workspaceJobPriority = "(github.event_name == 'merge_group' || github.event_name == 'pull_request') && 1 || 2"
 // Set this repository variable only after a runner administrator has provisioned
 // the profile with the existing image/cache and left it capacity outside the PR pool.
-// An unset variable retains the existing shapes with merge-first queue ordering.
+// An unset variable retains the existing shapes and Workspace priority policy.
 const namespaceLabels = (labels: readonly string[]) =>
-  `github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('${JSON.stringify(labels).replaceAll('${{ github.run_id }}', '{0}').replaceAll(linuxJobPriority, '{1}')}', github.run_id, github.event_name == 'merge_group' && 1 || 2)`
+  `github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('${JSON.stringify(labels).replaceAll('${{ github.run_id }}', '{0}').replaceAll(linuxJobPriority, '{1}')}', github.run_id, ${workspaceJobPriority})`
 /** `runs-on` for a stage job: picked ci1, else the shared Namespace queue class. */
 export const linuxStageRunsOn = pickedOr(
   namespaceLabels(linuxStageRunner),
@@ -285,16 +315,28 @@ export const testArchiveConsumerSetup = [
     env: { PRODUCER_RESULT: "${{ needs.linux-test-build.result }}" },
     run: '[ "$PRODUCER_RESULT" = success ] || { echo "::error::shared test producer failed or was skipped"; exit 1; }' },
   ...commonSetupSteps.filter((step: any) => step.id !== 'cargo-cache'
-    && step !== buildSnapshotRestore && step !== buildSnapshotPrepare),
+    && step !== buildSnapshotRestore && step !== buildSnapshotPrepare)
+    // The producer already restores the protected-main linux-tests Nix cache.
+    // Reuse that tool/fixture cache here instead of cold, per-consumer entries.
+    // Nix still resolves the pinned recipes; compiled test archives remain bound
+    // separately to this exact successful producer, source, attempt and hashes.
+    .map((step: any) => {
+      if (step.id !== 'nix-cache') return step
+      const key = step.with.key.replace('${{ github.job }}', 'linux-tests')
+      if (!key.includes('nix5-linux-tests-')) throw new Error('shared fixture cache key must name linux-tests')
+      return { ...step, with: { ...step.with, key,
+        'restore-keys': step.with['restore-keys'].replaceAll('${{ github.job }}', 'linux-tests') } }
+    }),
   ...testBuildSteps.slice(0, 2),
   {
     name: 'Download this run attempt’s successful test build',
-    uses: 'actions/download-artifact@v4',
-    with: {
-      'artifact-ids': '${{ needs.linux-test-build.outputs.artifact-id }}',
-      'merge-multiple': true,
-      path: '${{ runner.temp }}/ci-test-archives',
+    env: {
+      GH_TOKEN: '${{ github.token }}',
+      CI_TEST_ARCHIVE_ARTIFACT_ID: '${{ needs.linux-test-build.outputs.artifact-id }}',
+      CI_TEST_ARCHIVE_MANIFEST_SHA256: '${{ needs.linux-test-build.outputs.manifest-sha256 }}',
+      CI_TEST_ARCHIVE_PRODUCER_ATTEMPT: '${{ needs.linux-test-build.outputs.producer-attempt }}',
     },
+    run: 'python3 scripts/ci-test-archive download',
   },
   { ...nixDevelopStep({ name: 'Verify source, hashes and extract test archives',
     command: ['python3', 'scripts/ci-test-archive', 'consume'] }),
@@ -312,6 +354,7 @@ export const linuxStageJob = ({
   name,
   stage,
   setup,
+  cacheSaveSetup = setup,
   description,
   env = {},
   extraLogs = '',
@@ -324,6 +367,7 @@ export const linuxStageJob = ({
   name: string
   stage: string
   setup: readonly unknown[]
+  cacheSaveSetup?: readonly unknown[]
   description?: string
   env?: Record<string, string>
   extraLogs?: string
@@ -353,7 +397,7 @@ export const linuxStageJob = ({
       if: `success() && env.CI_LOCAL_CACHES != '1' && ${optionalQueueCacheSave}`,
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
-    ...saveMainDependencyCaches(setup),
+    ...saveMainDependencyCaches(cacheSaveSetup),
     ...buildSnapshotSave,
     {
       name: 'Retain stage logs and timings',
@@ -381,3 +425,81 @@ export const perfStoresCache = (stage: string) => ({
     key: `perf-${stage}-stores-\${{ hashFiles('crates/st3/tests/daemon_bench.rs', 'docs/st3/schema.md') }}`,
   },
 })
+
+/** pnpm's store under the runner's temporary directory, which only step-level env can name. */
+export const pnpmStoreEnv = { pnpm_config_store_dir: '${{ runner.temp }}/pnpm-store' } as const
+
+/** The web lane's pnpm store, keyed by its lock and toolchain; only main upkeep fills it. */
+export const fractalWebStoreCache = {
+  path: pnpmStoreEnv.pnpm_config_store_dir,
+  key: "fractal-web-pnpm-${{ runner.os }}-pnpm12.7.0-node24.20.0-${{ hashFiles('pnpm-lock.yaml') }}",
+} as const
+
+const embeddedPython = (script: string) =>
+  `python3 - <<'PY'\n${readFileSync(new URL(`../../scripts/${script}`, import.meta.url), 'utf8')}\nPY`
+
+/**
+ * The path-sensitive fractal-web gate. Detection and the gate always run on GitHub-hosted
+ * capacity without a checkout; execution runs only for web-relevant changes, after generated
+ * files are fresh. Workflow-level path filters would leave a required check pending forever.
+ */
+export const fractalWebJobs = {
+  'fractal-web-changes': {
+    name: 'fractal-web-changes',
+    'runs-on': 'ubuntu-latest',
+    'timeout-minutes': 1,
+    permissions: { contents: 'read' },
+    outputs: { relevant: '${{ steps.detect.outputs.relevant }}' },
+    steps: [
+      {
+        name: 'Detect web-relevant changes',
+        id: 'detect',
+        env: {
+          EVENT: '${{ github.event_name }}',
+          REMOTE: '${{ github.server_url }}/${{ github.repository }}.git',
+          BASE_SHA: '${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}',
+          HEAD_SHA: '${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}',
+        },
+        run: embeddedPython('ci-fractal-web-changes'),
+      },
+    ],
+  },
+  'fractal-web-execution': {
+    name: 'fractal-web-execution',
+    needs: ['fractal-web-changes', 'genie-freshness'],
+    if: "${{ !cancelled() && needs.fractal-web-changes.result == 'success' && needs.fractal-web-changes.outputs.relevant == 'true' && needs.genie-freshness.result == 'success' }}",
+    'runs-on': 'ubuntu-latest',
+    'timeout-minutes': 25,
+    permissions: { contents: 'read' },
+    defaults: { run: { shell: 'bash' } },
+    steps: [
+      { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+      ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+      { name: 'Restore the pnpm store', id: 'pnpm-store', uses: 'actions/cache/restore@v4', with: fractalWebStoreCache },
+      {
+        ...nixDevelopStep({ name: 'Run the fractal-web lanes and dependency license check', flake: '.#web', command: ['bash', 'scripts/ci-fractal-web'] }),
+        env: pnpmStoreEnv,
+      },
+    ],
+  },
+  'fractal-web': {
+    name: 'fractal-web',
+    needs: ['fractal-web-changes', 'fractal-web-execution'],
+    // A failed, cancelled or unexpectedly skipped execution must fail this check.
+    if: 'always()',
+    'runs-on': 'ubuntu-latest',
+    'timeout-minutes': 1,
+    permissions: {},
+    steps: [
+      {
+        name: 'Require detection and, for web changes, execution',
+        env: {
+          CHANGES_RESULT: '${{ needs.fractal-web-changes.result }}',
+          RELEVANT: '${{ needs.fractal-web-changes.outputs.relevant }}',
+          EXECUTION_RESULT: '${{ needs.fractal-web-execution.result }}',
+        },
+        run: embeddedPython('ci-fractal-web-gate'),
+      },
+    ],
+  },
+} as const

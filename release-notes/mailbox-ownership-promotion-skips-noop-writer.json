@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Skip the writer when a mailbox ownership promotion has nothing to promote",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers, and no change to the lease format."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged, and so are claim authority, lease, order and commit-before-ACK semantics."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change, no polling cadence change and no shared-cache change. A call that can promote runs the same transaction on the writer as before."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Revert the change. It adds one reader read of the lease row to each promotion call and avoids the writer round trip only where the call returns without writing. The saving has not been measured and no performance claim is made."}
+}

@@ -955,6 +955,8 @@ jobs:
         "namespace-features:github.run-id=${{ github.run_id }}",
       ]
     timeout-minutes: 10
+    env:
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -965,28 +967,75 @@ jobs:
       - name: Fingerprint locked dependencies
         id: lockfiles
         run: |
-          lockfiles_hash=$(sha256sum apps/ios/package-lock.json clients/typescript/st3-client/package-lock.json clients/typescript/st3-views/package-lock.json | sha256sum | cut -d ' ' -f1)
+          lockfiles_hash=$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)
           printf 'hash=%s\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"
       - name: Cache locked TypeScript dependencies
         id: typescript-cache
         uses: actions/cache@v5
         with:
-          path: |
-            apps/ios/node_modules
-            clients/typescript/st3-client/node_modules
-            clients/typescript/st3-views/node_modules
-          key: "typescript-client-${{ runner.os }}-node24.18.0-${{ steps.lockfiles.outputs.hash }}"
+          path: "${{ runner.temp }}/pnpm-store"
+          key: "typescript-client-${{ runner.os }}-node24.18.0-pnpm12.7.0-${{ steps.lockfiles.outputs.hash }}"
       - name: Fill missing dependencies
         if: steps.typescript-cache.outputs.cache-hit != 'true'
+        env:
+          pnpm_config_store_dir: "${{ runner.temp }}/pnpm-store"
         run: |
-          npm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund
-          npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund
-          npm ci --prefix apps/ios --ignore-scripts --no-audit --no-fund
+          corepack enable
+          pnpm fetch --frozen-lockfile
       - name: Report job cache coverage
         if: always()
         shell: bash
         env:
           CACHE_ENTRIES: '[{"name":"Cache locked TypeScript dependencies","outcome":"${{ steps.typescript-cache.outcome }}","hit":"${{ steps.typescript-cache.outputs.cache-hit }}","matched":"","opaqueFallback":true,"sourceOnly":false,"avoidable":"","lookup":false}]'
+        run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
+  fractal-web-cache:
+    name: warm-fractal-web
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Probe the pnpm store
+        id: pnpm-store
+        uses: actions/cache/restore@v4
+        with:
+          path: "${{ runner.temp }}/pnpm-store"
+          key: "fractal-web-pnpm-${{ runner.os }}-pnpm12.7.0-node24.20.0-${{ hashFiles('pnpm-lock.yaml') }}"
+          lookup-only: true
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+        if: steps.pnpm-store.outputs.cache-hit != 'true'
+      - name: Fetch the locked packages
+        shell: bash
+        run: "nix develop '.#web' -c pnpm fetch --frozen-lockfile"
+        env:
+          pnpm_config_store_dir: "${{ runner.temp }}/pnpm-store"
+        if: steps.pnpm-store.outputs.cache-hit != 'true'
+      - name: Save the pnpm store
+        uses: actions/cache/save@v4
+        with:
+          path: "${{ runner.temp }}/pnpm-store"
+          key: "fractal-web-pnpm-${{ runner.os }}-pnpm12.7.0-node24.20.0-${{ hashFiles('pnpm-lock.yaml') }}"
+        if: steps.pnpm-store.outputs.cache-hit != 'true'
+      - name: Report job cache coverage
+        if: always()
+        shell: bash
+        env:
+          CACHE_ENTRIES: '[{"name":"Probe the pnpm store","outcome":"${{ steps.pnpm-store.outcome }}","hit":"${{ steps.pnpm-store.outputs.cache-hit }}","matched":"${{ steps.pnpm-store.outputs.cache-matched-key }}","opaqueFallback":false,"sourceOnly":false,"avoidable":"","lookup":true}]'
         run: 'python3 "${CI_CACHE_AUDIT_SCRIPT:-scripts/ci-cache-audit}"'
   perf-cost:
     name: perf-cost

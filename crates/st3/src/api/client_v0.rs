@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::DesiredSubject;
 use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use std::collections::BTreeSet;
@@ -10,7 +11,16 @@ pub(super) mod arrangements;
 pub(super) mod conversation_blocks;
 mod collection_windows;
 mod collection_ivm;
+#[cfg(test)]
+mod collection_refresh_tests;
 mod summary;
+
+#[cfg(test)]
+mod stream_start_tests;
+#[cfg(test)]
+pub(super) mod observer_subscription_detail_tests;
+#[cfg(test)]
+mod agents_window_tests;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -22,7 +32,10 @@ pub(super) async fn request_latency(
     Extension(session): Extension<ClientSession>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
-    Ok(Json(json!({ "routes": super::request_latency_snapshot() })))
+    Ok(Json(json!({
+        "routes": super::request_latency_snapshot(),
+        "cost_counters": crate::profile::cost_snapshot(),
+    })))
 }
 
 // A client holds one socket for all its current collection views. A subscription
@@ -32,7 +45,7 @@ pub(super) async fn request_latency(
 struct CollectionSubscribe {
     kind: String,
     id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "collection_name")]
     collection: String,
     limit: Option<usize>,
     person: Option<String>,
@@ -47,6 +60,13 @@ struct CollectionSubscribe {
     capability: Option<String>,
     /// A conversation subscription names an agent or a session.
     conversation: Option<String>,
+}
+
+/// A collection's name, with `alerts` read as `attention`: the same rows under the name a person
+/// reads. Clients that predate alerts keep subscribing to `attention`.
+fn collection_name<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    Ok(if name == "alerts" { "attention".into() } else { name })
 }
 
 struct CollectionSubscription {
@@ -64,11 +84,15 @@ struct CollectionSubscription {
     /// The roster publication revision when this window's last read began. An agents window
     /// rereads once a later roster is published, even at the same graph index.
     roster_revision: u64,
+    /// The same for every other published view: its revision when this window's last read began.
+    view_revision: u64,
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
 const CONVERSATION_MAX_ADMISSIONS: usize = 8;
 const CONVERSATION_MAX_DAEMON_ADMISSIONS: usize = 32;
+const CONVERSATION_INITIAL_RETRY_WINDOW: Duration = Duration::from_secs(3);
+const CONVERSATION_INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Both slots follow the physical lookup, not its cancelable subscription awaiter.
 struct ConversationAdmissionPermits {
@@ -87,6 +111,12 @@ const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
 const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 const COLLECTION_PING_INTERVAL: Duration = Duration::from_secs(8);
 const COLLECTION_SEND_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Whether a collection's rows change as time passes without a claim: attention grace periods,
+/// mission and work-queue leases, and the summary counts made of them.
+fn collection_follows_clock(collection: &str) -> bool {
+    matches!(collection, "attention" | "missions" | "agents" | "summary")
+}
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
@@ -411,6 +441,11 @@ async fn collection_items_with_windows(
                                 return Ok(Err(super::agent_roster_not_ready()));
                             }
                             None if admitted => None,
+                            // A selected projection is sufficient for a warm unfiltered
+                            // window. Do not discard its FIFO reader grant merely because
+                            // no complete roster has been folded.
+                            None if status.is_none()
+                                && client_agent_window_is_cached(&store, index, limit)? => None,
                             None => return Ok(Ok(None)),
                         },
                     }
@@ -455,15 +490,15 @@ async fn collection_items_with_windows(
                             client_attention_resources_at(&store, person.as_deref(), false, now)?
                         }
                         "agents" => {
-                            // Unfiltered windows keep one row past the limit for `has_more`.
+                            // Published cards already exist; a cold unfiltered window folds
+                            // only its visible cards and gets has_more from shallow membership.
                             let keep = if status.is_none() { limit + 1 } else { usize::MAX };
                             match &cached_agents {
                                 Some(cards) => cards.iter().take(keep).cloned().collect(),
-                                None => {
-                                    let mut cards = client_agent_resources_cached(&store, false, index)?;
-                                    cards.truncate(keep);
-                                    cards
+                                None if status.is_none() => {
+                                    return client_agent_window_cards(&store, index, limit);
                                 }
+                                None => client_agent_resources_cached(&store, false, index)?,
                             }
                         }
                         "work" => client_work_resources(
@@ -511,7 +546,7 @@ async fn collection_items_with_windows(
                     if let Some(status) = &status {
                         items.retain(|item| item["state"].as_str() == Some(status.as_str()));
                     }
-                    has_more = items.len() > limit;
+                    has_more |= items.len() > limit;
                     items.truncate(limit);
                 }
                 Ok(Ok(Some((snapshot, items, has_more))))
@@ -535,6 +570,27 @@ async fn collection_items_with_windows(
         items.truncate(end);
     }
     Ok((snapshot, items, has_more))
+}
+
+/// Membership and display order come from the existing shallow page refs. The next
+/// reference proves `has_more` without folding an invisible card.
+fn client_agent_window_cards(store: &Store, index: u64, limit: usize) -> anyhow::Result<(Vec<Value>, bool)> {
+    let refs = client_agent_page_refs(store, false, index)?;
+    let has_more = refs.len() > limit;
+    let selected = refs.iter().take(limit)
+        .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    Ok((client_agent_cards_selected(store, false, index, &selected, true)?, has_more))
+}
+
+fn client_agent_window_is_cached(store: &Store, index: u64, limit: usize) -> anyhow::Result<bool> {
+    let Some(refs) = store.agent_page_refs_cached_at(index, false) else {
+        return Ok(false);
+    };
+    let selected = refs.iter().take(limit)
+        .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    Ok(store.agent_resources_cached_at(index, false, Some(&selected))?.is_some())
 }
 
 fn collection_window_label(collection: &str) -> &'static str {
@@ -857,7 +913,9 @@ async fn conversation_page(
     .map_err(ApiError::internal)?
 }
 
-/// What changed in a conversation after `after`, waiting up to `wait_ms` for something to.
+/// What changed in a conversation after `after`, waiting up to `wait_ms` for something to. A
+/// local follower keeps the conversation's `mark` between calls, so its owner and transcript are
+/// found once rather than on every wait.
 async fn conversation_changes_value(
     state: &AppState,
     session: &ClientSession,
@@ -865,6 +923,7 @@ async fn conversation_changes_value(
     remote: Option<&str>,
     after: Option<&str>,
     wait_ms: u64,
+    mark: &mut Option<ConversationMark>,
 ) -> Result<Value, ApiError> {
     if let Some(owner) = remote {
         let relay = state
@@ -891,7 +950,10 @@ async fn conversation_changes_value(
             })
             .map_err(|error| conversation_blocks::availability(remote_read_error(owner, error)));
     }
-    conversation_changes_local(state, session, session_id, after, wait_ms).await
+    let (value, kept) =
+        conversation_changes_local_marked(state, session, session_id, after, wait_ms, mark.take()).await?;
+    *mark = Some(kept);
+    Ok(value)
 }
 
 /// Capture the first page and its replay boundary with one timeline read. The graph and local
@@ -901,17 +963,18 @@ async fn conversation_open_value(
     session: &ClientSession,
     session_id: &str,
     remote: Option<&str>,
-) -> Result<(Value, Value), ApiError> {
+) -> Result<(Value, Value, Option<ConversationMark>), ApiError> {
     if remote.is_some() {
         // Existing owners relay the two public reads. Keep mixed-build relay compatibility.
-        let start = conversation_changes_value(state, session, session_id, remote, None, 0).await?;
+        let start = conversation_changes_value(state, session, session_id, remote, None, 0, &mut None).await?;
         let page = conversation_page(state, session, session_id, remote).await?;
-        return Ok((start, page));
+        return Ok((start, page, None));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
     let admission_store = state.store.clone();
     super::read_deadline::store_read(&admission_store, move || {
-        conversation_open_local(&state, &session, &session_id)
+        conversation_open_local_marked(&state, &session, &session_id)
+            .map(|(start, page, mark)| (start, page, Some(mark)))
     }).await.map_err(ApiError::internal)?
 }
 
@@ -921,9 +984,17 @@ thread_local! {
     static BEFORE_CONVERSATION_PAGE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
 fn conversation_open_local(
     state: &AppState, session: &ClientSession, session_id: &str,
 ) -> Result<(Value, Value), ApiError> {
+    conversation_open_local_marked(state, session, session_id).map(|(start, page, _)| (start, page))
+}
+
+/// The first page and its replay cursor, with the mark a follower keeps for its later waits.
+fn conversation_open_local_marked(
+    state: &AppState, session: &ClientSession, session_id: &str,
+) -> Result<(Value, Value, ConversationMark), ApiError> {
     // Local rows follow a graph position. Capture their high-water first: a row newer than
     // the graph cut must never be excluded from both this page and its replay cursor.
     let local_position = local_latest_position(state)?;
@@ -946,7 +1017,7 @@ fn conversation_open_local(
         state, session_id, snapshot.store_index, local_position, native,
     );
     remember_cursor(&cursor, mark.transcript_seen);
-    Ok((json!({"next_cursor":cursor}), page))
+    Ok((json!({"next_cursor":cursor}), page, mark))
 }
 
 fn native_latest_sequence(page: &Value) -> u64 {
@@ -975,8 +1046,25 @@ async fn follow_conversation(
 ) {
     let remote = remote.as_deref();
     let failed = |error: &ApiError| conversation_stream_error(&id, error);
+    let mut first_open = true;
     loop {
-        let (start, page) = match conversation_open_value(&state, &session, &session_id, remote).await {
+        let mut opened = conversation_open_value(&state, &session, &session_id, remote).await;
+        if std::mem::take(&mut first_open) && remote.is_some()
+            && matches!(&opened, Err(error) if error.code == "remote-unavailable")
+        {
+            // An opening viewer has no stale page to mark. Give a briefly unavailable
+            // owner one bounded recovery window without replacing the subscription.
+            let deadline = tokio::time::Instant::now() + CONVERSATION_INITIAL_RETRY_WINDOW;
+            while matches!(&opened, Err(error) if error.code == "remote-unavailable") {
+                tokio::time::sleep_until((tokio::time::Instant::now()
+                    + CONVERSATION_INITIAL_RETRY_INTERVAL).min(deadline)).await;
+                if tokio::time::Instant::now() >= deadline { break; }
+                // Once admitted, preserve the owner's normal read deadline: a slow
+                // but successful page must not be canceled by the retry-start window.
+                opened = conversation_open_value(&state, &session, &session_id, remote).await;
+            }
+        }
+        let (start, page, mut mark) = match opened {
             Ok(opened) => opened,
             Err(error) => {
                 if client_error_retryable(error.status, Some(&error.code)) {
@@ -1014,6 +1102,7 @@ async fn follow_conversation(
                 remote,
                 after.as_deref(),
                 10_000,
+                &mut mark,
             )
             .await
             {
@@ -1170,6 +1259,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut ivm_notices = sources.as_ref().map(|sources| sources.subscribe());
     let mut changed = state.event_notify.subscribe();
     let mut roster = state.store.subscribe_agent_roster();
+    let mut views = state.store.subscribe_collection_views();
     let windows = collection_windows::Windows::attach(&state.store);
     let mut window_revisions = [0; 8];
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
@@ -1177,7 +1267,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut conversations = ConversationFollowers::default();
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, u64, Value)>();
-    // The commits already weighed for a reread, whether one is due, and when the last ran.
+    // The commits already weighed, the windows due for a reread, and when the last reread ran.
     let mut attention_clock = tokio::time::interval_at(
         tokio::time::Instant::now() + ATTENTION_CLOCK_INTERVAL,
         ATTENTION_CLOCK_INTERVAL,
@@ -1189,7 +1279,10 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     );
     ping_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut weighed = state.store.index().unwrap_or_default();
-    let mut reread_due = false;
+    let mut reread_due = BTreeSet::<String>::new();
+    // Whether a commit may have changed the agents roster since its refresher was last asked
+    // to publish. Asking is paced like a reread: before, a stale reread asked for it.
+    let mut roster_wanted = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
     let mut reads = futures_util::stream::FuturesUnordered::new();
     let read_slots = Arc::new(tokio::sync::Semaphore::new(COLLECTION_MAX_SUBSCRIPTIONS));
@@ -1225,6 +1318,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         if request.kind == "unsubscribe" {
                             if let Some(presence) = &presence { presence.unfollow(&request.id); }
                             subscriptions.remove(&request.id);
+                            reread_due.remove(&request.id);
                             terminals.remove(&request.id);
                             conversations.stop(&request.id);
                             break 'command;
@@ -1244,6 +1338,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         // A subscription with a held ID replaces it.
                         subscriptions.remove(&request.id);
+                        reread_due.remove(&request.id);
                         terminals.remove(&request.id);
                         conversations.stop(&request.id);
                         // Allocate a fresh token for every accepted subscribe, including terminal
@@ -1286,7 +1381,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         refresh.push(request.id.clone());
                         // Collection results and conversation frames share the same generation fence.
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, request });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, view_revision: 0, request });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -1306,9 +1401,9 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                     Refreshed::Current => {}
                     Refreshed::Retry => {
                         if subscription.ivm.is_some() { subscription.dirty = true; }
-                        else { reread_due = true; }
+                        else { reread_due.insert(id.clone()); }
                     }
-                    Refreshed::Dropped => { subscriptions.remove(&id); }
+                    Refreshed::Dropped => { subscriptions.remove(&id); reread_due.remove(&id); }
                     Refreshed::Closed => return,
                 }
             }
@@ -1334,55 +1429,98 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
             }
             result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
-                // Weigh only the commits since the last look: a reread is due when one of them
-                // can change a held window.
+                // Weigh only the commits since the last look: a window is due for a reread when
+                // one of them can change it. A published view rereads when it publishes instead;
+                // a commit that can change the agents roster asks its refresher to publish.
                 let index = state.store.index().unwrap_or(weighed);
-                if subscriptions.values().all(|s| s.ivm.is_some()) {
+                let roster_refresher = state.store.agent_roster_refresher_running();
+                let followed = |s: &CollectionSubscription| s.ivm.is_none()
+                    && !state.store.collection_view_published(&s.request.collection);
+                if !subscriptions.values().any(followed) {
                     weighed = index;
                     continue;
                 }
+                let mut affected = BTreeSet::<String>::new();
                 if let Some(windows) = &windows {
+                    // Sockets on one store share the revisions: the first to look weighs a commit.
+                    let current = windows.current_changes(&state.store);
                     let (windows, store) = (windows.clone(), state.store.clone());
-                    match blocking_store(move || crate::profile::task("stream collection/invalidation", || windows.changes(&store))).await {
+                    let revisions = match current {
+                        Some(revisions) => Ok(revisions),
+                        None => blocking_store(move || crate::profile::task("stream collection/invalidation", || windows.changes(&store))).await,
+                    };
+                    match revisions {
                         Ok(revisions) => {
-                            reread_due |= subscriptions.values().filter(|s| s.ivm.is_none()).any(|subscription| collection_windows::Windows::changed(&subscription.request.collection, &window_revisions, &revisions));
+                            affected.extend(subscriptions.iter().filter(|(_, s)| followed(s)
+                                && collection_windows::Windows::changed(&s.request.collection, &window_revisions, &revisions))
+                                .map(|(id, _)| id.clone()));
                             window_revisions = revisions;
                         }
-                        Err(_) => { reread_due = true; }
+                        Err(_) => affected.extend(subscriptions.iter().filter(|(_, s)| followed(s)).map(|(id, _)| id.clone())),
                     }
                     weighed = index;
                 } else if index > weighed {
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims);
                     let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
                     let arrangements_changed = subscriptions.values().any(|s| s.request.collection == "arrangements") && state.store.arrangements_changed(weighed, index).unwrap_or(true);
-                    reread_due |= glasses_changed || arrangements_changed || match claims {
-                        Err(_) => true,
-                        Ok(claims) => claims.len() >= 10_000 || subscriptions.values().filter(|s| s.ivm.is_none()).any(|subscription| {
-                            claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
-                        }),
-                    };
+                    affected.extend(subscriptions.iter().filter(|(_, s)| followed(s) && (
+                        (glasses_changed && s.request.collection == "glasses")
+                        || (arrangements_changed && s.request.collection == "arrangements")
+                        || match &claims {
+                            Err(_) => true,
+                            Ok(claims) => claims.len() >= 10_000
+                                || claims.iter().any(|claim| !collection_ignores(&s.request.collection, &claim.kind)),
+                        }
+                    )).map(|(id, _)| id.clone()));
                     weighed = index;
                 }
-                if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
+                // Reading the roster before its refresher publishes would serve the one already
+                // held, and read it again once the newer one arrives.
+                let (roster_windows, others): (Vec<_>, Vec<_>) = affected.into_iter().partition(|id| roster_refresher
+                    && subscriptions.get(id).is_some_and(|s| s.request.collection == "agents"));
+                roster_wanted |= !roster_windows.is_empty();
+                reread_due.extend(others);
+                if reread_due.is_empty() && !roster_wanted || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                if std::mem::take(&mut roster_wanted) {
+                    state.store.request_agent_roster_refresh();
+                    last_reread = tokio::time::Instant::now();
+                }
+                refresh.extend(reread_due.iter().cloned());
             }
             result = roster.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 // A window read before this roster was published rereads it.
                 let published = *roster.borrow_and_update();
-                reread_due |= subscriptions.values().any(|s| s.ivm.is_none()
-                    && s.request.collection == "agents" && s.roster_revision < published);
-                if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
+                reread_due.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && s.request.collection == "agents" && s.roster_revision < published)
+                    .map(|(id, _)| id.clone()));
+                if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                refresh.extend(reread_due.iter().cloned());
             }
-            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (reread_due || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none() && reread_due || s.ivm.is_some() && s.dirty && s.reading.is_none()).map(|(id, _)| id.clone()));
+            result = views.changed(), if !command_waiting => {
+                if result.is_err() { return; }
+                // The same for every other published view.
+                let published = *views.borrow_and_update();
+                reread_due.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && s.view_revision < crate::store::published_views::revision(&published, &s.request.collection))
+                    .map(|(id, _)| id.clone()));
+                if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                refresh.extend(reread_due.iter().cloned());
+            }
+            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (!reread_due.is_empty() || roster_wanted || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
+                if std::mem::take(&mut roster_wanted) { state.store.request_agent_roster_refresh(); }
+                refresh.extend(reread_due.iter().cloned());
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_some() && s.dirty && s.reading.is_none()).map(|(id, _)| id.clone()));
                 last_reread = tokio::time::Instant::now();
             }
             _ = attention_clock.tick(), if !command_waiting && !subscriptions.is_empty() => {
-                // Pairing expiry and mission lease state can change without a claim. Stable
-                // rows remain reusable; authority and local overlays are rechecked on reads.
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()).map(|(id, _)| id.clone()));
+                // Grace periods, leases and queue deadlines pass without a claim, and so does a
+                // paired grant's expiry. Stable rows remain reusable; authority and local
+                // overlays are rechecked on reads.
+                let paired = session.transport != "unix";
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && (paired || collection_follows_clock(&s.request.collection)))
+                    .map(|(id, _)| id.clone()));
             }
             _ = ping_clock.tick() => {
                 // Protocol liveness never schedules an authorized window read.
@@ -1420,12 +1558,14 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
         if refresh.is_empty() {
             continue;
         }
+        // Rereads are paced together: reading any due window, or every held window (as a lone
+        // new subscription does), starts the next interval.
         let legacy_windows = subscriptions.values().filter(|s| s.ivm.is_none()).count();
         let refreshed_legacy = refresh.iter().filter(|id| subscriptions.get(*id).is_some_and(|s| s.ivm.is_none())).count();
-        if legacy_windows > 0 && refreshed_legacy == legacy_windows {
-            reread_due = false;
+        if refresh.iter().any(|id| reread_due.contains(id)) || legacy_windows > 0 && refreshed_legacy == legacy_windows {
             last_reread = tokio::time::Instant::now();
         }
+        reread_due.retain(|id| !refresh.contains(id));
         // Keep admission, conversation and terminal delivery live while each window reads.
         // Replaced/unsubscribed windows are fenced by their subscription generation.
         for id in refresh {
@@ -1438,6 +1578,8 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
             }
             subscription.dirty = false;
             subscription.roster_revision = *roster.borrow();
+            subscription.view_revision =
+                crate::store::published_views::revision(&views.borrow(), &subscription.request.collection);
             let (cancel, canceled) = tokio::sync::oneshot::channel::<()>();
             subscription.reading = Some(cancel);
             let request = subscription.request.clone();
@@ -2041,6 +2183,9 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         })
         .collect::<Vec<_>>();
     capabilities.push(json!({"id":"summary", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
+    // Attention rows say whether each is an alert and name its agent conversation; `alerts` names
+    // the attention collection and routes, and the summary counts alerts.
+    capabilities.push(json!({"id":"alerts", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
@@ -2959,6 +3104,81 @@ fn runtime_resources_from_status(
     Ok(values)
 }
 
+fn observer_subscription_spec(
+    desired: &DesiredSubject,
+    kind: &str,
+    history: bool,
+) -> anyhow::Result<Option<Value>> {
+    if desired.kind != kind
+        && !(desired.kind == "stop" && desired.subject.starts_with(&format!("{kind}/")))
+    {
+        return Ok(None);
+    }
+    let spec = if kind == "observer" {
+        let Some(spec) = crate::graph::observer_spec(&desired.desired) else {
+            return Ok(None);
+        };
+        serde_json::to_value(spec)?
+    } else {
+        let Some(spec) = crate::graph::subscription_spec(&desired.desired) else {
+            return Ok(None);
+        };
+        serde_json::to_value(spec)?
+    };
+    if !history
+        && spec
+            .get("stopped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    Ok(Some(spec))
+}
+
+fn observer_subscription_resource(
+    desired: DesiredSubject,
+    kind: &str,
+    spec: Value,
+    revision: String,
+    claim: Option<(Value, u128)>,
+    snapshot: &ClientSnapshot,
+) -> Value {
+    let stopped = spec
+        .get("stopped")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let observed_state = claim
+        .as_ref()
+        .and_then(|(body, _)| body.pointer("/fields/state"))
+        .and_then(Value::as_str);
+    let state_name = if stopped {
+        "stopped"
+    } else {
+        observed_state.unwrap_or("pending")
+    };
+    let updated_at = claim
+        .as_ref()
+        .map(|(_, at)| client_timestamp(*at))
+        .unwrap_or_else(|| snapshot.created_at.clone());
+    json!({
+        "id": desired.subject,
+        "kind": kind,
+        "revision": revision,
+        "updated_at": updated_at,
+        "state": state_name,
+        "spec": spec,
+        "owner_run_id": desired.owner_run,
+        "owner_generation_id": desired.owner_generation,
+        "owner_step_id": desired.owner_step,
+        "operational": {
+            "layer": if stopped { "history" } else { "current" },
+            "actionable": !stopped,
+            "reasons": if stopped { vec!["stopped"] } else { Vec::<&str>::new() }
+        }
+    })
+}
+
 fn observer_subscription_resources(
     state: &AppState,
     kind: &str,
@@ -2967,29 +3187,9 @@ fn observer_subscription_resources(
 ) -> anyhow::Result<Vec<Value>> {
     let mut values = Vec::new();
     for desired in state.store.desired_subjects()? {
-        if desired.kind != kind
-            && !(desired.kind == "stop" && desired.subject.starts_with(&format!("{kind}/")))
-        {
+        let Some(spec) = observer_subscription_spec(&desired, kind, history)? else {
             continue;
-        }
-        let spec = if kind == "observer" {
-            let Some(spec) = crate::graph::observer_spec(&desired.desired) else {
-                continue;
-            };
-            serde_json::to_value(spec)?
-        } else {
-            let Some(spec) = crate::graph::subscription_spec(&desired.desired) else {
-                continue;
-            };
-            serde_json::to_value(spec)?
         };
-        let stopped = spec
-            .get("stopped")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if stopped && !history {
-            continue;
-        }
         let claim_kind = if kind == "observer" {
             "observer.state"
         } else {
@@ -3006,45 +3206,127 @@ fn observer_subscription_resources(
             )?
             .claims
             .into_iter()
-            .next();
-        let observed_state = claim
-            .as_ref()
-            .and_then(|claim| claim.body.pointer("/fields/state"))
-            .and_then(Value::as_str);
-        let state_name = if stopped {
-            "stopped"
-        } else {
-            observed_state.unwrap_or("pending")
-        };
+            .next()
+            .map(|claim| (claim.body, claim.accepted_at_unix_ms));
         let revision = state
             .store
             .selected_desired_revision(&desired.subject)?
             .unwrap_or_else(|| "unknown".into());
-        let updated_at = claim
-            .as_ref()
-            .map(|claim| client_timestamp(claim.accepted_at_unix_ms))
-            .unwrap_or_else(|| snapshot.created_at.clone());
-        values.push(json!({
-            "id": desired.subject,
-            "kind": kind,
-            "revision": revision,
-            "updated_at": updated_at,
-            "state": state_name,
-            "spec": spec,
-            "owner_run_id": desired.owner_run,
-            "owner_generation_id": desired.owner_generation,
-            "owner_step_id": desired.owner_step,
-            "operational": {
-                "layer": if stopped { "history" } else { "current" },
-                "actionable": !stopped,
-                "reasons": if stopped { vec!["stopped"] } else { Vec::<&str>::new() }
-            }
-        }));
+        values.push(observer_subscription_resource(
+            desired, kind, spec, revision, claim, snapshot,
+        ));
     }
     values.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
     Ok(values)
 }
 
+/// The raw ID has priority over the prefixed fallback, just as client_detail does.
+/// Call inside read_snapshot; declaration, revision, state and envelope share that cut.
+fn observer_subscription_detail_at(
+    state: &AppState,
+    kind: &str,
+    id: &str,
+    snapshot: &ClientSnapshot,
+    budget: &mut crate::store::observer_subscription_detail::DetailBudget,
+) -> anyhow::Result<Option<Value>> {
+    use crate::store::observer_subscription_detail::MAX_DETAIL_KEY_BYTES;
+    if id.len() > MAX_DETAIL_KEY_BYTES
+        || (!id.starts_with(&format!("{kind}/"))
+            && id.len() + kind.len() + 1 > MAX_DETAIL_KEY_BYTES)
+    {
+        return Err(St3Error::new(
+            "projection-detail-too-large",
+            "observer/subscription detail ID exceeds the 4096 byte key budget",
+        )
+        .into());
+    }
+    let prefixed = client_detail_id(kind, id);
+    for subject in [id, prefixed.as_str()]
+        .into_iter()
+        .take(if id == prefixed { 1 } else { 2 })
+    {
+        let Some(declaration) = state
+            .store
+            .observer_subscription_detail_declaration(subject, kind, budget)?
+        else {
+            continue;
+        };
+        let Some(spec) = observer_subscription_spec(&declaration.desired, kind, true)? else {
+            continue;
+        };
+        let claim_kind = if kind == "observer" {
+            "observer.state"
+        } else {
+            "subscription.state"
+        };
+        let claim = state.store.observer_subscription_detail_state(
+            subject,
+            claim_kind,
+            snapshot.store_index,
+            budget,
+        )?;
+        smallclaims::read_budget::check()?;
+        let value = observer_subscription_resource(
+            declaration.desired,
+            kind,
+            spec,
+            declaration.revision,
+            claim,
+            snapshot,
+        );
+        // Source bytes bound JSON decoding and rendering; escaping can enlarge the output.
+        // Refuse the complete item rather than truncate any field or fall back to a list.
+        if serde_json::to_vec(&value)?.len() + serde_json::to_vec(snapshot)?.len() > 512 * 1024 {
+            return Err(St3Error::new(
+                "projection-detail-too-large",
+                "observer/subscription detail output exceeds the 512 KiB response budget",
+            )
+            .into());
+        }
+        smallclaims::read_budget::check()?;
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+async fn observer_subscription_detail(
+    state: AppState,
+    kind: &'static str,
+    id: String,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    let (snapshot, value) = super::blocking_store(move || {
+        state.store.clone().read_snapshot(|index| {
+            use crate::store::observer_subscription_detail::{DetailBudget, MAX_DETAIL_KEY_BYTES};
+            if state.node.len() > MAX_DETAIL_KEY_BYTES {
+                return Err(St3Error::new(
+                    "projection-detail-too-large",
+                    "observer/subscription detail host metadata exceeds the 4096 byte budget",
+                )
+                .into());
+            }
+            let mut budget = DetailBudget::new();
+            // Bound the snapshot's host/ID/fingerprint inputs before formatting them.
+            // Numeric position, timestamp and fixed JSON header overhead fit in 128 bytes.
+            budget.charge((3 * state.node.len() + CLIENT_PROJECTION_VERSION.len() + 128) as i64)?;
+            state
+                .store
+                .observer_subscription_detail_snapshot_guard(index, &mut budget)?;
+            let snapshot = client_snapshot_at(&state, index);
+            let value = state.store.with_owned_set_snapshot_reads(|| {
+                observer_subscription_detail_at(&state, kind, &id, &snapshot, &mut budget)
+            })?;
+            let value = value.ok_or_else(|| {
+                St3Error::new(
+                    "not-found",
+                    format!("{kind} `{}` does not exist", client_detail_id(kind, &id)),
+                )
+            })?;
+            Ok((snapshot, value))
+        })
+    })
+    .await?;
+    Ok((Extension(snapshot), Json(value)))
+}
 /// Every open lane, or every declared lane with history, in client form.
 pub(super) async fn lanes(
     State(state): State<AppState>,
@@ -3138,17 +3420,11 @@ pub(super) async fn observers(
 
 pub(super) async fn observer_detail(
     State(state): State<AppState>,
-    Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
     require_scope(&session, "read.projections")?;
-    client_detail(
-        observer_subscription_resources(&state, "observer", true, &snapshot)
-            .map_err(ApiError::internal)?,
-        "observer",
-        &id,
-    )
+    observer_subscription_detail(state, "observer", id).await
 }
 
 pub(super) async fn subscriptions(
@@ -3165,17 +3441,11 @@ pub(super) async fn subscriptions(
 
 pub(super) async fn subscription_detail(
     State(state): State<AppState>,
-    Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
     require_scope(&session, "read.projections")?;
-    client_detail(
-        observer_subscription_resources(&state, "subscription", true, &snapshot)
-            .map_err(ApiError::internal)?,
-        "subscription",
-        &id,
-    )
+    observer_subscription_detail(state, "subscription", id).await
 }
 
 fn machine_resources(
@@ -5092,14 +5362,19 @@ fn managed_claude_transcript(
     // provider's binding can survive a restart, so it counts only when it names the same
     // provider incarnation as the seat's current observation; neither its presence nor the
     // newest transcript in a workspace is sufficient.
-    let hook_binding = std::fs::read(directory.join("claude-native-session"))
+    let hook_record = std::fs::read(directory.join("claude-native-session"))
         .ok()
         .and_then(|binding| serde_json::from_slice::<Value>(&binding).ok())
-        .and_then(|binding| {
-            (binding["incarnation"].as_str() == Some(evidence))
-                .then(|| binding["native_session_id"].as_str().map(str::to_owned))
-                .flatten()
-        });
+        .filter(|binding| binding["incarnation"].as_str() == Some(evidence));
+    let hook_binding = hook_record
+        .as_ref()
+        .and_then(|binding| binding["native_session_id"].as_str().map(str::to_owned));
+    // The path Claude gave the hook is where this session's transcript really is, on whatever
+    // login the seat runs: `~/.claude` or any account's `CLAUDE_CONFIG_DIR`.
+    let recorded_path = hook_record
+        .as_ref()
+        .and_then(|binding| binding["transcript_path"].as_str())
+        .map(std::path::PathBuf::from);
     let native_id = match hook_binding {
         Some(native_id) => native_id,
         // Without the hook, prove the session from the live processes instead; see
@@ -5109,11 +5384,35 @@ fn managed_claude_transcript(
             format!("the SessionStart hook did not bind this incarnation, and {reason}")
         })?,
     };
-    match crate::external_sessions::find_bound_transcript(
-        home,
-        crate::external_sessions::ExternalDriver::Claude,
-        &native_id,
-    ) {
+    let find = |extra_roots: &[std::path::PathBuf]| {
+        crate::external_sessions::find_bound_transcript_with(
+            home,
+            crate::external_sessions::ExternalDriver::Claude,
+            &native_id,
+            recorded_path.as_deref(),
+            extra_roots,
+        )
+    };
+    let mut found = find(&[]);
+    // A seat started before its binding recorded a path, on an account's own login: look in the
+    // declared accounts' login directories too. Only reached when the ordinary places miss.
+    if matches!(found, Ok(None)) {
+        let host = st_drivers::run::detect_host();
+        let roots = state
+            .store
+            .declared_accounts()
+            .unwrap_or_default()
+            .iter()
+            .filter(|account| account.driver() == Some("claude"))
+            .filter_map(|account| account.login_for(&host))
+            .filter_map(|login| crate::accounts::expand_login(login, Some(home)))
+            .map(|login| login.join("projects"))
+            .collect::<Vec<_>>();
+        if !roots.is_empty() {
+            found = find(&roots);
+        }
+    }
+    match found {
         Ok(Some(session)) => Ok(session),
         Ok(None) => Err(Missing::not_yet(format!(
             "Claude session {native_id} has no transcript file yet"
@@ -6024,6 +6323,9 @@ fn conversation_read_now_unbounded(
 struct ConversationMark {
     owner: Option<String>,
     transcript: Option<std::path::PathBuf>,
+    /// When the owner and transcript were found. A harness can move to a new transcript within
+    /// one incarnation, so a kept mark finds them again after [`CONVERSATION_MARK_REUSE`].
+    resolved_at: std::time::Instant,
     store_index: u64,
     local_position: u64,
     transcript_seen: Option<(u64, std::time::SystemTime)>,
@@ -6034,6 +6336,9 @@ struct ConversationMark {
 /// rebuilding the timeline, that nothing concerning the conversation changed since: idle polls
 /// rebuilt a 200-entry timeline every time, 275–620 ms of daemon CPU each (idle-cpu findings).
 type TranscriptSeen = Option<(u64, std::time::SystemTime)>;
+/// How long a follower reuses the owner and transcript it found: one follow wait, as long as a
+/// wait-long changes read always reused them.
+const CONVERSATION_MARK_REUSE: Duration = Duration::from_secs(10);
 type HashMap<K, V> = std::collections::HashMap<K, V>;
 const ISSUED_CURSORS: usize = 4096;
 
@@ -6064,6 +6369,14 @@ fn issued_transcript(cursor: &str) -> Option<TranscriptSeen> {
     issued_cursors().lock().ok()?.1.get(cursor).copied()
 }
 
+/// Conversation owners and transcripts found, by session, counted by the work-budget tests.
+#[cfg(test)]
+fn conversation_marks_resolved() -> &'static std::sync::Mutex<HashMap<String, u64>> {
+    static RESOLVED: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    RESOLVED.get_or_init(Default::default)
+}
+
 /// First-page builds for initial OPEN and reactive changes, counted by the work-budget tests.
 #[cfg(test)]
 fn timeline_rebuilds() -> &'static std::sync::Mutex<HashMap<String, u64>> {
@@ -6085,6 +6398,10 @@ impl ConversationMark {
     }
 
     fn new_unbounded(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        #[cfg(test)]
+        if let Ok(mut resolved) = conversation_marks_resolved().lock() {
+            *resolved.entry(session_id.to_owned()).or_default() += 1;
+        }
         let index = state.store.index().map_err(ApiError::internal)?;
         let managed = super::managed_session_owner_at(&state.store, index, session_id)
             .map_err(ApiError::internal)?;
@@ -6102,10 +6419,26 @@ impl ConversationMark {
         Ok(Self {
             transcript_seen: transcript_seen(transcript.as_deref()),
             transcript,
+            resolved_at: std::time::Instant::now(),
             owner,
             store_index: index,
             local_position: local_latest_position(state)?,
         })
+    }
+
+    /// Bring a kept mark up to now without finding its owner or transcript again: the same as a
+    /// new mark while they are known and recently found. Otherwise find them again.
+    fn refresh(mut self, state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        if self.transcript.is_none() || self.resolved_at.elapsed() >= CONVERSATION_MARK_REUSE {
+            return Self::new(state, session_id);
+        }
+        super::read_deadline::query(&state.store, "/v1/client/conversations/{id}/changes", || {
+            self.store_index = state.store.index().map_err(ApiError::internal)?;
+            self.local_position = local_latest_position(state)?;
+            Ok(())
+        })?;
+        self.transcript_seen = transcript_seen(self.transcript.as_deref());
+        Ok(self)
     }
 
     /// Whether anything that concerns the conversation changed since the last look.
@@ -6145,9 +6478,27 @@ async fn conversation_changes_local(
     after: Option<&str>,
     wait_ms: u64,
 ) -> Result<Value, ApiError> {
+    conversation_changes_local_marked(state, session, session_id, after, wait_ms, None)
+        .await
+        .map(|(value, _)| value)
+}
+
+/// [`conversation_changes_local`], starting from a mark kept from an earlier read of the same
+/// conversation, and returning the mark to keep for the next.
+async fn conversation_changes_local_marked(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+    wait_ms: u64,
+    kept: Option<ConversationMark>,
+) -> Result<(Value, ConversationMark), ApiError> {
     let mut changed = state.event_notify.subscribe();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(30_000));
-    let mut mark = ConversationMark::new(state, session_id)?;
+    let mut mark = match kept {
+        Some(mark) => mark.refresh(state, session_id)?,
+        None => ConversationMark::new(state, session_id)?,
+    };
     // A cursor this member gave out, with nothing that concerns the conversation changed since:
     // there is nothing to read yet, so wait without rebuilding the timeline.
     let mut quiet = None;
@@ -6183,7 +6534,7 @@ async fn conversation_changes_local(
             || after.is_none()
             || tokio::time::Instant::now() >= deadline
         {
-            return Ok(value);
+            return Ok((value, mark));
         }
         // Read again only when something that concerns this conversation changed: a full read
         // parses the whole transcript, and the fleet commits many times a second.
@@ -6209,7 +6560,7 @@ async fn conversation_changes_local(
                     remember_cursor(&next, mark.transcript_seen);
                     value["next_cursor"] = Value::String(next);
                 }
-                return Ok(value);
+                return Ok((value, mark));
             }
         }
     }
@@ -6490,15 +6841,48 @@ fn client_session_id(owner: &str, incarnation: &str) -> String {
     format!("session/{}", &digest[..24])
 }
 
+/// What a page of events needs from the store to attribute its subjects, read once per page
+/// instead of once per event.
+#[derive(Default)]
+struct EventPageLookups {
+    missions: BTreeMap<String, String>,
+    custom_sources: BTreeSet<String>,
+}
+
+impl EventPageLookups {
+    fn read<'a>(state: &AppState, records: impl IntoIterator<Item = &'a EventRecord>) -> Self {
+        let (mut runs, mut customs) = (BTreeSet::new(), BTreeSet::new());
+        for record in records {
+            if record.subject.starts_with("custom/") {
+                customs.insert(record.subject.clone());
+            } else if record.subject.starts_with("mission-run/") {
+                runs.insert(record.subject.clone());
+            }
+        }
+        Self {
+            missions: state
+                .store
+                .run_missions(&runs.into_iter().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            custom_sources: state
+                .store
+                .registered_custom_subjects(&customs.into_iter().collect::<Vec<_>>())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[cfg(test)]
 fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec<String>, Value) {
-    if record.subject.starts_with("custom/")
-        && state
-            .store
-            .custom_subject(&record.subject)
-            .ok()
-            .flatten()
-            .is_some()
-    {
+    safe_event_projection_with(state, record, &EventPageLookups::read(state, [record]))
+}
+
+fn safe_event_projection_with(
+    state: &AppState,
+    record: &EventRecord,
+    lookups: &EventPageLookups,
+) -> (String, Vec<String>, Value) {
+    if record.subject.starts_with("custom/") && lookups.custom_sources.contains(&record.subject) {
         return (
             "attention.changed".into(),
             vec![record.subject.clone()],
@@ -6561,9 +6945,9 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
     {
         resource_ids.push(record.subject.clone());
     } else if record.subject.starts_with("mission-run/")
-        && let Ok(Some(mission)) = state.store.mission_for_run(&record.subject)
+        && let Some(mission) = lookups.missions.get(&record.subject)
     {
-        resource_ids.push(mission);
+        resource_ids.push(mission.clone());
     } else if record.subject.starts_with("planning-session/") {
         resource_ids.push(format!(
             "launch/{}",
@@ -6666,6 +7050,13 @@ pub(super) async fn events(
     // The projection enrichment reads the store (mission attribution, snapshot ids), so it
     // takes one admitted query scope; the wait above held no reader.
     let items = super::read_deadline::query(&state.store, "/v1/client/events", || {
+        // Every event is named by its own cut; read all of the page's cuts in one statement.
+        let cuts = records
+            .iter()
+            .map(|(record, _)| record.store_index)
+            .collect::<Vec<_>>();
+        let times = state.store.projection_times_at(&cuts).unwrap_or_default();
+        let lookups = EventPageLookups::read(&state, records.iter().map(|(record, _)| record));
         Ok(records
             .into_iter()
             .map(|(record, local)| {
@@ -6683,8 +7074,12 @@ pub(super) async fn events(
                         local: None,
                     },
                 };
-                let event_snapshot = client_snapshot_at(&state, record.store_index);
-                let (event_type, resource_ids, body) = safe_event_projection(&state, &record);
+                let event_snapshot = client_snapshot_with_time(
+                    &state,
+                    record.store_index,
+                    times.get(&record.store_index).copied().unwrap_or_default(),
+                );
+                let (event_type, resource_ids, body) = safe_event_projection_with(&state, &record, &lookups);
                 json!({
                     "id": format!("projection-event/{}/{}", state.node, position.label()),
                     "epoch": state.node,
@@ -10534,6 +10929,21 @@ pub(super) async fn action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_latency_keeps_scope_and_routes_with_a_memory_only_cost_snapshot() {
+        let mut session = ClientSession::for_tests("person/ada", "person/ada", "local");
+        assert_eq!(request_latency(Extension(session.clone())).await.unwrap_err().status, StatusCode::FORBIDDEN);
+        session.scopes.insert("read.projections".into());
+        let work = smallclaims::sqlite::work::SqliteWorkScope::start();
+        let Json(value) = request_latency(Extension(session)).await.unwrap();
+        assert_eq!(work.finish(), smallclaims::sqlite::work::SqliteWork::default(), "the counter handler must not execute SQLite statements");
+        assert!(value["routes"].is_array());
+        assert!(value["cost_counters"]["state"].is_string());
+        assert!(value["cost_counters"]["as_of_unix_ms"].is_number());
+        assert!(value["cost_counters"].get("window").is_some());
+    }
+
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
@@ -10969,6 +11379,59 @@ mission "queue-parity" state="ready" {
         let mut bad_retry = frame.clone();
         bad_retry["retryable"] = json!("yes");
         assert!(!validator.is_valid(&bad_retry));
+    }
+
+    #[tokio::test]
+    async fn agent_lifecycle_declaration_updates_live_roster_rows() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let writer = state.clone();
+        let apply = |lifecycle: Option<&str>, key: &str| {
+            let field = lifecycle.map(|value| format!("lifecycle \"{value}\";")).unwrap_or_default();
+            let source = format!("version 2\nagent \"example/purpose\" {{ {field} command \"true\" }}");
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let planned = writer.store.mission(&intent, IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            writer.store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            signal_changed(&writer);
+        };
+        apply(Some("standing"), "lifecycle-initial");
+        let app = axum::Router::new().route("/stream", axum::routing::get(
+            move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| collection_stream_socket_with_reader(
+                        socket, state, ClientSession::local(None).unwrap(), None,
+                        |state, session, request, permit| async move {
+                            collection_items(&state, &session, &request, permit).await
+                        },
+                    ))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"lifecycle","collection":"agents","limit":2}).to_string().into(),
+        )).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["kind"], "snapshot");
+        assert_eq!(frame["items"][0]["lifecycle"], "standing");
+        for (lifecycle, key) in [(Some("owner"), "lifecycle-owner"), (Some("bounded"), "lifecycle-bounded"), (None, "lifecycle-removed")] {
+            apply(lifecycle, key);
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["kind"], "changes", "{frame}");
+            assert_eq!(frame["upserts"][0]["id"], "agent/example/purpose");
+            assert_eq!(frame["upserts"][0].get("lifecycle"), lifecycle.map(|value| json!(value)).as_ref());
+        }
+        socket.close(None).await.unwrap();
+        server.abort();
     }
 
     #[tokio::test]
@@ -11557,6 +12020,65 @@ mission "queue-parity" state="ready" {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fresh_agent_roster_read_cuts_the_refresh_pause_short_and_plain_reads_do_not() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/fresh-pause";
+        let append = |fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "harness.observed".into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            state.store.index().unwrap()
+        };
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"fresh-pause", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        let list = |fresh: bool| client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery { fresh, ..ClientListQuery::default() }));
+        let publishes = |cut: u64| {
+            let store = state.store.clone();
+            move |_: &u64| store.published_agent_roster(store.index().unwrap(), false)
+                .is_some_and(|(published, _, _)| published >= cut)
+        };
+
+        // A plain read asks for a refresh; once it publishes, the refresher pauses a second.
+        let working = append(json!({"state":"working", "driver":"codex", "incarnation_id":"one"}));
+        let _ = list(false).await;
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(publishes(working)))
+            .await.expect("the refresher publishes the asked-for cut").unwrap();
+
+        // Unchanged: plain reads during the pause answer from the publication and do not cut it
+        // short, however many ask.
+        let idle = append(json!({"state":"idle", "driver":"codex", "incarnation_id":"one"}));
+        for _ in 0..3 {
+            let (Extension(snapshot), Json(page)) = list(false).await.unwrap();
+            assert!(snapshot.store_index < idle, "a plain read answers from the publication");
+            assert_eq!(page.items[0]["harness_state"], "working");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), published.wait_for(publishes(idle)))
+                .await.is_err(),
+            "plain reads must not shorten the refresher's minimum pause",
+        );
+
+        // Changed: a fresh read waits for one fold, not the rest of the pause (about 750 ms here).
+        let started = std::time::Instant::now();
+        let (Extension(snapshot), Json(page)) = list(true).await.unwrap();
+        let waited = started.elapsed();
+        assert!(snapshot.store_index >= idle, "a fresh read shows what was written before it");
+        assert_eq!(page.items[0]["harness_state"], "idle");
+        assert!(waited < Duration::from_millis(500), "a fresh read waited {waited:?} for the pause");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_roster_pages_ask_for_a_refresh_after_local_activity_alone() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
@@ -11601,6 +12123,61 @@ mission "queue-parity" state="ready" {
         let (snapshot, Json(after)) = page().await.unwrap();
         assert_eq!(snapshot.0.store_index, index);
         assert!(!after.items[0]["last_activity_at"].is_null(), "{:?}", after.items[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fresh_agent_roster_waits_only_for_claims_that_change_a_card() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/fresh-roster";
+        let append = |subject: &str, kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        append(subject, "runtime.observed", json!({"status":"running",
+            "runtime_id":"fresh-roster", "incarnation_id":"one"}));
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        let revision = *published.borrow_and_update();
+        let (_, Json(before)) = client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default())).await.unwrap();
+        let fresh = || async {
+            let started = std::time::Instant::now();
+            let (snapshot, Json(page)) = client_agents(State(state.clone()),
+                Extension(new_client_snapshot(&state)),
+                Query(ClientListQuery { fresh: true, ..ClientListQuery::default() })).await.unwrap();
+            (started.elapsed(), snapshot.0.store_index, page)
+        };
+
+        // Claims on subjects no card reads move the graph past the published cut. The paced
+        // refresher would publish the same cards, so a fresh read does not wait for it.
+        let cut = state.store.index().unwrap();
+        for marker in 0..3 {
+            append(&format!("custom/test/fresh-{marker}"), "custom.test.marker", json!({}));
+        }
+        assert!(state.store.index().unwrap() > cut);
+        assert!(state.store.published_agent_roster_unchanged_through(
+            state.store.index().unwrap(), false).unwrap());
+        let (waited, index, page) = fresh().await;
+        assert!(waited < Duration::from_millis(500), "waited {waited:?} for an unchanged roster");
+        assert_eq!(index, cut, "the unchanged roster is served under its own cut");
+        assert_eq!(page.items, before.items);
+
+        // A claim about the agent changes its card: the fresh read still waits for a roster
+        // at or after it, and shows it.
+        append(subject, "harness.observed", json!({"state":"working",
+            "driver":"codex", "incarnation_id":"one"}));
+        let written = state.store.index().unwrap();
+        assert!(!state.store.published_agent_roster_unchanged_through(written, false).unwrap());
+        let (_, index, page) = fresh().await;
+        assert_eq!(index, written);
+        assert_ne!(page.items, before.items, "the fresh read shows the claim it waited for");
+        assert!(*published.borrow_and_update() > revision);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -12298,8 +12875,8 @@ mission "queue-parity" state="ready" {
                                         entered.send(()).unwrap();
                                         held.notified().await;
                                     } else if request.id == "probe" && probe.fetch_add(1, Ordering::SeqCst) > 0 {
-                                        // A second work read can only come from the all-window
-                                        // commit refresh; the same pass marks held dirty.
+                                        // This mission publication changes both work and missions;
+                                        // the same commit refresh marks held dirty.
                                         refreshed.send(()).unwrap();
                                     }
                                     result
@@ -14563,7 +15140,7 @@ subscription "watch/source" {
                 snapshot_id: snapshot.id.clone(),
                 ..Default::default()
             },
-            parameters: json!({"to":"person/blair","content":"Send once despite unrelated activity."}),
+            parameters: json!({"to":"agent/blair","content":"Send once despite unrelated activity."}),
         };
         state
             .store
@@ -15705,6 +16282,109 @@ mission "example/zero-run" state="ready" {
     }
 
     #[tokio::test]
+    async fn event_pages_keep_each_events_own_cut_and_read_in_constant_statements() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "cut-node");
+        let session = ClientSession::local(None).unwrap();
+        let accepted = std::cell::RefCell::new(Vec::new());
+        let append = |count: usize| {
+            for _ in 0..count {
+                let key = format!("cut-{}", accepted.borrow().len());
+                accepted.borrow_mut().push(
+                    state
+                        .store
+                        .append_claim(&ClaimInput {
+                            subject: format!("message/{key}"),
+                            kind: "message.sent".into(),
+                            actor: Some("person/alex".into()),
+                            fields: BTreeMap::from([
+                                ("from".into(), Value::String("person/alex".into())),
+                                ("to".into(), Value::String("agent/worker".into())),
+                                ("content".into(), Value::String("safe".into())),
+                                ("status".into(), Value::String("sent".into())),
+                            ]),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(key),
+                        })
+                        .unwrap(),
+                );
+                // Acceptance times are milliseconds; keep neighbouring cuts distinct.
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let page = |after: Option<String>, limit: usize| {
+            let (state, session) = (state.clone(), session.clone());
+            async move {
+                let scope = smallclaims::sqlite::work::SqliteWorkScope::start();
+                let page = events(
+                    State(state),
+                    Extension(session),
+                    Query(EventsQuery { after, limit: Some(limit), wait_ms: None }),
+                )
+                .await
+                .unwrap()
+                .0;
+                (page, scope.finish().statements)
+            }
+        };
+        append(100);
+
+        // Each event keeps its own cut: its timestamp and snapshot id are the single lookup's.
+        let (tail, _) = page(None, 100).await;
+        let items = tail["items"].as_array().unwrap();
+        assert_eq!(items.len(), 100);
+        for item in items {
+            let sequence = item["sequence"].as_u64().unwrap();
+            let single = client_snapshot_at(&state, sequence);
+            assert_eq!(item["timestamp"], single.created_at, "sequence {sequence}");
+            assert_eq!(item["snapshot_id"], single.id, "sequence {sequence}");
+        }
+        let times = items.iter().map(|item| item["timestamp"].as_str().unwrap().to_owned()).collect::<BTreeSet<_>>();
+        assert!(times.len() > 1, "events must not share one page time");
+
+        // Statements stay flat as the page grows, and as unrelated history grows.
+        let mut counts = Vec::new();
+        for size in [10, 50, 100] {
+            counts.push(page(None, size).await.1);
+        }
+        eprintln!("events statements: 10/50/100 items {counts:?}");
+        assert!(counts.windows(2).all(|pair| pair[0] == pair[1]), "grew with page size: {counts:?}");
+        append(200);
+        let mut grown = Vec::new();
+        for size in [10, 50, 100] {
+            grown.push(page(None, size).await.1);
+        }
+        eprintln!("events statements after +200 claims of history: {grown:?}");
+        assert_eq!(counts, grown, "statements must not grow with history");
+
+        // Walking forward in pages, with an append during the walk, yields each event once, in
+        // order, with the same cuts.
+        let first = accepted.borrow()[0].store_index.saturating_sub(1);
+        let mut cursor = Some(format!("event-cursor/cut-node/{first}"));
+        let mut sequences = Vec::new();
+        let mut appended = false;
+        loop {
+            let (walked, _) = page(cursor.clone(), 7).await;
+            for item in walked["items"].as_array().unwrap() {
+                let sequence = item["sequence"].as_u64().unwrap();
+                assert_eq!(item["timestamp"], client_snapshot_at(&state, sequence).created_at);
+                sequences.push(sequence);
+            }
+            cursor = Some(walked["resume_cursor"].as_str().unwrap().to_owned());
+            if !appended {
+                appended = true;
+                append(3);
+            }
+            if !walked["has_more"].as_bool().unwrap() {
+                break;
+            }
+        }
+        let expected = accepted.borrow().iter().map(|claim| claim.store_index).collect::<Vec<_>>();
+        assert_eq!(sequences, expected);
+    }
+
+    #[tokio::test]
     async fn event_resync_replacement_produces_one_valid_frontier_cursor() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "resync-node");
@@ -16064,7 +16744,11 @@ mission "example/zero-run" state="ready" {
             assert_eq!(frame["has_more"], lines * 2 > 200);
             assert!(frame_bytes(&frame) <= CLIENT_MAX_RESPONSE_BYTES);
             let rebuilds = || timeline_rebuilds().lock().unwrap().get(&session_id).copied().unwrap_or(0);
+            let resolved = || conversation_marks_resolved().lock().unwrap().get(&session_id).copied().unwrap_or(0);
             assert_eq!(rebuilds(), 1, "OPEN must not fold an empty baseline before its page");
+            // Let the follower start its first wait: it keeps the owner and transcript OPEN found.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(resolved(), 1, "OPEN and its first wait find the transcript once");
             // Change the source after the first frame. The next frame is a delta, not a reload.
             use std::io::Write as _;
             let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
@@ -16077,6 +16761,8 @@ mission "example/zero-run" state="ready" {
             assert!(delta["items"].as_array().unwrap().iter().any(|item|
                 item["body"]["text"].as_str().is_some_and(|text| text.starts_with(&format!("answer {lines} ")))));
             assert_eq!(rebuilds(), 2);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(resolved(), 1, "a delta and the wait after it reuse the kept mark");
             assert_collection_frame_conforms(&delta);
             follower.abort();
             let _ = follower.await;

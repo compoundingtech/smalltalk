@@ -85,6 +85,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `checkpoint_envelopes` | Shared storage, with stated local fields | Shared immutable dropped-envelope identity. Live and trimmed nodes represent the same inventory using envelopes versus tombstones, so digest their logical union rather than treating trim progress as divergence. |
 | `checkpoint_claims` | Shared storage, with stated local fields | Shared immutable dropped-claim/evidence/ancestry/operation identity. Digest logical live/tombstoned identity where relevant; nodes may have trimmed at different times. |
 | `checkpoints` | Local | Local seal/verification/trim/adoption ledger and rowid high water; nodes legitimately occupy different protocol stages. Shared protocol facts are checkpoint.* claims. |
+| `checkpoint_capture_epoch` | Local | Capture invalidation epoch, monotonic envelope/time guard bounds and trigger-migration version. Store-local physical rowid frontiers and capture timing are not replicated projection outcomes and are outside shared digests. |
 
 The temporary tables write_clock, sealed_claims, sealed_envelopes, canonical_index, adopted_envelopes and adopted_claims are Local: clock simulation or checkpoint proof/adoption scratch state. SQLite sqlite_sequence is a local allocation counter. There are no persistent SQL views in the audited schema. Rust actual/subject/message/status/replication snapshot caches and exported mailbox files are Local disposable caches; their shared source selections are not exempt.
 

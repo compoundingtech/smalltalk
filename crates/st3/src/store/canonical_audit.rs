@@ -98,7 +98,9 @@ fn every_persistent_table_has_a_projection_scope() {
         "replica_envelope_holds",
         "checkpoint_envelopes",
         "checkpoint_claims",
+        "checkpoint_capture_epoch",
         "checkpoints",
+        "checkpoint_capture_epoch",
     ];
     let mut classified = SHARED_TABLES
         .iter()

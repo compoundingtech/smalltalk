@@ -1,0 +1,46 @@
+{
+  "id": "mission/person-ask/choose-date",
+  "kind": "mission",
+  "revision": "ask-revision",
+  "updated_at": "2026-09-20T11:00:00Z",
+  "title": "Choose a release date",
+  "state": "running",
+  "mission_revision": "ask-revision",
+  "runs": ["mission-run/person-ask/choose-date"],
+  "run_generations": {"mission-run/person-ask/choose-date": "run-generation/ask-choose-date"},
+  "run_details": [{
+    "id": "mission-run/person-ask/choose-date",
+    "generation_id": "run-generation/ask-choose-date",
+    "requester": "agent/asker",
+    "status": "running",
+    "phase": "main",
+    "progress": {"done": 0, "total": 1},
+    "must_act": "you",
+    "state_since": "2026-09-20T11:00:00Z",
+    "current_steps": [{
+      "id": "step-run/ask-choose-date/ask",
+      "title": "Choose a release date",
+      "assignee": "person/avery",
+      "claimant": null,
+      "state": "ready",
+      "since": "2026-09-20T11:00:00Z"
+    }],
+    "steps": [{
+      "id": "step-run/ask-choose-date/ask",
+      "path": "ask",
+      "title": "Choose a release date",
+      "state": "ready",
+      "attempt": 1,
+      "assignee": "person/avery",
+      "claimant": null,
+      "agentless": false,
+      "since": "2026-09-20T11:00:00Z",
+      "wake": {
+        "assignee": "person/avery",
+        "assignee_state": "unavailable",
+        "incarnation_id": "unknown",
+        "attempts": 0
+      }
+    }]
+  }]
+}

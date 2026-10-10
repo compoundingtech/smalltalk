@@ -74,6 +74,45 @@ impl WorkAction {
     }
 }
 
+const AGENTS: &str = "/v1/client/agents";
+
+/// What an agents roster read asks for. A fresh first page waits, by design, for the refresher
+/// to publish a roster at or after its own cut; the others answer from a publication at once.
+/// Each keeps its own sample so a latency target can count the designed wait separately
+/// without dropping it from the route total.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum AgentsRead {
+    FirstPage,
+    Fresh,
+    Continuation,
+}
+
+impl AgentsRead {
+    fn classify(method: &Method, route: &str, query: Option<&str>) -> Option<Self> {
+        if method != Method::GET || route != AGENTS {
+            return None;
+        }
+        let mut fresh = false;
+        for (name, value) in query.unwrap_or_default().split('&').filter_map(|pair| pair.split_once('=')) {
+            match name {
+                // A continuation answers from its first page's publication and never waits.
+                "cursor" => return Some(Self::Continuation),
+                "fresh" => fresh = value == "true",
+                _ => {}
+            }
+        }
+        Some(if fresh { Self::Fresh } else { Self::FirstPage })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::FirstPage => "first-page",
+            Self::Fresh => "fresh",
+            Self::Continuation => "continuation",
+        }
+    }
+}
+
 #[derive(Default)]
 struct Sample {
     count: u64,
@@ -119,10 +158,18 @@ pub(super) struct Meter {
     // Independent of the general route cap: all seven known actions retain a
     // complete denominator even if the route table has already filled.
     work_actions: BTreeMap<WorkAction, Sample>,
+    agents_reads: BTreeMap<AgentsRead, Sample>,
 }
 
 impl Meter {
-    pub(super) fn record(&mut self, method: &Method, route: &str, path: &str, elapsed: Duration) {
+    pub(super) fn record(
+        &mut self,
+        method: &Method,
+        route: &str,
+        path: &str,
+        query: Option<&str>,
+        elapsed: Duration,
+    ) {
         if self.routes.len() < ROUTES || self.routes.contains_key(route) {
             self.routes
                 .entry(route.to_owned())
@@ -131,6 +178,9 @@ impl Meter {
         }
         if let Some(action) = WorkAction::classify(method, route, path) {
             self.work_actions.entry(action).or_default().record(elapsed);
+        }
+        if let Some(read) = AgentsRead::classify(method, route, query) {
+            self.agents_reads.entry(read).or_default().record(elapsed);
         }
     }
 
@@ -142,6 +192,12 @@ impl Meter {
                 let mut row = sample.snapshot(action.route(), "work-action");
                 row["method"] = json!("POST");
                 row["action"] = json!(action.name());
+                row
+            }))
+            .chain(self.agents_reads.iter().map(|(read, sample)| {
+                let mut row = sample.snapshot(AGENTS, "agents-read");
+                row["method"] = json!("GET");
+                row["read"] = json!(read.name());
                 row
             }))
             .collect()
@@ -170,7 +226,7 @@ mod tests {
             ("/v1/work/claim/work/private-b", 900),
             ("/v1/work/renew/work/private-c", 27),
         ] {
-            meter.record(&Method::POST, WORK, path, Duration::from_millis(duration));
+            meter.record(&Method::POST, WORK, path, None, Duration::from_millis(duration));
         }
         let renew = row(&meter, "work-action", "/v1/work/renew/{*subject}");
         assert_eq!(renew["count"], 2);
@@ -201,6 +257,7 @@ mod tests {
                 &Method::POST,
                 WORK,
                 &format!("/v1/work/{action}/secret"),
+                None,
                 Duration::ZERO,
             );
         }
@@ -208,22 +265,25 @@ mod tests {
             &Method::POST,
             "/v1/work/extend/{*subject}",
             "/v1/work/extend/secret",
+            None,
             Duration::ZERO,
         );
         meter.record(
             &Method::POST,
             WORK,
             "/v1/work/%72%65%6e%65%77/secret",
+            None,
             Duration::ZERO,
         );
         for method in [Method::GET, Method::HEAD, Method::PUT] {
-            meter.record(&method, WORK, "/v1/work/renew/secret", Duration::ZERO);
+            meter.record(&method, WORK, "/v1/work/renew/secret", None, Duration::ZERO);
         }
         for i in 0..1_000 {
             meter.record(
                 &Method::POST,
                 WORK,
                 &format!("/v1/work/unknown-{i}/secret"),
+                None,
                 Duration::ZERO,
             );
         }
@@ -231,6 +291,7 @@ mod tests {
             &Method::POST,
             "/unmatched",
             "/v1/work/renew/secret",
+            None,
             Duration::ZERO,
         );
         assert_eq!(meter.work_actions.len(), 7);
@@ -249,6 +310,35 @@ mod tests {
     }
 
     #[test]
+    fn agents_reads_split_the_designed_fresh_wait_from_the_route_total() {
+        let mut meter = Meter::default();
+        for (query, duration) in [
+            (None, 4),
+            (Some("limit=50"), 6),
+            (Some("limit=50&fresh=true"), 700),
+            (Some("fresh=false"), 5),
+            (Some("fresh=true&cursor=page%2Fsecret"), 3),
+        ] {
+            meter.record(&Method::GET, AGENTS, AGENTS, query, Duration::from_millis(duration));
+        }
+        meter.record(&Method::HEAD, AGENTS, AGENTS, Some("fresh=true"), Duration::from_millis(9));
+        meter.record(&Method::GET, "/v1/client/work", "/v1/client/work", Some("fresh=true"), Duration::ZERO);
+        let read = |name: &str| meter.snapshot().into_iter()
+            .find(|row| row["scope"] == "agents-read" && row["read"] == name).unwrap();
+        assert_eq!(read("first-page")["count"], 3);
+        assert_eq!(read("first-page")["p99_ms"], 6);
+        assert_eq!(read("fresh")["count"], 1);
+        assert_eq!(read("fresh")["p99_ms"], 700);
+        assert_eq!(read("continuation")["count"], 1);
+        assert_eq!(read("fresh")["route"], AGENTS);
+        // The route total keeps every read, the designed wait included.
+        let route = row(&meter, "route", AGENTS);
+        assert_eq!(route["count"], 6);
+        assert_eq!(route["max_ms"], 700);
+        assert!(!serde_json::to_string(&meter.snapshot()).unwrap().contains("secret"));
+    }
+
+    #[test]
     fn action_denominator_survives_route_capacity_and_retains_last_512_of_all_completions() {
         let mut meter = Meter::default();
         for i in 0..ROUTES {
@@ -256,6 +346,7 @@ mod tests {
                 &Method::GET,
                 &format!("/known-route-{i}"),
                 "",
+                None,
                 Duration::ZERO,
             );
         }
@@ -264,6 +355,7 @@ mod tests {
                 &Method::POST,
                 WORK,
                 "/v1/work/renew/secret",
+                None,
                 Duration::from_millis(ms),
             );
         }

@@ -50,12 +50,18 @@ use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggreg
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once.
 
-All Linux Namespace jobs use run affinity and the same inline `job.priority=1`: required
-Workspace jobs, optional benchmarks, manual Performance controls, main upkeep and releases.
-Using one class prevents a continuous stream of required jobs from overtaking older performance
-requests. Run affinity ensures that a runner started for a request is assigned to that run,
-so GitHub cannot hand it to a newer run with the same shape. Local `ci1-priority` and `ci1-merge`
-reservations continue to select only the primary test shard.
+Required Workspace checks for PRs and merge groups use Namespace `job.priority=1`.
+Optional Performance and `perf-cost`, manual controls, main upkeep and releases retain
+priority 2. Required PR checks must finish before a PR can enter the merge queue; merge-first
+ordering previously allowed new merge jobs to overtake these prerequisites. This policy orders
+waiting jobs and neither preempts running work nor reserves capacity. The picker, local pools,
+runner shapes, run affinity and required checks are unchanged.
+
+The 2026-10-09 investigation retained a PR build waiting 55.1 minutes at priority 2 before
+15.7 minutes of execution; two sampled merge builds at priority 1 waited 0.3 and 1.7 minutes.
+One 116.6-minute PR had 41.0 minutes of producer wait and 28.8 minutes of shard wait.
+This motivates queue ordering; it does not establish a cache or compiler defect, nor promise
+that the 20-minute run SLO is met under overload.
 
 Profile labels carry affinity inline, for example
 `namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}`.
@@ -64,12 +70,10 @@ Shape labels retain `-with-features` and a separate
 separate `namespace-features:` label with profiles; see the
 [Runner Controls syntax](https://namespace.so/docs/solutions/github-actions/runner-controls).
 
-The queue still shares the existing Linux limit of 320 vCPUs / 640 GiB and must drain its older
-backlog. Queue time is measured separately from execution time; the shared class removes
-indefinite overtaking, rather than promising a fixed start time under arbitrary overload.
-An already queued job retains the labels from its immutable workflow revision. Recover old
-unprioritized controls with label-only revisions and new dispatches, preserving their source,
-fixtures and budgets; retain completed failures as evidence. See Namespace's
+The documented Linux limit is 320 vCPUs / 640 GiB; this change does not increase it.
+Queue time is measured separately from execution time. Already queued jobs retain the labels
+from their immutable workflow revision and finish naturally; this change does not rerun them.
+Optional jobs remain subject to capacity after required checks. See Namespace's
 [job ordering and priority controls](https://namespace.so/docs/solutions/github-actions/runner-controls/job-ordering).
 
 `scripts/ci-linux STAGE` runs one stage:
@@ -352,21 +356,73 @@ records the KVM probe and each phase's elapsed time.
 ### TypeScript client
 
 `typescript-client` runs on every PR and merge-group entry. Main retains the queue check;
-Main upkeep preserves the dependency cache. It installs Node 24.18.0
-(the workspace uses Node 24), the client's pinned TypeScript 6.0.3 and
-`effect@4.0.0-rc.118` development dependencies from its own lockfile. Both `node_modules`
-directories are cached together, keyed by both lockfiles and the Node version; a miss runs `npm ci --ignore-scripts` in each package.
-The lockfile fingerprint uses `sha256sum` in Bash so ci1's Nix runner needs no Node 20
+Main upkeep's `warm-typescript` fills the pnpm store with `pnpm fetch`. The job installs
+Node 24.18.0 through `actions/setup-node`, runs `corepack enable`, then installs the root
+workspace with `pnpm install --frozen-lockfile`. The client, shared views and iOS app share
+one root `pnpm-lock.yaml`; install scripts are disabled by the workspace configuration.
+The store cache key is
+`typescript-client-<os>-node24.18.0-pnpm12.7.0-<sha256 of pnpm-lock.yaml>`.
+The lockfile fingerprint uses `sha256sum` in Bash so the Nix runner needs no Node 20
 `hashFiles` helper when it evaluates the cache key.
 
-The client package's `npm test` runs the contract and schema tests with `node --test`;
-`npm run typecheck` runs its strict compiler checks. CI installs and checks the client before
-installing the iOS dependencies for the separate project typecheck.
-`bash scripts/ci-typescript-client` runs the client commands and `tsc --noEmit -p apps/ios` locally
-when both packages' dependencies are installed.
-The iOS project allows explicit TypeScript import extensions for generated-client consumers.
-The main ruleset requires `typescript-client`. It was enabled after the new job passed on main
-in [#1256](https://github.com/compoundingtech/smalltalk/pull/1256).
+After the root frozen install, `bash scripts/ci-typescript-client` runs the client's
+contract/schema tests and both compiler projects, the views' tests and typecheck,
+`tsc --noEmit -p .` in `apps/ios`, and the iOS tests. The client packages pin TypeScript
+6.0.3 and Effect 4.0.0-rc.118. The iOS project allows explicit TypeScript import extensions
+for generated-client consumers. The main ruleset requires `typescript-client`.
+
+### Fractal web
+
+The non-required Fractal web jobs run on GitHub-hosted `ubuntu-latest` without
+workflow-level path filters. `linux-gate` does not depend on them.
+
+- `fractal-web-changes` always runs, with a one-minute timeout and no checkout. Its
+  embedded `scripts/ci-fractal-web-changes` fetches both commits explicitly without
+  blobs and diffs PR base/head SHAs from their merge base, or a merge group's
+  `base_sha..head_sha`. `--no-renames` counts both sides of a rename. Missing or malformed
+  SHAs, failed fetches and failed diffs fail closed; `workflow_dispatch` forces execution.
+  Relevant paths are `apps/fractal-web/**`, `packages/fractal-ui/**`,
+  `clients/typescript/st3-views/**` and `fixtures/**`. Within `clients/typescript/st3-client`,
+  only the consumed export graph (`index.ts`, `Models.generated.ts`, `Client.generated.ts`,
+  `Schema.generated.ts`, `errors.ts`), `package.json`, `tsconfig.json`, `tsconfig.schema.json`,
+  `types.test.ts` and `BUCK*` trigger web execution. Rust generators and their schema/docs
+  inputs do not trigger it without a changed generated client file; root flake-only changes
+  also do not trigger it. Other relevant paths are
+  root `package.json*`, `pnpm-workspace.yaml*`, `pnpm-lock.yaml`,
+  `pnpm-install-contract.json*`, `.npmrc`, root `tsconfig*.json*`, `.buckroot*`,
+  `.buckconfig*`, root `BUCK*`, `buck2/**`, `genie/**`, `nix/web/**`,
+  `nix/fractal-web*.nix`, `scripts/ci-fractal-web*`,
+  `scripts/ci-typescript-client*`,
+  `.github/workflows/{fleet.yml*,workspace-ci.ts,main-upkeep.yml*,cache-audit.ts}`,
+  and `.github/repo-settings.json*`.
+- `fractal-web-execution` runs only for relevant changes after successful detection
+  and `genie-freshness`, with a 25-minute timeout and no retries. It runs
+  `nix develop .#web -c bash scripts/ci-fractal-web`. Timed lanes check toolchain/Buck-root
+  identity, run `pnpm install --frozen-lockfile`, then `buck2 build //:typecheck`.
+  It restores the pnpm store with key
+  `fractal-web-pnpm-<os>-pnpm12.7.0-node24.20.0-<hashFiles pnpm-lock.yaml>`;
+  only Main upkeep's `warm-fractal-web` saves this cache. App, UI kit, Storybook,
+  browser and performance lanes join the script with the packages that add them.
+- `fractal-web` is always emitted (`if: always()`), with a one-minute timeout. Its
+  embedded `scripts/ci-fractal-web-gate` passes only when detection succeeded and
+  either no relevant paths changed and execution was skipped, or execution succeeded.
+  Failure, timeout, cancellation and unexpected skips fail the gate. It is not a required
+  check; the ruleset adds it only after successful PR and merge-group emissions.
+
+`scripts/ci-fractal-web-test`, run by `genie-freshness`, covers detection, fail-closed
+paths, the gate truth table and generated job shape.
+
+The web shell supplies pnpm 12.7.0, Node 24.20, Bun 1.4.2 and Buck2 from the pinned
+effect-utils input; the Rust shells are unchanged. An empty `.buckroot` marks the Buck
+root; Genie generates `.buckconfig`, root `BUCK` and `buck2/toolchains/BUCK` from `buck2/root.ts`,
+mirroring `effect-utils.lib.mkConsumerBuckRoot` with cell `smalltalk`. Remote caching
+and uploads are disabled, with no remote endpoints. The shell links `rules` and
+`capabilities` cells into ignored `.buck2/`; CI fails if checked-in root files drift
+from the Nix rendering. `buck2/dependencies/BUCK` and its SHA-256 sidecar project the
+client and views importers from `pnpm-lock.yaml`; package `BUCK` files come from
+`buck2/typescript-package.ts`. The root typecheck runs tsgo over the client's two
+tsconfig projects and the views. Dependency archives are fetched from
+`registry.npmjs.org` at build time; nothing is uploaded.
 
 ### macOS
 
@@ -445,6 +501,15 @@ with its own `/tmp`, and nothing the job started outlives it. The runner names a
 cache, use that Cargo home, and Cargo keeps its intermediate build files in a per-runner build
 directory, while sccache shares compiled crates between all runners and the Nix store is the
 machine's own. The machine's configuration lives in the private network repository.
+In GitHub Actions, both Rust dev shells use `scripts/ci-rustc-wrapper`: sccache's response-I/O
+fallback is enabled. A separate read-only `sccache --dist-status` preflight is bounded
+to 15 seconds (five seconds to finish terminating it). A recognized preflight startup
+error or timeout disables caching for the rest of that job with a warning, before any
+compiler request is submitted. Signal statuses are preserved. Once compilation starts,
+the wrapper executes sccache directly and never retries based on its stderr; the actual
+cache/compiler result is authoritative, and cache statistics are optional.
+The boundary guard's dependency-free synthetic workspace uses
+a fresh Cargo home and no compiler wrappers, stays offline, and prints Cargo stderr on failure.
 Cargo builds use the host's four-job limit. Workspace test shards explicitly use eight test
 threads, with the host's 14 GiB per-job memory limit. The repository variable `CI1_MIN_IDLE`
 can override admission; keep it at four when preserving CPU capacity for reserved lanes.
@@ -696,7 +761,7 @@ queue it again. The merge train (`st lanes join smalltalk`) is retired.
 The ruleset (`.github/repo-settings.json`, generated from `repo-settings.json.genie.ts`, applied
 by an administrator and never by CI) requires the five checks from GitHub Actions with an empty
 bypass list, keeps the pull-request, deletion and force-push protections, and configures the queue:
-merge method MERGE, up to five entries build at once (see [Measured concurrency](#measured-concurrency)),
+merge method MERGE, a proposed three entries build at once (see [Merge overflow and daily Namespace minutes](#merge-overflow-and-daily-namespace-minutes)),
 up to five merge together, and a check that
 never reports fails its entry after 60 minutes. Repository settings enable native auto-merge and
 branch deletion after merge. Check the live settings against the file with `gh-check-settings`:
@@ -729,7 +794,7 @@ The TypeScript client job follows generator freshness and reuses its runner slot
 PR runs also start `perf-cost`, taking their initial peak to 56 vCPUs and 112 GiB. Main upkeep
 runs that check separately; its cache-fill jobs normally finish after their lookup-only probes.
 Five complete merge-queue groups need 240 vCPUs and 480 GiB, within the Linux pool limit;
-`max_entries_to_build` remains 5 in both the generated and live main rulesets.
+`max_entries_to_build` was 5 at this historical measurement; current capacity policy appears in [Merge overflow and daily Namespace minutes](#merge-overflow-and-daily-namespace-minutes).
 PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
 are available. The `linux-gate` aggregate starts after the four stage jobs finish, so it does
 not add to the initial peak. macOS uses its own pool.
@@ -801,4 +866,107 @@ even on failure. Inspect each stage's log and timing, the selected suite and che
 A passing retry is a flaky outcome in the nextest log. A queued Namespace job with no runner
 is infrastructure readiness, not a successful check; the merge queue keeps the entry waiting.
 
-During an outage, `CI_OUTAGE_FAST_QUEUE=on` skips optional Nix-cache saves and same-source build-snapshot publication on merge-group runs. Required checks, cache restores, the producer test archive, logs, cache coverage and PR/main cache publication continue. Set the variable back to `off` when Speed ends the outage; an unset variable also preserves normal publication. The temporary ruleset build concurrency is six; restore its prior value of two at outage end without changing the other ruleset fields.
+During an outage, `CI_OUTAGE_FAST_QUEUE=on` skips optional Nix-cache saves and same-source build-snapshot publication on merge-group runs. Required checks, cache restores, the producer test archive, logs, cache coverage and PR/main cache publication continue. Set the variable back to `off` when Speed ends the outage; an unset variable also preserves normal publication. The earlier six-build incident guidance and automatic restore-to-two instruction are superseded by CI-speed-owned capacity tuning. The current source proposes three with Namespace overflow; the initial live trial returned to two after a measured PR wait exceeded five minutes. Preserve all other live ruleset fields when changing admission.
+
+## Merge overflow and daily Namespace minutes
+
+CI-speed owns live CI variables and queue capacity. Start with `max_entries_to_build=3`,
+merge sizes 1–5 and a five-minute batch wait; live HEADGREEN remains the incident's
+existing strategy. The generated ruleset's normal ALLGREEN strategy is unchanged.
+Change only the build-count field when tuning the live ruleset. This is capacity
+configuration, not proof of CI p90 <20 minutes, runner wait <5 minutes or queue-to-merge
+p90 <45 minutes.
+
+With `CI_MERGE_CI1` unset/off, the picker admits an entire group to `ci1-merge`
+only when five distinct online idle merge workers are available and, after borrowing
+mixed workers, two general workers remain for PRs. Priority-only workers are excluded.
+Otherwise all group workload jobs use Namespace. Admission is a snapshot, not an
+atomic reservation across simultaneous pickers. Missing/invalid status also overflows.
+`CI_MERGE_CI1=on` retains the explicit forced-local switch for supported incidents.
+PR/fork/priority routing is unchanged. No job is migrated after it starts.
+
+`CI_MERGE_NAMESPACE_PROFILE` may name an existing, verified Linux profile; unset
+uses the existing 8x16 stage labels and Linux profile for supporting jobs, including
+KVM. Profile controls and run affinity remain inline. The initial live choice is
+unset: the shared `linux-x86-64` profile historically limited parallel runners, so
+funnelling all large stages into it can queue them despite workspace headroom.
+Three groups can request roughly 144–168 vCPU / 288–336 GiB during overlap on
+Namespace, below the held 320-vCPU / 640-GiB workspace limit, with capacity shared
+by PRs and other work. Actual starts/waits decide later tuning, not those upper
+bounds alone. A dedicated capped profile requires an actual administrator receipt;
+this PR does not claim one was provisioned.
+
+`Namespace usage` runs at 03:05 UTC on GitHub-hosted capacity and reports the previous
+UTC day's observed Namespace job execution minutes, split by event (merge_group,
+pull_request and other events). Cos can read the job summary and its 30-day JSON
+artifact for the morning cost check. The report has a 120-minute timeout, but request
+count is bounded separately: at most 4,000 GitHub API requests. It reuses the existing
+`CI1_RUNNERS_READ_TOKEN` from the main-only picker, without a new secret. Standard
+PAT/installation tokens have a 5,000-request hourly primary limit; the 1,000/hour
+job-token fallback cannot cover this repository's measured volume. The reporter
+checks actual response rate-limit headers, refuses a limit below its budget, and
+records the observed limit, lowest remaining count and actual requests in JSON.
+The collector stops at 500 remaining requests to reserve shared quota for runner
+admission. Shared credential use can still exhaust available quota and must remain visible.
+`python3 scripts/ci-namespace-usage --date YYYY-MM-DD --output usage.json` also
+provides an on-demand report. It queries eight UTC creation days: the reporting
+day and seven prior days, so reruns of older runs are outside coverage. Each day
+is queried separately, recursively splitting saturated time ranges until each
+query is below GitHub's 1,000-result cap. A saturated one-second interval or
+changing search that reaches the cap while paging refuses completeness. Within this window it queries all attempts, includes
+failed/cancelled execution, deduplicates job IDs and clips executions across midnight.
+Every day total is explicitly a **daily lower bound**, never a complete-day or
+invoice total. “Complete window evidence” means only that this creation window
+was collected without known evidence gaps; it does not cover older-run reruns.
+The job identity must be an actual `nsc-runner-*`, rather than just a planned
+Namespace label. Queued/skipped jobs and queue cancellations with no runner or
+started step add no execution minutes. A started step with missing/ambiguous
+Namespace runner identity, or an actual Namespace runner with missing timestamps,
+makes summary/JSON totals explicitly partial and fails the report. Known local
+and GitHub-hosted execution stays excluded. API errors, exhausted request budgets
+or pagination limits retain collected JSON as partial lower-bound evidence before
+failing, rather than declaring zero usage. Pagination is not an atomic history snapshot.
+Totals are operational execution minutes, not invoice dollars or billable unit
+minutes: provisioning before the first job step and deleted GitHub history are
+outside this method. Use Namespace's billing view for an invoice; the report
+preserves raw job IDs/timestamps for reconciliation.
+
+Intake's read-only day counts for October 2–8 were 949, 1,222, 1,227, 1,437,
+1,126, 1,761 and 1,699 runs. The last day alone requires at least 1,699 jobs
+requests plus run-list pages; this invalidated the earlier 800-request/job-token
+design. The bounded 4,000-call design and earlier schedule allow this scale, but
+actual call count, credential capability and natural completion remain execution
+evidence, not a guaranteed bound on future repository volume.
+The initial historical collector ended naturally after 37m05s, scanning 14,135
+retained run records and 1,761 relevant runs. That requires at least 1,903 API
+calls (142 run-list pages plus at least one jobs page per relevant run); its exact
+request count was not instrumented. Its older identity gap makes its 38,979.28
+observed job minutes a lower bound, not current collector qualification. The new
+collector records exact request/rate evidence for its own natural outcome.
+
+The reporter makes only read-only GET requests to Actions run/job endpoints. The
+existing secret must permit those reads in addition to the picker's organization
+runner-list access; workflow job-token permissions do not restrict a PAT's actual
+scopes. Source alone cannot confirm the installed secret's scope or capability.
+A missing permission returns partial evidence rather than a complete total.
+See GitHub's [workflow-run search limits](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-repository)
+and [REST rate limits](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api).
+Each response must have fresh valid limit and remaining headers; earlier values
+never substitute for missing current quota evidence.
+
+One pinned corrected local-auth report ended naturally with exit 1 after 207.77s:
+234 attempted API calls, observed limit 5,000, minimum remaining 499, and the
+explicit reserve-reached error. It retained 4,836.67 observed minutes as partial
+window evidence. This confirms the quota-reserve behavior with local authentication,
+not the scheduled credential, full window, or a successful daily total. No automatic
+retry follows quota exhaustion.
+
+Test archive transfer verifies the complete ZIP before exposing consumer inputs. The four
+archive consumers download only the successful producer artifact ID, verify its API size
+and SHA256, verify the producer-output manifest hash and all five ZIP members, then
+publish a fresh private directory atomically. A failed or incomplete transfer gets at most
+one repeat download of that same ID (each ZIP request has a 10-minute limit); interrupted
+requests retain their signal status. No compiler or test is retried. Source, run, successful
+producer attempt, toolchain and individual file hashes are still checked before extraction.
+The job logs the ZIP size/digest and transfer attempt. This protects the transfer boundary;
+it does not establish the cause of earlier digest mismatches or a measured speedup.

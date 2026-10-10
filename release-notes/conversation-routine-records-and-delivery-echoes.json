@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A conversation no longer shows routine status, usage and sensitive-content withheld lines, or the harness's raw channel and background-task markup after a message entry; the repeated channel error folds to one counted line",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, stored data or transcript change. The records stay in the normalized timeline; only the default reading hides them."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Published schema, operations and contract digest are unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "stui and st conversations timeline hide queued, running, waiting and completed status records, usage records and sensitive-content redaction records by default, through a new Telemetry display filter. Failed, cancelled and unknown status, other withholding reasons, errors and the transcript notice are still shown, and showing everything (no filters) still returns every entry. The shared expected-output contract gains a noise fixture; the Swift and TypeScript renderers are not changed and keep showing these records until they adopt the same filter."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; no data conversion or extra startup work."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, durable payload or initialization changes."
+  }
+}

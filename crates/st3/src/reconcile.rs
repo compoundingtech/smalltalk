@@ -36,6 +36,7 @@ use crate::store::Store;
 mod channel_recovery;
 mod placement;
 mod run_report;
+mod start_spacing;
 
 /// The actor of every attention request the reconciler raises.
 const RECONCILER_ACTOR: &str = "agent/st3/reconciler";
@@ -751,6 +752,9 @@ fn first_readiness_since(run: &MissionRunView) -> u128 {
 type MemberWake = (DesiredSubject, String, MemberSpec);
 #[cfg(test)]
 type WorkWakeObserveHook = Box<dyn FnOnce(&crate::incremental::Incremental, bool) + Send>;
+#[cfg(test)]
+type BackgroundEntryHook =
+    Arc<dyn Fn(bool, Option<tokio::time::Instant>, smallclaims::sqlite::work::SqliteWork) + Send + Sync>;
 
 pub struct Reconciler<R = NativeRuntime> {
     store: Arc<Store>,
@@ -765,6 +769,11 @@ pub struct Reconciler<R = NativeRuntime> {
     runtime_environment: BTreeMap<String, String>,
     notify: Arc<Notify>,
     event_notify: watch::Sender<u64>,
+    start_spacing: start_spacing::StartSpacing,
+    #[cfg(test)]
+    background_dispatch_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    background_entry_hook: Option<BackgroundEntryHook>,
     armed_schedules: Arc<Mutex<std::collections::HashSet<String>>>,
     schedule_peers: Vec<String>,
     /// The request and deadline of a failed workspace attempt, by schedule. Local retry state
@@ -919,6 +928,11 @@ impl Reconciler<NativeRuntime> {
             ]),
             notify,
             event_notify,
+            start_spacing: Default::default(),
+            #[cfg(test)]
+            background_dispatch_hook: Default::default(),
+            #[cfg(test)]
+            background_entry_hook: None,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_peers: Vec::new(),
             schedule_workspace_retries: Mutex::new(HashMap::new()),
@@ -989,6 +1003,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             runtime_environment: BTreeMap::new(),
             notify,
             event_notify: watch::channel(0_u64).0,
+            start_spacing: Default::default(),
+            #[cfg(test)]
+            background_dispatch_hook: Default::default(),
+            #[cfg(test)]
+            background_entry_hook: None,
             armed_schedules: Arc::new(Mutex::new(std::collections::HashSet::new())),
             schedule_peers: Vec::new(),
             schedule_workspace_retries: Mutex::new(HashMap::new()),
@@ -1192,6 +1211,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         self
     }
 
+    pub fn set_max_passes_per_minute(&self, value: u32) -> Result<()> {
+        self.start_spacing.set(value)
+    }
+
     pub async fn run(self: Arc<Self>) {
         self.notify.notify_one();
         // When the last pass began, and whether it changed nothing.
@@ -1230,15 +1253,30 @@ impl<R: RuntimeControl> Reconciler<R> {
                 trigger
             };
             for pass in 0..64 {
-                let started = now_ms();
                 let check_recovery = may_have_failed;
                 let pass_trigger = if pass == 0 {
                     trigger
                 } else {
                     "trigger/changed-repeat"
                 };
-                let (changed, failed) = self
-                    .blocking(move |this| {
+                let (changed, failed, started) = loop {
+                    self.start_spacing.wait().await;
+                    let queued = start_spacing::QueuedAdmission::default();
+                    let active = queued.0.clone();
+                    #[cfg(test)]
+                    if let Some(hook) = self.background_dispatch_hook.lock().unwrap().take() {
+                        hook();
+                    }
+                    let outcome = self.blocking(move |this| {
+                        #[cfg(test)]
+                        let admission_work = smallclaims::sqlite::work::SqliteWorkScope::start();
+                        let admitted = this.start_spacing.try_start_if(&active);
+                        #[cfg(test)]
+                        if let Some(hook) = &this.background_entry_hook {
+                            hook(admitted, this.start_spacing.last_start(), admission_work.finish());
+                        }
+                        if !admitted { return None; }
+                        let started = now_ms();
                         let before = this.store.index().ok();
                         let failed = match crate::profile::task("task reconcile-pass", || {
                             let _trigger_span = crate::profile::span(pass_trigger);
@@ -1267,9 +1305,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 false
                             }
                         };
-                        (before != this.store.index().ok(), failed)
-                    })
-                    .await;
+                        Some((before != this.store.index().ok(), failed, started))
+                    }).await;
+                    if let Some(outcome) = outcome { break outcome; }
+                };
                 may_have_failed = failed;
                 self.event_notify
                     .send_modify(|generation| *generation = generation.saturating_add(1));
@@ -5285,6 +5324,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         launch_member
             .environment
             .remove(crate::suspension::CONTINUE_PATH_ENV);
+        let selector_scope = crate::native_resume::selection_scope(member);
+        launch_member.environment.remove(crate::suspension::SELECTOR_SCOPE_ENV);
+        if let Some(scope) = &selector_scope {
+            launch_member.environment.insert(crate::suspension::SELECTOR_SCOPE_ENV.into(), scope.clone());
+        }
         let continued = if subject.kind == "agent"
             && !member
                 .environment
@@ -5296,6 +5340,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 &subject.subject,
                 harness,
                 launch_member.environment.get("ST3_ACCOUNT").map(String::as_str),
+                selector_scope.as_deref(),
             )?
         } else {
             None
@@ -7018,8 +7063,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 .map(|report| self.report_run(&run, &report, now_ms()))
                                 .transpose()
                         }) {
-                            Ok(stalls_at) => {
-                                due = [due, stalls_at.flatten()].into_iter().flatten().min();
+                            Ok(None) => {
+                                // A run whose reporter was cleared has nobody left to fail.
+                                if let Err(error) = self.close_fault(
+                                    &run.subject,
+                                    run_report::REPORT_FAULT_SCOPE,
+                                    "the run reports to nobody",
+                                ) {
+                                    eprintln!("st3: run report for {}: {error:#}", run.subject);
+                                }
+                            }
+                            Ok(Some(stalls_at)) => {
+                                due = [due, stalls_at].into_iter().flatten().min();
                             }
                             Err(error) => {
                                 if let Err(error) = self.record_fault(
@@ -15879,6 +15934,7 @@ mod tests {
     mod revision_seat_tests;
     mod rollout_tests;
     mod run_report_tests;
+    mod start_spacing_loop;
     #[test]
     fn native_exec_and_gate_shell_resolve_the_declared_path() {
         use super::{NativeRuntime, RuntimeControl};
@@ -16047,6 +16103,7 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
     #[derive(Default)]
     struct FakeRuntime {
         snapshot_error: Mutex<bool>,
+        before_snapshot: Mutex<Option<Box<dyn Fn() + Send>>>,
         before_observe_exec: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         ptys: Mutex<Vec<RuntimeObservation>>,
         execs: Mutex<HashMap<String, RuntimeObservation>>,
@@ -16108,6 +16165,9 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
 
     impl RuntimeControl for FakeRuntime {
         fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
+            if let Some(before) = self.before_snapshot.lock().unwrap().as_ref() {
+                before();
+            }
             if *self.snapshot_error.lock().unwrap() {
                 anyhow::bail!("the PTY snapshot is unavailable")
             }
@@ -16421,6 +16481,25 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             assert_eq!(reason(&store), reason(&replica));
             replica.import_replication("node", &batch).unwrap();
             assert_eq!(reason(&store), reason(&replica));
+            // Compare the dormant predicate with the independent Store oracle only in
+            // its narrower domain. These are supplied fixture facts, not an extractor
+            // or certification of runtime selection/dispatch coverage.
+            if restart == "never" && exit_code.is_some() {
+                let mut facts = crate::store::terminal_gate_evidence::tests::facts();
+                facts["gate"]["subject"] = serde_json::json!("exec/orchid/probe");
+                facts["gate"]["expected"] = serde_json::json!(expected);
+                facts["desired"]["subject"] = serde_json::json!("exec/orchid/probe");
+                facts["observed"]["status"] = serde_json::json!(status);
+                facts["observed"]["exit_code"] = serde_json::json!(exit_code);
+                let encoded = Value::String(facts.to_string());
+                assert_eq!(
+                    crate::store::terminal_gate_evidence::witness(&encoded)
+                        .unwrap()
+                        .into_witness(),
+                    reason(&store),
+                    "dormant predicate differs from selected-launch oracle"
+                );
+            }
             if let GateOutcome::Fail(reason) = outcome {
                 assert!(reason.contains("exec/orchid/probe"), "{reason}");
                 assert!(
@@ -24966,6 +25045,9 @@ mission "orchid/timeout" state="ready" timeout="1ms" {
             "node".into(),
             notify.clone(),
         ));
+        // This oracle checks convergence/lifecycle, at the fastest supported configured cap.
+        // Default30 start spacing is independently covered by deterministic gate controls.
+        reconciler.set_max_passes_per_minute(600).unwrap();
         let task = tokio::spawn(reconciler.run());
 
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -25062,6 +25144,9 @@ mission "orchid/timeout" state="ready" timeout="1ms" {
             "node".into(),
             notify.clone(),
         ));
+        // This oracle checks convergence/lifecycle, at the fastest supported configured cap.
+        // Default30 start spacing is independently covered by deterministic gate controls.
+        reconciler.set_max_passes_per_minute(600).unwrap();
         let task = tokio::spawn(reconciler.run());
 
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -25389,6 +25474,8 @@ mission "absent-stop" state="ready" {
             "node".into(),
             Arc::new(Notify::new()),
         ));
+        // Retain this deadline/convergence oracle and budget at a supported raised cap.
+        reconciler.set_max_passes_per_minute(600).unwrap();
         let task = tokio::spawn(reconciler.run());
 
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -26719,6 +26806,28 @@ mission "waiting" state="ready" {
                 "{person:?}"
             );
         }
+
+        // Each is an alert in the conversation of the agent behind it: the gate in the builder's
+        // whose work it reviews, the mission's person step in the run's requester's.
+        let conversations = store
+            .attention_items(Some("person/alex"))
+            .unwrap()
+            .into_iter()
+            .map(|item| (item.kind.clone(), (item.is_alert(), item.conversation)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            conversations,
+            BTreeMap::from([
+                (
+                    "human-gate".to_owned(),
+                    (true, Some("agent/node.builder".to_owned()))
+                ),
+                (
+                    "person-step".to_owned(),
+                    (true, Some("agent/node.lead".to_owned()))
+                ),
+            ])
+        );
 
         // Each owner heard about its fault once, however many passes ran.
         let faults_for = |agent: &str| {

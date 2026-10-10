@@ -7,7 +7,7 @@
     },
     "st-drivers": {
       "clippy::cloned_ref_to_slice_refs": 1,
-      "clippy::collapsible_if": 7,
+      "clippy::collapsible_if": 5,
       "clippy::items_after_test_module": 2,
       "clippy::needless_borrow": 2,
       "clippy::too_many_arguments": 12,
@@ -20,7 +20,7 @@
     },
     "st3": {
       "clippy::cloned_ref_to_slice_refs": 5,
-      "clippy::collapsible_if": 25,
+      "clippy::collapsible_if": 24,
       "clippy::collapsible_match": 1,
       "clippy::derivable_impls": 1,
       "clippy::double_ended_iterator_last": 1,

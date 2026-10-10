@@ -42,9 +42,10 @@ use crate::model::{
     LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendReceipt,
     MessageSendRequest, MessageView, MissionOutputView, MissionProductionRequest, MissionRequest,
     MissionResponse, MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest,
-    MissionRunRequest, MissionRunView, OperationalRepairApplyRequest, OperationalRepairPlan,
-    OperationalRepairResult, PlannerSpec, PlanningApprovalRequest, PlanningCancelRequest,
-    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningRevisionRequest,
+    MissionRunReportRequest, MissionRunReportView, MissionRunRequest, MissionRunView,
+    OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult, PlannerSpec,
+    PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
+    PlanningProposalRequest, PlanningRevisionRequest,
     PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest, QuickAgentResponse,
     ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse, ReplicationHealAnswer,
     ReplicationHealAnswerRequest, ReplicationHealNextRequest, ReplicationHealStep,
@@ -59,6 +60,8 @@ use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
+#[cfg(test)]
+mod terminal_gate_evidence;
 mod client_adapters;
 mod client_presence;
 mod client_v0;
@@ -464,6 +467,7 @@ impl IntoResponse for ApiError {
 }
 
 pub fn router(state: AppState) -> Router {
+    crate::relay_trace::init();
     delivery_presence::start();
     router_for_transport(state, ClientTransportBoundary::Unix)
 }
@@ -534,6 +538,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/devices", get(client_v0::devices))
         .route("/v1/client/attention", get(client_attention))
         .route("/v1/client/attention/{*id}", get(client_attention_detail))
+        // The same rows under the name a person reads.
+        .route("/v1/client/alerts", get(client_attention))
+        .route("/v1/client/alerts/{*id}", get(client_attention_detail))
         .route("/v1/client/messages", get(client_messages))
         .route("/v1/client/messages/{*id}", get(client_messages_detail))
         .route("/v1/client/launches", get(client_launches))
@@ -835,6 +842,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
         .route("/v1/mission-runs", get(list_mission_runs))
+        .route("/v1/mission-runs/tree", get(list_mission_run_tree))
         .route("/v1/mission-overview", get(mission_overview))
         .route("/v1/outcome-history", get(outcome_history))
         .route("/v1/performance", get(performance_report))
@@ -850,6 +858,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route(
             "/v1/mission-runs/{run}/outcome",
             post(set_mission_run_outcome),
+        )
+        .route(
+            "/v1/mission-runs/{run}/report-to",
+            post(set_mission_run_report),
         )
         .route("/v1/mission-runs/{run}", get(get_mission_run))
         .route("/v1/run-generations/{generation}", get(get_run_generation))
@@ -955,6 +967,7 @@ async fn response_envelope_unbounded(
     let started = Instant::now();
     let request_method = request.method().clone();
     let request_path = request.uri().path().to_owned();
+    let request_query = request.uri().query().map(str::to_owned);
     let request_route = request
         .extensions()
         .get::<axum::extract::MatchedPath>()
@@ -970,6 +983,15 @@ async fn response_envelope_unbounded(
         Some(caller.clone()),
     );
     let client_request = request.uri().path().starts_with("/v1/client/");
+    // These point readers admit snapshot metadata inside their pinned read before
+    // formatting it. Authentication still runs here; their response extension
+    // supplies the envelope snapshot. All other routes keep admission snapshots.
+    let defer_detail_snapshot = (request_method == axum::http::Method::GET
+        || request_method == axum::http::Method::HEAD)
+        && matches!(
+            request_route.as_str(),
+            "/v1/client/observers/{*id}" | "/v1/client/subscriptions/{*id}"
+        );
     let fabric_boundary_error = (matches!(transport, ClientTransportBoundary::FabricLoopback)
         && !client_request
         && request.uri().path() != "/v1/health")
@@ -1003,20 +1025,31 @@ async fn response_envelope_unbounded(
         let transport = transport.as_str();
         let auth_profile = profile.clone();
         let admission_queue = profile.as_ref().map(|op| op.wall_span("admission/queue"));
+        let mut diagnostic_queue =
+            crate::relay_trace::span(crate::relay_trace::Phase::AdmissionQueue);
         let admitted = crate::api::read_deadline::spawn_blocking(move || {
+            diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
             drop(admission_queue);
             let _entered = crate::profile::enter(auth_profile.as_ref());
             let authentication_span = crate::profile::span("admission/authenticate");
-            let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
+            let authentication =
+                crate::relay_trace::result(crate::relay_trace::Phase::Authenticate, || {
+                    client_v0::authenticate(&auth_state, &auth_request, transport)
+                });
             drop(authentication_span);
-            let snapshot_span = crate::profile::span("admission/snapshot");
-            let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
-            drop(snapshot_span);
+            let snapshot = (!defer_detail_snapshot).then(|| {
+                let snapshot_span = crate::profile::span("admission/snapshot");
+                let snapshot = crate::relay_trace::work(crate::relay_trace::Phase::Snapshot, || {
+                    client_request_snapshot(&auth_state, cursor_snapshot.flatten())
+                });
+                drop(snapshot_span);
+                snapshot
+            });
             (authentication, snapshot)
         })
         .await;
         match admitted {
-            Ok((authentication, snapshot)) => (authentication.map(Some), Some(snapshot)),
+            Ok((authentication, snapshot)) => (authentication.map(Some), snapshot),
             Err(error) => (Err(ApiError::internal(error)), None),
         }
     } else {
@@ -1043,15 +1076,20 @@ async fn response_envelope_unbounded(
             let cpu_kind = request_route.clone();
             let cpu_client = caller.clone();
             let handler_queue = profile.as_ref().map(|op| op.wall_span("handler/queue"));
+            let mut diagnostic_queue =
+                crate::relay_trace::span(crate::relay_trace::Phase::HandlerQueue);
             let forwarded_handler = request_path == crate::peer::CLIENT_READ_FORWARD_PATH;
             match crate::api::read_deadline::spawn_handler(move || {
+                diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
                 drop(handler_queue);
                 if let Some(profile) = &handler_profile {
                     profile.queued();
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
                 crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
-                    runtime.block_on(crate::api::read_deadline::handler(async move {
+                    let mut diagnostic_handler =
+                        crate::relay_trace::span(crate::relay_trace::Phase::Handler);
+                    let response = runtime.block_on(crate::api::read_deadline::handler(async move {
                         // Cancel the actual forwarded relay, not only its outer waiter.
                         // Other routes retain their existing cooperative cancellation;
                         // this transport's mutation variants carry no read budget.
@@ -1068,7 +1106,13 @@ async fn response_envelope_unbounded(
                         } else {
                             next.run(request).await
                         }
-                    }))
+                    }));
+                    diagnostic_handler.finish(if response.status().is_success() {
+                        crate::relay_trace::Outcome::Completed
+                    } else {
+                        crate::relay_trace::Outcome::Failed
+                    });
+                    response
                 })
             })
             .await
@@ -1089,6 +1133,7 @@ async fn response_envelope_unbounded(
             &request_method,
             &request_route,
             &request_path,
+            request_query.as_deref(),
             &caller,
             started,
         );
@@ -1098,6 +1143,7 @@ async fn response_envelope_unbounded(
         return response;
     }
     let enveloping = Instant::now();
+    let mut diagnostic_envelope = crate::relay_trace::span(crate::relay_trace::Phase::Envelope);
     let status = response.status();
     let (mut parts, body) = response.into_parts();
     // A page read inside one SQLite snapshot names that snapshot, which can be newer than the
@@ -1129,10 +1175,16 @@ async fn response_envelope_unbounded(
         state.store.index().unwrap_or_default()
     };
     let request_id = if client_request {
-        format!("request/{}", new_request_id())
+        crate::relay_trace::current().map_or_else(
+            || format!("request/{}", new_request_id()),
+            |trace| trace.id().to_owned(),
+        )
     } else {
         new_request_id()
     };
+    if let Some(trace) = crate::relay_trace::current() {
+        trace.response(&request_id);
+    }
     let envelope = if client_request && status.is_success() {
         json!({
             "api_version": CLIENT_API_VERSION,
@@ -1162,11 +1214,17 @@ async fn response_envelope_unbounded(
         })
     };
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
+    diagnostic_envelope.finish(if status.is_success() {
+        crate::relay_trace::Outcome::Completed
+    } else {
+        crate::relay_trace::Outcome::Failed
+    });
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     record_request_latency(
         &request_method,
         &request_route,
         &request_path,
+        request_query.as_deref(),
         &caller,
         started,
     );
@@ -1191,6 +1249,7 @@ fn record_request_latency(
     method: &axum::http::Method,
     route: &str,
     path: &str,
+    query: Option<&str>,
     caller: &str,
     started: Instant,
 ) {
@@ -1199,7 +1258,7 @@ fn record_request_latency(
     request_latency()
         .lock()
         .unwrap()
-        .record(method, route, path, elapsed);
+        .record(method, route, path, query, elapsed);
     if elapsed < Duration::from_secs(1) {
         return;
     }
@@ -1209,7 +1268,7 @@ fn record_request_latency(
     eprintln!("st3: slow request {path} took {} ms", elapsed.as_millis());
 }
 
-fn new_request_id() -> String {
+pub(crate) fn new_request_id() -> String {
     let mut bytes = [0_u8; 16];
     if getrandom::fill(&mut bytes).is_err() {
         let fallback = format!(
@@ -1272,12 +1331,21 @@ fn client_request_snapshot(
 }
 
 fn client_snapshot_at(state: &AppState, store_index: u64) -> ClientSnapshot {
-    let created_at = client_timestamp(
+    #[cfg(test)]
+    client_v0::observer_subscription_detail_tests::note_snapshot_construction(state);
+    client_snapshot_with_time(
+        state,
+        store_index,
         state
             .store
             .projection_time_at(store_index)
             .unwrap_or_default(),
-    );
+    )
+}
+
+/// The snapshot at `store_index` when its acceptance time (`projection_time_at`) is already known.
+fn client_snapshot_with_time(state: &AppState, store_index: u64, unix_ms: u128) -> ClientSnapshot {
+    let created_at = client_timestamp(unix_ms);
     let fingerprint = hex::encode(Sha256::digest(
         format!(
             "{CLIENT_PROJECTION_VERSION}:{}:{store_index}:{created_at}",
@@ -1372,6 +1440,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "invalid-subject-reference"
         | "stale-fence"
         | "timeline-history-incomplete"
+        | "projection-detail-too-large"
+        | "projection-detail-invalid-source"
         | "cursor-gap"
         | "page-cursor-expired"
         | "rate-limited"
@@ -2281,7 +2351,7 @@ fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> 
         let declaration = desired.get(&id);
         let name = crate::model::effective_agent_name(&id, declaration.map(|d| &d.desired));
         let queue = queues.get(&id).cloned().unwrap_or_default();
-        json!({
+        let mut reference = json!({
             "id":id, "name":name,
             "host_id":declaration.and_then(|d| d.member.as_ref()).map(|m| client_host_id(&m.host)),
             "current_work_ids":queue.current_work_ids, "active_work_count":queue.active_work_count,
@@ -2290,7 +2360,11 @@ fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> 
             "current_work":queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
             "next_work":queue.next_work_id.as_ref().and_then(label),
             "upcoming_work":queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
-        })
+        });
+        if let Some(lifecycle) = crate::model::declared_agent_lifecycle(declaration.map(|d| &d.desired)) {
+            reference["lifecycle"] = json!(lifecycle);
+        }
+        reference
     }).collect::<Vec<_>>();
     refs.sort_by(|a, b| {
         a["name"]
@@ -2881,6 +2955,9 @@ fn client_agent_resources_from_status(
                     None
                 },
             });
+            if let Some(lifecycle) = crate::model::declared_agent_lifecycle(subject.desired.as_ref()) {
+                value["lifecycle"] = json!(lifecycle);
+            }
             if let Some((_, previous)) = changed.filter(|_| retain_queues)
                 && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
                 for field in AGENT_QUEUE_FIELDS {
@@ -3289,6 +3366,8 @@ pub(crate) fn client_attention_resources_at(
     let mut resources = Vec::new();
     for item in current {
         let id = client_attention_id(&item.subject, &item.person, &item.episode)?;
+        let alert = item.is_alert();
+        let conversations = item.conversations();
         let mut resource = json!({
             "id": id, "kind": "attention", "attention_kind": item.kind,
             "source_id": item.subject, "source_kind": item.kind, "episode": item.episode,
@@ -3297,9 +3376,14 @@ pub(crate) fn client_attention_resources_at(
             "title": item.title, "detail": item.detail, "priority": item.priority,
             "state": "open", "requested_at": client_timestamp(item.requested_at_unix_ms),
             "targets": item.targets, "actions": client_attention_actions(&item.kind, item.review_mode.as_deref()),
-            "operational": {"layer": "current", "actionable": true, "reasons": []}
+            "operational": {"layer": "current", "actionable": true, "reasons": []},
+            "alert": alert,
         });
+        if !conversations.is_empty() {
+            resource["conversation_ids"] = json!(conversations);
+        }
         for (name, value) in [
+            ("conversation_id", item.conversation),
             ("requester_id", item.requester_id),
             ("launch_id", item.launch_id),
             ("variant_id", item.variant_id),
@@ -4544,8 +4628,10 @@ fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
 }
 
 /// For a read that asked to see what was written before it: wait, briefly, for the refresher
-/// to publish a roster at or after the current cut. The read itself folds nothing.
-async fn wait_for_agent_roster(store: &Store, history: bool) {
+/// to publish a roster at or after the current cut, unless no claim since the newest
+/// publication changes a card, so that a refresh would fold nothing. The read itself folds
+/// nothing.
+async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) {
     let Ok(wanted) = store.index() else { return };
     let published = |store: &Store| {
         let index = store.index().ok()?;
@@ -4557,11 +4643,15 @@ async fn wait_for_agent_roster(store: &Store, history: bool) {
     let mut publications = store.subscribe_agent_roster();
     let _ = tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
         while published(store).is_none_or(|cut| cut < wanted) {
-            if history {
-                store.request_agent_roster_history();
-            } else {
-                store.request_agent_roster_refresh();
+            // Claims on unrelated subjects move the cut all the time; the paced refresher
+            // would publish the same cards. One bounded range read tells.
+            let reader = Arc::clone(store);
+            if let Ok(true) = blocking_store(move || {
+                reader.published_agent_roster_unchanged_through(wanted, history)
+            }).await {
+                return;
             }
+            store.request_fresh_agent_roster(history);
             if publications.changed().await.is_err() {
                 return;
             }
@@ -4800,10 +4890,14 @@ async fn client_sessions_detail(
 ) -> Result<Json<Value>, ApiError> {
     if let Some(id) = id.strip_suffix("/timeline") {
         // An agent's timeline is its current session's: st resolves it, not the client.
-        let session_id = client_v0::conversation_session_id(&state, id)?;
+        let session_id = crate::relay_trace::result(crate::relay_trace::Phase::Session, || {
+            client_v0::conversation_session_id(&state, id)
+        })?;
         let id = session_id.as_str();
-        let managed = managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
-            .map_err(ApiError::internal)?;
+        let managed = crate::relay_trace::result(crate::relay_trace::Phase::Owner, || {
+            managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
+        })
+        .map_err(ApiError::internal)?;
         if let Some((_, _, origin)) = managed {
             let remote_host = origin
                 .as_deref()
@@ -5677,10 +5771,15 @@ pub fn start_native_session_discovery(state: &AppState) {
 /// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
 /// so refreshing never takes more than about half a core however often readers ask. Reads
 /// never wait for it: this bounds how stale a served roster can be, about a second plus a fold.
+/// A read waiting for a fresh roster cuts it short to the refresh's own length.
 const AGENT_ROSTER_REFRESH_PAUSE: Duration = Duration::from_secs(1);
 
+/// The shortest pause a read waiting for a fresh roster can cut the refresher's pause to, so
+/// that a very cheap fold cannot turn fresh reads into many refreshes a second.
+const AGENT_ROSTER_FRESH_PAUSE: Duration = Duration::from_millis(100);
+
 /// How long a read asking for a fresh roster waits for one at or after its own cut: long enough
-/// for the refresher's pause and one fold.
+/// for the refresher to finish a fold, pause as long, and fold again.
 const AGENT_ROSTER_READ_WAIT: Duration = Duration::from_secs(2);
 
 /// Keep the complete agents roster published off the request path. As the daemon starts it
@@ -5739,7 +5838,15 @@ pub fn start_agent_roster(state: &AppState) {
             if first {
                 continue;
             }
-            tokio::time::sleep(started.elapsed().max(AGENT_ROSTER_REFRESH_PAUSE)).await;
+            // Pause as long as the refresh took, so refreshing stays under about half a core
+            // however often readers ask, and at least the minimum pause unless a reader waits
+            // for a fresh roster: that read then waits for one fold, not the rest of the pause.
+            let pause = started.elapsed().max(AGENT_ROSTER_FRESH_PAUSE);
+            tokio::time::sleep(pause).await;
+            tokio::select! {
+                () = tokio::time::sleep(AGENT_ROSTER_REFRESH_PAUSE.saturating_sub(pause)) => {}
+                () = store.fresh_agent_roster_wanted() => {}
+            }
             wake.notified().await;
         }
     });
@@ -5846,24 +5953,37 @@ async fn serve_unix_with_ancestor_ready(
             }
         };
         // Every local connection names its caller, so request counts by client are always on.
+        let mut diagnostic_connection = crate::relay_trace::Connection::capture();
         let peer_pid = local_peer_pid(&stream);
         let app = app.clone();
         tokio::spawn(async move {
+            if let Some(connection) = &mut diagnostic_connection {
+                connection.dispatched();
+            }
             // /proc ancestry may fault in pages on a loaded host. Keep that work
             // out of the accept loop so a slow lookup delays only this peer.
-            let (bound_agent, caller, delivery_peer) = match peer_pid {
+            if let Some(connection) = &mut diagnostic_connection {
+                connection.queued();
+            }
+            let (bound_agent, caller, delivery_peer, diagnostic_connection) = match peer_pid {
                 Some(pid) => crate::api::read_deadline::spawn_blocking(move || {
+                    if let Some(connection) = &mut diagnostic_connection {
+                        connection.started();
+                    }
                     let bound_agent = bind_ancestry.then(|| ancestor(pid)).flatten();
                     let caller = Some(crate::profile::Caller::of_command(
                         local_process_arguments(pid).map(|(arguments, _)| arguments),
                         bound_agent.as_deref(),
                     ));
                     let delivery_peer = bind_harness.then(|| native_delivery_peer(pid)).flatten();
-                    (bound_agent, caller, delivery_peer)
+                    if let Some(connection) = &mut diagnostic_connection {
+                        connection.finished();
+                    }
+                    (bound_agent, caller, delivery_peer, diagnostic_connection)
                 })
                 .await
                 .unwrap_or_default(),
-                None => (None, None, None),
+                None => (None, None, None, diagnostic_connection),
             };
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
@@ -5872,6 +5992,9 @@ async fn serve_unix_with_ancestor_ready(
                 let delivery_peer = delivery_peer.clone();
                 async move {
                     let mut request = request.map(Body::new);
+                    if let Some(connection) = diagnostic_connection {
+                        request.extensions_mut().insert(connection);
+                    }
                     if let Some(pid) = peer_pid {
                         request.extensions_mut().insert(LocalPeer {
                             pid,
@@ -6304,6 +6427,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "status": "ready",
         "node": state.node,
         "version": env!("CARGO_PKG_VERSION"),
+        "build": {"commit": st_drivers::version::build_commit()},
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
@@ -12243,6 +12367,8 @@ fn accept_message_receipt_with_upload_owner(
             "external sender imports require the enrolled adapter endpoint",
         )));
     }
+    crate::model::refuse_person_recipient(&normalize_message_party(&request.to))
+        .map_err(ApiError::bad)?;
     if request.content.trim().is_empty() && request.attachments.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "empty-message",
@@ -13257,6 +13383,13 @@ struct MissionRunQuery {
 }
 
 #[derive(Deserialize)]
+struct MissionRunTreeQuery {
+    root: String,
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct MissionOverviewQuery {
     mission: String,
 }
@@ -13346,6 +13479,43 @@ async fn list_mission_runs(
             "select exactly one mission or root mission run",
         ))),
     }
+}
+
+async fn list_mission_run_tree(
+    State(state): State<AppState>,
+    Query(query): Query<MissionRunTreeQuery>,
+) -> Result<Json<crate::model::MissionRunTreePage>, ApiError> {
+    let limit = query.limit.unwrap_or(50);
+    if !(1..=50).contains(&limit) {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-mission-run-limit",
+            "mission run tree page limit must be 1 through 50",
+        )));
+    }
+    let store = state.store.clone();
+    let page = blocking_store(move || {
+        store.read_snapshot(|frontier| {
+            let Some((mut runs, next_cursor)) =
+                store.mission_runs_for_root_page(&query.root, query.after.as_deref(), limit)?
+            else {
+                return Ok(None);
+            };
+            annotate_stuck_gates(&store, &mut runs)?;
+            Ok(Some(crate::model::MissionRunTreePage {
+                runs,
+                has_more: next_cursor.is_some(),
+                next_cursor,
+                frontier,
+            }))
+        })
+    })
+    .await?;
+    page.map(Json).ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "invalid-mission-run-cursor",
+            "the mission run cursor is absent from this root; start again without a cursor",
+        ))
+    })
 }
 
 fn annotate_stuck_gates(store: &Store, runs: &mut [MissionRunView]) -> anyhow::Result<()> {
@@ -13916,6 +14086,29 @@ async fn set_mission_run_outcome(
     Ok(Json(outcome))
 }
 
+/// A person or the run's requester changes who a running run reports to.
+async fn set_mission_run_report(
+    State(state): State<AppState>,
+    AxumPath(run): AxumPath<String>,
+    Json(request): Json<MissionRunReportRequest>,
+) -> Result<Json<MissionRunReportView>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "run-report-authority-denied")?;
+    let store = state.store.clone();
+    let report = blocking_action(move || {
+        store.set_mission_run_report(
+            &run,
+            &actor,
+            request.report_to.as_deref(),
+            request.stalled_after_ms,
+            request.report_completed,
+            &request.idempotency_key,
+        )
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(report))
+}
+
 /// A person or an agent retires a mission.
 async fn retire_mission(
     State(state): State<AppState>,
@@ -14349,13 +14542,24 @@ async fn work_action_response(
     // An exact retry returns the transaction's durable response even if the provider exited after
     // committing it. The store repeats this lookup under its mutation boundary; this early read
     // only prevents the live-incarnation precondition from breaking idempotent recovery.
-    if let Some(response) = state
+    if let Some(mut response) = state
         .store
         .cached_idempotency_response::<StepRunView>(&request.idempotency_key)
         .map_err(ApiError::internal)?
     {
         if let Some(input) = handoff.as_ref() {
             state.store.handoff_retry(&subject, input).map_err(ApiError::bad)?;
+        }
+        if action == "renew" {
+            // A renewal caches its view without the fields the writer no longer folds.
+            let store = state.store.clone();
+            response = blocking_action(move || {
+                store
+                    .enrich_work_response(&mut response)
+                    .map_err(|error| St3Error::new("store-read-failed", format!("{error:#}")))?;
+                Ok(response)
+            })
+            .await?;
         }
         return Ok(Json(response));
     }
@@ -16165,6 +16369,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             &axum::http::Method::GET,
             "/v1/client/agents",
             "/v1/client/agents",
+            None,
             "stui",
             Instant::now() - Duration::from_secs(2),
         );
@@ -16451,6 +16656,33 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         let removed = client_agent_page_refs(&state.store, false, index).unwrap();
         assert_eq!(removed.len(), 1, "a stopped undeclared runtime moves to history");
         assert_eq!(removed, client_agent_page_refs_uncached(&state.store, false, index).unwrap());
+    }
+
+    #[test]
+    fn agent_lifecycle_roster_tracks_current_declaration_without_defaults() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        for (version, lifecycle) in [None, Some("standing"), Some("owner"), Some("bounded"), None]
+            .into_iter().enumerate()
+        {
+            let field = lifecycle.map(|value| format!("lifecycle \"{value}\";")).unwrap_or_default();
+            let source = format!("version 2\nagent \"example/purpose\" {{ {field} command \"true\" }}");
+            let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+            let plan = store.mission(&intent, crate::model::IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            store.apply(&intent, &plan.subject_tokens, &format!("lifecycle-{version}")).unwrap();
+            let index = store.index().unwrap();
+            for history in [false, true] {
+                let refs = client_agent_page_refs(store, history, index).unwrap();
+                let rows = checked_agent_cache(store, history, index);
+                let cards = client_agent_cards_for_page(store, history, index, &refs, "0").unwrap();
+                for row in refs.iter().chain(rows.iter()).chain(cards.iter()) {
+                    assert_eq!(row.get("lifecycle"), lifecycle.map(|value| json!(value)).as_ref());
+                }
+            }
+        }
     }
 
     #[test]
@@ -19180,6 +19412,27 @@ agent "good" {{ workspace {:?}; command "true" }}
     }
 
     #[tokio::test]
+    async fn health_build_commit_matches_version_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let (status, health) = get_request(app, "/v1/health").await;
+        assert_eq!(status, StatusCode::OK, "{health}");
+        assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+        let commit = health["build"]["commit"].as_str().unwrap();
+        assert_eq!(commit, st_drivers::version::build_commit());
+        let version = st_drivers::version::machine_version();
+        let revision = version.split_once('+').unwrap().1;
+        let revision = revision.strip_prefix("local.").unwrap_or(revision);
+        let revision = revision.strip_suffix(".dirty").unwrap_or(revision);
+        let revision = revision.strip_suffix("-dirty").unwrap_or(revision);
+        if revision == "dev" {
+            assert_eq!(commit, "unknown");
+        } else {
+            assert!(commit.starts_with(revision), "{version}: {commit}");
+        }
+    }
+
+    #[tokio::test]
     async fn health_and_doctor_report_runtime_metadata() {
         let root = tempfile::tempdir().unwrap();
         let app = router(state(root.path()));
@@ -21840,6 +22093,83 @@ version 2
     }
 
     #[tokio::test]
+    async fn a_send_or_reply_to_a_person_is_refused_and_an_agent_still_receives() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let message = |key: &str, from: &str, to: &str, in_reply_to: Option<&str>| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.into(),
+                from: from.into(),
+                to: to.into(),
+                content: "Hello".into(),
+                title: None,
+                in_reply_to: in_reply_to.map(str::to_owned),
+                tags: Vec::new(),
+                attachments: Vec::new(),
+            })
+            .unwrap()
+        };
+        // An agent, and a person writing to an agent, are unchanged.
+        let (status, asked) =
+            json_request(app.clone(), "/v1/messages", message("ask", "person/ada", "agent/worker", None)).await;
+        assert_eq!(status, StatusCode::OK, "{asked}");
+        let asked = asked["subject"].as_str().unwrap().to_owned();
+        let (status, relayed) =
+            json_request(app.clone(), "/v1/messages", message("relay", "agent/worker", "agent/helper", None)).await;
+        assert_eq!(status, StatusCode::OK, "{relayed}");
+        // A send to a person, a reply to a person, a bare name that means the requester, and a
+        // person writing to a person all fail with the one error, and write nothing.
+        let before = state.store.claims_for_kind_at("message.sent", None, true, 100).unwrap().claims.len();
+        for (key, from, to, parent) in [
+            ("send", "agent/worker", "person/ada", None),
+            ("reply", "agent/worker", "person/ada", Some(asked.as_str())),
+            ("requester", "agent/worker", "requester", None),
+            ("people", "person/ada", "person/robin", None),
+        ] {
+            let (status, body) =
+                json_request(app.clone(), "/v1/messages", message(key, from, to, parent)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{key}: {body}");
+            assert_eq!(body["code"], "person-has-no-inbox", "{key}");
+            let text = body["message"].as_str().unwrap();
+            assert!(text.starts_with("people do not have inboxes: print your answer in the chat"), "{text}");
+            let chat = text.find("print in the chat").unwrap();
+            assert!(chat < text.find("work ask").unwrap() && chat < text.find("work update").unwrap());
+            assert!(text.contains("only if the person asked for it"), "{text}");
+        }
+        assert_eq!(
+            state.store.claims_for_kind_at("message.sent", None, true, 100).unwrap().claims.len(),
+            before,
+            "a refused message is not written"
+        );
+        // What an older client already holds stays readable: a message to a person that is in the
+        // graph still lists, reads and settles.
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/earlier".into(),
+                kind: "message.sent".into(),
+                actor: Some("agent/worker".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("agent/worker")),
+                    ("to".into(), json!("person/ada")),
+                    ("content".into(), json!("Sent before people lost their inbox.")),
+                    ("status".into(), json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("earlier".into()),
+            })
+            .unwrap();
+        let (status, listed) = get_request(app.clone(), "/v1/messages?to=person/ada&include_closed=true").await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        assert!(listed.as_array().unwrap().iter().any(|row| row["subject"] == "message/earlier"), "{listed}");
+        let (status, read) = get_request(app, "/v1/messages/read/earlier").await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        assert_eq!(read["content"], "Sent before people lost their inbox.");
+    }
+
+    #[tokio::test]
     async fn message_lifecycle_requires_the_exact_recipient_actor() {
         let root = tempfile::tempdir().unwrap();
         let app = router(state(root.path()));
@@ -21849,7 +22179,7 @@ version 2
             serde_json::to_value(MessageSendRequest {
                 idempotency_key: "recipient-authority-message".into(),
                 from: "agent/sender".into(),
-                to: "person/receiver".into(),
+                to: "agent/receiver".into(),
                 content: "Please review this.".into(),
                 title: None,
                 in_reply_to: None,
@@ -21910,7 +22240,7 @@ version 2
             serde_json::to_value(MessageLifecycleRequest {
                 delegation: None,
                 lifecycle: "staged".into(),
-                actor: Some("person/receiver".into()),
+                actor: Some("agent/receiver".into()),
                 transport: Some("codex-app-server".into()),
                 runtime_id: Some("runtime/receiver".into()),
                 evidence: Vec::new(),
@@ -21922,7 +22252,7 @@ version 2
         .await;
         assert_eq!(status, StatusCode::OK, "{staged}");
         assert_eq!(staged["body"]["fields"]["status"], "staged");
-        assert_eq!(staged["body"]["fields"]["recipient"], "person/receiver");
+        assert_eq!(staged["body"]["fields"]["recipient"], "agent/receiver");
         assert_eq!(staged["body"]["fields"]["transport"], "codex-app-server");
         assert_eq!(staged["body"]["fields"]["runtime_id"], "runtime/receiver");
 
@@ -21932,7 +22262,7 @@ version 2
             serde_json::to_value(MessageLifecycleRequest {
                 delegation: None,
                 lifecycle: "delivered".into(),
-                actor: Some("person/receiver".into()),
+                actor: Some("agent/receiver".into()),
                 transport: None,
                 runtime_id: None,
                 evidence: Vec::new(),
@@ -21943,7 +22273,7 @@ version 2
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{read}");
-        assert_eq!(read["actor"], "person/receiver");
+        assert_eq!(read["actor"], "agent/receiver");
 
         let legacy = app
             .oneshot(
@@ -23435,6 +23765,61 @@ mission "wake" state="ready" {
             let (_, cards, _) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
             assert_eq!(cards.len(), 1, "history {history}");
         }
+    }
+
+    async fn assert_agent_roster_survives_other_mode_publications(history: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.store = Arc::new(roster_followup_store());
+        let store = &state.store;
+        let wake = store.start_agent_roster_refresher().unwrap();
+        let advance = |marker| {
+            store.append_claim(&ClaimInput {
+                subject: format!("custom/test/roster-retention-{marker}"),
+                kind: "custom.test.marker".into(), actor: None, fields: BTreeMap::new(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        refresh_agent_roster(store, history).unwrap();
+        advance(0);
+        refresh_agent_roster(store, history).unwrap();
+        let (cut, _, published_at) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+        let (_, Json(before)) = client_agents(
+            State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery { history, ..ClientListQuery::default() }),
+        ).await.unwrap();
+        let mut first_other_cut = None;
+        for marker in 1..=12 {
+            advance(marker);
+            refresh_agent_roster(store, !history).unwrap();
+            let other_cut = store.published_agent_roster(store.index().unwrap(), !history).unwrap().0;
+            assert_eq!(other_cut, store.index().unwrap(), "each refresh must publish a distinct cut");
+            first_other_cut.get_or_insert(other_cut);
+        }
+        assert!(store.index().unwrap() > cut);
+        assert!(store.published_agent_roster_at(first_other_cut.unwrap(), !history).is_none(),
+            "old publications of the busy mode must still be evicted");
+        assert!(!store.take_agent_roster_history_request());
+        let (Extension(snapshot), Json(after)) = client_agents(
+            State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery { history, fresh: true, ..ClientListQuery::default() }),
+        ).await.expect("the retained publication must answer, not return agent-roster-not-ready");
+        assert_eq!(snapshot.store_index, cut, "serve the newest retained publication's own cut");
+        assert_eq!(snapshot.published_at, Some(client_timestamp(published_at)));
+        assert_eq!(after.items, before.items);
+        assert_eq!(store.take_agent_roster_history_request(), history);
+        tokio::time::timeout(Duration::from_secs(1), wake.notified()).await
+            .expect("the stale first page must request a refresh");
+    }
+
+    #[tokio::test]
+    async fn client_agents_agent_roster_retains_history_during_current_publications() {
+        assert_agent_roster_survives_other_mode_publications(true).await;
+    }
+
+    #[tokio::test]
+    async fn client_agents_agent_roster_retains_current_during_history_publications() {
+        assert_agent_roster_survives_other_mode_publications(false).await;
     }
 
     #[test]

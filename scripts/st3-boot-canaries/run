@@ -98,7 +98,10 @@ class Node:
         # binary. A link, because a debug st3 is hundreds of megabytes and /tmp is a small tmpfs.
         self.binary = root / "bin/st3"
         self.binary.symlink_to(binary)
-        for tool in ("pty", "git"):
+        # The Nix sandbox has no /usr/bin/env and only /bin/sh: the daemon's login shell runs `env -0`
+        # and the stand-ins run hooks with `bash -c`, so resolve both here, before PATH is narrowed
+        # to this directory plus /usr/bin:/bin.
+        for tool in ("pty", "git", "env", "bash"):
             executable = shutil.which(tool)
             if not executable:
                 raise SystemExit(f"{tool} must be on PATH")

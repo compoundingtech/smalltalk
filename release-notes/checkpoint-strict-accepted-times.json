@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Reject malformed accepted times when checkpoint capture first reads them",
+  "replay": {"status": "none", "detail": "No replay or rebuild. Valid stores produce the same sealed sets, digests and checkpoint plans."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint retention rules and cut boundaries are unchanged."},
+  "compatibility": {"status": "none", "detail": "No wire or response-shape change. Accepted times in checkpoint capture must parse as unsigned 128-bit integers; malformed, negative and overflowing values now fail instead of silently counting as zero or excluding an envelope."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step for valid stores."},
+  "recovery": {"status": "changed", "detail": "Checkpoint capture rejects an invalid claim accepted time on its first read, including when another late claim would exclude the same envelope. Invalid envelope accepted times also fail on their first read. Claim errors identify the affected claim. Other readers retain their existing parsing behavior."}
+}

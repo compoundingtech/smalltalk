@@ -83,6 +83,7 @@ from the painted label, so a card's specific action stays visible in the footer.
 | `Actions(agent)` | Agent header's `⋯ actions` opens agent actions card | Agent context | Background; agent actions |
 | `Field(index)` | Form value row focuses field | Context | Background; focus field / Tab |
 | `Revoke(device)` | Device button asks to revoke; `y` confirms | Context | Background; ask to revoke |
+| `Attach` | Unattached terminal placeholder's Attach button runs the existing `Ctrl+]` action | Context | Background; attach terminal |
 | `Detach` | Terminal status row leaves terminal (`Ctrl+\\`) | Context | Background; leave terminal |
 | `GlassMenu` | Space name opens spaces palette (`Ctrl+G`) | Own action | Background; spaces |
 | `PaletteSection(index)` | Top-bar counts open that palette section | Own action | Background; agents / missions / fleet |
@@ -90,7 +91,7 @@ from the painted label, so a card's specific action stays visible in the footer.
 | `Link(url)` | Raw HTTP(S) or remembered markdown link copies complete URL; wrapped parts copy the same address | Message/subject context where applicable, otherwise copy-link action | Underline; copy link |
 | `Split(right)` | Home launcher controls split right/below (`Ctrl+V` / `Ctrl+X`) | Own action | Background; split right/below |
 | `Menu(action)` | Context-menu row runs existing action | Closes menu | Background; painted row action |
-| `GlassTab(group, tab)` | Shows tab; drag reorders, moves or splits | Tab menu | Background; show tab / drag to move or split |
+| `GlassTab(group, tab)` | Shows tab; drag reorders, moves or splits; middle press and release over the same tab closes via the existing tab-menu action | Tab menu | Background; show tab / drag to move or split / middle-click close |
 | `GlassAdd(group)` | `+` focuses group and opens new-tab palette (`Ctrl+T`) | Split context | Background; new tab |
 | `PaletteChoice(index)` | Palette result opens it | No menu | Background; open painted result |
 
