@@ -967,7 +967,13 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
         "the driver wrote into the seat's terminal: {terminal}"
     );
     let log = driver_log(root);
-    assert!(log.contains("is not reachable"), "{log}");
+    // The barrier makes an accepted request lose its connection. Another in-flight
+    // request may instead observe refusal; both are the daemon outage we require.
+    assert!(
+        log.contains("is not reachable")
+            || log.contains("closed the connection before it answered"),
+        "{log}"
+    );
     assert!(log.contains("may be restarting"), "{log}");
     assert!(
         log.contains("retrying every 1s until the daemon is back"),
