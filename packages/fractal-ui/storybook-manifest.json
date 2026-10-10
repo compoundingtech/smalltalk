@@ -3,6 +3,13 @@
   "exceptions": [
     {
       "book": "kit",
+      "title": "Fractal/Explore/Content network safety",
+      "classification": "explore",
+      "owner": "fractal",
+      "reason": "T102/B1, T009/T017/B7: retain the unmounted EmbraceThread and EmbraceMarkdownPreview alternatives' network-safety assertions separately from the production Transcript boundary."
+    },
+    {
+      "book": "kit",
       "title": "Fractal/Explore/Composer",
       "classification": "explore",
       "owner": "fractal-web-live",
