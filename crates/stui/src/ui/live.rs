@@ -2270,6 +2270,7 @@ async fn send_message(
         in_reply_to,
         session_id,
         tags,
+        kind: st3_client::MessageKind::Wake,
         attachments,
         signature: None,
     };

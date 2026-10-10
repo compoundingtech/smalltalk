@@ -2373,6 +2373,166 @@ async fn cli_send_reply_read_archive_search_and_attachments_survive_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_silent_kinds_and_count_reads_survive_restart() {
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let mut daemon = Daemon::new().await;
+    daemon.worker();
+    const PEER: &str = "agent/example/peer";
+    let send = |key: &'static str, flag: &'static str| {
+        vec![
+            "conversations",
+            "send",
+            WORKER,
+            "--from",
+            PEER,
+            "--body",
+            key,
+            "--idempotency-key",
+            key,
+            "--kind",
+            flag,
+        ]
+    };
+    let silent_args = send("copper-silent", "silent");
+    let sent = cli_value(daemon.cli(PEER, &silent_args).await);
+    assert_eq!(sent["kind"], "silent");
+    let held = sent["subject"].as_str().unwrap().to_owned();
+    assert!(st3::silent::is_held(
+        &daemon.store().message(&held).unwrap().unwrap()
+    ));
+    daemon.restart().await;
+    assert_eq!(
+        cli_value(daemon.cli(PEER, &silent_args).await)["subject"],
+        held
+    );
+    // An unoffered silent is readable on demand, before any question wakes the seat.
+    let read = cli_value(
+        daemon
+            .cli(WORKER, &["conversations", "read", &held, "--as", WORKER])
+            .await,
+    );
+    assert_eq!(read["status"], "read");
+    let question = cli_value(daemon.cli(PEER, &send("copper-question", "wake")).await);
+    assert_eq!(question["kind"], "wake");
+    assert!(!st3::silent::is_held(
+        &daemon
+            .store()
+            .message(question["subject"].as_str().unwrap())
+            .unwrap()
+            .unwrap()
+    ));
+    let asked = cli_value(
+        daemon
+            .cli(
+                WORKER,
+                &[
+                    "conversations",
+                    "send",
+                    PEER,
+                    "--from",
+                    WORKER,
+                    "--body",
+                    "Which proof?",
+                    "--kind",
+                    "wake",
+                    "--idempotency-key",
+                    "copper-asked",
+                ],
+            )
+            .await,
+    );
+    let parent = asked["subject"].as_str().unwrap();
+    let answer = cli_value(
+        daemon
+            .cli(
+                PEER,
+                &[
+                    "conversations",
+                    "reply",
+                    parent,
+                    "--from",
+                    PEER,
+                    "--body",
+                    "The copper proof.",
+                    "--idempotency-key",
+                    "copper-answer",
+                ],
+            )
+            .await,
+    );
+    assert!(!st3::silent::is_held(
+        &daemon
+            .store()
+            .message(answer["subject"].as_str().unwrap())
+            .unwrap()
+            .unwrap()
+    ));
+    let reply = cli_value(
+        daemon
+            .cli(
+                WORKER,
+                &[
+                    "conversations",
+                    "reply",
+                    &held,
+                    "--from",
+                    WORKER,
+                    "--body",
+                    "Noted.",
+                    "--kind",
+                    "silent",
+                    "--idempotency-key",
+                    "copper-silent-reply",
+                ],
+            )
+            .await,
+    );
+    assert!(st3::silent::is_held(
+        &daemon
+            .store()
+            .message(reply["subject"].as_str().unwrap())
+            .unwrap()
+            .unwrap()
+    ));
+    let fence = daemon.fence(PEER).await;
+    let api = dispatch(
+        &daemon.client(PEER),
+        "message.send",
+        "coverage-copper-api-silent",
+        fence,
+        json!({"to": WORKER, "content":"A client silent.", "kind":"silent"}),
+    )
+    .await
+    .unwrap();
+    let api = serde_json::to_value(api).unwrap();
+    let api_id = api["value"]["affected_ids"][0].as_str().unwrap();
+    assert!(st3::silent::is_held(
+        &daemon.store().message(api_id).unwrap().unwrap()
+    ));
+    let before = daemon.store().index().unwrap();
+    let counts = cli_value(
+        daemon
+            .cli(WORKER, &["usage", "--messages-only", "--hours", "24"])
+            .await,
+    );
+    assert_eq!(counts["agent_to_agent"], 6);
+    assert_eq!(counts["silent"], 3);
+    assert_eq!(counts["complete"], true);
+    assert_eq!(
+        daemon.store().index().unwrap(),
+        before,
+        "count read wrote or built"
+    );
+    daemon.restart().await;
+    assert_eq!(
+        cli_value(daemon.cli(WORKER, &["usage", "--messages-only"]).await)["silent"],
+        3
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_aged_unread_cleanup_preserves_fresh_and_read_mail_across_restart() {
     if st3::test_support::supervise_test() {
         return;
