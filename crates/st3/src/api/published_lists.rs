@@ -15,6 +15,11 @@ use smallclaims::store::now_ms;
 /// took, so a refresher never takes more than about half a core.
 const REFRESH_PAUSE: Duration = Duration::from_secs(1);
 
+/// The shortest pause when a fresh read waits: the rest of [`REFRESH_PAUSE`] is cut short for it,
+/// never this, so fresh reads however frequent fold at most this often, and a fold still pauses
+/// as long as it took.
+const FRESH_PAUSE: Duration = Duration::from_millis(100);
+
 /// The most rows one snapshot refolds. More changed rows refold in chunks, each at its own cut,
 /// and a last short snapshot completes the publication at one cut.
 const FOLD_CHUNK: usize = 100;
@@ -211,6 +216,7 @@ fn spawn<R: Send + Sync + 'static>(
             // the next pause short. One made during the fold stays, and cuts that pause.
             let _ = futures_util::FutureExt::now_or_never(fresh.notified());
             let started = tokio::time::Instant::now();
+            list(&store).note_fold();
             let reader = store.clone();
             let folded = tokio::task::spawn_blocking(move || {
                 crate::profile::task(label, || {
@@ -272,8 +278,11 @@ fn spawn<R: Send + Sync + 'static>(
                     withdraw(&store, list, name);
                 }
             }
-            // The pause keeps commits paced; a fresh read waiting on the list cuts it short.
-            let _ = tokio::time::timeout(started.elapsed().max(REFRESH_PAUSE), fresh.notified()).await;
+            // Pause as long as the fold took, and at least the fresh floor; then the rest of the
+            // full pause, unless a fresh read waits for the list. Commits keep the full pause.
+            let pause = started.elapsed().max(FRESH_PAUSE);
+            tokio::time::sleep(pause).await;
+            let _ = tokio::time::timeout(REFRESH_PAUSE.saturating_sub(pause), fresh.notified()).await;
             let deadline = list(&store).newest().and_then(|newest| newest.valid_until_unix_ms);
             let mut wait = deadline.map(|deadline| {
                 Duration::from_millis(deadline.saturating_sub(now_ms()).min(u64::MAX as u128) as u64)

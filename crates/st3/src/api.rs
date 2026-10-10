@@ -4522,12 +4522,19 @@ async fn wait_for_work_list(
     let wanted = store.index().map_err(ApiError::internal)?;
     let mut changes = list.subscribe();
     let deadline = tokio::time::Instant::now() + WORK_LIST_FRESH_WAIT;
-    list.request_fresh();
+    let mut asked = false;
     loop {
         drop(changes.borrow_and_update());
         let newest = match list.current() {
             ListRead::Served(publication, id) if publication.cut >= wanted => return Ok((publication, id)),
-            ListRead::Served(publication, _) => publication.cut,
+            // Behind the request: ask once for a fold now, without the rest of the pause.
+            ListRead::Served(publication, _) => {
+                if !asked {
+                    list.request_fresh();
+                    asked = true;
+                }
+                publication.cut
+            }
             ListRead::Ended => return Err(published_lists::work_list_ended()),
             ListRead::NotReady | ListRead::NeverStarted => return Err(published_lists::work_list_not_ready()),
         };

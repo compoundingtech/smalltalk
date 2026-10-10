@@ -57,6 +57,9 @@ pub(crate) struct PublishedList<R> {
     changes: tokio::sync::watch::Sender<u64>,
     /// Folds from nothing or in chunks, by why: each refolded many rows, not a few.
     rebuilds: Mutex<BTreeMap<String, u64>>,
+    /// Folds the refresher began, for tests.
+    #[cfg(test)]
+    folds: std::sync::atomic::AtomicUsize,
 }
 
 // Not derived: rows need no default of their own.
@@ -76,6 +79,8 @@ impl<R> Default for PublishedList<R> {
             sequence: AtomicU64::new(0),
             changes: tokio::sync::watch::Sender::new(0),
             rebuilds: Mutex::default(),
+            #[cfg(test)]
+            folds: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -172,6 +177,17 @@ impl<R> PublishedList<R> {
     pub(crate) fn request_fresh(&self) {
         self.fresh.notify_one();
         self.wake.notify_one();
+    }
+
+    /// Count one fold the refresher began, for tests.
+    pub(crate) fn note_fold(&self) {
+        #[cfg(test)]
+        self.folds.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn folds(&self) -> usize {
+        self.folds.load(Ordering::Relaxed)
     }
 
     /// What a fresh read's request notifies: see [`Self::request_fresh`].

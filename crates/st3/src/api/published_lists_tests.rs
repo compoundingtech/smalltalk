@@ -1425,3 +1425,25 @@ async fn a_fresh_read_cuts_the_refresher_pause_short_and_commits_keep_it() {
     let (first, second) = tokio::join!(work_page(&state, fresh.clone()), work_page(&state, fresh));
     assert_eq!((first.unwrap().items.len(), second.unwrap().items.len()), (4, 4));
 }
+
+#[tokio::test(start_paused = true)]
+async fn sustained_fresh_requests_fold_no_faster_than_the_fresh_floor() {
+    let root = tempfile::tempdir().unwrap();
+    let state = app_state(root.path());
+    let store = &state.store;
+    seat_mission(store, "garden/tend", "agent/garden/ash");
+    ready_run(store, "garden/tend", "tend-1");
+    start_published_work(&state);
+    wait_published(store).await;
+    let list = store.published_work_list();
+    let (before, began) = (list.folds(), tokio::time::Instant::now());
+    // Fifty fresh requests a second for two seconds.
+    for _ in 0..100 {
+        list.request_fresh();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (folds, span) = (list.folds() - before, began.elapsed());
+    let most = (span.as_millis() / FRESH_PAUSE.as_millis()) as usize + 2;
+    assert!(folds <= most, "{folds} folds in {span:?}, at most {most}");
+    assert!(folds >= 2, "fresh requests did cut the pause: {folds} folds in {span:?}");
+}
