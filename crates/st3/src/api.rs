@@ -745,6 +745,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages/cleanup", post(mail_backlog::cleanup))
         .route("/v1/mailbox", get(mailbox::subscribe))
         .route("/v1/harness-events", post(harness_events::publish))
+        .route("/v1/harness-prompts/state", get(harness_events::prompt_state))
         .route("/v1/mailbox/bind", post(mailbox::bind))
         .route("/v1/mailbox/attachment", get(mailbox::attachment))
         .route("/v1/mailbox/receipts", post(mailbox::receipt))
@@ -3480,6 +3481,12 @@ pub(crate) fn client_attention_resources_at(
         }
         if let Some(mode) = item.review_mode {
             resource["review_mode"] = json!(mode);
+        }
+        // A prompt st can answer offers its answers as one typed action.
+        if !item.answers.is_empty() {
+            resource["actions"] = json!(["prompt.respond"]);
+            resource["action_parameters"] = json!({"prompt.respond": {
+                "target_id": item.subject, "episode": item.episode, "answers": item.answers}});
         }
         if item.kind.starts_with("custom.")
             && let Some(source) = store.custom_subject(&item.subject)?

@@ -1781,6 +1781,10 @@ pub struct AttentionItemView {
     /// gate reviews, that planned a launch or proposed a revision, or the seat itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// The answers a person can give from a client, for a prompt its harness lets st answer:
+    /// `allow` and `deny` for a Claude permission prompt. Empty when it is answered at its source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<String>,
     pub title: String,
     pub detail: String,
     /// The structured request a person-step ask carries.

@@ -117,7 +117,7 @@ pub use smallclaims::store::{
 mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
-pub(crate) use attention_snapshot::native_prompt_gone_key;
+pub(crate) use attention_snapshot::{NativePromptState, native_prompt_gone_key};
 // Registration stays opt-in until the shared installer certifies every source family.
 #[cfg_attr(
     not(test),
@@ -14554,7 +14554,7 @@ impl Store {
                     ),
                     launch_id: None,
                     variant_id: None,
-                    message_id: None, conversation: None,
+                    message_id: None, answers: Vec::new(), conversation: None,
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -17375,7 +17375,7 @@ impl Store {
             items.push(AttentionItemView {
                 episode: first.episode.clone(), priority: "high".into(), kind: "harness-login".into(), review_mode: None,
                 subject: first.subject.clone(), person: owner, requester_id: None, launch_id: None,
-                variant_id: None, message_id: None, conversation: Some(first.subject.clone()),
+                variant_id: None, message_id: None, answers: Vec::new(), conversation: Some(first.subject.clone()),
                 title, detail,
                 request: None, mission: None, mission_run: None, step: None,
                 targets: names.iter().map(|name| (*name).to_owned()).collect(),
@@ -24554,7 +24554,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
         requester_id: None,
         launch_id: None,
         variant_id: None,
-        message_id: None, conversation: None,
+        message_id: None, answers: Vec::new(), conversation: None,
         title: review
             .title
             .clone()
@@ -24620,7 +24620,7 @@ fn attention_item_from_planning(
             "launch-variant/{}/{}",
             session.id, candidate.variant
         )),
-        message_id: None,
+        message_id: None, answers: Vec::new(),
         conversation: attention_snapshot::agent(&session.planner),
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
@@ -24679,7 +24679,7 @@ fn attention_item_from_revision(
         requester_id: None,
         launch_id: None,
         variant_id: None,
-        message_id: None,
+        message_id: None, answers: Vec::new(),
         conversation: attention_snapshot::agent(&proposal.actor),
         title: format!("Approve a revision of {}", run.mission),
         detail: proposal.reason.clone(),
@@ -24740,7 +24740,7 @@ fn attention_item_from_failure(request: AttentionRequestView) -> AttentionItemVi
         requester_id: Some(request.actor),
         launch_id: None,
         variant_id: None,
-        message_id: None, conversation: None,
+        message_id: None, answers: Vec::new(), conversation: None,
         title: request.title,
         detail: request.reason,
         mission: None,
@@ -55202,6 +55202,165 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         assert_eq!(prompts().len(), 1);
         append("runtime.observed", json!({"status":"running", "incarnation_id":"two"}));
         assert!(prompts().is_empty());
+    }
+
+    /// A Claude permission prompt can be answered from a client: only by the seat's person, only
+    /// while it waits, and once. The hook sees the answer; the alert goes once it is answered.
+    #[test]
+    fn a_claude_permission_prompt_is_answered_once_by_its_person_while_it_waits() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &preview.subject_tokens, "answer-seat", Some("person/avery"))
+            .unwrap();
+        let seat = "agent/node.worker";
+        let append = |kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: seat.into(),
+                    kind: kind.into(),
+                    actor: Some(seat.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        // The hook waits on its own observation, named by its state record's sequences.
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Open,
+            "the hook's observation is not published yet"
+        );
+        append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}));
+        let asked = append(
+            "harness.observed",
+            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"Bash",
+                "ownership_sequence":1, "transition_sequence":3}),
+        );
+        let prompt = || {
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .into_iter()
+                .find(|item| item.kind == "harness-prompt")
+        };
+        assert_eq!(
+            prompt().unwrap().answers,
+            vec!["allow".to_owned(), "deny".to_owned()]
+        );
+        assert_eq!(
+            store
+                .answer_native_prompt(seat, &asked.id, "allow", "person/other")
+                .unwrap_err()
+                .code,
+            "forbidden"
+        );
+        assert_eq!(
+            store
+                .answer_native_prompt(seat, "an-older-prompt", "allow", "person/avery")
+                .unwrap_err()
+                .code,
+            "stale-fence"
+        );
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Open
+        );
+        store
+            .answer_native_prompt(seat, &asked.id, "deny", "person/avery")
+            .unwrap();
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Answered {
+                answer: "deny".into()
+            }
+        );
+        assert!(prompt().is_none(), "an answered prompt is no longer an alert");
+        assert!(
+            store
+                .answer_native_prompt(seat, &asked.id, "allow", "person/avery")
+                .is_err(),
+            "a prompt is answered once"
+        );
+        // Claude acts on the answer and moves on: a hook still waiting sees it gone.
+        append(
+            "harness.observed",
+            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":null, "ask":null, "ownership_sequence":1, "transition_sequence":4}),
+        );
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Gone
+        );
+        // The next prompt is its own: the earlier prompt's answer never answers it.
+        append(
+            "harness.observed",
+            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"Write",
+                "ownership_sequence":1, "transition_sequence":5}),
+        );
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 5).unwrap(),
+            NativePromptState::Open
+        );
+        // Only the tool is stored; the call itself is read from the seat's conversation.
+        assert!(prompt().unwrap().detail.starts_with("Claude asks to use Write;"));
+        // A later observation of the same waiting prompt: an answer to it is still the hook's.
+        let restated = append(
+            "harness.observed",
+            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"Write",
+                "provider_auth": true, "ownership_sequence":1, "transition_sequence":6}),
+        );
+        assert_eq!(prompt().unwrap().episode, restated.id);
+        store
+            .answer_native_prompt(seat, &restated.id, "allow", "person/avery")
+            .unwrap();
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 5).unwrap(),
+            NativePromptState::Answered {
+                answer: "allow".into()
+            }
+        );
+        // A prompt that does not say what it would run can only be answered in the terminal.
+        append(
+            "harness.observed",
+            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"permissionRequest",
+                "ownership_sequence":1, "transition_sequence":7}),
+        );
+        assert!(prompt().unwrap().answers.is_empty());
+        // A question is answered in the terminal: it is an alert without answers.
+        let question = append(
+            "harness.observed",
+            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"question"}),
+        );
+        assert!(prompt().unwrap().answers.is_empty());
+        assert_eq!(
+            store
+                .answer_native_prompt(seat, &question.id, "allow", "person/avery")
+                .unwrap_err()
+                .code,
+            "stale-fence"
+        );
     }
 
     #[test]

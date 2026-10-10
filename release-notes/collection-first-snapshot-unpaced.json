@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "A collection window still waiting for its first snapshot reads as soon as its view publishes",
+  "replay": {"status": "none", "detail": "Collection refresh scheduling only; claim admission and replay are unchanged."},
+  "schema": {"status": "none", "detail": "No database or persistent state changes."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged; no coordinated member upgrade is required."},
+  "compatibility": {"status": "none", "detail": "Frames and their order are unchanged. A window that subscribed while its view was not ready, and got a retryable resync, now reads when the roster or published view publishes rather than at the next paced reread, so its first snapshot no longer waits up to 1.5 s more. Held windows remain paced."},
+  "downtime": {"status": "none", "detail": "No additional startup work or interruption beyond a normal daemon restart."},
+  "manual": {"status": "none", "detail": "No operator action or client configuration change is needed."},
+  "recovery": {"status": "none", "detail": "No persistent changes or new binary swap-back restrictions."}
+}

@@ -518,6 +518,7 @@ public struct ActionRequest: Codable, Sendable {
     public static func missionRevise(id: String, idempotencyKey: String, fence: Fence, parameters: MissionReviseParameters) throws -> Self { try .init(id: id, type: .missionRevise, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func missionStart(id: String, idempotencyKey: String, fence: Fence, parameters: MissionStartParameters) throws -> Self { try .init(id: id, type: .missionStart, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func pairingRevoke(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) throws -> Self { try .init(id: id, type: .pairingRevoke, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
+    public static func promptRespond(id: String, idempotencyKey: String, fence: Fence, parameters: PromptRespondParameters) throws -> Self { try .init(id: id, type: .promptRespond, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func reviewApprove(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) throws -> Self { try .init(id: id, type: .reviewApprove, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func reviewReject(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) throws -> Self { try .init(id: id, type: .reviewReject, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
     public static func reviewRequestChanges(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) throws -> Self { try .init(id: id, type: .reviewRequestChanges, idempotencyKey: idempotencyKey, fence: fence, typedParameters: parameters) }
@@ -677,6 +678,12 @@ public struct GlassCollectionFrame: Codable, Sendable {
 
 public struct StatusHistory: Codable, Sendable { public let kind, seat, retainedFrom: String; public let items: [StatusTransition]; public let complete: Bool; enum CodingKeys: String, CodingKey { case kind, seat, items, retainedFrom = "retained_from", complete } }
 public struct StatusTransition: Codable, Sendable { public let seat, runtimeIncarnation, observedAt: String; public let state: String?; public let reset: Bool; enum CodingKeys: String, CodingKey { case seat, runtimeIncarnation = "runtime_incarnation", state, observedAt = "observed_at", reset } }
+
+public struct PromptRespondParameters: Codable, Sendable {
+    public var targetID, episode, answer: String
+    public init(targetID: String, episode: String, answer: String) { self.targetID = targetID; self.episode = episode; self.answer = answer }
+    enum CodingKeys: String, CodingKey { case targetID = "target_id", episode, answer }
+}
 
 public struct CustomReplyParameters: Codable, Sendable {
     public var targetID, registration, revision, episode: String
