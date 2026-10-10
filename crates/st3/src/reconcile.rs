@@ -4458,15 +4458,21 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// relabels. Older launches do not count: after A → B → A the seat runs A again.
     /// What a running seat's declaration changed about how it launches since its running
     /// incarnation started, when that matters: its host, workspace, harness, terminal, command,
-    /// model or arguments. A seat st did not launch, or whose launch it no longer has, has
-    /// nothing to compare and keeps running.
+    /// model or arguments. A seat's nested exec or PTY follows the seat and compares the same
+    /// way. A seat st did not launch, or whose launch it no longer has, has nothing to compare
+    /// and keeps running.
     fn declared_launch_changes(
         &self,
         subject: &DesiredSubject,
         member: &MemberSpec,
         observation: &RuntimeObservation,
     ) -> Result<Option<Vec<&'static str>>> {
-        if subject.kind != "agent" || member.lifecycle != MemberLifecycle::Service {
+        let follows_seat = crate::rollout::attached_agent(&subject.subject).is_some()
+            && member.tags.contains_key("st3.agent")
+            && !member.one_shot;
+        if (subject.kind != "agent" && !follows_seat)
+            || member.lifecycle != MemberLifecycle::Service
+        {
             return Ok(None);
         }
         let Some(incarnation) = observation.incarnation_id.as_deref() else {

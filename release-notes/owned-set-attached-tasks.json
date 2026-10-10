@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Owned sets accept a seat's nested exec and PTY tasks as members that follow their seat.",
+  "replay": {"status": "none", "detail": "No replay or backfill is required."},
+  "schema": {"status": "none", "detail": "No database or claim schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "changed", "detail": "A set receipt can name exec and PTY task members. Daemons without this change refuse such a receipt. Thus st refuses to publish a set with nested tasks until every active daemon advertises owned_set_tasks. Upgrade all daemons before you add nested tasks to a set."},
+  "manual": {"status": "none", "detail": "Adopting a seat adopts its nested tasks. No other operator action is required."},
+  "recovery": {"status": "none", "detail": "Task retirement and task restarts use the existing stop and start paths."},
+  "downtime": {"status": "changed", "detail": "A running nested task restarts when its host, workspace, terminal or command changes. While its seat holds its incumbent for a pending cutover, the task keeps running. It restarts or stops when the seat's cutover starts."}
+}

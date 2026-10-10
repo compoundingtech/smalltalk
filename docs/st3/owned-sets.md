@@ -1,7 +1,8 @@
 # Owned sets
 
 An owned set gives one publisher responsibility for a complete list of top-level seats, mission
-definitions and schedules. A successful publication retires previously live members that are
+definitions and schedules. A seat's nested `exec` and `pty` tasks are members together with their
+seat. A successful publication retires previously live members that are
 absent from that list. Membership lives in the ordinary graph, on `owned-set/NAME` subjects with
 immutable `owned-set.revised` claims. There is no inventory database alongside the graph.
 
@@ -36,9 +37,21 @@ previews first, then submits captured member heads with the apply. The daemon ch
 revision, source sequence and every captured member head within the publication transaction.
 
 An existing unmanaged declaration requires `--adopt agent/garden/orchard` (repeat for each
-subject). Adoption captures the old heads in the set revision. A member already belonging to
+subject). Adopting a seat also adopts its nested `exec` and `pty` tasks. Adoption captures the old
+heads in the set revision. A member already belonging to
 another set is refused. Retirement keeps ownership; v1 has no release or transfer operation.
 Reintroducing a retired member through its set makes it live again.
+
+A nested task follows its seat. Omitting the seat retires its tasks with it. Omitting one task
+while the seat stays retires only that task. When the seat holds its incumbent for a pending
+manual rollout or an idle drain, a running task keeps its incarnation: a changed task launch and a
+task retirement wait until the seat's cutover starts. Without a held cutover, task changes take
+effect at once: a running task whose host, workspace, terminal or command changed restarts with
+its new launch. A top-level `exec` or `pty` declaration cannot be a set member.
+
+A set receipt with nested tasks names them with the member kinds `exec` and `pty`. Daemons
+without this support refuse such a receipt. Thus publication of a set with nested tasks is
+refused until every active admitted daemon advertises `owned_set_tasks`.
 
 Mission runs, mission-owned seats, resources, observers and subscriptions cannot be set members.
 Publish those through their existing routes. A mission definition may contain its normal

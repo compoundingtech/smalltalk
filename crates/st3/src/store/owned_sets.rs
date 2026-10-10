@@ -152,6 +152,21 @@ pub(super) fn manual_member(connection: &Connection, member: &Member) -> Result<
             .is_some_and(|desired| crate::rollout::manual(&desired)))
 }
 
+/// A nested exec or PTY task of a seat in the same bundle; the seat owns its lifecycle.
+fn attached_parent(input: &NormalizedIntent, subject: &str) -> Option<String> {
+    let task = input.subjects.get(subject)?;
+    let seat = crate::rollout::attached_agent(subject)?;
+    (matches!(task.kind.as_str(), "exec" | "pty")
+        && subject.starts_with(&format!("{}/", task.kind))
+        && task
+            .member
+            .as_ref()
+            .and_then(|m| m.tags.get("st3.agent"))
+            == Some(&seat)
+        && input.subjects.get(&seat).is_some_and(|s| s.kind == "agent"))
+    .then_some(seat)
+}
+
 pub fn subject(name: &str) -> Result<String, St3Error> {
     let name = name.strip_prefix("owned-set/").unwrap_or(name);
     if name.is_empty()
@@ -636,14 +651,15 @@ pub(super) fn plan_tx(
         || !input.resource_refreshes.is_empty()
         || !input.replica_repairs.is_empty()
         || input.subjects.values().any(|s| {
-            !matches!(s.kind.as_str(), "agent" | "schedule")
+            !(matches!(s.kind.as_str(), "agent" | "schedule")
+                || attached_parent(input, &s.subject).is_some())
                 || s.owner_run.is_some()
                 || s.owner_step.is_some()
         })
     {
         return Err(St3Error::new(
             "unsupported-set-member",
-            "owned sets manage top-level agents, missions and schedules only",
+            "owned sets manage top-level agents with their nested exec and PTY tasks, missions and schedules only",
         ));
     }
     let old = selected(transaction, None)?
@@ -693,6 +709,17 @@ pub(super) fn plan_tx(
             ));
         }
     }
+    // Older daemons refuse receipts naming exec or PTY members, even through replication.
+    let tasks = input
+        .subjects
+        .keys()
+        .any(|s| attached_parent(input, s).is_some())
+        || old.as_ref().is_some_and(|view| {
+            view.receipt
+                .members
+                .values()
+                .any(|m| matches!(m.kind.as_str(), "exec" | "pty"))
+        });
     let membership = fleet_membership_tx(transaction).map_err(internal)?;
     for member in membership.incarnations().filter(|m| m.end.is_none()) {
         let supported: Option<bool> = transaction.query_row(&canonical_sql(
@@ -718,6 +745,15 @@ pub(super) fn plan_tx(
                 params![format!("daemon/{}",member.name),member.name],|row|row.get(0)).optional().map_err(internal)?.flatten();
             if supported != Some(true) {
                 blockers.push(format!("host/{} has not advertised manual seat-rollout support; upgrade before activation", member.name));
+            }
+        }
+        if tasks {
+            let supported: Option<bool> = transaction.query_row(&canonical_sql(
+                "SELECT json_extract(body,'$.fields.features.owned_set_tasks')=1 FROM claims
+                 WHERE subject=?1 AND kind='daemon.started' AND origin=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                params![format!("daemon/{}",member.name),member.name],|row|row.get(0)).optional().map_err(internal)?.flatten();
+            if supported != Some(true) {
+                blockers.push(format!("host/{} has not advertised owned-set exec and PTY task support; upgrade before publishing nested tasks", member.name));
             }
         }
         if supported != Some(true) {
@@ -784,7 +820,9 @@ pub(super) fn plan_tx(
             intent_leaves_tx(transaction, s).map_err(internal)?
         };
         if own.is_none() && !tokens.is_empty() {
-            if !options.adopt.contains(s) {
+            if !options.adopt.contains(s)
+                && !attached_parent(input, s).is_some_and(|seat| options.adopt.contains(&seat))
+            {
                 blockers.push(format!("explicit adoption required: {s}"));
             } else {
                 adoptions.insert(s.clone(), tokens.clone());
@@ -818,7 +856,8 @@ pub(super) fn plan_tx(
                     (Some(new), Some(old)) => {
                         let changed = new.launch_changes(&old);
                         let manual = input.subjects.get(s).is_some_and(crate::rollout::manual);
-                        if (options.rollout.is_some() || manual) && !changed.is_empty() {
+                        let attached = attached_parent(input, s).is_some();
+                        if !attached && (options.rollout.is_some() || manual) && !changed.is_empty() {
                             if old_subject
                                 .as_ref()
                                 .and_then(|d| crate::accounts::harness_binding(&d.desired))
@@ -853,7 +892,9 @@ pub(super) fn plan_tx(
                         } else {
                             format!(
                                 "{}: {}",
-                                if manual {
+                                if attached {
+                                    "restart runtime; held while its seat's cutover is pending"
+                                } else if manual {
                                     "publish declaration; rollout pending (manual)"
                                 } else if options.rollout.is_some() {
                                     "drain and resume native session"
@@ -930,6 +971,8 @@ pub(super) fn plan_tx(
                     s.clone(),
                     if m.kind == "schedule" {
                         "stop future occurrences; retain runs"
+                    } else if matches!(m.kind.as_str(), "exec" | "pty") {
+                        "stop runtime; held while its seat's cutover is pending"
                     } else {
                         if manual {
                             "publish retirement; rollout pending (manual)"
@@ -1082,6 +1125,10 @@ pub(super) fn commit_tx(
                 },
                 kind: if s.starts_with("agent/") {
                     "agent"
+                } else if s.starts_with("exec/") {
+                    "exec"
+                } else if s.starts_with("pty/") {
+                    "pty"
                 } else {
                     "schedule"
                 }
@@ -1221,7 +1268,7 @@ pub(super) fn validate_receipt(subject_name: &str, body: &Value) -> Result<(), S
         ));
     }
     for (s, m) in revision.members.iter().chain(&revision.retired) {
-        if !matches!(m.kind.as_str(), "agent" | "mission" | "schedule")
+        if !matches!(m.kind.as_str(), "agent" | "exec" | "pty" | "mission" | "schedule")
             || !s.starts_with(&format!("{}/", m.kind))
             || m.claim.is_empty()
             || m.revision.is_empty()
