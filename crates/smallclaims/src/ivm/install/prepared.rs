@@ -177,95 +177,188 @@ impl PreparedPage {
     /// Call in the SAME read snapshot as prepare_*, before any off-writer computation.
     /// Ordinary namespace-keyed tables only. Generated/virtual tables are unsupported.
     pub fn capture_table(&mut self, db: &Connection, name: &str) -> Result<()> {
-        identifier(name)?;
+        self.capture_tables(db, &[name])
+    }
+
+    /// Capture a bounded group on the supplied preparation cut, sharing one foreign-key
+    /// inventory traversal. Nothing is cached across calls/cuts; all metadata is accepted
+    /// together only after every shape and fanout check succeeds. Duplicate group names refuse;
+    /// the single-table wrapper may still recapture an existing table. Schema row caps do not
+    /// qualify SQLite metadata VM/byte work; callers still need actual work accounting.
+    pub fn capture_tables(&mut self, db: &Connection, names: &[&str]) -> Result<()> {
+        ensure!(
+            !names.is_empty() && names.len() <= self.limits.tables,
+            "prepared table bound exceeded"
+        );
+        let requested = names
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        ensure!(requested.len() == names.len(), "duplicate prepared table");
+        for &name in names {
+            identifier(name)?;
+        }
+        ensure!(
+            self.tables
+                .keys()
+                .map(String::as_str)
+                .chain(names.iter().copied())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                <= self.limits.tables,
+            "prepared table bound exceeded"
+        );
+        // The caller owns one preparation snapshot. Stage read-only metadata privately;
+        // the final schema check below rejects a changed cut before accepting any table.
+        // A second cookie read here does not strengthen that same-cut acceptance check.
+        let tables = self.capture_table_shapes(db, names)?;
+        // The materialized inventory preserves the old 256-table refusal. A LEFT JOIN
+        // emits a row even for a table with no foreign keys. Stream counts per table to
+        // preserve the old 128 FK-column-row cap, including unrelated tables. The extra
+        // global row detects truncation instead of treating an incomplete walk as safe.
+        const SCHEMA_TABLES: usize = 256;
+        const FK_ROWS: usize = 128;
+        let mut statement = db.prepare(
+            "WITH inventory AS MATERIALIZED (
+               SELECT name FROM main.sqlite_schema WHERE type='table' ORDER BY name LIMIT 257
+             )
+             SELECT inventory.name,f.id,f.\"table\"
+             FROM inventory LEFT JOIN pragma_foreign_key_list(inventory.name,'main') AS f ON 1
+             LIMIT ?1",
+        )?;
+        let mut rows = statement.query([(SCHEMA_TABLES * FK_ROWS + 1) as i64])?;
+        let mut inventory = BTreeMap::<String, usize>::new();
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            count += 1;
+            ensure!(
+                count <= SCHEMA_TABLES * FK_ROWS,
+                "prepared foreign-key inventory exceeds bound"
+            );
+            let candidate: String = row.get(0)?;
+            let fk_id: Option<i64> = row.get(1)?;
+            let target: Option<String> = row.get(2)?;
+            let foreign_keys = inventory.entry(candidate.clone()).or_default();
+            match (fk_id, target) {
+                (None, None) => {}
+                (Some(_), Some(target)) => {
+                    *foreign_keys += 1;
+                    ensure!(
+                        *foreign_keys <= FK_ROWS,
+                        "prepared foreign-key inventory exceeds bound"
+                    );
+                    ensure!(
+                        !names.iter().any(|name| candidate.eq_ignore_ascii_case(name)
+                            || target.eq_ignore_ascii_case(name)),
+                        "prepared output foreign keys unsupported"
+                    );
+                }
+                _ => anyhow::bail!("prepared malformed foreign-key metadata"),
+            }
+            ensure!(
+                inventory.len() <= SCHEMA_TABLES,
+                "prepared schema inventory exceeds bound"
+            );
+        }
         ensure!(
             schema_version(db)? == self.schema_version,
             "prepared table schema changed"
         );
-        ensure!(
-            self.tables.len() < self.limits.tables || self.tables.contains_key(name),
-            "prepared table bound exceeded"
-        );
-        let kind: String = db.query_row(
-            "SELECT type FROM pragma_table_list WHERE schema='main' AND name=?1",
-            [name],
-            |r| r.get(0),
-        )?;
-        ensure!(kind == "table", "prepared virtual/shadow table unsupported");
-        let mut statement =
-            db.prepare("SELECT name,pk,hidden FROM pragma_table_xinfo(?1) LIMIT 129")?;
-        let fields = statement
-            .query_map([name], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, u32>(1)?,
-                    r.get::<_, u32>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(
-            !fields.is_empty() && fields.len() <= 128 && fields.iter().all(|f| f.2 == 0),
-            "prepared generated/oversized table unsupported"
-        );
-        ensure!(
-            !db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND tbl_name=?1)",
-                [name],
-                |r| r.get::<_, bool>(0)
-            )?,
-            "prepared output triggers unsupported"
-        );
-        // Reject every foreign-key edge touching this output: cascades could turn a
-        // bounded point write into unbounded work. Inspect only a bounded schema inventory.
-        let mut inventory = db
-            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name LIMIT 257")?;
-        let names = inventory
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(
-            names.len() <= 256,
-            "prepared schema inventory exceeds bound"
-        );
-        for candidate in names {
-            let mut fk =
-                db.prepare("SELECT \"table\" FROM pragma_foreign_key_list(?1) LIMIT 129")?;
-            let targets = fk
-                .query_map([&candidate], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            ensure!(
-                targets.len() <= 128,
-                "prepared foreign-key inventory exceeds bound"
-            );
-            ensure!(
-                (candidate != name || targets.is_empty())
-                    && !targets.iter().any(|t| t.eq_ignore_ascii_case(name)),
-                "prepared output foreign keys unsupported"
-            );
-        }
-        for field in &fields {
-            identifier(&field.0)?;
-        }
-        let columns = fields.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
-        let mut primary = fields.iter().filter(|f| f.1 > 0).collect::<Vec<_>>();
-        primary.sort_by_key(|f| f.1);
-        ensure!(
-            primary.iter().any(|f| f.0 == "namespace"),
-            "namespace must be part of prepared primary key"
-        );
-        let keys = primary
-            .iter()
-            .filter(|f| f.0 != "namespace")
-            .map(|f| f.0.clone())
-            .collect();
-        self.tables.insert(
-            name.into(),
-            Table {
-                name: name.into(),
-                columns,
-                keys,
-            },
-        );
+        self.tables.extend(tables);
         Ok(())
+    }
+
+    fn capture_table_shapes(
+        &self,
+        db: &Connection,
+        names: &[&str],
+    ) -> Result<BTreeMap<String, Table>> {
+        // Names were validated and bounded before discovery. Materialize headers so
+        // table_list and trigger discovery are shared, rather than repeated per field.
+        // NOT INDEXED keeps the small bounded header join from building an autoindex.
+        // The LEFT JOIN retains missing/zero-column shapes for explicit refusal.
+        let requested = vec!["(?)"; names.len()].join(",");
+        let sql = format!(
+            "WITH requested(name) AS (VALUES {requested}),
+             kinds AS MATERIALIZED (
+               SELECT name,type FROM pragma_table_list WHERE schema='main'
+                 AND name IN (SELECT name FROM requested)
+             ), headers AS MATERIALIZED (
+               SELECT requested.name,kinds.type,
+                 EXISTS(SELECT 1 FROM main.sqlite_schema
+                        WHERE type='trigger' AND tbl_name=requested.name) AS triggered
+               FROM requested LEFT JOIN kinds NOT INDEXED ON kinds.name=requested.name
+             )
+             SELECT headers.name,headers.type,headers.triggered,f.name,f.pk,f.hidden
+             FROM headers LEFT JOIN pragma_table_xinfo(headers.name,'main') AS f ON 1
+             LIMIT {}",
+            names.len() * 128 + 1
+        );
+        let mut statement = db.prepare(&sql)?;
+        let mut rows = statement.query(params_from_iter(names.iter()))?;
+        let mut fields = BTreeMap::<String, Vec<(String, u32)>>::new();
+        let mut count = 0;
+        while let Some(row) = rows.next()? {
+            count += 1;
+            ensure!(
+                count <= names.len() * 128,
+                "prepared generated/oversized table unsupported"
+            );
+            let name: String = row.get(0)?;
+            let kind: Option<String> = row.get(1)?;
+            ensure!(
+                kind.as_deref() == Some("table"),
+                "prepared virtual/shadow/missing table unsupported"
+            );
+            ensure!(
+                !row.get::<_, bool>(2)?,
+                "prepared output triggers unsupported"
+            );
+            let column: Option<String> = row.get(3)?;
+            let pk: Option<u32> = row.get(4)?;
+            let hidden: Option<u32> = row.get(5)?;
+            let (Some(column), Some(pk), Some(0)) = (column, pk, hidden) else {
+                anyhow::bail!("prepared generated/oversized table unsupported");
+            };
+            identifier(&column)?;
+            let columns = fields.entry(name).or_default();
+            ensure!(
+                columns.len() < 128,
+                "prepared generated/oversized table unsupported"
+            );
+            columns.push((column, pk));
+        }
+        ensure!(
+            fields.len() == names.len(),
+            "prepared table metadata incomplete"
+        );
+        let mut tables = BTreeMap::new();
+        for &name in names {
+            let fields = fields
+                .get(name)
+                .context("prepared table metadata incomplete")?;
+            let columns = fields.iter().map(|f| f.0.clone()).collect::<Vec<_>>();
+            let mut primary = fields.iter().filter(|f| f.1 > 0).collect::<Vec<_>>();
+            primary.sort_by_key(|f| f.1);
+            ensure!(
+                primary.iter().any(|f| f.0 == "namespace"),
+                "namespace must be part of prepared primary key"
+            );
+            let keys = primary
+                .iter()
+                .filter(|f| f.0 != "namespace")
+                .map(|f| f.0.clone())
+                .collect();
+            tables.insert(
+                name.to_owned(),
+                Table {
+                    name: name.into(),
+                    columns,
+                    keys,
+                },
+            );
+        }
+        Ok(tables)
     }
     /// Values cover all non-namespace columns in captured table order; namespace is injected.
     pub fn upsert(&mut self, table: &str, values: Vec<SqlValue>) -> Result<()> {
@@ -783,6 +876,34 @@ impl Installer {
         view: &str,
         limits: PublicationLimits,
     ) -> Result<PreparedPage> {
+        self.prepare_live_inner(db, view, limits, limits.rows, limits.bytes)
+    }
+    /// Bound input references separately from the combined input/write/evidence budget.
+    /// This allows a page to consume N inputs and publish their bounded outputs without
+    /// selecting extra inputs merely to leave room for writes. Both budgets are cumulative.
+    pub fn prepare_live_bounded(
+        &self,
+        db: &Connection,
+        view: &str,
+        limits: PublicationLimits,
+        input_rows: usize,
+        input_bytes: usize,
+    ) -> Result<PreparedPage> {
+        limits.validate()?;
+        ensure!(
+            (1..=limits.rows).contains(&input_rows) && (1..=limits.bytes).contains(&input_bytes),
+            "prepared input bound exceeds publication budget"
+        );
+        self.prepare_live_inner(db, view, limits, input_rows, input_bytes)
+    }
+    fn prepare_live_inner(
+        &self,
+        db: &Connection,
+        view: &str,
+        limits: PublicationLimits,
+        input_rows: usize,
+        input_bytes: usize,
+    ) -> Result<PreparedPage> {
         let (namespace,source,fingerprint,source_fp,epoch,applied,ready,generation,status):(String,String,String,String,u64,u64,bool,u64,u64)=db.query_row("SELECT namespace,source,fingerprint,source_fingerprint,epoch,revision,ready,generation,status_revision FROM ivm_install_roots WHERE view=?1",[view],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?)))?;
         ensure!(
             ready && self.fingerprints.get(view) == Some(&fingerprint),
@@ -805,7 +926,7 @@ impl Installer {
             page.position.epoch == epoch && page.position.fingerprint == source_fp,
             "prepared live source replaced"
         );
-        page.load_references(db, applied, limits.rows, limits.bytes)?;
+        page.load_references(db, applied, input_rows, input_bytes)?;
         Ok(page)
     }
     /// Apply only precomputed writes. Caller uses a short managed reactor transaction and

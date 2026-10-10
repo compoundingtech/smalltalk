@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Validate staged prepared metadata once before same-cut acceptance",
+  "replay": {
+    "status": "none",
+    "detail": "Remove a redundant pre-discovery schema read under the existing caller-owned snapshot contract; final schema refusal and all-or-none acceptance remain, with changed-cut/publication controls and unchanged accounting ceilings. No persisted schema, source activation, publication or writer change. Exact-test successful output visibility changes only diagnostics; retry/thread/budget policies remain."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Remove a redundant pre-discovery schema read under the existing caller-owned snapshot contract; final schema refusal and all-or-none acceptance remain, with changed-cut/publication controls and unchanged accounting ceilings. No persisted schema, source activation, publication or writer change. Exact-test successful output visibility changes only diagnostics; retry/thread/budget policies remain."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Remove a redundant pre-discovery schema read under the existing caller-owned snapshot contract; final schema refusal and all-or-none acceptance remain, with changed-cut/publication controls and unchanged accounting ceilings. No persisted schema, source activation, publication or writer change. Exact-test successful output visibility changes only diagnostics; retry/thread/budget policies remain."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Remove a redundant pre-discovery schema read under the existing caller-owned snapshot contract; final schema refusal and all-or-none acceptance remain, with changed-cut/publication controls and unchanged accounting ceilings. No persisted schema, source activation, publication or writer change. Exact-test successful output visibility changes only diagnostics; retry/thread/budget policies remain."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Remove a redundant pre-discovery schema read under the existing caller-owned snapshot contract; final schema refusal and all-or-none acceptance remain, with changed-cut/publication controls and unchanged accounting ceilings. No persisted schema, source activation, publication or writer change. Exact-test successful output visibility changes only diagnostics; retry/thread/budget policies remain."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Remove a redundant pre-discovery schema read under the existing caller-owned snapshot contract; final schema refusal and all-or-none acceptance remain, with changed-cut/publication controls and unchanged accounting ceilings. No persisted schema, source activation, publication or writer change. Exact-test successful output visibility changes only diagnostics; retry/thread/budget policies remain."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Remove a redundant pre-discovery schema read under the existing caller-owned snapshot contract; final schema refusal and all-or-none acceptance remain, with changed-cut/publication controls and unchanged accounting ceilings. No persisted schema, source activation, publication or writer change. Exact-test successful output visibility changes only diagnostics; retry/thread/budget policies remain."
+  }
+}
