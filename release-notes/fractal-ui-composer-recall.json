@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "fractal-ui restores the previous-message action beside Send, and fractal-web recalls the user's own confirmed submitted drafts",
+  "summary": "Enable previous-message recall beside Send using confirmed own submitted drafts. Shared send events reset recall, and recall stays unavailable while an own send is pending.",
   "replay": {
     "status": "none",
     "detail": "No replay or rebuild."
