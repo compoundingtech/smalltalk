@@ -25,7 +25,6 @@ struct Daemon {
     socket: PathBuf,
     store: Arc<Store>,
     event_notify: watch::Sender<u64>,
-    server: Option<tokio::task::JoinHandle<()>>,
     isolated_server: Option<(tokio::sync::oneshot::Sender<()>, std::thread::JoinHandle<()>)>,
 }
 
@@ -36,7 +35,6 @@ impl Daemon {
             socket: root.join("st3.sock"),
             store: Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap()),
             event_notify: watch::channel(0_u64).0,
-            server: None,
             isolated_server: None,
         }
     }
@@ -69,9 +67,14 @@ impl Daemon {
         }
     }
 
-    // Dropping this runtime also closes upgraded WebSocket connections, just as exiting
-    // the daemon does. Aborting only the listener would leave those tasks alive.
+    // Dropping this runtime closes accepted HTTP requests and upgraded WebSocket
+    // connections, just as exiting the daemon does. Aborting only the listener
+    // would leave those tasks alive.
     async fn start_isolated_app(&mut self, app: axum::Router) {
+        self.start_isolated_app_with_binding(app, true).await;
+    }
+
+    async fn start_isolated_app_with_binding(&mut self, app: axum::Router, native: bool) {
         let socket = self.socket.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let thread = std::thread::spawn(move || {
@@ -82,7 +85,13 @@ impl Daemon {
                 .unwrap();
             runtime.block_on(async {
                 tokio::select! {
-                    result = st3::api::serve_unix_bound(&socket, &socket, app) => {
+                    result = async {
+                        if native {
+                            st3::api::serve_unix_bound(&socket, &socket, app).await
+                        } else {
+                            st3::api::serve_unix(&socket, app).await
+                        }
+                    } => {
                         result.unwrap();
                     }
                     _ = stopped => {}
@@ -99,22 +108,7 @@ impl Daemon {
     }
 
     async fn start_with_binding(&mut self, native: bool) {
-        let state = self.state();
-        let socket = self.socket.clone();
-        self.server = Some(tokio::spawn(async move {
-            let app = st3::api::router(state);
-            if native {
-                let _ = st3::api::serve_unix_bound(&socket, &socket, app).await;
-            } else {
-                let _ = st3::api::serve_unix(&socket, app).await;
-            }
-        }));
-        wait_until(
-            "the daemon accepts connections",
-            Duration::from_secs(5),
-            || std::os::unix::net::UnixStream::connect(&self.socket).is_ok(),
-        )
-        .await;
+        self.start_isolated_app_with_binding(st3::api::router(self.state()), native).await;
     }
 
     /// Stop the API the way an exiting daemon does: the socket file stays and refuses.
@@ -122,10 +116,6 @@ impl Daemon {
         if let Some((stop, thread)) = self.isolated_server.take() {
             let _ = stop.send(());
             tokio::task::spawn_blocking(move || thread.join().unwrap()).await.unwrap();
-        }
-        if let Some(server) = self.server.take() {
-            server.abort();
-            let _ = server.await;
         }
         wait_until(
             "the stopped daemon refuses new connections",
@@ -220,9 +210,6 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        if let Some(server) = self.server.take() {
-            server.abort();
-        }
         if let Some((stop, thread)) = self.isolated_server.take() {
             let _ = stop.send(());
             let _ = thread.join();
@@ -871,7 +858,27 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
     assert_alive(&mut driver, "a starting Claude driver");
     assert!(daemon.harness_states(seat, incarnation).is_empty());
 
-    daemon.start().await;
+    let accepted = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (seen, gate) = (accepted.clone(), release.clone());
+    let app = st3::api::router(daemon.state()).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let (seen, gate, first) = (seen.clone(), gate.clone(), first.clone());
+            async move {
+                if request.uri().path() == "/v1/messages/page"
+                    && first.swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    seen.notify_one();
+                    gate.notified().await;
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    // Stop must close this accepted request as well as the listener. Its handler is
+    // released only after offline mail is appended, so a surviving old API would leak it.
+    daemon.start_isolated_app(app).await;
     wait_until(
         "the driver records the seat as starting",
         Duration::from_secs(10),
@@ -879,10 +886,14 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
     )
     .await;
 
-    // Now the seat is running. A message accepted just before the next restart is delivered
-    // once the daemon is back, without the driver exiting or writing to the seat's terminal.
+    tokio::time::timeout(Duration::from_secs(10), accepted.notified())
+        .await
+        .expect("the driver has an accepted message-page request");
+    // A message accepted while the API is stopped is delivered once the daemon is
+    // back, without the driver exiting or writing to the seat's terminal.
     daemon.stop().await;
     daemon.send("message/restart-claude-mail", seat, "AMBER LANTERN");
+    release.notify_one();
     wait_until(
         "native delivery observes the daemon outage",
         Duration::from_secs(20),
@@ -893,7 +904,12 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
     )
     .await;
     assert_alive(&mut driver, "a running Claude driver");
-    assert!(files_containing(&root.join("drivers"), "AMBER LANTERN").is_empty());
+    let payload_files = files_containing(&root.join("drivers"), "AMBER LANTERN");
+    assert!(
+        payload_files.is_empty(),
+        "outage payload files: {payload_files:?}; driver log: {}",
+        driver_log(root)
+    );
     daemon.start().await;
     wait_until(
         "native delivery records recovery after the daemon restart",
