@@ -94,6 +94,39 @@ nix develop .#web -c python3 scripts/ci-fractal-web-licenses --check
 full guard immediately after its frozen install. The generator/full guard restore the
 inventory's read-only permissions (Git does not preserve them).
 
+## Fractal app Storybook
+
+The app-owned book mounts `LiveAgentWorkspace` and `ConversationPane` directly from
+their production modules, under `DataSourceProvider` and `fixtureSource`. It never
+imports the live bootstrap or starts a gateway. Its Vite builder loads the app's
+unchanged `vite.config.ts`, including the production StyleX compiler and virtual
+CSS pipeline; the preview imports the real app stylesheet and theme roots.
+
+```sh
+pnpm --filter fractal-web storybook
+pnpm --filter fractal-web build-storybook
+pnpm --filter fractal-web typecheck
+pnpm --filter fractal-web test
+```
+
+Development listens on `127.0.0.1:53706`; the static build is
+`apps/fractal-web/storybook-static` (ignored by Git). Build the app first, then the
+kit, never concurrently. The kit landing composes the app as ref `fractal-app`,
+title **Fractal App**. Canonical suites are `Fractal/App/LiveAgentWorkspace` and
+`Fractal/App/ConversationPane`. Each has four AllStates variants: dark/light ×
+600/1440px, showing loading, empty, populated, a failed tool, offline/stale,
+unavailable and the existing scripted repair session. Fixture time is frozen.
+The adapter decodes production DTOs and reuses the existing timeline projector;
+its unit tests run the scenario corpus decode/privacy gates and an intentional
+stub control that must reject the missing production transcript.
+
+There is no kit Storybook test-runner task in this checkout. To exercise plays,
+serve the static directory with a loopback static server, open each story's
+`iframe.html?id=<story-id>&viewMode=story` in Playwright, and wait for
+`[data-app-play="passed"]`. That marker is written only after the production
+transcript/composer assertions succeed. Do not infer play success from a story
+label or a loaded iframe.
+
 ## fractal-web Content Security Policy
 
 The app server and Vite's development/preview servers set an enforcing
