@@ -87,6 +87,12 @@ const meta = {
 export default meta
 type Story = StoryObj<typeof meta>
 
+export const SoftParagraphLines: Story = {
+  render: () => <div {...stylex.props(styles.canvas, ...baselineTheme)}><ThemePortal><div style={{ padding: 40, maxWidth: 760 }}>
+    <Markdown text={'One per line:\n1\n2\n3\n\n```text\na\nb\n```'} />
+  </div></ThemePortal></div>,
+}
+
 const settle = () => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
 const requireElement = <T extends Element>(root: Element, selector: string): T => {
   const element = root.querySelector<T>(selector)
