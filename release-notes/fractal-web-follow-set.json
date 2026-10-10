@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web adopts the fractal-ui follow set: a floating Scroll to end pill that hides on press intent and eases back to the growing transcript end (instant under prefers-reduced-motion), reader input cancels the return, and detached history keeps its anchor while content grows or shrinks above it. Bounded turns anchor their nested rows (tool status, thinking entries, work-log summaries) instead of the turn wrapper, and switching back to a conversation inside the app restores the reader's row by its item id. Sidebar rows omit attention and unread signals the runtime does not report.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only packages/fractal-ui changes. The restored row lives in memory for the page lifetime; no storage, protocol or wire-format change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}
