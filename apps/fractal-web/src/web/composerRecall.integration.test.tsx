@@ -41,11 +41,14 @@ it('loads submitted history only on recall activation, never on mount or transcr
   expect(get).toHaveBeenCalledTimes(1)
   expect(container.querySelector('textarea')?.value).toBe('Previous submitted message')
 })
-it('resets the recall cursor when submitting before the next confirmed draft appears', async () => {
+it.each(['form', 'Enter'])('resets the recall cursor through %s before the next confirmed draft appears', async path => {
   await mount(['Earlier', 'Latest'])
   const button = () => container.querySelector<HTMLButtonElement>('button[aria-label="Recall previous message"]')!
   await React.act(async () => button().click())
-  await React.act(async () => container.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })))
+  await React.act(async () => {
+    if (path === 'form') container.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    else container.querySelector('textarea')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }))
+  })
   await mount(['Earlier', 'Latest', 'New confirmed'])
   await React.act(async () => button().click())
   expect(container.querySelector('textarea')?.value).toBe('New confirmed')
@@ -64,4 +67,14 @@ it('leaves multiline caret navigation alone away from the first and last line', 
   field.setSelectionRange(0, 0)
   await React.act(async () => field.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true })))
   expect(field.value).toBe('Earlier')
+})
+it('resets recalled history through the actual Send button, not just form submission', async () => {
+  await mount(['Earlier', 'Latest'])
+  await React.act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Recall previous message"]')!.click())
+  const send = container.querySelector<HTMLButtonElement>('button[aria-label="Send"]')!
+  expect(send.type).toBe('button')
+  await React.act(async () => send.click())
+  await mount(['Earlier', 'Latest', 'New confirmed'])
+  await React.act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Recall previous message"]')!.click())
+  expect(container.querySelector('textarea')?.value).toBe('New confirmed')
 })

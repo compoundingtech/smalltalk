@@ -1,6 +1,6 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
-import { ComposerPrimitive, QueueItemPrimitive, useAui, useAuiState } from '@assistant-ui/react'
+import { ComposerPrimitive, QueueItemPrimitive, useAui, useAuiEvent, useAuiState } from '@assistant-ui/react'
 import {
   Autocomplete, Button, Focusable, Header, ListBox, ListBoxItem, ListBoxSection, Menu, MenuItem, MenuTrigger, Popover, Text, Token, TokenField, TokenInput, Tooltip, TooltipTrigger,
   type Key,
@@ -312,6 +312,7 @@ function PlainComposer({ history = emptyHistory, historySource, showHistory = fa
   const aui = useAui()
   const formRef = React.useRef<HTMLFormElement>(null)
   const recall = React.useRef<{ index: number; original: string; entries: readonly string[] } | undefined>(undefined)
+  useAuiEvent('composer.send', () => { recall.current = undefined })
   const hasHistory = historySource?.available ?? history.length > 0
   const recallHistory = (direction: 'previous' | 'next') => {
     if (readOnly || !hasHistory) return
@@ -331,7 +332,7 @@ function PlainComposer({ history = emptyHistory, historySource, showHistory = fa
       ref={formRef}
       onInput={() => { recall.current = undefined }}
       {...stylex.props(styles.root, style)}
-      onSubmit={event => { recall.current = undefined; if (readOnly || onRequestSubmit !== undefined) event.preventDefault(); if (!readOnly) onRequestSubmit?.(false) }}
+      onSubmit={event => { if (readOnly || onRequestSubmit !== undefined) event.preventDefault(); if (!readOnly) onRequestSubmit?.(false) }}
       onCompositionStartCapture={() => { composing.current = true }}
       onCompositionEndCapture={() => { composing.current = false }}
       onKeyDownCapture={event => {
