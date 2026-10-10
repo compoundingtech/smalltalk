@@ -44,7 +44,8 @@ For example, the sync canvas supports
 `?id=fractal-ui-scenarios-sync-line--explore&globals=scenario:failed-sync-socket-dropped&args=sync:socket-dropped;scheme:dark`.
 The sync controls also include `reconnected` and `subscription-limit-local`.
 The elapsed-time control (`scenarioAt`) defaults to 10,000 ms, after the socket-drop and
-reconnection events. It drives the kit's manual clock rather than inventing a transport status.
+reconnection events. The preview wraps `withScenario` with this manual clock, so the provider
+and the component's observation time agree rather than inventing a transport status.
 `pnpm --filter @smalltalk/fractal-ui check-scenarios <receipt.json>` checks declared reads,
 contrast pairs, world switching, pinned worlds and URL state through the actual component stories.
 
