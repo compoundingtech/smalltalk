@@ -75,3 +75,9 @@ success-output = "immediate"
 [[profile.ci.overrides]]
 filter = 'package(=smallclaims) and binary(=ivm_admitted_applied_slice) and test(/^canonical_metadata_inventory_growth_reports_actual_page_work$/)'
 success-output = "immediate"
+
+# Retain actual maintenance work and removed row/byte counts on success.
+# Output visibility only: all inherited retries, threads and ceilings remain.
+[[profile.ci.overrides]]
+filter = 'package(=smallclaims) and binary(=ivm_admitted_applied_slice) and test(/^full_prune_accounting_includes_physical_writer_return$/)'
+success-output = "immediate"
