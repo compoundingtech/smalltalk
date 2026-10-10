@@ -299,10 +299,11 @@ class Gateway {
     })
   }
 
-  screen(id: string, name: string, text: string) {
+  /** `terminalId` defaults to the subject-shaped id; the daemon itself publishes `terminal/<agent id>`. */
+  screen(id: string, name: string, text: string, terminalId = `terminal/${name}`) {
     const value: TerminalScreen = {
       kind: 'terminal-screen',
-      terminal_id: `terminal/${name}`,
+      terminal_id: terminalId,
       runtime_incarnation: `incarnation-${name}`,
       revision: '1',
       next_sequence: 1,
@@ -963,7 +964,7 @@ describe('terminal input', () => {
         yield* settle
         gateway.screen(gateway.subscription('terminal').id, 'example', 'prompt$')
         yield* settle
-        const port = yield* Effect.promise(() => live.source.terminalInput!({ terminalRef: 'terminal/example', incarnation: 'incarnation-example', registry: live.registry }))
+        const port = yield* Effect.promise(() => live.source.terminalInput!({ subject: 'terminal/example', terminalRef: 'terminal/example', incarnation: 'incarnation-example', registry: live.registry }))
         port.open()
         yield* Effect.promise(() => port.send(new Uint8Array([3])))
         expect(gateway.terminalInputs).toEqual([
@@ -974,11 +975,48 @@ describe('terminal input', () => {
           }),
         ])
         // A session bound to an older incarnation never reaches the current program.
-        const old = yield* Effect.promise(() => live.source.terminalInput!({ terminalRef: 'terminal/example', incarnation: 'incarnation-previous', registry: live.registry }))
+        const old = yield* Effect.promise(() => live.source.terminalInput!({ subject: 'terminal/example', terminalRef: 'terminal/example', incarnation: 'incarnation-previous', registry: live.registry }))
         old.open()
         const refused = yield* Effect.promise(() => old.send(new Uint8Array([3])).then(() => 'sent', () => 'refused'))
         expect(refused).toBe('refused')
         expect(gateway.terminalInputs).toHaveLength(1)
+      }),
+    ),
+  )
+
+  it.live('admits keys for the shown screen when the gateway terminal id differs from the subject address', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.agents)
+        live.registry.mount(live.source.grants)
+        yield* settle
+        // Real id shapes: the view addresses `terminal/<agent path>`, the daemon names `terminal/<agent id>`.
+        const seat = { ...agent, id: 'agent/example/input-subject' }
+        gateway.fleet([seat])
+        yield* settle
+        const subject = 'terminal/example/input-subject'
+        live.registry.mount(live.source.terminalInterest!(subject))
+        yield* settle
+        gateway.screen(gateway.subscription('terminal').id, 'example', 'prompt$', `terminal/${seat.id}`)
+        yield* settle
+        const shown = live.registry.get(live.source.terminal(subject))
+        if (shown._tag !== 'Observed') return yield* Effect.die(`terminal ${subject} was not observed`)
+        // Bind the session exactly as TerminalDetail does: from the shown screen's own identity.
+        const port = yield* Effect.promise(() => live.source.terminalInput!({
+          subject,
+          terminalRef: shown.value.terminal_id,
+          incarnation: shown.value.runtime_incarnation,
+          registry: live.registry,
+        }))
+        port.open()
+        const outcome = yield* Effect.promise(() => port.send(new Uint8Array([3])).then(() => 'sent', (error: Error) => error.message))
+        expect(outcome).toBe('sent')
+        expect(gateway.terminalInputs).toEqual([
+          expect.objectContaining({
+            parameters: { terminal_id: 'terminal/agent/example/input-subject', mode: 'key', value: 'ctrl+c' },
+            fence: { snapshot_id: snapshot.id, subject_revisions: {}, runtime_incarnation: 'incarnation-example', terminal_sequence: 1 },
+          }),
+        ])
       }),
     ),
   )
@@ -997,7 +1035,7 @@ describe('terminal input', () => {
         gateway.screen(gateway.subscription('terminal').id, 'example', 'prompt$')
         yield* settle
         expect(live.registry.get(live.source.grants).terminalInput).toBe('ungranted')
-        const port = yield* Effect.promise(() => live.source.terminalInput!({ terminalRef: 'terminal/example', incarnation: 'incarnation-example', registry: live.registry }))
+        const port = yield* Effect.promise(() => live.source.terminalInput!({ subject: 'terminal/example', terminalRef: 'terminal/example', incarnation: 'incarnation-example', registry: live.registry }))
         port.open()
         const outcome = yield* Effect.promise(() => port.send(new Uint8Array([3])).then(() => 'sent', (error: Error) => error.message))
         expect(outcome).toBe('This device is not allowed to type into terminals.')

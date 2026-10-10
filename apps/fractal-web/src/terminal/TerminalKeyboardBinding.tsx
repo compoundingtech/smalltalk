@@ -14,6 +14,8 @@ import { TerminalKeyboard } from './TerminalKeyboard.tsx'
 
 /** Props for binding ordered input to one observed terminal incarnation. */
 export interface TerminalKeyboardBindingProps {
+  /** The subject address of the shown terminal feed; the input port re-reads that feed per post. */
+  readonly subject: string
   readonly terminalRef: string
   readonly incarnation: string
   readonly modes: TerminalModes
@@ -52,6 +54,7 @@ interface PreparedKeyboard {
 }
 
 const SupportedKeyboard = ({
+  subject,
   terminalRef,
   incarnation,
   modes,
@@ -64,7 +67,7 @@ const SupportedKeyboard = ({
         Effect.acquireRelease(
           Effect.tryPromise({
             try: async (signal): Promise<PreparedKeyboard> => {
-              const port = await factory({ terminalRef, incarnation, registry })
+              const port = await factory({ subject, terminalRef, incarnation, registry })
               if (signal.aborted) {
                 port.close()
                 throw new TerminalInputPreparationCancelled()
@@ -102,7 +105,7 @@ const SupportedKeyboard = ({
             }),
         ),
       ).pipe(Atom.setIdleTTL(0)),
-    [factory, registry, terminalRef, incarnation],
+    [factory, registry, subject, terminalRef, incarnation],
   )
   const result = useAtomValue(resource)
   const refresh = useAtomRefresh(resource)

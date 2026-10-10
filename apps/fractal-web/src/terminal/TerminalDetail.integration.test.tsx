@@ -22,7 +22,10 @@ import { makeTerminalInputFixture } from './terminalInputFixture.ts'
 vi.mock('@stylexjs/stylex', () => ({ create: (styles: unknown) => styles, defineVars: (variables: unknown) => variables, createTheme: () => ({}), keyframes: () => 'animation', props: () => ({}) }))
 
 const ref = 'terminal/example'
-const screen: TerminalScreen = { ...makeScreen({ scene: 'F3', columns: 40, rows: 4, frame: 0 }), terminal_id: ref }
+// The daemon names the terminal `terminal/<agent id>`, not by the view's subject address.
+const screen: TerminalScreen = { ...makeScreen({ scene: 'F3', columns: 40, rows: 4, frame: 0 }), terminal_id: 'terminal/agent/example' }
+const other: `terminal/${string}` = 'terminal/other'
+const otherScreen: TerminalScreen = { ...screen, terminal_id: 'terminal/agent/other', runtime_incarnation: 'incarnation/other' }
 const agent = (reachability: 'reachable' | 'unreachable') => decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', name: 'Example Agent', host_id: 'host/example', runtime_ids: [], reachability, state: 'running', harness_state: 'idle', blocked_on: null, fault: null, revision: '1', updated_at: '2026-10-04T12:00:00.000Z' })
 let registry: AtomRegistry.AtomRegistry
 let root: Root
@@ -115,10 +118,10 @@ describe('terminal detail input', () => {
     vi.stubGlobal('fetch', async () => new Response(new Uint8Array(await readFile(join(import.meta.dirname, 'assets/ghostty-key-encoder.generated.wasm'))), { headers: { 'content-type': 'application/wasm' } }))
   })
   const sessions = () => {
-    const opened: Array<{ readonly terminalRef: string; readonly fixture: ReturnType<typeof makeTerminalInputFixture> }> = []
-    const factory: TerminalInputPortFactory = async ({ terminalRef, registry: owner }) => {
+    const opened: Array<{ readonly subject: string; readonly terminalRef: string; readonly fixture: ReturnType<typeof makeTerminalInputFixture> }> = []
+    const factory: TerminalInputPortFactory = async ({ subject, terminalRef, registry: owner }) => {
       const fixture = makeTerminalInputFixture({ registry: owner, autoDeliver: false })
-      opened.push({ terminalRef, fixture })
+      opened.push({ subject, terminalRef, fixture })
       return fixture.port
     }
     return { opened, factory }
@@ -135,15 +138,14 @@ describe('terminal detail input', () => {
 
   it('types only into the shown terminal and drops a queue when the view switches terminals', async () => {
     const { opened, factory } = sessions()
-    const other: `terminal/${string}` = 'terminal/other'
-    const terminals = { [ref]: observed({ value: screen }), [other]: observed({ value: { ...screen, terminal_id: other, runtime_incarnation: 'incarnation/other' } }) }
+    const terminals = { [ref]: observed({ value: screen }), [other]: observed({ value: otherScreen }) }
     await mount({ terminal: terminals, terminalInput: factory })
     await vi.waitFor(() => expect(button('Enable input')).toBeDefined())
     await act(async () => button('Enable input')!.click())
     await type('a')
     await type('b')
     const first = opened[0]!
-    expect(first.terminalRef).toBe(ref)
+    expect(first).toMatchObject({ subject: ref, terminalRef: screen.terminal_id })
     expect(registry.get(first.fixture.writes)).toEqual([{ mode: 'raw', value: btoa('a') }])
     await mount({ terminal: terminals, terminalInput: factory, at: other })
     // Leaving the pane closes its session: the queued key is dropped, not carried over.
@@ -152,15 +154,14 @@ describe('terminal detail input', () => {
     expect(registry.get(first.fixture.writes)).toHaveLength(1)
     await vi.waitFor(() => expect(button('Enable input')).toBeDefined())
     const second = opened.at(-1)!
-    expect(second.terminalRef).toBe(other)
+    expect(second).toMatchObject({ subject: other, terminalRef: otherScreen.terminal_id })
     expect(registry.get(second.fixture.writes)).toEqual([])
   })
 
   it.each(['switches terminals', 'loses the terminal input grant'] as const)(
     'posts nothing for a key whose snapshot read finishes after the view %s',
     async (cut) => {
-      const other: `terminal/${string}` = 'terminal/other'
-      const terminals = { [ref]: observed({ value: screen }), [other]: observed({ value: { ...screen, terminal_id: other, runtime_incarnation: 'incarnation/other' } }) }
+      const terminals = { [ref]: observed({ value: screen }), [other]: observed({ value: otherScreen }) }
       const posted: unknown[] = []
       const read = Promise.withResolvers<string | undefined>()
       const reads: Array<PromiseWithResolvers<string | undefined>> = [read]
@@ -174,8 +175,8 @@ describe('terminal detail input', () => {
         connect: (fetchImpl) => new St3Client({ baseUrl: 'https://gateway.invalid', fetchImpl }),
         transport,
         snapshot: () => reads.shift()?.promise ?? Promise.resolve('snapshot/next'),
-        liveScreen: (terminalRef) => {
-          const feed = terminals[terminalRef]
+        liveScreen: (subject) => {
+          const feed = terminals[subject]
           return feed?._tag === 'Observed' ? feed.value : undefined
         },
         granted: () => granted,

@@ -46,16 +46,17 @@ export const gatewayTerminalInput = ({
   readonly transport: typeof fetch
   /** The freshest snapshot id this client holds, or undefined when none can be obtained. */
   readonly snapshot: () => Promise<string | undefined>
-  /** The terminal's currently observed live screen, or undefined when stale or not observed. */
-  readonly liveScreen: (terminalRef: string) => TerminalScreen | undefined
+  /** The live screen of the terminal feed at this subject address, or undefined when stale or not observed. */
+  readonly liveScreen: (subject: string) => TerminalScreen | undefined
   /** Whether this device currently holds the terminal input grant. */
   readonly granted: () => boolean
 }): TerminalInputPortFactory =>
-  ({ terminalRef, incarnation, registry }) => {
+  ({ subject, terminalRef, incarnation, registry }) => {
     const admitted = (attempt: TerminalInputAttempt): { readonly screen: TerminalScreen } | TerminalInputOutcome => {
       if (!attempt.live()) return abandoned
       if (!granted()) return ungranted
-      const screen = liveScreen(terminalRef)
+      // The feed is keyed by the view's subject address; the screen names the gateway terminal.
+      const screen = liveScreen(subject)
       return screen?.terminal_id === terminalRef && screen.runtime_incarnation === incarnation ? { screen } : restarted
     }
     // One action is in flight per session, so the transport holds at most the one it may post.

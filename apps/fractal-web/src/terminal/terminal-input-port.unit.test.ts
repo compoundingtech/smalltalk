@@ -7,7 +7,9 @@ import recording from '../data/subjectReadPort.gateway.fixtures.json' with { typ
 import { makeScreen } from './fixtures.ts'
 import { gatewayTerminalInput } from './terminal-input-port.ts'
 
-const ref = 'terminal/example'
+// The view's subject address and the gateway's terminal id differ, as they do against the daemon.
+const subject = 'terminal/example'
+const ref = 'terminal/agent/example'
 const ack = {
   kind: 'action-result', action_id: 'action/returned', operation_id: 'operation/returned',
   snapshot_id: 'snapshot/returned', affected_ids: [ref], status: 'accepted',
@@ -47,7 +49,7 @@ const harness = ({
     connect: (fetchImpl) => new St3Client({ baseUrl: 'https://gateway.invalid', fetchImpl, ...(credential === undefined ? {} : { credential }) }),
     transport,
     snapshot: snapshot ?? (async () => `snapshot/fresh/${(snapshots += 1)}`),
-    liveScreen: (terminalRef) => (terminalRef === ref ? screen : undefined),
+    liveScreen: (address) => (address === subject ? screen : undefined),
     granted: () => granted,
   })
   return {
@@ -60,7 +62,7 @@ const harness = ({
     },
     screen: () => screen!,
     open: async (incarnation = 'incarnation/one') => {
-      const port = await factory({ terminalRef: ref, incarnation, registry })
+      const port = await factory({ subject, terminalRef: ref, incarnation, registry })
       port.open()
       return port
     },

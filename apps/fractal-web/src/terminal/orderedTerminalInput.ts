@@ -21,6 +21,9 @@ export interface TerminalInputPort {
 
 /** Absence of DataSource.terminalInput means the actual producer does not support ordered input. */
 export type TerminalInputPortFactory = (options: {
+  /** The subject address whose terminal feed the view shows (`terminal/<agent path>`). */
+  readonly subject: string
+  /** The gateway's id for that terminal (`terminal/<agent id>`); a different string from `subject`. */
   readonly terminalRef: string
   readonly incarnation: string
   readonly registry: AtomRegistry.AtomRegistry

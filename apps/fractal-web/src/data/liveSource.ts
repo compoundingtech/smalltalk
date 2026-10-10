@@ -951,8 +951,8 @@ export const liveSource = ({
           const current = await messageSnapshot()
           return current._tag === 'Success' ? current.value : undefined
         },
-        liveScreen: (ref) => {
-          const feed = registry.get(terminal(ref))
+        liveScreen: (subject) => {
+          const feed = registry.get(terminal(subject))
           return feed._tag === 'Observed' && feed.freshness === 'live' ? feed.value : undefined
         },
         granted: () => registry.get(grants).terminalInput === 'granted',

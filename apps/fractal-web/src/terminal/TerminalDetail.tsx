@@ -98,6 +98,7 @@ export const TerminalDetail = React.memo(
             />
             <DomTerminal screen={screen} palette={defaultTerminalPalette} />
             <TerminalKeyboardBinding
+              subject={address.ref}
               terminalRef={screen.terminal_id}
               incarnation={screen.runtime_incarnation}
               modes={screen.modes}

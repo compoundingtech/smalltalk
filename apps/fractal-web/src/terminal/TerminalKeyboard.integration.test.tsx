@@ -67,7 +67,7 @@ const armed = async () => {
 
 describe('terminal keyboard', () => {
   it('stays disabled and sends nothing when the source publishes no ordered input factory', async () => {
-    await render(<TerminalKeyboardBinding terminalRef="terminal/example" incarnation="incarnation/example" modes={keyboardTestModes} />)
+    await render(<TerminalKeyboardBinding subject="terminal/example" terminalRef="terminal/agent/example" incarnation="incarnation/example" modes={keyboardTestModes} />)
     expect(field().disabled).toBe(true)
     expect(button('Enable input')).toBeUndefined()
     expect(host.querySelector('[role="status"]')?.textContent).toBe('Ordered terminal input is not available from this producer')
