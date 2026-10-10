@@ -2469,6 +2469,7 @@ export type ActionRequest =
   attachments?: Array<AttachmentInput>;
   content: string;
   in_reply_to?: Id;
+  kind?: "silent" | "wake";
   session_id?: Id;
   signature?: DeviceSignature;
   tags?: Array<string>;

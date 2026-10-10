@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Checkpoints drop account limit readings the account fold can no longer read, and older reconcile decisions of each key",
+  "replay": {"status": "none", "detail": "No replay. A checkpoint proof refolds the account limits from its copy's claims before and after the drop and compares them, and compares the newest reconcile decision of each key; the live projection is unchanged."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes, triggers or schema version change."},
+  "rules": {"status": "changed", "detail": "Rules version 15 adds a harness.limits rule: each seat keeps its newest claim and newest accepted reading, and every reading measured within an hour of its account group's newest is kept; older readings are dropped. runtime.reconcile-decision keeps the newest claim of each decision key. The rules digest changes, so members seal and verify new checkpoints only once every participant runs rules 15; upgrade all members in one window. Replication and ordinary work are unaffected while they differ.", "transitions": [[14, 15]]},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change. Account limits answer the same before and after a trim."},
+  "downtime": {"status": "none", "detail": "No restart requirement beyond the ordinary deploy. The first stable rules-15 checkpoint trims the backlog of readings in the background, in 50 ms chunks."},
+  "manual": {"status": "changed", "detail": "Deploy every checkpoint participant to rules 15 together; until then new checkpoints wait at sealing."},
+  "recovery": {"status": "changed", "detail": "Dropped readings do not come back. Rolling a member back to rules 14 stalls new checkpoints until it runs rules 15 again; nothing else needs repair."}
+}

@@ -1,8 +1,9 @@
 //! Plan a checkpoint on a private, previously copied store and report what it would drop.
-//! Usage: cargo run --release -p st3 --example retention_plan -- CLONE DAY [SCRATCH]
+//! Usage: cargo run --release -p st3 --example retention_plan -- CLONE DAY [SCRATCH] [--trim]
 //! DAY names the checkpoint's cut, such as 2026-10-10. With SCRATCH, the plan is also proved on a
-//! copy written there, as a real checkpoint proves it. Never supply a live store or an immutable
-//! capture: this opens and migrates CLONE.
+//! copy written there, as a real checkpoint proves it. With `--trim`, the plan is then trimmed
+//! from CLONE as a stable checkpoint is, and the report adds the writer's holds and the pages
+//! freed. Never supply a live store or an immutable capture: this opens and migrates CLONE.
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
@@ -15,7 +16,10 @@ use smallclaims::store::checkpoint::checkpoint_cut;
 use st3::store::Store;
 
 fn main() -> Result<()> {
-    let mut args = std::env::args_os().skip(1);
+    let mut args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let trim = args.iter().any(|arg| arg == "--trim");
+    args.retain(|arg| arg != "--trim");
+    let mut args = args.into_iter();
     let path = PathBuf::from(args.next().context("private clone path is required")?);
     let day = args
         .next()
@@ -23,7 +27,7 @@ fn main() -> Result<()> {
         .into_string()
         .map_err(|_| anyhow::anyhow!("the day must be UTF-8"))?;
     let scratch = args.next().map(PathBuf::from);
-    ensure!(args.next().is_none(), "expected CLONE DAY [SCRATCH]");
+    ensure!(args.next().is_none(), "expected CLONE DAY [SCRATCH] [--trim]");
     ensure!(!path.is_symlink(), "clone must not be a symlink");
     ensure!(
         path.metadata()?.permissions().mode() & 0o777 == 0o600,
@@ -45,6 +49,44 @@ fn main() -> Result<()> {
         }
         None => None,
     };
+    let pages = |store: &Store| -> Result<(u64, u64)> {
+        let connection = store.readers.get();
+        Ok((
+            connection.query_row("PRAGMA page_count", [], |row| row.get(0))?,
+            connection.query_row("PRAGMA freelist_count", [], |row| row.get(0))?,
+        ))
+    };
+    let trimmed = if trim {
+        let holds = || {
+            smallclaims::windows::store_series(smallclaims::windows::StoreWork::WriterHold)
+                .snapshot(Instant::now())["1h"]
+                .clone()
+        };
+        let before = pages(&store)?;
+        let holds_before = holds();
+        let trimming = Instant::now();
+        let mut actions = Vec::new();
+        store.trim_checkpoint(
+            &format!("checkpoint/{day}"),
+            cut,
+            &plan.drop_digest,
+            &plan.envelopes,
+            &plan.claims,
+            false,
+            &mut actions,
+        )?;
+        let after = pages(&store)?;
+        Some(json!({
+            "elapsed_ms": trimming.elapsed().as_millis(),
+            "actions": actions,
+            "pages_before": {"page_count": before.0, "freelist_count": before.1},
+            "pages_after": {"page_count": after.0, "freelist_count": after.1},
+            "writer_holds_before_trim_1h": holds_before,
+            "writer_holds_after_trim_1h": holds(),
+        }))
+    } else {
+        None
+    };
     let by_kind = plan
         .by_kind
         .iter()
@@ -64,6 +106,7 @@ fn main() -> Result<()> {
         "store_open_ms": open_ms,
         "plan_ms": plan_ms,
         "proof": proof,
+        "trim": trimmed,
         "release_build": !cfg!(debug_assertions),
     });
     println!("{}", serde_json::to_string_pretty(&result)?);

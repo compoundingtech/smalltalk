@@ -677,20 +677,9 @@ pub(super) fn plan_tx(
             manual_seats |= manual_member(transaction, member)?;
         }
     }
-    for desired in input
-        .subjects
-        .values()
-        .filter(|d| crate::rollout::manual(d))
-    {
-        if let Some(member) = &desired.member {
-            if let Err(refusal) = crate::native_resume::rollout_support(member) {
-                blockers.push(format!("{}: {}", desired.subject, refusal.reason));
-            }
-        } else {
-            blockers.push(format!(
-                "{}: manual rollout needs a native seat launch",
-                desired.subject
-            ));
+    for desired in input.subjects.values().filter(|d| crate::rollout::manual(d)) {
+        if desired.member.as_ref().is_none_or(|member| !matches!(member.launch, crate::model::LaunchSpec::Argv(_))) {
+            blockers.push(format!("{}: manual rollout needs a typed native harness launch", desired.subject));
         }
     }
     let membership = fleet_membership_tx(transaction).map_err(internal)?;
@@ -831,7 +820,7 @@ pub(super) fn plan_tx(
                                     "{s}: when-idle requires the same native account binding"
                                 ));
                             }
-                            if let Err(refusal) = crate::native_resume::rollout_support(new) {
+                            if !manual && let Err(refusal) = crate::native_resume::rollout_support(new) {
                                 blockers.push(format!("{s}: {}", refusal.reason));
                             }
                             if new.host != old.host || new.driver != old.driver {
@@ -974,6 +963,13 @@ pub(super) fn plan_tx(
             .map(|(subject, _)| subject.as_str()),
         Some(current_index(transaction).map_err(internal)?),
     )?;
+    let rollouts = input.subjects.values().filter(|desired| crate::rollout::manual(desired))
+        .filter_map(|desired| {
+            let refusal = desired.member.as_ref()
+                .and_then(|member| crate::native_resume::rollout_support(member).err())?;
+            Some((desired.subject.clone(), json!({"action":"cutover","policy":{"mode":"manual"},
+                "blocking":[refusal.reason]})))
+        }).collect();
     let preview = Preview {
         declaration_diffs,
         rollout: options.rollout.clone(),
@@ -982,7 +978,7 @@ pub(super) fn plan_tx(
         source: options.source.clone(),
         changes,
         effects,
-        rollouts: BTreeMap::new(),
+        rollouts,
         expected_subjects: heads,
         digest,
         mass_retirement: mass,

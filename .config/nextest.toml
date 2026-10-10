@@ -76,6 +76,12 @@ success-output = "immediate"
 filter = 'package(=smallclaims) and binary(=ivm_admitted_applied_slice) and test(/^canonical_metadata_inventory_growth_reports_actual_page_work$/)'
 success-output = "immediate"
 
+# Keep the operation helper's actual SQL/VM/scan tuples on successful hosted controls.
+# Output visibility only: selection, retries, threads and work assertions are unchanged.
+[[profile.ci.overrides]]
+filter = 'package(=smallclaims) and test(/^store::repair_operation_tests::complete_operation_reconciliation_characterizes_inventory_and_all_changed_dml$/)'
+success-output = "immediate"
+
 # Retain actual maintenance work and removed row/byte counts on success.
 # Output visibility only: all inherited retries, threads and ceilings remain.
 [[profile.ci.overrides]]

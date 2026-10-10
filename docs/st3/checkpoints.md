@@ -170,8 +170,9 @@ agree on a checkpoint only when they run the same rules. In summary:
 | `resource.observed` written by an observer | subject | the newest |
 | `runtime.action.*` with no actor, `render.applied`, `runtime.readiness-deadline-reached` | subject (and action, incarnation, status) | the newest; only claims dated at least five days before the cut go |
 | `sekret.called`, `sekret.exited`, `sekret.refused`, `sekret.changed` written before they became local observations | subject | the newest; only claims dated at least five days before the cut go |
-| `harness.limits` | none | every claim: the account fold compares readings across seats and reset windows, so a later reading does not replace an earlier one (since rules version 8) |
+| `harness.limits` | subject | the newest; the newest reading the account fold accepts, and any accepted at the same time; every reading measured within an hour of the newest reading of its account group (driver, account, declared account, weekly or five-hour only) across every seat |
 | `harness.todo.observed` | subject | the newest (a rule that predates its description line) |
+| `runtime.reconcile-decision` | subject, decision key | the newest of each key; the reconciler asks whether a key was recorded, reads the newest member-reconcile decision and the subject's newest |
 | `harness.usage`, response rollups | subject, incarnation, model, account, run, step, host | the last snapshot of each UTC hour in the seven days before the cut, the newest snapshot before that window, and the newest of all |
 | `harness.usage`, session cumulative | subject, incarnation | the newest and the last claim of the largest total |
 | `harness.usage`, context occupancy | subject, incarnation | the newest |
@@ -200,6 +201,15 @@ bound session.
 already forgets after seven days. A claim is dropped from the replicated log only when it is at
 least five days older than the cut, and a checkpoint is due two days after its cut, so it is at
 least seven days old by then.
+
+**Why `harness.limits` keeps an hour per account.** The account fold reads, for each account
+group, every reading measured within an hour of the group's newest, and picks the highest weekly
+percentage in the newest reset window among them; it also reads each seat's newest reading to know
+which seats use the account. A group's newest measurement only moves forward, so a reading more
+than an hour older than the newest the sealed set holds is never read again, whatever arrives
+later. Seats report limits every few minutes and repeat them unchanged, so this drops almost all
+of them. Because the answer folds every seat's readings, the proof also compares the account
+limits across the whole fleet, refolded from the copy's claims before and after the drop.
 
 **Why `work.renewed` is not in the table.** It is the case that taught the rules what "witness"
 costs. A late step claim can land between any two lease renewals, so no renewal has a witness that

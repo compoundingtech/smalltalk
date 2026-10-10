@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add silent and wake message kinds, capped held batches, and count-only coordination metadata",
+  "replay": {
+    "status": "changed",
+    "detail": "No graph replay or projection invalidation. Local coordination metadata backfills at most eight historical message subjects per paced job on the existing FIFO writer, with a 100-millisecond pause between jobs; count reads return complete=false until caught up and never advance the backfill."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Adds derived coordination_sends timestamp/count flags and held flag, covering time/held indexes, a guarded receipt trigger, and local_coordination_backfill cursor/ceiling/progress. Numeric schema version is unchanged. No conversation payload is newly stored."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules version, canonical graph digest, or sealing rule change. New count tables are local derived metadata."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds message.send kind: silent | wake, default wake, and CLI --kind with the same two values. There is no per-seat wake policy, question tag or inherited question-thread state. FYI is one use of silent. Old daemons silently ignore the kind field and deliver silent-tagged messages normally; old CLIs reject --kind. Raw send/by-key receipts confirm the accepted kind; CLI warns unless an agent silent receipt confirms kind silent, since old daemons can retain unfamiliar tags without honoring them. SDK callers must upgrade all owners before relying on silence. Unsigned admission deduplicates tags and removes delivery-only remaining-count markers for both wake and silent messages. Person signatures retain signed tags and always wake. External Rust struct literals need kind: MessageKind, default Wake when deserialized. Downgrade below this build is unsupported; the startup writer migrates the earlier preview fyi metadata column to silent (covering index follows) and reads legacy held tags as silent without rewriting source claims. Earlier preview binaries remain incompatible with the new schema; recover forward and never downgrade. Reserved event tags remain a cooperative sender filter, not authentication. Generic agent launch tags remain allowed. Native person mail forwards the existing dictated notice."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Normal binary swap/restart; no numeric schema migration. Empty derived tables and indexes are created, then bounded background jobs fill metadata. Held diagnostics select at most 128 indexed rows, delivery hydrates at most eight held subjects. Populated restart-to-health timings have not been measured."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Upgrade all sender and owner daemons before relying on silent holding. Use --kind silent for informational messages; questions, answers and handoffs use --kind wake or the default. No seat configuration is required. The companion collector uses the silent count subset and waits for complete metadata before publishing ratios. See docs/st3/silent-messages.md."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Unoffered silent messages remain unread, excluded from backlog cleanup, and survive polling/reconnect. Each real wake offers at most eight newest silent messages with an older-held notice; on-demand reads see all. Downgrade removes no-wake guarantees. Roll-forward reopens uncovered sends after an old binary. Corrupt source fails closed (never falsely complete); usage exposes cursor/ceiling/progress and doctor warns after 15 minutes stalled. Repair source with existing recovery procedures. Failed startup bootstrap pages roll back and log without preventing startup; the background worker already pauses 60 seconds after a failed page. Remaining notice arithmetic saturates and raw stored markers are filtered from views without mutating signed claims. At 8 subjects per 100 ms job, 100k sends need at least 20.8 minutes, 1M about 3.5 hours, plus writer contention; while incomplete, ratios are unavailable, held diagnostics partial, and backlog banners suppressed. Held-only bootstrap and a pending-exclusion banner are deferred. Refill is coalesced per changed-claim update with at most 8 held bodies; existing whole-mailbox metadata sorting remains. Cosmetic remaining notices can lag on-demand reads, and canonical earliest-send counts can be conservative against later replicated duplicates; optimizing these is deferred. Cleanup revalidates every candidate and preserves held mail."
+  }
+}
