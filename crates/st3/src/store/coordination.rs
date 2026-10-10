@@ -66,6 +66,7 @@ pub(super) fn sync(
 /// At most eight historical subjects per writer batch. No startup scan or read-side build.
 /// Live pending sends are maintained by the existing send projection, including replication.
 pub(super) fn backfill(transaction: &Transaction<'_>) -> Result<()> {
+    let started = std::time::Instant::now();
     transaction.execute(
         "INSERT OR IGNORE INTO local_coordination_backfill
          SELECT 1,0,COALESCE(MAX(store_index),0),0 FROM claims WHERE kind='message.sent'",
@@ -84,7 +85,12 @@ pub(super) fn backfill(transaction: &Transaction<'_>) -> Result<()> {
          WHERE kind='message.sent' AND store_index>?1 AND store_index<=?2 ORDER BY store_index LIMIT 8",
     )?.query_map(params![cursor, ceiling], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut processed = 0;
     for (_, subject) in &batch {
+        // Leave room for the rest of the FIFO writer batch under its 100 ms hold limit.
+        if processed > 0 && started.elapsed() >= std::time::Duration::from_millis(10) {
+            break;
+        }
         let sent: Option<(u64, String)> = transaction
             .query_row(
                 "SELECT CAST(accepted_at_unix_ms AS INTEGER),body FROM claims
@@ -105,12 +111,15 @@ pub(super) fn backfill(transaction: &Transaction<'_>) -> Result<()> {
                 .zip(body.as_ref())
                 .map(|((at, _), body)| (*at, &body["fields"])),
         )?;
+        processed += 1;
     }
     transaction.execute(
         "UPDATE local_coordination_backfill SET cursor=?1,complete=?2 WHERE singleton=1",
         params![
-            batch.last().map_or(ceiling, |(index, _)| *index),
-            batch.len() < 8
+            batch
+                .get(processed.wrapping_sub(1))
+                .map_or(ceiling, |(index, _)| *index),
+            processed == batch.len() && batch.len() < 8
         ],
     )?;
     Ok(())
@@ -171,16 +180,20 @@ mod tests {
             .unwrap()
             .unwrap();
         let partial = store.coordination_counts(0, u64::MAX / 2).unwrap();
-        assert_eq!(partial["agent_to_agent"], 8);
+        assert!(partial["agent_to_agent"].as_u64().unwrap() <= 8);
         assert_eq!(partial["complete"], false);
         assert_eq!(store.coordination_counts(0, u64::MAX / 2).unwrap(), partial);
-        store.connection.batched(backfill).unwrap().unwrap();
-        assert_eq!(
-            store.coordination_counts(0, u64::MAX / 2).unwrap()["agent_to_agent"],
-            16
-        );
-        store.connection.batched(backfill).unwrap().unwrap();
-        let complete = store.coordination_counts(0, u64::MAX / 2).unwrap();
+        let mut complete = partial;
+        for _ in 0..20 {
+            if complete["complete"] == true {
+                break;
+            }
+            let previous = complete["agent_to_agent"].as_u64().unwrap();
+            store.connection.batched(backfill).unwrap().unwrap();
+            complete = store.coordination_counts(0, u64::MAX / 2).unwrap();
+            let next = complete["agent_to_agent"].as_u64().unwrap();
+            assert!(next >= previous && next <= previous + 8);
+        }
         assert_eq!(complete["agent_to_agent"], 19);
         assert_eq!(complete["fyi"], 19);
         assert_eq!(complete["complete"], true);

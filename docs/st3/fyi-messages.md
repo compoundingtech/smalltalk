@@ -75,7 +75,7 @@ FYI mail unread for over a day.
 `st usage --hours 24 --messages-only --json` reads counts without message bodies or token
 usage: `agent_to_agent`, its held `fyi` subset, and `to_person`. Each message subject counts
 once, including messages already read. Daemon and person senders do not count. The covering
-metadata index is maintained by writers; historical bootstrap advances eight subjects per
-writer batch. `complete: false` means bootstrap is unfinished, so collectors publish no ratio.
+metadata index is maintained by writers; historical bootstrap advances at most eight subjects per
+writer batch, stopping between subjects once it has spent ten milliseconds. `complete: false` means bootstrap is unfinished, so collectors publish no ratio.
 Reads never advance bootstrap. The factory SLO timer divides each count by merges in the
 rolling day and publishes informational values; zero merges gives no ratio.

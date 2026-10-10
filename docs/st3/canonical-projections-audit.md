@@ -284,6 +284,7 @@ The fix step must extend this foundation with non-empty fixtures for currently e
 
 Coordination cost metadata is also local: `coordination_sends` holds only a message subject,
 send time, and three integer category flags; `local_coordination_backfill` holds its local
-arrival cursor and completion marker. Writers derive them from sent claims in bounded batches.
+arrival cursor and completion marker. Writers derive them from sent claims in batches of at most eight subjects, stopping between
+subjects after ten milliseconds to leave room for the rest of the writer transaction.
 They are outside the shared logical rows and checkpoint digests, contain no message body, and
 are not replicated. Count readers query the metadata without advancing the backfill.
