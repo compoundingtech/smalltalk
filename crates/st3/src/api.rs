@@ -4596,6 +4596,7 @@ async fn client_agents_published(
     snapshot: ClientSnapshot,
     query: ClientListQuery,
 ) -> Result<ClientPageResponse, ApiError> {
+    state.store.note_agent_roster_read();
     if query.cursor.is_some() {
         let reader = state.clone();
         return blocking_store(move || Ok(client_agents_published_continuation(&reader, snapshot, &query)))
@@ -5796,6 +5797,8 @@ pub fn start_agent_roster(state: &AppState) {
                 crate::performance::task("roster/refresh", || if first {
                     reader.read_snapshot(|index| client_agent_roster_head(&reader, index))
                 } else {
+                    // Nothing published to start from: every card folds again from the log.
+                    let cold = reader.published_agent_roster(u64::MAX, false).is_none();
                     let folded = Instant::now();
                     let refreshed = reader.answer_agent_roster_requests(|| {
                         refresh_agent_roster(&reader, false)?;
@@ -5804,7 +5807,11 @@ pub fn start_agent_roster(state: &AppState) {
                         }
                         Ok(())
                     });
-                    record_roster_stage(request_latency::RosterStage::Refresh, folded.elapsed());
+                    record_roster_stage(if cold {
+                        request_latency::RosterStage::RefreshCold
+                    } else {
+                        request_latency::RosterStage::Refresh
+                    }, folded.elapsed());
                     refreshed
                 })
             })
@@ -24049,6 +24056,40 @@ mission "wake" state="ready" {
         {
             println!("roster fold task {}: n={} total_ms={} max_ms={}",
                 row["kind"], row["count"], row["total_ms"], row["max_ms"]);
+        }
+    }
+
+    /// What a refresh costs after a backlog of real claims: the roster folded at a cut that many
+    /// claims back, then refreshed at the newest, as after an idle refresher or a slow one.
+    /// `ST_ROSTER_BACKLOG_STORE` names a disposable store copy, opened in place; and
+    /// `ST_ROSTER_BACKLOGS` the backlogs in claims, comma separated.
+    #[test]
+    #[ignore = "roster refresh timing after a backlog; set ST_ROSTER_BACKLOG_STORE and run with --ignored --nocapture"]
+    fn agent_roster_backlog_refresh_timing_on_a_store_copy() {
+        let Some(database) = std::env::var_os("ST_ROSTER_BACKLOG_STORE").map(PathBuf::from) else {
+            return;
+        };
+        let backlogs = std::env::var("ST_ROSTER_BACKLOGS").unwrap_or_else(|_| "20,200,2000".into());
+        smallclaims::profile::init_from_env();
+        for backlog in backlogs.split(',').map(|n| n.trim().parse::<u64>().unwrap()) {
+            // A fresh store each time: no fold kept from the previous backlog.
+            let store = Store::open(&database, "bench-host").unwrap();
+            let newest = store.index().unwrap();
+            let timed = |label: &str, work: &dyn Fn()| {
+                let before = smallclaims::sqlite::work::total();
+                let started = Instant::now();
+                smallclaims::profile::task("roster-backlog-timing", work);
+                println!("roster backlog {backlog}: {label} {:.1} ms; sqlite_work={:?}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    smallclaims::sqlite::work::total() - before);
+            };
+            timed("cold", &|| { client_agent_resources_cached(&store, false, newest - backlog).unwrap(); });
+            let reason = store.agent_roster_unbounded_because(newest, false, AGENT_ROSTER_WARM_CHUNK)
+                .unwrap();
+            let refolded = store.agent_resources_refolded_cards_for_test();
+            timed("refresh", &|| refresh_agent_roster(&store, false).unwrap());
+            println!("roster backlog {backlog}: chunked because {reason:?}; cards refolded {}",
+                store.agent_resources_refolded_cards_for_test() - refolded);
         }
     }
 
