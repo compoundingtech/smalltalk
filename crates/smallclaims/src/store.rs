@@ -7722,6 +7722,23 @@ fn admission_retry_query_with_schema_retry(retry_hash_mismatches: bool, retry_su
     )
 }
 
+#[cfg(test)]
+mod condition_schema_retry_query_tests {
+    use super::*;
+
+    #[test]
+    fn steady_schema_admission_retry_keeps_all_branches_indexed() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA).unwrap();
+        let sql = admission_retry_query_with_schema_retry(false, false);
+        assert!(!sql.contains("unknown-subject-family"));
+        let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        let plan = statement.query_map([], |row| row.get::<_, String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert!(!plan.iter().any(|line| line.starts_with("SCAN replica_records") || line.starts_with("SCAN replica_envelopes")), "{plan:?}");
+        assert!(plan.iter().any(|line| line.contains("SEARCH replica_records")), "{plan:?}");
+    }
+}
+
 /// Subject `?1`'s newest claim of kind `?2` in canonical order. See [`Store::latest_claim`].
 pub fn latest_claim_of_kind_query() -> String {
     format!(

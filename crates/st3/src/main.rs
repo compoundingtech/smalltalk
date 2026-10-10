@@ -98,7 +98,7 @@ async fn run_conditions(client: &Client, command: ConditionsCommand, json_output
             let instances = condition["instances"].as_array().cloned().unwrap_or_default();
             if instances.is_empty() { println!("  awaiting a sample"); }
             for instance in instances {
-                println!("  {} · {} · value {} · measured {}", instance["instance"].as_str().unwrap_or("?"),
+                println!("  {} · {} · value {} · measured {}", st3::conditions::display_text(instance["instance"].as_str().unwrap_or("?")),
                     instance["phase"].as_str().unwrap_or("?"), instance["value"], instance["measured_at"]);
                 println!("    series: {}", instance["values"]);
             }

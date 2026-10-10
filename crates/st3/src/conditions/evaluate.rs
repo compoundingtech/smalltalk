@@ -36,6 +36,7 @@ pub fn spawn(
         let mut interval =
             tokio::time::interval(std::time::Duration::from_millis(super::EVALUATE_EVERY_MS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut logged_errors = BTreeSet::new();
         loop {
             interval.tick().await;
             let tick_store = store.clone();
@@ -66,11 +67,19 @@ pub fn spawn(
                             if report.recorded > 0 || !report.messages.is_empty() {
                                 events.send_modify(|index| *index = index.wrapping_add(1));
                             }
-                            for error in report.errors {
+                            let errors = report.errors.into_iter().collect::<BTreeSet<_>>();
+                            for error in errors.difference(&logged_errors) {
                                 tracing::warn!(%error, "condition evaluation");
                             }
+                            logged_errors = errors;
                         }
-                        Err(error) => tracing::warn!(%error, "condition evaluation"),
+                        Err(error) => {
+                            let error = format!("{error:#}");
+                            if !logged_errors.contains(&error) {
+                                tracing::warn!(%error, "condition evaluation");
+                            }
+                            logged_errors = BTreeSet::from([error]);
+                        }
                     }
                 }
                 Err(error) => {
@@ -200,7 +209,6 @@ struct Readings {
     database: Option<Option<f64>>,
     slo: Option<Value>,
     claim_bytes: Option<Option<f64>>,
-    physical_growth: Option<f64>,
 }
 
 impl Evaluator {
@@ -240,16 +248,28 @@ impl Evaluator {
     pub fn tick(&mut self, store: &Store, now: u128) -> Result<TickReport> {
         let mut report = TickReport::default();
         // Bring the heads up to date first: they are what readers and a restart read.
-        store.seed_condition_heads(!self.restored)?;
+        if let Err(error) = store.seed_condition_heads(!self.restored) {
+            report.errors.push(format!("condition heads: {error:#}"));
+        }
         // Folding other members' new transitions does not gate local evaluation.
         for _ in 0..4 {
-            if store.fold_condition_heads()? < 500 {
-                break;
+            match store.fold_condition_heads() {
+                Ok(count) if count < 500 => break,
+                Ok(_) => {}
+                Err(error) => {
+                    report.errors.push(format!("condition fold: {error:#}"));
+                    break;
+                }
             }
         }
         if !self.restored {
-            self.trackers = store.condition_trackers_at(&self.host, now)?;
-            self.restored = true;
+            match store.condition_trackers_at(&self.host, now) {
+                Ok(trackers) => {
+                    self.trackers = trackers;
+                    self.restored = true;
+                }
+                Err(error) => report.errors.push(format!("condition restore: {error:#}")),
+            }
         }
         if self
             .last_tick
@@ -260,8 +280,20 @@ impl Evaluator {
             }
         }
         self.last_tick = Some(now);
-        let decls = store
-            .declared_conditions()?
+        let declarations = match store.declared_conditions() {
+            Ok(declarations) => declarations,
+            Err(error) => {
+                report
+                    .errors
+                    .push(format!("condition declarations: {error:#}"));
+                match store.flush_condition_notifications() {
+                    Ok(messages) => report.messages.extend(messages),
+                    Err(error) => report.errors.push(format!("notifications: {error:#}")),
+                }
+                return Ok(report);
+            }
+        };
+        let decls = declarations
             .into_iter()
             .filter_map(|condition| condition.decl.ok())
             .filter(|decl| decl.applies_to(&self.host))
@@ -280,29 +312,6 @@ impl Evaluator {
                 Err(error) => report.errors.push(format!("authored bytes: {error:#}")),
             }
         }
-        if decls.iter().any(|decl| {
-            matches!(
-                decl.metric,
-                Metric::DbGrowthBytesPerDay | Metric::DbSizeBytes
-            )
-        }) {
-            let growth = (|| -> Result<Option<f64>> {
-                if store.condition_database_sample_due(now)? {
-                    let size = *readings
-                        .database
-                        .get_or_insert_with(|| self.probe.database_bytes());
-                    if let Some(size) = size {
-                        store.record_condition_database_sample(now, size)?;
-                    }
-                }
-                readings.database = Some(store.condition_database_size(now)?);
-                store.condition_database_growth_per_day(now)
-            })();
-            match growth {
-                Ok(value) => readings.physical_growth = value,
-                Err(error) => report.errors.push(format!("physical growth: {error:#}")),
-            }
-        }
         let process_names = decls
             .iter()
             .filter_map(|decl| decl.process.as_deref())
@@ -315,11 +324,21 @@ impl Evaluator {
         let mut live = BTreeSet::new();
         for decl in &decls {
             let subject = decl.subject();
-            let values = self
-                .values(store, decl, &mut readings, now)
-                .into_iter()
-                .take(super::MAX_INSTANCES)
-                .collect::<Vec<_>>();
+            let mut values = self.values(store, decl, &mut readings, now);
+            if values.len() > super::MAX_INSTANCES {
+                let omitted = values.len() - super::MAX_INSTANCES;
+                report.errors.push(format!("{subject}: {omitted} instances not evaluated (eight-instance limit); select explicit data filesystem paths"));
+                values.truncate(super::MAX_INSTANCES);
+            }
+            values.retain(|(instance, _)| {
+                let valid = instance.len() <= 2048 && !instance.chars().any(char::is_control);
+                if !valid {
+                    report.errors.push(format!(
+                        "{subject}: invalid or oversized instance was not evaluated"
+                    ));
+                }
+                valid
+            });
             let wanted = values
                 .iter()
                 .map(|(instance, _)| instance.as_str())
@@ -349,10 +368,17 @@ impl Evaluator {
                         ));
                         continue;
                     }
-                    self.trackers.insert(
-                        key.clone(),
-                        store.condition_tracker(&subject, &instance, now)?,
-                    );
+                    match store.condition_tracker(&subject, &instance, now) {
+                        Ok(tracker) => {
+                            self.trackers.insert(key.clone(), tracker);
+                        }
+                        Err(error) => {
+                            report
+                                .errors
+                                .push(format!("condition restore {subject}: {error:#}"));
+                            continue;
+                        }
+                    }
                 }
                 let tracker = self.trackers.get_mut(&key).expect("just inserted");
                 if !self.unrecorded.contains_key(&key)
@@ -411,7 +437,11 @@ impl Evaluator {
                 })
             })
             .collect::<Vec<_>>();
-        store.record_condition_observations(&records)?;
+        if let Err(error) = store.record_condition_observations(&records) {
+            report
+                .errors
+                .push(format!("condition observations: {error:#}"));
+        }
         // Instances of conditions that no longer apply here stop being tracked. One whose value
         // could not be read this tick keeps its state for the next.
         let declared = decls
@@ -428,8 +458,13 @@ impl Evaluator {
         }
         // Fold freshly written claims before draining the durable notification queue.
         for _ in 0..4 {
-            if store.fold_condition_heads()? < 500 {
-                break;
+            match store.fold_condition_heads() {
+                Ok(count) if count < 500 => break,
+                Ok(_) => {}
+                Err(error) => {
+                    report.errors.push(format!("condition fold: {error:#}"));
+                    break;
+                }
             }
         }
         match store.flush_condition_notifications() {
@@ -487,10 +522,6 @@ impl Evaluator {
             Metric::DbSizeBytes => readings
                 .database
                 .get_or_insert_with(|| self.probe.database_bytes())
-                .map(|value| vec![(host, value)])
-                .unwrap_or_default(),
-            Metric::DbGrowthBytesPerDay => readings
-                .physical_growth
                 .map(|value| vec![(host, value)])
                 .unwrap_or_default(),
             Metric::DbAuthoredBytesPerDay => readings
@@ -598,6 +629,7 @@ mod tests {
         cpu: Arc<Mutex<Option<f64>>>,
         slo: Arc<Mutex<Value>>,
         panic_once: Arc<std::sync::atomic::AtomicBool>,
+        database: Arc<Mutex<Option<f64>>>,
     }
 
     impl Probe for Fake {
@@ -652,7 +684,7 @@ mod tests {
                 .collect()
         }
         fn database_bytes(&mut self) -> Option<f64> {
-            Some(1_000.0)
+            self.database.lock().unwrap().or(Some(1_000.0))
         }
         fn slo_windows(&mut self) -> Value {
             self.slo.lock().unwrap().clone()
@@ -835,6 +867,40 @@ condition "fleet/elsewhere" {
     }
 
     #[test]
+    fn database_size_uses_each_live_tick_instead_of_an_hourly_sample() {
+        let (_directory, store) = store();
+        let source = r#"version 2
+condition "fleet/size" { metric "db.size-bytes"; scope "member"; above 2000; for "1m"; owner "person/ada" }
+"#;
+        let intent = parse_intent(source, "alder").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &plan.subject_tokens, "size", Some("person/ada"))
+            .unwrap();
+        let fake = Fake::default();
+        let mut evaluator = Evaluator::new("alder", Box::new(fake.clone()));
+        evaluator.tick(&store, 1_000).unwrap();
+        *fake.database.lock().unwrap() = Some(3000.0);
+        evaluator.tick(&store, 31_000).unwrap();
+        let size = store
+            .conditions()
+            .unwrap()
+            .into_iter()
+            .find(|view| view.subject == "condition/fleet/size")
+            .unwrap();
+        assert_eq!(size.instances[0].value, Some(3000.0));
+        assert_eq!(size.instances[0].phase, "pending");
+    }
+
+    #[test]
     fn instance_caps_bound_live_trackers_and_cached_rows_when_mounts_change() {
         let (_directory, store) = store();
         let fake = Fake::default();
@@ -845,9 +911,13 @@ condition "fleet/elsewhere" {
                 .insert(format!("/mount-{number}"), (90, 100));
         }
         let mut evaluator = Evaluator::new("alder", Box::new(fake.clone()));
-        assert_eq!(
-            evaluator.tick(&store, 1_000).unwrap().evaluated,
-            super::super::MAX_INSTANCES
+        let report = evaluator.tick(&store, 1_000).unwrap();
+        assert_eq!(report.evaluated, super::super::MAX_INSTANCES);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("92 instances not evaluated"))
         );
         assert_eq!(evaluator.trackers.len(), super::super::MAX_INSTANCES);
         fake.free.lock().unwrap().clear();

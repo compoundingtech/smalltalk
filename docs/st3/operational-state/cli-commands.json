@@ -48,6 +48,8 @@
   },
   "canonical_roots": ["apply", "sets", "up", "now", "usage", "missions", "launch", "alerts", "machines", "agents", "conversations", "activity", "devices", "clients", "work", "lanes", "terminals", "conditions", "doctor", "recorder", "repair", "uninstall", "fleet", "backup", "replication", "service", "subject", "gh", "claim", "diagnostic", "trace", "schema", "documents", "blobs", "rules", "sekrets", "import", "completions", "gate", "skill", "admission"],
   "installed_baseline": [
+    { "path": "st conditions", "purpose_id": "conditions", "disposition": "add-canonical" },
+    { "path": "st conditions ls|show", "purpose_id": "conditions", "disposition": "add-canonical" },
     { "path": "st apply", "purpose_id": "apply", "disposition": "add-canonical" },
     { "path": "st sets ls|show|status", "purpose_id": "owned-sets", "disposition": "add-canonical" },
     { "path": "st up", "purpose_id": "daemon", "disposition": "keep" },

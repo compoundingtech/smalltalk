@@ -23,8 +23,7 @@ use serde_json::Value;
 
 /// How often a daemon samples and evaluates its conditions.
 pub const EVALUATE_EVERY_MS: u64 = 30_000;
-/// The most often an instance's value is written to the graph when its phase has not crossed a
-/// transition. A transition is written at once.
+/// Bounds on declaration and instance work per evaluation.
 pub const MAX_CONDITIONS: usize = 32;
 pub const MAX_INSTANCES: usize = 8;
 pub const MAX_REMOTE_INSTANCES: usize = 256;
@@ -82,8 +81,6 @@ pub enum Metric {
     ProcessRssBytes,
     /// The claim database file and its write-ahead log.
     DbSizeBytes,
-    /// Physical net database-plus-WAL growth, normalized over 24 hours of hourly samples.
-    DbGrowthBytesPerDay,
     /// Bytes of claims this member wrote in the last 24 hours. Every member stores every claim, so
     /// this is what each member adds to every database in the fleet.
     DbAuthoredBytesPerDay,
@@ -108,11 +105,6 @@ const METRICS: &[(&str, Metric, Scope)] = &[
     ("process.cpu-cores", Metric::ProcessCpuCores, Scope::Process),
     ("process.rss-bytes", Metric::ProcessRssBytes, Scope::Process),
     ("db.size-bytes", Metric::DbSizeBytes, Scope::Member),
-    (
-        "db.physical-growth-bytes-per-day",
-        Metric::DbGrowthBytesPerDay,
-        Scope::Member,
-    ),
     (
         "db.authored-bytes-per-day",
         Metric::DbAuthoredBytesPerDay,
@@ -163,7 +155,6 @@ impl Metric {
             Self::DiskFreeBytes
             | Self::ProcessRssBytes
             | Self::DbSizeBytes
-            | Self::DbGrowthBytesPerDay
             | Self::DbAuthoredBytesPerDay => bytes(value),
             Self::ProcessCpuCores | Self::DaemonCpuCores => format!("{} cores", round(value)),
             Self::CostUsdPerDay => format!("${}", round(value)),
@@ -192,6 +183,9 @@ pub fn round(value: f64) -> f64 {
     }
     let digits = 2 - value.abs().log10().floor() as i32;
     let scale = 10f64.powi(digits);
+    if !scale.is_finite() || scale == 0.0 || !(value * scale).is_finite() {
+        return value;
+    }
     (value * scale).round() / scale
 }
 
@@ -364,15 +358,22 @@ fn duration(node: &Value, name: &str) -> Result<Option<u128>, String> {
 /// A condition declaration, from its canonical desired body. The publication check calls this
 /// too, so a declaration that is published is one the daemon can evaluate.
 pub fn parse_condition(subject: &str, desired: &Value) -> Result<ConditionDecl, String> {
-    if subject.len() > 256 || children(desired).take(49).count() > 48 {
+    if subject.len() > 256
+        || subject.chars().any(char::is_control)
+        || children(desired).take(49).count() > 48
+    {
         return Err("condition name or declaration exceeds its bounded size".into());
     }
     for child in children(desired) {
-        if arguments(child)
-            .iter()
-            .any(|argument| argument.as_str().is_some_and(|text| text.len() > 1024))
-        {
-            return Err("condition strings must be at most 1024 bytes".into());
+        if arguments(child).iter().any(|argument| {
+            argument
+                .as_str()
+                .is_some_and(|text| text.len() > 1024 || text.chars().any(char::is_control))
+        }) {
+            return Err(
+                "condition strings must be at most 1024 bytes and contain no control characters"
+                    .into(),
+            );
         }
     }
     let name = subject
@@ -731,6 +732,7 @@ impl Tracker {
                 if breaching
                     && !self.recorded.is_some_and(|recorded| {
                         recorded.phase == Phase::Clear
+                            && now >= recorded.at
                             && now.saturating_sub(recorded.at) < COOLDOWN_MS
                     }) =>
             {
@@ -884,13 +886,40 @@ pub fn instance_subject_prefix(condition: &str) -> String {
     )
 }
 
+pub fn instance_origin_prefix(condition: &str, origin: &str) -> String {
+    use sha2::Digest as _;
+    format!(
+        "{}{}/",
+        instance_subject_prefix(condition),
+        hex::encode(sha2::Sha256::digest(origin.as_bytes()))
+    )
+}
+
 pub fn instance_subject(condition: &str, instance: &str) -> String {
+    let origin = instance
+        .split_once(':')
+        .map_or(instance, |(origin, _)| origin);
+    instance_subject_with_origin(condition, origin, instance)
+}
+
+pub(crate) fn instance_subject_with_origin(
+    condition: &str,
+    origin: &str,
+    instance: &str,
+) -> String {
     use sha2::Digest as _;
     format!(
         "{}{}",
-        instance_subject_prefix(condition),
+        instance_origin_prefix(condition, origin),
         hex::encode(sha2::Sha256::digest(instance.as_bytes()))
     )
+}
+
+/// Safe text for terminals and one-line notification titles.
+pub fn display_text(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
 }
 
 /// Verify that a state is bounded and belongs to its authenticated author. The instance
@@ -905,11 +934,13 @@ pub(crate) fn valid_state_identity(subject: &str, origin: &str, fields: &Value) 
         && condition.starts_with("condition/")
         && condition.len() <= 256
         && instance.len() <= 2048
+        && !instance.chars().any(char::is_control)
+        && !origin.chars().any(char::is_control)
         && (instance == origin
             || instance
                 .strip_prefix(origin)
                 .is_some_and(|suffix| suffix.starts_with(':')))
-        && subject == instance_subject(condition, instance)
+        && subject == instance_subject_with_origin(condition, origin, instance)
         && text("owner").len() <= 256
         && text("notification_title").len() <= 512
         && text("notification_body").len() <= 3500
@@ -958,9 +989,11 @@ pub fn doctor_lines_at(
         .iter()
         .map(|condition| {
             let stale = |instance: &crate::store::ConditionInstanceView| {
-                instance.measured_at.is_some_and(|at| {
-                    now < u128::from(at) || now.saturating_sub(u128::from(at)) > STALE_AFTER_MS
-                })
+                instance.local_observation
+                    && Phase::parse(&instance.phase).is_some_and(Phase::in_breach)
+                    && instance.measured_at.is_some_and(|at| {
+                        now < u128::from(at) || now.saturating_sub(u128::from(at)) > STALE_AFTER_MS
+                    })
             };
             let status = if condition.invalid.is_some()
                 || condition.instances.iter().any(|instance| {
@@ -983,7 +1016,7 @@ pub fn doctor_lines_at(
                 .map(|instance| {
                     format!(
                         "{} {}{} (value {})",
-                        instance.instance,
+                        display_text(&instance.instance),
                         instance.phase,
                         if stale(instance) { "; stale" } else { "" },
                         instance
@@ -1362,13 +1395,35 @@ mod tests {
     }
 
     #[test]
+    fn a_backward_clock_does_not_suppress_entry_until_the_old_time() {
+        let mut declaration = disk();
+        declaration.hold_ms = 60_000;
+        let mut tracker = Tracker::restore(
+            Phase::Clear,
+            None,
+            Recorded {
+                at: 1_000_000,
+                phase: Phase::Clear,
+                value: 30.0,
+            },
+        );
+        assert_eq!(tracker.observe(&declaration, 1.0, 100), None);
+        assert_eq!(tracker.phase, Phase::Pending);
+        assert_eq!(
+            tracker.observe(&declaration, 1.0, 60_100),
+            Some(Transition::Enter)
+        );
+        assert_eq!(round(f64::from_bits(1)), f64::from_bits(1));
+    }
+
+    #[test]
     fn values_are_rounded_to_three_significant_digits() {
         assert_eq!(round(12.3456), 12.3);
         assert_eq!(round(0.012345), 0.0123);
         assert_eq!(round(123_456.0), 123_000.0);
         assert_eq!(round(0.0), 0.0);
         assert_eq!(
-            Metric::DbGrowthBytesPerDay.describe(3.5 * 1024.0 * 1024.0),
+            Metric::DbSizeBytes.describe(3.5 * 1024.0 * 1024.0),
             "3.5 MiB"
         );
         assert_eq!(duration_text(90 * 60_000), "1h30m");

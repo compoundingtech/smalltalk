@@ -239,6 +239,8 @@ pub(crate) fn filesystems() -> BTreeMap<String, DiskSpace> {
         .unwrap_or_default();
     #[cfg(target_os = "macos")]
     let mounts = apple_mount_points();
+    let mut mounts = mounts;
+    mounts.sort();
     let mut seen = std::collections::BTreeSet::new();
     let mut output = BTreeMap::new();
     for mount in mounts.into_iter().take(256) {
@@ -449,6 +451,8 @@ impl ProcessSampler {
             .iter()
             .copied()
             .collect::<std::collections::HashSet<_>>();
+        self.last
+            .retain(|name, _| names_set.contains(name.as_str()));
         let mut found: HashMap<&str, HashMap<(u32, u64), ProcessStat>> = HashMap::new();
         if let Ok(entries) = std::fs::read_dir(&self.root) {
             for entry in entries.flatten().take(16_384) {

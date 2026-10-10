@@ -9316,7 +9316,7 @@ impl Store {
         if !condition_subjects.is_empty() {
             let mut existing = connection.prepare_cached("SELECT subject FROM desired WHERE kind='condition' LIMIT 33").map_err(internal)?;
             let mut all = condition_subjects.iter().map(|subject| (*subject).to_owned()).collect::<BTreeSet<_>>();
-            for subject in existing.query_map([], |row| row.get::<_, String>(0)).map_err(internal)? { all.insert(subject.map_err(internal)?); }
+            for subject in existing.query_map([], |row| row.get::<_, String>(0)).map_err(internal)? { let subject = subject.map_err(internal)?; if !intent.subjects.get(&subject).is_some_and(|desired| desired.kind == "stop") { all.insert(subject); } }
             if all.len() > crate::conditions::MAX_CONDITIONS { blockers.push("condition-limit: at most 32 conditions may be active in the fleet".into()); }
         }
 
@@ -14420,7 +14420,10 @@ impl Store {
         items.extend(self.harness_login_attention_items(person)?);
         items.extend(self.harness_prompt_attention_items(person)?);
         items.extend(self.custom_attention_items(person)?);
-        items.extend(self.condition_attention_items(person)?);
+        match self.condition_attention_items(person) {
+            Ok(conditions) => items.extend(conditions),
+            Err(error) => tracing::warn!(%error, "condition attention unavailable; other attention remains available"),
+        }
         // A person who published a broken gate is the one to correct it.
         items.extend(
             self.broken_gate_items(person, as_of)?

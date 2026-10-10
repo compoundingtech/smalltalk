@@ -1052,7 +1052,7 @@ const ARRANGEMENT_PATH: &str = "/v1/client/arrangements/ada/019a0000-0000-7000-8
 const ARRANGEMENT_FOLDER: &str = "019a0000-0000-7000-8000-000000000010";
 const ARRANGEMENT_PLACEMENT: &str = "agent/fleet/fixture-cost-arrangements/seat";
 
-/// Keep eight breached instances live while their durable history grows tenfold.
+/// Keep 256 remote breached instances per condition while eight histories grow tenfold.
 fn seed_condition(store: &Store, scale: f64) {
     let mut source = "version 2\n".to_owned();
     for number in 0..4 {
@@ -1069,28 +1069,37 @@ fn seed_condition(store: &Store, scale: f64) {
     let plan = store.mission(&intent, st3::model::IntentInput { kdl: source.clone(), source_name: None }).unwrap();
     assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
     store.apply_as(&intent, &plan.subject_tokens, "cost-condition", Some("person/ada")).unwrap();
-    for condition in store.declared_conditions().unwrap() {
-        let decl = condition.decl.unwrap();
-        for volume in 0..2 {
-            let instance = format!("{NODE}:/volume{volume}");
-            let mut tracker = st3::conditions::Tracker::default();
-            assert!(tracker.observe(&decl, 30.0, 0).is_none());
-            assert!(tracker.observe(&decl, 30.0, 60_000).is_some());
-            for sample in 0..((scale * 1_000.0).round() as usize).max(1) {
-                let now = 90_000 + sample as u128 * 30_000;
-                assert!(tracker.observe(&decl, 30.0 + (sample % 10) as f64, now).is_none());
-                store.record_condition_state(&st3::store::ConditionRecord {
-                    decl: &decl, host: NODE, instance: &instance, tracker: &tracker, transition: None, now,
-                }).unwrap();
+    let declarations = store.declared_conditions().unwrap().into_iter().map(|condition| condition.decl.unwrap()).collect::<Vec<_>>();
+    // 32 authenticated remote origins x eight breached instances per declaration.
+    // History for eight instances grows tenfold; all other live heads stay fixed.
+    for host_number in 0..32 {
+        let origin = format!("cost-remote-{host_number:02}");
+        let remote = Store::open_memory(&origin).unwrap();
+        remote.bind_fleet(FLEET).unwrap();
+        for decl in &declarations {
+            for volume in 0..8 {
+                let instance = format!("{origin}:/volume{volume}");
+                let mut tracker = st3::conditions::Tracker::default();
+                assert!(tracker.observe(decl, 30.0, 0).is_none());
+                assert!(tracker.observe(decl, 30.0, 60_000).is_some());
+                let history = if host_number == 0 { ((scale * 1_000.0).round() as usize).max(1) } else { 1 };
+                for sample in 0..history {
+                    let now = 90_000 + sample as u128 * 30_000;
+                    assert!(tracker.observe(decl, 30.0 + (sample % 10) as f64, now).is_none());
+                    remote.record_condition_state(&st3::store::ConditionRecord {
+                        decl, host: &origin, instance: &instance, tracker: &tracker, transition: None, now,
+                    }).unwrap();
+                }
             }
         }
+        sync(&remote, &origin, store);
     }
     store.seed_condition_heads(true).unwrap();
     let views = store.conditions().unwrap();
     assert_eq!(views.len(), 4);
     for view in views {
-        assert_eq!(view.instances.len(), 2);
-        assert!(view.instances.iter().all(|instance| instance.phase == "breach"));
+        assert_eq!(view.instances.len(), 256);
+        assert!(view.instances.iter().all(|instance| instance.phase == "breach" && instance.host != NODE));
     }
 }
 

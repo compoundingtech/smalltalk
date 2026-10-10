@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `87f3841005755ea1082c43478fc0f32fb769d74bfcd6bb64267af383cde0b7b6`
+Digest: `0f4a8d0564e72b68daa5e0f4866caf97832b4a3d93da8154f7f3f3a8bd44d14d`
 Storage version: `18`
 Storage digest: `d11a3e5db57db0a0bd6a9b27474cdd93958a401b3a6482b62aea3595530dbcef`
 
@@ -18,7 +18,7 @@ Storage digest: `d11a3e5db57db0a0bd6a9b27474cdd93958a401b3a6482b62aea3595530dbce
 | `checkpoint` | `checkpoint/DAY` | no | A checkpoint that trims replicated history dated before a UTC day. |
 | `checkpoint-excusal` | `checkpoint-excusal/ID` | no | A person's excusal of an unreachable writer from checkpoints. |
 | `condition` | `condition/NAME` | no | A threshold on a metric the daemon measures, with its owner. |
-| `condition-instance` | `condition-instance/CONDITION_HASH/INSTANCE_HASH` | no | One daemon-evaluated instance's transition state, referencing its declaration. |
+| `condition-instance` | `condition-instance/CONDITION_HASH/ORIGIN_HASH/INSTANCE_HASH` | no | One daemon-evaluated instance's transition state, referencing its declaration. |
 | `custom` | `custom/NAMESPACE/NAME` | yes | An extension subject. |
 | `daemon` | `daemon/NODE` | no | An st3 daemon. |
 | `doc` | `doc/NAME` | no | A named immutable document lineage. |

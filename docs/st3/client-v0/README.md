@@ -595,7 +595,7 @@ identity or graph context from prose.
 
 `alert` says whether the item is an alert: it blocks or waits on the person. Asks, human
 gates, launch and revision approvals, agent and custom requests, harness prompts and logins, and
-a broken gate the person published are alerts; an update, which asks nothing, is not. `conversation_id` names the agent whose
+condition breaches and a broken gate the person published are alerts; an update, which asks nothing, is not. `conversation_id` names the agent whose
 conversation the item belongs to: the agent that asked, the agent whose work a gate reviews
 (else its run's requester), the launch's planner, the revision's proposer, or the seat itself.
 It is absent when no agent is behind the item. `conversation_ids` lists every conversation the item
@@ -1789,3 +1789,5 @@ chunk reads do not rebuild the session. The owner never requests transcript HTTP
 URLs. External images use an `image_link` block for explicit client opening; file
 reads are restricted to content-addressed files in the bound Pi/OMP blob store. MIME comes from passive image
 signatures, with SVG/HTML/unrecognized bytes returned only as opaque octets.
+
+A `condition` attention item describes a standing metric breach and clears after recovery. It has no human resolution action. stui displays its title and detail on home. Deploy current clients before person-owned declarations: older strict clients do not receive a compatibility downgrade for this new kind.

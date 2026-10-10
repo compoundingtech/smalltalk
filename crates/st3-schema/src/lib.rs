@@ -738,7 +738,7 @@ fn build_registry() -> Registry {
         ),
         (
             "condition-instance",
-            "condition-instance/CONDITION_HASH/INSTANCE_HASH",
+            "condition-instance/CONDITION_HASH/ORIGIN_HASH/INSTANCE_HASH",
             "One daemon-evaluated instance's transition state, referencing its declaration.",
             false,
         ),

@@ -3,27 +3,27 @@
   "summary": "Declare metric thresholds in KDL; the daemon evaluates conditions in the background and notifies owners once on breach and recovery.",
   "replay": {
     "status": "changed",
-    "detail": "No graph replay required. Local condition heads seed from indexed latest per-instance state, not historical replay. Replication re-admits old unknown-subject-family invalid records once per schema digest; genuinely invalid records remain invalid and do not retry on every pass."
+    "detail": "No graph replay; one-time re-admission of old unknown-family invalid records per new schema digest. Local condition heads re-seed through bounded indexed seeks whenever declarations change."
   },
   "schema": {
     "status": "changed",
-    "detail": "Adds condition declarations and condition-instance subjects with system-only durable condition.state transitions; routine values stay local. Registry digest expands. Storage version stays 18; five local condition tables and a desired-condition partial index are created on store open, without a global claims-index build."
+    "detail": "Adds condition declarations and condition-instance/condition-hash/origin-hash/instance-hash subjects with authenticated system-only durable transitions. Storage version stays 18; four local cache tables and a desired-condition partial index are created on open, without a global claims-index build."
   },
   "rules": {
     "status": "none",
-    "detail": "No checkpoint rule changes. Only entry/recovery transitions append durable condition.state; routine samples and intermediate phases stay in a bounded local overlay. Minimum holds and recovery cooldown bound flapping."
+    "detail": "condition.state is durable and never trimmed: no checkpoint rule changes. Only entry/recovery append; routine and hold phases stay local. At minimum holds plus cooldown, flapping can append about two claims per seven minutes (~411/day/instance), at most 32 declarations x eight local instances. This is a worst-case transition bound, not a steady-sample stream."
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Additive /v1/conditions and st conditions ls/show. Client-v0 attention_kind adds condition; generated clients and CONTRACT_SHA256 change. Deploy daemons before CLI, every member before publishing new facts, and clients before person-owned conditions. Older schemas reject the new subject families; upgrade retries those rejections once per new digest."
+    "detail": "Adds /v1/conditions and st conditions ls/show. Client-v0 adds condition attention kind; generated clients/digest change and stui renders these alerts. Deploy all daemons before facts, daemon before CLI, and clients before person-owned declarations. Old daemons mark condition intent.desired invalid (degraded envelope) and condition.state unknown; these heal once after upgrade without replication repair."
   },
   "downtime": {
     "status": "none",
-    "detail": "Ordinary daemon restart; breaches resume silently and pending holds restart. Background evaluation every 30 seconds; hourly physical database sampling; one isolated disk worker with stale-cache diagnostics."
+    "detail": "Ordinary daemon restart; breaches resume silently, holds restart. Evaluation and live file+WAL size sampling every 30 seconds; one disk worker with stale diagnostics. Physical daily growth is deferred to the shared SLO sampler adapter; no separate hourly ring."
   },
   "manual": {
     "status": "changed",
-    "detail": "Operations must deploy all fleet daemons before publishing the first conditions. Keep existing watches until real-host breach/recovery verification and operations approval."
+    "detail": "Operations must deploy all fleet daemons before publishing the first conditions. Keep existing watches until real-host breach/recovery verification and operations approval. Publication caps subtract same-apply stops; out-of-band replicated over-cap declarations produce an explicit invalid-declaration diagnostic. Missing breached instances remain last-known breach until measured recovery; absence cannot prove recovery. Process PID enumeration is bounded and may miss processes beyond the cap. Background tasks stop when the daemon runtime shuts down; an uninterruptible kernel call may delay shutdown."
   },
   "recovery": {
     "status": "changed",
