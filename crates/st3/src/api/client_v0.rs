@@ -8977,6 +8977,41 @@ fn parameter_string(parameters: &Value, key: &str) -> Result<String, ApiError> {
         .ok_or_else(|| validation(format!("action parameters require `{key}`")))
 }
 
+/// `fyi` and `question` are the same as their tags. A signed message carries them in the tags its
+/// device signed, since st cannot add a tag to a signed message.
+fn message_send_tags(parameters: &Value) -> Result<Vec<String>, ApiError> {
+    let mut tags: Vec<String> = parameters
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    for (flag, tag) in [
+        ("fyi", crate::fyi::FYI_TAG),
+        ("question", crate::fyi::QUESTION_TAG),
+    ] {
+        if parameters.get(flag).and_then(Value::as_bool) != Some(true)
+            || tags.iter().any(|existing| existing == tag)
+        {
+            continue;
+        }
+        if parameters.get("signature").is_some() {
+            return Err(validation(format!(
+                "a signed message with `{flag}` carries `{tag}` in its signed tags"
+            )));
+        }
+        tags.push(tag.into());
+    }
+    if tags.iter().any(|tag| tag == crate::fyi::FYI_TAG)
+        && tags.iter().any(|tag| tag == crate::fyi::QUESTION_TAG)
+    {
+        return Err(validation("a message is FYI or a question, not both"));
+    }
+    Ok(tags)
+}
+
 fn validate_message_session(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -9812,14 +9847,7 @@ async fn dispatch_action(
                         .get("in_reply_to")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
-                    tags: p
-                        .get("tags")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect(),
+                    tags: message_send_tags(p)?,
                     attachments: p
                         .get("attachments")
                         .cloned()

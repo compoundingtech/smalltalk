@@ -1963,7 +1963,7 @@
             "type": { "const": "message.send" },
             "parameters": {
               "type": "object", "additionalProperties": false, "required": ["to", "content"],
-              "properties": { "to": { "$ref": "#/$defs/Id" }, "session_id": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }, "signature": { "$ref": "#/$defs/DeviceSignature" }, "attachments": { "type": "array", "maxItems": 4, "items": { "$ref": "#/$defs/AttachmentInput" } } }
+              "properties": { "to": { "$ref": "#/$defs/Id" }, "session_id": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }, "fyi": { "type": "boolean" }, "question": { "type": "boolean" }, "signature": { "$ref": "#/$defs/DeviceSignature" }, "attachments": { "type": "array", "maxItems": 4, "items": { "$ref": "#/$defs/AttachmentInput" } } }
             }
           }
         },

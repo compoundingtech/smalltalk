@@ -2268,6 +2268,8 @@ async fn send_message(
         in_reply_to,
         session_id,
         tags,
+        fyi: false,
+        question: false,
         attachments,
         signature: None,
     };

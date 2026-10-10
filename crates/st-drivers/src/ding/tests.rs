@@ -3080,8 +3080,13 @@ fn dictated_deliveries_keep_the_message_body_and_digest() {
         Some(ordinary.as_str())
     );
     assert_eq!(
-        with_dictation_notice(ordinary.clone(), &["not-dictated".into()]),
+        with_tag_notices(ordinary.clone(), &["not-dictated".into()]),
         ordinary
+    );
+    assert_eq!(
+        with_tag_notices(ordinary.clone(), &["st3-fyi".into()])
+            .strip_prefix("(FYI: held without waking you until this turn)\n"),
+        Some(ordinary.as_str())
     );
 }
 

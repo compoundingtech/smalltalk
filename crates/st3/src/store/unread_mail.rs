@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS unread_mail (
     subject TEXT PRIMARY KEY,
     sent_time INTEGER NOT NULL
 ) WITHOUT ROWID;
+-- Lists the oldest unread mail, such as held FYI mail past a day, without a table scan.
+CREATE INDEX IF NOT EXISTS unread_mail_sent_time_index ON unread_mail(sent_time);
 CREATE TABLE IF NOT EXISTS unread_mail_prefixes (
     shift INTEGER NOT NULL,
     prefix INTEGER NOT NULL,
@@ -144,6 +146,50 @@ pub(super) fn count_in_snapshot(connection: &Connection, before_unix_ms: u128) -
         )?
         .query_row([before], |row| row.get(0))?;
     Ok(u64::try_from(base + delta)?)
+}
+
+/// Unread messages sent before the cutoff, with their recipient, sender and tags. The queued
+/// subjects are read as they stand, without folding the queue: a read never writes.
+pub(super) struct UnreadSent {
+    pub to: String,
+    pub from: String,
+    pub tags: Vec<String>,
+    pub sent_unix_ms: u128,
+}
+
+pub(super) fn sent_before(connection: &Connection, before_unix_ms: u128) -> Result<Vec<UnreadSent>> {
+    let before = i64::try_from(before_unix_ms).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare_cached(
+        "WITH candidates(subject) AS (
+             SELECT subject FROM unread_mail WHERE sent_time < ?1
+             UNION SELECT subject FROM unread_mail_pending)
+         SELECT json_extract(sent.body,'$.fields.to'), json_extract(sent.body,'$.fields.from'),
+                json_extract(sent.body,'$.fields.tags'),
+                MAX(CAST(sent.accepted_at_unix_ms AS INTEGER)) AS sent_time
+         FROM candidates JOIN claims sent
+           ON sent.subject=candidates.subject AND sent.kind='message.sent'
+         WHERE NOT EXISTS (
+             SELECT 1 FROM claims terminal WHERE terminal.subject=candidates.subject
+             AND terminal.kind IN ('message.read','message.closed'))
+         GROUP BY candidates.subject HAVING sent_time < ?1",
+    )?;
+    let rows = statement.query_map([before], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut sent = Vec::new();
+    for row in rows {
+        let (to, from, tags, time) = row?;
+        let tags = tags
+            .and_then(|tags| serde_json::from_str::<Vec<String>>(&tags).ok())
+            .unwrap_or_default();
+        sent.push(UnreadSent { to, from, tags, sent_unix_ms: u128::try_from(time).unwrap_or_default() });
+    }
+    Ok(sent)
 }
 
 pub(super) fn count_before(transaction: &Transaction<'_>, before_unix_ms: u128) -> Result<u64> {

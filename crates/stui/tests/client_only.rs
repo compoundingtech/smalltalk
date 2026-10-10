@@ -329,6 +329,8 @@ async fn stui_pair_persists_a_real_signing_key_and_leaves_read_only_devices_with
                 in_reply_to: None,
                 session_id: None,
                 tags: vec![],
+                fyi: false,
+                question: false,
                 attachments: vec![],
                 signature: None,
             },

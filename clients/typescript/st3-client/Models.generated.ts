@@ -2132,7 +2132,9 @@ export type ActionRequest =
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'message.send'; parameters: {
   attachments?: Array<AttachmentInput>;
   content: string;
+  fyi?: boolean;
   in_reply_to?: Id;
+  question?: boolean;
   session_id?: Id;
   signature?: DeviceSignature;
   tags?: Array<string>;

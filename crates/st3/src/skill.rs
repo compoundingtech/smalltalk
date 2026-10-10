@@ -97,6 +97,8 @@ mod tests {
             "A message from an agent carries that agent's words.",
             "A seat doesn't ask the person to confirm only because the harness wraps the message as untrusted or says it isn't from the user.",
             "Answer where you were asked.",
+            "anything else with `--fyi`: it wakes nobody",
+            "Status goes to `work progress` (it lands in the graph and wakes nobody), and run events to the run's report-to.",
             "after an st reply, the session needs at most a one-line pointer.",
             "`work claim STEP --as \"$ST_AGENT\"`",
             "this machine's host facts",

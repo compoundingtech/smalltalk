@@ -665,6 +665,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/sets/apply", post(owned_sets::apply))
         .route("/v1/intent/apply", post(apply_with_bound))
         .route("/v1/agents/rename", post(rename_agent))
+        .route("/v1/agents/wake-on", post(set_agent_wake_on))
         .route("/v1/agents/restart", post(restart_agent))
         .route("/v1/agents/rollout", post(rollout_agent))
         .route("/v1/agents/start", post(start_mission_seat))
@@ -6263,6 +6264,7 @@ async fn guard_bound_request(
         "/v1/sets/",
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
+        "/v1/agents/wake-on",
         "/v1/agents/restart",
         "/v1/agents/rollout",
         "/v1/agents/start",
@@ -6910,6 +6912,37 @@ fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
     }
 }
 
+/// Held FYI mail is never lost: unread past a day, it is listed for its seat.
+fn held_mail_check(store: &Store, now: u128) -> DoctorCheck {
+    match store.held_mail_before(now.saturating_sub(crate::fyi::HELD_TOO_LONG_MS)) {
+        Ok(seats) if seats.is_empty() => DoctorCheck {
+            name: "held-mail".into(),
+            status: "pass".into(),
+            message: "no seat holds FYI mail unread for over a day".into(),
+        },
+        Ok(seats) => DoctorCheck {
+            name: "held-mail".into(),
+            status: "warn".into(),
+            message: format!(
+                "FYI mail unread for over a day: {}; read it with `st conversations ls --as SEAT`",
+                seats
+                    .iter()
+                    .map(|(seat, count, oldest)| format!(
+                        "{seat}: {count}, oldest {}h",
+                        now.saturating_sub(*oldest) / 3_600_000
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        },
+        Err(error) => DoctorCheck {
+            name: "held-mail".into(),
+            status: "warn".into(),
+            message: error.to_string(),
+        },
+    }
+}
+
 fn unread_current_seat_counts(
     store: &Store,
     recipients: &BTreeSet<&str>,
@@ -6921,6 +6954,8 @@ fn unread_current_seat_counts(
     for message in messages.iter().filter(|message| {
         recipients.contains(message.to.as_str())
             && !matches!(message.status.as_str(), "read" | "closed")
+            // Held mail is not late: it waits for the seat's next turn.
+            && !crate::fyi::waits_for_turn(message)
     }) {
         let owners = store.desired_subjects_named(std::slice::from_ref(&message.to))?;
         if let Some(host) = owners
@@ -7703,6 +7738,7 @@ fn doctor_report_with_operation_drift(
         }),
         Err(error) => checks.push(DoctorCheck { name: "mail-backlog".into(), status: "warn".into(), message: error.to_string() }),
     }
+    checks.push(held_mail_check(&state.store, client_now_ms()));
     match delivery_probes::check(
         &state.store,
         client_now_ms(),
@@ -10948,6 +10984,45 @@ async fn rename_agent(
     Ok(Json(response))
 }
 
+#[derive(Deserialize)]
+struct AgentWakeOnRequest {
+    subject: String,
+    wake_on: String,
+    actor: String,
+    idempotency_key: String,
+}
+
+async fn set_agent_wake_on(
+    State(state): State<AppState>,
+    Json(request): Json<AgentWakeOnRequest>,
+) -> Result<Json<ApplyResponse>, ApiError> {
+    let subject = if request.subject.starts_with("agent/") {
+        request.subject
+    } else {
+        format!("agent/{}", request.subject)
+    };
+    if !request.actor.starts_with("person/") {
+        normalized_agent_actor(&request.actor).ok_or_else(|| {
+            ApiError::bad(St3Error::new("invalid-wake-on-actor", "wake-on needs a person or agent actor"))
+        })?;
+    }
+    let wake_on = crate::fyi::WakeOn::parse(&request.wake_on).ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "invalid-agent-wake-on",
+            format!("wake-on `{}` must be all or questions", request.wake_on),
+        ))
+    })?;
+    let response = blocking_api(move || {
+        state
+            .store
+            .set_agent_wake_on(&subject, wake_on, &request.idempotency_key)
+            .map_err(ApiError::bad)
+            .inspect(|_| signal_changed(&state))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
 async fn apply(
     State(state): State<AppState>,
     Json(request): Json<ApplyRequest>,
@@ -12326,6 +12401,29 @@ fn accept_message_receipt_with_upload_owner(
     let attachments = client_blobs::resolve_attachments(state, upload_owner.unwrap_or(&from), &request.attachments)?;
     let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()))[..16].to_owned();
     let subject = format!("message/{id}");
+    let parent = request
+        .in_reply_to
+        .as_deref()
+        .map(|parent| state.store.message(&message_subject(parent)))
+        .transpose()
+        .map_err(ApiError::internal)?
+        .flatten();
+    // A signed message stores exactly the tags its device signed; only a person signs, and a
+    // person's message always wakes.
+    let tags = if device_signature.is_some() {
+        request.tags.clone()
+    } else {
+        crate::fyi::stored_tags(&from, &to, &request.tags, parent.as_ref(), || {
+            state
+                .store
+                .desired_subjects_named(std::slice::from_ref(&to))
+                .ok()
+                .and_then(|seats| seats.into_iter().next())
+                .map_or_else(Default::default, |seat| {
+                    crate::fyi::declared_wake_on(Some(&seat.desired))
+                })
+        })
+    };
     let mut fields = BTreeMap::from([
         ("from".into(), Value::String(from.clone())),
         ("to".into(), Value::String(to.clone())),
@@ -12349,7 +12447,7 @@ fn accept_message_receipt_with_upload_owner(
         ),
         (
             "tags".into(),
-            Value::Array(request.tags.iter().cloned().map(Value::String).collect()),
+            Value::Array(tags.iter().cloned().map(Value::String).collect()),
         ),
     ]);
     if let Some(session_id) = session_id {
@@ -12379,15 +12477,13 @@ fn accept_message_receipt_with_upload_owner(
         None => state.store.append_claim_outcome(&input),
     }
     .map_err(ApiError::bad)?;
-    let mut work_wake = is_work_wake(&request.tags);
-    if let Some(parent) = request.in_reply_to.as_deref() {
+    let mut work_wake = is_work_wake(&tags);
+    if let Some(reference) = request.in_reply_to.as_deref() {
         // Settling the parent writes its lifecycle claims too.
-        work_wake |= state
-            .store
-            .message(&message_subject(parent))
-            .map_err(ApiError::internal)?
+        work_wake |= parent
+            .as_ref()
             .is_none_or(|message| is_work_wake(&message.tags));
-        settle_answered_message(&state.store, parent, &from, &to, &subject, &record.id)?;
+        settle_answered_message(&state.store, reference, &from, &to, &subject, &record.id)?;
     }
     signal_message_changed(state, "message.sent", work_wake);
     Ok(MessageSendReceipt {
@@ -12399,7 +12495,7 @@ fn accept_message_receipt_with_upload_owner(
             status: "sent".into(),
             title: request.title,
             in_reply_to: request.in_reply_to,
-            tags: request.tags,
+            tags,
             created_index: record.store_index,
             attachments,
         },
@@ -15870,6 +15966,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         for path in [
             "/v1/agent-queue-moves",
             "/v1/agents/rename",
+            "/v1/agents/wake-on",
             "/v1/agents/restart",
             "/v1/agents/rollout",
             "/v1/agents/start",

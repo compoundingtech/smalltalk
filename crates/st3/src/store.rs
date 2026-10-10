@@ -12548,6 +12548,38 @@ impl Store {
         if name == Some("") {
             return Err(St3Error::new("invalid-agent-name", "a seat label must be a non-empty string"));
         }
+        self.revise_agent_in_place(
+            subject,
+            json!({ "agent": subject, "display_name": name }),
+            idempotency_key,
+            |desired| desired.set_display_name(name),
+        )
+    }
+
+    /// Choose what wakes a seat, without restarting its harness. Messages already sent keep
+    /// the delivery they were sent with.
+    pub fn set_agent_wake_on(
+        &self,
+        subject: &str,
+        wake_on: crate::fyi::WakeOn,
+        idempotency_key: &str,
+    ) -> Result<ApplyResponse, St3Error> {
+        self.revise_agent_in_place(
+            subject,
+            json!({ "agent": subject, "wake_on": wake_on.as_str() }),
+            idempotency_key,
+            |desired| desired.set_wake_on(wake_on),
+        )
+    }
+
+    /// Republish a seat's current declaration with one change that keeps its launch.
+    fn revise_agent_in_place(
+        &self,
+        subject: &str,
+        normalized: Value,
+        idempotency_key: &str,
+        revise: impl FnOnce(&mut DesiredSubject) -> Result<(), St3Error>,
+    ) -> Result<ApplyResponse, St3Error> {
         let (mut desired, heads, writer) = {
             let connection = self.readers.get();
             let transaction = connection.unchecked_transaction().map_err(internal)?;
@@ -12577,8 +12609,7 @@ impl Store {
             let heads = intent_leaves_tx(&transaction, subject).map_err(internal)?;
             (desired.0, heads, desired.1)
         };
-        desired.set_display_name(name)?;
-        let normalized = json!({ "agent": subject, "display_name": name });
+        revise(&mut desired)?;
         let intent = NormalizedIntent {
             direct_message_registrations: BTreeSet::new(),
             schema: "st3.v1".into(),
@@ -13361,6 +13392,25 @@ impl Store {
         let count = unread_mail::count_before(&transaction, before_unix_ms)?;
         transaction.commit()?;
         Ok(count)
+    }
+
+    /// Each seat's unread held mail sent before the cutoff: its count and oldest send time.
+    /// A read: it never folds the unread queue, and reads the queued subjects as they stand.
+    pub fn held_mail_before(&self, before_unix_ms: u128) -> Result<Vec<(String, u64, u128)>> {
+        let mut seats = BTreeMap::<String, (u64, u128)>::new();
+        for sent in unread_mail::sent_before(&self.readers.get(), before_unix_ms)? {
+            if sent.tags.iter().any(|tag| tag == crate::fyi::FYI_TAG)
+                && !crate::fyi::always_wakes(&sent.from, &sent.tags)
+            {
+                let seat = seats.entry(sent.to).or_insert((0, sent.sent_unix_ms));
+                seat.0 += 1;
+                seat.1 = seat.1.min(sent.sent_unix_ms);
+            }
+        }
+        Ok(seats
+            .into_iter()
+            .map(|(seat, (count, oldest))| (seat, count, oldest))
+            .collect())
     }
 
     pub fn messages(
@@ -21230,12 +21280,14 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
     Ok(lineage)
 }
 
-/// Two agent declarations that differ only in their human label share one launch.
+/// Two agent declarations that differ only in their human label or in what wakes the seat
+/// share one launch.
 fn presentation_only_change(previous: &Value, next: &Value) -> bool {
     let parse = |body: &Value| {
         let mut desired = serde_json::from_value::<DesiredSubject>(body.clone()).ok()?;
         (desired.kind == "agent").then_some(())?;
         desired.set_display_name(None).ok()?;
+        desired.set_wake_on(crate::fyi::WakeOn::All).ok()?;
         Some(desired)
     };
     matches!((parse(previous), parse(next)), (Some(previous), Some(next)) if previous == next)
@@ -34156,6 +34208,37 @@ agent "test/worker" { workspace "."; command "true"; name "Initial" }
         let cleared = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap().0;
         assert_eq!(crate::model::effective_agent_name("agent/test/worker", Some(&cleared.desired)), "test/worker");
         assert_eq!(cleared.member.unwrap().display_name, None);
+    }
+
+    #[test]
+    fn wake_on_is_declared_in_kdl_and_set_by_command_without_a_new_launch() {
+        use crate::fyi::{WakeOn, declared_wake_on};
+        let store = Store::open_memory("node").unwrap();
+        let intent = parse_intent(r#"version 2
+agent "test/worker" { command "true"; wake-on "questions" }
+"#, "node").unwrap();
+        let preview = store.mission(&intent, IntentInput {
+            kdl: String::new(), source_name: None,
+        }).unwrap();
+        store.apply(&intent, &preview.subject_tokens, "declared").unwrap();
+        let wake_on = |store: &Store| {
+            let seat = store.desired_subjects_named(&["agent/test/worker".into()]).unwrap();
+            declared_wake_on(seat.first().map(|seat| &seat.desired))
+        };
+        assert_eq!(wake_on(&store), WakeOn::Questions);
+        let launch = store.selected_desired_token("agent/test/worker").unwrap().unwrap();
+        store.set_agent_wake_on("agent/test/worker", WakeOn::All, "all").unwrap();
+        assert_eq!(wake_on(&store), WakeOn::All);
+        store.set_agent_wake_on("agent/test/worker", WakeOn::Questions, "questions").unwrap();
+        assert_eq!(wake_on(&store), WakeOn::Questions);
+        // The setting changes what wakes the seat, never its launch: no restart.
+        let lineage = store.launch_lineage("agent/test/worker").unwrap();
+        assert_eq!(lineage.last(), Some(&launch), "{lineage:?}");
+        assert_eq!(lineage.len(), 3);
+        for invalid in [r#"wake-on "sometimes""#, r#"wake-on"#, r#"wake-on "all"; wake-on "all""#] {
+            let kdl = format!("version 2\nagent \"test/other\" {{ command \"true\"; {invalid} }}\n");
+            assert!(parse_intent(&kdl, "node").is_err(), "{invalid}");
+        }
     }
 
     #[test]

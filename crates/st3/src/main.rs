@@ -2963,6 +2963,13 @@ enum AgentsCommand {
     Resume(AgentResumeArgs),
     /// Change only a seat's human label, without restarting its harness.
     Rename(AgentRenameArgs),
+    /// Choose what wakes a seat, without restarting its harness.
+    ///
+    /// `questions` holds every message that asks the seat nothing as FYI: stored unread, and
+    /// shown at the seat's next turn. A person's message, a work handoff, a fault, a ready step
+    /// and a gh watch event still wake it. `all`, the default, wakes it for every message not
+    /// sent `--fyi`. The same choice is `wake-on "questions"` in the agent's KDL.
+    WakeOn(AgentWakeOnArgs),
     /// Show one seat's current claim and its queued mission runs in order, or move a run.
     /// The show form is also available as `st missions queued AGENT`.
     Queue(AgentQueueArgs),
@@ -2992,6 +2999,17 @@ struct AgentHoldArgs {
     release: bool,
     #[arg(long)]
     reason: Option<String>,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct AgentWakeOnArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
+    subject: String,
+    #[arg(value_parser = ["all", "questions"])]
+    wake_on: String,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
@@ -4198,8 +4216,11 @@ enum MessageCommand {
     /// Send one durable normalized message to an agent.
     ///
     /// A message is a direct connection: it wakes the recipient agent for a full turn,
-    /// which rereads its context. People have no inbox: a send or reply to a person fails.
-    /// To reach a person, print in the chat.
+    /// which rereads its context. Send one for a question or a handoff; `--fyi` for anything
+    /// else, which wakes nobody and reaches the recipient at its next turn. Status goes to
+    /// `work progress` (it lands in the graph and wakes nobody), run events to report-to.
+    /// People have no inbox: a send or reply to a person fails. To reach a person, print in
+    /// the chat.
     Send(MessageSendArgs),
     /// List the current mailbox for one explicit identity.
     Ls(MessageListArgs),
@@ -4211,7 +4232,7 @@ enum MessageCommand {
     /// Reply to one canonical message ID while preserving its thread.
     ///
     /// A message is a direct connection: it wakes the recipient agent for a full turn,
-    /// which rereads its context.
+    /// which rereads its context. A reply that only acknowledges or reports is `--fyi`.
     Reply(MessageReplyArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
@@ -4295,6 +4316,8 @@ struct MessageSendArgs {
     /// member and fetched by the machine that reads or delivers the message.
     #[arg(long = "attach", value_name = "FILE")]
     attach: Vec<PathBuf>,
+    #[command(flatten)]
+    wake: MessageWakeArgs,
     /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
@@ -4303,6 +4326,31 @@ struct MessageSendArgs {
     /// the message already sent instead of sending it twice.
     #[arg(long)]
     idempotency_key: Option<String>,
+}
+
+/// Whether a message wakes its recipient. A person's message, a handoff, a fault, a ready step
+/// and a gh watch event always wake it.
+#[derive(Args, Clone, Copy, Default)]
+struct MessageWakeArgs {
+    /// Store it unread without waking the recipient; it sees the message at its next turn.
+    #[arg(long, conflicts_with = "question")]
+    fyi: bool,
+    /// It asks the recipient something: it wakes a seat that wakes only on questions, and so
+    /// does each reply to you in its thread.
+    #[arg(long)]
+    question: bool,
+}
+
+impl MessageWakeArgs {
+    fn tags(self) -> impl Iterator<Item = String> {
+        [
+            self.fyi.then_some(st3::fyi::FYI_TAG),
+            self.question.then_some(st3::fyi::QUESTION_TAG),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+    }
 }
 
 #[derive(Args)]
@@ -4351,6 +4399,8 @@ struct MessageReplyArgs {
     /// Attach an image (PNG, JPEG, GIF or WebP, at most 10 MiB, up to 4).
     #[arg(long = "attach", value_name = "FILE")]
     attach: Vec<PathBuf>,
+    #[command(flatten)]
+    wake: MessageWakeArgs,
     /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
@@ -5346,6 +5396,9 @@ fn guard_mutating_cli_actor(
             })?),
             AgentsCommand::Rename(args) => Some(args.actor.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("a harness rename needs explicit --as {own}")
+            })?),
+            AgentsCommand::WakeOn(args) => Some(args.actor.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("a harness wake-on change needs explicit --as {own}")
             })?),
             AgentsCommand::Queue(args) => match &args.command {
                 Some(AgentQueueCommand::Move(args)) => Some(args.actor.as_deref().ok_or_else(|| {
@@ -12704,6 +12757,21 @@ async fn run_agents(
             ).await?;
             print_value(&response, json_output)
         }
+        AgentsCommand::WakeOn(args) => {
+            let actor = args.actor.as_deref().or(configured_person).context(
+                "st3 agents wake-on needs --as ACTOR or a configured person",
+            )?;
+            let response: Value = cli_client(endpoint).post(
+                "/v1/agents/wake-on",
+                &json!({
+                    "subject": normalize_agent_subject(&args.subject),
+                    "wake_on": args.wake_on,
+                    "actor": actor,
+                    "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                }),
+            ).await?;
+            print_value(&response, json_output)
+        }
         AgentsCommand::Queue(args) => {
             run_agent_queue(endpoint, configured_person, args, json_output).await
         }
@@ -13726,6 +13794,7 @@ async fn run_agent_inspection(
         | AgentsCommand::Suspend(_)
         | AgentsCommand::Resume(_)
         | AgentsCommand::Rename(_)
+        | AgentsCommand::WakeOn(_)
         | AgentsCommand::Queue(_)
         | AgentsCommand::Hold(_) => {
             unreachable!("agent mutation and queue commands return before inspection")
@@ -15323,6 +15392,7 @@ async fn run_attention(
                     tags: Vec::new(),
                     from: actor,
                     attach: Vec::new(),
+                    wake: MessageWakeArgs::default(),
                     print_kdl: false,
                     idempotency_key: args.idempotency_key,
                 },
@@ -16560,6 +16630,7 @@ async fn run_message(
                     in_reply_to: Some(original.subject),
                     tags: Vec::new(),
                     from: args.from,
+                    wake: args.wake,
                     print_kdl: args.print_kdl,
                     idempotency_key: args.idempotency_key,
                 },
@@ -16805,6 +16876,12 @@ async fn send_message(
     st3::model::refuse_person_recipient(&to).map_err(|error| anyhow::anyhow!(error.message))?;
     reject_foreign_agent_actor(&args.from)?;
     let from = normalize_message_subject(&args.from);
+    let mut args = args;
+    for tag in args.wake.tags() {
+        if !args.tags.contains(&tag) {
+            args.tags.push(tag);
+        }
+    }
     let kdl = message_mission_intent(
         &mission_id,
         &id,
@@ -20078,7 +20155,7 @@ fn pi_family_message_frame(
     json!({
         "type": "message",
         "deliverAs": "steer",
-        "content": st_drivers::ding::with_dictation_notice(st_drivers::ding::st3_notification_with_attachments(
+        "content": st_drivers::ding::with_tag_notices(st_drivers::ding::st3_notification_with_attachments(
             &message.subject,
             &message.from,
             &message.to,
@@ -20571,7 +20648,9 @@ async fn run_pi_channel(
                     }
                     // A prior incarnation's handoff is not proof that the model consumed mail.
                     // The incarnation-local set survives channel reexec and prevents repeats here.
-                    for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered")) {
+                    let mut items = page.items;
+                    st3::fyi::release(&mut items);
+                    for message in items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered")) {
                     if state.retry_after_ms.get(&message.subject).is_some_and(|after|
                         current_unix_ms().unwrap_or_default() < u128::from(*after)) {
                         continue;
@@ -23391,7 +23470,10 @@ async fn forward_projected_messages_reporting(
             if cursor.is_none() { report } else { None },
         )
         .await?;
-        for message in page.items {
+        let mut items = page.items;
+        // Held mail goes to the seat only beside a message that wakes it.
+        st3::fyi::release(&mut items);
+        for message in items {
             active_subjects.insert(message.subject.clone());
             if matches!(message.status.as_str(), "read" | "closed") {
                 consumed_by_recipient.insert(message.subject);
@@ -28049,6 +28131,7 @@ mod tests {
             tags: Vec::new(),
             from: "agent/example/worker".into(),
             attach: Vec::new(),
+            wake: MessageWakeArgs::default(),
             print_kdl: false,
             idempotency_key: Some("refuse-a-person".into()),
         };

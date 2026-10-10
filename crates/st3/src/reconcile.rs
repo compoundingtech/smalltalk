@@ -11565,6 +11565,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .into_iter()
                 .any(|message| {
                     matches!(message.status.as_str(), "sent" | "staged" | "delivered")
+                        // Held mail waits for the seat's next turn, not for this seat.
+                        && !crate::fyi::waits_for_turn(&message)
                         && !message.tags.iter().any(|tag| {
                             tag.starts_with("st3-work:") || tag.starts_with("st3-wake-source:")
                         })

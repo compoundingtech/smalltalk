@@ -308,6 +308,22 @@ impl DesiredSubject {
         }
         Ok(())
     }
+
+    /// Set what wakes the seat, as its `wake-on` child; `All` is the default and removes it.
+    pub fn set_wake_on(&mut self, wake_on: crate::fyi::WakeOn) -> Result<(), St3Error> {
+        let body = self.desired.as_object_mut()
+            .ok_or_else(|| St3Error::new("invalid-agent-declaration", "agent has no canonical body"))?;
+        if !body.contains_key("children") {
+            body.insert("children".into(), serde_json::json!([]));
+        }
+        let children = body.get_mut("children").and_then(Value::as_array_mut)
+            .ok_or_else(|| St3Error::new("invalid-agent-declaration", "agent body must be an array"))?;
+        children.retain(|child| child.get("name").and_then(Value::as_str) != Some("wake-on"));
+        if wake_on != crate::fyi::WakeOn::All {
+            children.push(serde_json::json!({ "name": "wake-on", "arguments": [wake_on.as_str()] }));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]

@@ -43,6 +43,8 @@ Use these documents for implementation details:
   enough to stop, and how each harness comes back on its own native session.
 - [Seats across deploys](seat-deploys.md) explains how a running seat's driver and channels follow
   a replaced st binary without ending the provider session, and how st reports a stale message path.
+- [FYI messages](fyi-messages.md) explains messages that wake nobody, a seat that wakes only on
+  questions and handoffs, and where status and run events go instead.
 - [Delivery probes](delivery-probes.md) describes token-free native-channel probes, per-direction
   read latency, overdue attention, and the replicated results in `st doctor`.
 - [Live-path priority](priority.md) explains how the daemon and each PTY server outrank the builds

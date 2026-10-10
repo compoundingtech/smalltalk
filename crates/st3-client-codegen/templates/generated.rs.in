@@ -2550,6 +2550,12 @@ pub struct MessageSendParameters {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Store it unread without waking the recipient; it sees the message at its next turn.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fyi: bool,
+    /// It asks the recipient something, so it wakes a seat that wakes only on questions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub question: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentInput>,
     /// The sending device's signature over the message, as `docs/st3/device-signing.md` lays out.

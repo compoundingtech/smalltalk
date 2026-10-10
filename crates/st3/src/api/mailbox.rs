@@ -242,7 +242,12 @@ fn retain_live_mail(
         if after_connection || recovered.contains(&message.subject) {
             live.push(message);
         } else if sent.accepted_at_unix_ms
-            > since.saturating_sub(u128::from(super::mail_backlog::THRESHOLD_MS))
+            > since.saturating_sub(if crate::fyi::is_held(&message) {
+                // Held mail waits for a turn, not a delivery: it is still news for a day.
+                crate::fyi::HELD_TOO_LONG_MS
+            } else {
+                u128::from(super::mail_backlog::THRESHOLD_MS)
+            })
             && never_offered(store, &message)?
         {
             recovered.insert(message.subject.clone());
@@ -795,6 +800,9 @@ async fn stream_with_timers_inner<F, S, H>(
                 .map(|message| message.subject.clone())
                 .collect::<Vec<_>>();
             subscription.messages(&subjects);
+            // Held mail stays admitted to this stream, so the next waking message releases it
+            // without another read; until then the seat is offered none of it.
+            crate::fyi::release(&mut messages);
             let bytes = serde_json::to_vec(&messages).unwrap_or_default();
             if fence.component == "delivery" && bytes != previous_mailbox {
                 if send(&mut socket, &Frame::Mailbox { messages })
@@ -1812,6 +1820,219 @@ mod tests {
             state.store.messages(Some(seat), false).unwrap()[0].status,
             "sent"
         );
+        server.abort();
+    }
+
+    /// The next mail frame, skipping seat and control frames.
+    async fn next_mail(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+    ) -> Vec<crate::model::MessageView> {
+        loop {
+            if let Frame::Mailbox { messages } = next(socket).await {
+                return messages;
+            }
+        }
+    }
+
+    /// No mail frame arrives for a while: nothing was offered to the seat.
+    async fn no_mail(socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>) {
+        let quiet = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Frame::Mailbox { messages } = serde_json::from_str(&text).unwrap() {
+                            return messages;
+                        }
+                    }
+                    Some(Ok(Message::Ping(bytes))) => socket.send(Message::Pong(bytes)).await.unwrap(),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        })
+        .await;
+        if let Ok(messages) = quiet {
+            panic!("held mail was offered: {messages:?}");
+        }
+    }
+
+    /// Each receipt updates the frame; the mailbox ends empty once the seat has read it all.
+    async fn drained(socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>) {
+        while !next_mail(socket).await.is_empty() {}
+    }
+
+    /// The seat reads each message, as its channel does.
+    async fn read_all(client: &Client, fence: &Fence, messages: &[crate::model::MessageView]) {
+        for message in messages {
+            for lifecycle in ["staged", "delivered", "read"] {
+                let _: ClaimRecord = client
+                    .post(
+                        "/v1/mailbox/receipts",
+                        &Receipt {
+                            fence: fence.clone(),
+                            message: message.subject.clone(),
+                            lifecycle: lifecycle.into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn held_mail_wakes_nobody_and_goes_out_with_the_next_waking_message() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
+        crate::mailbox::tests::ready(&state.store, "session-1");
+        let kdl = "version 2\nagent \"eval.worker\" { workspace \"/work\"; command \"sleep 60\"; wake-on \"questions\"; }\n";
+        let intent = crate::graph::parse_test_intent(kdl, "node").unwrap();
+        let planned = state
+            .store
+            .mission(&intent, IntentInput { kdl: kdl.into(), source_name: None })
+            .unwrap();
+        state.store.apply(&intent, &planned.subject_tokens, "seat").unwrap();
+        let peer = NativeDeliveryPeer {
+            agent: "agent/eval.worker".into(),
+            transport: "claude-channel",
+            pid: 37,
+            archives_inbox: false,
+        };
+        let path = root.path().join("daemon.sock");
+        let server_path = path.clone();
+        let app = admitted_fixture_router(state.clone(), peer);
+        let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
+        let client = Client::new(Endpoint::Unix(path.clone()));
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let fence: Fence = client
+            .post("/v1/mailbox/bind", &Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .await
+            .unwrap();
+        let mut socket = client.open_mailbox(&fence).await.unwrap();
+        assert!(next_mail(&mut socket).await.is_empty());
+        let send = |key: &str, from: &str, tags: &[&str], in_reply_to: Option<&str>| {
+            super::super::accept_message(
+                &state,
+                MessageSendRequest {
+                    idempotency_key: key.into(),
+                    from: from.into(),
+                    to: fence.subject.clone(),
+                    content: format!("{key} words"),
+                    title: Some(key.into()),
+                    in_reply_to: in_reply_to.map(str::to_owned),
+                    tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+                    attachments: Vec::new(),
+                },
+                None,
+                None,
+            )
+            .unwrap()
+            .0
+        };
+        // An FYI wakes nobody, and neither does a status the seat's setting holds.
+        let fyi = send("fyi", "agent/eval.peer", &[crate::fyi::FYI_TAG], None);
+        let status = send("status", "agent/eval.peer", &[], None);
+        assert!(status.tags.iter().any(|tag| tag == crate::fyi::HELD_BY_SETTING_TAG));
+        signal_changed(&state);
+        no_mail(&mut socket).await;
+        // Nothing is lost: both are unread, in the seat's mailbox.
+        for held in [&fyi, &status] {
+            assert_eq!(state.store.message(&held.subject).unwrap().unwrap().status, "sent");
+        }
+        let listed = state.store.held_mail_before(u128::MAX).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].0.as_str(), listed[0].1), ("agent/eval.worker", 2));
+
+        // A question wakes the seat, and the held mail goes out with it, oldest first.
+        let question = send("question", "agent/eval.peer", &[crate::fyi::QUESTION_TAG], None);
+        signal_changed(&state);
+        let batch = next_mail(&mut socket).await;
+        assert_eq!(
+            batch.iter().map(|message| message.subject.as_str()).collect::<Vec<_>>(),
+            [fyi.subject.as_str(), status.subject.as_str(), question.subject.as_str()]
+        );
+        read_all(&client, &fence, &batch).await;
+        drained(&mut socket).await;
+
+        // An answer in a thread the seat started with a question wakes it.
+        let asked = super::super::accept_message(
+            &state,
+            MessageSendRequest {
+                idempotency_key: "asked".into(),
+                from: fence.subject.clone(),
+                to: "agent/eval.peer".into(),
+                content: "Which branch?".into(),
+                title: None,
+                in_reply_to: None,
+                tags: vec![crate::fyi::QUESTION_TAG.into()],
+                attachments: Vec::new(),
+            },
+            None,
+            None,
+        )
+        .unwrap()
+        .0;
+        let answer = send("answer", "agent/eval.peer", &[], Some(&asked.subject));
+        assert!(!crate::fyi::is_held(&answer), "{:?}", answer.tags);
+        signal_changed(&state);
+        let woken = next_mail(&mut socket).await;
+        assert_eq!(woken.len(), 1);
+        read_all(&client, &fence, &woken).await;
+        drained(&mut socket).await;
+
+        // Each kind that always wakes still wakes a seat that wakes only on questions.
+        let kinds: [(&str, &str, &[&str]); 5] = [
+            ("person", "person/eval", &[]),
+            ("handoff", "agent/eval.peer", &["st3-work-handoff:step-run/r/s"]),
+            ("fault", "daemon/runtime", &["st3-fault:episode"]),
+            ("ready-step", "daemon/runtime", &["st3-work:step-run/r/s@1@1@x"]),
+            ("gh-watch", "daemon/node", &[crate::github_watch::WATCH_TAG]),
+        ];
+        for (kind, from, tags) in kinds {
+            let held = send(&format!("held-before-{kind}"), "agent/eval.peer", &[crate::fyi::FYI_TAG], None);
+            signal_changed(&state);
+            no_mail(&mut socket).await;
+            // st's own messages are appended as claims, like the daemon does; the others are sent.
+            let subject = if from.starts_with("daemon/") {
+                let subject = format!("message/{kind}");
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: subject.clone(),
+                        kind: "message.sent".into(),
+                        actor: Some(from.into()),
+                        fields: BTreeMap::from([
+                            ("status".into(), json!("sent")),
+                            ("from".into(), json!(from)),
+                            ("to".into(), json!(fence.subject)),
+                            ("content".into(), json!(kind)),
+                            ("tags".into(), json!(tags)),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(kind.into()),
+                    })
+                    .unwrap();
+                subject
+            } else {
+                send(kind, from, tags, None).subject
+            };
+            signal_changed(&state);
+            let batch = next_mail(&mut socket).await;
+            assert_eq!(
+                batch.iter().map(|message| message.subject.as_str()).collect::<Vec<_>>(),
+                [held.subject.as_str(), subject.as_str()],
+                "{kind} wakes the seat and carries its held mail"
+            );
+            read_all(&client, &fence, &batch).await;
+            drained(&mut socket).await;
+        }
+        assert!(state.store.held_mail_before(u128::MAX).unwrap().is_empty());
         server.abort();
     }
 

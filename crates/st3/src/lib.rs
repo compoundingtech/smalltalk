@@ -25,6 +25,8 @@ pub mod driver_hook;
 pub mod environment;
 pub(crate) mod external_sessions;
 pub mod fleet;
+/// FYI messages: stored and readable, but they wake nobody.
+pub mod fyi;
 /// `st missions check`: run a mission file's exec gates once, now, the way a run would.
 pub mod gate_check;
 /// Built-in gate kinds: what gates shelled out for most, answered by st itself.
