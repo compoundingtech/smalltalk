@@ -57,8 +57,10 @@ pub fn memory_query(host: &str) -> String {
     let host = serde_json::to_string(host).expect("serialize host");
     let labels = format!("job=\"infra/node\",host={host}");
     let ratio = format!("1 - node_memory_MemAvailable_bytes{{{labels}}} / node_memory_MemTotal_bytes{{{labels}}}");
-    // Do not mistake instant-query evaluation time for exporter sample time.
-    let timestamp = format!("min by (host) (timestamp({{__name__=~\"node_memory_Mem(Available|Total)_bytes\",{labels}}}))");
+    // timestamp() drops metric names. Keep each original selector separate,
+    // then distinguish the timestamp vectors before combining/aggregating them.
+    // Applying timestamp after label_replace would report evaluation time.
+    let timestamp = format!("min by (host) (label_replace(timestamp(node_memory_MemAvailable_bytes{{{labels}}}), \"panel_memory_part\", \"available\", \"host\", \".*\") or label_replace(timestamp(node_memory_MemTotal_bytes{{{labels}}}), \"panel_memory_part\", \"total\", \"host\", \".*\"))");
     format!("label_replace(({ratio}), \"panel_sample\", \"value\", \"host\", \".*\") or label_replace(({timestamp}), \"panel_sample\", \"observed-at\", \"host\", \".*\")")
 }
 
@@ -212,6 +214,14 @@ mod tests {
     #[test]
     fn host_literal_is_escaped() {
         assert!(memory_query("dev3\"}").contains("host=\"dev3\\\"}\""));
+    }
+    #[test]
+    fn timestamp_selectors_are_separate_before_label_transformation() {
+        let query = memory_query("dev3");
+        assert!(query.contains("label_replace(timestamp(node_memory_MemAvailable_bytes"));
+        assert!(query.contains("label_replace(timestamp(node_memory_MemTotal_bytes"));
+        assert!(!query.contains("timestamp(label_replace"));
+        assert!(!query.contains("__name__=~"));
     }
     #[test]
     fn contract_rejects_unknown_versions() {
