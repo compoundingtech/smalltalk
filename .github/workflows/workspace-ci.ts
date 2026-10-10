@@ -329,12 +329,13 @@ export const testArchiveConsumerSetup = [
   ...testBuildSteps.slice(0, 2),
   {
     name: 'Download this run attempt’s successful test build',
-    uses: 'actions/download-artifact@v4',
-    with: {
-      'artifact-ids': '${{ needs.linux-test-build.outputs.artifact-id }}',
-      'merge-multiple': true,
-      path: '${{ runner.temp }}/ci-test-archives',
+    env: {
+      GH_TOKEN: '${{ github.token }}',
+      CI_TEST_ARCHIVE_ARTIFACT_ID: '${{ needs.linux-test-build.outputs.artifact-id }}',
+      CI_TEST_ARCHIVE_MANIFEST_SHA256: '${{ needs.linux-test-build.outputs.manifest-sha256 }}',
+      CI_TEST_ARCHIVE_PRODUCER_ATTEMPT: '${{ needs.linux-test-build.outputs.producer-attempt }}',
     },
+    run: 'python3 scripts/ci-test-archive download',
   },
   { ...nixDevelopStep({ name: 'Verify source, hashes and extract test archives',
     command: ['python3', 'scripts/ci-test-archive', 'consume'] }),

@@ -310,6 +310,15 @@ pub struct Attention {
     pub attention_kind: String,
     pub source_id: String,
     pub person_id: String,
+    /// Whether this item blocks or waits on its person's answer; absent on older daemons.
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub alert: Option<bool>,
+    /// The agent whose conversation this item belongs to.
+    #[serde(default, skip_serializing_if="Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// Every agent conversation this item shows in, starting with `conversation_id`.
+    #[serde(default, skip_serializing_if="Vec::is_empty")]
+    pub conversation_ids: Vec<String>,
     pub requester_id: Option<String>,
     pub launch_id: Option<String>,
     pub variant_id: Option<String>,
@@ -1611,7 +1620,11 @@ pub struct Summary {
     #[serde(flatten)]
     pub header: ResourceHeader,
     pub person_id: Option<String>,
+    /// The alert count; an older daemon also counted unread updates.
     pub needs_you: u64,
+    /// Open alerts; absent on daemons that predate alerts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alerts: Option<u64>,
     pub working_agents: u64,
     pub active_missions: u64,
     pub machines: SummaryMachines,

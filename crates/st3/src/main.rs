@@ -20271,7 +20271,10 @@ async fn skip_native_continue(
         subject,
         &json!({"type":"native_continue_skipped","driver":driver,"session":session,"code":refusal.code,"reason":refusal.reason}).to_string(),
     );
-    let diagnostic = ClaimInput {
+    let selector_scope = (refusal.code == "authored-session-selection")
+        .then(|| std::env::var(st3::suspension::SELECTOR_SCOPE_ENV).ok())
+        .flatten();
+    let mut diagnostic = ClaimInput {
         subject: subject.into(),
         kind: "harness.diagnostic".into(),
         actor: Some(subject.into()),
@@ -20290,11 +20293,17 @@ async fn skip_native_continue(
                 )),
             ),
             ("incarnation_id".into(), Value::String(incarnation.into())),
+            ("session_id".into(), Value::String(session.into())),
         ]),
         evidence: Vec::new(),
         expected_subject: None,
-        idempotency_key: Some(st3::suspension::continue_unavailable_key(subject, session)),
+        idempotency_key: Some(st3::suspension::typed_continue_unavailable_key(
+            subject, session, refusal.code, selector_scope.as_deref(),
+        )),
     };
+    if let Some(scope) = selector_scope {
+        diagnostic.fields.insert("selector_scope".into(), Value::String(scope));
+    }
     if let Err(error) = retry_while_daemon_unreachable(subject, || {
         client.post::<_, ClaimRecord>("/v1/claims", &diagnostic)
     })

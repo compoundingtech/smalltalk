@@ -169,7 +169,10 @@ for consumer in ('linux-tests', 'linux-tests-shard-2', 'mail-redelivery-canaries
     assert 'Require the shared test producer to succeed' in blocks[consumer]
     assert 'PRODUCER_RESULT' in blocks[consumer] and 'shared test producer failed or was skipped' in blocks[consumer]
     assert 'CI_TEST_ARCHIVE_PRODUCER_ATTEMPT' in blocks[consumer]
-    assert 'merge-multiple: true' in blocks[consumer], 'exact artifact ID must extract directly into the archive directory'
+    assert 'python3 scripts/ci-test-archive download' in blocks[consumer], 'consumers must wait for the complete verified producer ZIP'
+    assert 'GH_TOKEN: ${{ github.token }}' in blocks[consumer], 'download uses the existing read-only job token'
+    assert 'CI_TEST_ARCHIVE_ARTIFACT_ID' in blocks[consumer]
+    assert 'actions/download-artifact@' not in blocks[consumer], 'do not stream unverified files into the consumer directory'
 assert 'ST_ISOLATION_BUILD_WORKSPACE' in blocks['isolation-vm']
 assert 'Keep valid same-source build outputs' in blocks['linux-test-build'], 'shared producer must retain its build snapshot'
 assert 'CI_TEST_PARTITION' not in canaries, "every required canary must run"

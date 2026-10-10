@@ -908,3 +908,13 @@ explicit reserve-reached error. It retained 4,836.67 observed minutes as partial
 window evidence. This confirms the quota-reserve behavior with local authentication,
 not the scheduled credential, full window, or a successful daily total. No automatic
 retry follows quota exhaustion.
+
+Test archive transfer verifies the complete ZIP before exposing consumer inputs. The four
+archive consumers download only the successful producer artifact ID, verify its API size
+and SHA256, verify the producer-output manifest hash and all five ZIP members, then
+publish a fresh private directory atomically. A failed or incomplete transfer gets at most
+one repeat download of that same ID (each ZIP request has a 10-minute limit); interrupted
+requests retain their signal status. No compiler or test is retried. Source, run, successful
+producer attempt, toolchain and individual file hashes are still checked before extraction.
+The job logs the ZIP size/digest and transfer attempt. This protects the transfer boundary;
+it does not establish the cause of earlier digest mismatches or a measured speedup.
