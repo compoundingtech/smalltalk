@@ -38,6 +38,7 @@
     "refractor": "5.0.0"
   },
   "devDependencies": {
+    "@smalltalk/st3-scenarios": "workspace:*",
     "storybook": "10.6.1",
     "@storybook/react-vite": "10.6.1",
     "@storybook/addon-a11y": "10.6.1",

@@ -113,6 +113,7 @@ export const scanTree = (fixturesDir: string, vocabularyDir: string, sourceDirs:
   const rel = (path: string) => relative(REPO_ROOT, path)
   return [
     ...filesUnder(fixturesDir).flatMap((path) => [...scanContent(rel(path), read(path)), ...scanIdentities(rel(path), read(path))]),
+    ...filesUnder(join(PACKAGE_ROOT, 'src/sessions')).flatMap((path) => [...scanContent(rel(path), read(path)), ...scanIdentities(rel(path), read(path))]),
     ...sourceDirs.flatMap((dir) => filesUnder(dir).flatMap((path) => scanContent(rel(path), read(path)))),
     ...filesUnder(vocabularyDir).flatMap((path) => scanVocabulary(rel(path), read(path))),
   ]

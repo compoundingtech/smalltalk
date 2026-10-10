@@ -42,3 +42,26 @@ instants each file lists in `times` (vectors: `fixtures/scenarios/_vectors/rebas
 | `pnpm --filter @smalltalk/st3-scenarios decode` | strict-decodes every variant of every world |
 | `pnpm --filter @smalltalk/st3-scenarios scan` | privacy gate |
 | `CI=1 pnpm --filter @smalltalk/st3-scenarios test` | unit and property tests |
+
+## Curated Fractal sessions
+
+`@smalltalk/st3-scenarios/sessions` exports eight hand-authored fictional sessions and the stable
+`sessionNames`: `short-success`, `flaky-test`, `multi-file-refactor`, `interrupted-draft`,
+`offline-retry`, `first-result`, `long-debug`, and `waiting-queued`. This existing fixture domain
+keeps the kit's view fixtures and the app's transport scenarios separate without importing the app
+into the kit. The kit only imports this development dependency from its stories.
+
+`sessionEntries(session)` returns production-schema-decoded timeline items for the app's existing
+projection. `encodeSteps` validates every emitted item with the same production schema. The script
+vocabulary follows `fractal-web/src/conversation/fixtures.ts`; the frozen clock matches its
+`fixtures/world.ts`. These shared modules deliberately leave those app-local modules untouched;
+the app owner can migrate their clock/emitter consumers without changing live rendering.
+Reasoning uses the production native-content convention, not a proposed reasoning schema.
+
+`initialStepCount` selects the initial empty/offline snapshot; consuming all steps reveals the
+first result or recovered result. `draft` is host-owned editable state, not a new wire field.
+Counts and durations are derived from emitted items with `sessionCounts`, never stored counters.
+The privacy `scan` includes every source under `src/sessions`; `test/sessions.test.ts` checks
+every step, rejects malformed entries, and proves the privacy negative controls. Kit
+`Fractal/Kit/Sessions` stories mount the real `Transcript` (and `EmbraceComposer` for saved drafts);
+each play checks a session-specific witness and rejects a planted missing-witness control.
