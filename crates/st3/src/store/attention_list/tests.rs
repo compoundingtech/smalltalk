@@ -599,3 +599,55 @@ fn a_prompt_blocked_on_a_person_and_its_clearing_fold() {
         AttentionDelta::Unchanged(None)
     );
 }
+
+/// A Claude permission prompt answered from a client leaves attention: the answer is a claim on
+/// the prompting seat, and it folds while the seat's prompt is published.
+#[test]
+fn an_answered_native_prompt_folds_away() {
+    let store = Store::open_memory("node").unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let source = format!(
+        "version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+        workspace.path().display().to_string()
+    );
+    let intent = crate::graph::parse_intent(&source, "node").unwrap();
+    let preview = store
+        .mission(&intent, crate::model::IntentInput { kdl: source, source_name: None })
+        .unwrap();
+    store
+        .apply_as(&intent, &preview.subject_tokens, "answer-seat", Some("person/avery"))
+        .unwrap();
+    let seat = "agent/node.worker";
+    store.start_attention_list_refresher().unwrap();
+    refresh_and_check(&store);
+    let prompts = |publication: &AttentionPublication| {
+        publication.rows.iter().filter(|row| row["attention_kind"] == "harness-prompt").count()
+    };
+    store
+        .append_claim(&input(
+            seat,
+            "runtime.observed",
+            Some(seat),
+            json!({"status":"running", "incarnation_id":"one"}),
+        ))
+        .unwrap();
+    let asked = store
+        .append_claim(&input(
+            seat,
+            "harness.observed",
+            Some(seat),
+            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"Bash",
+                "ownership_sequence":1, "transition_sequence":3}),
+        ))
+        .unwrap();
+    let prompted = refresh_and_check(&store);
+    assert_eq!(prompts(&prompted), 1);
+    let before = folds(&store);
+    store
+        .answer_native_prompt(seat, &asked.id, "deny", "person/avery")
+        .unwrap();
+    let answered = refresh_and_check(&store);
+    assert_eq!(folds(&store), before + 1, "the answer folds");
+    assert_eq!(prompts(&answered), 0);
+}
