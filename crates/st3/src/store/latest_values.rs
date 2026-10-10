@@ -411,7 +411,8 @@ impl Drop for CurrentConnection<'_> {
     fn drop(&mut self) {
         let Some(connection) = self.connection.take() else { return; };
         connection.progress_handler(0, None::<fn() -> bool>);
-        let mut clean = connection.is_autocommit();
+        let returned_clean = connection.is_autocommit();
+        let mut clean = returned_clean;
         if !clean {
             let _ = connection.execute_batch("ROLLBACK");
             clean = connection.is_autocommit();
@@ -431,7 +432,7 @@ impl Drop for CurrentConnection<'_> {
         };
         debug_assert!(clean && !pending, "current connection returned with an active transaction or statement");
         let mut state = self.pool.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if self.reusable && clean && !pending && state.generation == self.generation {
+        if self.reusable && returned_clean && clean && !pending && state.generation == self.generation {
             state.idle = Some((connection, self.schema, self.epoch.clone()));
         } else {
             drop(connection);
@@ -451,7 +452,19 @@ fn pooled_current_transaction<T>(
     let mut loan = pool.checkout(&graph.path, deadline - CURRENT_WRITE_RESERVE)?;
     let result = current_transaction_until(loan.connection.as_mut().unwrap(),
         Some((&graph.connection, background)), deadline, Some(&mut loan.schema), work);
-    loan.reusable = result.is_ok();
+    // A successful commit still succeeds if this housekeeping check cannot finish.
+    // Discard its connection rather than carrying changed schema or an expired loan
+    // into the next attempt. The check uses only this attempt's remaining time.
+    if result.is_ok() && std::time::Instant::now() < deadline {
+        let connection = loan.connection.as_ref().unwrap();
+        if connection.is_autocommit() {
+            connection.progress_handler(100, Some(move || std::time::Instant::now() >= deadline));
+            let cookie = connection.query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0));
+            connection.progress_handler(0, None::<fn() -> bool>);
+            loan.reusable = matches!(cookie, Ok(cookie) if Some(cookie) == loan.schema)
+                && std::time::Instant::now() < deadline;
+        }
+    }
     result
 }
 
@@ -1832,6 +1845,32 @@ mod tests {
     }
 
     #[test]
+    fn current_connection_changed_schema_on_return_is_discarded() {
+        let store = Store::open_memory("node").unwrap();
+        let pool = &store.smalltalk.current_connections;
+        pooled_current_transaction(&store.graph, pool, false, |_| Ok(())).unwrap();
+        pooled_current_transaction(&store.graph, pool, false, |tx| {
+            tx.execute_batch("CREATE TABLE changed_during_loan(value INTEGER); INSERT INTO changed_during_loan VALUES(7);")
+                .map_err(internal)
+        }).unwrap();
+        assert_eq!(pool.state.lock().unwrap().opened, 1);
+        assert!(pool.state.lock().unwrap().idle.is_none());
+        let value = pooled_current_transaction(&store.graph, pool, false, |tx| {
+            tx.query_row("SELECT value FROM changed_during_loan", [], |row| row.get::<_, i64>(0)).map_err(internal)
+        }).unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(pool.state.lock().unwrap().opened, 2);
+        assert!(pool.state.lock().unwrap().idle.is_some());
+        // Cleanup of an unexpectedly open transaction cannot make that loan reusable.
+        let mut loan = pool.checkout(&store.graph.path, std::time::Instant::now()+std::time::Duration::from_secs(1)).unwrap();
+        loan.connection.as_ref().unwrap().execute_batch("BEGIN; INSERT INTO changed_during_loan VALUES(9);").unwrap();
+        loan.reusable = true;
+        drop(loan);
+        assert!(pool.state.lock().unwrap().idle.is_none());
+        assert_eq!(store.readers.get().query_row("SELECT COUNT(*) FROM changed_during_loan", [], |row| row.get::<_, usize>(0)).unwrap(), 1);
+    }
+
+    #[test]
     fn current_connection_burst_is_exclusive_bounded_and_checkout_expires() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let pool = &store.smalltalk.current_connections;
@@ -2051,7 +2090,8 @@ mod tests {
             .unwrap();
         CURRENT_TRANSACTION_STEPS.with(|v| v.set(Some(0)));
         CURRENT_TRANSACTION_ELAPSED.with(|v| v.set(Some(std::time::Duration::ZERO)));
-        append(&store.graph, &input, 2, None).unwrap();
+        let pool = &store.smalltalk.current_connections;
+        append_with_connections(&store.graph, &input, 2, None, Some(pool)).unwrap();
         let steps = CURRENT_TRANSACTION_STEPS.with(|v| v.replace(None).unwrap());
         let hold = CURRENT_TRANSACTION_ELAPSED.with(|v| v.replace(None).unwrap());
         println!("20k first context: request VM steps={steps}, writer hold={hold:?}");
@@ -2060,6 +2100,16 @@ mod tests {
             "first publication must not scan numeric history: {steps}"
         );
         assert!(hold < crate::client::LATEST_VALUE_TIMEOUT);
+        assert_eq!(pool.state.lock().unwrap().opened, 1);
+        CURRENT_TRANSACTION_STEPS.with(|v| v.set(Some(0)));
+        CURRENT_TRANSACTION_ELAPSED.with(|v| v.set(Some(std::time::Duration::ZERO)));
+        append_with_connections(&store.graph, &input, 3, None, Some(pool)).unwrap();
+        let steps = CURRENT_TRANSACTION_STEPS.with(|v| v.replace(None).unwrap());
+        let hold = CURRENT_TRANSACTION_ELAPSED.with(|v| v.replace(None).unwrap());
+        println!("20k reused context: request VM steps={steps}, writer hold={hold:?}");
+        assert!(steps > 0 && steps < 4000);
+        assert!(hold < crate::client::LATEST_VALUE_TIMEOUT);
+        assert_eq!(pool.state.lock().unwrap().opened, 1);
         let revision = store.graph.runtime.current_observation_revision("");
         let frontier = store.current_cache_revision().unwrap();
         assert_eq!(drain_maintenance(&store), 20_001);
