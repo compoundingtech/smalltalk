@@ -2373,6 +2373,61 @@ async fn cli_send_reply_read_archive_search_and_attachments_survive_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_fyi_settings_and_count_reads_survive_restart() {
+    if st3::test_support::supervise_test() { return; }
+    let mut daemon = Daemon::new().await;
+    daemon.worker();
+    const PEER: &str = "agent/example/peer";
+    let launch = daemon.store().selected_desired_token(WORKER).unwrap().unwrap();
+    cli_value(daemon.cli(WORKER, &["agents", "wake-on", WORKER, "questions", "--as", WORKER]).await);
+    daemon.restart().await;
+    let seat = daemon.store().desired_subjects_named(&[WORKER.into()]).unwrap();
+    assert_eq!(st3::fyi::declared_wake_on(Some(&seat[0].desired)), st3::fyi::WakeOn::Questions);
+    assert_eq!(daemon.store().launch_lineage(WORKER).unwrap().last(), Some(&launch));
+    let send = |key: &'static str, flag: &'static str| vec![
+        "conversations", "send", WORKER, "--from", PEER, "--body", key,
+        "--idempotency-key", key, flag,
+    ];
+    let fyi_args = send("copper-fyi", "--fyi");
+    let sent = cli_value(daemon.cli(PEER, &fyi_args).await);
+    let held = sent["subject"].as_str().unwrap().to_owned();
+    assert!(st3::fyi::is_held(&daemon.store().message(&held).unwrap().unwrap()));
+    daemon.restart().await;
+    assert_eq!(cli_value(daemon.cli(PEER, &fyi_args).await)["subject"], held);
+    let question = cli_value(daemon.cli(PEER, &send("copper-question", "--question")).await);
+    assert!(!st3::fyi::is_held(&daemon.store().message(question["subject"].as_str().unwrap()).unwrap().unwrap()));
+    let asked = cli_value(daemon.cli(WORKER, &[
+        "conversations", "send", PEER, "--from", WORKER, "--body", "Which proof?", "--question",
+        "--idempotency-key", "copper-asked",
+    ]).await);
+    let parent = asked["subject"].as_str().unwrap();
+    let answer = cli_value(daemon.cli(PEER, &[
+        "conversations", "reply", parent, "--from", PEER, "--body", "The copper proof.",
+        "--idempotency-key", "copper-answer",
+    ]).await);
+    assert!(!st3::fyi::is_held(&daemon.store().message(answer["subject"].as_str().unwrap()).unwrap().unwrap()));
+    let reply = cli_value(daemon.cli(WORKER, &[
+        "conversations", "reply", &held, "--from", WORKER, "--body", "Noted.", "--fyi",
+        "--idempotency-key", "copper-fyi-reply",
+    ]).await);
+    assert!(st3::fyi::is_held(&daemon.store().message(reply["subject"].as_str().unwrap()).unwrap().unwrap()));
+    let fence = daemon.fence(PEER).await;
+    let api = dispatch(&daemon.client(PEER), "message.send", "copper-api-fyi", fence,
+        json!({"to": WORKER, "content":"A client FYI.", "fyi":true})).await.unwrap();
+    let api = serde_json::to_value(api).unwrap();
+    let api_id = api["value"]["affected_ids"][0].as_str().unwrap();
+    assert!(st3::fyi::is_held(&daemon.store().message(api_id).unwrap().unwrap()));
+    let before = daemon.store().index().unwrap();
+    let counts = cli_value(daemon.cli(WORKER, &["usage", "--messages-only", "--hours", "24"]).await);
+    assert_eq!(counts["agent_to_agent"],6);
+    assert_eq!(counts["fyi"],3);
+    assert_eq!(counts["complete"],true);
+    assert_eq!(daemon.store().index().unwrap(), before, "count read wrote or built");
+    daemon.restart().await;
+    assert_eq!(cli_value(daemon.cli(WORKER, &["usage", "--messages-only"]).await)["fyi"],3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_aged_unread_cleanup_preserves_fresh_and_read_mail_across_restart() {
     if st3::test_support::supervise_test() {
         return;

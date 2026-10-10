@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Hold FYI mail until the next wake, allow question-only seats, and expose coordination counts",
+  "replay": {
+    "status": "changed",
+    "detail": "No graph replay or projection invalidation. Local coordination metadata backfills at most eight historical message subjects per normal writer batch; count reads return complete=false until caught up and never advance the backfill."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Adds coordination_sends, its covering sent_ms/count-flags index, local_coordination_backfill, and an unread_mail sent_time index. Numeric schema version is unchanged. These are derived count metadata, not new conversation payload storage."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules version, canonical graph digest, or sealing rule change. New count tables are local derived metadata."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds optional fyi/question booleans to message.send, sender tags, wake-on all/questions in agent KDL, and agents wake-on and usage --messages-only commands. Old daemons accepting a message's FYI tag do not hold it: they deliver and wake as before. Old CLIs reject the new flags, and old daemons do not provide the new endpoints or accept wake-on KDL. Upgrade recipient owner daemons before relying on no-wake delivery; mixed versions do not guarantee it. Device signatures continue to cover exactly the signed tags; person messages always wake."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Requires the normal daemon binary swap and restart. New tables are empty at creation and coordination backfill is bounded; the unread-mail index is built on startup. Restart-to-API and restart-to-health times for populated installations have not been measured."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Set wake-on questions in agent KDL or use agents wake-on AGENT questions --as ACTOR after upgrading. Explicit FYI and question flags are opt-in. The companion factory collector needs the upgraded count-only endpoint and waits for complete metadata before publishing ratios. See docs/st3/fyi-messages.md."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Unstaged FYI mail stays unread and survives reconnects regardless of age; doctor lists held unread mail older than a day. Installing an older daemon retains additive tables but removes the no-wake guarantee: existing FYI tags can wake recipients. Prefer roll-forward if held delivery semantics must be preserved; no numeric schema migration is undone by a binary swap."
+  }
+}

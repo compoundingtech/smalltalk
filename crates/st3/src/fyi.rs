@@ -166,7 +166,7 @@ mod tests {
         MessageView {
             subject: subject.into(),
             from: from.into(),
-            to: "agent/fleet/reader".into(),
+            to: "agent/example/reader".into(),
             content: "body".into(),
             status: status.into(),
             title: None,
@@ -183,20 +183,20 @@ mod tests {
 
     #[test]
     fn an_fyi_stays_back_until_a_waking_message_goes_out() {
-        let fyi = message("message/fyi", "agent/fleet/writer", "sent", &[FYI_TAG]);
+        let fyi = message("message/fyi", "agent/example/writer", "sent", &[FYI_TAG]);
         let mut alone = vec![fyi.clone()];
         release(&mut alone);
         assert!(alone.is_empty(), "an FYI alone wakes nobody");
 
-        let wake = message("message/wake", "agent/fleet/writer", "sent", &[]);
+        let wake = message("message/wake", "agent/example/writer", "sent", &[]);
         let mut batch = vec![fyi.clone(), wake.clone()];
         release(&mut batch);
         assert_eq!(batch.len(), 2, "held mail goes out with the next waking message");
 
         // Once offered, the FYI stays in the delivery set; a new FYI waits for the next wake.
-        let offered_fyi = message("message/fyi", "agent/fleet/writer", "staged", &[FYI_TAG]);
-        let offered_wake = message("message/wake", "agent/fleet/writer", "staged", &[]);
-        let later = message("message/later", "agent/fleet/writer", "sent", &[FYI_TAG]);
+        let offered_fyi = message("message/fyi", "agent/example/writer", "staged", &[FYI_TAG]);
+        let offered_wake = message("message/wake", "agent/example/writer", "staged", &[]);
+        let later = message("message/later", "agent/example/writer", "sent", &[FYI_TAG]);
         let mut after = vec![offered_fyi, offered_wake, later];
         release(&mut after);
         assert_eq!(
@@ -212,12 +212,12 @@ mod tests {
             ("external/discord/someone", FYI_TAG),
             ("daemon/runtime", "st3-work:step-run/a/b@1@1@x"),
             ("daemon/runtime", "st3-fault:episode"),
-            ("daemon/hetz", crate::github_watch::WATCH_TAG),
-            ("agent/fleet/writer", "st3-work-handoff:step-run/a/b"),
+            ("daemon/example", crate::github_watch::WATCH_TAG),
+            ("agent/example/writer", "st3-work-handoff:step-run/a/b"),
         ] {
             let stored = stored_tags(
                 from,
-                "agent/fleet/reader",
+                "agent/example/reader",
                 &tags(&[FYI_TAG, tag]),
                 None,
                 || WakeOn::Questions,
@@ -232,12 +232,12 @@ mod tests {
     #[test]
     fn the_questions_setting_holds_everything_that_asks_nothing() {
         let questions = || WakeOn::Questions;
-        let status = stored_tags("agent/fleet/writer", "agent/fleet/reader", &[], None, questions);
+        let status = stored_tags("agent/example/writer", "agent/example/reader", &[], None, questions);
         assert_eq!(status, tags(&[FYI_TAG, HELD_BY_SETTING_TAG]));
 
         let question = stored_tags(
-            "agent/fleet/writer",
-            "agent/fleet/reader",
+            "agent/example/writer",
+            "agent/example/reader",
             &tags(&[QUESTION_TAG]),
             None,
             questions,
@@ -245,12 +245,12 @@ mod tests {
         assert!(!question.contains(&FYI_TAG.to_owned()));
 
         // The default setting delivers everything not marked FYI.
-        let all = stored_tags("agent/fleet/writer", "agent/fleet/reader", &[], None, || WakeOn::All);
+        let all = stored_tags("agent/example/writer", "agent/example/reader", &[], None, || WakeOn::All);
         assert!(all.is_empty());
         // The setting is read only when it matters.
         let declared = stored_tags(
-            "agent/fleet/writer",
-            "agent/fleet/reader",
+            "agent/example/writer",
+            "agent/example/reader",
             &tags(&[FYI_TAG]),
             None,
             || unreachable!("a declared FYI needs no setting"),
@@ -260,8 +260,8 @@ mod tests {
 
     #[test]
     fn a_thread_the_recipient_started_with_a_question_wakes_it() {
-        let asker = "agent/fleet/reader";
-        let answerer = "agent/fleet/writer";
+        let asker = "agent/example/reader";
+        let answerer = "agent/example/writer";
         let questions = || WakeOn::Questions;
         // The reader asks; its question carries the thread tag naming it.
         let root_tags = stored_tags(asker, answerer, &tags(&[QUESTION_TAG]), None, questions);
