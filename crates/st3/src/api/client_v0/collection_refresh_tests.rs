@@ -532,3 +532,24 @@ async fn clients_hold_what_full_reads_give_through_replication_rollback_checkpoi
     assert_parity(&own, &avery, &mine,
         &[json!({"kind":"subscribe","id":"mine","collection":"attention","limit":200})], "person").await;
 }
+
+#[tokio::test]
+async fn a_window_waiting_for_its_first_snapshot_reads_as_soon_as_its_view_publishes() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "alder");
+    // The view is not ready when the client subscribes: its first read is a retryable failure.
+    let mut fixture = Fixture::open(state.clone(), false, Some("work"), &["work"]).await;
+    assert_eq!(fixture.frame().await["kind"], "resync");
+    // Its publication is what the window waited for: no reread interval lies between them.
+    let published = tokio::time::Instant::now();
+    state.store.publish_collection_view("work");
+    let snapshot = fixture.frame().await;
+    assert_eq!(snapshot["kind"], "snapshot", "{snapshot}");
+    assert!(published.elapsed() < COLLECTION_REREAD_INTERVAL / 2, "{:?}", published.elapsed());
+    fixture.quiet().await;
+    assert_eq!(fixture.counts(), counts(&[("work", 2)]));
+    // Held windows are paced as before: the next publication waits for the interval.
+    state.store.publish_collection_view("work");
+    assert_eq!(fixture.frame().await["kind"], "changes");
+    assert_eq!(fixture.counts(), counts(&[("work", 3)]));
+}

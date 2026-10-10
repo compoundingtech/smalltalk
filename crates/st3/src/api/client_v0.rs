@@ -114,6 +114,29 @@ const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 const COLLECTION_PING_INTERVAL: Duration = Duration::from_secs(8);
 const COLLECTION_SEND_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Schedule the windows a publication made stale. A window still waiting for its first snapshot,
+/// usually because the view was not ready when it subscribed, reads at once: the publication is
+/// what it waited for, and pacing would add up to a reread interval to its first frame. Held
+/// windows are paced together as usual. Returns whether nothing is due yet.
+fn publication_rereads<'a>(
+    stale: impl Iterator<Item = (&'a String, &'a CollectionSubscription)>,
+    reread_due: &mut BTreeSet<String>,
+    refresh: &mut Vec<String>,
+    last_reread: tokio::time::Instant,
+) -> bool {
+    for (id, subscription) in stale {
+        if subscription.delivered {
+            reread_due.insert(id.clone());
+        } else {
+            refresh.push(id.clone());
+        }
+    }
+    if !reread_due.is_empty() && last_reread.elapsed() >= COLLECTION_REREAD_INTERVAL {
+        refresh.extend(reread_due.iter().cloned());
+    }
+    refresh.is_empty()
+}
+
 /// Whether a collection's rows change as time passes without a claim: attention grace periods,
 /// mission and work-queue leases, and the summary counts made of them.
 fn collection_follows_clock(collection: &str) -> bool {
@@ -1526,21 +1549,17 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 if result.is_err() { return; }
                 // A window read before this roster was published rereads it.
                 let published = *roster.borrow_and_update();
-                reread_due.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
-                    && s.request.collection == "agents" && s.roster_revision < published)
-                    .map(|(id, _)| id.clone()));
-                if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(reread_due.iter().cloned());
+                let stale = subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && s.request.collection == "agents" && s.roster_revision < published);
+                if publication_rereads(stale, &mut reread_due, &mut refresh, last_reread) { continue; }
             }
             result = views.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 // The same for every other published view.
                 let published = *views.borrow_and_update();
-                reread_due.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
-                    && s.view_revision < crate::store::published_views::revision(&published, &s.request.collection))
-                    .map(|(id, _)| id.clone()));
-                if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(reread_due.iter().cloned());
+                let stale = subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && s.view_revision < crate::store::published_views::revision(&published, &s.request.collection));
+                if publication_rereads(stale, &mut reread_due, &mut refresh, last_reread) { continue; }
             }
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (!reread_due.is_empty() || roster_wanted || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
                 if std::mem::take(&mut roster_wanted) { state.store.request_agent_roster_refresh(); }
