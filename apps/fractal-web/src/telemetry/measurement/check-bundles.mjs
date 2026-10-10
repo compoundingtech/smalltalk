@@ -1,9 +1,30 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, readFile } from 'node:fs/promises'
+import { mkdtemp, rm, readFile, readdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
+// The CI production build passes its actual output directory; scan all emitted JS/CSS,
+// including lazy chunks. These are stable literals from devbar and meters, not minified names.
+const diagnosticMarkers = [
+  '@overeng/devbar', '@overeng/meters', 'Developer tools',
+  'useMeters requires a MetersProvider', 'Browser performance clock is unavailable',
+  'Browser animation frames are unavailable', 'wf.longFrames', 'JS heap (approx.)',
+]
+if (process.argv[2] !== undefined) {
+  const assets = join(process.argv[2], 'assets')
+  const files = (await readdir(assets)).filter((name) => /\.(js|css)$/.test(name))
+  assert.ok(files.length > 0, 'production assets must exist')
+  for (const name of files) {
+    assert.equal(/devbar|meters/i.test(name), false, `${name}: diagnostic chunk`)
+    const text = await readFile(join(assets, name), 'utf8')
+    for (const marker of diagnosticMarkers) {
+      assert.equal(text.includes(marker), false, `${name}: diagnostic marker ${marker}`)
+    }
+  }
+  console.log(JSON.stringify({ diagnosticBundleExclusion: { files: files.length, markers: diagnosticMarkers, hits: 0 } }))
+  process.exit(0)
+}
 // Run with Bun. Its compile-time defines exercise the same boolean boundary as Vite.
 const directory = await mkdtemp(join(tmpdir(), 'fractal-measurement-'))
 const entry = fileURLToPath(new URL('./index.ts', import.meta.url))

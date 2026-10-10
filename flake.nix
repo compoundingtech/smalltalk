@@ -1249,6 +1249,7 @@
               webPkgs.corepack
               webPkgs.nodejs_24
               webPkgs.bun
+              webPkgs.watchman
               effectUtilsPackages.buck2
               effectUtilsPackages.genie
             ];

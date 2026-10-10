@@ -38,6 +38,7 @@ production_build() (
   out_dir=$(mktemp -d "${TMPDIR:-/tmp}/fractal-web-build.XXXXXX")
   trap 'rm -rf "$out_dir"' EXIT
   pnpm --dir apps/fractal-web exec vite build --config vite.config.ts --configLoader runner --outDir "$out_dir"
+  bun apps/fractal-web/src/telemetry/measurement/check-bundles.mjs "$out_dir"
 )
 
 lane "Toolchain and Buck root" toolchain
