@@ -31,7 +31,7 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_resources_cache: Mutex<VecDeque<AgentResourcesEntry>>,
     /// Each agent's usage fold at the newest cut a read reached, so a card refold reads only
     /// the usage claims after it rather than the agent's whole usage history.
-    pub(crate) usage_folds: Mutex<HashMap<String, Arc<CachedUsageFold>>>,
+    pub(crate) usage_folds: Mutex<UsageFolds>,
     /// Ordering and queue metadata for lazy HTTP pages, shared at the same graph cuts.
     pub(crate) agent_page_refs_cache: Mutex<VecDeque<AgentResourcesEntry>>,
     /// Acquire before opening a SQLite snapshot, never while pinning a WAL read mark.
@@ -363,10 +363,7 @@ impl Runtime for SmalltalkRuntime {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-        self.usage_folds
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        *self.usage_folds.lock().unwrap_or_else(PoisonError::into_inner) = UsageFolds::default();
         self.agent_roster_published.send_modify(|revision| *revision += 1);
         self.published_views.invalidate();
         self.agent_page_refs_cache

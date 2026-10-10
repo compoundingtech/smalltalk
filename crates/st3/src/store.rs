@@ -247,8 +247,40 @@ pub(crate) struct CachedUsageFold {
     fold: UsageFold,
 }
 
-/// How many agents' usage folds a store keeps. Past it the cache starts over.
-const USAGE_FOLDS: usize = 4096;
+/// How much usage fold state a store keeps, counted in incarnations and rollup series. Past it
+/// the kept folds start over; a single fold heavier than a sixteenth of it is never kept.
+const USAGE_FOLD_WEIGHT: usize = 65_536;
+
+/// The usage folds a store keeps, by agent, and their total weight.
+#[derive(Default)]
+pub(crate) struct UsageFolds {
+    folds: HashMap<String, Arc<CachedUsageFold>>,
+    weight: usize,
+}
+
+impl UsageFolds {
+    fn get(&self, subject: &str) -> Option<&Arc<CachedUsageFold>> {
+        self.folds.get(subject)
+    }
+
+    /// Keep `cached` unless a newer fold is kept already or it is too heavy to keep.
+    fn keep(&mut self, subject: String, cached: CachedUsageFold) {
+        let weight = cached.fold.weight();
+        if weight > USAGE_FOLD_WEIGHT / 16
+            || self.folds.get(&subject).is_some_and(|kept| kept.through > cached.through)
+        {
+            return;
+        }
+        if let Some(previous) = self.folds.remove(&subject) {
+            self.weight -= previous.fold.weight();
+        }
+        if self.weight + weight > USAGE_FOLD_WEIGHT {
+            *self = Self::default();
+        }
+        self.weight += weight;
+        self.folds.insert(subject, Arc::new(cached));
+    }
+}
 
 /// Canonical order's first components: accepted time as stored, shorter first.
 fn accepted_order(accepted: &str) -> (usize, &str) {
@@ -400,6 +432,11 @@ impl UsageFold {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The state this fold keeps: one per incarnation and one per rollup series.
+    fn weight(&self) -> usize {
+        1 + self.spend.values().map(|group| 1 + group.rollups.len()).sum::<usize>()
     }
 
     fn summary(&self) -> Option<UsageSummary> {
@@ -16206,13 +16243,7 @@ impl Store {
             .collect();
         let mut folds = self.smalltalk.usage_folds.lock().expect("usage folds poisoned");
         for (subject, cached) in folded {
-            if folds.get(&subject).is_some_and(|kept| kept.through > cached.through) {
-                continue;
-            }
-            if folds.len() >= USAGE_FOLDS && !folds.contains_key(&subject) {
-                folds.clear();
-            }
-            folds.insert(subject, Arc::new(cached));
+            folds.keep(subject, cached);
         }
         Ok(summaries)
     }
