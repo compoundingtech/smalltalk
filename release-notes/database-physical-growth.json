@@ -2,9 +2,9 @@
   "version": 1,
   "summary": "The database sample also measures the WAL and physical daily growth, for every reader of the store's size",
   "replay": {"status": "none", "detail": "No replay or rebuild."},
-  "schema": {"status": "none", "detail": "No tables or indexes. database_size_samples rows in meta gain a fourth element, the WAL's length; three-element rows from the previous build still read."},
+  "schema": {"status": "none", "detail": "No tables or indexes. database_size_samples rows in meta gain the WAL's and the main file's lengths; three-element rows from the previous build still read and are never a physical baseline."},
   "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
-  "compatibility": {"status": "changed", "detail": "The request-latency database row adds wal_bytes, physical_bytes, physical_growth_bytes_per_day and physical_growth_span_ms. st3::slo::database_size exposes the cached newest sample so other readers use one sampler."},
+  "compatibility": {"status": "changed", "detail": "The request-latency database row adds wal_bytes, main_file_bytes, physical_bytes (the two file lengths), physical_growth_bytes_per_day and physical_growth_span_ms. st3::slo::database_size exposes the cached newest sample so other readers use one sampler."},
   "downtime": {"status": "none", "detail": "None. One more file length per hourly sample."},
   "manual": {"status": "none", "detail": "No manual step. Physical growth appears once a sample within half an hour of a day ago exists."},
   "recovery": {"status": "none", "detail": "The previous build ignores the fourth element."}

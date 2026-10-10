@@ -61,8 +61,9 @@ daily growth, what is written less what checkpoints and retention free. The daem
 store hourly, after its local trims, by reading three pragmas, and keeps two days of samples in
 `meta` (`database_size_samples`), so a restart does not lose the growth. Growth is measured from
 the newest sample at least a day old, or extrapolated from the oldest once there is an hour of
-samples; `size` says over what span. Each sample also records the WAL's length:
-`physical_bytes` is the file and its WAL, what the store takes on disk, and
+samples; `size` says over what span. Each sample also records the lengths of the main file and its WAL:
+`physical_bytes` is their sum, what the store takes on disk (page counts include pages committed
+to the WAL but not yet copied into the main file, so they are never added to the WAL), and
 `physical_growth_bytes_per_day` compares it with the sample nearest exactly a day ago, within half
 an hour of it, scaled to a day. It is never extrapolated. A sample dated in the future, after the
 clock went back, is dropped. The newest sample is the one every reader uses

@@ -6,8 +6,9 @@
 
 use super::*;
 
-/// The `meta` key holding recent samples: `[[unix_ms, live_bytes, file_bytes, wal_bytes], ...]`,
-/// oldest first. Samples written before the WAL was measured have three elements.
+/// The `meta` key holding recent samples:
+/// `[[unix_ms, live_bytes, file_bytes, wal_bytes, main_file_bytes], ...]`, oldest first. Samples
+/// written before the files were measured have three elements.
 const SAMPLES: &str = "database_size_samples";
 /// Samples older than this are forgotten.
 const KEEP_MS: u128 = 49 * 60 * 60 * 1000;
@@ -19,13 +20,15 @@ const MIN_SPAN_MS: u128 = 60 * 60 * 1000;
 /// How far from exactly a day ago a physical baseline may be.
 const BASELINE_TOLERANCE_MS: u128 = 30 * 60 * 1000;
 
-/// One stored sample: when, the pages in use, the file, and the WAL when it was measured.
+/// One stored sample: when, the pages in use, the pages in all, and the lengths of the main file
+/// and its WAL when they were measured.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Sample {
     at: u128,
     live: u64,
     file: u64,
     wal: Option<u64>,
+    main: Option<u64>,
 }
 
 impl Sample {
@@ -36,17 +39,21 @@ impl Sample {
             live: item(1)?,
             file: item(2)?,
             wal: item(3),
+            main: item(4),
         })
     }
 
     fn to_value(self) -> Value {
         let mut row = vec![json!(self.at as u64), json!(self.live), json!(self.file)];
-        row.extend(self.wal.map(|wal| json!(wal)));
+        if let (Some(wal), Some(main)) = (self.wal, self.main) {
+            row.extend([json!(wal), json!(main)]);
+        }
         Value::Array(row)
     }
 
+    /// The main file's length and its WAL's: what the store takes on disk.
     fn physical(self) -> Option<u64> {
-        self.wal.map(|wal| self.file + wal)
+        Some(self.main? + self.wal?)
     }
 }
 
@@ -54,7 +61,8 @@ impl Sample {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DatabaseSize {
     pub measured_at_unix_ms: u128,
-    /// The file's pages, including free ones.
+    /// The store's pages, including free ones and those committed to the WAL but not yet copied
+    /// into the main file.
     pub file_bytes: u64,
     /// The pages in use: the file less its free pages, which SQLite reuses before growing.
     pub live_bytes: u64,
@@ -66,7 +74,10 @@ pub struct DatabaseSize {
     pub growth_span_ms: Option<u128>,
     /// The WAL file's length beside the store.
     pub wal_bytes: u64,
-    /// What the store takes on disk: the file and its WAL.
+    /// The main file's length. Pages committed to the WAL and not yet copied in are not in it.
+    pub main_file_bytes: u64,
+    /// What the store takes on disk: the main file's length and the WAL's. Page counts include
+    /// pages still in the WAL, so they are not added to it.
     pub physical_bytes: u64,
     /// How much `physical_bytes` grew since the sample nearest exactly a day ago, within half an
     /// hour of it, scaled to a day. Never extrapolated: none until that baseline exists.
@@ -122,8 +133,10 @@ impl Store {
         // A store without a WAL file beside it (in memory, or just checkpointed away) has none.
         let mut wal = self.path.clone().into_os_string();
         wal.push("-wal");
-        let wal_bytes = std::fs::metadata(&wal).map_or(0, |metadata| metadata.len());
-        let physical_bytes = file_bytes + wal_bytes;
+        let length = |path: &std::ffi::OsStr| std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        let wal_bytes = length(&wal);
+        let main_file_bytes = length(self.path.as_os_str());
+        let physical_bytes = main_file_bytes + wal_bytes;
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let mut samples: Vec<Sample> = transaction
@@ -141,7 +154,13 @@ impl Store {
         let triples = samples.iter().map(|sample| (sample.at, sample.live, sample.file)).collect::<Vec<_>>();
         let growth = growth(&triples, now, live_bytes);
         let physical = physical_growth(&samples, now, physical_bytes);
-        samples.push(Sample { at: now, live: live_bytes, file: file_bytes, wal: Some(wal_bytes) });
+        samples.push(Sample {
+            at: now,
+            live: live_bytes,
+            file: file_bytes,
+            wal: Some(wal_bytes),
+            main: Some(main_file_bytes),
+        });
         let excess = samples.len().saturating_sub(MAX_SAMPLES);
         samples.drain(..excess);
         let stored = Value::Array(samples.iter().map(|sample| sample.to_value()).collect());
@@ -158,6 +177,7 @@ impl Store {
             growth_bytes_per_day: growth.map(|(per_day, _)| per_day),
             growth_span_ms: growth.map(|(_, span)| span),
             wal_bytes,
+            main_file_bytes,
             physical_bytes,
             physical_growth_bytes_per_day: physical.map(|(per_day, _)| per_day),
             physical_growth_span_ms: physical.map(|(_, span)| span),
@@ -187,7 +207,7 @@ mod tests {
     }
 
     fn sample(at: u128, physical: Option<u64>) -> Sample {
-        Sample { at, live: 0, file: physical.unwrap_or(0), wal: physical.map(|_| 0) }
+        Sample { at, live: 0, file: 0, wal: physical.map(|_| 0), main: physical }
     }
 
     #[test]
@@ -212,13 +232,13 @@ mod tests {
 
     #[test]
     fn a_sample_from_before_the_wal_was_measured_still_reads() {
-        assert_eq!(
-            Sample::from_value(&json!([5, 1, 2])),
-            Some(Sample { at: 5, live: 1, file: 2, wal: None })
-        );
-        let measured = Sample { at: 5, live: 1, file: 2, wal: Some(3) };
+        let old = Sample::from_value(&json!([5, 1, 2])).unwrap();
+        assert_eq!(old, Sample { at: 5, live: 1, file: 2, wal: None, main: None });
+        assert_eq!(old.physical(), None, "never a physical baseline");
+        let measured = Sample { at: 5, live: 1, file: 9, wal: Some(3), main: Some(4) };
         assert_eq!(Sample::from_value(&measured.to_value()), Some(measured));
-        assert_eq!(measured.physical(), Some(5));
+        // The main file and the WAL, not the page count, which includes the WAL's pages.
+        assert_eq!(measured.physical(), Some(7));
     }
 
     #[test]
@@ -232,7 +252,11 @@ mod tests {
         assert_eq!((back.growth_bytes_per_day, back.physical_growth_bytes_per_day), (None, None));
         let next = store.record_database_size(start + DAY_MS).unwrap();
         assert!(next.physical_growth_bytes_per_day.is_some(), "the earlier sample is a day old");
-        assert!(next.physical_bytes >= next.file_bytes);
+        assert_eq!(next.physical_bytes, next.main_file_bytes + next.wal_bytes);
+        let on_disk = |suffix: &str| {
+            std::fs::metadata(directory.path().join(format!("claims.sqlite3{suffix}"))).map_or(0, |m| m.len())
+        };
+        assert_eq!((next.main_file_bytes, next.wal_bytes), (on_disk(""), on_disk("-wal")));
     }
 
     #[test]
