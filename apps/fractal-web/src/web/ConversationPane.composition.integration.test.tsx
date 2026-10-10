@@ -34,6 +34,7 @@ const source = vi.hoisted(() => ({
   feed: { _tag: 'Waiting' } as Feed<ConversationPage>,
   sync: undefined as FeedSyncObservation | undefined,
   now: 1000,
+  sendEnabled: false,
   runtimeItems: [] as NonNullable<ConversationRuntimeOptions['messages']>[],
   transcriptTurns: [] as (readonly TranscriptTurn[])[],
   scrollToBottomKeys: [] as (string | undefined)[],
@@ -47,10 +48,10 @@ vi.mock('../data/react.tsx', async () => {
   return ({
   useConversation: () => source.feed,
   useConversationSync: () => source.sync,
-  useDataSource: () => ({ agents, conversationInterest: undefined }),
+  useDataSource: () => ({ agents, conversationInterest: undefined, attachments: source.sendEnabled ? { send: vi.fn() } : undefined }),
   useFeedInterest: () => {},
   useNow: () => source.now,
-  useGrants: () => ({ actions: 'ungranted', messageSend: 'ungranted', terminalInput: 'ungranted' }),
+  useGrants: () => ({ actions: 'ungranted', messageSend: source.sendEnabled ? 'granted' : 'ungranted', terminalInput: 'ungranted' }),
   })
 })
 
@@ -106,6 +107,7 @@ const container = document.createElement('div')
 
 beforeEach(() => {
   source.now = 1000
+  source.sendEnabled = false
   source.runtimeItems = []
   source.transcriptTurns = []
   source.scrollToBottomKeys = []
@@ -142,6 +144,17 @@ const mount = async (ux?: UxTelemetry) => {
 const text = () => container.textContent ?? ''
 
 describe('ConversationPane composition activation', () => {
+  it('keeps the not-found composer pinned without promising that the missing conversation will load', async () => {
+    source.sendEnabled = true
+    source.feed = { _tag: 'Unavailable', reason: 'failed', code: 'not-found', detail: 'synthetic diagnostic' }
+    await mount()
+    expect(container.querySelector('[data-testid="transcript-unavailable"]')?.textContent).toContain('Conversation not found')
+    expect(container.querySelector('[data-testid="composer-footer"]')?.textContent).toContain('Conversation not found')
+    expect(text()).not.toContain('Messages can be sent once this conversation loads.')
+    expect(source.composerProps.at(-1)?.disabledReason).toBe('Conversation not found')
+    expect(container.querySelector<HTMLTextAreaElement>('textarea')?.disabled).toBe(true)
+    expect(container.querySelector<HTMLElement>('[data-testid="conversation-composer-dock"]')?.style.flexShrink).toBe('0')
+  })
   it('insets the composer dock so its focus outline stays inside the viewport', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
     await mount()
