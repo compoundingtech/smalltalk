@@ -9,7 +9,7 @@ if [ -d apps/fractal-web/.storybook ]; then
   test -s apps/fractal-web/storybook-static/index.html
   node packages/fractal-ui/scripts/check-storybook-index.mjs app apps/fractal-web/storybook-static/index.json
 else
-  echo 'App Storybook not introduced yet; publishing kit with a lazy, unavailable app ref.'
+  echo 'App Storybook not introduced yet; publishing kit with the unavailable app ref disabled.'
 fi
 pnpm --filter @smalltalk/fractal-ui build-storybook
 node packages/fractal-ui/scripts/check-storybook-index.mjs kit packages/fractal-ui/storybook-static/index.json

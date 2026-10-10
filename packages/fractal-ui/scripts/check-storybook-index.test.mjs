@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { resolve } from 'node:path'
 import { test } from 'node:test'
 import { checkIndex } from './check-storybook-index.mjs'
-import { appRef, composition } from '../.storybook/composition.mjs'
+import { appRef, composition } from '../.storybook/composition.ts'
 
 const manifest = { version: 1, exceptions: [{ book: 'kit', title: 'Fractal/Explore/Workbench', classification: 'explore', owner: 'fractal-web-live', reason: 'Not the production workspace.' }] }
 const index = (title, tags = []) => ({ v: 5, entries: { example: { id: 'example', type: 'story', title, name: 'AllStates', tags } } })
@@ -35,15 +35,17 @@ test('schema, ownership, duplicates, stale rows and classification fail closed',
   assert.throws(() => checkIndex(index('Fractal/Explore/Workbench'), raw({ classification: 'perf' }), 'kit'), /classification/)
   assert.throws(() => checkIndex({ v: 5, entries: {} }, { version: 1, exceptions: [] }, 'kit'), /Empty/)
 })
-test('local missing ref is lazy; static build requires output once app book exists', () => {
+test('missing local ref is disabled without fetches; introduced app requires static output', () => {
   const repoRoot = mkdtempSync(resolve(tmpdir(), 'fractal-book-contract-'))
   try {
     const options = { repoRoot, build: false, ci: false, appUrl: 'https://app.example.test' }
     assert.equal(composition(options).refs[appRef.id].url, options.appUrl)
-    assert.equal(composition(options).refs[appRef.id].type, 'server-lazy')
+    assert.equal(composition(options).refs[appRef.id].disable, false)
+    assert.equal(composition({ ...options, appUrl: undefined }).refs[appRef.id].disable, true)
     assert.equal(composition({ ...options, build: true }).refs[appRef.id].url, appRef.staticPath)
     assert.equal(composition({ ...options, ci: true }).refs[appRef.id].url, appRef.staticPath)
     assert.deepEqual(composition({ ...options, build: true }).staticDirs, [])
+    assert.equal(composition({ ...options, build: true }).refs[appRef.id].disable, true)
     mkdirSync(resolve(repoRoot, 'apps/fractal-web/.storybook'), { recursive: true })
     assert.doesNotThrow(() => composition(options))
     assert.throws(() => composition({ ...options, build: true, ci: true }), /static output is missing/)
@@ -53,6 +55,7 @@ test('local missing ref is lazy; static build requires output once app book exis
     assert.throws(() => composition({ ...options, build: true }), /static output is missing/)
     writeFileSync(resolve(output, 'index.html'), '<html></html>')
     assert.deepEqual(composition({ ...options, build: true }).staticDirs, [{ from: output, to: '/apps/fractal-web/storybook-static' }])
+    assert.equal(composition({ ...options, build: true }).refs[appRef.id].disable, false)
   } finally {
     rmSync(repoRoot, { recursive: true, force: true })
   }

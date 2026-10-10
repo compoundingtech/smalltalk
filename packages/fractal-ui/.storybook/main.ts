@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
-import { composition } from './composition.mjs'
+import { composition } from './composition.ts'
 import type { StorybookConfig } from '@storybook/react-vite'
 import tailwindcss from '@tailwindcss/vite'
 import stylex from '@stylexjs/unplugin'
