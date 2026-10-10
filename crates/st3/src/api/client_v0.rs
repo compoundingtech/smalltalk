@@ -12183,6 +12183,14 @@ mission "queue-parity" state="ready" {
         assert!(snapshot.store_index >= idle, "a fresh read shows what was written before it");
         assert_eq!(page.items[0]["harness_state"], "idle");
         assert!(waited < Duration::from_millis(500), "a fresh read waited {waited:?} for the pause");
+        // The fresh read's wait and page, and the refresher's folds, land in their stage rows.
+        let stages = crate::api::request_latency_snapshot().into_iter()
+            .filter(|row| row["scope"] == "agents-roster")
+            .filter_map(|row| row["stage"].as_str().map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        for stage in ["fresh-wait", "fresh-page", "refresh"] {
+            assert!(stages.contains(stage), "{stage} recorded: {stages:?}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

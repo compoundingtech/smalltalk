@@ -90,6 +90,9 @@ activity makes the canonical agent `state: "waiting"`; clients present that comb
 a person. It takes precedence over working or idle, not over a terminal runtime, an ended/failed or
 indeterminate harness, a reconcile fault, or an observation fenced out by the current incarnation.
 `ask` names the structured question, permission, or review, not text inferred from the terminal.
+The optional `activity` is a status that is neither work nor a wait on a person, never an alert:
+`compacting` while the harness compacts its conversation (reason `compaction`; Claude Code, Codex
+and omp report both edges, pi only the end, so pi never shows it).
 
 The omp extension correlates an ask with its tool-call ID. Unrelated results leave it blocked; the
 matching answer emits a new unblocked activity frame. The pi-family channel retains all three axes
@@ -599,6 +602,14 @@ It is absent when no agent is behind the item. `conversation_ids` lists every co
 shows in, starting with `conversation_id`: a harness login alert is one alert per login directory
 and host, naming every seat that shares it, since one sign-in answers them all. Daemons that
 predate alerts omit these fields.
+
+A `harness-prompt` alert is a native prompt a seat's harness shows in its terminal and waits on:
+a permission, a question or a review. Its `source_id` and `conversation_id` are the seat, its
+`episode` is the harness observation that opened the prompt, and its detail carries the prompt
+text the harness reported. It clears when the harness reports the prompt gone, however it was
+answered, when Claude's terminal shows it was refused (Claude reports no event for that), or
+when the seat's runtime incarnation changes. It offers no typed action yet: its action attaches
+to the seat's terminal to answer there.
 
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
 generation, step, or agent), its current `state` and, when known, the `since`

@@ -583,6 +583,11 @@ those sparse p99s are effectively observed maxima. This bounded tolerance still 
 regressions on rare paths. CPU tolerates 0.05 cores. A PR without a main baseline fails as P0;
 a main bootstrap may check only absolute budgets and errors.
 
+The CPU budget (2 cores) comes from [`slo/targets.toml`](../slo/targets.toml), which st3 builds in:
+a missing file fails the build and an invalid one fails the run, with no default. The report and step summary also show each
+path's p99 target from that file (`descriptive_target_ms`, `over_descriptive_target`) when the path
+stands for one. Targets describe and never gate: the budgets and main's baseline remain the gates.
+
 Performance uses the small `.#perf` Nix shell and the opt-in `perf_load` test target (feature
 `perf-load`), which imports the same `daemon_load` and `daemon_bench` modules without compiling
 all integration fixtures. Completed main and PR runs retain seven-day build snapshots containing
@@ -881,10 +886,27 @@ p90 <45 minutes.
 With `CI_MERGE_CI1` unset/off, the picker admits an entire group to `ci1-merge`
 only when five distinct online idle merge workers are available and, after borrowing
 mixed workers, two general workers remain for PRs. Priority-only workers are excluded.
-Otherwise all group workload jobs use Namespace. Admission is a snapshot, not an
-atomic reservation across simultaneous pickers. Missing/invalid status also overflows.
+If the whole group does not fit, the primary test consumer and then mail canaries
+may use at most two idle merge slots. This smaller allocation charges *every* selected
+job against general headroom (`min(2, idle_merge, max(0, idle_general - 2))`), even if
+dedicated workers are idle, because a `ci1-merge` job may select a mixed worker. Only
+those two consumers use the partial outputs; the producer, second shard, VM and other
+supporting jobs retain Namespace routing. With two idle dedicated workers and three
+idle general workers, one consumer fits, rather than stranding every local slot.
+Admission is still an early snapshot, not an atomic reservation across simultaneous
+pickers or a guarantee that those workers remain idle until the producer finishes.
+Missing/invalid status overflows to Namespace. This does not change either queue class,
+run affinity, live build count, job budgets, test selection, retry policy or guarded
+runner state. Measure actual new-group consumer wait and PR wait after rollout; a
+slow local test or loss of PR headroom must remain visible.
 `CI_MERGE_CI1=on` retains the explicit forced-local switch for supported incidents.
 PR/fork/priority routing is unchanged. No job is migrated after it starts.
+If a selected local consumer waits for more than five minutes, the CI capacity owner
+checks that named runner registration and job. Preserve running work; restore an
+intentionally admitted healthy local worker or repair its supported registration.
+A queued job cannot acquire new runs-on labels. If no compatible worker can be
+restored, retain the failure and use the ordinary curator requeue path after a
+reviewed routing correction; do not blind-retry or reopen an isolated runner.
 
 `CI_MERGE_NAMESPACE_PROFILE` may name an existing, verified Linux profile; unset
 uses the existing 8x16 stage labels and Linux profile for supporting jobs, including

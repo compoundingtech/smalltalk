@@ -1407,6 +1407,12 @@ fn request_latency() -> &'static Mutex<request_latency::Meter> {
     REQUEST_LATENCY.get_or_init(|| Mutex::new(request_latency::Meter::default()))
 }
 
+/// Count one agents roster stage's duration beside the request rows.
+fn record_roster_stage(stage: request_latency::RosterStage, elapsed: Duration) {
+    // A poisoned diagnostic lock must not stop the refresher that records into it.
+    request_latency().lock().unwrap_or_else(std::sync::PoisonError::into_inner).record_roster_stage(stage, elapsed);
+}
+
 fn request_latency_snapshot() -> Vec<Value> {
     request_latency().lock().unwrap().snapshot()
 }
@@ -3185,6 +3191,13 @@ fn client_agent_resources_from_status(
                 "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
                 "ask": subject.harness.as_ref().and_then(|harness| harness.ask.as_deref()),
                 "reason": subject.harness.as_ref().and_then(|harness| harness.reason.as_deref()),
+                // What the seat is doing that is neither work nor a wait on anyone: a status,
+                // never an alert.
+                "activity": subject
+                    .harness
+                    .as_ref()
+                    .filter(|harness| harness.reason.as_deref() == Some("compaction"))
+                    .map(|_| "compacting"),
                 "host_id": desired_agents.get(&subject.subject).map(|(host, _, _)| host),
                 "workspace": desired_agents.get(&subject.subject).map(|(_, workspace, _)| workspace),
                 "checkout": desired_agents.get(&subject.subject).and_then(|(_, _, checkout)| checkout.as_ref()),
@@ -4715,12 +4728,20 @@ async fn client_agents_published(
         return blocking_store(move || Ok(client_agents_published_continuation(&reader, snapshot, &query)))
             .await?;
     }
-    if query.fresh {
+    let fresh = query.fresh;
+    if fresh {
+        let waited = Instant::now();
         wait_for_agent_roster(&state.store, query.history).await;
+        record_roster_stage(request_latency::RosterStage::FreshWait, waited.elapsed());
     }
     let reader = state.clone();
     let history = query.history;
-    match blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await?? {
+    let built = Instant::now();
+    let page = blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await;
+    if fresh {
+        record_roster_stage(request_latency::RosterStage::FreshPage, built.elapsed());
+    }
+    match page?? {
         Some(page) => Ok(page),
         None => {
             if history {
@@ -6025,8 +6046,11 @@ pub fn start_agent_roster(state: &AppState) {
         loop {
             let started = tokio::time::Instant::now();
             let mut admission = store.admit_agent_resources().await;
-            let reader = store.clone();
             let first = std::mem::take(&mut head);
+            if !first {
+                record_roster_stage(request_latency::RosterStage::RefreshAdmission, started.elapsed());
+            }
+            let reader = store.clone();
             if first {
                 // Warm without admission: nothing is published, and no reader folds.
                 drop(admission);
@@ -6047,13 +6071,16 @@ pub fn start_agent_roster(state: &AppState) {
                 crate::performance::task("roster/refresh", || if first {
                     reader.read_snapshot(|index| client_agent_roster_head(&reader, index))
                 } else {
-                    reader.answer_agent_roster_requests(|| {
+                    let folded = Instant::now();
+                    let refreshed = reader.answer_agent_roster_requests(|| {
                         refresh_agent_roster(&reader, false)?;
                         if reader.take_agent_roster_history_request() {
                             refresh_agent_roster(&reader, true)?;
                         }
                         Ok(())
-                    })
+                    });
+                    record_roster_stage(request_latency::RosterStage::Refresh, folded.elapsed());
+                    refreshed
                 })
             })
             .await;
@@ -25193,6 +25220,15 @@ mission "agent-human" state="ready" {
         assert!(answered.blocked_on.is_none());
         assert!(answered.ask.is_none());
         assert!(answered.reason.is_none());
+        assert!(answered.activity.is_none());
+        // Compacting is the seat's status: it runs, it waits on nobody.
+        append("harness.observed", json!({
+            "state": "working", "driver": "omp", "incarnation_id": "human-1",
+            "blocked_on": null, "ask": null, "reason": "compaction", "input_buffer": null, "exit": null,
+        }));
+        let compacting: st3_client::Agent = serde_json::from_value(agent()).unwrap();
+        assert_eq!(compacting.state, "running");
+        assert_eq!(compacting.activity.as_deref(), Some("compacting"));
         // The harness schema's terminal activity keeps precedence over a stale ask.
         observe_harness("ended");
         assert_eq!(agent()["state"], "failed");

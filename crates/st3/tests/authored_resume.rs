@@ -226,7 +226,18 @@ agent "garden/worker" {{
     std::fs::write(&stop, "").unwrap();
     let output = completion.await.unwrap();
     server.abort();
-    assert_eq!(std::fs::read_link(&managed).unwrap(), legacy);
+    let metadata = std::fs::symlink_metadata(&managed).unwrap();
+    assert!(metadata.is_dir());
+    assert!(!metadata.file_type().is_symlink());
+    assert_ne!(std::fs::canonicalize(&managed).unwrap(), std::fs::canonicalize(&legacy).unwrap());
+    assert_eq!(std::fs::read_dir(&managed).unwrap().count(), 2);
+    let managed_transcript = managed.join(transcript.file_name().unwrap());
+    assert_eq!(std::fs::read_link(&managed_transcript).unwrap(), transcript);
+    assert_eq!(std::fs::read(&managed_transcript).unwrap(), std::fs::read(&transcript).unwrap());
+    let managed_artifacts = managed.join(transcript.file_stem().unwrap());
+    assert_eq!(std::fs::read_link(&managed_artifacts).unwrap(), transcript.with_extension(""));
+    assert!(managed_artifacts.is_dir());
+    assert!(!managed.join(format!("2026-10-05_{sibling_id}.jsonl")).exists());
     // This fixture has no PTY/reconciler. Releasing its provider can fence the delivery
     // subscription during teardown; the contract under test is the binding while it is live.
     let binding = binding.unwrap_or_else(|| panic!("native binding was not published: {output:?}"));

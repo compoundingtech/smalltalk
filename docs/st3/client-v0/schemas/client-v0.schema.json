@@ -246,7 +246,7 @@
           "required": ["kind", "attention_kind", "source_id", "person_id", "title", "detail", "priority", "state", "requested_at", "actions"],
           "properties": {
             "kind": { "const": "attention" },
-            "attention_kind": {"anyOf": [{"enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "person-step", "agent-request", "fault"]}, {"type": "string", "pattern": "^custom\\.[a-zA-Z0-9_.-]+$"}]},
+            "attention_kind": {"anyOf": [{"enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "person-step", "agent-request", "fault", "harness-login", "harness-prompt"]}, {"type": "string", "pattern": "^custom\\.[a-zA-Z0-9_.-]+$"}]},
           "custom_form": {"type": "object", "description": "Data-only registered reply form; absent on native attention."},
             "source_kind": {"type": "string"},
             "episode": {"type": "string"},
@@ -1029,6 +1029,7 @@
             "blocked_on": { "type": ["string", "null"], "description": "Current incarnation's harness blocking axis; human means a person must answer before it continues." },
             "ask": { "type": ["string", "null"], "description": "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." },
             "reason": { "type": ["string", "null"], "description": "Diagnostic harness reason, not a machine-readable verdict." },
+            "activity": { "type": ["string", "null"], "description": "What the seat is doing that is neither ordinary work nor a wait on a person, shown as its status and never as an alert: compacting while its harness compacts its conversation (Claude Code, Codex and omp report both edges). Absent otherwise and on older daemons; clients show unknown values as plain text." },
             "host_id": { "oneOf": [{ "$ref": "#/$defs/HostId" }, { "type": "null" }] },
             "last_activity_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
             "silent_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },

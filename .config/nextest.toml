@@ -63,3 +63,15 @@ retries = 0
 filter = 'package(st3) and test(/^idle_budget::a_quiescent_daemon_cpu_control_accepts_idle_and_rejects_busy$/)'
 success-output = "immediate"
 retries = 0
+
+# Retain the measured whole-page tuple on success as well as failure.
+# This changes output visibility only; inherited retries and all work ceilings remain.
+[[profile.ci.overrides]]
+filter = 'package(=smallclaims) and binary(=ivm_admitted_applied_slice) and test(/^full_page_accounting_includes_metadata_and_physical_reader_writer_return$/)'
+success-output = "immediate"
+
+# Retain actual inventory-growth tuples; this is diagnostic visibility only.
+# Selection, retries, threads, ceilings and the strict override remain unchanged.
+[[profile.ci.overrides]]
+filter = 'package(=smallclaims) and binary(=ivm_admitted_applied_slice) and test(/^canonical_metadata_inventory_growth_reports_actual_page_work$/)'
+success-output = "immediate"

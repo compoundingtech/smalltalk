@@ -406,6 +406,13 @@ fn channel_loop(
     // `agent_start` also precedes that write; the first `idle` lifecycle edge proves the boot turn
     // and transcript have both completed. Startup mail then begins a clean provider turn.
     let mut delivery_ready = false;
+    // Whether this channel saw a compaction start and not yet its end. pi reports only the end,
+    // so it never shows as compacting rather than showing a status it cannot clear.
+    let mut compacting = false;
+    // The activity this channel last recorded, which a compaction's end restores: omp compacts
+    // mid-turn too, and says a turn is active only when it starts.
+    let mut activity = None;
+    let mut activity_before_compaction = None;
     let label = kind.label;
     let mut next_heartbeat = Instant::now() + heartbeat_every;
     loop {
@@ -451,13 +458,16 @@ fn channel_loop(
                 {
                     writer.interrupt();
                 }
-                if let Some(observation) = observation
+                if let Some(observation) = observation {
+                    activity = Some(observation.state);
                     // A queued live frame must never overwrite the wrapper's terminal record:
                     // the channel and the wrapper are separate processes, so the flock alone
                     // serializes but does not order their writes.
-                    && let Err(error) = writer.observe_unless_ended(observation)
-                {
-                    tracing::warn!("st {label} channel: recording observed state failed: {error}");
+                    if let Err(error) = writer.observe_unless_ended(observation) {
+                        tracing::warn!(
+                            "st {label} channel: recording observed state failed: {error}"
+                        );
+                    }
                 }
                 // The credential axis is a third record, independent of the numbers and of the
                 // categorical state: a rejection stands until a turn reaches its ordinary end,
@@ -471,31 +481,61 @@ fn channel_loop(
                 // a producer holding no fresh reading must write nothing at all, so the record
                 // ages visibly through `ageMs` instead of looking refreshed. Every frame is handed
                 // to the guard, which decides bucket, compaction edge, or heartbeat.
-                if let Some(context) = frame.as_ref().and_then(context_frame)
+                let context = frame.as_ref().and_then(context_frame);
+                let compaction_ended =
+                    compacting && context.as_ref().is_some_and(|(_, edge)| edge.is_some());
+                if let Some(context) = context
                     && let Some(context_writer) = context_writer.as_deref_mut()
                     && let Err(error) = write_context(context_writer, context)
                 {
                     tracing::warn!("st {label} channel: recording harness context failed: {error}");
                 }
-                if frame.as_ref().is_some_and(|frame| {
+                // A compaction is the seat's status from its start to its end. A start whose
+                // context recovery failed says so instead: that is what someone must act on.
+                let compaction = if frame.as_ref().is_some_and(|frame| {
                     frame.get("type").and_then(Value::as_str) == Some("pre_compact")
-                }) && let Err(error) = ensure_pre_compact_context(agent_dir)
-                {
-                    tracing::warn!(
-                        "st {label} channel: writing pre-compact context stub failed: {error}"
-                    );
-                    let actionable = harness_state::Observation::new(
-                        harness_state::Activity::Active,
+                }) {
+                    if !compacting {
+                        activity_before_compaction = activity;
+                    }
+                    compacting = true;
+                    Some(match ensure_pre_compact_context(agent_dir) {
+                        Ok(_) => harness_state::Observation::new(
+                            harness_state::Activity::Active,
+                            harness_state::BlockedOn::None,
+                            harness_state::InputBuffer::Unknown,
+                        )
+                        .with_reason("compaction"),
+                        Err(error) => {
+                            tracing::warn!(
+                                "st {label} channel: writing pre-compact context stub failed: {error}"
+                            );
+                            harness_state::Observation::new(
+                                harness_state::Activity::Active,
+                                harness_state::BlockedOn::None,
+                                harness_state::InputBuffer::Unknown,
+                            )
+                            .with_reason(PRE_COMPACT_ERROR_REASON)
+                        }
+                    })
+                } else if compaction_ended {
+                    compacting = false;
+                    // Back to what the seat was doing: a turn that compacted mid-way still
+                    // works, and a `/compact` from idle is idle again.
+                    Some(harness_state::Observation::new(
+                        activity_before_compaction
+                            .take()
+                            .unwrap_or(harness_state::Activity::Idle),
                         harness_state::BlockedOn::None,
                         harness_state::InputBuffer::Unknown,
-                    )
-                    .with_reason(PRE_COMPACT_ERROR_REASON);
-                    if let Err(state_error) = writer.observe_unless_ended(actionable) {
-                        tracing::warn!(
-                            "st {label} channel: recording pre-compact recovery failure failed: \
-                             {state_error}"
-                        );
-                    }
+                    ))
+                } else {
+                    None
+                };
+                if let Some(observation) = compaction
+                    && let Err(error) = writer.observe_unless_ended(observation)
+                {
+                    tracing::warn!("st {label} channel: recording compaction failed: {error}");
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -1344,6 +1384,13 @@ mod tests {
             "the recovery edge must never replace authored state"
         );
 
+        // A successful recovery edge marks the seat compacting. Each run here is a new session,
+        // and a session never replaces another's record, so the next one starts on a fresh record.
+        let state_path = harness_state::harness_state_path(agent_dir);
+        let compacting: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(compacting["reason"], "compaction");
+        std::fs::remove_file(&state_path).unwrap();
+
         std::fs::remove_file(context_dir.join("now.md")).unwrap();
         std::fs::write(context_dir.join("now.md"), [0xff]).unwrap();
         run_frame();
@@ -1358,6 +1405,63 @@ mod tests {
         .unwrap();
         assert_eq!(raw["state"], "active");
         assert_eq!(raw["reason"], PRE_COMPACT_ERROR_REASON);
+    }
+
+    /// Compacting is the seat's status from omp's compaction start to its end, and a channel that
+    /// saw no start (pi reports only the end) leaves the status alone.
+    #[test]
+    fn compacting_runs_from_the_start_edge_to_the_end_edge() {
+        let run = |frames: &[&str]| -> Option<Value> {
+            let tmp = tempfile::tempdir().unwrap();
+            let agent_dir = tmp.path();
+            let inbox = message::inbox_dir(agent_dir);
+            std::fs::create_dir_all(&inbox).unwrap();
+            context::write_now(&context::context_dir(agent_dir), "Authored state.\n").unwrap();
+            let mut writer =
+                harness_state::Writer::new(agent_dir, "h.worker", "omp", Some("h.worker".into()));
+            let mut timeline = crate::harness_timeline::Writer::new(agent_dir, "omp", "test");
+            let (tx, rx) = mpsc::channel();
+            for frame in frames {
+                tx.send(Ok((*frame).to_string())).unwrap();
+            }
+            drop(tx);
+            channel_loop(
+                &rx,
+                &mut Vec::new(),
+                &inbox,
+                agent_dir,
+                &mut writer,
+                None,
+                &mut timeline,
+                "h.worker",
+                &OMP_KIND,
+                Duration::from_millis(1),
+                Duration::from_secs(60),
+            )
+            .unwrap();
+            std::fs::read(harness_state::harness_state_path(agent_dir))
+                .ok()
+                .map(|raw| serde_json::from_slice(&raw).unwrap())
+        };
+        let start = r#"{"type":"pre_compact"}"#;
+        let end = r#"{"type":"context","compaction":{"trigger":null,"count":1}}"#;
+        let compacting = run(&[start]).unwrap();
+        assert_eq!(compacting["state"], "active");
+        assert_eq!(compacting["reason"], "compaction");
+        // A `/compact` with nothing running before it ends idle.
+        let done = run(&[start, end]).unwrap();
+        assert_eq!(done["state"], "idle");
+        assert!(done["reason"].is_null(), "{done}");
+        assert!(run(&[end]).is_none(), "an end alone writes no status");
+        // A compaction inside a working turn ends with the turn still working: omp says a turn is
+        // active only when it starts.
+        let working = r#"{"type":"state","state":"active"}"#;
+        let idle = r#"{"type":"state","state":"idle"}"#;
+        let mid_turn = run(&[working, start, end]).unwrap();
+        assert_eq!(mid_turn["state"], "active", "{mid_turn}");
+        assert!(mid_turn["reason"].is_null(), "{mid_turn}");
+        let from_idle = run(&[idle, start, end]).unwrap();
+        assert_eq!(from_idle["state"], "idle", "{from_idle}");
     }
 
     /// The stdio connection is the evidence. While it lives, the record's heartbeat advances

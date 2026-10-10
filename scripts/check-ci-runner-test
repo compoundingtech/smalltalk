@@ -128,14 +128,29 @@ check("one PR slot is not enough", [{'runners': [runner('ci1-merge') for _ in ra
       EVENT='merge_group', MERGE_LOCAL_ONLY='')
 mixed = [runner() for _ in range(5)]
 for item in mixed: item['labels'].append({'name': 'ci1-merge'})
-check("five mixed workers cannot also promise two PR slots", [{'runners': mixed}], EVENT='merge_group', MERGE_LOCAL_ONLY='')
+check("five mixed workers allocate at most two consumers while retaining two PR slots", [{'runners': mixed}], {'merge_primary': ['ci1-merge'], 'merge_mail': ['ci1-merge']}, EVENT='merge_group', MERGE_LOCAL_ONLY='')
 check("five mixed plus two general workers admit a group", [{'runners': mixed + [runner(), runner()]}],
       {'merge_ci1': ['ci1-merge']}, EVENT='merge_group', MERGE_LOCAL_ONLY='')
 check("duplicated API runner IDs never inflate capacity", [{'runners': mixed}, {'runners': mixed}],
-      EVENT='merge_group', MERGE_LOCAL_ONLY='')
+      {'merge_primary': ['ci1-merge'], 'merge_mail': ['ci1-merge']}, EVENT='merge_group', MERGE_LOCAL_ONLY='')
 priority = [runner('ci1-priority') for _ in range(7)]
 for item in priority: item['labels'].extend([{'name': 'ci1-merge'}, {'name': 'ci1'}])
 check("priority-only workers remain reserved", [{'runners': priority}], EVENT='merge_group', MERGE_LOCAL_ONLY='')
+
+# Partial routing charges every local job against general headroom, even when
+# dedicated workers are idle: a ci1-merge label can also select a mixed worker.
+check("two dedicated and three general idle slots serve only the primary consumer", [{"runners": [runner('ci1-merge') for _ in range(2)] + [runner() for _ in range(3)]}],
+      {'merge_primary': ['ci1-merge']}, EVENT='merge_group', MERGE_LOCAL_ONLY='')
+check("two dedicated and four general idle slots serve primary and mail", [{"runners": [runner('ci1-merge') for _ in range(2)] + [runner() for _ in range(4)]}],
+      {'merge_primary': ['ci1-merge'], 'merge_mail': ['ci1-merge']}, EVENT='merge_group', MERGE_LOCAL_ONLY='')
+check("two dedicated but no general headroom must not borrow PR capacity", [{"runners": [runner('ci1-merge') for _ in range(2)] + [runner() for _ in range(2)]}],
+      EVENT='merge_group', MERGE_LOCAL_ONLY='')
+check("one merge worker cannot be offered to two consumers", [{"runners": [runner('ci1-merge')] + [runner() for _ in range(4)]}],
+      {'merge_primary': ['ci1-merge']}, EVENT='merge_group', MERGE_LOCAL_ONLY='')
+check("no idle merge label never routes partial consumers", [{"runners": [runner() for _ in range(5)] + [runner('ci1-merge', busy=True)]}],
+      EVENT='merge_group', MERGE_LOCAL_ONLY='')
+check("priority-labelled mixed worker cannot provide partial capacity", [{"runners": priority + [runner() for _ in range(4)]}],
+      EVENT='merge_group', MERGE_LOCAL_ONLY='')
 
 # Supporting PR jobs must never spend ordinary work on priority/merge capacity.
 import re
@@ -197,9 +212,11 @@ for job in ("linux-tests", "linux-tests-shard-2"):
 assert "vars.CI1_MIN_IDLE || '1'" in picker, "use an idle general slot without requiring the entire pool"
 
 # Evaluate the generated runs-on expressions, not a second copy of the routing rule.
-def route(job, event, profile='', picked='', merge_ci1='', merge_picked=''):
+def route(job, event, profile='', picked='', merge_ci1='', merge_picked='', partial_primary='', partial_mail=''):
     expression = blocks[job].split('runs-on: ', 1)[1].splitlines()[0].strip().removeprefix('${{').removesuffix('}}').strip()
     expression = expression.replace('needs.pick-runner.outputs.merge_ci1', repr(merge_picked))
+    expression = expression.replace('needs.pick-runner.outputs.merge_primary', repr(partial_primary))
+    expression = expression.replace('needs.pick-runner.outputs.merge_mail', repr(partial_mail))
     expression = re.sub(r'needs\.pick-runner\.outputs\.ci1(?:_secondary|_mail)?', repr(picked), expression)
     expression = expression.replace('github.event_name', repr(event)).replace('github.run_id', '123').replace('vars.CI_MERGE_NAMESPACE_PROFILE', repr(profile)).replace('vars.CI_MERGE_CI1', repr(merge_ci1))
     return eval(expression.replace('&&', ' and ').replace('||', ' or '), {'__builtins__': {}}, {'fromJSON': json.loads, 'format': lambda template, *args: template.format(*args)})
@@ -217,6 +234,13 @@ for job in ('linux-test-build', 'linux-clippy', 'linux-fleet-compat', 'genie-fre
         assert f"job.priority={1 if event == 'pull_request' else 2}" in ordinary[0], (job, 'required PRs share merge class; manual work remains second')
     if job in ('linux-test-build', 'linux-tests', 'linux-tests-shard-2', 'mail-redelivery-canaries'):
         assert route(job, 'merge_group', 'queue-reserved', '["ci1-merge"]') == ['namespace-profile-queue-reserved;job.priority=1;github.run-id=123'], (job, 'no individual picked lane may override whole-group admission')
+for job in ('linux-test-build', 'linux-clippy', 'linux-fleet-compat', 'genie-freshness', 'typescript-client', 'isolation-vm', 'linux-tests', 'linux-tests-shard-2', 'mail-redelivery-canaries'):
+    selected = route(job, 'merge_group', partial_primary='["ci1-merge"]', partial_mail='["ci1-merge"]')
+    assert (selected == ['ci1-merge']) == (job in ('linux-tests', 'mail-redelivery-canaries')), (job, 'partial allocation must not reach the producer or supporting jobs')
+    assert route(job, 'pull_request', partial_primary='["ci1-merge"]', partial_mail='["ci1-merge"]') == route(job, 'pull_request'), (job, 'merge consumer allocation cannot reach PRs')
+assert 'outputs.merge_primary' in blocks['linux-tests']
+assert 'outputs.merge_mail' in blocks['mail-redelivery-canaries']
+assert 'outputs.merge_primary' not in blocks['linux-test-build']
 assert required_priority not in blocks['perf-cost'], 'optional cost must not join required PR priority'
 assert "job.priority=${{ github.event_name == 'merge_group' && 1 || 2 }}" in blocks['perf-cost']
 print('passed: required PR and merge checks share priority; optional/manual remain second; reservations, shapes and affinity preserved')

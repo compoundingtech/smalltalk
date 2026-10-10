@@ -14762,6 +14762,10 @@ fn render_client_agents(
                     "  incarnation {}",
                     agent.incarnation_id.as_deref().unwrap_or("-")
                 );
+                // A status that is neither work nor a wait, such as compacting.
+                if let Some(activity) = &agent.activity {
+                    let _ = writeln!(output, "  {activity}");
+                }
                 if let Some(current) = agent.current_work_ids.first() {
                     let _ = writeln!(output, "  current {current}");
                 }

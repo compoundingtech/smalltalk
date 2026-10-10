@@ -124,6 +124,7 @@ pub use smallclaims::store::{
 mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
+pub(crate) use attention_snapshot::native_prompt_gone_key;
 // Registration stays opt-in until the shared installer certifies every source family.
 #[cfg_attr(
     not(test),
@@ -14791,6 +14792,7 @@ impl Store {
         let mut items = self.mission_run_attention_items(person)?;
         items.extend(self.person_attention_items(person, as_of)?);
         items.extend(self.harness_login_attention_items(person)?);
+        items.extend(self.harness_prompt_attention_items(person)?);
         items.extend(self.custom_attention_items(person)?);
         // A person who published a broken gate is the one to correct it.
         items.extend(
@@ -56187,6 +56189,101 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
                 (seats(&["third"]), (true, seats(&["third"]))),
             ])
         );
+    }
+
+    /// A native prompt is an alert in its seat's conversation while the harness waits on it, and
+    /// clears when the harness reports it gone, when the terminal shows it was refused, or when
+    /// the seat restarts.
+    #[test]
+    fn a_native_prompt_is_an_alert_until_its_harness_or_terminal_says_it_is_gone() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &preview.subject_tokens, "prompt-seat", Some("person/avery"))
+            .unwrap();
+        let append = |kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "agent/node.worker".into(),
+                    kind: kind.into(),
+                    actor: Some("agent/node.worker".into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let prompts = || {
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.kind == "harness-prompt")
+                .collect::<Vec<_>>()
+        };
+        append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}));
+        assert!(prompts().is_empty());
+        let asked = append(
+            "harness.observed",
+            json!({"state":"working", "incarnation_id":"one", "blocked_on":"human",
+                "ask":"permission", "reason":"Deploy production?"}),
+        );
+        let shown = prompts();
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(shown[0].episode, asked.id);
+        assert!(shown[0].is_alert());
+        assert_eq!(shown[0].conversation.as_deref(), Some("agent/node.worker"));
+        assert!(shown[0].detail.starts_with("Deploy production?"));
+        // Answered in the terminal: the harness reports it is no longer blocked.
+        append(
+            "harness.observed",
+            json!({"state":"working", "incarnation_id":"one", "blocked_on":null, "ask":null}),
+        );
+        assert!(prompts().is_empty());
+        // Asked again, then refused in the terminal, which only the screen shows.
+        let again = append(
+            "harness.observed",
+            json!({"state":"working", "incarnation_id":"one", "blocked_on":"human", "ask":"question"}),
+        );
+        assert_eq!(prompts()[0].episode, again.id);
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: serde_json::from_value(
+                    json!({"code":"native-prompt-gone", "incarnation_id":"one"}),
+                )
+                .unwrap(),
+                evidence: vec![again.id.clone()],
+                expected_subject: None,
+                idempotency_key: Some(attention_snapshot::native_prompt_gone_key(&again.id)),
+            })
+            .unwrap();
+        assert!(prompts().is_empty());
+        // A prompt from an incarnation that is no longer running waits on nobody.
+        append(
+            "harness.observed",
+            json!({"state":"working", "incarnation_id":"one", "blocked_on":"human", "ask":"permission"}),
+        );
+        assert_eq!(prompts().len(), 1);
+        append("runtime.observed", json!({"status":"running", "incarnation_id":"two"}));
+        assert!(prompts().is_empty());
     }
 
     #[test]

@@ -71,8 +71,12 @@ const BASELINE_RUNS: usize = 5;
 /// The daemon's CPU, in cores, may differ from the baseline by this much whatever the ratio.
 const CPU_SLACK: f64 = 0.05;
 
-/// The daemon's average CPU over the run may not pass this many cores.
-const CPU_BUDGET: f64 = 2.0;
+/// The daemon's average CPU over the run may not pass this many cores: the CPU target in
+/// `slo/targets.toml`, built into st3. A missing file fails the build and an invalid one fails
+/// the run; there is no default.
+fn cpu_budget() -> f64 {
+    st3::slo::targets().cpu.max_cores
+}
 
 /// Requests in flight at once before the load stops adding more; a daemon this far behind fails.
 const IN_FLIGHT_LIMIT: usize = 256;
@@ -241,6 +245,13 @@ struct PathReport {
     p99_ms: f64,
     max_ms: f64,
     budget_ms: f64,
+    /// The path's p99 target in `slo/targets.toml`, when it has one. It describes; the run's
+    /// gates are `budget_ms` and main's baseline, not this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    descriptive_target_ms: Option<f64>,
+    /// Whether this run's p99 was over that descriptive target. Reported, never a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    over_descriptive_target: Option<bool>,
 }
 
 struct Baseline {
@@ -474,10 +485,11 @@ fn absolute_failures(report: &Report) -> Vec<String> {
             }
         }
     }
-    if report.daemon_cores > CPU_BUDGET {
+    if report.daemon_cores > cpu_budget() {
         failures.push(format!(
-            "the daemon used {:.2} cores, over its {CPU_BUDGET} budget",
-            report.daemon_cores
+            "the daemon used {:.2} cores, over its {} budget",
+            report.daemon_cores,
+            cpu_budget()
         ));
     }
     // Count classified one-shot drops for diagnosis, but do not use them to waive
@@ -834,9 +846,75 @@ fn unchanged_work_tolerates_bounded_shared_runner_variation() {
 }
 
 #[test]
+fn targets_come_from_the_targets_file_and_describe_without_gating() {
+    // The CPU budget is the file's, not a copy of it here.
+    assert_eq!(cpu_budget(), st3::slo::targets().cpu.max_cores);
+    // Each request stands for the path in the file that serves it, and takes that target's
+    // owner-side p99, so editing the file moves these without editing this test.
+    let targets = st3::slo::targets();
+    for (name, path) in [
+        ("harness event", "POST /v1/harness-events"),
+        ("message send", "POST /v1/messages"),
+        ("lease renewal", "POST /v1/work/{action}/{*subject}"),
+        ("seat work", "GET /v1/work"),
+        ("person read /v1/client/now", "GET /v1/client/now"),
+        ("person read /v1/client/agents", "GET /v1/client/agents"),
+        (ROSTER_SNAPSHOT, "stream agents"),
+        (ROSTER_CONNECT_SNAPSHOT, "stream agents"),
+        ("work snapshot", "stream work"),
+        ("attention connect+snapshot", "stream attention"),
+    ] {
+        let target = targets
+            .for_path(path)
+            .unwrap_or_else(|| panic!("{path} has no target in slo/targets.toml"));
+        assert_eq!(descriptive_target(name), Some(target.target(false)), "{name}");
+    }
+    for name in [
+        "claim",
+        "replication exchange",
+        "person read /v1/client/missions",
+        "missions snapshot",
+        LONG_POLL,
+    ] {
+        assert_eq!(descriptive_target(name), None, "{name}");
+    }
+    // Every path over its descriptive target but within its budget fails nothing.
+    let mut report = Report {
+        daemon_cores: cpu_budget(),
+        long_poll_seats: SEATS,
+        roster_subscribers: ROSTER_SUBSCRIBERS,
+        ..Report::default()
+    };
+    for (name, budget, count) in MIX
+        .iter()
+        .map(|load| (load.name, load.budget, 100))
+        .chain([
+            (ROSTER_SNAPSHOT, ROSTER_BUDGET, ROSTER_SUBSCRIBERS),
+            (ROSTER_CONNECT_SNAPSHOT, ROSTER_BUDGET, ROSTER_SUBSCRIBERS),
+        ])
+    {
+        let budget_ms = budget.as_secs_f64() * 1_000.0;
+        let target = descriptive_target(name).map(|target| target.as_secs_f64() * 1_000.0);
+        report.paths.insert(
+            name.into(),
+            PathReport {
+                count,
+                p99_ms: budget_ms,
+                budget_ms,
+                descriptive_target_ms: target,
+                over_descriptive_target: target.map(|target| budget_ms > target),
+                ..PathReport::default()
+            },
+        );
+    }
+    assert!(report.paths.values().any(|path| path.over_descriptive_target == Some(true)));
+    assert_eq!(absolute_failures(&report), Vec::<String>::new());
+}
+
+#[test]
 fn relative_tolerance_keeps_every_absolute_budget_and_correctness_check() {
     let mut report = Report {
-        daemon_cores: CPU_BUDGET,
+        daemon_cores: cpu_budget(),
         long_poll_seats: SEATS,
         roster_subscribers: ROSTER_SUBSCRIBERS,
         ..Report::default()
@@ -888,13 +966,13 @@ fn relative_tolerance_keeps_every_absolute_budget_and_correctness_check() {
         );
         report.paths.get_mut(&name).unwrap().p99_ms = 10.0;
     }
-    report.daemon_cores = CPU_BUDGET + 0.01;
+    report.daemon_cores = cpu_budget() + 0.01;
     assert!(
         absolute_failures(&report)
             .iter()
             .any(|failure| failure.contains("cores"))
     );
-    report.daemon_cores = CPU_BUDGET;
+    report.daemon_cores = cpu_budget();
     report.failed.insert("claim".into(), 1);
     assert!(
         absolute_failures(&report)
@@ -968,15 +1046,21 @@ fn print(report: &Report) {
         );
     }
     println!(
-        "{:<28} {:>7} {:>8} {:>8} {:>8} {:>8}",
-        "request", "n", "p50 ms", "p99 ms", "max ms", "budget"
+        "{:<28} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "request", "n", "p50 ms", "p99 ms", "max ms", "budget", "target"
     );
     for (name, path) in &report.paths {
+        let target = match (path.descriptive_target_ms, path.over_descriptive_target) {
+            (Some(ms), Some(true)) => format!("{ms:.0} over"),
+            (Some(ms), _) => format!("{ms:.0}"),
+            (None, _) => "-".into(),
+        };
         println!(
-            "{:<28} {:>7} {:>8.1} {:>8.1} {:>8.1} {:>8.0}",
-            name, path.count, path.p50_ms, path.p99_ms, path.max_ms, path.budget_ms
+            "{:<28} {:>7} {:>8.1} {:>8.1} {:>8.1} {:>8.0} {:>8}",
+            name, path.count, path.p50_ms, path.p99_ms, path.max_ms, path.budget_ms, target
         );
     }
+    println!("target: slo/targets.toml's p99, described and never gated");
     if !report.failed.is_empty() {
         println!("failed requests: {:?}", report.failed);
     }
@@ -1651,6 +1735,9 @@ fn run(
                 p99_ms: millis(percentile(&samples, 99)),
                 max_ms: millis(samples.iter().max().copied().unwrap_or_default()),
                 budget_ms: millis(budget(&budgets, &name)),
+                descriptive_target_ms: descriptive_target(&name).map(millis),
+                over_descriptive_target: descriptive_target(&name)
+                    .map(|target| percentile(&samples, 99) > target),
             };
             (name, report)
         })
@@ -2209,6 +2296,32 @@ async fn send_one(context: &Context, name: &str) -> Result<(), String> {
 /// The running runtime of `seat`, whose driver publishes its harness events.
 fn runtime_of(seat: &str) -> String {
     format!("load-{}-runtime", seat.rsplit('/').next().unwrap_or(seat))
+}
+
+/// The path in `slo/targets.toml` a request stands for, when it stands for one. Lease renewal
+/// calls the store directly; it is timed as the work action it is.
+fn target_path(name: &str) -> Option<String> {
+    match name {
+        "harness event" => Some("POST /v1/harness-events".into()),
+        "message send" => Some("POST /v1/messages".into()),
+        "lease renewal" => Some("POST /v1/work/{action}/{*subject}".into()),
+        "seat work" => Some("GET /v1/work".into()),
+        ROSTER_SNAPSHOT | ROSTER_CONNECT_SNAPSHOT => Some("stream agents".into()),
+        _ => match name.strip_prefix("person read ") {
+            Some(route) => Some(format!("GET {route}")),
+            // The collections profile times each window's first snapshot under its name.
+            None => name
+                .strip_suffix(" connect+snapshot")
+                .or_else(|| name.strip_suffix(" snapshot"))
+                .map(|collection| format!("stream {collection}")),
+        },
+    }
+}
+
+/// A request's descriptive p99 target from `slo/targets.toml`, served on its owner.
+fn descriptive_target(name: &str) -> Option<Duration> {
+    let path = target_path(name)?;
+    Some(st3::slo::targets().for_path(&path)?.target(false))
 }
 
 /// A request's budget: its kind's, or for a person read, its route's.

@@ -1,0 +1,36 @@
+
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /…/example
+
+
+❯ Use the Bash tool to run: sleep 25. Nothing else.
+
+  Ran 1 shell command
+
+● The harness blocked sleep 25 because standalone sleeps are not allowed in this session. I haven't
+  worked around that. If you need a pause, I can use a Monitor with an until-loop on a real
+  condition, or you can run ! sleep 25 yourself in the prompt.
+
+✻ Cogitated for 4s · done 6:30 AM
+
+❯ Use the Bash tool to run exactly: ping -c 20 127.0.0.1 . Nothing else.
+
+● Pinging localhost 20 times · 14s
+  ⎿  $ ping -c 20 127.0.0.1 (4s · 6 lines)
+     (ctrl+b ctrl+b (twice) to run in background)
+
+
+
+
+
+
+
+
+* Crunching… (7s · ↓ 203 tokens)
+  ⎿  Tip: Send messages to Claude while it works to steer Claude in real-time
+                                                                                ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · esc to interrupt · ← for agents

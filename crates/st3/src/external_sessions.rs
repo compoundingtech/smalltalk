@@ -820,10 +820,9 @@ pub(crate) fn find_managed_omp_transcript(
     const CANDIDATES: usize = 64;
     let mut files = Vec::new();
     for entry in entries.filter_map(std::result::Result::ok) {
-        if entry.file_type().is_ok_and(|kind| kind.is_file())
-            && entry.path().extension().is_some_and(|ext| ext == "jsonl")
-        {
-            files.push(entry.path());
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
+            files.push(path);
             if files.len() >= CANDIDATES * 4 {
                 files.sort_unstable_by(|left, right| right.file_name().cmp(&left.file_name()));
                 files.truncate(CANDIDATES);
