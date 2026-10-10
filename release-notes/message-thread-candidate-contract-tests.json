@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Pin message thread candidate extraction semantics in isolated tests",
+  "replay": {
+    "status": "none",
+    "detail": "Only cfg(test) source changes; no projection, replay or backfill is installed."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production table, index, trigger or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission, canonical selection, authority and publication rules are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No production route, CLI behavior or response changes. The tests describe a proposed candidate extraction contract only."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No runtime installation or migration."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new production state or recovery path."
+  }
+}
