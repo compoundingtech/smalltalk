@@ -237,7 +237,7 @@ pub(crate) fn write_timeline_with_output(
                 preceding.insert(source.into(), operation.clone());
             }
             if !new_operations.is_empty() {
-                append_timeline_operations(&tx, record, new_operations)?;
+                super::append_timeline_operations(&tx, record, new_operations)?;
             }
             if previous.as_ref() != Some(&envelope) {
                 tx.execute(
@@ -252,39 +252,6 @@ pub(crate) fn write_timeline_with_output(
             Ok(())
         },
     )
-}
-
-// Prototype-only copy of the current timeline append body. A future runtime
-// caller must compose and review its actual shared transaction; these controls
-// do not certify a producer adapter or an unmodified separate timeline write.
-fn append_timeline_operations(
-    tx: &rusqlite::Connection,
-    record: &Record,
-    new_operations: &[Operation],
-) -> Result<()> {
-    tx.execute(
-        "INSERT INTO metadata VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        params![
-            format!("timeline-next:{}", record.incarnation_id),
-            record.next_sequence.to_string()
-        ],
-    )?;
-    for operation in new_operations {
-        tx.execute(
-            "INSERT INTO timeline(incarnation,source,body) VALUES (?1,?2,?3)",
-            params![
-                record.incarnation_id,
-                operation.source_id.as_deref().unwrap_or(""),
-                serde_json::to_string(operation)?
-            ],
-        )?;
-        super::append_event(tx, "harness-timeline", &serde_json::to_value(operation)?)?;
-    }
-    tx.execute("DELETE FROM timeline WHERE id NOT IN (SELECT id FROM timeline ORDER BY id DESC LIMIT 4096)", [])?;
-    tx.execute("DELETE FROM timeline WHERE id IN (
-        SELECT id FROM (SELECT id, SUM(length(CAST(body AS BLOB))) OVER (ORDER BY id DESC) AS retained FROM timeline)
-        WHERE retained > 2097152)", [])?;
-    Ok(())
 }
 
 fn preceding_operations(
