@@ -184,7 +184,7 @@ async fn trace_follow_advances_empty_filtered_pages_and_stops_on_resync() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn trace_follow_uses_legacy_only_when_the_page_route_is_absent() {
+async fn trace_follow_reports_a_missing_page_route_without_reading_legacy_history() {
     let output = scripted_cli(
         &[
             "--json",
@@ -206,20 +206,15 @@ async fn trace_follow_uses_legacy_only_when_the_page_route_is_absent() {
                 "/v1/health".into(),
                 Reply::Value(json!({"features":{"bounded_legacy_events":1}})),
             ),
-            (
-                events_path(10).replace("/events/page?", "/events?"),
-                Reply::Value(json!([event(11)])),
-            ),
-            (
-                events_path(11).replace("/events/page?", "/events?"),
-                Reply::Error(410),
-            ),
         ],
     )
     .await;
-    assert_refusal(&output, 0);
-    let event: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(event["store_index"], 11);
+    assert_eq!(
+        output.result.unwrap_err().to_string(),
+        "st API returned 404: "
+    );
+    assert_eq!(output.requests.len(), 3);
+    assert!(output.stdout.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
