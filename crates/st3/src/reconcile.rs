@@ -3462,31 +3462,19 @@ impl<R: RuntimeControl> Reconciler<R> {
             seen.remove(&subject.subject);
             return Ok(());
         }
+        let episode = Store::native_prompt_episode(&blocked);
         if !st_drivers::blocking_screen::claude_input_ready(screen) {
             // The prompt's dialog is up.
-            seen.insert(subject.subject.clone(), blocked.id.clone());
+            seen.insert(subject.subject.clone(), episode.clone());
             return Ok(());
         }
         // The box before the dialog was drawn, or while Claude works, says nothing.
-        if seen.get(&subject.subject) != Some(&blocked.id) {
+        if seen.get(&subject.subject) != Some(&episode) {
             return Ok(());
         }
         seen.remove(&subject.subject);
         drop(seen);
-        self.store.append_claim(&ClaimInput {
-            subject: subject.subject.clone(),
-            kind: "harness.diagnostic".into(),
-            actor: Some(subject.subject.clone()),
-            fields: BTreeMap::from([
-                ("code".into(), Value::String("native-prompt-gone".into())),
-                ("status".into(), Value::String("resolved".into())),
-                ("driver".into(), Value::String("claude".into())),
-                ("incarnation_id".into(), Value::String(incarnation.into())),
-            ]),
-            evidence: vec![blocked.id.clone()],
-            expected_subject: None,
-            idempotency_key: Some(crate::store::native_prompt_gone_key(&blocked.id)),
-        })?;
+        self.store.record_native_prompt_gone(&blocked, incarnation)?;
         self.signal_changed();
         Ok(())
     }
@@ -7059,7 +7047,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             return Ok(());
         }
-        let record = self.store.append_claim(&ClaimInput {
+        let input = ClaimInput {
             subject: subject.into(),
             kind: kind.into(),
             actor: None,
@@ -7067,7 +7055,20 @@ impl<R: RuntimeControl> Reconciler<R> {
             evidence,
             expected_subject: None,
             idempotency_key: None,
-        })?;
+        };
+        let record = match self.store.append_claim(&input) {
+            Ok(record) => record,
+            Err(_) if crate::store::is_current_input(&input) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if crate::store::is_current_input(&input)
+            && let Some(relay) = self.client_relay.clone()
+        {
+            let current = record.clone();
+            tokio::spawn(async move {
+                relay.publish_current_value(current).await;
+            });
+        }
         if crate::store::local_observation_position(&record).is_some() {
             // Only this node reads a local observation, and it cannot advance a mission.
             self.event_notify
@@ -33833,35 +33834,39 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
         );
         reconciler.reconcile_once().unwrap();
         *runtime.ptys.lock().unwrap() = vec![claude_seat_pty("seat", "running", "one")];
+        reconciler.reconcile_once().unwrap();
         let publish = |accepted: bool, sequence: u64, epoch: &str, owner: u64| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: "agent/node.seat".into(),
-                    kind: "harness.observed".into(),
-                    actor: Some("agent/node.seat".into()),
-                    fields: BTreeMap::from([
-                        ("state".into(), Value::String("idle".into())),
-                        ("incarnation_id".into(), Value::String(epoch.into())),
-                        ("provider_auth".into(), Value::Bool(accepted)),
-                        ("provider_auth_sequence".into(), Value::from(sequence)),
-                        ("ownership_sequence".into(), Value::from(owner)),
-                        (
-                            "reason".into(),
-                            if accepted {
-                                Value::Null
-                            } else {
-                                Value::String("providerAuth".into())
-                            },
-                        ),
-                    ])
-                    .into_iter()
-                    .filter(|(_, v)| !v.is_null())
-                    .collect(),
-                    evidence: vec![],
-                    expected_subject: None,
-                    idempotency_key: None,
-                })
-                .unwrap();
+            let result = store.append_claim(&ClaimInput {
+                subject: "agent/node.seat".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/node.seat".into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("incarnation_id".into(), Value::String(epoch.into())),
+                    ("provider_auth".into(), Value::Bool(accepted)),
+                    ("provider_auth_sequence".into(), Value::from(sequence)),
+                    ("ownership_sequence".into(), Value::from(owner)),
+                    (
+                        "reason".into(),
+                        if accepted {
+                            Value::Null
+                        } else {
+                            Value::String("providerAuth".into())
+                        },
+                    ),
+                ])
+                .into_iter()
+                .filter(|(_, v)| !v.is_null())
+                .collect(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            });
+            if epoch == "stale" {
+                assert_eq!(result.unwrap_err().code, "stale-harness-event-session");
+            } else {
+                result.unwrap();
+            }
         };
         publish(false, 1, "one", 1);
         store
@@ -34218,6 +34223,35 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
         let second = ask();
         reconciler.reconcile_once().unwrap();
         assert!(!gone(&second.id));
+        // Modern heartbeat snapshots replace their IDs between seeing and refusing the dialog.
+        // Their ownership/transition axes name the same prompt throughout that interval.
+        let modern = |transition: u64| {
+            store.append_claim(&ClaimInput {
+                subject: "agent/node.seat".into(), kind: "harness.observed".into(),
+                actor: Some("agent/node.seat".into()),
+                fields: serde_json::from_value(serde_json::json!({
+                    "state":"working", "driver":"claude", "incarnation_id":"one",
+                    "blocked_on":"human", "ask":"permission",
+                    "ownership_sequence":4, "transition_sequence":transition
+                })).unwrap(),
+                evidence: vec![], expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        let third = modern(12);
+        let episode = Store::native_prompt_episode(&third);
+        show("claude-permission-dialog.txt");
+        reconciler.reconcile_once().unwrap();
+        let heartbeat = modern(12);
+        assert_ne!(third.id, heartbeat.id);
+        show("claude-permission-refused.txt");
+        reconciler.reconcile_once().unwrap();
+        assert!(gone(&episode));
+        modern(12);
+        reconciler.reconcile_once().unwrap();
+        let next = modern(13);
+        reconciler.reconcile_once().unwrap();
+        assert!(!gone(&Store::native_prompt_episode(&next)), "a new transition still needs its own dialog proof");
+
     }
 
     #[test]
@@ -35968,7 +36002,7 @@ mission "work-alert" state="ready" {
             2
         );
 
-        store
+        let error = store
             .append_claim(&ClaimInput {
                 subject: desired.subject.clone(),
                 kind: "harness.observed".into(),
@@ -35985,7 +36019,8 @@ mission "work-alert" state="ready" {
                 expected_subject: None,
                 idempotency_key: Some("worker-three-idle".into()),
             })
-            .unwrap();
+            .unwrap_err();
+        assert_eq!(error.code, "stale-harness-event-session");
         let historical_wake = store
             .step_run(&step.subject)
             .unwrap()
@@ -37104,7 +37139,7 @@ mission "gated" state="ready" {
             );
             reconciler.reconcile_once().unwrap();
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: SEAT.into(),
                     kind: "harness.observed".into(),
                     actor: Some(SEAT.into()),

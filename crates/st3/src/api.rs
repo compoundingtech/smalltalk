@@ -72,6 +72,7 @@ mod delivery_probes;
 mod github_watch;
 mod harness_events;
 mod mailbox;
+mod native_process_identity;
 mod mail_backlog;
 mod read_deadline;
 mod owned_sets;
@@ -110,7 +111,7 @@ pub struct AppState {
 const CLIENT_API_VERSION: &str = "st3.client.v0";
 const CLIENT_PROJECTION_VERSION: &str = "client-projection.v0";
 const CLIENT_DEFAULT_PAGE_ITEMS: usize = 50;
-const CLIENT_MAX_PAGE_ITEMS: usize = 200;
+pub(crate) const CLIENT_MAX_PAGE_ITEMS: usize = 200;
 const CLIENT_MAX_RESPONSE_BYTES: usize = 1_048_576;
 // Keep complete result sets briefly so fleet writes cannot reorder or invalidate a traversal.
 // Cursors expire after this bounded window or if the daemon restarts/evicts their snapshot.
@@ -261,6 +262,157 @@ fn signal_visible_change(state: &AppState) {
 
 #[cfg(test)]
 mod storage_contention_response_tests {
+    #[tokio::test]
+    async fn current_maintenance_notifications_preserve_the_minimum_interval() {
+        use super::{CURRENT_MAINTENANCE_MIN_PAUSE, current_maintenance_pause};
+        use std::{sync::Arc, time::Duration};
+        use tokio::sync::Notify;
+        let wake = Arc::new(Notify::new());
+        let sender = wake.clone();
+        let flood = tokio::spawn(async move {
+            loop {
+                sender.notify_one();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        let started = tokio::time::Instant::now();
+        for _ in 0..4 {
+            current_maintenance_pause(
+                &wake,
+                Duration::from_secs(1),
+                tokio::time::Instant::now() + CURRENT_MAINTENANCE_MIN_PAUSE,
+            )
+            .await;
+        }
+        flood.abort();
+        assert!(started.elapsed() >= CURRENT_MAINTENANCE_MIN_PAUSE * 4);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "notifications must still cut the idle pause"
+        );
+    }
+
+    #[test]
+    fn cached_agent_freshness_uses_register_stamps_and_keeps_incarnation_fences() {
+        use serde_json::json;
+        let store = crate::store::Store::open_memory("owner").unwrap();
+        store
+            .append_claim(&crate::model::ClaimInput {
+                subject: "agent/freshness".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    json!({"status":"running","host":"owner","incarnation_id":"one"}),
+                )
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let now = st_drivers::message::now_ms();
+        let publish = |at| {
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: "agent/freshness".into(),
+                    kind: "harness.observed".into(),
+                    actor: None,
+                    fields: serde_json::from_value(json!({"state":"working","driver":"codex",
+                    "incarnation_id":"one","observed_at_ms":at}))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        publish(now - 100_000);
+        let old = store.current_harness("agent/freshness").unwrap().unwrap();
+        let fresh = publish(now);
+        assert_eq!(
+            fresh.body["_semantic_transition"], true,
+            "a stale seat recovering is a semantic change"
+        );
+        let card = |incarnation| {
+            let mut source = serde_json::to_value(&old).unwrap();
+            source["incarnation_id"] = json!(incarnation);
+            json!({"id":"agent/freshness","state":"running","harness_state":"working",
+                "updated_at":"","_status_source":source})
+        };
+        let mut current = vec![card("one")];
+        super::overlay_agent_resources(&store, &mut current, "").unwrap();
+        assert_eq!(current[0]["observation"], "current");
+        assert_eq!(current[0]["harness_state"], "working");
+        let mut predecessor = vec![card("older")];
+        super::overlay_agent_resources(&store, &mut predecessor, "").unwrap();
+        assert_eq!(predecessor[0]["observation"], "stale");
+        assert_eq!(predecessor[0]["harness_state"], "indeterminate");
+    }
+
+    #[test]
+    fn fresh_register_becomes_stale_at_ninety_seconds_without_a_write() {
+        use serde_json::json;
+        let store = crate::store::Store::open_memory("owner").unwrap();
+        store
+            .append_claim(&crate::model::ClaimInput {
+                subject: "agent/fresh-boundary".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    json!({"status":"running","host":"owner","incarnation_id":"one"}),
+                )
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let now = st_drivers::message::now_ms();
+        store
+            .append_claim(&crate::model::ClaimInput {
+                subject: "agent/fresh-boundary".into(),
+                kind: "harness.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(json!({"state":"working","driver":"codex",
+                "incarnation_id":"one","observed_at_ms":now}))
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let harness = store
+            .current_harness("agent/fresh-boundary")
+            .unwrap()
+            .unwrap();
+        let make = || {
+            vec![
+                json!({"id":"agent/fresh-boundary","state":"running","harness_state":"working",
+            "updated_at":"","_status_source":harness}),
+            ]
+        };
+        let boundary = store.current_observation_boundary().unwrap();
+        let mut fresh = make();
+        super::overlay_agent_resources_at(&store, &mut fresh, "", u128::from(now) + 90_000)
+            .unwrap();
+        assert_eq!(fresh[0]["observation"], "current");
+        let mut stale = make();
+        super::overlay_agent_resources_at(&store, &mut stale, "", u128::from(now) + 90_001)
+            .unwrap();
+        assert_eq!(stale[0]["observation"], "stale");
+        assert_eq!(stale[0]["harness_state"], "indeterminate");
+        assert_eq!(stale[0]["state"], "waiting");
+        assert_eq!(store.current_observation_boundary().unwrap(), boundary);
+    }
+
+    #[test]
+    fn current_write_deadline_is_typed_unavailable_and_retryable() {
+        let error = super::ApiError::bad(super::St3Error::new("current-value-deadline", "write expired"));
+        assert_eq!(error.status, super::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(super::client_error_code(Some(&error.code)), "current-value-deadline");
+        assert!(super::client_error_retryable(error.status, Some(&error.code)));
+        assert!(super::client_error_retryable(super::StatusCode::UNPROCESSABLE_ENTITY, Some(&error.code)));
+    }
     #[test]
     fn admitted_contention_is_pending_not_a_peer_error_and_other_faults_stay_errors() {
         for code in ["database-busy", "database-locked"] {
@@ -386,7 +538,7 @@ impl ApiError {
             | "lane-approval-denied"
             | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
             "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
-            "database-busy" | "database-locked" => StatusCode::SERVICE_UNAVAILABLE,
+            "database-busy" | "database-locked" | "current-value-deadline" | "current-value-capacity" => StatusCode::SERVICE_UNAVAILABLE,
             "read-deadline" => StatusCode::GATEWAY_TIMEOUT,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -473,7 +625,21 @@ pub(crate) fn admitted_mailbox_protocol_router(state: AppState) -> Router {
 #[cfg(feature = "test-support")]
 pub(crate) fn synthetic_mailbox_protocol_router(state: AppState, subject: &str) -> Router {
     assert!(subject.starts_with("agent/example/"));
-    admitted_mailbox_protocol_router(state).layer(Extension(NativeDeliveryPeer {
+    admitted_mailbox_protocol_router(state).layer(Extension(NativeDeliveryPeer { start_token: None,
+        agent: subject.into(),
+        transport: "omp-channel",
+        pid: std::process::id(),
+        archives_inbox: false,
+    }))
+}
+
+/// Disposable-store protocol workloads with an already admitted native seat. Physical
+/// Unix-peer identity is tested separately; this has no daemon or CLI entry point.
+#[cfg(feature = "test-support")]
+pub fn native_observation_protocol_router(state: AppState, subject: &str) -> Router {
+    assert!(subject.starts_with("agent/"));
+    router(state).layer(Extension(NativeDeliveryPeer {
+        start_token: None,
         agent: subject.into(),
         transport: "omp-channel",
         pid: std::process::id(),
@@ -740,6 +906,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages/cleanup", post(mail_backlog::cleanup))
         .route("/v1/mailbox", get(mailbox::subscribe))
         .route("/v1/harness-events", post(harness_events::publish))
+        .route("/v1/harness-events/usage-flush", post(harness_events::flush_usage))
         .route("/v1/harness-prompts/state", get(harness_events::prompt_state))
         .route("/v1/mailbox/bind", post(mailbox::bind))
         .route("/v1/mailbox/attachment", get(mailbox::attachment))
@@ -823,6 +990,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(fleet_publish_endpoints),
         )
         .route("/v1/internal/replication-wake", post(replication_wake))
+        .route("/v1/internal/current-value", post(receive_current_value))
         .route(
             crate::peer::CLIENT_READ_FORWARD_PATH,
             post(forward_client_read).layer(DefaultBodyLimit::max(16_384)),
@@ -1467,6 +1635,8 @@ fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
         code,
         Some(
             "remote-unavailable"
+                | "current-value-deadline"
+                | "current-value-capacity"
                 | "terminal-unavailable"
                 | "cursor-gap"
                 | "conversation-content-invalidated"
@@ -1531,6 +1701,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "blob-expired"
         | "database-busy"
         | "database-locked"
+        | "current-value-deadline"
+        | "current-value-capacity"
         | "internal" => code.unwrap_or("internal").to_owned(),
         "too-many-attachments" | "invalid-blob-reference" => "validation-failed".into(),
         "launch-review-not-authorized"
@@ -2550,7 +2722,21 @@ fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Re
 }
 
 fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
+    overlay_agent_resources_at(store, items, at, client_now_ms())
+}
+
+fn overlay_agent_resources_at(
+    store: &Store,
+    items: &mut [Value],
+    at: &str,
+    now: u128,
+) -> anyhow::Result<()> {
     let local_host = client_host_id(store.origin());
+    let subjects = items
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let stamps = store.current_harness_stamps(&subjects)?;
     for item in items.iter_mut() {
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
@@ -2560,20 +2746,27 @@ fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyh
             .unwrap()
             .remove("_status_source")
             .unwrap_or(Value::Null);
-        let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
-        // Freshness is approximate presentation. Use the card's already reduced observation;
-        // querying diagnostic and local-observation history here made every read grow with it.
+        let mut harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
+        if let Some(harness) = harness.as_mut()
+            && let Some((incarnation, at)) = item["id"].as_str().and_then(|id| stamps.get(id))
+            && incarnation == &harness.incarnation_id
+        {
+            harness.observed_at_unix_ms = harness.observed_at_unix_ms.max(*at);
+        }
+        // Freshness uses the cached semantic fold plus current register timestamps. It never
+        // reads diagnostic or observation history; a same-incarnation heartbeat stays current.
         let observation = match harness {
             None => "missing",
-            Some(harness)
-                if client_now_ms().saturating_sub(harness.observed_at_unix_ms) > 90_000 =>
-            {
-                "stale"
-            }
+            Some(harness) if now.saturating_sub(harness.observed_at_unix_ms) > 90_000 => "stale",
             Some(_) => "current",
         };
         item["observation"] = json!(observation);
-        if observation == "stale" && matches!(item["harness_state"].as_str(), Some("ready" | "idle" | "working")) {
+        if observation == "stale"
+            && matches!(
+                item["harness_state"].as_str(),
+                Some("ready" | "idle" | "working")
+            )
+        {
             item["harness_state"] = json!("indeterminate");
             if item["state"] == "running" {
                 item["state"] = json!("waiting");
@@ -2607,6 +2800,9 @@ fn client_suspension(suspension: &crate::suspension::Suspension) -> Value {
 /// Each seat's running subagents: open, with a lease that runs past this read. A lease runs out
 /// without a claim, so this is read per request rather than cached with the agents.
 fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
     let mut running = BTreeMap::<String, Vec<Value>>::new();
     for subagent in store.running_subagents(client_now_ms() as u64)? {
         running
@@ -2980,6 +3176,7 @@ fn client_agent_resources_from_status(
                 .desired_revision
                 .clone()
                 .or_else(|| subject.claims.last().cloned())
+                .or_else(|| store.latest_claim(&subject.subject, None).ok().flatten().map(|claim| claim.id))
                 .unwrap_or_else(|| format!("agent/{}", subject.subject));
             let queue = work_queues
                 .get(&subject.subject)
@@ -4613,7 +4810,7 @@ const AGENT_ROSTER_ASSEMBLY_ROUNDS: usize = 3;
 /// whose claims changed, and completion is tried again. Readers keep the previous complete
 /// roster meanwhile, with its own cut and publication time; if it cannot be assembled, the
 /// refresh fails and is tried again on the next request.
-fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
+pub(crate) fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
     if store.read_snapshot(|index| store.agent_roster_current(index, history))? {
         return Ok(());
     }
@@ -4665,9 +4862,11 @@ async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) {
     let Ok(wanted) = store.index() else { return };
     let published = |store: &Store| {
         let index = store.index().ok()?;
-        store.published_agent_roster(index, history).map(|(cut, _, _)| cut).or_else(|| {
+        store.published_agent_roster(index, history).map(|(cut, _, _)| cut)
+            .filter(|cut| store.agent_roster_publication_is_current(*cut, history, None)).or_else(|| {
             (!history).then(|| store.published_agent_roster_head(index, 1)).flatten()
                 .map(|(cut, _, _, _)| cut)
+                .filter(|cut| store.agent_roster_publication_is_current(*cut, history, Some(1)))
         })
     };
     let mut publications = store.subscribe_agent_roster();
@@ -4702,8 +4901,27 @@ fn client_agents_published_page(
     state: &AppState,
     query: &ClientListQuery,
 ) -> Result<Option<ClientPageResponse>, ApiError> {
+    for recheck in [false, true] {
+        let current = state.store.index().map_err(ApiError::internal)?;
+        #[cfg(test)]
+        state.store.roster_window_snapshot_for_test(current);
+        let page = client_agents_published_page_at(state, query, current)?;
+        if page.is_some() || recheck || !state.store.agent_roster_publication_after(current,
+            query.history, (!query.history && query.status.is_none()).then_some(CLIENT_MAX_PAGE_ITEMS + 1)) {
+            return Ok(page);
+        }
+        // A newer publication overtook this cut. Read the clock once more, without
+        // folding cards or changing continuation semantics.
+    }
+    unreachable!("the second page lookup always returns")
+}
+
+fn client_agents_published_page_at(
+    state: &AppState,
+    query: &ClientListQuery,
+    current: u64,
+) -> Result<Option<ClientPageResponse>, ApiError> {
     let store = &state.store;
-    let current = store.index().map_err(ApiError::internal)?;
     let index = current;
     let Some((index, cards, published_at)) = store.published_agent_roster(index, query.history) else {
         // Before the first complete roster, an unfiltered first page can come from its head.
@@ -4715,6 +4933,9 @@ fn client_agents_published_page(
         else {
             return Ok(None);
         };
+        if query.fresh && !store.agent_roster_publication_is_current(index, false, Some(CLIENT_MAX_PAGE_ITEMS + 1)) {
+            return Ok(None);
+        }
         store.request_agent_roster_refresh();
         let snapshot = roster_snapshot(state, index, published_at);
         let mut page = client_page_read(state, &snapshot, "agents", (*refs).clone(), query, true)?;
@@ -4723,6 +4944,9 @@ fn client_agents_published_page(
         )?;
         return Ok(Some((Extension(snapshot), Json(page))));
     };
+    if query.fresh && !store.agent_roster_publication_is_current(index, query.history, None) {
+        return Ok(None);
+    }
     // A roster older than the current cut, its local activity or its queue deadline needs a
     // refresh; the newest one needs none.
     if index < current || !store.agent_roster_current(current, query.history).map_err(ApiError::internal)? {
@@ -5678,6 +5902,136 @@ pub fn start_native_session_discovery(state: &AppState) {
     crate::external_sessions::start_history_inventory(state.native_session_home.as_deref());
 }
 
+/// Recover and retry retained numeric stop accounting independently of accepted current
+/// posts and driver lifetimes. One reader batch visits at most 64 pending subjects per tick.
+pub fn start_stopped_usage_flush(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut after = String::new();
+        let mut backoff = BTreeMap::<String, tokio::time::Instant>::new();
+        loop {
+            let now = tokio::time::Instant::now();
+            backoff.retain(|_, until| *until > now);
+            let skipped = backoff.keys().cloned().collect::<BTreeSet<_>>();
+            let store = state.store.clone();
+            let cursor = after.clone();
+            match blocking_action(move || store.flush_stopped_usage_batch(&cursor, &skipped)).await
+            {
+                Ok(batch) => {
+                    // Advance even past a failed subject; its durable slot remains for retry.
+                    after = batch.after.unwrap_or_default();
+                    for (subject, error) in batch.failures {
+                        eprintln!("st3: retained accounting for {subject} failed: {error}");
+                        if backoff.len() >= 256
+                            && let Some(oldest) = backoff
+                                .iter()
+                                .min_by_key(|(_, until)| **until)
+                                .map(|(subject, _)| subject.clone())
+                        {
+                            backoff.remove(&oldest);
+                        }
+                        backoff.insert(subject, now + Duration::from_secs(30));
+                    }
+                    if batch.changed {
+                        signal_visible_change(&state);
+                    }
+                }
+                Err(error) => eprintln!("st3: retained accounting reader failed: {error:?}"),
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
+}
+
+fn current_fleet_hosts(state: &AppState) -> Result<BTreeSet<String>, St3Error> {
+    state.client_relay.as_ref().map_or_else(
+        || {
+            Ok(state
+                .configured_peers
+                .iter()
+                .cloned()
+                .chain(std::iter::once(state.node.clone()))
+                .collect())
+        },
+        |relay| relay.current_hosts().map_err(smallclaims::error::internal),
+    )
+}
+
+const CURRENT_MAINTENANCE_MIN_PAUSE: Duration = Duration::from_millis(100);
+
+async fn current_maintenance_pause(wake: &Notify, pause: Duration, earliest: tokio::time::Instant) {
+    tokio::select! {
+        _ = tokio::time::sleep(pause) => {},
+        _ = wake.notified() => {},
+    }
+    // Notification pressure can shorten idle waiting, never the minimum pass interval.
+    tokio::time::sleep_until(earliest).await;
+}
+
+/// Retire obsolete register payloads and legacy history in bounded background passes.
+pub fn start_current_value_maintenance(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut after = String::new();
+        let mut recovery_kind = None;
+        let mut recovery_after = String::new();
+        let mut last_warning = None;
+        loop {
+            let earliest = tokio::time::Instant::now() + CURRENT_MAINTENANCE_MIN_PAUSE;
+            let mut pause = Duration::from_secs(1);
+            if recovery_kind.is_none() {
+                recovery_kind = state.store.take_current_capacity_kind();
+            }
+            let worker = state.clone();
+            let kind = recovery_kind.clone();
+            let cursor = if kind.is_some() {
+                recovery_after.clone()
+            } else {
+                after.clone()
+            };
+            match blocking_action(move || {
+                let hosts = current_fleet_hosts(&worker)?;
+                worker
+                    .store
+                    .maintain_current_values_of_kind(&hosts, &cursor, kind.as_deref())
+            })
+            .await
+            {
+                Ok(batch) => {
+                    if recovery_kind.is_some() {
+                        recovery_after = batch.after;
+                        if recovery_after.is_empty() {
+                            recovery_kind = None;
+                        }
+                    } else {
+                        after = batch.after;
+                    }
+                    if batch.history_visited != 0 || batch.removed != 0 || recovery_kind.is_some() {
+                        pause = CURRENT_MAINTENANCE_MIN_PAUSE;
+                    }
+                    if batch.removed != 0 {
+                        signal_local_change(&state);
+                    }
+                }
+                Err(error) => {
+                    if last_warning.is_none_or(|at: tokio::time::Instant| {
+                        at.elapsed() >= Duration::from_secs(30)
+                    }) {
+                        eprintln!("st3: current value maintenance deferred: {error:?}");
+                        last_warning = Some(tokio::time::Instant::now());
+                    }
+                }
+            }
+            current_maintenance_pause(
+                state.store.current_value_maintenance_wake(),
+                pause,
+                earliest,
+            )
+            .await;
+        }
+    });
+}
+
 /// The shortest pause between two roster refreshes. A refresh also pauses as long as it took,
 /// so refreshing never takes more than about half a core however often readers ask. Reads
 /// never wait for it: this bounds how stale a served roster can be, about a second plus a fold.
@@ -6035,6 +6389,8 @@ fn harness_ancestor(_pid: u32) -> Option<String> {
 
 #[derive(Clone)]
 struct NativeDeliveryPeer {
+    /// Kernel process birth captured with the authenticated Unix peer.
+    start_token: Option<u64>,
     agent: String,
     transport: &'static str,
     pid: u32,
@@ -6042,8 +6398,15 @@ struct NativeDeliveryPeer {
 }
 
 fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
+    let start_token = native_process_identity::birth(pid)?;
     let (args, env) = local_process_arguments(pid)?;
-    native_delivery_identity(pid, &args, &env)
+    let mut peer = native_delivery_identity(pid, &args, &env)?;
+    // Do not authenticate argv/environment from one process as a reused PID's caller.
+    if native_process_identity::birth(pid)? != start_token {
+        return None;
+    }
+    peer.start_token = Some(start_token);
+    Some(peer)
 }
 
 fn native_delivery_identity(
@@ -6075,6 +6438,7 @@ fn native_delivery_identity(
         transport,
         pid,
         archives_inbox,
+        start_token: None,
     })
 }
 
@@ -6268,10 +6632,12 @@ async fn guard_bound_request(
     let path = request.uri().path();
     // A forwarded client read carries a person's authority between fleet members. Only the
     // replication worker, which runs in no harness, hands one over.
-    if path.starts_with(crate::peer::CLIENT_READ_FORWARD_PATH) {
+    if path.starts_with(crate::peer::CLIENT_READ_FORWARD_PATH)
+        || path == "/v1/internal/current-value"
+    {
         return Err(ApiError::bad(St3Error::new(
             "foreign-agent-actor",
-            format!("this harness is `{bound_agent}` and cannot forward a person's client read"),
+            format!("this harness is `{bound_agent}` and cannot submit replication worker requests"),
         )));
     }
     if ![
@@ -8048,6 +8414,7 @@ async fn replication_receive(
     State(state): State<AppState>,
     Json(request): Json<ReplicationReceiveRequest>,
 ) -> Result<Json<ReplicationReceiveResponse>, ApiError> {
+    let transport_peer = request.peer.clone();
     let store = state.store.clone();
     let (response, reconcile_changed) = blocking_action(move || {
         let before_index = store
@@ -8128,7 +8495,23 @@ async fn replication_receive(
             .event_notify
             .send_modify(|generation| *generation = generation.saturating_add(1));
     }
+    publish_transport_current(&state, transport_peer);
     Ok(Json(response))
+}
+
+fn publish_transport_current(state: &AppState, peer: String) {
+    let state = state.clone();
+    let store = state.store.clone();
+    tokio::spawn(async move {
+        if let Ok(Some(record)) = blocking_store(move || store.own_transport_value(&peer)).await {
+            if record.body["_semantic_transition"] != false {
+                signal_local_change(&state);
+            }
+            if let Some(relay) = &state.client_relay {
+                relay.publish_current_value(record).await;
+            }
+        }
+    });
 }
 
 /// Answer a peer's heal question. A swap or a replay can change the graph.
@@ -8204,9 +8587,9 @@ async fn replication_peer_failure(
     State(state): State<AppState>,
     Json(request): Json<ReplicationPeerFailureRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let transport_peer = request.peer.clone();
     let store = state.store.clone();
     let changed = blocking_store(move || {
-        let before_index = store.index()?;
         let stale = store.record_peer_failure(&request.peer, &request.status, &request.error)?;
         if stale && store.observes_transport_to(&request.peer)? {
             store.record_transport_observation(
@@ -8216,15 +8599,29 @@ async fn replication_peer_failure(
                 None,
             )?;
         }
-        // A peer that fails mid-sync sends no more exchanges, so project what it delivered.
-        let projected = store.replication_projection_deferred()
-            && store.project_replication_backlog_unless_catching_up()? == Some(true);
-        Ok(store.index()? != before_index || projected)
+        Ok(stale)
     })
     .await?;
     if changed {
-        signal_changed(&state);
+        signal_local_change(&state);
     }
+    publish_transport_current(&state, transport_peer);
+    // Preserve already admitted durable inventory recovery independently of the current hint.
+    // A reachability POST never waits for that ordered projection.
+    let recovery = state.clone();
+    tokio::spawn(async move {
+        let store = recovery.store.clone();
+        if matches!(
+            blocking_store(move || {
+                Ok(store.replication_projection_deferred()
+                    && store.project_replication_backlog_unless_catching_up()? == Some(true))
+            })
+            .await,
+            Ok(true)
+        ) {
+            signal_changed(&recovery);
+        }
+    });
     Ok(Json(json!({ "recorded": true, "changed": changed })))
 }
 
@@ -11348,8 +11745,33 @@ async fn post_delivery_hold(
 }
 async fn post_claim(
     State(state): State<AppState>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
     Json(request): Json<ClaimInput>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
+    if crate::store::is_current_input(&request)
+        && matches!(
+            request.kind.as_str(),
+            "harness.observed" | "harness.usage" | "harness.todo.observed"
+        )
+        && request.subject.starts_with("agent/")
+    {
+        let runtime_incarnation = request
+            .fields
+            .get("incarnation_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        return harness_events::publish_current(
+            State(state),
+            peer,
+            Json(crate::harness_events::Publication {
+                runtime_incarnation,
+                sequence: 0,
+                claim: request,
+            }),
+        )
+        .await;
+    }
     // A write can wait for the store's writer. It waits on the blocking pool, so the API's
     // workers keep answering other requests meanwhile.
     let store = state.store.clone();
@@ -11357,6 +11779,27 @@ async fn post_claim(
     let (response, appended) =
         blocking_action(move || store.append_client_claim_outcome(&request)).await?;
     finish_claim_publication(&state, &kind, response, appended, None).await
+}
+
+async fn receive_current_value(
+    State(state): State<AppState>,
+    Json(record): Json<ClaimRecord>,
+) -> Result<Json<Value>, ApiError> {
+    let worker = state.clone();
+    let transition =
+        record.kind == "harness.observed" && record.body["fields"]["status_transition"] != false;
+    let (changed, semantic) =
+        blocking_action(move || {
+            let hosts = current_fleet_hosts(&worker)?;
+            worker.store.receive_current_value_for_hosts(&record, &hosts)
+        }).await?;
+    if semantic {
+        signal_local_change(&state);
+        if transition {
+            state.notify.notify_one();
+        }
+    }
+    Ok(Json(json!({"changed":changed})))
 }
 
 // Both claim transports must publish response-usage rollups, even on replay after the original
@@ -11368,6 +11811,26 @@ async fn finish_claim_publication(
     appended: bool,
     harness_transition: Option<bool>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
+    if crate::store::is_current_value(kind)
+        && (kind != "harness.usage" || response.body["fields"]["semantics"] == "context_occupancy")
+        && response.body["_source_epoch"].is_string()
+    {
+        if appended {
+            if response.body["_semantic_transition"] != false {
+                signal_local_change(state);
+                if kind == "harness.observed" && response.body["fields"]["status_transition"] != false {
+                    state.notify.notify_one();
+                }
+            }
+            if let Some(relay) = state.client_relay.clone() {
+                let record = response.clone();
+                tokio::spawn(async move {
+                    relay.publish_current_value(record).await;
+                });
+            }
+        }
+        return Ok(Json(response));
+    }
     // Publish only the cumulative buckets. The response detail and turn ID remain local.
     if response.kind == "harness.timeline" {
         let store = state.store.clone();
@@ -15942,6 +16405,14 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
                 .await
                 .is_ok()
         );
+        for path in [crate::peer::CLIENT_READ_FORWARD_PATH, "/v1/internal/current-value"] {
+            let request = Request::builder().method("POST").uri(path)
+                .body(Body::from(json!({"subject":"agent/peer","kind":"harness.observed"}).to_string())).unwrap();
+            let error = guard_bound_request(request, Some("agent/own")).await.unwrap_err();
+            assert_eq!(error.code, "foreign-agent-actor", "{path}");
+            let worker_request = Request::builder().method("POST").uri(path).body(Body::empty()).unwrap();
+            assert!(guard_bound_request(worker_request, None).await.is_ok());
+        }
         let request = Request::builder()
             .method("POST")
             .uri("/v1/agent-queue-moves")
@@ -16846,6 +17317,7 @@ mission "expiring-work" state="ready" {
             transport: "omp-channel",
             pid: 37,
             archives_inbox: false,
+            start_token: None,
         };
         record_legacy_poll(Some(&peer), Some("agent/eval/other-mailbox"), false);
         record_legacy_poll(Some(&peer), Some(recipient), true);
@@ -17281,12 +17753,111 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
     }
 
     #[tokio::test]
+    async fn current_status_requires_kernel_seat_identity_and_running_incarnation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let input = ClaimInput {
+            subject: "agent/example/seat".into(),
+            kind: "harness.observed".into(),
+            actor: Some("agent/example/seat".into()),
+            fields: serde_json::from_value(
+                json!({"state":"working","driver":"codex","incarnation_id":"one"}),
+            )
+            .unwrap(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        assert!(
+            post_claim(State(state.clone()), None, Json(input.clone()))
+                .await
+                .is_err()
+        );
+        let peer = |agent: &str| {
+            Some(Extension(NativeDeliveryPeer {
+                agent: agent.into(),
+                transport: "app-server",
+                pid: 1,
+                archives_inbox: true,
+                start_token: None,
+            }))
+        };
+        assert!(
+            post_claim(
+                State(state.clone()),
+                peer("agent/example/other"),
+                Json(input.clone())
+            )
+            .await
+            .is_err()
+        );
+        let mut starting = input.clone();
+        starting.fields.insert("state".into(), json!("starting"));
+        let _ = post_claim(State(state.clone()), peer(&input.subject), Json(starting))
+            .await
+            .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: input.subject.clone(),
+                kind: "runtime.observed".into(),
+                actor: input.actor.clone(),
+                fields: serde_json::from_value(
+                    json!({"status":"running","runtime_id":"example/seat","incarnation_id":"two"}),
+                )
+                .unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(
+            post_claim(
+                State(state.clone()),
+                peer(&input.subject),
+                Json(input.clone())
+            )
+            .await
+            .is_err()
+        );
+        let mut live = input.clone();
+        live.fields.insert("incarnation_id".into(), json!("two"));
+        let _ = post_claim(State(state.clone()), peer(&input.subject), Json(live))
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .store
+                .current_harness(&input.subject)
+                .unwrap()
+                .unwrap()
+                .incarnation_id,
+            "two"
+        );
+    }
+
+    #[tokio::test]
     async fn a_local_only_harness_observation_wakes_only_the_client_feed() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let wake_file = root.path().join("replication.wake");
         let mut client_feed = state.event_notify.subscribe();
         let subject = "agent/node.worker";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    json!({"status":"running","runtime_id":"node.worker","incarnation_id":"inc-1"}),
+                )
+                .unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         let observed = |state_name: &str, observed_at_ms: u64| ClaimInput {
             subject: subject.into(),
             kind: "harness.observed".into(),
@@ -17317,7 +17888,19 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             expected_subject: None,
             idempotency_key: Some(format!("wake-usage-{tokens}")),
         };
-        let post = |input: ClaimInput| post_claim(State(state.clone()), Json(input));
+        let post = |input: ClaimInput| {
+            post_claim(
+                State(state.clone()),
+                Some(Extension(NativeDeliveryPeer {
+                    agent: subject.into(),
+                    transport: "app-server",
+                    pid: 1,
+                    archives_inbox: true,
+                    start_token: None,
+                })),
+                Json(input),
+            )
+        };
         let reconciler_woke = || async {
             tokio::time::timeout(Duration::from_millis(20), state.notify.notified())
                 .await
@@ -17329,25 +17912,27 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             changed
         };
 
-        let change = post(observed("working", 1)).await.unwrap().0;
-        assert!(crate::store::local_observation_position(&change).is_none());
+        let now = st_drivers::message::now_ms();
+        let change = post(observed("working", now)).await.unwrap().0;
+        assert!(crate::store::local_observation_position(&change).is_some());
         assert!(reconciler_woke().await);
-        assert!(wake_file.exists());
+        assert!(!wake_file.exists());
         assert!(client_feed_woke());
-        fs::remove_file(&wake_file).unwrap();
 
-        let heartbeat = post(observed("working", 300_001)).await.unwrap().0;
+        let heartbeat = post(observed("working", now + 1)).await.unwrap().0;
         assert!(crate::store::local_observation_position(&heartbeat).is_some());
         assert!(!reconciler_woke().await, "a heartbeat does not reconcile");
         assert!(!wake_file.exists(), "a heartbeat does not wake replication");
-        assert!(client_feed_woke(), "clients still see the observation");
+        assert!(
+            !client_feed_woke(),
+            "unchanged restamps do not invalidate client windows"
+        );
 
         let first_usage = post(usage(10)).await.unwrap().0;
-        assert!(crate::store::local_observation_position(&first_usage).is_none());
-        assert!(wake_file.exists(), "replicated usage wakes replication");
+        assert!(crate::store::local_observation_position(&first_usage).is_some());
+        assert!(!wake_file.exists(), "context is a current value");
         assert!(!reconciler_woke().await, "usage never reconciles");
         assert!(client_feed_woke());
-        fs::remove_file(&wake_file).unwrap();
 
         let throttled = post(usage(20)).await.unwrap().0;
         assert!(crate::store::local_observation_position(&throttled).is_some());
@@ -17502,9 +18087,12 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
     fn probe_claim(key: &str, state: &str) -> ClaimInput {
         ClaimInput {
             subject: "agent/probe".into(),
-            kind: "harness.observed".into(),
+            kind: "runtime.observed".into(),
             actor: Some("agent/probe".into()),
-            fields: BTreeMap::from([("state".into(), Value::String(state.into()))]),
+            fields: BTreeMap::from([
+                ("status".into(), Value::String(state.into())),
+                ("runtime_id".into(), json!("probe")),
+            ]),
             evidence: Vec::new(),
             expected_subject: None,
             idempotency_key: Some(key.into()),
@@ -21223,7 +21811,7 @@ mission "planned/direct" state="ready" {
         let store = state(root.path()).store;
         let subject = "agent/diagnostic-run/sig.base";
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "harness.observed".into(),
                 actor: Some(subject.into()),
@@ -23274,7 +23862,7 @@ mission "wake" state="ready" {
         }
         assert_eq!(breakdown["work.claimed"], (6, 6));
         assert_eq!(breakdown["work.progress"], (6, 6));
-        assert_eq!(breakdown["harness.todo.observed"], (12, 0));
+        assert_eq!(local_breakdown["harness.todo.observed"], 12);
         assert_eq!(local_breakdown["harness.usage"], 12);
         assert_eq!(old_cold, 12);
     }
@@ -23596,12 +24184,12 @@ mission "wake" state="ready" {
             )
             .unwrap();
         store.apply(&intent, &plan.subject_tokens, "roster-followup").unwrap();
-        store.append_claim(&roster_local_observation(
+        store.append_legacy_claim(&roster_local_observation(
             "runtime.observed",
             json!({"status":"running", "runtime_id":"node.amber",
                 "incarnation_id":"amber-1"}),
         )).unwrap();
-        store.append_claim(&roster_local_observation(
+        store.append_legacy_claim(&roster_local_observation(
             "harness.observed",
             json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
                 "observed_at_ms":1}),
@@ -23698,7 +24286,7 @@ mission "wake" state="ready" {
         let started = Instant::now();
         let mut hits = 0;
         for n in 0..APPENDS {
-            let response = store.append_claim(&roster_local_observation(
+            let response = store.append_legacy_claim(&roster_local_observation(
                 "harness.observed",
                 json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
                     "observed_at_ms":300_001 + n as u64}),
@@ -23760,7 +24348,7 @@ mission "wake" state="ready" {
             })),
             roster_local_timeline(),
         ] {
-            let (response, appended) = state.store.append_claim_outcome(&request).unwrap();
+            let (response, appended) = state.store.append_legacy_claim_outcome(&request).unwrap();
             assert!(appended);
             assert!(crate::store::local_observation_position(&response).is_some());
             assert_eq!(state.store.index().unwrap(), index);
@@ -24147,7 +24735,7 @@ mission "wake" state="ready" {
     }
 
     #[test]
-    fn agent_cards_advance_locally_and_keep_historical_snapshots() {
+    fn agent_cards_advance_when_current_registers_change() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = &state.store;
@@ -24251,8 +24839,8 @@ mission "wake" state="ready" {
                 );
             }
         }
-        // Evicted old snapshots rebuild independently of the newest cache.
-        assert_eq!(checked_agent_cache(store, false, before), original);
+        // Register updates are current even when the durable graph snapshot stays fixed.
+        assert_ne!(checked_agent_cache(store, false, before), original);
         append(
             "agent/node.cobalt",
             "runtime.observed",
@@ -24697,11 +25285,13 @@ mission "agent-human" state="ready" {
         // Before a new incarnation's first observation, the previous ask is fenced out.
         assert_eq!(agent()["state"], "starting", "{}", agent());
         assert!(agent()["blocked_on"].is_null());
-        append("harness.observed", json!({
-            "state": "idle", "driver": "omp", "incarnation_id": "human-2",
-            "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
-        }));
-        observe_harness("working");
+        append(
+            "harness.observed",
+            json!({
+                "state": "idle", "driver": "omp", "incarnation_id": "human-2",
+                "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
+            }),
+        );
         let resumed: st3_client::Agent = serde_json::from_value(agent()).unwrap();
         assert_eq!(resumed.state, "running");
         assert_eq!(resumed.harness_state.as_deref(), Some("idle"));
@@ -25533,14 +26123,17 @@ version 2
     async fn claims_endpoint_returns_bounded_cursor_pages() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
-        for (subject, key) in [("host/one", "one"), ("host/two", "two")] {
+        for (subject, key) in [("agent/one", "one"), ("agent/two", "two")] {
             state
                 .store
                 .append_claim(&ClaimInput {
                     subject: subject.into(),
-                    kind: "transport.observed".into(),
+                    kind: "runtime.observed".into(),
                     actor: None,
-                    fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                    fields: BTreeMap::from([
+                        ("status".into(), json!("running")),
+                        ("runtime_id".into(), json!("cursor")),
+                    ]),
                     evidence: Vec::new(),
                     expected_subject: None,
                     idempotency_key: Some(key.into()),
@@ -25566,7 +26159,7 @@ version 2
         assert_eq!(status, StatusCode::OK, "{descending}");
         assert_eq!(
             descending["claims"][0]["subject"].as_str(),
-            Some("host/two")
+            Some("agent/two")
         );
     }
 
@@ -26586,6 +27179,7 @@ agent "seat" { workspace "/tmp"; command "true" }
             transport: "claude-channel",
             pid: 7,
             archives_inbox: true,
+            start_token: None,
         };
         let (status, _) = json_request(
             app.clone().layer(Extension(peer)),
@@ -26599,6 +27193,7 @@ agent "seat" { workspace "/tmp"; command "true" }
             transport: "claude-channel",
             pid: 7,
             archives_inbox: true,
+            start_token: None,
         };
         let app = app.layer(Extension(peer));
         let (status, first) =
@@ -26607,7 +27202,10 @@ agent "seat" { workspace "/tmp"; command "true" }
         let (status, replay) =
             json_request(app.clone(), "/v1/harness-events", request.clone()).await;
         assert_eq!(status, StatusCode::OK, "{replay}");
-        assert_eq!(first["body"]["fields"], replay["body"]["fields"]);
+        assert_eq!(
+            first["body"]["fields"]["state"],
+            replay["body"]["fields"]["state"]
+        );
         let mut usage = request.clone();
         usage["sequence"] = json!(2);
         usage["claim"]["kind"] = json!("harness.timeline");

@@ -545,6 +545,8 @@ async fn usage_cli_and_client_keep_pricing_provenance_and_native_session_binding
         "harness.observed",
         json!({"state":"idle","driver":"codex","incarnation_id":"inc-one"}),
     );
+    // The current status transaction and reliable numeric stop flush are independent.
+    assert!(store.flush_pending_usage(subject, "inc-one").unwrap());
     assert_eq!(
         store
             .claims_for(subject, Some("harness.usage"))
@@ -552,6 +554,7 @@ async fn usage_cli_and_client_keep_pricing_provenance_and_native_session_binding
             .len(),
         2
     );
+    assert!(!store.flush_pending_usage(subject, "inc-one").unwrap(), "a repeated numeric flush must not republish the bound reading");
     append(
         "harness.observed",
         json!({"state":"working","driver":"codex","incarnation_id":"inc-one"}),
@@ -569,6 +572,8 @@ async fn usage_cli_and_client_keep_pricing_provenance_and_native_session_binding
         "harness.observed",
         json!({"state":"idle","driver":"codex","incarnation_id":"inc-one"}),
     );
+    // The current status transaction and reliable numeric stop flush are independent.
+    assert!(store.flush_pending_usage(subject, "inc-one").unwrap());
     assert_eq!(
         store
             .claims_for(subject, Some("harness.usage"))
@@ -2263,9 +2268,7 @@ mission "cli/child" state="ready" {
         .unwrap();
     let nested_work = child_run.steps[0].subject.clone();
     store.set_step_state(&nested_work, "ready", None).unwrap();
-    state
-        .store
-        .append_claim(&ClaimInput {
+    st3::test_support::append_legacy_claim(&state.store, &ClaimInput {
             subject: "host/discovered-history".into(),
             kind: "transport.observed".into(),
             actor: Some("daemon/runtime".into()),

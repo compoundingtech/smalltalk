@@ -65,6 +65,9 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_usage_responses` | Local | Local usage-input deduplication, trimmed after 30 days. |
 | `local_limit_stops` | Local | Seats this node's limits policy stopped, once per account and weekly window. |
 | `local_latest_slots` | Local | Local latest-retention publication slots and pending local observation pointers. |
+| `latest_values`, `latest_readiness` | Local current values | Replace-in-place observations and per-incarnation readiness. Current owner epochs and source revisions fence these values independently of immutable graph digests. They provide no retained observation series. |
+| `current_value_frontiers` | Local | Per-subject semantic cache frontier and collection tombstones using the local observation ID clock; no replicated outcome or source selection. |
+| `current_value_retirements` | Local | Resumable bounded retirement cursors for legacy local observation history; numeric accounting rows remain retained. |
 | `revision_proposals` | Shared projection | Shared candidate/source generation, reviewers/approvals, cutover/compatibility, status/preview/successor and durable timestamps. |
 | `planning_sessions` | Shared projection | Shared launch/planner/request/config, status, selected revision, ownership and durable timestamps. |
 | `planning_candidates` | Shared projection | Shared immutable variant/revision/document references, mission revision and submission timestamp. |

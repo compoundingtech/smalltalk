@@ -374,6 +374,10 @@ thread_local! {static CURRENT: RefCell<Option<Charged>> = const {RefCell::new(No
 pub fn current() -> Option<Charged> {
     CURRENT.with(|label| label.borrow().clone())
 }
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn current_kind_for_trace() -> Option<String> {
+    CURRENT.with(|label| label.borrow().as_ref().map(|charged| charged.kind.clone()))
+}
 /// Run `work` charged to what another thread was charged to, such as a request's store work.
 pub fn with_charged<T>(charged: Option<Charged>, work: impl FnOnce() -> T) -> T {
     match charged {

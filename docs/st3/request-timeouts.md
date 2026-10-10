@@ -55,10 +55,26 @@ after the next one.
 
 ## Writes since 2026-09-30
 
-One thread owns the store's only write connection, and every write queues in front of it in
-arrival order. Nothing else takes SQLite's write lock.
+One thread owns the managed writer connection. Durable writes queue in arrival order.
+Replaceable current registers use a separate connection and one 100 ms attempt. They reserve
+an empty managed-writer turn within that bound, with 10 ms reserved for work; the turn carries
+no sample, SQL or caller closure. Foreground arrival order and background admission remain
+unchanged. An expired rendezvous drains without any late write, and releasing a reservation
+does not notify commit observers. External contention retries only BEGIN within the remaining
+bound. Validation and mutation run once, under the same transaction deadline; a timed-out
+sample leaves no retry obligation. Reads remain read-only.
+Durable peer errors and `replication_refusals` still use the managed writer. Bounded current-value
+housekeeping reserves a background turn for its separate connection with the same 100 ms deadline: a pass inspects
+at most 64 register keys and retires at most 256 local history rows. An empty pass stays
+read-only. Obsolete seat and host payloads release capacity; semantic clocks retain a small
+tombstone per subject so removal cannot rewind a reader frontier.
 
-- **Batched writes.** Claims, local observations such as heartbeats, work actions, step and run
+Each register commit uses its own `synchronous=FULL` flush. On an isolated test host, the native
+register probe measured 7.0–13.4 ms from `BEGIN IMMEDIATE` through `COMMIT` (including flush),
+versus 16.1–22.6 ms for the complete publication call. Fleet-scale throughput and request
+latency are checked by the load harness; these isolated numbers are not throughput guarantees.
+
+- **Batched writes.** Claims, legacy local observations, work actions, step and run
   state changes, publications (`apply`), documents, resource observations, mission outputs and
   the receipt of a peer's envelopes each run as one job. The writer thread runs the next job and
   the jobs queued behind it in one `BEGIN IMMEDIATE` transaction, each in its own savepoint. It
@@ -79,3 +95,13 @@ every write that arrived while the previous batch ran.
 Under `ST3_PROFILE_DIR`, a batched write's operation counts the time until the writer started
 its job as writer wait, and the job itself as writer hold. The batch's `COMMIT` shows under
 `(unlabeled st3-writer)`, whose statement count is the number of batches.
+
+## Restoring a database file with current registers
+
+A filesystem-copy restore preserves the old current-value epoch and can rewind workspace
+and transport counters. Before starting the restored daemon, delete only the
+`current-value-epoch` row from the offline database's `meta` table and ensure the host clock
+has moved forward. Open then creates a later epoch. Restart native producers with fresh
+runtime incarnations; restarting them alone does not recover workspace or transport values
+that peers already received. Ordinary reopen retains the epoch; signed-log restore creates
+a new one automatically.

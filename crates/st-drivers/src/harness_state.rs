@@ -27,8 +27,9 @@ use serde::{Deserialize, Serialize};
 /// observed harness state.
 pub const HARNESS_STATE_STALE: Duration = Duration::from_secs(15 * 60);
 /// How often a live writer re-stamps unchanged evidence it still holds. State changes
-/// publish immediately; quiet sessions retain the cadence used before the twenty-second refresh.
-pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(5 * 60);
+/// publish immediately. Fresh provider evidence arrives before the daemon's 90-second
+/// freshness window, independently of the slower presence refresh.
+pub const HARNESS_STATE_REFRESH: Duration = Duration::from_secs(30);
 /// Maximum accepted positive difference between the writer's UTC clock and the reader's clock.
 pub const HARNESS_STATE_FUTURE_SKEW: Duration = Duration::from_secs(60);
 
@@ -516,7 +517,7 @@ impl Writer {
             written_at_ms,
             transitions,
         };
-        write_record(&self.path, &record)?;
+        write_observed_record(&self.path, &record)?;
         self.interrupted = false;
         Ok(true)
     }
@@ -754,6 +755,17 @@ fn read_record(path: &Path) -> Option<Record> {
     }
 }
 
+fn write_observed_record(path: &Path, record: &Record) -> anyhow::Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    if crate::harness_events::enabled(dir) {
+        // Preserve the provider's new evidence before its independent, lossy daemon POST.
+        // A dropped local transition would otherwise make every later heartbeat restamp
+        // the old state. Wait only before writer admission; no publication job is queued.
+        return crate::harness_events::write_ownership_snapshot(dir, &serde_json::to_vec(record)?);
+    }
+    write_record(path, record)
+}
+
 fn write_record(path: &Path, record: &Record) -> anyhow::Result<()> {
     // This record stages beside itself, unchanged: the sibling driver record
     // ([`crate::harness_context`]) stages outside the agent subtree because a replicated
@@ -917,7 +929,13 @@ fn claim_locked(writer: &Writer, token: &str) -> anyhow::Result<u64> {
             .as_ref()
             .map_or(0, |record| record.transitions.saturating_add(1)),
     };
-    write_record(&writer.path, &record)?;
+    if let Some(dir) = writer.path.parent()
+        && crate::harness_events::enabled(dir)
+    {
+        crate::harness_events::write_ownership_snapshot(dir, &serde_json::to_vec(&record)?)?;
+    } else {
+        write_record(&writer.path, &record)?;
+    }
     // The floor accompanies every act that establishes ownership; its own failure
     // modes must never be quiet ones.
     persist_floor(&writer.path, seq);

@@ -33,6 +33,13 @@ mod roster_controls;
 #[cfg(test)]
 mod agents_window_deadline_tests;
 pub(crate) mod step_labels;
+mod canonical;
+mod latest_values;
+use latest_values::{current_sql, harness_sql};
+pub(crate) use latest_values::CURRENT_VALUE_KINDS;
+pub use latest_values::{CurrentObservationBoundary, is_current_input, is_current_value};
+#[cfg(any(test, feature = "test-support"))]
+pub use latest_values::with_native_current_admission_for_test;
 mod operation_audit;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -117,7 +124,9 @@ pub use smallclaims::store::{
 mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
-pub(crate) use attention_snapshot::{NativePromptState, native_prompt_gone_key};
+pub(crate) use attention_snapshot::NativePromptState;
+#[cfg(test)]
+pub(crate) use attention_snapshot::native_prompt_gone_key;
 // Registration stays opt-in until the shared installer certifies every source family.
 #[cfg_attr(
     not(test),
@@ -454,17 +463,12 @@ impl UsageFold {
         let mut has_cost = false;
         for group in self.spend.values().cloned() {
             summary.incarnation_count += 1;
-            if !group.rollups.is_empty() {
-                for (total, input, output, writes, reads) in group.rollups.into_values() {
-                    summary.total_tokens = summary.total_tokens.saturating_add(total);
-                    summary.input_tokens = summary.input_tokens.saturating_add(input);
-                    summary.output_tokens = summary.output_tokens.saturating_add(output);
-                    summary.cache_write_tokens = summary.cache_write_tokens.saturating_add(writes);
-                    summary.cached_tokens = summary.cached_tokens.saturating_add(reads);
-                }
-            } else if let Some((total, input, output, cached, group_cost, currency)) =
-                group.cumulative
-            {
+            let rollup_total = group.rollups.values().fold(0_u64, |total, row| total.saturating_add(row.0));
+            // These are two cumulative views of the same incarnation, never additive.
+            // Incomplete attributed rollups cannot lower a larger provider total; newer
+            // complete rollups may exceed a still-old provider reading.
+            let cumulative = group.cumulative.filter(|value| group.rollups.is_empty() || value.0 > rollup_total);
+            if let Some((total, input, output, cached, group_cost, currency)) = cumulative {
                 summary.total_tokens = summary.total_tokens.saturating_add(total);
                 summary.input_tokens = summary.input_tokens.saturating_add(input);
                 summary.output_tokens = summary.output_tokens.saturating_add(output);
@@ -474,6 +478,14 @@ impl UsageFold {
                     has_cost = true;
                 }
                 summary.currency = summary.currency.or(currency);
+            } else if !group.rollups.is_empty() {
+                for (total, input, output, writes, reads) in group.rollups.into_values() {
+                    summary.total_tokens = summary.total_tokens.saturating_add(total);
+                    summary.input_tokens = summary.input_tokens.saturating_add(input);
+                    summary.output_tokens = summary.output_tokens.saturating_add(output);
+                    summary.cache_write_tokens = summary.cache_write_tokens.saturating_add(writes);
+                    summary.cached_tokens = summary.cached_tokens.saturating_add(reads);
+                }
             } else {
                 summary.total_tokens = summary.total_tokens.saturating_add(group.response_total);
                 summary.input_tokens = summary.input_tokens.saturating_add(group.response_input);
@@ -1059,6 +1071,8 @@ CREATE TABLE IF NOT EXISTS local_latest_slots (
     pending_local_id INTEGER,
     PRIMARY KEY (subject, kind, slot)
 );
+CREATE INDEX IF NOT EXISTS local_latest_pending_usage_index ON local_latest_slots(subject)
+WHERE kind='harness.usage' AND pending_local_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS revision_proposals (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES mission_runs(id),
@@ -1268,6 +1282,7 @@ const AGENT_ROSTER_OVERDUE_MS: u64 = 30_000;
 /// One subject's reduction, read at snapshot `read_at`, so it holds from there on.
 struct StatusEntry {
     read_at: u64,
+    current_revision: u64,
     owners: Vec<String>,
     status: SubjectStatus,
     action: Option<PlannedAction>,
@@ -1282,6 +1297,36 @@ struct ViewEntry {
     /// Whether the answer used a declaration, and so the snapshot's owner state.
     declared: bool,
     owners: Vec<String>,
+}
+
+#[cfg(test)]
+fn subject_current_revision(connection: &Connection, subject: &str) -> Result<u64> {
+    if !subject.starts_with("agent/") {
+        return Ok(0);
+    }
+    Ok(connection.query_row(
+        "SELECT COALESCE(MAX(local_id),0) FROM current_value_revisions WHERE subject=?1",
+        [subject],
+        |row| row.get(0),
+    )?)
+}
+
+fn subject_current_revisions(connection: &Connection, names: &BTreeSet<String>) -> Result<BTreeMap<String, u64>> {
+    let agents = names.iter().filter(|name| name.starts_with("agent/")).collect::<Vec<_>>();
+    let mut revisions = BTreeMap::new();
+    let mut statement = connection.prepare_cached(
+        "SELECT v.subject,MAX(v.local_id) FROM json_each(?1) selected
+         CROSS JOIN current_value_revisions v ON v.subject=selected.value GROUP BY v.subject",
+    )?;
+    for chunk in agents.chunks(64) {
+        for row in statement.query_map([serde_json::to_string(chunk)?], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })? {
+            let (subject, revision) = row?;
+            revisions.insert(subject, revision);
+        }
+    }
+    Ok(revisions)
 }
 
 fn subject_head_at(connection: &Connection, subject: &str, store_index: u64) -> Result<u64> {
@@ -1746,7 +1791,7 @@ pub struct EndedDeclaration {
 
 /// A kept agent status: the snapshot it answers, the agent projection index it was reduced at,
 /// whether it includes history, and the status.
-type AgentStatusEntry = (u64, u64, bool, Arc<StatusResponse>);
+type AgentStatusEntry = (u64, u64, u64, bool, Arc<StatusResponse>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MissionGateRunner {
@@ -3061,21 +3106,25 @@ pub fn runtime() -> Arc<dyn smallclaims::Runtime> {
 }
 
 /// The local rows a roster card can read: timeline entries an agent subject made, which date its
-/// activity and its managed session. Heartbeat and telemetry observations never change a card —
-/// the harness fold, working episodes, usage summaries and todos all read replicated claims —
-/// and neither do `Latest` observations, which reach cards only through the claims written when
-/// their state changes. So the frontier is the newest agent timeline row at or before the cut,
-/// an exact `MAX(id)`: it never assumes observation ids and graph cuts rise together, which
-/// repair and trim can break.
-const ROSTER_LOCAL_FRONTIER: &str = "SELECT COALESCE((SELECT id FROM local_observations
- WHERE kind='harness.timeline' AND subject LIKE 'agent/%' AND after_store_index<=?1
- ORDER BY id DESC LIMIT 1), 0)";
+/// activity and its managed session, together with current agent registers. Legacy heartbeat
+/// and telemetry rows do not change a card. Timeline rows respect the graph cut; registers
+/// deliberately reflect request-time state. Both use the local observation id clock.
+const ROSTER_LOCAL_FRONTIER: &str = "SELECT MAX(
+ COALESCE((SELECT id FROM local_observations WHERE kind='harness.timeline'
+ AND subject LIKE 'agent/%' AND after_store_index<=?1 ORDER BY id DESC LIMIT 1),0),
+ COALESCE((SELECT MAX(local_id) FROM current_value_revisions WHERE subject LIKE 'agent/%'),0))";
 
 /// One frontier read, inside the caller's SQLite snapshot when it holds one: the reader pool
 /// lends pinned reads the same connection. The partial frontier index keeps an old cut from
 /// walking newer heartbeat rows.
 fn roster_local_frontier(connection: &Connection, index: u64) -> Result<u64> {
     Ok(connection.query_row(ROSTER_LOCAL_FRONTIER, [index], |row| row.get::<_, u64>(0))?)
+}
+
+pub(crate) struct PendingUsageBatch {
+    pub after: Option<String>,
+    pub changed: bool,
+    pub failures: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -3159,6 +3208,111 @@ impl Store {
         let smalltalk = Arc::new(SmalltalkRuntime::with_ivm_views(views));
         let graph = GraphStore::open(path, origin, smalltalk.clone())?;
         Ok(Self { graph, smalltalk })
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn append_legacy_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
+        self.append_legacy_claim_outcome(input).map(|p| p.0)
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn append_legacy_claim_outcome(
+        &self,
+        input: &ClaimInput,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        append_claim_with_commit_context(&self.graph, input, None, None, None, None, ClaimCommitContext { legacy: true, ..Default::default() })
+    }
+
+    fn refresh_current_caches(&self) -> Result<()> {
+        let connection = self.readers.get();
+        let current: u64 = connection.query_row(
+            "SELECT coalesce(max(local_id),0) FROM current_value_revisions",
+            [],
+            |r| r.get(0),
+        )?;
+        let mut seen = self
+            .smalltalk
+            .latest_cache_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if *seen != current {
+            let subjects = connection
+                .prepare_cached("SELECT DISTINCT subject FROM current_value_revisions WHERE local_id>?1")?
+                .query_map([*seen], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut cache = self
+                .smalltalk
+                .subject_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for subject in subjects {
+                cache.statuses.remove(&subject);
+                cache.card_statuses.remove(&subject);
+                cache.views.remove(&subject);
+            }
+            drop(cache);
+            *seen = current;
+        }
+        Ok(())
+    }
+
+    fn current_cache_revision(&self) -> Result<u64> {
+        Ok(self.readers.get().query_row(
+            "SELECT coalesce(max(local_id),0) FROM current_value_revisions",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn changed_current_agents(&self, since: u64) -> Result<BTreeSet<String>> {
+        Ok(self.readers.get().prepare_cached(
+            "SELECT DISTINCT subject FROM current_value_revisions WHERE local_id>?1 AND subject LIKE 'agent/%'",
+        )?.query_map([since], |row| row.get(0))?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub(crate) fn has_claim_or_current_value(&self, subject: &str) -> Result<bool> {
+        Ok(self.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1)
+                OR EXISTS(SELECT 1 FROM latest_values WHERE subject=?1)",
+            [subject], |row| row.get(0),
+        )?)
+    }
+
+    pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
+        if kind.is_some_and(is_current_value) {
+            let connection = self.readers.get();
+            let query = format!(
+                "SELECT {CLAIM_COLUMNS} FROM registered_claims AS claims
+                WHERE subject=?1 AND kind=?2 ORDER BY length(accepted_at_unix_ms) DESC,
+                accepted_at_unix_ms DESC,id DESC LIMIT 1"
+            );
+            if let Some(record) = connection
+                .query_row(&query, params![subject, kind], claim_from_row)
+                .optional()?
+            {
+                if let Some(legacy) = self.graph.latest_claim(subject, kind)?
+                    && legacy.accepted_at_unix_ms > record.accepted_at_unix_ms
+                {
+                    return Ok(Some(legacy));
+                }
+                return Ok(Some(record));
+            }
+        }
+        let legacy = self.graph.latest_claim(subject, kind)?;
+        if legacy.is_none() && kind.is_none() {
+            let connection = self.readers.get();
+            return Ok(connection.query_row(
+                &format!("SELECT {CLAIM_COLUMNS} FROM registered_claims AS claims
+                    WHERE subject=?1 ORDER BY length(accepted_at_unix_ms) DESC,accepted_at_unix_ms DESC,id DESC LIMIT 1"),
+                [subject], claim_from_row,
+            ).optional()?);
+        }
+        Ok(legacy)
+    }
+
+    pub fn claim_by_id(&self, id: &str) -> Result<Option<ClaimRecord>> {
+        if id.starts_with("local-observation/") {
+            return claim_by_id_tx(&self.readers.get(), id);
+        }
+        self.graph.claim_by_id(id)
     }
 
     /// Open a shared-memory store for sequential fixtures and short-lived tools.
@@ -3352,6 +3506,22 @@ impl Store {
             .unwrap_or_default())
     }
 
+    #[cfg(test)]
+    pub(crate) fn on_next_roster_window_snapshot_for_test(&self, hook: impl FnOnce(u64) + Send + 'static) {
+        *self.smalltalk.roster_window_snapshot_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn roster_window_snapshot_for_test(&self, index: u64) {
+        let hook = self.smalltalk.roster_window_snapshot_hook.lock().unwrap().take();
+        if let Some(hook) = hook { hook(index); }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn invalidate_incremental_roster_for_test(&self) {
+        self.smalltalk.forget_incremental_views();
+    }
+
     /// Never waits; multi-gate readers release unrelated guards before queuing on a miss.
     pub(crate) fn try_admit_agent_resources(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         self.smalltalk.agent_resources_admission.clone().try_lock_owned().ok()
@@ -3431,14 +3601,18 @@ impl Store {
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         // Without rows to start from, every agent is missing: a small roster, or an empty
         // one, still completes in one bounded fold.
-        let (changed, membership) = match &previous {
-            None => (0, true),
-            Some(previous) if previous.index == index => (0, false),
+        let (mut changed, membership) = match &previous {
+            None => (BTreeSet::new(), true),
+            Some(previous) if previous.index == index => (BTreeSet::new(), false),
             Some(previous) => match self.agent_resources_delta(previous.index, index, &previous.items)? {
-                Ok(delta) => (delta.subjects.len(), delta.membership),
+                Ok(delta) => (delta.subjects, delta.membership),
                 Err(reason) => return Ok(Some(reason)),
             },
         };
+        if let Some(previous) = &previous {
+            changed.extend(self.changed_current_agents(previous.local)?);
+        }
+        let changed = changed.len();
         // Complete rows whose membership no claim moved miss no agent: skip listing them all.
         if previous.as_ref().is_some_and(|previous| previous.covered.is_none()) && !membership {
             return Ok((changed > bound).then(|| "cards changed".to_owned()));
@@ -3608,11 +3782,80 @@ impl Store {
     ) -> Option<(u64, Arc<Vec<Value>>, u128)> {
         self.smalltalk.agent_roster_refresh.get()?;
         self.warn_if_agent_roster_overdue();
-        self.smalltalk.agent_resources_cache.lock()
+        let current = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
-            .max_by_key(|entry| (entry.index, entry.local))
-            .map(|entry| (entry.index, Arc::clone(&entry.items), entry.published_at_unix_ms))
+            .max_by_key(|entry| (entry.index, entry.local, entry.published_at_unix_ms))
+            .map(runtime::PublishedRoster::from);
+        let previous = self.smalltalk.roster_fallback.lock().expect("roster fallback poisoned")
+            .complete[usize::from(history)].as_ref().filter(|entry| entry.index <= index).cloned();
+        current.into_iter().chain(previous).max_by_key(runtime::PublishedRoster::position)
+            .map(|entry| (entry.index, entry.items, entry.at))
+    }
+
+    /// Bounded cache metadata for the opted-in private load recorder; no SQL or card copies.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn trace_missing_agent_roster(&self, index: u64) {
+        if !smallclaims::sqlite::transaction_trace::is_active() { return; }
+        static PRINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if PRINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 128 { return; }
+        let cards = self.smalltalk.agent_resources_cache.lock().expect("agent resources cache poisoned")
+            .iter().map(|entry| json!({"index":entry.index,"local":entry.local,
+                "history":entry.history,"complete":entry.covered.is_none(),"rows":entry.items.len()}))
+            .collect::<Vec<_>>();
+        let refs = self.smalltalk.agent_page_refs_cache.lock().expect("agent page refs cache poisoned")
+            .iter().map(|entry| json!({"index":entry.index,"history":entry.history,"rows":entry.items.len()}))
+            .collect::<Vec<_>>();
+        eprintln!("missing published roster: {}", json!({"read_index":index,"cards":cards,"refs":refs}));
+    }
+
+    /// Whether a newer publication can answer a window whose physical snapshot was
+    /// overtaken. Check cached metadata and head coverage without copying any cards.
+    pub(crate) fn agent_roster_publication_after(&self, index: u64, history: bool, head_count: Option<usize>) -> bool {
+        let cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        if cache.iter().any(|entry| entry.history == history && entry.covered.is_none() && entry.index > index) {
+            return true;
+        }
+        drop(cache);
+        let fallback = self.smalltalk.roster_fallback.lock().expect("roster fallback poisoned");
+        if fallback.complete[usize::from(history)].as_ref().is_some_and(|entry| entry.index > index) {
+            return true;
+        }
+        if !history && head_count.is_some_and(|count| count <= crate::api::CLIENT_MAX_PAGE_ITEMS + 1)
+            && fallback.head.as_ref().is_some_and(|(entry, _)| entry.index > index) {
+            return true;
+        }
+        drop(fallback);
+        let Some(count) = head_count else { return false; };
+        let refs = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned").iter()
+            .filter(|entry| !entry.history && entry.index > index)
+            .max_by_key(|entry| entry.index)
+            .map(|entry| (entry.index, Arc::clone(&entry.items)));
+        let Some((cut, refs)) = refs else { return false; };
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .any(|entry| !entry.history && entry.index == cut && entry.covered.as_ref().is_none_or(|covered|
+                refs.iter().take(count).all(|reference|
+                    reference["id"].as_str().is_some_and(|id| covered.contains(id)))))
+    }
+
+    /// Fresh reads require a live fold-cache publication; an old immutable fallback is
+    /// deliberately excluded even when its admitted index equals the current graph clock.
+    pub(crate) fn agent_roster_publication_is_current(
+        &self, cut: u64, history: bool, head_count: Option<usize>,
+    ) -> bool {
+        let cards = self.smalltalk.agent_resources_cache.lock().expect("agent resources cache poisoned");
+        if cards.iter().any(|entry| entry.index == cut && entry.history == history && entry.covered.is_none()) {
+            return true;
+        }
+        let Some(count) = head_count.filter(|_| !history) else { return false; };
+        let refs = self.smalltalk.agent_page_refs_cache.lock().expect("agent page refs cache poisoned");
+        refs.iter().filter(|entry| !entry.history && entry.index == cut).any(|reference|
+            cards.iter().filter(|entry| !entry.history && entry.index == cut).any(|entry|
+                entry.covered.as_ref().is_none_or(|covered| reference.items.iter().take(count)
+                    .all(|row| row["id"].as_str().is_some_and(|id| covered.contains(id))))))
     }
 
     /// The complete roster published at exactly `cut`, for a page continuing from a first page
@@ -3623,11 +3866,15 @@ impl Store {
         history: bool,
     ) -> Option<(Arc<Vec<Value>>, u128)> {
         self.smalltalk.agent_roster_refresh.get()?;
-        self.smalltalk.agent_resources_cache.lock()
+        let current = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index == cut)
-            .max_by_key(|entry| entry.local)
-            .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms))
+            .max_by_key(|entry| (entry.local, entry.published_at_unix_ms))
+            .map(runtime::PublishedRoster::from);
+        let previous = self.smalltalk.roster_fallback.lock().expect("roster fallback poisoned")
+            .complete[usize::from(history)].as_ref().filter(|entry| entry.index == cut).cloned();
+        current.into_iter().chain(previous).max_by_key(runtime::PublishedRoster::position)
+            .map(|entry| (entry.items, entry.at))
     }
 
     /// When no complete roster is published yet: the newest current refs at or before `index`
@@ -3635,30 +3882,32 @@ impl Store {
     /// `count` agents, all at that one cut. The refresher publishes this head first as the
     /// daemon starts, so a window or first page need not wait for every card to fold.
     pub(crate) fn published_agent_roster_head(
-        &self,
-        index: u64,
-        count: usize,
+        &self, index: u64, count: usize,
     ) -> Option<PublishedRosterHead> {
         self.smalltalk.agent_roster_refresh.get()?;
         self.warn_if_agent_roster_overdue();
-        let (cut, refs) = self.smalltalk.agent_page_refs_cache.lock()
-            .expect("agent page refs cache poisoned").iter()
-            .filter(|entry| !entry.history && entry.index <= index)
-            .max_by_key(|entry| entry.index)
-            .map(|entry| (entry.index, Arc::clone(&entry.items)))?;
-        let cache = self.smalltalk.agent_resources_cache.lock()
-            .expect("agent resources cache poisoned");
-        let head = cache.iter().filter(|entry| entry.index == cut && !entry.history)
-            .find_map(|entry| {
-                let cards = entry.items.iter()
-                    .filter_map(|card| Some((card["id"].as_str()?, card)))
-                    .collect::<HashMap<_, _>>();
-                refs.iter().take(count)
-                    .map(|reference| cards.get(reference["id"].as_str()?).map(|card| (*card).clone()))
-                    .collect::<Option<Vec<_>>>()
-                    .map(|head| (head, entry.published_at_unix_ms))
-            })?;
-        Some((cut, refs, head.0, head.1))
+        let assemble = |entry: &runtime::PublishedRoster, refs: &Arc<Vec<Value>>| {
+            let cards = entry.items.iter().filter_map(|card| Some((card["id"].as_str()?, card)))
+                .collect::<HashMap<_, _>>();
+            let head = refs.iter().take(count)
+                .map(|reference| cards.get(reference["id"].as_str()?).map(|card| (*card).clone()))
+                .collect::<Option<Vec<_>>>()?;
+            Some((entry.index, Arc::clone(refs), head, entry.at))
+        };
+        let reference = self.smalltalk.agent_page_refs_cache.lock().expect("agent page refs cache poisoned")
+            .iter().filter(|entry| !entry.history && entry.index <= index).max_by_key(|entry| entry.index)
+            .map(|entry| (entry.index, Arc::clone(&entry.items)));
+        let current = reference.and_then(|(cut, refs)| {
+            self.smalltalk.agent_resources_cache.lock().expect("agent resources cache poisoned")
+                .iter().filter(|entry| !entry.history && entry.index == cut)
+                .filter_map(|entry| assemble(&runtime::PublishedRoster::from(entry), &refs)
+                    .map(|head| ((entry.local, entry.published_at_unix_ms), head)))
+                .max_by_key(|(position, _)| *position).map(|(_, head)| head)
+        });
+        let previous = self.smalltalk.roster_fallback.lock().expect("roster fallback poisoned")
+            .head.as_ref().filter(|(entry, _)| entry.index <= index).cloned();
+        current.into_iter().chain(previous.and_then(|(entry, refs)| assemble(&entry, &refs)))
+            .max_by_key(|(cut, _, _, at)| (*cut, *at))
     }
 
     /// Follows the revision of complete current roster publications: it rises with every one,
@@ -3695,6 +3944,7 @@ impl Store {
         history: bool,
         build: impl FnOnce() -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        let epoch = self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire);
         let now = now_ms();
         let valid = |entry: &&runtime::AgentResourcesEntry| {
             entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
@@ -3717,6 +3967,9 @@ impl Store {
         };
         let mut cache = self.smalltalk.agent_page_refs_cache.lock()
             .expect("agent page refs cache poisoned");
+        if self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch {
+            return Ok((*items).clone());
+        }
         cache.push_back(runtime::AgentResourcesEntry {
             index, local: 0, history, covered: None, valid_until_unix_ms, items: Arc::clone(&items),
             published_at_unix_ms: now,
@@ -3760,6 +4013,7 @@ impl Store {
         chunk: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
+        let epoch = self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire);
         // Cold presentation reads current desired/queue tables even for historical status
         // cuts. Do not reuse rows from an older physical projection for those requests.
         if index < current_index(&self.readers.get())? {
@@ -3775,8 +4029,8 @@ impl Store {
         let valid = |entry: &&runtime::AgentResourcesEntry| {
             entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)
         };
-        // Local agent timeline rows do not advance the graph index, but do change cards; the
-        // frontier ignores heartbeats and every other local kind, none of which a card reads.
+        // Local agent timeline rows and current registers do not advance the graph index,
+        // but do change cards. The frontier ignores legacy heartbeat and telemetry rows.
         // Read it inside the caller's SQLite snapshot, never from a future atomic generation
         // that could race this cut.
         let local = crate::performance::task("roster/frontier-read", || {
@@ -3800,6 +4054,7 @@ impl Store {
             .filter(|entry| entry.index <= index && entry.local <= local && entry.history == history)
             .max_by_key(|entry| (entry.index, entry.local)).cloned();
         drop(cache);
+        self.refresh_current_caches()?;
         let entry = crate::performance::task("roster/build",
         || -> Result<runtime::AgentResourcesEntry> {
         let previous = match previous {
@@ -3827,6 +4082,7 @@ impl Store {
                     changed.extend(names.symmetric_difference(&old).cloned());
                 }
                 if previous.local != local {
+                    changed.extend(self.changed_current_agents(previous.local)?);
                     let connection = self.readers.get();
                     let mut statement = connection.prepare_cached(
                         "SELECT DISTINCT subject FROM local_observations WHERE id>?1 AND id<=?2
@@ -3943,6 +4199,9 @@ impl Store {
         })?;
         let mut cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
+        if self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire) != epoch {
+            return Ok(select(&entry.items));
+        }
         // All endpoint callers hold admission. Direct internal readers may still race; never
         // replace a complete published projection with a partial one.
         let published = cache.iter().filter(valid).find(|entry| {
@@ -3965,6 +4224,11 @@ impl Store {
             }
             items
         };
+        {
+            let refs = self.smalltalk.agent_page_refs_cache.lock().expect("agent page refs cache poisoned");
+            self.smalltalk.roster_fallback.lock().expect("roster fallback poisoned")
+                .discard_superseded(&cache, &refs);
+        }
         drop(cache);
         if complete {
             self.smalltalk.agent_roster_published.send_modify(|revision| *revision += 1);
@@ -10712,6 +10976,29 @@ impl Store {
             .map_err(|error| St3Error::new("internal", error))?
     }
 
+    /// Kernel-bound native publication of a current register; it has no event sequence/receipt.
+    pub(crate) fn append_bound_current(
+        &self,
+        input: &ClaimInput,
+        runtime: &str,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        if !is_current_input(input) || runtime.is_empty() {
+            return Err(St3Error::new(
+                "invalid-harness-event",
+                "invalid current observation",
+            ));
+        }
+        st3_schema::registry()
+            .validate_public_claim(
+                &input.subject,
+                &input.kind,
+                &input.fields,
+                input.actor.as_deref(),
+            )
+            .map_err(|error| St3Error::new(error.code, error.message))?;
+        latest_values::append(&self.graph, input, now_ms(), Some(runtime))
+    }
+
     /// Append a native driver's observation, as `POST /v1/harness-events` does once it has
     /// bound the caller to its seat. The daemon tests call it directly, without a driver.
     pub fn append_harness_event(
@@ -10780,8 +11067,11 @@ impl Store {
                 &self.graph, &input, now_ms(), Some(&publication.runtime_incarnation),
             )
         } else {
-            append_claim_with_fences(
-                &self.graph, &input, None, Some(&publication.runtime_incarnation),
+            // Nonzero event sequences are the legacy reliable protocol. Keep their
+            // deduplication and replicated retention through a mixed-version upgrade.
+            append_claim_with_commit_context(
+                &self.graph, &input, None, Some(&publication.runtime_incarnation), None, None,
+                ClaimCommitContext { legacy: true, ..Default::default() },
             ).map(|(record, appended)| (record, appended, false))
         }
     }
@@ -11612,12 +11902,14 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        self.refresh_current_caches()?;
         // Agent listings are expensive on large graphs. Hold this lock while building the
         // snapshot so concurrent callers share one reduction, then serve clones at the same
         // store index. A later index always rebuilds, preserving snapshot semantics.
         if prefix == "agent/" {
             // What this thread's reads can see, as every snapshot read checks: a read pinned to
             // a snapshot can see a commit a moment before the writer publishes its index.
+            let revision = self.current_cache_revision()?;
             let current = current_index(&self.readers.get())?;
             let index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
             let mut cache = self
@@ -11625,22 +11917,38 @@ impl Store {
                 .agent_status_cache
                 .lock()
                 .expect("agent status cache poisoned");
-            if let Some((_, _, _, status)) = cache.iter().find(|(cached_index, _, history, _)| {
-                *cached_index == index && *history == include_history
-            }) {
+            if let Some((_, _, _, _, status)) =
+                cache.iter().find(|(cached_index, _, current, history, _)| {
+                    *cached_index == index && *current == revision && *history == include_history
+                })
+            {
                 let mut result = (**status).clone();
                 result.store_index = index;
+                drop(cache);
+                let connection = self.readers.get();
+                for status in &mut result.subjects {
+                    self.refresh_kept_harness_source(&connection, status, revision)?;
+                }
                 return Ok(result);
             }
             let projection_index = self.agent_status_index(index)?;
-            if let Some((cached_index, _, _, status)) =
-                cache.iter_mut().find(|(_, cached_projection, history, _)| {
-                    *cached_projection == projection_index && *history == include_history
-                })
+            if let Some((cached_index, _, _, _, status)) =
+                cache
+                    .iter_mut()
+                    .find(|(_, cached_projection, current, history, _)| {
+                        *cached_projection == projection_index
+                            && *current == revision
+                            && *history == include_history
+                    })
             {
                 *cached_index = index;
                 let mut result = (**status).clone();
                 result.store_index = index;
+                drop(cache);
+                let connection = self.readers.get();
+                for status in &mut result.subjects {
+                    self.refresh_kept_harness_source(&connection, status, revision)?;
+                }
                 return Ok(result);
             }
             let status =
@@ -11648,6 +11956,7 @@ impl Store {
             cache.push_back((
                 index,
                 projection_index,
+                revision,
                 include_history,
                 Arc::new(status.clone()),
             ));
@@ -11668,7 +11977,7 @@ impl Store {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-        let subjects = if prefix.starts_with("arrangement/") {
+        let mut subjects = if prefix.starts_with("arrangement/") {
             connection.prepare_cached("SELECT subject FROM arrangements WHERE subject>=?1 AND subject<?2 ORDER BY subject")?
                 .query_map(params![prefix, prefix_upper_bound(prefix).context("arrangement prefix bound")?], |row| row.get::<_,String>(0))?
                 .collect::<Result<BTreeSet<_>,_>>()?
@@ -11684,12 +11993,21 @@ impl Store {
                 .prepare(
                     "SELECT DISTINCT subject FROM claims
                      WHERE store_index<=?1 AND subject GLOB ?2 ORDER BY subject",
-                )?
-                .query_map(params![store_index, format!("{prefix}*")], |row| {
-                    row.get::<_, String>(0)
-                })?
-                .collect::<Result<BTreeSet<_>, _>>()?,
-        }};
+                    )?
+                    .query_map(params![store_index, format!("{prefix}*")], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<Result<BTreeSet<_>, _>>()?,
+            }
+        };
+        if !include_history {
+            subjects.extend(
+                connection
+                    .prepare_cached("SELECT subject FROM latest_values WHERE subject GLOB ?1")?
+                    .query_map([format!("{prefix}*")], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+        }
         drop(connection);
         self.status_for_subject_names_at(subjects, store_index, include_history)
     }
@@ -11701,6 +12019,7 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        self.refresh_current_caches()?;
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
@@ -11802,28 +12121,67 @@ impl Store {
         subject: &str,
         store_index: u64,
         newest: bool,
+        current_revision: u64,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
-        self.cached_subject_status_with_mode(connection, subject, store_index, newest, SubjectStatusMode::Full)
-    }
-
-    fn cached_subject_status_with_mode(
-        &self, connection: &Connection, subject: &str, store_index: u64,
-        newest: bool, mode: SubjectStatusMode,
-    ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
-        if let Some(kept) = self.kept_subject_status(subject, store_index, mode) {
+        let mode = SubjectStatusMode::Full;
+        if let Some(mut kept) = self.kept_subject_status(subject, store_index, mode, current_revision) {
+            self.refresh_kept_harness_source(connection, &mut kept.0, current_revision)?;
             return Ok(kept);
         }
-        let (status, action) = subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
-            .expect("a reduction without an owner filter always has a status");
+        let (status, action) =
+            subject_status_at_with_mode(connection, subject, Some(store_index), None, mode)?
+                .expect("a reduction without an owner filter always has a status");
         if newest {
-            self.keep_subject_status(subject, store_index, mode, &status, &action);
+            self.keep_subject_status(
+                subject,
+                store_index,
+                mode,
+                current_revision,
+                &status,
+                &action,
+            );
         }
         Ok((status, action))
     }
 
+    // A semantic cache hit keeps the reduction, while source identity/time follow the
+    // replaceable register. A semantic commit after the cache lookup keeps the old source
+    // with its old state; diagnostic/runtime fences also keep their own source claims.
+    fn refresh_kept_harness_source(
+        &self,
+        connection: &Connection,
+        status: &mut SubjectStatus,
+        current_revision: u64,
+    ) -> Result<()> {
+        let Some(harness) = status.harness.as_mut() else {
+            return Ok(());
+        };
+        if !harness.claim.starts_with(LOCAL_OBSERVATION_ID_PREFIX) {
+            return Ok(());
+        };
+        let current: Option<(String, String, u64)> = connection
+            .query_row(
+                "SELECT source_id,coalesce(json_extract(body,'$.fields.incarnation_id'),''),
+            min(source_at,coalesce(json_extract(body,'$.fields.observed_at_ms'),source_at))
+            FROM latest_values WHERE subject=?1 AND kind='harness.observed' AND slot=''
+            AND coalesce((SELECT revision FROM current_value_frontiers WHERE subject=?1),0)<=?2",
+                params![status.subject, current_revision],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((claim, incarnation, observed_at)) = current
+            && incarnation == harness.incarnation_id
+            && u128::from(observed_at) >= harness.observed_at_unix_ms
+        {
+            harness.claim = claim;
+            harness.observed_at_unix_ms = u128::from(observed_at);
+        }
+        Ok(())
+    }
+
     /// `subject`'s kept status reduction, if one holds at `store_index`.
     fn kept_subject_status(
-        &self, subject: &str, store_index: u64, mode: SubjectStatusMode,
+        &self, subject: &str, store_index: u64, mode: SubjectStatusMode, current_revision: u64,
     ) -> Option<(SubjectStatus, Option<PlannedAction>)> {
         let cache = self
             .smalltalk
@@ -11835,14 +12193,15 @@ impl Store {
             SubjectStatusMode::AgentCard => &cache.card_statuses,
         };
         entries.get(subject)
-            .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
+            .filter(|entry| entry.read_at <= store_index && store_index <= cache.through
+                && entry.current_revision == current_revision)
             .map(|entry| (entry.status.clone(), entry.action.clone()))
     }
 
     /// Keep a reduction read at the newest applied snapshot, `store_index`.
     fn keep_subject_status(
         &self, subject: &str, store_index: u64, mode: SubjectStatusMode,
-        status: &SubjectStatus, action: &Option<PlannedAction>,
+        current_revision: u64, status: &SubjectStatus, action: &Option<PlannedAction>,
     ) {
         let mut cache = self
             .smalltalk
@@ -11873,6 +12232,7 @@ impl Store {
             subject.to_owned(),
             StatusEntry {
                 read_at: store_index,
+                current_revision,
                 owners,
                 status: status.clone(),
                 action: action.clone(),
@@ -12002,12 +12362,18 @@ impl Store {
     ) -> Result<StatusResponse> {
         let connection = self.readers.get();
         let index = selected_index(current_index(&connection)?, Some(index)).map_err(anyhow::Error::new)?;
-        let names = match names {
+        let all_names = names.is_none();
+        let mut names = match names {
             Some(names) => names.clone(),
             None => connection.prepare_cached(RANGE_SUBJECTS)?
                 .query_map(params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<BTreeSet<_>>>()?,
         };
+        if all_names && !history {
+            names.extend(connection.prepare_cached(
+                "SELECT DISTINCT subject FROM latest_values WHERE subject LIKE 'agent/%'",
+            )?.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?);
+        }
         // The view and status passes share what they read of each subject.
         let mut reads = card_fold::CardReads::new(index);
         let names = if history { names } else {
@@ -12017,8 +12383,10 @@ impl Store {
         let mode = SubjectStatusMode::AgentCard;
         let mut kept = HashMap::new();
         let mut missing = Vec::new();
+        let revisions = subject_current_revisions(&connection, &names)?;
         for name in &names {
-            match self.kept_subject_status(name, index, mode) {
+            let revision = revisions.get(name).copied().unwrap_or(0);
+            match self.kept_subject_status(name, index, mode, revision) {
                 Some((status, _)) => {
                     kept.insert(name.clone(), status);
                 }
@@ -12027,7 +12395,7 @@ impl Store {
         }
         for (name, (status, action)) in self.agent_card_statuses(&connection, &missing, index, &mut reads)? {
             if newest {
-                self.keep_subject_status(&name, index, mode, &status, &action);
+                self.keep_subject_status(&name, index, mode, revisions.get(&name).copied().unwrap_or(0), &status, &action);
             }
             kept.insert(name, status);
         }
@@ -12148,6 +12516,7 @@ impl Store {
         at_index: Option<u64>,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        self.refresh_current_caches()?;
         self.status_at_view_for_names(
             selected,
             selected_owner_run,
@@ -12197,6 +12566,11 @@ impl Store {
             }
             _ => None,
         };
+        let revisions = if newest.is_some() {
+            subject_current_revisions(&connection, &subject_names)?
+        } else {
+            BTreeMap::new()
+        };
         let mut subjects = Vec::new();
         let mut pending_actions = Vec::new();
         for subject in subject_names {
@@ -12204,9 +12578,13 @@ impl Store {
                 continue;
             }
             let reduced = match newest {
-                Some(newest) => {
-                    Some(self.cached_subject_status(&connection, &subject, store_index, newest)?)
-                }
+                Some(newest) => Some(self.cached_subject_status(
+                    &connection,
+                    &subject,
+                    store_index,
+                    newest,
+                    revisions.get(&subject).copied().unwrap_or(0),
+                )?),
                 None => subject_status_at(&connection, &subject, at_index, selected_owner_run)?,
             };
             let Some((status, action)) = reduced else {
@@ -12448,21 +12826,7 @@ impl Store {
         smallclaims::touched::note_read(|| "kind:harness.observed".to_owned());
         smallclaims::touched::note_read(|| "kind:harness.diagnostic".to_owned());
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(
-            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
-             FROM desired WHERE kind='agent'
-               AND EXISTS (SELECT 1 FROM claims INDEXED BY claims_harness_login_candidate_index
-                 WHERE claims.subject=desired.subject AND (
-                   (kind='harness.observed' AND (
-                     json_type(body, '$.fields.provider_auth')='false'
-                     OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-                         THEN '$.reason' ELSE '$.fields.reason' END)='providerAuth'
-                     OR json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
-                         THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
-                   OR (kind='harness.diagnostic'
-                     AND json_extract(body, '$.fields.code')='provider-auth-expired')))
-             ORDER BY subject",
-        )?;
+        let mut statement = connection.prepare_cached(latest_values::LOGIN_CANDIDATES_SQL)?;
         statement
             .query_map([], desired_from_row)?
             .collect::<Result<Vec<_>, _>>()
@@ -12477,7 +12841,7 @@ impl Store {
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired
              WHERE kind='agent' AND json_extract(member, '$.host')=?1
                AND (EXISTS (SELECT 1 FROM json_each(body, '$.children') child WHERE json_extract(child.value, '$.name')='checkout')
-                    OR EXISTS (SELECT 1 FROM claims WHERE claims.subject=desired.subject AND claims.kind='workspace.observed'))
+                    OR EXISTS (SELECT 1 FROM current_claims WHERE current_claims.subject=desired.subject AND current_claims.kind='workspace.observed'))
              ORDER BY subject",
         )?;
         let rows = statement.query_map([host], desired_from_row)?;
@@ -12491,11 +12855,11 @@ impl Store {
     ) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
         connection
-            .prepare_cached(&format!(
+            .prepare_cached(&current_sql(&format!(
                 "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
              WHERE claims.subject=?1 AND claims.kind='workspace.observed' AND claims.origin=?2
              ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1",
-            ))?
+            )))?
             .query_row(params![subject, host], smallclaims::store::claim_from_row)
             .optional()
             .map_err(Into::into)
@@ -13769,6 +14133,9 @@ impl Store {
     pub fn latest_observation(&self, subject: &str, kind: &str) -> Result<Option<ClaimRecord>> {
         smallclaims::touched::note_read(|| subject.to_owned());
         let claim = self.latest_claim(subject, Some(kind))?;
+        if is_current_value(kind) && kind != "harness.usage" {
+            return Ok(claim);
+        }
         let local = {
             let connection = self.readers.get();
             connection
@@ -13811,7 +14178,10 @@ impl Store {
              JOIN batches ON batches.id=claims.batch_id"
         ))?;
         let rows = statement.query_map(
-            params![serde_json::to_string(subjects)?, at_index.min(i64::MAX as u64)],
+            params![
+                serde_json::to_string(subjects)?,
+                at_index.min(i64::MAX as u64)
+            ],
             claim_from_row,
         )?;
         let mut observations = BTreeMap::<String, BTreeMap<String, ClaimRecord>>::new();
@@ -13819,6 +14189,22 @@ impl Store {
             let claim = claim?;
             observations.entry(claim.subject.clone()).or_default()
                 .insert(claim.kind.clone(), claim);
+        }
+        // Keep the historical bulk seek on its indexes. Joining the UNION view by a
+        // correlated source ID materializes the fleet; overlay only the selected registers.
+        let mut current = connection.prepare_cached(&format!(
+            "SELECT {CLAIM_COLUMNS} FROM registered_claims AS claims
+             WHERE claims.subject IN (SELECT value FROM json_each(?1))
+               AND claims.kind='harness.todo.observed'"
+        ))?;
+        let rows = current.query_map([serde_json::to_string(subjects)?], claim_from_row)?;
+        for claim in rows {
+            let claim = claim?;
+            let kinds = observations.entry(claim.subject.clone()).or_default();
+            if kinds.get(&claim.kind).is_none_or(|legacy|
+                legacy.accepted_at_unix_ms <= claim.accepted_at_unix_ms) {
+                kinds.insert(claim.kind.clone(), claim);
+            }
         }
         Ok(observations)
     }
@@ -16098,7 +16484,7 @@ impl Store {
     ) -> Result<Option<UsageSummary>> {
         let connection = self.readers.get();
         let at_index = at_index.unwrap_or(i64::MAX as u64);
-        let mut statement = connection.prepare(&canonical_sql(
+        let mut statement = connection.prepare(&current_canonical_sql(
             "SELECT store_index, body, accepted_at_unix_ms FROM claims
              WHERE subject=?1 AND kind='harness.usage' AND store_index<=?2
              ORDER BY CANONICAL_ASC(claims)",
@@ -16163,6 +16549,7 @@ impl Store {
         at_index: Option<u64>,
         snapshot: u64,
     ) -> Result<BTreeMap<String, UsageSummary>> {
+        let cache_epoch = self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire);
         let through = at_index.map_or(snapshot, |at| at.min(snapshot));
         let connection = self.readers.get();
         let unique_subjects = subjects
@@ -16256,10 +16643,44 @@ impl Store {
             }
             folded.insert(subject.clone(), CachedUsageFold { through, last_accepted, fold });
         }
-        let summaries = folded.iter()
-            .filter_map(|(subject, cached)| cached.fold.summary().map(|summary| (subject.clone(), summary)))
-            .collect();
+        // Cache only immutable history. A context register can change at the same graph
+        // cut, and its timestamp must not prevent a later numeric claim from resuming.
+        let mut summaries = BTreeMap::new();
+        let mut contexts = BTreeMap::new();
+        let context_subjects = folded.keys().collect::<Vec<_>>();
+        for chunk in context_subjects.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT subject,store_index,body,CAST(source_at AS TEXT)
+                 FROM latest_values INDEXED BY latest_values_kind_key_index
+                 WHERE kind='harness.usage' AND subject IN ({placeholders})",
+            );
+            let mut statement = connection.prepare_cached(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+            })?;
+            for row in rows {
+                let (subject, index, body, accepted) = row?;
+                contexts.insert(subject, (index, body, accepted));
+            }
+        }
+        for (subject, cached) in &folded {
+            let mut fold = cached.fold.clone();
+            if let Some((index, body, accepted)) = contexts.remove(subject) {
+                let source_at = accepted.parse::<u128>().unwrap_or_default();
+                if fold.context.as_ref().is_none_or(|(_, value)| value.observed_at_unix_ms <= source_at) {
+                    fold.apply(index, &body, &accepted, None)?;
+                }
+            }
+            if let Some(summary) = fold.summary() { summaries.insert(subject.clone(), summary); }
+        }
         let mut folds = self.smalltalk.usage_folds.lock().expect("usage folds poisoned");
+        // A replay or prefix reset can race this read; do not repopulate the new
+        // epoch with folds built against its predecessor.
+        if self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire) != cache_epoch {
+            return Ok(summaries);
+        }
         for (subject, cached) in folded {
             folds.keep(subject, cached);
         }
@@ -16944,12 +17365,20 @@ impl Store {
     pub fn latest_actual_value(&self, subject: &str) -> Result<Option<Value>> {
         smallclaims::touched::note_read(|| subject.to_owned());
         let connection = self.readers.get();
-        // The actual state folds only this subject's append-only claims, so the subject's newest
-        // claim identifies it. A write elsewhere in the graph must not make every reconcile pass
-        // re-read and re-parse the history of every stopped runtime.
-        let newest: u64 = connection
-            .prepare_cached("SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1")?
-            .query_row([subject], |row| row.get(0))?;
+        // Actual state also folds the workspace register. Track its source revision beside
+        // the durable frontier; neither unrelated writes nor harness heartbeats invalidate it.
+        let newest = connection
+            .prepare_cached(
+                "SELECT COALESCE(MAX(store_index), 0),
+                (SELECT source_id FROM latest_values WHERE subject=?1 AND kind='workspace.observed')
+             FROM claims WHERE subject=?1",
+            )?
+            .query_row([subject], |row| {
+                Ok(runtime::ActualCacheKey {
+                    durable: row.get(0)?,
+                    workspace: row.get(1)?,
+                })
+            })?;
         if let Some((_, value)) = self
             .smalltalk
             .actual_cache
@@ -17414,12 +17843,16 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                &canonical_sql(
+                &harness_sql(
+                    &connection,
+                    subject,
+                    &canonical_sql(
                     "SELECT body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
              AND json_extract(body, '$.fields.incarnation_id')=?2
              AND json_type(body, '$.fields.provider_auth') IN ('true','false')
              ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ),
+                    ),
+                )?,
                 params![subject, incarnation],
                 |row| row.get::<_, String>(0),
             )
@@ -17486,6 +17919,39 @@ impl Store {
         current_harness_at(&connection, subject, None)
     }
 
+    /// Refresh source times for cached cards with point seeks, without refolding any seat.
+    pub(crate) fn current_harness_stamps(
+        &self,
+        subjects: &[String],
+    ) -> Result<BTreeMap<String, (String, u128)>> {
+        if subjects.is_empty()
+            || self
+                .smalltalk
+                .current_harness_freshness
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+        {
+            return Ok(BTreeMap::new());
+        }
+        let connection = self.readers.get();
+        let mut query = connection.prepare_cached(
+            "SELECT v.subject,
+            coalesce(json_extract(v.body,'$.fields.incarnation_id'),''),
+            min(v.source_at,coalesce(json_extract(v.body,'$.fields.observed_at_ms'),v.source_at))
+            FROM json_each(?1) selected CROSS JOIN latest_values v
+            ON v.subject=selected.value AND v.kind='harness.observed' AND v.slot=''",
+        )?;
+        query
+            .query_map([serde_json::to_string(subjects)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    (row.get(1)?, u128::from(row.get::<_, u64>(2)?)),
+                ))
+            })?
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(Into::into)
+    }
+
     /// The seat's harness for the one question the login attention item asks: does it need a
     /// login? A seat that does not returns without the observation fold, which is what a
     /// full `current_harness` costs, so an attention read no longer folds every seat that ever
@@ -17500,6 +17966,109 @@ impl Store {
         smallclaims::touched::note_read(|| format!("actor:{subject}"));
         let connection = self.readers.get();
         current_harness_fold_at(&connection, subject, None, true, true)
+    }
+    /// Flush retained numeric accounting at a provider stop independently of current status.
+    pub(crate) fn flush_bound_pending_usage(
+        &self,
+        subject: &str,
+        incarnation: &str,
+    ) -> Result<bool, St3Error> {
+        // Preserve the native fence even when there is no pending slot, without a write.
+        check_harness_event_runtime(&self.readers.get(), subject, Some(incarnation))?;
+        if !self.has_pending_usage(subject, incarnation)? {
+            return Ok(false);
+        }
+        self.connection
+            .batched(|tx| {
+                check_harness_event_runtime(tx, subject, Some(incarnation))?;
+                publish_pending_usage_tx(tx, &self.origin, subject, incarnation, now_ms())
+                    .map(|claims| !claims.is_empty())
+            })
+            .map_err(|e| St3Error::new("internal", e))?
+    }
+
+    fn has_pending_usage(&self, subject: &str, incarnation: &str) -> Result<bool, St3Error> {
+        self.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_latest_slots WHERE subject=?1 AND kind='harness.usage'
+             AND (pending_local_id IS NOT NULL OR (
+                json_extract(published_fields,'$.semantics')='response_rollup'
+                AND json_extract(published_fields,'$.incarnation_id')=?2
+                AND json_extract(published_fields,'$.native_session_id') IS NULL
+                AND EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind='harness.session-file'
+                    AND json_extract(body,'$.fields.incarnation_id')=?2
+                    AND json_extract(body,'$.fields.harness')=json_extract(published_fields,'$.driver')))))",
+            params![subject, incarnation], |r| r.get(0)).map_err(internal)
+    }
+
+    /// Flush retained numeric accounting, including providers without a native spool.
+    pub fn flush_pending_usage(&self, subject: &str, incarnation: &str) -> Result<bool, St3Error> {
+        if !self.has_pending_usage(subject, incarnation)? {
+            return Ok(false);
+        }
+        self.connection
+            .batched(|tx| {
+                publish_pending_usage_tx(tx, &self.origin, subject, incarnation, now_ms())
+                    .map(|claims| !claims.is_empty())
+            })
+            .map_err(|e| St3Error::new("internal", e))?
+    }
+
+    /// Keyset batches visit only retained numeric work, including adopted providers.
+    /// Checking status here never appends or replays a categorical observation.
+    pub(crate) fn flush_stopped_usage_batch(
+        &self,
+        after: &str,
+        skipped: &BTreeSet<String>,
+    ) -> Result<PendingUsageBatch, St3Error> {
+        let subjects = {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare_cached(
+                "SELECT subject FROM local_latest_slots INDEXED BY local_latest_pending_usage_index
+                 WHERE kind='harness.usage' AND pending_local_id IS NOT NULL AND subject>?1
+                 ORDER BY subject LIMIT 64").map_err(internal)?;
+            let rows = statement
+                .query_map([after], |row| row.get::<_, String>(0))
+                .map_err(internal)?;
+            let mut subjects = rows
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(internal)?;
+            // Bound index rows as well as returned subjects; DISTINCT would visit every
+            // pending historical slot of one seat before advancing to the next subject.
+            subjects.dedup();
+            subjects
+        };
+        let mut changed = false;
+        let mut failures = Vec::new();
+        for subject in &subjects {
+            if skipped.contains(subject) {
+                continue;
+            }
+            let result = (|| -> Result<bool, St3Error> {
+                let harness = self.current_harness(subject).map_err(internal)?;
+                if harness.as_ref().is_none_or(|harness| {
+                    harness.state != "working"
+                        || harness.reason.as_deref() == Some("providerCapacity")
+                }) {
+                    self.flush_pending_usage(
+                        subject,
+                        harness
+                            .as_ref()
+                            .map_or("", |harness| harness.incarnation_id.as_str()),
+                    )
+                } else {
+                    Ok(false)
+                }
+            })();
+            match result {
+                Ok(updated) => changed |= updated,
+                Err(error) => failures.push((subject.clone(), error.message)),
+            }
+        }
+        Ok(PendingUsageBatch {
+            after: subjects.last().cloned(),
+            changed,
+            failures,
+        })
     }
 
     /// Positive attachment proof under the indexed current-incarnation diagnostic fence.
@@ -17519,7 +18088,8 @@ impl Store {
     pub fn harness_was_ready(&self, subject: &str, incarnation: &str) -> Result<bool> {
         let connection = self.readers.get();
         let found: i64 = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM claims
+            "SELECT EXISTS(SELECT 1 FROM latest_readiness WHERE subject=?1 AND incarnation=?2 AND ready=1)
+             OR EXISTS(SELECT 1 FROM claims
              WHERE subject=?1 AND kind='harness.observed'
                AND json_extract(body, '$.fields.incarnation_id')=?2
                AND json_extract(body, '$.fields.state') IN ('ready','working','idle')
@@ -20130,6 +20700,15 @@ fn registered_client_claim_kind(kind: &str) -> bool {
     st3_schema::is_known_claim(kind)
 }
 
+// Current-state folds share canonical ordering with legacy facts during mixed-build rollout.
+fn canonical_sql(sql: &str) -> String {
+    smallclaims::store::canonical::canonical_sql(sql)
+}
+
+fn current_canonical_sql(sql: &str) -> String {
+    current_sql(&canonical_sql(sql))
+}
+
 const LOCAL_OBSERVATION_COLUMNS: &str = "SELECT id, after_store_index, subject, kind, actor, body, observed_at_unix_ms FROM local_observations";
 
 // MIN(id) makes SQLite walk rowids from the beginning until it finds a match, even with the
@@ -20853,7 +21432,14 @@ fn publish_due_usage_tx(
         )
         .optional()
         .map_err(internal)?;
-    let working = latest_claim_of_kind_tx(transaction, &input.subject, "harness.observed")?
+    let query = harness_sql(transaction, &input.subject, &latest_claim_of_kind_query())
+        .map_err(internal)?;
+    let working = transaction
+        .prepare_cached(&query)
+        .map_err(internal)?
+        .query_row(params![input.subject, "harness.observed"], claim_from_row)
+        .optional()
+        .map_err(internal)?
         .is_some_and(|claim| {
             claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("working")
         });
@@ -20951,7 +21537,7 @@ fn publish_pending_usage_tx(
                 "{LOCAL_OBSERVATION_COLUMNS} WHERE id IN (
                     SELECT pending_local_id FROM local_latest_slots
                     WHERE subject=?1 AND kind='harness.usage' AND pending_local_id IS NOT NULL
-                 ) ORDER BY id"
+                 ) AND coalesce(json_extract(body,'$.fields.semantics'),'')!='context_occupancy' ORDER BY id"
             ))
             .map_err(internal)?;
         let rows = statement
@@ -21189,7 +21775,7 @@ fn renew_nested_ancestor_leases_tx(
 
 fn claim_by_id_tx(connection: &Connection, id: &str) -> Result<Option<ClaimRecord>> {
     connection
-        .prepare_cached("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms FROM claims WHERE id=?1")?
+        .prepare_cached("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms FROM current_claims WHERE id=?1")?
         .query_row(
             [id],
             claim_from_row,
@@ -22456,7 +23042,38 @@ fn latest_actual_at(
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    fold_latest_actual(rows)
+    let legacy = fold_latest_actual(rows)?;
+    let body: Option<String> = connection
+        .query_row(
+            "SELECT body FROM latest_values v WHERE subject=?1 AND kind='workspace.observed'
+             AND source_at>=COALESCE((SELECT CAST(c.accepted_at_unix_ms AS INTEGER)
+                 FROM claims c INDEXED BY claims_subject_kind_accepted_index
+                 WHERE c.subject=v.subject AND c.kind=v.kind AND c.store_index<=?2
+                 ORDER BY length(c.accepted_at_unix_ms) DESC,c.accepted_at_unix_ms DESC LIMIT 1),0)",
+            params![subject, at_index],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match body {
+        Some(body) => {
+            let workspace: Value = serde_json::from_str(&body)?;
+            let fields = workspace.get("fields").unwrap_or(&workspace);
+            // A workspace register survives a placement change. It describes its source
+            // host, and cannot overwrite the new runtime's host or workspace on a read.
+            if legacy
+                .as_ref()
+                .and_then(|actual| actual["host"].as_str())
+                .is_some_and(|host| fields["host"].as_str() != Some(host))
+            {
+                return Ok(legacy);
+            }
+            fold_latest_values([
+                (String::new(), legacy.unwrap_or(Value::Null)),
+                ("workspace.observed".into(), workspace),
+            ])
+        }
+        None => Ok(legacy),
+    }
 }
 
 /// A subject's actual state from its actual-state claims, `(kind, body)` in canonical order.
@@ -22547,13 +23164,14 @@ fn harness_observations_without_incarnation_query() -> String {
 }
 
 fn newest_claims_of_kind_query(columns: &str, kind: &str) -> String {
-    format!(
+    let query = format!(
         "SELECT {columns}
          FROM claims INDEXED BY claims_subject_kind_accepted_index
          JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1 AND claims.kind='{kind}' AND +claims.store_index<=?2
          ORDER BY {CANONICAL_ORDER_DESC}"
-    )
+    );
+    query
 }
 
 fn check_mailbox_incarnation(
@@ -22579,9 +23197,10 @@ fn check_mailbox_incarnation(
     // A runtime observation that does not name this incarnation describes something older: a
     // predecessor, or the daemon's own "exited" for a seat that died while no daemon watched,
     // which names no incarnation at all. Only an observation of this very incarnation is final.
-    let describes_another = fields.get("incarnation_id").and_then(Value::as_str)
-        != Some(fence.incarnation.as_str());
+    let describes_another =
+        fields.get("incarnation_id").and_then(Value::as_str) != Some(fence.incarnation.as_str());
     if !live
+        && fence.epoch == 0
         && (describes_another
             || matches!(
                 fields.get("status").and_then(Value::as_str),
@@ -22589,10 +23208,17 @@ fn check_mailbox_incarnation(
             ))
     {
         let harness: Option<String> = connection
-            .prepare_cached(&format!(
-                "{} LIMIT 1",
-                newest_claims_of_kind_query("claims.body", "harness.observed")
-            ))
+            .prepare_cached(
+                &harness_sql(
+                    connection,
+                    &fence.subject,
+                    &format!(
+                        "{} LIMIT 1",
+                        newest_claims_of_kind_query("claims.body", "harness.observed")
+                    ),
+                )
+                .map_err(internal)?,
+            )
             .map_err(internal)?
             .query_row(params![fence.subject, i64::MAX], |row| row.get(0))
             .optional()
@@ -22614,9 +23240,20 @@ fn check_mailbox_incarnation(
             }
         }
     }
-    if !live
-        || mailbox_harness_ended(connection, &fence.subject, &fence.incarnation, &runtime_claim)
-            .map_err(internal)?
+    if !live {
+        return Err(St3Error::new(
+            "stale-mailbox-session",
+            "this is not the seat's live incarnation",
+        )
+        .with_detail("mailbox_runtime_pending", true));
+    }
+    if mailbox_harness_ended(
+        connection,
+        &fence.subject,
+        &fence.incarnation,
+        &runtime_claim,
+    )
+    .map_err(internal)?
     {
         return Err(St3Error::new(
             "stale-mailbox-session",
@@ -22655,7 +23292,11 @@ fn mailbox_harness_ended(
     let mut latest = None;
     for observed_incarnation in [Some(incarnation), None] {
         let observation: Option<(String, String)> = connection
-            .prepare_cached(&newest_mailbox_harness_state_query())?
+            .prepare_cached(&harness_sql(
+                connection,
+                subject,
+                &newest_mailbox_harness_state_query(),
+            )?)?
             .query_row(params![subject, observed_incarnation], |row| {
                 Ok((row.get(0)?, row.get(1)?))
             })
@@ -22931,6 +23572,23 @@ fn login_evidence_in_epoch(
     incarnation_id: &str,
     runtime_accepted_at: &str,
 ) -> Result<bool> {
+    let current: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM latest_values v
+         WHERE subject=?1 AND kind='harness.observed'
+         AND json_extract(body,'$.fields.incarnation_id')=?2
+         AND v.source_at>=coalesce((SELECT CAST(legacy.accepted_at_unix_ms AS INTEGER)
+             FROM main.claims legacy INDEXED BY claims_subject_kind_accepted_index
+             WHERE legacy.subject=v.subject AND legacy.kind=v.kind AND legacy.store_index<=?3
+             ORDER BY length(legacy.accepted_at_unix_ms) DESC,legacy.accepted_at_unix_ms DESC LIMIT 1),0)
+         AND (json_type(body,'$.fields.provider_auth')='false'
+             OR json_extract(body,'$.fields.reason')='providerAuth'
+             OR json_extract(body,'$.fields.state')='needs-login'))",
+        params![subject, incarnation_id, at_index],
+        |row| row.get(0),
+    )?;
+    if current {
+        return Ok(true);
+    }
     let sql = format!(
         "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_harness_login_candidate_index
            WHERE claims.subject=?1 AND (
@@ -22942,6 +23600,9 @@ fn login_evidence_in_epoch(
                    THEN '$.state' ELSE '$.fields.state' END)='needs-login'))
              OR (kind='harness.diagnostic'
                AND json_extract(body, '$.fields.code')='provider-auth-expired'))
+           AND (kind='harness.diagnostic' OR NOT EXISTS (SELECT 1 FROM latest_values v
+                WHERE v.subject=claims.subject AND v.kind=claims.kind
+                    AND v.source_at>=CAST(claims.accepted_at_unix_ms AS INTEGER)))
            AND store_index<=?2
            AND ({INCARNATION_OF_CLAIM}=?3
                 OR (({INCARNATION_OF_CLAIM} IS NULL OR typeof({INCARNATION_OF_CLAIM})!='text')
@@ -22949,11 +23610,10 @@ fn login_evidence_in_epoch(
                          OR (length(claims.accepted_at_unix_ms)=length(?4)
                              AND claims.accepted_at_unix_ms>=?4)))))"
     );
-    Ok(connection
-        .prepare_cached(&sql)?
-        .query_row(params![subject, at_index, incarnation_id, runtime_accepted_at], |row| {
-            row.get(0)
-        })?)
+    Ok(connection.prepare_cached(&sql)?.query_row(
+        params![subject, at_index, incarnation_id, runtime_accepted_at],
+        |row| row.get(0),
+    )?)
 }
 
 /// `login_only` answers only whether the seat needs a login: it returns at once, before any
@@ -23037,12 +23697,20 @@ fn current_harness_fold_at(
     }
 
     // A native credential refusal is independent of activity, and work claims cannot erase it.
-    let auth = connection.prepare_cached(&canonical_sql(
+    let auth_query = canonical_sql(
         "SELECT id, accepted_at_unix_ms, body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
          AND +store_index<=?2 AND json_extract(body, '$.fields.incarnation_id')=?3
          AND json_type(body, '$.fields.provider_auth') IN ('true','false')
-         ORDER BY CANONICAL_DESC(claims) LIMIT 1"))?.query_row(params![subject, at_index, incarnation_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1");
+    let auth = connection
+        .prepare_cached(&harness_sql(connection, subject, &auth_query)?)?
+        .query_row(params![subject, at_index, incarnation_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
         .optional()?;
     let mut auth_restored = false;
     if let Some((claim, time, body)) = auth {
@@ -23050,6 +23718,10 @@ fn current_harness_fold_at(
         let fields = &body["fields"];
         auth_restored = fields["provider_auth"] == true;
         if fields["provider_auth"] == false {
+            let observed_at = if claim.starts_with(LOCAL_OBSERVATION_ID_PREFIX) {
+                fields["observed_at_ms"].as_u64().map(u128::from)
+                    .unwrap_or(time.parse()?).min(time.parse()?)
+            } else { time.parse()? };
             return Ok(Some(crate::model::CurrentHarnessView {
                 state: "needs-login".into(),
                 driver: fields["driver"].as_str().map(str::to_owned),
@@ -23062,7 +23734,7 @@ fn current_harness_fold_at(
                 exit: None,
                 claim,
                 since_unix_ms: time.parse()?,
-                observed_at_unix_ms: time.parse()?,
+                observed_at_unix_ms: observed_at,
             }));
         }
     }
@@ -23135,7 +23807,11 @@ fn current_harness_fold_at(
         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
     };
     let mut unnamed = connection
-        .prepare_cached(&harness_observations_without_incarnation_query())?
+        .prepare_cached(&harness_sql(
+            connection,
+            subject,
+            &harness_observations_without_incarnation_query(),
+        )?)?
         .query_map(params![subject, at_index, runtime_key.0.to_string()], row)?
         .map(|row| {
             smallclaims::read_budget::check()?;
@@ -23147,7 +23823,11 @@ fn current_harness_fold_at(
         .collect::<Result<Vec<_>>>()?;
     unnamed.sort_by(|a, b| b.0.cmp(&a.0));
     let mut unnamed = unnamed.into_iter().peekable();
-    let mut statement = connection.prepare_cached(&harness_observations_of_incarnation_query())?;
+    let mut statement = connection.prepare_cached(&harness_sql(
+        connection,
+        subject,
+        &harness_observations_of_incarnation_query(),
+    )?)?;
     let mut named = statement.query_map(params![subject, at_index, incarnation_id], row)?;
     let mut next_named = None;
     let mut current = None;
@@ -23337,6 +24017,28 @@ fn agent_working_since_at(
     incarnation: &str,
     snapshot_index: u64,
 ) -> Result<Option<u128>> {
+    let register: Option<(String, String)> = connection
+        .query_row(
+            "SELECT body,source_at FROM latest_values v WHERE subject=?1 AND kind='harness.observed'
+             AND source_at>=COALESCE((SELECT CAST(c.accepted_at_unix_ms AS INTEGER)
+                 FROM claims c INDEXED BY claims_subject_kind_accepted_index
+                 WHERE c.subject=v.subject AND c.kind=v.kind AND c.store_index<=?2
+                 ORDER BY length(c.accepted_at_unix_ms) DESC,c.accepted_at_unix_ms DESC LIMIT 1),0)",
+            params![agent, snapshot_index],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)?.to_string())),
+        )
+        .optional()?;
+    if let Some((body, at)) = register {
+        let body: Value = serde_json::from_str(&body)?;
+        return Ok((body["fields"]["incarnation_id"] == incarnation
+            && body["fields"]["state"] == "working")
+            .then(|| {
+                body["fields"]["observed_since_ms"]
+                    .as_u64()
+                    .map(u128::from)
+                    .unwrap_or_else(|| at.parse().unwrap_or_default())
+            }));
+    }
     // Stream accepted-time groups backwards. Resolve complete canonical keys only for
     // ties, before applying the state fold. Non-working ends the episode; null does not.
     // Tie lookups must share the stream's cut, including for standalone callers.
@@ -25773,6 +26475,19 @@ mod fleet_admission_tests {
         admission
     }
 
+    /// A modern live observation travels separately from signed durable inventory.
+    fn sync_transport(from: &Store, to: &Store, peer: &str) {
+        sync(from, to);
+        let record = from.own_transport_value(peer).unwrap().unwrap();
+        // This fixture configures its live hosts explicitly; it has no sealed membership.
+        let hosts = BTreeSet::from([
+            from.origin().to_owned(),
+            to.origin().to_owned(),
+            peer.to_owned(),
+        ]);
+        to.receive_current_value_for_hosts(&record, &hosts).unwrap();
+    }
+
     fn admitted(store: &Store, claim: &ClaimRecord) -> bool {
         store.claim_by_id(&claim.id).unwrap().is_some()
     }
@@ -26685,7 +27400,7 @@ mod fleet_admission_tests {
         observer
             .record_transport_observation("elm", "up", None, Some(success))
             .unwrap();
-        sync(&observer, &receiver);
+        sync_transport(&observer, &receiver, "elm");
         let expected = vec![("cedar".into(), "elm".into())];
         assert_eq!(
             receiver
@@ -26716,7 +27431,8 @@ mod fleet_admission_tests {
             .claims_for("host/elm", Some("transport.observed"))
             .unwrap()
             .len();
-        assert_eq!(count, 2);
+        assert_eq!(count, 0);
+        let current_id = observer.own_transport_value("elm").unwrap().unwrap().id;
         observer
             .record_transport_observation("elm", "up", None, None)
             .unwrap();
@@ -26727,13 +27443,14 @@ mod fleet_admission_tests {
                 .len(),
             count
         );
-        sync(&observer, &receiver);
+        assert_eq!(observer.own_transport_value("elm").unwrap().unwrap().id,current_id);
+        sync_transport(&observer, &receiver, "elm");
         assert_eq!(receiver.transport_links().unwrap(), expected);
 
         observer
             .record_transport_observation("elm", "unknown", None, None)
             .unwrap();
-        sync(&observer, &receiver);
+        sync_transport(&observer, &receiver, "elm");
         assert!(
             receiver.transport_links().unwrap().is_empty(),
             "latest unknown never revives an earlier up"
@@ -26745,12 +27462,11 @@ mod fleet_admission_tests {
         use smallclaims::store::{TRANSPORT_LINK_CLOCK_SKEW_MS, TRANSPORT_LINK_MAX_AGE_MS};
         let observer = node("cedar", None, None);
         let receiver = node("birch", None, None);
-        let claim = append(
-            &observer,
-            "transport.observed",
-            "host/elm",
-            json!({"status":"up"}),
-        );
+        let claim = observer.append_legacy_claim(&ClaimInput {
+            subject:"host/elm".into(),kind:"transport.observed".into(),actor:None,
+            fields:serde_json::from_value(json!({"status":"up"})).unwrap(),
+            evidence:vec![],expected_subject:None,idempotency_key:None,
+        }).unwrap();
         let accepted = claim.accepted_at_unix_ms;
         sync(&observer, &receiver);
         assert_eq!(
@@ -26802,7 +27518,8 @@ mod fleet_admission_tests {
         observer
             .record_transport_observation("elm", "up", None, None)
             .unwrap();
-        sync(&observer, &receiver);
+        sync_transport(&observer, &receiver, "elm");
+        let original = observer.own_transport_value("elm").unwrap().unwrap().id;
         // Quiet listening links remain available beyond the old 90-second cutoff, without
         // generating refresh claims at each 30-60-second exchange.
         for elapsed in [
@@ -26821,8 +27538,9 @@ mod fleet_admission_tests {
                     .claims_for("host/elm", Some("transport.observed"))
                     .unwrap()
                     .len(),
-                1
+                0
             );
+            assert_eq!(observer.own_transport_value("elm").unwrap().unwrap().id,original);
             assert_eq!(
                 receiver.transport_links().unwrap(),
                 vec![("cedar".into(), "elm".into())]
@@ -26837,12 +27555,13 @@ mod fleet_admission_tests {
                 .claims_for("host/elm", Some("transport.observed"))
                 .unwrap()
                 .len(),
-            2
+            0
         );
         let refreshed = observer
             .latest_claim("host/elm", Some("transport.observed"))
             .unwrap()
             .unwrap();
+        assert_ne!(refreshed.id,original);
         assert_eq!(
             refreshed.body["fields"]["last_success_at"],
             json!(start + TRANSPORT_LINK_REFRESH_MS)
@@ -26855,7 +27574,7 @@ mod fleet_admission_tests {
                 .claims_for("host/elm", Some("transport.observed"))
                 .unwrap()
                 .len(),
-            2
+            0
         );
     }
 
@@ -26883,7 +27602,7 @@ mod fleet_admission_tests {
             observer
                 .record_transport_observation("elm", "up", None, Some(success))
                 .unwrap();
-            sync(&observer, &receiver);
+            sync_transport(&observer, &receiver, "elm");
             assert_eq!(
                 receiver.transport_links_at(read_at).unwrap(),
                 vec![("cedar".into(), "elm".into())]
@@ -33801,6 +34520,65 @@ mod tests {
     }
 
     #[test]
+    fn incremental_projection_preserves_a_publication_without_preserving_fold_caches() {
+        let (controller, worker, _) = replicated_step_pair();
+        worker.start_agent_roster_refresher().unwrap();
+        crate::api::refresh_agent_roster(&worker, false).unwrap();
+        let (cut, rows, at) = worker.published_agent_roster(worker.index().unwrap(), false).unwrap();
+        for n in 0..300 {
+            controller.append_claim(&ClaimInput { subject: format!("custom/roster-prefix/{n}"),
+                kind: "custom.test.marker".into(), actor: None, fields: BTreeMap::new(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None }).unwrap();
+        }
+        let exchange = exchange_from(&controller, &worker.replication_inventory().unwrap());
+        worker.receive_replication_exchange("controller", TEST_FLEET, &exchange).unwrap();
+        worker.validate_replication_backlog().unwrap();
+        let mut yields = 0;
+        worker.project_replication_backlog_with_yield(|| {
+            yields += 1;
+            let (old_cut, old_rows, old_at) = worker.published_agent_roster(worker.index().unwrap(), false)
+                .expect("a committed incremental prefix must not empty the publication");
+            assert_eq!((old_cut, old_at), (cut, at));
+            assert!(Arc::ptr_eq(&old_rows, &rows));
+            assert!(worker.smalltalk.agent_resources_cache.lock().unwrap().is_empty());
+            assert!(worker.smalltalk.agent_page_refs_cache.lock().unwrap().is_empty());
+        }).unwrap();
+        assert!(yields >= 2, "exercise multiple committed projection chunks");
+        assert!(worker.published_agent_roster_at(cut, false).is_some());
+        crate::api::refresh_agent_roster(&worker, false).unwrap();
+        assert_eq!(worker.published_agent_roster(worker.index().unwrap(), false).unwrap().0,
+            worker.index().unwrap());
+        assert!(worker.smalltalk.roster_fallback.lock().unwrap().complete[0].is_none(),
+            "a new coherent publication releases its fallback");
+        worker.smalltalk.forget_views();
+        assert!(worker.published_agent_roster(worker.index().unwrap(), false).is_none());
+        assert!(worker.published_agent_roster_at(cut, false).is_none());
+    }
+
+    #[test]
+    fn an_inflight_roster_fold_cannot_republish_after_a_full_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&root.path().join("graph.sqlite"), "node").unwrap());
+        store.start_agent_roster_refresher().unwrap();
+        let (entered, building) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let other = store.clone();
+        let thread = std::thread::spawn(move || other.read_snapshot(|index| {
+            other.cached_agent_resources(index, false, |_| {
+                entered.send(()).unwrap();
+                released.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                Ok(vec![json!({"id":"agent/old-epoch"})])
+            })
+        }).unwrap());
+        building.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        store.smalltalk.forget_views();
+        release.send(()).unwrap();
+        assert_eq!(thread.join().unwrap()[0]["id"], "agent/old-epoch");
+        assert!(store.published_agent_roster(store.index().unwrap(), false).is_none());
+        assert!(store.smalltalk.agent_resources_cache.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn projection_times_at_names_every_cut_like_the_single_lookup() {
         let store = roster_cache_store();
         let (_, newest) = store.event_bounds().unwrap();
@@ -33853,7 +34631,7 @@ mod tests {
             )
             .unwrap();
         store.apply(&intent, &plan.subject_tokens, "roster-cache").unwrap();
-        store.append_claim(&local_observation_for_test("harness.observed", json!({
+        store.append_legacy_claim(&local_observation_for_test("harness.observed", json!({
             "state":"idle", "driver":"codex", "incarnation_id":"amber-1", "observed_at_ms":1,
         }))).unwrap();
         store
@@ -33895,7 +34673,7 @@ mod tests {
             .unwrap()
             .unwrap();
         for n in 0..8 {
-            let response = store.append_claim(&local_observation_for_test(
+            let response = store.append_legacy_claim(&local_observation_for_test(
                 "harness.observed",
                 json!({"state":"idle", "driver":"codex", "incarnation_id":"amber-1",
                     "observed_at_ms":300_001 + n}),
@@ -35649,7 +36427,7 @@ agent "test/empty" { command "true" }
     fn one_divergent_envelope_exchanges_only_its_inventory_range() {
         let observe = |store: &Store, subject: &str, number: usize| {
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "transport.observed".into(),
                     actor: None,
@@ -37860,7 +38638,7 @@ observer "ordered/file" {
         let store = Store::open_memory("node").unwrap();
         let observe = |subject: &str, runtime_id: &str| {
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "runtime.observed".into(),
                     actor: None,
@@ -37878,7 +38656,7 @@ observer "ordered/file" {
         let first_index = observe("agent/selected", "selected");
         observe("exec/also-runtime", "also-runtime");
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/unrelated".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -38063,7 +38841,7 @@ observer "ordered/file" {
         let store = Store::open_memory("node").unwrap();
         let subject = "agent/cache/modes";
         observe_runtime(&store, subject, "running", "one");
-        store.append_claim(&ClaimInput {
+        store.append_legacy_claim(&ClaimInput {
             subject: subject.into(), kind: "harness.observed".into(), actor: Some(subject.into()),
             fields: BTreeMap::from([
                 ("state".into(), json!("idle")), ("incarnation_id".into(), json!("one")),
@@ -38090,7 +38868,7 @@ observer "ordered/file" {
         observe_runtime(&store, subject, "running", "one");
         for _ in 0..20 {
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "harness.observed".into(),
                     actor: Some(subject.into()),
@@ -38153,6 +38931,7 @@ observer "ordered/file" {
             cache.card_statuses.clear();
             for n in 0..AGENT_CARD_STATUS_LIMIT {
                 cache.card_statuses.insert(format!("agent/fill/{n}"), StatusEntry {
+                    current_revision: 0,
                     read_at: cut, owners: Vec::new(), status: first.subjects[0].clone(), action: None,
                 });
             }
@@ -38375,24 +39154,25 @@ mission "card-owner" state="ready" {
                     &incarnation,
                 );
             } else {
-                store
-                    .append_claim(&ClaimInput {
-                        subject: subject.clone(),
-                        kind: "harness.observed".into(),
-                        actor: Some(subject.clone()),
-                        fields: BTreeMap::from([
-                            (
-                                "state".into(),
-                                Value::String(states[next() % states.len()].into()),
-                            ),
-                            ("incarnation_id".into(), Value::String(incarnation)),
-                            ("driver".into(), Value::String("claude".into())),
-                        ]),
-                        evidence: Vec::new(),
-                        expected_subject: None,
-                        idempotency_key: None,
-                    })
-                    .unwrap();
+                let result = store.append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "harness.observed".into(),
+                    actor: Some(subject.clone()),
+                    fields: BTreeMap::from([
+                        (
+                            "state".into(),
+                            Value::String(states[next() % states.len()].into()),
+                        ),
+                        ("incarnation_id".into(), Value::String(incarnation)),
+                        ("driver".into(), Value::String("claude".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                });
+                if let Err(error) = result {
+                    assert_eq!(error.code, "stale-harness-event-session");
+                }
             }
             if step % 6 != 5 {
                 continue;
@@ -38976,7 +39756,7 @@ version 2
                 .get(subject)
                 .cloned()
         };
-        assert_eq!(cached(&store).unwrap().0, stopped.store_index);
+        assert_eq!(cached(&store).unwrap().0.durable, stopped.store_index);
 
         // Other subjects' writes leave a stopped runtime's folded state valid.
         observe("agent/run/other", "running");
@@ -38993,7 +39773,7 @@ version 2
             store.latest_actual_value(subject).unwrap().unwrap()["status"],
             "running"
         );
-        assert_eq!(cached(&store).unwrap().0, running.store_index);
+        assert_eq!(cached(&store).unwrap().0.durable, running.store_index);
     }
 
     #[test]
@@ -42717,7 +43497,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         for unknown_kind in [false, true] {
             let source = Store::open_memory("source").unwrap();
             let valid = source
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: "host/source".into(),
                     kind: "transport.observed".into(),
                     actor: None,
@@ -42774,7 +43554,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             );
 
             source
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: "host/later".into(),
                     kind: "transport.observed".into(),
                     actor: None,
@@ -42800,7 +43580,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn an_unknown_field_is_retryable_and_an_old_schema_rejection_is_readmitted() {
         let source = Store::open_memory("source").unwrap();
         let claim = source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -42866,7 +43646,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn a_claim_field_from_a_newer_schema_is_unknown_instead_of_invalid() {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -42916,7 +43696,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn one_invalid_blob_does_not_block_an_unrelated_valid_claim() {
         let source = Store::open_memory("source").unwrap();
         let valid = source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -42977,7 +43757,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn same_sequence_candidates_converge_in_any_receipt_order() {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -43195,7 +43975,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             ("running", "inc-1"),
         ] {
             source
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: agent.into(),
                     kind: "runtime.observed".into(),
                     actor: None,
@@ -43211,7 +43991,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         }
         for (state, observed_at) in [("idle", 1_000), ("working", 2_000), ("idle", 3_000)] {
             source
-                .append_claim_outcome(&harness_state(agent, state, observed_at))
+                .append_legacy_claim_outcome(&harness_state(agent, state, observed_at))
                 .unwrap();
         }
         let envelopes = exchange_from(&source, &ReplicationInventory::default()).envelopes;
@@ -43679,8 +44459,16 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
 
         // Different envelopes cannot be compared, so they leave the last comparison standing.
         let compared = diverged.graph_compared_at_unix_ms;
-        left.record_transport_observation("right", "up", None, None)
-            .unwrap();
+        left.append_legacy_claim(&ClaimInput {
+            subject: "host/right".into(),
+            kind: "transport.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([("status".into(), json!("up"))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
         let moved = summary(&left, &right, "left");
         assert_eq!(moved.peer_only_envelopes, 1);
         assert_eq!(moved.graph_compared_at_unix_ms, compared);
@@ -43782,7 +44570,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn an_explicit_repair_keeps_the_bad_record_and_names_its_replacement() {
         let source = Store::open_memory("source").unwrap();
         let replacement = source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -43970,7 +44758,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         let target = Store::open_memory("birch").unwrap();
         let observation = |reason: &str, key: &str| {
             source
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: "daemon/alder".into(),
                     kind: "daemon.diagnostic".into(),
                     actor: None,
@@ -44109,7 +44897,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             let source = Store::open_memory("source").unwrap();
             for index in 0..4 {
                 source
-                    .append_claim(&ClaimInput {
+                    .append_legacy_claim(&ClaimInput {
                         subject: format!("host/source-{index}"),
                         kind: "transport.observed".into(),
                         actor: None,
@@ -44159,7 +44947,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn replication_rejects_tampered_claims() {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -44183,7 +44971,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn insertion_order_hashed_batch() -> ReplicationBatch {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -44351,7 +45139,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn replication_rejects_a_registered_claim_that_violates_the_schema() {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -44431,7 +45219,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     fn replication_relays_each_origin_across_multiple_peers() {
         let source = Store::open_memory("source").unwrap();
         source
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "host/source".into(),
                 kind: "transport.observed".into(),
                 actor: None,
@@ -46237,7 +47025,7 @@ version 2
     /// only `observed_at_ms` would stay in the local observation log.
     fn observe_harness(store: &Store, observed_at_ms: u64) {
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: "agent/example".into(),
                 kind: "harness.observed".into(),
                 actor: Some("agent/example".into()),
@@ -48169,7 +48957,7 @@ mission "nested-work" state="ready" {
         {
             ids.push(
                 store
-                    .append_claim(&ClaimInput {
+                    .append_legacy_claim(&ClaimInput {
                         subject: agent.into(),
                         kind: "harness.observed".into(),
                         actor: Some(agent.into()),
@@ -48516,7 +49304,7 @@ mission "nested-work" state="ready" {
         let local = Store::open_memory("host-one").unwrap();
         let subject = "agent/example.worker";
         let seed = local
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "harness.observed".into(),
                 actor: Some(subject.into()),
@@ -48574,7 +49362,7 @@ mission "nested-work" state="ready" {
             .unwrap();
         assert_eq!(rollup.fields["total_tokens"], 29);
         assert_eq!(rollup.fields["host"], "host-one");
-        local.append_claim(&rollup).unwrap();
+        local.append_legacy_claim(&rollup).unwrap();
         let baseline = rollup.fields["observed_at_unix_ms"].as_u64().unwrap();
         let (repeated, appended) = local.append_claim_outcome(&first).unwrap();
         assert!(!appended);
@@ -48598,7 +49386,7 @@ mission "nested-work" state="ready" {
             .unwrap()
             .unwrap();
         assert_eq!(rollup.fields["total_tokens"], 65);
-        local.append_claim(&rollup).unwrap();
+        local.append_legacy_claim(&rollup).unwrap();
         let mut replay = second.clone();
         replay
             .fields
@@ -48885,7 +49673,7 @@ mission "nested-work" state="ready" {
         let subject = "agent/example.worker";
         let observed = |state: &str, key: &str| {
             local
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "harness.observed".into(),
                     actor: Some(subject.into()),
@@ -49428,7 +50216,7 @@ mission "nested-work" state="ready" {
     }
 
     #[test]
-    fn a_harness_state_replicates_only_when_it_changes() {
+    fn legacy_harness_state_replicates_only_when_it_changes() {
         let store = Store::open_memory("node").unwrap();
         let subject = "agent/node.worker";
         let inventory_before = store.replication_inventory().unwrap().envelopes.len();
@@ -49442,7 +50230,7 @@ mission "nested-work" state="ready" {
             ("working", 903_000, true),
         ] {
             let (record, appended) = store
-                .append_claim_outcome(&harness_state(subject, state, observed_at))
+                .append_legacy_claim_outcome(&harness_state(subject, state, observed_at))
                 .unwrap();
             assert!(appended);
             assert_eq!(
@@ -49455,7 +50243,7 @@ mission "nested-work" state="ready" {
             }
         }
         let (repeated, appended) = store
-            .append_claim_outcome(&harness_state(subject, "idle", 902_000))
+            .append_legacy_claim_outcome(&harness_state(subject, "idle", 902_000))
             .unwrap();
         assert!(!appended);
         assert!(local_observation_position(&repeated).is_some());
@@ -49499,6 +50287,155 @@ mission "nested-work" state="ready" {
     }
 
     #[test]
+    fn stopped_usage_recovery_passes_a_poison_subject_and_preserves_its_slot() {
+        let store = Store::open_memory("node").unwrap();
+        for subject in ["agent/amber", "agent/cobalt"] {
+            let mut runtime = harness_state(subject, "working", 1);
+            runtime.kind = "runtime.observed".into();
+            runtime.fields = BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("incarnation_id".into(), json!("inc-1")),
+            ]);
+            store.append_claim(&runtime).unwrap();
+            store
+                .append_bound_current(&harness_state(subject, "working", now_ms() as u64), "inc-1")
+                .unwrap();
+            for tokens in [10, 20] {
+                store
+                    .append_claim(&harness_usage(subject, "session_cumulative", tokens, 0))
+                    .unwrap();
+            }
+            assert_eq!(
+                store
+                    .claims_for(subject, Some("harness.usage"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            store
+                .append_bound_current(&harness_state(subject, "idle", now_ms() as u64), "inc-1")
+                .unwrap();
+        }
+        store.connection.write().execute(
+            "UPDATE local_observations SET body='{' WHERE id=(SELECT pending_local_id
+             FROM local_latest_slots WHERE subject='agent/amber' AND pending_local_id IS NOT NULL LIMIT 1)", [],
+        ).unwrap();
+        let batch = store
+            .flush_stopped_usage_batch("", &BTreeSet::new())
+            .unwrap();
+        assert_eq!(batch.after.as_deref(), Some("agent/cobalt"));
+        assert!(batch.changed);
+        assert_eq!(batch.failures.len(), 1);
+        assert_eq!(batch.failures[0].0, "agent/amber");
+        assert_eq!(
+            store
+                .claims_for("agent/cobalt", Some("harness.usage"))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(store.has_pending_usage("agent/amber", "inc-1").unwrap());
+        let skipped = BTreeSet::from(["agent/amber".into()]);
+        let retry = store.flush_stopped_usage_batch("", &skipped).unwrap();
+        assert_eq!(retry.after.as_deref(), Some("agent/amber"));
+        assert!(retry.failures.is_empty());
+    }
+
+    #[test]
+    fn accounting_runtime_fence_distinguishes_an_early_launch_from_retirement() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/cedar";
+        let check = || check_harness_event_runtime(&store.readers.get(), subject, Some("inc-1"));
+        assert_eq!(
+            check().unwrap_err().details.get("retired"),
+            Some(&json!(false))
+        );
+        let mut runtime = harness_state(subject, "working", 1);
+        runtime.kind = "runtime.observed".into();
+        runtime.fields = BTreeMap::from([
+            ("status".into(), json!("running")),
+            ("incarnation_id".into(), json!("inc-1")),
+        ]);
+        runtime.idempotency_key = None;
+        store.append_claim(&runtime).unwrap();
+        check().unwrap();
+        runtime
+            .fields
+            .insert("incarnation_id".into(), json!("inc-2"));
+        store.append_claim(&runtime).unwrap();
+        assert_eq!(
+            check().unwrap_err().details.get("retired"),
+            Some(&json!(true))
+        );
+        runtime.fields.insert("status".into(), json!("failed"));
+        store.append_claim(&runtime).unwrap();
+        assert_eq!(
+            check_harness_event_runtime(&store.readers.get(), subject, Some("inc-2"))
+                .unwrap_err()
+                .details
+                .get("retired"),
+            Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn retained_accounting_without_a_spool_flushes_after_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("accounting.sqlite");
+        let subject = "agent/cedar";
+        {
+            let store = Store::open(&path, "node").unwrap();
+            let mut runtime = harness_state(subject, "working", 1);
+            runtime.kind = "runtime.observed".into();
+            runtime.fields = BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("incarnation_id".into(), json!("inc-1")),
+            ]);
+            store.append_claim(&runtime).unwrap();
+            store
+                .append_claim(&harness_state(subject, "working", now_ms() as u64))
+                .unwrap();
+            store
+                .append_latest_observation(
+                    &harness_usage(subject, "session_cumulative", 10, 0),
+                    now_ms(),
+                )
+                .unwrap();
+            store
+                .append_latest_observation(
+                    &harness_usage(subject, "session_cumulative", 20, 0),
+                    now_ms(),
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .claims_for(subject, Some("harness.usage"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert!(!store.flush_stopped_usage_batch("", &BTreeSet::new()).unwrap().changed);
+            store
+                .append_claim(&harness_state(subject, "idle", now_ms() as u64))
+                .unwrap();
+            // No native stop route and no accepted-status callback has performed the flush.
+            assert_eq!(
+                store
+                    .claims_for(subject, Some("harness.usage"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let store = Store::open(&path, "node").unwrap();
+        assert!(store.flush_stopped_usage_batch("", &BTreeSet::new()).unwrap().changed);
+        let claims = store.claims_for(subject, Some("harness.usage")).unwrap();
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[1].body["fields"]["context_used_tokens"], 20);
+        assert!(!store.flush_stopped_usage_batch("", &BTreeSet::new()).unwrap().changed);
+    }
+
+    #[test]
     fn harness_usage_replicates_on_a_schedule_while_working_and_at_once_when_it_stops() {
         let store = Store::open_memory("node").unwrap();
         let subject = "agent/node.worker";
@@ -49522,7 +50459,7 @@ mission "nested-work" state="ready" {
                 })
                 .collect::<Vec<_>>()
         };
-        let occupancy = |tokens: u64| ("context_occupancy".to_owned(), tokens);
+        let occupancy = |tokens: u64| ("session_cumulative".to_owned(), tokens);
         store
             .append_claim_outcome(&harness_state(subject, "working", 1))
             .unwrap();
@@ -49535,13 +50472,13 @@ mission "nested-work" state="ready" {
                 .unwrap()
         };
 
-        assert!(local_observation_position(&usage("context_occupancy", 10, 0, start).0).is_none());
+        assert!(local_observation_position(&usage("session_cumulative", 10, 0, start).0).is_none());
         assert!(
-            local_observation_position(&usage("context_occupancy", 20, 0, start + minute).0)
+            local_observation_position(&usage("session_cumulative", 20, 0, start + minute).0)
                 .is_some()
         );
         assert!(
-            local_observation_position(&usage("context_occupancy", 30, 0, start + 2 * minute).0)
+            local_observation_position(&usage("session_cumulative", 30, 0, start + 2 * minute).0)
                 .is_some()
         );
         assert_eq!(
@@ -49550,33 +50487,33 @@ mission "nested-work" state="ready" {
             "while working, a changed reading waits for the interval"
         );
         assert!(
-            local_observation_position(&usage("session_cumulative", 500, 0, start + 2 * minute).0)
+            local_observation_position(&usage("response_rollup", 500, 0, start + 2 * minute).0)
                 .is_none(),
             "each semantics has its own slot"
         );
         assert!(
-            local_observation_position(&usage("context_occupancy", 5, 1, start + 3 * minute).0)
+            local_observation_position(&usage("session_cumulative", 5, 1, start + 3 * minute).0)
                 .is_none(),
             "a compaction replicates at once"
         );
         assert!(
-            local_observation_position(&usage("context_occupancy", 15, 1, start + 4 * minute).0)
+            local_observation_position(&usage("session_cumulative", 15, 1, start + 4 * minute).0)
                 .is_some()
         );
         assert!(
-            local_observation_position(&usage("context_occupancy", 25, 1, start + 9 * minute).0)
+            local_observation_position(&usage("session_cumulative", 25, 1, start + 9 * minute).0)
                 .is_none(),
             "the interval has passed since the last replicated reading"
         );
         assert!(
-            local_observation_position(&usage("context_occupancy", 35, 1, start + 10 * minute).0)
+            local_observation_position(&usage("session_cumulative", 35, 1, start + 10 * minute).0)
                 .is_some()
         );
         assert_eq!(
             usage_claims(&store),
             [
                 occupancy(10),
-                ("session_cumulative".into(), 500),
+                ("response_rollup".into(), 500),
                 occupancy(5),
                 occupancy(25),
             ]
@@ -49585,6 +50522,7 @@ mission "nested-work" state="ready" {
         store
             .append_claim_outcome(&harness_state(subject, "idle", 2))
             .unwrap();
+        store.flush_pending_usage(subject, "inc-1").unwrap();
         assert_eq!(
             usage_claims(&store).last(),
             Some(&occupancy(35)),
@@ -49596,11 +50534,11 @@ mission "nested-work" state="ready" {
             .unwrap();
         assert_eq!(usage_claims(&store).len(), settled, "nothing was pending");
         assert!(
-            local_observation_position(&usage("context_occupancy", 36, 1, start + 11 * minute).0)
+            local_observation_position(&usage("session_cumulative", 36, 1, start + 11 * minute).0)
                 .is_none(),
             "an idle harness replicates its usage at once"
         );
-        assert_eq!(store.local_observations_after(0, 100).unwrap().len(), 12);
+        assert_eq!(store.local_observations_after(0, 100).unwrap().len(), 10);
     }
 
     #[test]
@@ -54855,7 +55793,7 @@ message "human-attention" {
             .unwrap();
         let append = |name: &str, kind: &str, fields: Value| {
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: format!("agent/node.{name}"),
                     kind: kind.into(),
                     actor: Some(format!("agent/node.{name}")),
@@ -54955,6 +55893,236 @@ message "human-attention" {
         assert_eq!(
             login_subjects(),
             BTreeSet::from(["agent/node.healthy".into()])
+        );
+    }
+
+    #[test]
+    fn login_candidates_follow_register_replacement_without_resurrecting_legacy_auth() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "register-login-candidate")
+            .unwrap();
+        let input = |auth: Value| ClaimInput {
+            subject: "agent/node.worker".into(),
+            kind: "harness.observed".into(),
+            actor: None,
+            fields: serde_json::from_value(json!({
+                "state":"idle", "incarnation_id":"current", "provider_auth":auth,
+            }))
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        store.append_legacy_claim(&input(json!(false))).unwrap();
+        assert_eq!(store.desired_harness_login_candidates().unwrap().len(), 1);
+        store.append_claim(&input(json!(false))).unwrap();
+        assert_eq!(store.desired_harness_login_candidates().unwrap().len(), 1);
+        store.append_claim(&input(Value::Null)).unwrap();
+        assert_eq!(
+            store.desired_harness_login_candidates().unwrap().len(),
+            1,
+            "an unknown sample must retain known credential rejection"
+        );
+        store.append_claim(&input(json!(true))).unwrap();
+        assert!(
+            store.desired_harness_login_candidates().unwrap().is_empty(),
+            "a healthy replacement retracts both its register and shadowed legacy candidate"
+        );
+        store.append_claim(&input(json!(false))).unwrap();
+        assert_eq!(
+            store.desired_harness_login_candidates().unwrap().len(),
+            1,
+            "a new rejection must enter the index again"
+        );
+    }
+
+    #[test]
+    fn login_candidate_sql_cost_does_not_grow_with_healthy_fleet_members() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let mut costs = Vec::new();
+        for size in [32, 320] {
+            let source = format!(
+                "version 2\nagent \"login\" {{ workspace {:?}; harness \"claude\" {{}} }}\n{}",
+                workspace.path().display().to_string(),
+                (0..size)
+                    .map(|n| format!(
+                        "agent \"quiet-{n}\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+                        workspace.path().display().to_string()
+                    ))
+                    .collect::<String>()
+            );
+            let intent = parse_intent(&source, "node").unwrap();
+            let preview = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("candidate-cost-{size}"),
+                )
+                .unwrap();
+            for name in
+                std::iter::once("login".to_owned()).chain((0..size).map(|n| format!("quiet-{n}")))
+            {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: format!("agent/node.{name}"),
+                        kind: "harness.observed".into(),
+                        actor: None,
+                        fields: serde_json::from_value(json!({
+                            "state":"idle", "incarnation_id":"current", "provider_auth":name != "login",
+                        }))
+                        .unwrap(),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            }
+            let connection = store.readers.get();
+            let mut statement = connection
+                .prepare_cached(latest_values::LOGIN_CANDIDATES_SQL)
+                .unwrap();
+            statement.reset_status(rusqlite::StatementStatus::VmStep);
+            statement.reset_status(rusqlite::StatementStatus::FullscanStep);
+            let candidates = statement
+                .query_map([], desired_from_row)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].subject, "agent/node.login");
+            costs.push((
+                statement.get_status(rusqlite::StatementStatus::VmStep),
+                statement.get_status(rusqlite::StatementStatus::FullscanStep),
+            ));
+        }
+        assert!(
+            costs[1].0 <= costs[0].0 + 100,
+            "same positive candidate must not scan healthy declarations or registers: {costs:?}"
+        );
+        assert_eq!(
+            costs[0].1, costs[1].1,
+            "unrelated declarations must not increase full-scan steps"
+        );
+    }
+
+    #[test]
+    fn login_candidate_sql_is_bounded_by_live_fleet_despite_orphan_history() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"login\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string(),
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "legacy-login-cost")
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.login".into(),
+                kind: "harness.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    json!({"state":"idle", "incarnation_id":"current", "provider_auth":false}),
+                )
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let mut costs = Vec::new();
+        let mut previous_size = 0;
+        for size in [364, 4096] {
+            for n in previous_size..size {
+                for sample in 0..2 {
+                    store.append_claim(&ClaimInput {
+                    subject:format!("agent/retired-{n}"),
+                    kind:"harness.diagnostic".into(), actor:None,
+                    fields:serde_json::from_value(json!({"code":"provider-auth-expired", "incarnation_id":"retired", "driver":"claude"})).unwrap(),
+                    evidence:vec![], expected_subject:None, idempotency_key:Some(format!("old-login-{n}-{sample}")),
+                }).unwrap();
+                }
+            }
+            previous_size = size;
+            let connection = store.readers.get();
+            let plan = connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {}",
+                    latest_values::LOGIN_CANDIDATES_SQL
+                ))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|step| step.contains("SEARCH")
+                    && step.contains("claims_harness_login_candidate_index")
+                    && step.contains("subject=?")),
+                "legacy evidence must be sought by declared subject: {plan:?}"
+            );
+
+            let mut statement = connection
+                .prepare_cached(latest_values::LOGIN_CANDIDATES_SQL)
+                .unwrap();
+            statement.reset_status(rusqlite::StatementStatus::VmStep);
+            statement.reset_status(rusqlite::StatementStatus::FullscanStep);
+            let candidates = statement
+                .query_map([], desired_from_row)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].subject, "agent/node.login");
+            costs.push((
+                statement.get_status(rusqlite::StatementStatus::VmStep),
+                statement.get_status(rusqlite::StatementStatus::FullscanStep),
+            ));
+        }
+        println!("login candidate cost at 364 and 4096 orphan subjects: {costs:?}");
+        assert!(
+            costs[1].0 <= costs[0].0 + 100,
+            "a fixed live fleet must not walk orphan subjects or their historical evidence: {costs:?}"
+        );
+        assert_eq!(
+            costs[0].1, costs[1].1,
+            "history must not add full-scan work"
         );
     }
 
@@ -55095,20 +56263,7 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             json!({"state":"working", "incarnation_id":"one", "blocked_on":"human", "ask":"question"}),
         );
         assert_eq!(prompts()[0].episode, again.id);
-        store
-            .append_claim(&ClaimInput {
-                subject: "agent/node.worker".into(),
-                kind: "harness.diagnostic".into(),
-                actor: Some("agent/node.worker".into()),
-                fields: serde_json::from_value(
-                    json!({"code":"native-prompt-gone", "incarnation_id":"one"}),
-                )
-                .unwrap(),
-                evidence: vec![again.id.clone()],
-                expected_subject: None,
-                idempotency_key: Some(attention_snapshot::native_prompt_gone_key(&again.id)),
-            })
-            .unwrap();
+        store.record_native_prompt_gone(&again, "one").unwrap();
         assert!(prompts().is_empty());
         // A prompt from an incarnation that is no longer running waits on nobody.
         append(
@@ -55124,159 +56279,311 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
     /// while it waits, and once. The hook sees the answer; the alert goes once it is answered.
     #[test]
     fn a_claude_permission_prompt_is_answered_once_by_its_person_while_it_waits() {
+        for legacy in [true, false] {
+            let store = Store::open_memory("node").unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let source = format!(
+                "version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+                workspace.path().display().to_string()
+            );
+            let intent = parse_intent(&source, "node").unwrap();
+            let preview = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source,
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply_as(&intent, &preview.subject_tokens, "answer-seat", Some("person/avery"))
+                .unwrap();
+            let seat = "agent/node.worker";
+            let append = |kind: &str, fields: Value| {
+                let input = ClaimInput {
+                        subject: seat.into(),
+                        kind: kind.into(),
+                        actor: Some(seat.into()),
+                        fields: serde_json::from_value(fields).unwrap(),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    };
+                if legacy { store.append_legacy_claim(&input) } else { store.append_claim(&input) }.unwrap()
+            };
+            // The hook waits on its own observation, named by its state record's sequences.
+            assert_eq!(
+                store.native_prompt_state(seat, 1, 3).unwrap(),
+                NativePromptState::Open,
+                "the hook's observation is not published yet"
+            );
+            append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}));
+            let asked = append(
+                "harness.observed",
+                json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                    "blocked_on":"human", "ask":"permission", "reason":"Bash",
+                    "ownership_sequence":1, "transition_sequence":3}),
+            );
+            let prompt = || {
+                store
+                    .attention_items(Some("person/avery"))
+                    .unwrap()
+                    .into_iter()
+                    .find(|item| item.kind == "harness-prompt")
+            };
+            assert_eq!(
+                prompt().unwrap().answers,
+                vec!["allow".to_owned(), "deny".to_owned()]
+            );
+            assert_eq!(
+                store
+                    .answer_native_prompt(seat, &Store::native_prompt_episode(&asked), "allow", "person/other")
+                    .unwrap_err()
+                    .code,
+                "forbidden"
+            );
+            assert_eq!(
+                store
+                    .answer_native_prompt(seat, "an-older-prompt", "allow", "person/avery")
+                    .unwrap_err()
+                    .code,
+                "stale-fence"
+            );
+            assert_eq!(
+                store.native_prompt_state(seat, 1, 3).unwrap(),
+                NativePromptState::Open
+            );
+            store
+                .answer_native_prompt(seat, &Store::native_prompt_episode(&asked), "deny", "person/avery")
+                .unwrap();
+            assert_eq!(
+                store.native_prompt_state(seat, 1, 3).unwrap(),
+                NativePromptState::Answered {
+                    answer: "deny".into()
+                }
+            );
+            assert!(prompt().is_none(), "an answered prompt is no longer an alert");
+            assert!(
+                store
+                    .answer_native_prompt(seat, &Store::native_prompt_episode(&asked), "allow", "person/avery")
+                    .is_err(),
+                "a prompt is answered once"
+            );
+            // Claude acts on the answer and moves on: a hook still waiting sees it gone.
+            append(
+                "harness.observed",
+                json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                    "blocked_on":null, "ask":null, "ownership_sequence":1, "transition_sequence":4}),
+            );
+            assert_eq!(
+                store.native_prompt_state(seat, 1, 3).unwrap(),
+                NativePromptState::Gone
+            );
+            // The next prompt is its own: the earlier prompt's answer never answers it.
+            append(
+                "harness.observed",
+                json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                    "blocked_on":"human", "ask":"permission", "reason":"Write",
+                    "ownership_sequence":1, "transition_sequence":5}),
+            );
+            assert_eq!(
+                store.native_prompt_state(seat, 1, 5).unwrap(),
+                NativePromptState::Open
+            );
+            // Only the tool is stored; the call itself is read from the seat's conversation.
+            assert!(prompt().unwrap().detail.starts_with("Claude asks to use Write;"));
+            // A later observation of the same waiting prompt: an answer to it is still the hook's.
+            let restated = append(
+                "harness.observed",
+                json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                    "blocked_on":"human", "ask":"permission", "reason":"Write",
+                    "provider_auth": true, "ownership_sequence":1, "transition_sequence":6}),
+            );
+            assert_eq!(prompt().unwrap().episode, Store::native_prompt_episode(&restated));
+            store
+                .answer_native_prompt(seat, &Store::native_prompt_episode(&restated), "allow", "person/avery")
+                .unwrap();
+            assert_eq!(
+                store.native_prompt_state(seat, 1, 5).unwrap(),
+                NativePromptState::Answered {
+                    answer: "allow".into()
+                }
+            );
+            // A prompt that does not say what it would run can only be answered in the terminal.
+            append(
+                "harness.observed",
+                json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                    "blocked_on":"human", "ask":"permission", "reason":"permissionRequest",
+                    "ownership_sequence":1, "transition_sequence":7}),
+            );
+            assert!(prompt().unwrap().answers.is_empty());
+            // A question is answered in the terminal: it is an alert without answers.
+            let question = append(
+                "harness.observed",
+                json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                    "blocked_on":"human", "ask":"question"}),
+            );
+            assert!(prompt().unwrap().answers.is_empty());
+            assert_eq!(
+                store
+                    .answer_native_prompt(seat, &Store::native_prompt_episode(&question), "allow", "person/avery")
+                    .unwrap_err()
+                    .code,
+                "stale-fence"
+            );
+        }
+    }
+
+    #[test]
+    fn current_prompt_answers_are_bounded_and_break_on_gaps_owners_epochs_and_ended_runtime() {
         let store = Store::open_memory("node").unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let source = format!(
-            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
-            workspace.path().display().to_string()
-        );
+        let source = format!("version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n", workspace.path().display().to_string());
         let intent = parse_intent(&source, "node").unwrap();
-        let preview = store
-            .mission(
-                &intent,
-                IntentInput {
-                    kdl: source,
-                    source_name: None,
-                },
-            )
-            .unwrap();
-        store
-            .apply_as(&intent, &preview.subject_tokens, "answer-seat", Some("person/avery"))
-            .unwrap();
+        let preview = store.mission(&intent, IntentInput { kdl: source, source_name: None }).unwrap();
+        store.apply_as(&intent, &preview.subject_tokens, "prompt-bounds", Some("person/avery")).unwrap();
         let seat = "agent/node.worker";
-        let append = |kind: &str, fields: Value| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: seat.into(),
-                    kind: kind.into(),
-                    actor: Some(seat.into()),
-                    fields: serde_json::from_value(fields).unwrap(),
-                    evidence: vec![],
-                    expected_subject: None,
-                    idempotency_key: None,
-                })
-                .unwrap()
+        let input = |kind: &str, fields: Value| ClaimInput {
+            subject: seat.into(), kind: kind.into(), actor: Some(seat.into()),
+            fields: serde_json::from_value(fields).unwrap(), evidence: vec![],
+            expected_subject: None, idempotency_key: None,
         };
-        // The hook waits on its own observation, named by its state record's sequences.
-        assert_eq!(
-            store.native_prompt_state(seat, 1, 3).unwrap(),
-            NativePromptState::Open,
-            "the hook's observation is not published yet"
-        );
-        append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}));
-        let asked = append(
-            "harness.observed",
-            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
-                "blocked_on":"human", "ask":"permission", "reason":"Bash",
-                "ownership_sequence":1, "transition_sequence":3}),
-        );
-        let prompt = || {
-            store
-                .attention_items(Some("person/avery"))
-                .unwrap()
-                .into_iter()
-                .find(|item| item.kind == "harness-prompt")
+        store.append_claim(&input("runtime.observed", json!({"status":"running", "incarnation_id":"one"}))).unwrap();
+        let sample = |owner: u64, transition: u64, tool: &str| store.append_claim(&input("harness.observed", json!({
+            "state":"working", "driver":"claude", "incarnation_id":"one", "blocked_on":"human",
+            "ask":"permission", "reason":tool, "ownership_sequence":owner, "transition_sequence":transition
+        }))).unwrap();
+        let mut latest = sample(1, 1, "Write");
+        for transition in 2..=16 { latest = sample(1, transition, "Write"); }
+        assert_eq!(store.native_prompt_state(seat, 1, 1).unwrap(), NativePromptState::Open,
+            "the sixteenth contiguous transition still proves the waiting hook's prompt");
+        assert_eq!(store.native_prompt_state(seat, 1, 10).unwrap(), NativePromptState::Open);
+        let episode = Store::native_prompt_episode(&latest);
+        let heartbeat = sample(1, 16, "Write");
+        assert_ne!(latest.id, heartbeat.id);
+        assert_eq!(Store::native_prompt_episode(&heartbeat), episode);
+        assert_eq!(store.answer_native_prompt(seat, &heartbeat.id, "allow", "person/avery").unwrap_err().code, "stale-fence",
+            "the client must use the alert's opaque episode, not a register ID");
+        store.answer_native_prompt(seat, &episode, "allow", "person/avery").unwrap();
+        assert_eq!(store.native_prompt_state(seat, 1, 10).unwrap(), NativePromptState::Answered { answer: "allow".into() });
+        let overflow = sample(1, 17, "Write");
+        assert_eq!(store.native_prompt_state(seat, 1, 16).unwrap(), NativePromptState::Gone,
+            "the seventeenth transition must fall back to the terminal, not discard the waiter's proof and answer a later hook");
+        assert_eq!(store.answer_native_prompt(seat, &Store::native_prompt_episode(&overflow), "deny", "person/avery").unwrap_err().code, "stale-fence");
+        assert!(store.attention_items(Some("person/avery")).unwrap().iter()
+            .filter(|item| item.kind == "harness-prompt").all(|item| item.answers.is_empty()));
+        assert!(store.receive_current_value(&overflow).is_ok());
+        sample(1, 18, "Write");
+        assert_eq!(store.native_prompt_state(seat, 1, 18).unwrap(), NativePromptState::Gone,
+            "overflow remains terminal-only until the permission chain ends");
+        store.append_claim(&input("harness.observed", json!({"state":"working", "driver":"claude",
+            "incarnation_id":"one", "blocked_on":null, "ask":null, "reason":null,
+            "ownership_sequence":1, "transition_sequence":19}))).unwrap();
+        sample(1, 20, "Write");
+        assert_eq!(store.native_prompt_state(seat, 1, 20).unwrap(), NativePromptState::Open);
+        let gap = sample(1, 22, "Write");
+        assert_eq!(store.native_prompt_state(seat, 1, 20).unwrap(), NativePromptState::Gone,
+            "a dropped intervening transition cannot inherit an earlier answer");
+        assert_eq!(store.native_prompt_state(seat, 1, 22).unwrap(), NativePromptState::Open);
+        assert_eq!(store.answer_native_prompt(seat, &episode, "deny", "person/avery").unwrap_err().code, "stale-fence");
+        sample(1, 23, "Bash");
+        assert_eq!(store.native_prompt_state(seat, 1, 22).unwrap(), NativePromptState::Gone);
+        store.append_claim(&input("harness.observed", json!({"state":"working", "driver":"claude",
+            "incarnation_id":"one", "blocked_on":"human", "ask":"question", "reason":null,
+            "ownership_sequence":1, "transition_sequence":24}))).unwrap();
+        assert_eq!(store.native_prompt_state(seat, 1, 23).unwrap(), NativePromptState::Gone);
+        sample(1, 25, "Bash");
+        sample(2, 26, "Bash");
+        assert_eq!(store.native_prompt_state(seat, 1, 23).unwrap(), NativePromptState::Gone);
+        store.graph.connection.lock().unwrap().execute("UPDATE meta SET value='9876543210123456789' WHERE key='current-value-epoch'", []).unwrap();
+        let restored = sample(2, 27, "Bash");
+        assert_eq!(store.native_prompt_state(seat, 2, 26).unwrap(), NativePromptState::Gone);
+        assert_eq!(store.native_prompt_state(seat, 2, 27).unwrap(), NativePromptState::Open);
+        let mut invalid = restored.clone();
+        invalid.body["_native_prompt_transitions"] = json!((0..17).collect::<Vec<_>>());
+        assert_eq!(store.receive_current_value(&invalid).unwrap_err().code, "invalid-current-value");
+        assert_eq!(store.latest_claim(seat, Some("harness.observed")).unwrap().unwrap().id, restored.id);
+        store.append_claim(&input("runtime.observed", json!({"status":"ended", "incarnation_id":"one"}))).unwrap();
+        assert_eq!(store.native_prompt_state(seat, 2, 27).unwrap(), NativePromptState::Gone);
+        assert_eq!(store.answer_native_prompt(seat, &Store::native_prompt_episode(&restored), "allow", "person/avery").unwrap_err().code, "stale-fence");
+        // Epoch and ownership changes give these prompts distinct opaque identities.
+        assert_ne!(Store::native_prompt_episode(&gap), Store::native_prompt_episode(&restored));
+    }
+
+    #[test]
+    fn native_prompt_clear_preserves_legacy_graph_evidence() {
+        let store = Store::open_memory("node").unwrap();
+        let observation = store.append_legacy_claim(&ClaimInput {
+            subject: "agent/node.worker".into(), kind: "harness.observed".into(),
+            actor: Some("agent/node.worker".into()),
+            fields: serde_json::from_value(json!({"state":"working", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission",
+                "ownership_sequence":7, "transition_sequence":10})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert!(checkpoint::claim_or_tombstone_exists(&store.readers.get(), &observation.id).unwrap());
+        assert_eq!(Store::native_prompt_episode(&observation), observation.id);
+        let old_clear = store.append_claim(&ClaimInput {
+            subject: observation.subject.clone(), kind: "harness.diagnostic".into(),
+            actor: Some(observation.subject.clone()),
+            fields: serde_json::from_value(json!({"code":"native-prompt-gone", "status":"resolved",
+                "driver":"claude", "incarnation_id":"one"})).unwrap(),
+            evidence: vec![observation.id.clone()], expected_subject: None,
+            idempotency_key: Some(native_prompt_gone_key(&observation.id)),
+        }).unwrap();
+        let clear = store.record_native_prompt_gone(&observation, "one").unwrap();
+        assert_eq!(clear.id, old_clear.id, "an existing graph clear keeps its original payload and key");
+        assert_eq!(clear.body["evidence"], json!([observation.id]));
+    }
+
+    #[test]
+    fn native_prompt_register_heartbeats_keep_the_clear_and_a_new_transition_reopens() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!("version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n", workspace.path().display().to_string());
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store.mission(&intent, IntentInput { kdl: source, source_name: None }).unwrap();
+        store.apply_as(&intent, &preview.subject_tokens, "prompt-heartbeat", Some("person/avery")).unwrap();
+        let input = |kind: &str, fields: Value| ClaimInput {
+            subject: "agent/node.worker".into(), kind: kind.into(),
+            actor: Some("agent/node.worker".into()), fields: serde_json::from_value(fields).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
         };
-        assert_eq!(
-            prompt().unwrap().answers,
-            vec!["allow".to_owned(), "deny".to_owned()]
-        );
-        assert_eq!(
-            store
-                .answer_native_prompt(seat, &asked.id, "allow", "person/other")
-                .unwrap_err()
-                .code,
-            "forbidden"
-        );
-        assert_eq!(
-            store
-                .answer_native_prompt(seat, "an-older-prompt", "allow", "person/avery")
-                .unwrap_err()
-                .code,
-            "stale-fence"
-        );
-        assert_eq!(
-            store.native_prompt_state(seat, 1, 3).unwrap(),
-            NativePromptState::Open
-        );
-        store
-            .answer_native_prompt(seat, &asked.id, "deny", "person/avery")
-            .unwrap();
-        assert_eq!(
-            store.native_prompt_state(seat, 1, 3).unwrap(),
-            NativePromptState::Answered {
-                answer: "deny".into()
-            }
-        );
-        assert!(prompt().is_none(), "an answered prompt is no longer an alert");
-        assert!(
-            store
-                .answer_native_prompt(seat, &asked.id, "allow", "person/avery")
-                .is_err(),
-            "a prompt is answered once"
-        );
-        // Claude acts on the answer and moves on: a hook still waiting sees it gone.
-        append(
-            "harness.observed",
-            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
-                "blocked_on":null, "ask":null, "ownership_sequence":1, "transition_sequence":4}),
-        );
-        assert_eq!(
-            store.native_prompt_state(seat, 1, 3).unwrap(),
-            NativePromptState::Gone
-        );
-        // The next prompt is its own: the earlier prompt's answer never answers it.
-        append(
-            "harness.observed",
-            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
-                "blocked_on":"human", "ask":"permission", "reason":"Write",
-                "ownership_sequence":1, "transition_sequence":5}),
-        );
-        assert_eq!(
-            store.native_prompt_state(seat, 1, 5).unwrap(),
-            NativePromptState::Open
-        );
-        // Only the tool is stored; the call itself is read from the seat's conversation.
-        assert!(prompt().unwrap().detail.starts_with("Claude asks to use Write;"));
-        // A later observation of the same waiting prompt: an answer to it is still the hook's.
-        let restated = append(
-            "harness.observed",
-            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
-                "blocked_on":"human", "ask":"permission", "reason":"Write",
-                "provider_auth": true, "ownership_sequence":1, "transition_sequence":6}),
-        );
-        assert_eq!(prompt().unwrap().episode, restated.id);
-        store
-            .answer_native_prompt(seat, &restated.id, "allow", "person/avery")
-            .unwrap();
-        assert_eq!(
-            store.native_prompt_state(seat, 1, 5).unwrap(),
-            NativePromptState::Answered {
-                answer: "allow".into()
-            }
-        );
-        // A prompt that does not say what it would run can only be answered in the terminal.
-        append(
-            "harness.observed",
-            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
-                "blocked_on":"human", "ask":"permission", "reason":"permissionRequest",
-                "ownership_sequence":1, "transition_sequence":7}),
-        );
-        assert!(prompt().unwrap().answers.is_empty());
-        // A question is answered in the terminal: it is an alert without answers.
-        let question = append(
-            "harness.observed",
-            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
-                "blocked_on":"human", "ask":"question"}),
-        );
-        assert!(prompt().unwrap().answers.is_empty());
-        assert_eq!(
-            store
-                .answer_native_prompt(seat, &question.id, "allow", "person/avery")
-                .unwrap_err()
-                .code,
-            "stale-fence"
-        );
+        store.append_claim(&input("runtime.observed", json!({"status":"running", "incarnation_id":"one"}))).unwrap();
+        let sample = |transition: u64| store.append_claim(&input("harness.observed", json!({
+            "state":"working", "incarnation_id":"one", "blocked_on":"human", "ask":"permission",
+            "ownership_sequence":7, "transition_sequence":transition
+        }))).unwrap();
+        let prompts = || store.attention_items(Some("person/avery")).unwrap().into_iter()
+            .filter(|item| item.kind == "harness-prompt").collect::<Vec<_>>();
+        let first = sample(10);
+        let episode = Store::native_prompt_episode(&first);
+        assert_eq!(prompts()[0].episode, episode);
+        let mut restored = first.clone();
+        restored.id = "local-observation/node/different-epoch/1".into();
+        assert_ne!(Store::native_prompt_episode(&restored), episode);
+        let heartbeat = sample(10);
+        assert_ne!(heartbeat.id, first.id);
+        assert_eq!(Store::native_prompt_episode(&heartbeat), episode);
+        assert_eq!(prompts()[0].episode, episode);
+        assert!(store.record_native_prompt_gone(&heartbeat, "other").is_err());
+        let clear = store.record_native_prompt_gone(&heartbeat, "one").unwrap();
+        let reason = clear.body["fields"]["reason"].as_str().unwrap();
+        assert!(reason.starts_with("The native prompt was refused in the terminal. Reference: "));
+        assert!(reason.len() <= 128 && !reason.contains(&episode) && !reason.contains("local-observation/"));
+        assert_eq!(clear.body["evidence"], json!([]));
+        assert!(prompts().is_empty());
+        let later = sample(10);
+        assert_eq!(store.record_native_prompt_gone(&later, "one").unwrap().id, clear.id);
+        assert!(prompts().is_empty(), "a heartbeat must not reopen a refused prompt");
+        let next = sample(11);
+        assert_ne!(Store::native_prompt_episode(&next), episode);
+        assert_eq!(prompts()[0].episode, Store::native_prompt_episode(&next));
+        // Local snapshot references remain inadmissible as arbitrary durable claim evidence.
+        let mut arbitrary = input("harness.diagnostic", json!({"code":"unrelated"}));
+        arbitrary.evidence = vec![next.id];
+        assert_eq!(store.append_claim(&arbitrary).unwrap_err().code, "missing-evidence");
     }
 
     #[test]
@@ -55285,7 +56592,7 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         let subject = "agent/node.worker";
         let runtime = |incarnation: &str, key: &str| {
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "runtime.observed".into(),
                     actor: None,
@@ -55311,7 +56618,7 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
                 fields.insert("incarnation_id".into(), Value::String(incarnation.into()));
             }
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "harness.observed".into(),
                     actor: Some(subject.into()),
@@ -55371,7 +56678,7 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             store.claims_for(subject, None).unwrap().last().map(|claim| claim.id.clone())
         );
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "harness.observed".into(),
                 actor: Some(subject.into()),
@@ -55404,7 +56711,7 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             complete.insert(field.into(), Value::Null);
         }
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "harness.observed".into(),
                 actor: Some(subject.into()),
@@ -55420,7 +56727,7 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         assert_eq!(complete.reason, None);
 
         store
-            .append_claim(&ClaimInput {
+            .append_legacy_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "runtime.readiness-deadline-reached".into(),
                 actor: None,
@@ -55744,7 +57051,7 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         for i in 0..602 {
             let subject = subjects[i % 2];
             store
-                .append_claim(&ClaimInput {
+                .append_legacy_claim(&ClaimInput {
                     subject: subject.into(),
                     kind: "harness.usage".into(),
                     actor: Some(subject.into()),
@@ -56608,6 +57915,7 @@ type ClaimAdmission<'a> = dyn Fn(&Connection) -> Result<(), St3Error> + Sync + '
 
 #[derive(Default)]
 struct ClaimCommitContext<'a> {
+    legacy: bool,
     admission: Option<&'a ClaimAdmission<'a>>,
     signature: Option<&'a str>,
 }
@@ -56622,13 +57930,16 @@ fn append_claim_with_commit_context(
     context: ClaimCommitContext<'_>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_claim_input(input)?;
+    if !context.legacy && is_current_input(input) {
+        return latest_values::append(graph, input, now_ms(), event_runtime);
+    }
     if local_retention(&input.kind)
         || (input.actor.is_none() && system_local_retention(&input.kind))
     {
         return append_local_observation_fenced(graph, input, event_runtime);
     }
     if latest_retention(&input.kind) {
-        return append_latest_observation_fenced(graph, input, now_ms(), event_runtime);
+        return append_legacy_graph_observation_fenced(graph, input, now_ms(), event_runtime);
     }
     let operation = claim_operation(input)?;
     // One claim in a savepoint of the writer's next batch; its caller hears back once that
@@ -56926,9 +58237,6 @@ pub fn validate_claim_input(input: &ClaimInput) -> Result<(), St3Error> {
     Ok(())
 }
 
-/// Record an observation of `local` retention on this node only. It gets no batch, no
-/// envelope and no idempotency row, and it never replicates. A repeated idempotency key
-/// returns the first observation. The record's ID starts with `local-observation/`.
 fn check_harness_event_runtime(
     connection: &Connection,
     subject: &str,
@@ -56949,14 +58257,27 @@ fn check_harness_event_runtime(
     let body: Value = serde_json::from_str(body.as_deref().unwrap_or("null")).map_err(internal)?;
     let fields = body.get("fields").unwrap_or(&body);
     if fields["status"] != "running" || fields["incarnation_id"].as_str() != Some(runtime) {
+        let retired = fields["status"] == "running"
+            && fields["incarnation_id"]
+                .as_str()
+                .is_some_and(|current| current != runtime)
+            || fields["incarnation_id"].as_str() == Some(runtime)
+                && matches!(
+                    fields["status"].as_str(),
+                    Some("exited" | "stopped" | "absent" | "vanished" | "failed")
+                );
         return Err(St3Error::new(
             "stale-harness-event-session",
             "the publishing driver is not this seat's running incarnation",
-        ));
+        )
+        .with_detail("retired", json!(retired)));
     }
     Ok(())
 }
 
+/// Record an observation of `local` retention on this node only. It gets no batch, no
+/// envelope and no idempotency row, and it never replicates. A repeated idempotency key
+/// returns the first observation. The record's ID starts with `local-observation/`.
 fn append_local_observation_fenced(
     graph: &GraphStore,
     input: &ClaimInput,
@@ -56984,7 +58305,22 @@ fn append_latest_observation(
     append_latest_observation_fenced(graph, input, now, None)
 }
 
+#[cfg(test)]
 fn append_latest_observation_fenced(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    now: u128,
+    event_runtime: Option<&str>,
+) -> Result<(ClaimRecord, bool), St3Error> {
+    if is_current_input(input) {
+        return latest_values::append(graph, input, now, event_runtime);
+    }
+    append_legacy_graph_observation_fenced(graph, input, now, event_runtime)
+}
+
+// Numeric readings retain their durable publication policy. Also used to construct authentic
+// older-build history in mixed-version replication/checkpoint tests.
+fn append_legacy_graph_observation_fenced(
     graph: &GraphStore,
     input: &ClaimInput,
     now: u128,

@@ -4,6 +4,7 @@ use super::*;
 use crate::mailbox::{Fence, Frame, Receipt};
 
 mod authority;
+mod startup;
 
 pub(super) async fn subscribe(
     State(state): State<AppState>,
@@ -47,14 +48,55 @@ pub(super) async fn bind(
     let bind_state = state.clone();
     let peer = peer.expect("authorize checked the native peer").0;
     let bound = blocking_action(move || {
-        if !cfg!(target_os = "linux") { return bind_state.store.bind_mailbox(&request); }
-        if let Some(bound) = authority::with_argv_channel(&bind_state, &request, &peer, |member, validate| {
-            bind_state.store.bind_argv_mailbox_checked(&request, member, validate)
-        })? { return Ok(bound); }
-        authority::with_authority(&bind_state, &request, &peer, |owner, validate| {
-            bind_state.store.bind_mailbox_with_lease_checked(&request, Some(owner), validate)
+        if !cfg!(target_os = "linux") {
+            return startup::bind_with_native_startup(&bind_state.store, &request, || {
+                startup::live_native_incarnation(
+                    &bind_state.store,
+                    &bind_state.node,
+                    &bind_state.pty_root,
+                    &peer,
+                    &request,
+                )
+            });
+        }
+        if let Some(bound) =
+            authority::with_argv_channel(&bind_state, &request, &peer, |member, validate| {
+                let admitted = bind_state
+                    .store
+                    .bind_argv_mailbox_checked(&request, member, validate);
+                startup::reclassify_native_startup(&bind_state.store, &request, admitted, || {
+                    validate().is_ok()
+                        && startup::live_native_incarnation(
+                            &bind_state.store,
+                            &bind_state.node,
+                            &bind_state.pty_root,
+                            &peer,
+                            &request,
+                        )
+                })
+            })?
+        {
+            return Ok(bound);
+        }
+        let admitted =
+            authority::with_authority(&bind_state, &request, &peer, |owner, validate| {
+                bind_state
+                    .store
+                    .bind_mailbox_with_lease_checked(&request, Some(owner), validate)
+            });
+        // Successful admission never reads launch evidence again. The only repairable
+        // refusal is the graph's running observation; provider/capability refusals stay final.
+        startup::reclassify_native_startup(&bind_state.store, &request, admitted, || {
+            startup::live_native_incarnation(
+                &bind_state.store,
+                &bind_state.node,
+                &bind_state.pty_root,
+                &peer,
+                &request,
+            )
         })
-    }).await?;
+    })
+    .await?;
     signal_local_change(&state);
     Ok(Json(bound))
 }
@@ -1103,7 +1145,7 @@ mod tests {
         }
         let title = state.store.bind_mailbox(&Fence::new(subject, "current", "title")).unwrap();
         let delivery = state.store.bind_mailbox(&Fence::new(subject, "current", "delivery")).unwrap();
-        let peer = NativeDeliveryPeer { agent: subject.into(), transport: "claude-channel", pid: 7, archives_inbox: true };
+        let peer = NativeDeliveryPeer { start_token: None, agent: subject.into(), transport: "claude-channel", pid: 7, archives_inbox: true };
         let ready = json!({"transport":"claude-channel","ready":true,"channel":{"pid":8,"age_ms":0}}).to_string();
         delivery_presence::record_fenced(&delivery, &ready);
         assert!(attachment(State(state.clone()), Query(title.clone()), Some(Extension(peer.clone()))).await.unwrap().0.attached);
@@ -1215,6 +1257,7 @@ mod tests {
             transport,
             pid: 37,
             archives_inbox: true,
+            start_token: None,
         };
         let app = admitted_fixture_router(state.clone(), peer);
         let path = root.path().join("daemon.sock");
@@ -1347,6 +1390,7 @@ mod tests {
                 transport,
                 pid: 37,
                 archives_inbox: true,
+                start_token: None,
             };
             for (id, phase) in [
                 ("fresh", "sent"),
@@ -1547,6 +1591,7 @@ mod tests {
             transport,
             pid: 37,
             archives_inbox: true,
+            start_token: None,
         };
         let app = admitted_fixture_router(state.clone(), peer);
         let path = root.path().join("daemon.sock");
@@ -1784,6 +1829,7 @@ mod tests {
             transport: "claude-channel",
             pid: 37,
             archives_inbox: false,
+            start_token: None,
         };
         let app = admitted_fixture_router(state.clone(), peer);
         let path = root.path().join("daemon.sock");
@@ -1852,6 +1898,7 @@ mod tests {
                 transport,
                 pid: 37,
                 archives_inbox: false,
+                start_token: None,
             };
             let lose_response = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let injection = lose_response.clone();
@@ -2397,7 +2444,7 @@ mod tests {
         harness_events::enable(&agent_dir, "current").unwrap();
         let sequence = harness_state::claim(&agent_dir, name, "omp", "report-session").unwrap();
         let raw = harness_events::read_runtime_state(&agent_dir, "current").unwrap().unwrap();
-        let peer = NativeDeliveryPeer { agent: subject.clone(), transport: "omp-channel",
+        let peer = NativeDeliveryPeer { start_token: None, agent: subject.clone(), transport: "omp-channel",
             pid: std::process::id(), archives_inbox: true };
         // An explicitly already-admitted fixture lease isolates report consumption.
         // This is not a physical bind/launch authentication certificate.
@@ -3449,6 +3496,7 @@ mod tests {
             transport: "omp-channel",
             pid: 37,
             archives_inbox: false,
+            start_token: None,
         };
         assert!(authorize(&fence, Some(&peer)).is_err());
     }

@@ -20,10 +20,22 @@ const COLLECTIONS: [&str; 8] = [
     "summary-missions",
 ];
 
+/// Registers affect live seat overlays; occupancy can also establish a work usage value.
+fn register_affects(collection: &str, kind: &str) -> bool {
+    match collection {
+        "agents" | "summary" => true,
+        "attention" => kind == "harness.observed",
+        "work" => kind == "harness.usage",
+        _ => false,
+    }
+}
+
 #[derive(Default)]
 struct Revisions {
     index: u64,
     commits: u64,
+    writers: u64,
+    current: [u64; crate::store::CURRENT_VALUE_KINDS.len()],
     local: u64,
     values: [u64; 8],
 }
@@ -77,6 +89,7 @@ pub(super) struct ReadFence {
 /// Held by all sockets using this Store, and by physical workers until they finish.
 /// The registry and commit callback keep only weak references. No follower task is started.
 pub(super) struct Windows {
+    store: Weak<Store>,
     commits: AtomicU64,
     revisions: Mutex<Revisions>,
     /// Held while one socket weighs new commits, so sockets woken by the same commit wait for
@@ -94,7 +107,13 @@ static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 
 impl Windows {
     pub(super) fn commits(&self) -> u64 {
-        self.commits.load(Ordering::Acquire)
+        // Register commits do not enter the graph writer or run its callbacks. Combine the
+        // two monotonic hints so a same-cut register change also invalidates shared windows.
+        let current = self
+            .store
+            .upgrade()
+            .map_or(0, |store| store.runtime.current_observation_revision(""));
+        self.commits.load(Ordering::Acquire).wrapping_add(current)
     }
     pub(super) fn attach(store: &Arc<Store>) -> Option<Arc<Self>> {
         let mut registry = REGISTRY
@@ -113,6 +132,7 @@ impl Windows {
             return None;
         }
         let windows = Arc::new(Self {
+            store: store_key.clone(),
             commits: AtomicU64::new(0),
             revisions: Mutex::new(Revisions::default()),
             weighing: Mutex::new(()),
@@ -204,7 +224,10 @@ impl Windows {
             .observed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let commits = self.commits.load(Ordering::Acquire);
+        let writers = self.commits.load(Ordering::Acquire);
+        let commits = writers.wrapping_add(store.runtime.current_observation_revision(""));
+        let current = crate::store::CURRENT_VALUE_KINDS
+            .map(|kind| store.runtime.current_observation_revision(kind));
         // A slower physical reader can hold an older SQLite snapshot. It cannot update the
         // shared frontier or reuse rows from a newer one.
         if index < revisions.index
@@ -218,29 +241,43 @@ impl Windows {
         let local = observed.local;
         drop(observed);
         if index != revisions.index || commits != revisions.commits {
-            let connection = store.readers.get();
-            let mut kinds = connection.prepare_cached("SELECT kind FROM claims WHERE store_index>?1 AND store_index<=?2 ORDER BY store_index LIMIT ?3")?;
-            let kinds = kinds
-                .query_map(
-                    rusqlite::params![revisions.index, index, KIND_LIMIT + 1],
-                    |row| row.get::<_, String>(0),
-                )?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            // A non-claim commit can change local availability, ordering or lease state.
-            // Overflow, replay/trim and metadata errors must never certify an unchanged view.
-            let all = local != revisions.local
-                || index == revisions.index
-                || kinds.is_empty()
-                || kinds.len() > KIND_LIMIT;
-            let arrangements = store.arrangements_changed(revisions.index, index)?;
+            let graph_changed = index != revisions.index;
+            let kinds = if graph_changed {
+                let connection = store.readers.get();
+                let mut kinds = connection.prepare_cached("SELECT kind FROM claims WHERE store_index>?1 AND store_index<=?2 ORDER BY store_index LIMIT ?3")?;
+                kinds
+                    .query_map(
+                        rusqlite::params![revisions.index, index, KIND_LIMIT + 1],
+                        |row| row.get::<_, String>(0),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+            // Retain the existing conservative rule for managed nonclaim commits, replay,
+            // trim and incomplete claim metadata. Register-only commits use their kind below.
+            let all = (writers != revisions.writers
+                && (local != revisions.local || !graph_changed))
+                || (graph_changed && (kinds.is_empty() || kinds.len() > KIND_LIMIT));
+            let arrangements =
+                graph_changed && store.arrangements_changed(revisions.index, index)?;
             for (position, name) in COLLECTIONS.iter().enumerate() {
+                let register_changed = crate::store::CURRENT_VALUE_KINDS.iter().enumerate().any(
+                    |(kind_index, kind)| {
+                        current[kind_index] != revisions.current[kind_index]
+                            && register_affects(name, kind)
+                    },
+                );
                 if all
+                    || register_changed
                     || (*name == "arrangements" && arrangements)
                     || kinds.iter().any(|kind| !collection_ignores(name, kind))
                 {
                     revisions.values[position] = revisions.values[position].wrapping_add(1);
                 }
             }
+            revisions.writers = writers;
+            revisions.current = current;
             revisions.index = index;
             revisions.commits = commits;
             revisions.local = local;
@@ -643,6 +680,170 @@ mod tests {
             count.load(Ordering::SeqCst),
             2,
             "a new lifetime starts from authority"
+        );
+    }
+
+    #[test]
+    fn stale_to_fresh_heartbeat_invalidates_a_held_window() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let now = client_now_ms() as u64;
+        let publish = |at| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "agent/heartbeat".into(),
+                    kind: "harness.observed".into(),
+                    actor: None,
+                    fields: serde_json::from_value(json!({"state":"working","driver":"codex",
+                "incarnation_id":"one","observed_at_ms":at}))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        publish(now - 90_001);
+        let count = AtomicUsize::new(0);
+        read(&windows, &state, &session, &request("agents"), 0, &count);
+        let commits = windows.commits();
+        let frontier = state
+            .store
+            .current_observation_boundary()
+            .unwrap()
+            .local_cursor;
+        let first = state
+            .store
+            .read_snapshot(|index| windows.revision(&state.store, index, "agents", commits))
+            .unwrap();
+        let recovered = publish(now);
+        assert_eq!(recovered.body["_semantic_transition"], true);
+        assert!(
+            state
+                .store
+                .current_observation_boundary()
+                .unwrap()
+                .local_cursor
+                > frontier
+        );
+        assert!(
+            state
+                .store
+                .read_snapshot(|index| windows.revision(&state.store, index, "agents", commits))
+                .unwrap()
+                .is_none()
+        );
+        read(&windows, &state, &session, &request("agents"), 0, &count);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let next = state
+            .store
+            .read_snapshot(|index| {
+                windows.revision(&state.store, index, "agents", windows.commits())
+            })
+            .unwrap();
+        assert_ne!(first, next);
+    }
+
+    #[test]
+    fn restamped_heartbeats_keep_collection_windows_until_a_semantic_change() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let publish = |at, activity| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "agent/heartbeat".into(),
+                    kind: "harness.observed".into(),
+                    actor: None,
+                    fields: serde_json::from_value(json!({"state":activity,"driver":"codex",
+                    "incarnation_id":"one","observed_at_ms":at}))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let now = client_now_ms() as u64;
+        publish(now, "working");
+        let count = AtomicUsize::new(0);
+        for name in ["agents", "attention"] {
+            read(&windows, &state, &session, &request(name), 0, &count);
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let summary = state
+            .store
+            .read_snapshot(|index| {
+                windows.revision(&state.store, index, "summary", windows.commits())
+            })
+            .unwrap();
+        for at in now + 1..now + 31 {
+            // Capture the real read fence, then commit from another thread before its
+            // snapshot checks that fence. This reproduced the aggregate-restamp race.
+            let commits = windows.commits();
+            let store = state.store.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let writing = barrier.clone();
+            let writer = std::thread::spawn(move || {
+                writing.wait();
+                store
+                    .append_claim(&ClaimInput {
+                        subject: "agent/heartbeat".into(),
+                        kind: "harness.observed".into(),
+                        actor: None,
+                        fields: serde_json::from_value(json!({"state":"working","driver":"codex",
+                        "incarnation_id":"one","observed_at_ms":at}))
+                        .unwrap(),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            });
+            barrier.wait();
+            writer.join().unwrap();
+            let concurrent = state
+                .store
+                .read_snapshot(|index| windows.revision(&state.store, index, "summary", commits))
+                .unwrap();
+            assert_eq!(
+                concurrent, summary,
+                "an unchanged heartbeat must not reject the captured read fence"
+            );
+            for name in ["agents", "attention"] {
+                read(&windows, &state, &session, &request(name), 0, &count);
+            }
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            2,
+            "fresh timestamps must not rebuild held windows"
+        );
+        assert_eq!(
+            state
+                .store
+                .read_snapshot(|index| windows.revision(
+                    &state.store,
+                    index,
+                    "summary",
+                    windows.commits()
+                ))
+                .unwrap(),
+            summary
+        );
+        publish(now + 31, "idle");
+        for name in ["agents", "attention"] {
+            read(&windows, &state, &session, &request(name), 0, &count);
+        }
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            4,
+            "state changes still invalidate the affected windows"
         );
     }
 

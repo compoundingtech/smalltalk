@@ -94,8 +94,9 @@ impl Fixture {
     }
 
     async fn frame(&mut self) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let message = tokio::time::timeout(Duration::from_secs(10), self.socket.next())
+            let message = tokio::time::timeout_at(deadline, self.socket.next())
                 .await
                 .expect("a collection frame")
                 .unwrap()
@@ -148,6 +149,84 @@ fn counts(pairs: &[(&str, usize)]) -> BTreeMap<String, usize> {
     pairs.iter().map(|(id, count)| ((*id).to_owned(), *count)).collect()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chunked_replication_keeps_agents_pages_and_a_followed_window_until_a_fresh_publication() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "prefix-roster");
+    let fleet = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    state.store.bind_fleet(fleet).unwrap();
+    state.store.append_claim(&ClaimInput {
+        subject: "agent/prefix-roster".into(), kind: "runtime.observed".into(), actor: None,
+        fields: serde_json::from_value(json!({"status":"running", "runtime_id":"prefix-roster",
+            "incarnation_id":"one"})).unwrap(), evidence: vec![],
+        expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let source = Store::open_memory("prefix-source").unwrap();
+    source.bind_fleet(fleet).unwrap();
+    for n in 0..300 {
+        source.append_claim(&ClaimInput { subject: format!("custom/prefix/{n}"),
+            kind:"custom.test.marker".into(), actor:None, fields:BTreeMap::new(),
+            evidence:vec![], expected_subject:None, idempotency_key:None }).unwrap();
+    }
+    // Initialize the projection frontier before admitting the new backlog, so this
+    // exercises incremental chunks rather than the missing-health full replay path.
+    state.store.project_replication_backlog().unwrap();
+    state.store.start_agent_roster_refresher().unwrap();
+    crate::api::refresh_agent_roster(&state.store, false).unwrap();
+    let (cut, _, at) = state.store.published_agent_roster(state.store.index().unwrap(), false).unwrap();
+    let mut publications = state.store.subscribe_agent_roster();
+    let revision = *publications.borrow_and_update();
+    let mut fixture = Fixture::open(state.clone(), true, None, &["agents"]).await;
+    let initial = fixture.frame().await;
+    assert_eq!(initial["kind"], "snapshot", "{initial}");
+    let exchange = source.export_replication_exchange(fleet,
+        &state.store.replication_inventory().unwrap()).unwrap();
+    state.store.receive_replication_exchange("prefix-source", fleet, &exchange).unwrap();
+    state.store.validate_replication_backlog().unwrap();
+    let (entered, chunk) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let projecting = state.store.clone();
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut entered = Some(entered);
+        let mut chunks = 0;
+        projecting.project_replication_backlog_with_yield(|| {
+            chunks += 1;
+            if let Some(entered) = entered.take() {
+                entered.send(()).unwrap();
+                released.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        }).unwrap();
+        chunks
+    });
+    tokio::time::timeout(Duration::from_secs(5), chunk).await.unwrap().unwrap();
+    assert_eq!(*publications.borrow(), revision, "fallback retention is no publication");
+    let (Extension(snapshot), Json(page)) = client_agents(State(state.clone()),
+        Extension(new_client_snapshot(&state)), Query(ClientListQuery::default())).await.unwrap();
+    assert_eq!(snapshot.store_index, cut);
+    assert_eq!(snapshot.published_at, Some(client_timestamp(at)));
+    assert_eq!(page.items, initial["items"].as_array().unwrap().clone());
+    fixture.subscribe("across-prefix", "agents").await;
+    let across = fixture.frame().await;
+    assert_eq!(across["kind"], "snapshot", "a boundary must not resync: {across}");
+    assert_eq!(across["items"], initial["items"]);
+    fixture.quiet().await;
+    let error = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+        Query(ClientListQuery { fresh:true, ..ClientListQuery::default() })).await.unwrap_err();
+    assert_eq!(error.code, "agent-roster-not-ready", "fresh cannot serve the fallback");
+    release.send(()).unwrap();
+    assert!(worker.await.unwrap() >= 2, "exercise real multiple projection chunks");
+    crate::api::refresh_agent_roster(&state.store, false).unwrap();
+    let (_, Json(fresh)) = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+        Query(ClientListQuery { fresh:true, ..ClientListQuery::default() })).await.unwrap();
+    // Canonical whole replay gives the same cards as incremental projection and its fallback.
+    state.store.replay_replication_graph().unwrap();
+    crate::api::refresh_agent_roster(&state.store, false).unwrap();
+    let (_, Json(replayed)) = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+        Query(ClientListQuery { fresh:true, ..ClientListQuery::default() })).await.unwrap();
+    assert_eq!(fresh.items, replayed.items);
+    assert_eq!(fresh.items, page.items);
+}
+
 #[tokio::test]
 async fn a_retry_reads_only_the_failed_subscription() {
     let root = tempfile::tempdir().unwrap();
@@ -189,6 +268,87 @@ async fn a_usage_commit_rereads_agents_and_leaves_missions_idle() {
         json!({"code":"fixture", "severity":"error", "reason":"unrelated"}));
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("agents", 3), ("missions", 2)]));
+}
+
+#[tokio::test]
+async fn local_and_received_status_registers_reread_agents_without_missions_or_work() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "alder");
+    let intent=crate::graph::parse_intent("version 2\nagent \"fixture/roster\" { harness \"codex\" {} }","alder").unwrap();
+    state.store.apply_internal(&intent,"declared-current-receive-fixture").unwrap();
+    let mut fixture = Fixture::open(state, false, None, &["missions", "agents", "work"]).await;
+    for _ in 0..3 {
+        assert_eq!(fixture.frame().await["kind"], "snapshot");
+    }
+    fixture.claim(
+        "agent/fixture/roster",
+        "runtime.observed",
+        json!({"status":"running", "incarnation_id":"one"}),
+    );
+    for _ in 0..3 {
+        assert_eq!(fixture.frame().await["kind"], "changes");
+    }
+    fixture.claim(
+        "agent/fixture/roster",
+        "harness.observed",
+        json!({"state":"working", "driver":"codex", "incarnation_id":"one"}),
+    );
+    let changed = fixture.frame().await;
+    assert_eq!(changed["id"], "agents", "{changed}");
+    fixture.quiet().await;
+    assert_eq!(
+        fixture.counts(),
+        counts(&[("agents", 3), ("missions", 2), ("work", 2)])
+    );
+
+    let source = Store::open_memory("alder").unwrap();
+    let received = source
+        .append_claim(&ClaimInput {
+            subject: "agent/fixture/roster".into(),
+            kind: "harness.observed".into(),
+            actor: None,
+            fields: serde_json::from_value(
+                json!({"state":"idle", "driver":"codex", "incarnation_id":"one"}),
+            )
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    assert!(
+        fixture
+            .state
+            .store
+            .receive_current_value(&received)
+            .unwrap()
+    );
+    signal_changed(&fixture.state);
+    let changed = fixture.frame().await;
+    assert_eq!(changed["id"], "agents", "{changed}");
+    fixture.quiet().await;
+    assert_eq!(
+        fixture.counts(),
+        counts(&[("agents", 4), ("missions", 2), ("work", 2)])
+    );
+    // Even without numeric usage, the first occupancy reading establishes a work usage
+    // value. Its window must refresh, while mission cards still have no register input.
+    fixture.claim(
+        "agent/fixture/roster",
+        "harness.usage",
+        json!({"semantics":"context_occupancy", "driver":"codex", "incarnation_id":"one",
+            "context_used_tokens":12}),
+    );
+    let mut changed = BTreeSet::new();
+    for _ in 0..2 {
+        changed.insert(fixture.frame().await["id"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(changed, BTreeSet::from(["agents".into(), "work".into()]));
+    fixture.quiet().await;
+    assert_eq!(
+        fixture.counts(),
+        counts(&[("agents", 5), ("missions", 2), ("work", 3)])
+    );
 }
 
 #[tokio::test]
@@ -238,37 +398,107 @@ async fn an_agents_commit_waits_for_the_roster_publication_instead_of_rereading(
     let state = super::tests::test_state_named(root.path(), "routed-roster");
     let subject = "agent/routed-roster";
     let append = |kind: &str, fields: Value| {
-        state.store.append_claim(&ClaimInput {
-            subject: subject.into(), kind: kind.into(), actor: None,
-            fields: serde_json::from_value(fields).unwrap(),
-            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
-        }).unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: kind.into(),
+                actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
         signal_changed(&state);
     };
-    append("runtime.observed", json!({"status":"running",
-        "runtime_id":"routed-roster", "incarnation_id":"one"}));
+    append(
+        "runtime.observed",
+        json!({"status":"running",
+        "runtime_id":"routed-roster", "incarnation_id":"one"}),
+    );
     let mut published = state.store.subscribe_agent_roster();
     crate::api::start_agent_roster(&state);
-    tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
-        .await.expect("the daemon publishes its roster as it starts").unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        published.wait_for(|revision| *revision > 0),
+    )
+    .await
+    .expect("the daemon publishes its roster as it starts")
+    .unwrap();
     let mut fixture = Fixture::open(state.clone(), true, None, &["agents"]).await;
     let snapshot = fixture.frame().await;
     assert_eq!(snapshot["kind"], "snapshot", "{snapshot}");
-    assert!(snapshot["items"][0]["harness_state"].is_null(), "{snapshot}");
+    assert!(
+        snapshot["items"][0]["harness_state"].is_null(),
+        "{snapshot}"
+    );
     // Let any publication the first read asked for settle, then hold the next refresh back.
     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
-    while tokio::time::timeout(Duration::from_millis(200), fixture.socket.next()).await.is_ok() {}
-    let held = state.store.admit_agent_resources().await;
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < drain_deadline,
+            "roster publications did not settle: {:?}",
+            fixture.counts()
+        );
+        match tokio::time::timeout(Duration::from_millis(200), fixture.socket.next()).await {
+            Err(_) => break,
+            Ok(Some(Ok(frame))) => assert!(
+                !matches!(frame, Message::Close(_)),
+                "collection closed while settling: {frame:?}"
+            ),
+            other => panic!("collection ended while settling: {other:?}"),
+        }
+    }
+    let held = tokio::time::timeout(Duration::from_secs(5), state.store.admit_agent_resources())
+        .await
+        .expect("the settled roster releases builder admission");
     let before = fixture.counts()["agents"];
-    append("harness.observed", json!({"state":"working", "driver":"codex", "incarnation_id":"one"}));
+    let writing = state.clone();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            writing
+                .store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.observed".into(),
+                    actor: None,
+                    fields: serde_json::from_value(
+                        json!({"state":"working", "driver":"codex", "incarnation_id":"one"}),
+                    )
+                    .unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            signal_changed(&writing);
+        }),
+    )
+    .await
+    .expect("a current write must not wait for roster builder admission")
+    .unwrap();
     // Reading now would only serve the roster already held.
     fixture.quiet().await;
-    assert_eq!(fixture.counts()["agents"], before, "no read before the roster is published");
+    assert_eq!(
+        fixture.counts()["agents"],
+        before,
+        "no read before the roster is published"
+    );
     drop(held);
     let changes = fixture.frame().await;
     assert_eq!(changes["kind"], "changes", "{changes}");
-    assert_eq!(changes["upserts"][0]["harness_state"], "working", "{changes}");
-    assert_eq!(fixture.counts()["agents"], before + 1, "one read, of the newer roster");
+    assert_eq!(
+        changes["upserts"][0]["harness_state"], "working",
+        "{changes}"
+    );
+    assert_eq!(
+        fixture.counts()["agents"],
+        before + 1,
+        "one read, of the newer roster"
+    );
 }
 
 /// What a client holds for one window after applying every frame in order.
@@ -368,7 +598,7 @@ fn custom_review_kind(store: &Store) {
 }
 
 fn claim(store: &Store, subject: &str, kind: &str, actor: Option<&str>, fields: Value) {
-    store.append_claim(&ClaimInput {
+    store.append_legacy_claim(&ClaimInput {
         subject: subject.into(), kind: kind.into(), actor: actor.map(str::to_owned),
         fields: serde_json::from_value(fields).unwrap(),
         evidence: vec![], expected_subject: None, idempotency_key: None,

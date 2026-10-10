@@ -1,8 +1,9 @@
 use super::*;
 
+// These controls exercise the retained legacy history and its canonical indexes.
 fn append(store: &Store, kind: &str, fields: Value) -> ClaimRecord {
     store
-        .append_claim(&ClaimInput {
+        .append_legacy_claim(&ClaimInput {
             subject: "agent/grove/cedar".into(),
             kind: kind.into(),
             actor: Some("agent/grove/cedar".into()),

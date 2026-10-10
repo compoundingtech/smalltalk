@@ -25,7 +25,6 @@ struct Daemon {
     socket: PathBuf,
     store: Arc<Store>,
     event_notify: watch::Sender<u64>,
-    server: Option<tokio::task::JoinHandle<()>>,
     isolated_server: Option<(tokio::sync::oneshot::Sender<()>, std::thread::JoinHandle<()>)>,
 }
 
@@ -36,13 +35,12 @@ impl Daemon {
             socket: root.join("st3.sock"),
             store: Arc::new(Store::open(&root.join("daemon.sqlite3"), "restart-node").unwrap()),
             event_notify: watch::channel(0_u64).0,
-            server: None,
             isolated_server: None,
         }
     }
 
     async fn start(&mut self) {
-        self.start_with_binding(false).await;
+        self.start_with_binding(true).await;
     }
 
     /// Protocol/receipt controls with fabricated incarnations and bare channel children.
@@ -69,9 +67,14 @@ impl Daemon {
         }
     }
 
-    // Dropping this runtime also closes upgraded WebSocket connections, just as exiting
-    // the daemon does. Aborting only the listener would leave those tasks alive.
+    // Dropping this runtime closes accepted HTTP requests and upgraded WebSocket
+    // connections, just as exiting the daemon does. Aborting only the listener
+    // would leave those tasks alive.
     async fn start_isolated_app(&mut self, app: axum::Router) {
+        self.start_isolated_app_with_binding(app, true).await;
+    }
+
+    async fn start_isolated_app_with_binding(&mut self, app: axum::Router, native: bool) {
         let socket = self.socket.clone();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let thread = std::thread::spawn(move || {
@@ -82,7 +85,13 @@ impl Daemon {
                 .unwrap();
             runtime.block_on(async {
                 tokio::select! {
-                    result = st3::api::serve_unix_bound(&socket, &socket, app) => {
+                    result = async {
+                        if native {
+                            st3::api::serve_unix_bound(&socket, &socket, app).await
+                        } else {
+                            st3::api::serve_unix(&socket, app).await
+                        }
+                    } => {
                         result.unwrap();
                     }
                     _ = stopped => {}
@@ -99,22 +108,7 @@ impl Daemon {
     }
 
     async fn start_with_binding(&mut self, native: bool) {
-        let state = self.state();
-        let socket = self.socket.clone();
-        self.server = Some(tokio::spawn(async move {
-            let app = st3::api::router(state);
-            if native {
-                let _ = st3::api::serve_unix_bound(&socket, &socket, app).await;
-            } else {
-                let _ = st3::api::serve_unix(&socket, app).await;
-            }
-        }));
-        wait_until(
-            "the daemon accepts connections",
-            Duration::from_secs(5),
-            || std::os::unix::net::UnixStream::connect(&self.socket).is_ok(),
-        )
-        .await;
+        self.start_isolated_app_with_binding(st3::api::router(self.state()), native).await;
     }
 
     /// Stop the API the way an exiting daemon does: the socket file stays and refuses.
@@ -122,10 +116,6 @@ impl Daemon {
         if let Some((stop, thread)) = self.isolated_server.take() {
             let _ = stop.send(());
             tokio::task::spawn_blocking(move || thread.join().unwrap()).await.unwrap();
-        }
-        if let Some(server) = self.server.take() {
-            server.abort();
-            let _ = server.await;
         }
         wait_until(
             "the stopped daemon refuses new connections",
@@ -181,8 +171,9 @@ impl Daemon {
     /// API's write lock fails with `SQLITE_LOCKED`. A waiting read treats that as "not yet".
     fn harness_states(&self, subject: &str, incarnation: &str) -> Vec<String> {
         self.store
-            .claims_for(subject, Some("harness.observed"))
-            .unwrap_or_default()
+            .latest_claim(subject, Some("harness.observed"))
+            .ok()
+            .flatten()
             .into_iter()
             .filter(|claim| {
                 claim
@@ -219,9 +210,6 @@ impl Daemon {
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        if let Some(server) = self.server.take() {
-            server.abort();
-        }
         if let Some((stop, thread)) = self.isolated_server.take() {
             let _ = stop.send(());
             let _ = thread.join();
@@ -285,10 +273,13 @@ fn files_containing(directory: &Path, needle: &str) -> Vec<PathBuf> {
 }
 
 fn assert_alive(child: &mut Child, what: &str) {
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "{what} exited during the daemon outage"
-    );
+    if let Some(status) = child.try_wait().unwrap() {
+        let mut stderr = String::new();
+        if let Some(output) = child.stderr.take() {
+            output.take(8192).read_to_string(&mut stderr).unwrap();
+        }
+        panic!("{what} exited during the daemon outage: {status}; stderr={stderr}");
+    }
 }
 
 fn stop(mut child: Child) -> String {
@@ -850,6 +841,7 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
     daemon.stop().await;
 
     let mut driver = seat_command(root, &daemon.socket)
+        .env("ST_AGENT", seat)
         .args(["driver", "claude", "--subject", seat, "--", "sleep", "300"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -869,7 +861,27 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
     assert_alive(&mut driver, "a starting Claude driver");
     assert!(daemon.harness_states(seat, incarnation).is_empty());
 
-    daemon.start().await;
+    let accepted = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let first = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (seen, gate) = (accepted.clone(), release.clone());
+    let app = st3::api::router(daemon.state()).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let (seen, gate, first) = (seen.clone(), gate.clone(), first.clone());
+            async move {
+                if request.uri().path() == "/v1/messages/page"
+                    && first.swap(false, std::sync::atomic::Ordering::AcqRel)
+                {
+                    seen.notify_one();
+                    gate.notified().await;
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    // Stop must close this accepted request as well as the listener. Its handler is
+    // released only after offline mail is appended, so a surviving old API would leak it.
+    daemon.start_isolated_app(app).await;
     wait_until(
         "the driver records the seat as starting",
         Duration::from_secs(10),
@@ -877,10 +889,14 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
     )
     .await;
 
-    // Now the seat is running. A message accepted just before the next restart is delivered
-    // once the daemon is back, without the driver exiting or writing to the seat's terminal.
+    tokio::time::timeout(Duration::from_secs(10), accepted.notified())
+        .await
+        .expect("the driver has an accepted message-page request");
+    // A message accepted while the API is stopped is delivered once the daemon is
+    // back, without the driver exiting or writing to the seat's terminal.
     daemon.stop().await;
     daemon.send("message/restart-claude-mail", seat, "AMBER LANTERN");
+    release.notify_one();
     wait_until(
         "native delivery observes the daemon outage",
         Duration::from_secs(20),
@@ -891,7 +907,12 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
     )
     .await;
     assert_alive(&mut driver, "a running Claude driver");
-    assert!(files_containing(&root.join("drivers"), "AMBER LANTERN").is_empty());
+    let payload_files = files_containing(&root.join("drivers"), "AMBER LANTERN");
+    assert!(
+        payload_files.is_empty(),
+        "outage payload files: {payload_files:?}; driver log: {}",
+        driver_log(root)
+    );
     daemon.start().await;
     wait_until(
         "native delivery records recovery after the daemon restart",
@@ -949,7 +970,13 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
         "the driver wrote into the seat's terminal: {terminal}"
     );
     let log = driver_log(root);
-    assert!(log.contains("is not reachable"), "{log}");
+    // The barrier makes an accepted request lose its connection. Another in-flight
+    // request may instead observe refusal; both are the daemon outage we require.
+    assert!(
+        log.contains("is not reachable")
+            || log.contains("closed the connection before it answered"),
+        "{log}"
+    );
     assert!(log.contains("may be restarting"), "{log}");
     assert!(
         log.contains("retrying every 1s until the daemon is back"),
@@ -976,6 +1003,7 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
     daemon.start().await;
 
     let mut channel = seat_command(root, &daemon.socket)
+        .env("ST_AGENT", seat)
         .arg("--catalog")
         .arg(root.join("catalog"))
         .args(["driver", "omp-channel", "--identity", "restart-omp"])
@@ -1000,16 +1028,16 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
 
     daemon.stop().await;
     // The harness goes idle and a message arrives while the daemon is down.
-    writeln!(input, "{}", json!({"type": "state", "state": "idle"})).unwrap();
-    input.flush().unwrap();
+    write_channel_frame(&mut input, &mut channel, json!({"type": "state", "state": "idle"}));
     daemon.send("message/restart-omp-mail", seat, "COPPER KITE");
     tokio::time::sleep(Duration::from_millis(2_500)).await;
     assert_alive(&mut channel, "the omp channel");
     assert!(daemon.harness_states(seat, incarnation).is_empty());
 
     daemon.start().await;
+    write_channel_frame(&mut input, &mut channel, json!({"type":"state", "state":"idle"}));
     wait_until(
-        "the channel publishes the state it kept",
+        "the channel publishes a fresh state after the outage",
         Duration::from_secs(10),
         || daemon.harness_states(seat, incarnation) == ["idle"],
     )
@@ -1056,6 +1084,91 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
     assert!(!log.contains("st3 up"), "{log}");
 }
 
+fn write_channel_frame(input: &mut std::process::ChildStdin, channel: &mut Child, frame: Value) {
+    if let Err(error) = writeln!(input, "{frame}").and_then(|_| input.flush()) {
+        let status = channel.try_wait().unwrap();
+        let mut stderr = String::new();
+        if status.is_some() && let Some(output) = channel.stderr.take() {
+            output.take(8192).read_to_string(&mut stderr).unwrap();
+        }
+        panic!("channel frame failed: {error}; exit={status:?}; stderr={stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pi_family_channel_retries_a_cancelled_startup_read_without_ending() {
+    use axum::{Json, http::StatusCode, middleware, response::IntoResponse as _};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    if st3::test_support::supervise_test() { return; }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let seat = "agent/restart-cancelled-omp";
+    let incarnation = "4344:2026-09-27T12:00:00.000Z";
+    let mut daemon = Daemon::new(root);
+    daemon.observe_running(seat, incarnation);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = reads.clone();
+    let context_read = Arc::new(AtomicBool::new(false));
+    let hello = Arc::new(Notify::new());
+    let hello_seen = hello.clone();
+    let app = st3::api::router(daemon.state()).layer(middleware::from_fn(
+        move |request: axum::extract::Request, next: middleware::Next| {
+            let reads = counted.clone();
+            let context_read = context_read.clone();
+            let hello_seen = hello_seen.clone();
+            async move {
+                if request.uri().path() == "/v1/documents" {
+                    let response = next.run(request).await;
+                    context_read.store(true, Ordering::SeqCst);
+                    return response;
+                }
+                // The context lookup immediately precedes hello. Hold the next
+                // status reply until the test has consumed hello, then reproduce
+                // the captured shutdown error on that activation read.
+                if request.uri().path() == "/v1/status"
+                    && context_read.load(Ordering::SeqCst)
+                    && reads.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    hello_seen.notified().await;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                        "code":"internal", "message":"task 19 was cancelled", "details":{}
+                    }))).into_response();
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    daemon.start_isolated_app(app).await;
+    let mut channel = seat_command(root, &daemon.socket)
+        .env("ST_AGENT", seat)
+        .arg("--catalog").arg(root.join("catalog"))
+        .args(["driver", "omp-channel", "--identity", "restart-cancelled-omp"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    let mut input = channel.stdin.take().unwrap();
+    let (frames, received) = std::sync::mpsc::channel::<Value>();
+    let output = channel.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(frame) = serde_json::from_str(&line) { let _ = frames.send(frame); }
+        }
+    });
+    assert_eq!(received.recv_timeout(Duration::from_secs(10)).unwrap()["type"], "hello");
+    hello.notify_one();
+    wait_until("the cancelled startup read is retried", Duration::from_secs(5),
+        || {
+            assert_alive(&mut channel, "the channel during its cancelled startup read");
+            reads.load(Ordering::SeqCst) >= 2
+        }).await;
+    assert_alive(&mut channel, "the channel after its cancelled startup read");
+    write_channel_frame(&mut input, &mut channel, json!({"type":"state", "state":"idle"}));
+    wait_until("the recovered channel publishes idle", Duration::from_secs(10),
+        || daemon.harness_states(seat, incarnation) == ["idle"]).await;
+    assert!(stop(channel).is_empty());
+    assert!(driver_log(root).contains("task 19 was cancelled"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_after_catchup() {
     if st3::test_support::supervise_test() {
@@ -1087,10 +1200,24 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
         ]}], "totals":{"pending":0,"in_progress":1,"completed":0,"blocked":0},
         "truncated":false});
     st_drivers::harness_events::enable(&dir, &incarnation).unwrap();
-    let mut fields = st_drivers::pi_channel::todo_observation(&todo, "omp", Some("native"), &incarnation).unwrap();
+    let mut fields =
+        st_drivers::pi_channel::todo_observation(&todo, "omp", Some("native"), &incarnation)
+            .unwrap();
     fields.get_mut("phases").unwrap()[0]["tasks"][0]["content"] = "Older rejected hydration".into();
     st_drivers::harness_events::write_channel_todo(&dir, &incarnation, &json!(fields)).unwrap();
-    let event = st_drivers::harness_events::pending(&dir, 10).unwrap().remove(0);
+    // Model an actual older-build pending event; modern current writers enqueue nothing.
+    let raw = st_drivers::harness_events::read_snapshot(&dir, "harness-todo")
+        .unwrap()
+        .unwrap();
+    let connection =
+        rusqlite::Connection::open(st_drivers::harness_events::database_path(&dir)).unwrap();
+    connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES (?1,0,'harness-todo',?2)",
+        rusqlite::params![incarnation, String::from_utf8(raw).unwrap()]).unwrap();
+    connection.execute("UPDATE metadata SET value=(SELECT sum(length(CAST(body AS BLOB))) FROM events) WHERE key='pending-bytes'", []).unwrap();
+    drop(connection);
+    let event = st_drivers::harness_events::pending(&dir, 10)
+        .unwrap()
+        .remove(0);
     let mut bad_fields: BTreeMap<String, Value> = serde_json::from_value(event.payload).unwrap();
     bad_fields.remove("incarnation");
     let rejected = ClaimInput {
@@ -1121,8 +1248,10 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
     for frame in [
         json!({"type":"ready", "sessionId":"native"}),
         json!({"type":"state", "state":"idle"}),
-        todo,
-    ] { writeln!(input, "{frame}").unwrap(); }
+        todo.clone(),
+    ] {
+        writeln!(input, "{frame}").unwrap();
+    }
     input.flush().unwrap();
     daemon.send("message/restart-todo-mail", seat, "GRAPH LAG MAIL");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -1138,14 +1267,37 @@ async fn todo_graph_lag_on_first_open_keeps_delivery_and_publishes_hydration_aft
         }
     }
     assert_alive(&mut channel, "the graph-lag channel");
-    assert!(daemon.store.claims_for(seat, Some("harness.todo.observed")).unwrap().is_empty());
+    assert!(
+        daemon
+            .store
+            .claims_for(seat, Some("harness.todo.observed"))
+            .unwrap()
+            .is_empty()
+    );
     daemon.observe_running(seat, &incarnation);
+    let mut fresh_todo = todo;
+    fresh_todo["observed_at"] = "2026-10-03T20:00:02Z".into();
+    writeln!(input, "{fresh_todo}").unwrap();
+    input.flush().unwrap();
     let deadline = Instant::now() + Duration::from_secs(65);
-    while !daemon.store.claims_for(seat, Some("harness.todo.observed")).unwrap_or_default().iter()
-            .any(|claim| claim.body.pointer("/fields/incarnation_id").and_then(Value::as_str)
-                    == Some(incarnation.as_str())
-                && claim.body.pointer("/fields/phases/0/tasks/0/content").and_then(Value::as_str)
-                    == Some("Preserved through graph lag"))
+    while !daemon
+        .store
+        .latest_claim(seat, Some("harness.todo.observed"))
+        .ok()
+        .flatten()
+        .into_iter()
+        .any(|claim| {
+            claim
+                .body
+                .pointer("/fields/incarnation_id")
+                .and_then(Value::as_str)
+                == Some(incarnation.as_str())
+                && claim
+                    .body
+                    .pointer("/fields/phases/0/tasks/0/content")
+                    .and_then(Value::as_str)
+                    == Some("Preserved through graph lag")
+        })
     {
         assert!(Instant::now() < deadline, "hydration after graph catch-up: {}", driver_log(root));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1258,10 +1410,15 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
     daemon.start().await;
     let client = st3::client::Client::unix(&daemon.socket);
     let mut channel = seat_command(root, &daemon.socket)
-        .arg("--catalog").arg(root.join("catalog"))
+        .env("ST_AGENT", seat)
+        .arg("--catalog")
+        .arg(root.join("catalog"))
         .args(["driver", "omp-channel", "--identity", "human-omp"])
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().unwrap();
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     let mut input = channel.stdin.take().unwrap();
 
     writeln!(input, "{}", json!({
@@ -1288,13 +1445,30 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
     })).unwrap();
     writeln!(input, "{}", json!({"type": "state", "state": "active"})).unwrap();
     input.flush().unwrap();
-    wait_until("the channel publishes the answered state", Duration::from_secs(10), || {
-        daemon.harness_states(seat, incarnation) == ["working", "working"]
-    }).await;
-    let status: st3::model::StatusResponse =
-        client.get(&format!("/v1/status?subject={seat}")).await.unwrap();
-    let answered = status.subjects.into_iter().find(|status| status.subject == seat)
-        .unwrap().harness.unwrap();
+    wait_until(
+        "the channel publishes the answered state",
+        Duration::from_secs(10),
+        || {
+            daemon
+                .store
+                .current_harness(seat)
+                .ok()
+                .flatten()
+                .is_some_and(|state| state.state == "working" && state.blocked_on.is_none())
+        },
+    )
+    .await;
+    let status: st3::model::StatusResponse = client
+        .get(&format!("/v1/status?subject={seat}"))
+        .await
+        .unwrap();
+    let answered = status
+        .subjects
+        .into_iter()
+        .find(|status| status.subject == seat)
+        .unwrap()
+        .harness
+        .unwrap();
     assert_eq!(answered.state, "working");
     assert!(answered.blocked_on.is_none());
     assert!(answered.ask.is_none());
@@ -1303,18 +1477,42 @@ agent "human-omp" { workspace "/tmp"; harness "omp" {} }
 
     // A delayed ask from the old channel must not block a resumed runtime's fresh idle proof.
     daemon.observe_running(seat, "human-2");
-    daemon.append(seat, "harness.observed", json!({
-        "state": "idle", "driver": "omp", "incarnation_id": "human-2",
-        "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
-    }));
-    daemon.append(seat, "harness.observed", json!({
-        "state": "working", "driver": "omp", "incarnation_id": incarnation,
-        "blocked_on": "human", "ask": "question", "reason": "An obsolete question",
-    }));
-    let status: st3::model::StatusResponse =
-        client.get(&format!("/v1/status?subject={seat}")).await.unwrap();
-    let resumed = status.subjects.into_iter().find(|status| status.subject == seat)
-        .unwrap().harness.unwrap();
+    daemon.append(
+        seat,
+        "harness.observed",
+        json!({
+            "state": "idle", "driver": "omp", "incarnation_id": "human-2",
+            "blocked_on": null, "ask": null, "reason": null, "input_buffer": null, "exit": null,
+        }),
+    );
+    let stale = daemon
+        .store
+        .append_claim(&ClaimInput {
+            subject: seat.into(),
+            kind: "harness.observed".into(),
+            actor: Some(seat.into()),
+            fields: serde_json::from_value(json!({
+                "state":"working", "driver":"omp", "incarnation_id":incarnation,
+                "blocked_on":"human", "ask":"question", "reason":"An obsolete question",
+            }))
+            .unwrap(),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap_err();
+    assert_eq!(stale.code, "stale-harness-event-session");
+    let status: st3::model::StatusResponse = client
+        .get(&format!("/v1/status?subject={seat}"))
+        .await
+        .unwrap();
+    let resumed = status
+        .subjects
+        .into_iter()
+        .find(|status| status.subject == seat)
+        .unwrap()
+        .harness
+        .unwrap();
     assert_eq!(resumed.state, "idle");
     assert_eq!(resumed.incarnation_id, "human-2");
     assert!(resumed.blocked_on.is_none());

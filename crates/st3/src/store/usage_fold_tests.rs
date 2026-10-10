@@ -101,6 +101,71 @@ fn a_kept_usage_fold_reads_only_the_claims_after_it() {
 }
 
 #[test]
+fn kept_numeric_usage_reads_replaced_context_at_the_same_graph_cut() {
+    let store = Store::open_memory("alder").unwrap();
+    let subject = "agent/context-cache".to_owned();
+    let subjects = std::slice::from_ref(&subject);
+    store.set_write_clock_at(1_000).unwrap();
+    usage(&store, &subject, json!({"semantics":"session_cumulative", "incarnation_id":"one", "total_tokens":100}));
+    usage(&store, &subject, json!({"semantics":"context_occupancy", "incarnation_id":"one", "context_used_tokens":10}));
+    let cut = store.index().unwrap();
+    let first = store.usage_summaries_at(subjects, None).unwrap();
+    assert_eq!(first[&subject].context.as_ref().unwrap().used_tokens, Some(10));
+    usage(&store, &subject, json!({"semantics":"context_occupancy", "incarnation_id":"two", "context_used_tokens":20}));
+    assert_eq!(store.index().unwrap(), cut);
+    let replaced = store.usage_summaries_at(subjects, None).unwrap();
+    assert_eq!(replaced[&subject].context.as_ref().unwrap().used_tokens, Some(20));
+    assert_eq!(replaced.get(&subject), store.usage_summary_at(&subject, None, None).unwrap().as_ref());
+    assert_eq!(replaced[&subject].total_tokens, 100);
+
+    // The register's wall timestamp is newer than this durable claim's acceptance time.
+    // It must never advance the cached numeric fold's canonical timestamp frontier.
+    store.set_write_clock_at(2_000).unwrap();
+    usage(&store, &subject, json!({"semantics":"session_cumulative", "incarnation_id":"one", "total_tokens":150}));
+    let resumed = store.usage_summaries_at(subjects, None).unwrap();
+    assert_eq!(resumed[&subject].total_tokens, 150);
+    assert_eq!(resumed[&subject].context.as_ref().unwrap().used_tokens, Some(20));
+    assert_eq!(resumed.get(&subject), store.usage_summary_at(&subject, None, None).unwrap().as_ref());
+}
+
+#[test]
+fn a_context_only_register_is_visible_without_a_durable_usage_fold() {
+    let store = Store::open_memory("alder").unwrap();
+    let subject = "agent/context-only".to_owned();
+    let subjects = std::slice::from_ref(&subject);
+    assert!(store.usage_summaries_at(subjects, None).unwrap().is_empty());
+    let cut = store.index().unwrap();
+    usage(&store, &subject, json!({"semantics":"context_occupancy", "incarnation_id":"one", "context_used_tokens":0}));
+    assert_eq!(store.index().unwrap(), cut);
+    let summary = store.usage_summaries_at(subjects, None).unwrap();
+    assert_eq!(summary[&subject].total_tokens, 0);
+    assert_eq!(summary[&subject].context.as_ref().unwrap().used_tokens, Some(0));
+    assert_eq!(summary.get(&subject), store.usage_summary_at(&subject, None, None).unwrap().as_ref());
+}
+
+#[test]
+fn current_context_overlays_keep_the_fleet_statement_budget_across_batches() {
+    let store = Store::open_memory("alder").unwrap();
+    let subjects = (0..501).map(|n| format!("agent/context-{n:04}")).collect::<Vec<_>>();
+    for (n, subject) in subjects.iter().enumerate() {
+        usage(&store, subject, json!({"semantics":"context_occupancy", "incarnation_id":"one", "context_used_tokens":n}));
+    }
+    let cut = store.index().unwrap();
+    let work = smallclaims::sqlite::work::SqliteWorkScope::start();
+    let summaries = store.usage_summaries_at(&subjects, Some(cut)).unwrap();
+    let work = work.finish();
+    for (n, subject) in subjects.iter().enumerate() {
+        assert_eq!(summaries[subject].context.as_ref().unwrap().used_tokens, Some(n as u64));
+        assert_eq!(summaries[subject].total_tokens, 0);
+    }
+    assert_eq!(summaries.len(), subjects.len());
+    println!("501 current contexts: {} statements, {} VM steps", work.statements, work.vm_steps);
+    // This part of a cold roster must fit within its unchanged whole-roster allowance.
+    assert!(work.statements as f64 <= 0.33 * subjects.len() as f64, "{work:?}");
+    assert_eq!(store.index().unwrap(), cut);
+}
+
+#[test]
 fn kept_usage_folds_stay_within_their_weight() {
     let fold = |series: usize| {
         let mut spend = BTreeMap::new();

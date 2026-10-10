@@ -582,7 +582,7 @@ impl World {
         // well as the writer's. Pin both to this node's simulated time so omitted source
         // timestamps cannot put host wall time into a seeded claim.
         smallclaims::store::set_thread_clock(Some(self.clock(index) as u128));
-        let appended = self.nodes[index].store.append_claim(&input);
+        let appended = st3::test_support::append_legacy_claim(&self.nodes[index].store, &input);
         smallclaims::store::set_thread_clock(None);
         if let Ok(claim) = appended {
             *self.written.entry(claim.kind.clone()).or_default() += 1;

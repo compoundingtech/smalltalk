@@ -1,10 +1,57 @@
 use super::*;
 use crate::harness_events::Publication;
 
+pub(super) async fn flush_usage(
+    State(state): State<AppState>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
+    Json(request): Json<crate::harness_events::UsageFlush>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(peer) = peer else {
+        return Err(ApiError::bad(St3Error::new(
+            "unbound-harness-event",
+            "accounting stops require a local native driver",
+        )));
+    };
+    if peer.agent != request.subject
+        || !peer.archives_inbox && peer.transport != "pi-channel" && peer.transport != "omp-channel"
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "foreign-harness-event",
+            "only this seat's native driver can flush its accounting",
+        )));
+    }
+    let store = state.store.clone();
+    let changed = blocking_action(move || {
+        store.flush_bound_pending_usage(&request.subject, &request.runtime_incarnation)
+    })
+    .await?;
+    if changed {
+        signal_visible_change(&state);
+    }
+    Ok(Json(json!({"changed": changed})))
+}
+
 pub(super) async fn publish(
     State(state): State<AppState>,
     peer: Option<Extension<NativeDeliveryPeer>>,
     Json(request): Json<Publication>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    publish_with_mode(state, peer, request, false).await
+}
+
+pub(super) async fn publish_current(
+    State(state): State<AppState>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
+    Json(request): Json<Publication>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    publish_with_mode(state, peer, request, true).await
+}
+
+async fn publish_with_mode(
+    state: AppState,
+    peer: Option<Extension<NativeDeliveryPeer>>,
+    request: Publication,
+    current_route: bool,
 ) -> Result<Json<ClaimRecord>, ApiError> {
     let Some(peer) = peer else {
         return Err(ApiError::bad(St3Error::new(
@@ -23,8 +70,19 @@ pub(super) async fn publish(
     }
     let store = state.store.clone();
     let kind = request.claim.kind.clone();
-    let (record, changed, transition) =
-        blocking_action(move || store.append_harness_event_publication(&request)).await?;
+    let current = crate::store::is_current_input(&request.claim);
+    let (record, changed, transition) = blocking_action(move || {
+        if current && current_route {
+            let (record, changed) =
+                store.append_bound_current(&request.claim, &request.runtime_incarnation)?;
+            let transition = request.claim.kind == "harness.observed"
+                && record.body["fields"]["status_transition"] == true;
+            Ok((record, changed, transition))
+        } else {
+            store.append_harness_event_publication(&request)
+        }
+    })
+    .await?;
     finish_claim_publication(&state, &kind, record, changed, Some(transition)).await
 }
 
@@ -112,6 +170,7 @@ mod tests {
                     .uri("/v1/harness-events")
                     .header("content-type", "application/json")
                     .extension(NativeDeliveryPeer {
+                        start_token: None,
                         agent: agent.into(),
                         transport: "claude-channel",
                         pid: 37,
@@ -137,6 +196,94 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(20), state.notify.notified())
             .await
             .is_ok()
+    }
+
+    #[tokio::test]
+    async fn accounting_stop_flushes_when_the_idle_register_was_never_accepted() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        runtime(&state, "native-one");
+        state
+            .store
+            .append_bound_current(&event(1, "working").claim, "native-one")
+            .unwrap();
+        for tokens in [100, 200] {
+            let mut usage = event(tokens, "working");
+            usage.claim.kind = "harness.usage".into();
+            usage.claim.fields.remove("state");
+            usage
+                .claim
+                .fields
+                .insert("semantics".into(), json!("session_cumulative"));
+            usage
+                .claim
+                .fields
+                .insert("total_tokens".into(), json!(tokens));
+            state.store.append_harness_event(&usage).unwrap();
+        }
+        assert_eq!(
+            state
+                .store
+                .claims_for(SEAT, Some("harness.usage"))
+                .unwrap()
+                .last()
+                .unwrap()
+                .body["fields"]["total_tokens"],
+            100
+        );
+        let flush = crate::harness_events::UsageFlush {
+            subject: SEAT.into(),
+            runtime_incarnation: "native-one".into(),
+        };
+        for agent in ["agent/example/foreign", SEAT, SEAT] {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/harness-events/usage-flush")
+                        .header("content-type", "application/json")
+                        .extension(NativeDeliveryPeer {
+                            start_token: None,
+                            agent: agent.into(),
+                            transport: "claude-channel",
+                            pid: 37,
+                            archives_inbox: true,
+                        })
+                        .body(Body::from(serde_json::to_vec(&flush).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if agent == SEAT {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                }
+            );
+        }
+        let usage = state.store.claims_for(SEAT, Some("harness.usage")).unwrap();
+        assert_eq!(
+            usage.len(),
+            2,
+            "stop replay does not duplicate the final accounting claim"
+        );
+        assert_eq!(usage.last().unwrap().body["fields"]["total_tokens"], 200);
+        assert_eq!(
+            state.store.current_harness(SEAT).unwrap().unwrap().state,
+            "working",
+            "the accounting flush succeeds independently of the dropped idle register"
+        );
+        runtime(&state, "native-two");
+        assert_eq!(
+            state
+                .store
+                .flush_bound_pending_usage(SEAT, "native-one")
+                .unwrap_err()
+                .code,
+            "stale-harness-event-session"
+        );
     }
 
     #[tokio::test]

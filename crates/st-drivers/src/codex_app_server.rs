@@ -711,6 +711,7 @@ struct CodexInboxDelivery {
     _watcher: Option<notify::RecommendedWatcher>,
     next_inbox_refresh: Instant,
     next_presence_refresh: Instant,
+    next_observation_refresh: Instant,
     next_context_transcript_refresh: Instant,
     head: Option<message::Message>,
     suppressed: bool,
@@ -879,6 +880,7 @@ impl CodexInboxDelivery {
             _watcher: watcher,
             next_inbox_refresh: Instant::now(),
             next_presence_refresh: Instant::now(),
+            next_observation_refresh: Instant::now(),
             next_context_transcript_refresh: Instant::now(),
             head: None,
             suppressed: false,
@@ -1322,10 +1324,13 @@ impl CodexInboxDelivery {
             self.config
                 .control
                 .refresh(&status::status_path(&self.config.agent_dir));
+            self.next_presence_refresh = now + crate::provider_session::SESSION_REFRESH;
+        }
+        if now >= self.next_observation_refresh {
             if self.harness_evidence {
                 let _ = self.harness_writer.heartbeat();
             }
-            self.next_presence_refresh = now + crate::provider_session::SESSION_REFRESH;
+            self.next_observation_refresh = now + crate::harness_state::HARNESS_STATE_REFRESH;
         }
         let mut due = now >= self.next_inbox_refresh;
         while self.wake.try_recv().is_ok() {

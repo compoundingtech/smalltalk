@@ -1,6 +1,6 @@
 //! st-owned observation outbox. Opt-in is per directory, never process-global: an adopted
 //! provider keeps its transport while a fresh st seat initializes this database before spawn.
-//! A snapshot and its event commit together. The driver removes only acknowledged events;
+//! Current snapshots replace in place without publication jobs. Timeline events remain ordered;
 //! readers of provider-local evidence do not depend on the daemon being reachable.
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,9 +13,12 @@ use serde_json::Value;
 
 use crate::harness_timeline::{Operation, Record};
 
+pub const CURRENT_WAKE_PIPE: &str = ".st-harness-current-wake";
 pub const WAKE_PIPE: &str = ".st-harness-events-wake";
 pub const DATABASE: &str = "st-harness-events.sqlite";
 const MAX_PENDING_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_QUARANTINE_ROWS: u64 = 256;
+const MAX_QUARANTINE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Event {
@@ -55,11 +58,19 @@ fn open(agent_dir: &Path) -> Result<Connection> {
 /// Bind a fresh pipe inode before exposing its name. A predecessor retains its old descriptor
 /// and cannot steal its successor's wakeups. Pipe bytes are hints; startup always replays SQLite.
 pub fn bind_wake_pipe(agent_dir: &Path) -> Result<std::fs::File> {
+    bind_named_wake_pipe(agent_dir, WAKE_PIPE)
+}
+
+pub fn bind_current_wake_pipe(agent_dir: &Path) -> Result<std::fs::File> {
+    bind_named_wake_pipe(agent_dir, CURRENT_WAKE_PIPE)
+}
+
+fn bind_named_wake_pipe(agent_dir: &Path, pipe: &str) -> Result<std::fs::File> {
     use std::os::unix::{
         ffi::OsStrExt as _,
         fs::{FileTypeExt as _, OpenOptionsExt as _},
     };
-    let path = agent_dir.join(WAKE_PIPE);
+    let path = agent_dir.join(pipe);
     if let Ok(metadata) = path.symlink_metadata() {
         anyhow::ensure!(
             metadata.file_type().is_fifo(),
@@ -91,13 +102,18 @@ pub fn bind_wake_pipe(agent_dir: &Path) -> Result<std::fs::File> {
 }
 
 fn signal_wake(agent_dir: &Path) {
+    signal_named_wake(agent_dir, WAKE_PIPE);
+    signal_named_wake(agent_dir, CURRENT_WAKE_PIPE);
+}
+
+fn signal_named_wake(agent_dir: &Path, pipe: &str) {
     use std::io::Write as _;
     use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _};
     let signal = (|| -> io::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(agent_dir.join(WAKE_PIPE))?;
+            .open(agent_dir.join(pipe))?;
         if !file.metadata()?.file_type().is_fifo() {
             return Err(io::Error::other("event wake path is not a pipe"));
         }
@@ -246,15 +262,25 @@ pub fn read_runtime_state(agent_dir: &Path, runtime: &str) -> Result<Option<Vec<
 pub fn read_bound_provider_state(agent_dir: &Path) -> Result<Option<(String, Vec<u8>)>> {
     let mut connection = open(agent_dir)?;
     let tx = connection.transaction()?;
-    let raw: Option<Vec<u8>> = tx.query_row(
-        "SELECT body FROM snapshots WHERE kind='harness-state'", [], |row| row.get(0),
-    ).optional()?;
-    let Some(raw) = raw else { return Ok(None); };
+    let raw: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT body FROM snapshots WHERE kind='harness-state'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
     let state: Value = serde_json::from_slice(&raw)?;
-    let token = state["incarnation"].as_str().filter(|token| !token.is_empty())
+    let token = state["incarnation"]
+        .as_str()
+        .filter(|token| !token.is_empty())
         .ok_or_else(|| anyhow::anyhow!("provider snapshot has no ownership token"))?;
     let runtime: String = tx.query_row(
-        "SELECT value FROM metadata WHERE key=?1", [format!("provider-runtime:{token}")], |row| row.get(0),
+        "SELECT value FROM metadata WHERE key=?1",
+        [format!("provider-runtime:{token}")],
+        |row| row.get(0),
     )?;
     Ok(Some((runtime, raw)))
 }
@@ -273,11 +299,33 @@ fn current_token(connection: &Connection) -> Result<Option<String>> {
 }
 
 pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
+    write_snapshot_with_policy(agent_dir, kind, body, false)
+}
+
+/// Ownership establishment is control, and must not be lost to the current-value writer.
+/// Wait for the local writer before entering the short transaction; never queue a sample.
+pub(crate) fn write_ownership_snapshot(agent_dir: &Path, body: &[u8]) -> Result<()> {
+    write_snapshot_with_policy(agent_dir, "harness-state", body, true)
+}
+
+fn write_snapshot_with_policy(
+    agent_dir: &Path,
+    kind: &str,
+    body: &[u8],
+    ownership: bool,
+) -> Result<()> {
     anyhow::ensure!(
         matches!(kind, "harness-state" | "harness-context" | "harness-todo"),
         "unsupported observation kind"
     );
-    let value: Value = serde_json::from_slice(body)?;
+    let mut value: Value = serde_json::from_slice(body)?;
+    if kind == "harness-context" {
+        value["account_ref"] = std::env::var("ST3_ACCOUNT")
+            .ok()
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+    }
+    let body = serde_json::to_vec(&value)?;
     anyhow::ensure!(
         value["incarnation"]
             .as_str()
@@ -285,34 +333,165 @@ pub fn write_snapshot(agent_dir: &Path, kind: &str, body: &[u8]) -> Result<()> {
         "observation needs an owner"
     );
     let mut connection = open(agent_dir)?;
-    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    if kind == "harness-state" {
-        let token = value["incarnation"].as_str().unwrap();
-        if current_token(&tx)?.as_deref() != Some(token) {
-            tx.execute("DELETE FROM metadata WHERE key LIKE 'provider-runtime:%' OR key LIKE 'timeline-next:%'", [])?;
-            tx.execute(
+    let current_result = (|| -> Result<()> {
+        if !ownership {
+            connection.busy_timeout(Duration::ZERO)?;
+        }
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if kind == "harness-state" {
+            let token = value["incarnation"].as_str().unwrap();
+            if current_token(&tx)?.as_deref() != Some(token) {
+                tx.execute("DELETE FROM metadata WHERE key LIKE 'provider-runtime:%' OR key LIKE 'timeline-next:%'", [])?;
+                tx.execute(
                 "INSERT INTO metadata(key,value) SELECT ?1,value FROM metadata WHERE key='runtime'",
                 [format!("provider-runtime:{token}")],
             )?;
+            }
+        }
+        // Context writers used to have no ownership fence. Refuse a delayed predecessor now that
+        // its snapshot is replaced in the same transaction as the ownership check.
+        if matches!(kind, "harness-context" | "harness-todo") {
+            anyhow::ensure!(
+                current_token(&tx)?.as_deref() == value["incarnation"].as_str(),
+                "harness observation owner was superseded"
+            );
+        }
+        tx.execute(
+            "INSERT INTO snapshots VALUES (?1,?2)
+        ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
+            params![kind, body],
+        )?;
+        // Snapshots are current values. Their wake never appends an ordered publication job.
+        tx.commit()?;
+        signal_wake(agent_dir);
+        Ok(())
+    })();
+    if kind == "harness-state" && current_result.is_err() {
+        return current_result;
+    }
+    if kind == "harness-state"
+        && (!matches!(
+            value["state"].as_str(),
+            Some("active" | "working" | "child")
+        ) || value["reason"] == "providerCapacity")
+        && !(value["state"] == "ended"
+            && value["exit"].is_null()
+            && value["reason"] == "superseded")
+    {
+        // Stop accounting and diagnostics are durable obligations, without categorical
+        // publication. Read the guard before asking for the zero-wait writer.
+        let obligation: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM metadata WHERE key='accounting-fingerprint')
+                OR EXISTS(SELECT 1 FROM timeline)",
+            [],
+            |row| row.get(0),
+        )?;
+        if !obligation && value["reason"] != "providerCapacity" {
+            return current_result;
+        }
+        let accounting: Option<String> = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key='accounting-fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let timeline: bool =
+            connection.query_row("SELECT EXISTS(SELECT 1 FROM timeline)", [], |row| {
+                row.get(0)
+            })?;
+        let obligation = accounting.is_some() || timeline || value["reason"] == "providerCapacity";
+        let fingerprint = serde_json::to_string(&serde_json::json!([
+            value["incarnation"],
+            value["state"],
+            value["reason"],
+            value["sinceMs"],
+            value["exit"],
+            value["harness"],
+            accounting,
+        ]))?;
+        let previous: Option<String> = connection
+            .query_row(
+                "SELECT value FROM metadata WHERE key='state-control-fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() == Some(fingerprint.as_str()) {
+            return current_result;
+        }
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key='state-control-fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if obligation && previous.as_deref() != Some(fingerprint.as_str()) {
+            let control = serde_json::json!({
+                "schema": "st.harness-context.v1", "agent": value["agent"],
+                "harness": value["harness"], "incarnation": value["incarnation"],
+                "observedAtMs": value["writtenAtMs"], "writtenAtMs": value["writtenAtMs"],
+                "accounting_stop": true, "state_control": value,
+            });
+            // Older drivers already consume this kind and ignore the additive stop marker.
+            append_event(&tx, "harness-context", &control)?;
+            tx.execute(
+                "INSERT INTO metadata(key,value) VALUES ('state-control-fingerprint',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [&fingerprint],
+            )?;
+            tx.commit()?;
+            signal_wake(agent_dir);
         }
     }
-    // Context writers used to have no ownership fence. Refuse a delayed predecessor now that
-    // its snapshot and event are admitted in the same transaction as the ownership check.
-    if matches!(kind, "harness-context" | "harness-todo") {
-        anyhow::ensure!(
-            current_token(&tx)?.as_deref() == value["incarnation"].as_str(),
-            "harness observation owner was superseded"
-        );
+    if kind == "harness-context"
+        && (value["sessionTotalTokens"].is_number()
+            || value["rateLimits"]["fiveHour"].is_number()
+            || value["rateLimits"]["sevenDay"].is_number())
+    {
+        // Accounting survives outages. It carries no context occupancy or categorical state.
+        let mut accounting = value;
+        for key in [
+            "usedTokens",
+            "windowTokens",
+            "usedPercent",
+            "compactions",
+            "lastCompactionMs",
+            "lastCompactionTrigger",
+        ] {
+            accounting.as_object_mut().unwrap().remove(key);
+        }
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        // Re-stamping context occupancy is not new accounting. Keep the source limit timestamp:
+        // a genuinely new account-window measurement is evidence used by the 95% stop. Commit
+        // this guard with the durable event, so a full spool or failed transaction cannot lose
+        // the next attempt. Pending accounting keeps its existing durable delivery and retry.
+        let mut comparison = accounting.clone();
+        comparison.as_object_mut().unwrap().remove("observedAtMs");
+        comparison.as_object_mut().unwrap().remove("writtenAtMs");
+        let fingerprint = serde_json::to_string(&comparison)?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key='accounting-fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if previous.as_deref() != Some(fingerprint.as_str()) {
+            append_event(&tx, "harness-context", &accounting)?;
+            tx.execute(
+                "INSERT INTO metadata(key,value) VALUES ('accounting-fingerprint',?1)
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [&fingerprint],
+            )?;
+            tx.commit()?;
+            signal_wake(agent_dir);
+        }
     }
-    tx.execute(
-        "INSERT INTO snapshots VALUES (?1,?2)
-        ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
-        params![kind, body],
-    )?;
-    append_event(&tx, kind, &value)?;
-    tx.commit()?;
-    signal_wake(agent_dir);
-    Ok(())
+    current_result
 }
 
 /// Graph-native channels have no provider record writer. Their spool is scoped to one
@@ -321,16 +500,18 @@ pub fn write_channel_todo(agent_dir: &Path, runtime: &str, fields: &Value) -> Re
     let mut value = fields.clone();
     value["incarnation"] = runtime.into();
     let mut connection = open(agent_dir)?;
+    connection.busy_timeout(Duration::ZERO)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let bound: String = tx.query_row(
-        "SELECT value FROM metadata WHERE key='runtime'", [], |row| row.get(0),
+        "SELECT value FROM metadata WHERE key='runtime'",
+        [],
+        |row| row.get(0),
     )?;
     anyhow::ensure!(bound == runtime, "channel todo runtime was superseded");
     tx.execute(
         "INSERT OR IGNORE INTO metadata(key,value) VALUES (?1,?2)",
         params![format!("provider-runtime:{runtime}"), runtime],
     )?;
-    append_event(&tx, "harness-todo", &value)?;
     tx.execute(
         "INSERT INTO snapshots VALUES ('harness-todo',?1)
         ON CONFLICT(kind) DO UPDATE SET body=excluded.body",
@@ -341,10 +522,11 @@ pub fn write_channel_todo(agent_dir: &Path, runtime: &str, fields: &Value) -> Re
     Ok(())
 }
 
-/// At a known evidence deadline, queue the derived unknown once. Compare in the same
+/// At a known evidence deadline, wake a best-effort derived unknown observation once. Compare in the same
 /// transaction so an observer's concurrent heartbeat always supersedes this deadline.
 pub fn expire_state(agent_dir: &Path, expected: &Value) -> Result<()> {
     let mut connection = open(agent_dir)?;
+    connection.busy_timeout(Duration::ZERO)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let current: Option<Vec<u8>> = tx
         .query_row(
@@ -369,7 +551,6 @@ pub fn expire_state(agent_dir: &Path, expected: &Value) -> Result<()> {
         .optional()?;
     let identity = serde_json::to_string(expected)?;
     if expired.as_deref() != Some(&identity) {
-        append_event(&tx, "harness-state-expired", expected)?;
         tx.execute(
             "INSERT INTO metadata VALUES ('expired-state',?1)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -466,9 +647,74 @@ pub fn prepare_publication(
     Ok(serde_json::from_str(&body)?)
 }
 
+/// Track one retained event's repeated refusal without changing its acknowledgement.
+/// A bounded prepared row survives re-exec and is deleted with the event's normal prefix ack.
+pub fn note_publication_refusal(
+    agent_dir: &Path,
+    sequence: u64,
+    refusal: &str,
+    now_ms: u64,
+) -> Result<Option<String>> {
+    #[derive(Serialize, Deserialize)]
+    struct Refusal {
+        reason: String,
+        attempts: u64,
+        last_notice_ms: Option<u64>,
+    }
+    let mut connection = open(agent_dir)?;
+    connection.busy_timeout(Duration::ZERO)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let pending: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE sequence=?1)",
+        [sequence],
+        |r| r.get(0),
+    )?;
+    if !pending {
+        return Ok(None);
+    }
+    let prior: Option<String> = tx
+        .query_row(
+            "SELECT body FROM prepared WHERE sequence=?1 AND slot='publication-refusal'",
+            [sequence],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let mut state: Refusal = match prior {
+        Some(body) => serde_json::from_str(&body)?,
+        None => Refusal {
+            reason: refusal.chars().take(512).collect(),
+            attempts: 0,
+            last_notice_ms: None,
+        },
+    };
+    state.attempts = state.attempts.saturating_add(1);
+    // Retain facts by default, but surface a stuck head after 100 refusals. Failed notices
+    // retry at most once per minute with the same original reason/idempotency key.
+    let notice = state.attempts >= 100
+        && state
+            .last_notice_ms
+            .is_none_or(|at| now_ms.saturating_sub(at) >= 60_000);
+    if notice {
+        state.last_notice_ms = Some(now_ms);
+    }
+    tx.execute(
+        "INSERT INTO prepared VALUES(?1,'publication-refusal',?2)
+        ON CONFLICT(sequence,slot) DO UPDATE SET body=excluded.body",
+        params![sequence, serde_json::to_string(&state)?],
+    )?;
+    tx.commit()?;
+    Ok(notice.then_some(state.reason))
+}
+
 pub fn acknowledge(agent_dir: &Path, sequence: u64) -> Result<()> {
     let mut connection = open(agent_dir)?;
     let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    acknowledge_tx(&tx, sequence)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn acknowledge_tx(tx: &Connection, sequence: u64) -> Result<()> {
     let removed: u64 = tx.query_row(
         "SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM events WHERE sequence<=?1",
         [sequence],
@@ -480,7 +726,40 @@ pub fn acknowledge(agent_dir: &Path, sequence: u64) -> Result<()> {
         "UPDATE metadata SET value=CAST(value AS INTEGER)-?1 WHERE key='pending-bytes'",
         [removed],
     )?;
+    Ok(())
+}
+
+/// Retain an unpublishable event and its original provenance without blocking successors.
+/// Quarantine is local evidence, never an automatic replay or a new categorical publication.
+pub fn quarantine(agent_dir: &Path, sequence: u64, reason: &str) -> Result<()> {
+    let mut connection = open(agent_dir)?;
+    connection.busy_timeout(Duration::ZERO)?;
+    let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS quarantined_events (
+        sequence INTEGER PRIMARY KEY, runtime_incarnation TEXT NOT NULL,
+        queued_at_ms INTEGER NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL, reason TEXT NOT NULL)")?;
+    let reason = reason.chars().take(1024).collect::<String>();
+    tx.execute("INSERT OR IGNORE INTO quarantined_events
+        SELECT sequence,runtime_incarnation,queued_at_ms,kind,body,?2 FROM events WHERE sequence=?1",
+        params![sequence,reason])?;
+    prune_quarantine_tx(&tx, MAX_QUARANTINE_ROWS, MAX_QUARANTINE_BYTES)?;
+    acknowledge_tx(&tx, sequence)?;
     tx.commit()?;
+    Ok(())
+}
+
+fn prune_quarantine_tx(tx: &Connection, max_rows: u64, max_bytes: u64) -> Result<()> {
+    // Keep the newest suffix within both caps; old inspection evidence is pruned first.
+    // A valid spool event fits the byte cap, including a single oversized-row workload.
+    tx.execute(
+        "DELETE FROM quarantined_events WHERE sequence IN (
+        SELECT sequence FROM (
+            SELECT sequence, ROW_NUMBER() OVER (ORDER BY sequence DESC) AS position,
+                SUM(length(CAST(body AS BLOB))) OVER (ORDER BY sequence DESC) AS bytes
+            FROM quarantined_events
+        ) WHERE position>?1 OR bytes>?2)",
+        params![max_rows, max_bytes],
+    )?;
     Ok(())
 }
 
@@ -603,7 +882,318 @@ mod tests {
     use super::*;
     use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer, claim};
     #[test]
-    fn committed_events_survive_reopen_and_acknowledgement() {
+    fn ownership_waits_for_the_writer_but_current_samples_do_not() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let connection = open(root.path()).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let placeholder =
+            serde_json::json!({"incarnation":"provider-a", "state":"ended", "reason":"superseded"});
+        assert!(
+            write_snapshot(
+                root.path(),
+                "harness-state",
+                &serde_json::to_vec(&placeholder).unwrap()
+            )
+            .is_err()
+        );
+        let dir = root.path().to_owned();
+        let (sent, received) = std::sync::mpsc::channel();
+        let claim = std::thread::spawn(move || {
+            let outcome = crate::harness_state::claim(&dir, "example/seat", "omp", "provider-a");
+            sent.send(outcome).unwrap();
+        });
+        assert!(matches!(
+            received.recv_timeout(Duration::from_millis(120)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        connection.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        claim.join().unwrap();
+        assert!(
+            read_runtime_state(root.path(), "runtime-a")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            pending(root.path(), 10).unwrap().is_empty(),
+            "ownership is not a queued categorical observation"
+        );
+    }
+
+    #[test]
+    fn repeated_publication_refusal_survives_reexec_and_reports_without_acknowledging() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let connection = open(root.path()).unwrap();
+        connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES('runtime-a',1,'fixture','{}')", []).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value='2' WHERE key='pending-bytes'",
+                [],
+            )
+            .unwrap();
+        for _ in 0..99 {
+            assert!(
+                note_publication_refusal(root.path(), 1, "unconfirmed binding", 1)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        enable(root.path(), "runtime-b").unwrap();
+        assert_eq!(
+            note_publication_refusal(root.path(), 1, "a later error", 2)
+                .unwrap()
+                .as_deref(),
+            Some("unconfirmed binding")
+        );
+        assert!(
+            note_publication_refusal(root.path(), 1, "a later error", 60_001)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            note_publication_refusal(root.path(), 1, "a later error", 60_002)
+                .unwrap()
+                .as_deref(),
+            Some("unconfirmed binding")
+        );
+        assert_eq!(
+            pending(root.path(), 10).unwrap()[0].runtime_incarnation,
+            "runtime-a"
+        );
+        acknowledge(root.path(), 1).unwrap();
+        assert!(
+            note_publication_refusal(root.path(), 1, "gone", 120_002)
+                .unwrap()
+                .is_none()
+        );
+        let prepared: u64 = connection
+            .query_row("SELECT COUNT(*) FROM prepared", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(prepared, 0);
+    }
+
+    #[test]
+    fn quarantine_retains_provenance_and_advances_only_the_acknowledged_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let connection = open(root.path()).unwrap();
+        for kind in ["bad-driver", "harness-timeline"] {
+            let body = serde_json::json!({"driver":"fixture","kind":kind}).to_string();
+            connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES('runtime-a',1,?1,?2)",
+                params![kind, body]).unwrap();
+        }
+        connection.execute("UPDATE metadata SET value=(SELECT SUM(length(CAST(body AS BLOB))) FROM events) WHERE key='pending-bytes'", []).unwrap();
+        let events = pending(root.path(), 10).unwrap();
+        quarantine(root.path(), events[0].sequence, "invalid driver").unwrap();
+        let retained: (String, String, String) = connection
+            .query_row(
+                "SELECT runtime_incarnation,kind,reason FROM quarantined_events WHERE sequence=?1",
+                [events[0].sequence],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retained,
+            (
+                "runtime-a".into(),
+                "bad-driver".into(),
+                "invalid driver".into()
+            )
+        );
+        let remaining = pending(root.path(), 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].sequence, events[1].sequence);
+        let bytes: usize = connection
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='pending-bytes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&remaining[0].payload).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn quarantine_prunes_oldest_evidence_with_both_row_and_payload_bounds() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let connection = open(root.path()).unwrap();
+        connection.execute("INSERT INTO events(runtime_incarnation,queued_at_ms,kind,body) VALUES('runtime-a',1,'fixture','{}')", []).unwrap();
+        connection
+            .execute(
+                "UPDATE metadata SET value='2' WHERE key='pending-bytes'",
+                [],
+            )
+            .unwrap();
+        quarantine(root.path(), 1, "fixture").unwrap();
+        for sequence in 2..=MAX_QUARANTINE_ROWS + 12 {
+            connection.execute("INSERT INTO quarantined_events VALUES(?1,'runtime-a',1,'fixture','1234','fixture')", [sequence]).unwrap();
+        }
+        prune_quarantine_tx(&connection, MAX_QUARANTINE_ROWS, MAX_QUARANTINE_BYTES).unwrap();
+        let (count, oldest): (u64, u64) = connection
+            .query_row(
+                "SELECT COUNT(*),MIN(sequence) FROM quarantined_events",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, MAX_QUARANTINE_ROWS);
+        assert_eq!(oldest, 13);
+        // A small byte budget independently keeps only the newest complete payload.
+        prune_quarantine_tx(&connection, MAX_QUARANTINE_ROWS, 6).unwrap();
+        let (count, newest, bytes): (u64,u64,u64) = connection.query_row("SELECT COUNT(*),MAX(sequence),SUM(length(CAST(body AS BLOB))) FROM quarantined_events", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!((count, newest, bytes), (1, MAX_QUARANTINE_ROWS + 12, 4));
+    }
+
+    #[test]
+    fn accounting_stop_retries_a_full_spool_without_replaying_current_status() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let seq = claim(root.path(), "example/seat", "claude", "provider-a").unwrap();
+        let mut writer = Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
+            .with_ownership("provider-a", seq);
+        writer
+            .observe(Observation::new(
+                Activity::Active,
+                BlockedOn::None,
+                InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let mut context = crate::harness_context::Writer::new_paths(
+            root.path(),
+            "example/seat",
+            crate::harness_context::Harness::Claude,
+        )
+        .unwrap()
+        .with_session("provider-a");
+        context
+            .observe(crate::harness_context::Reading {
+                session_total_tokens: Some(123),
+                ..Default::default()
+            })
+            .unwrap();
+        let accounting = pending(root.path(), 10).unwrap().remove(0);
+        acknowledge(root.path(), accounting.sequence).unwrap();
+        open(root.path())
+            .unwrap()
+            .execute(
+                "UPDATE metadata SET value=?1 WHERE key='pending-bytes'",
+                [MAX_PENDING_BYTES],
+            )
+            .unwrap();
+        let idle = || Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown);
+        assert!(writer.observe(idle()).is_err());
+        let snapshot: Value = serde_json::from_slice(
+            &read_runtime_state(root.path(), "runtime-a")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot["state"], "idle",
+            "the current sample commits independently of accounting backpressure"
+        );
+        open(root.path())
+            .unwrap()
+            .execute("UPDATE metadata SET value=0 WHERE key='pending-bytes'", [])
+            .unwrap();
+        writer.observe(idle()).unwrap();
+        writer.heartbeat().unwrap();
+        let events = pending(root.path(), 10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "harness-context");
+        assert_eq!(events[0].payload["accounting_stop"], true);
+        // The baseline driver decodes this existing context kind before acknowledging it.
+        let old_reading = crate::harness_context::read_raw_at(
+            &serde_json::to_vec(&events[0].payload).unwrap(),
+            crate::message::now_ms(),
+        )
+        .unwrap();
+        assert_eq!(old_reading.session_total_tokens, None);
+        enable(root.path(), "runtime-a").unwrap();
+        assert_eq!(
+            pending(root.path(), 10).unwrap()[0].sequence,
+            events[0].sequence
+        );
+    }
+
+    #[test]
+    fn a_new_activity_waits_for_local_evidence_but_a_heartbeat_drops() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime-a").unwrap();
+        let seq = claim(root.path(), "example/seat", "claude", "provider-a").unwrap();
+        let mut writer = Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
+            .with_ownership("provider-a", seq);
+        writer
+            .observe(Observation::new(
+                Activity::Active,
+                BlockedOn::None,
+                InputBuffer::Unknown,
+            ))
+            .unwrap();
+        let mut connection = open(root.path()).unwrap();
+        let lock = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            writer.heartbeat().is_err(),
+            "heartbeat keeps zero-wait admission"
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let directory = root.path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            let mut writer = Writer::new(&directory, "example/seat", "claude", Some("pty".into()))
+                .with_ownership("provider-a", seq);
+            started_tx.send(()).unwrap();
+            let result = writer.observe(Observation::new(
+                Activity::Idle,
+                BlockedOn::None,
+                InputBuffer::Unknown,
+            ));
+            done_tx.send(result.is_ok()).unwrap();
+            result.unwrap();
+            writer.heartbeat().unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        lock.commit().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        observer.join().unwrap();
+        let snapshot: Value = serde_json::from_slice(
+            &read_runtime_state(root.path(), "runtime-a")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot["state"], "idle",
+            "the next heartbeat uses the new provider evidence"
+        );
+        assert!(
+            pending(root.path(), 100).unwrap().is_empty(),
+            "local evidence creates no current publication job"
+        );
+    }
+
+    #[test]
+    fn current_snapshots_replace_without_publication_jobs() {
         let root = tempfile::tempdir().unwrap();
         enable(root.path(), "runtime-a").unwrap();
         let seq = claim(root.path(), "agent/example", "claude", "provider-a").unwrap();
@@ -614,33 +1204,40 @@ mod tests {
             Some("fixture".into()),
         )
         .with_ownership("provider-a", seq);
-        writer
-            .observe(Observation::new(
-                Activity::Active,
-                BlockedOn::None,
-                InputBuffer::Unknown,
-            ))
+        for _ in 0..100 {
+            writer
+                .observe(Observation::new(
+                    Activity::Active,
+                    BlockedOn::None,
+                    InputBuffer::Unknown,
+                ))
+                .unwrap();
+            writer
+                .observe(Observation::new(
+                    Activity::Idle,
+                    BlockedOn::None,
+                    InputBuffer::Unknown,
+                ))
+                .unwrap();
+        }
+        assert!(pending(root.path(), 100).unwrap().is_empty());
+        let snapshot = read_runtime_state(root.path(), "runtime-a")
+            .unwrap()
             .unwrap();
-        assert!(!root.path().join("harness-state").exists());
-        let before = pending(root.path(), 100).unwrap();
-        assert_eq!(before.len(), 2);
         enable(root.path(), "runtime-a").unwrap();
         assert_eq!(
-            pending(root.path(), 100).unwrap()[1].sequence,
-            before[1].sequence
+            read_runtime_state(root.path(), "runtime-a")
+                .unwrap()
+                .unwrap(),
+            snapshot
         );
-        acknowledge(root.path(), before[0].sequence).unwrap();
-        assert_eq!(pending(root.path(), 100).unwrap().len(), 1);
-        acknowledge(root.path(), before[1].sequence).unwrap();
-        assert!(pending(root.path(), 100).unwrap().is_empty());
-        writer
-            .observe(Observation::new(
-                Activity::Idle,
-                BlockedOn::None,
-                InputBuffer::Unknown,
-            ))
-            .unwrap();
-        assert!(pending(root.path(), 100).unwrap()[0].sequence > before[1].sequence);
+        assert_eq!(
+            open(root.path())
+                .unwrap()
+                .query_row("SELECT count(*) FROM snapshots", [], |r| r.get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
     }
 }
 
@@ -810,7 +1407,7 @@ mod protocol_tests {
         );
     }
     #[test]
-    fn full_spool_rolls_back_snapshot_and_timeline_changes() {
+    fn a_full_timeline_spool_does_not_block_current_snapshots() {
         let root = tempfile::tempdir().unwrap();
         enable(root.path(), "runtime").unwrap();
         let seq = claim(root.path(), "example/seat", "claude", "provider").unwrap();
@@ -824,8 +1421,8 @@ mod protocol_tests {
             .unwrap();
         let mut writer = Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
             .with_ownership("provider", seq);
-        assert!(writer.observe(active()).is_err());
-        assert_eq!(read_snapshot(root.path(), "harness-state").unwrap(), before);
+        assert!(writer.observe(active()).is_ok());
+        assert_ne!(read_snapshot(root.path(), "harness-state").unwrap(), before);
         let mut timeline = crate::harness_timeline::Writer::new(root.path(), "claude", "provider");
         assert!(
             timeline
@@ -839,7 +1436,7 @@ mod protocol_tests {
                 .is_err()
         );
         assert!(read_timeline(root.path()).unwrap().is_none());
-        assert_eq!(pending(root.path(), 100).unwrap().len(), 1);
+        assert!(pending(root.path(), 100).unwrap().is_empty());
     }
     #[test]
     fn deadlines_are_once_only_and_cannot_expire_concurrent_evidence() {
@@ -854,12 +1451,12 @@ mod protocol_tests {
         .unwrap();
         expire_state(root.path(), &state).unwrap();
         expire_state(root.path(), &state).unwrap();
-        assert_eq!(pending(root.path(), 100).unwrap().len(), 2);
+        assert!(pending(root.path(), 100).unwrap().is_empty());
         let mut writer = Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
             .with_ownership("provider", seq);
         writer.observe(active()).unwrap();
         expire_state(root.path(), &state).unwrap();
-        assert_eq!(pending(root.path(), 100).unwrap().len(), 3);
+        assert!(pending(root.path(), 100).unwrap().is_empty());
     }
     #[test]
     fn replacement_pipe_receives_commits_without_database_read_wakeups() {
@@ -875,6 +1472,17 @@ mod protocol_tests {
             old.read(&mut byte).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
+        assert!(pending(root.path(), 100).unwrap().is_empty());
+        crate::harness_timeline::Writer::new(root.path(), "claude", "provider")
+            .append(
+                "source",
+                Role::Assistant,
+                EntryType::Content,
+                json!({"text":"hello"}),
+                true,
+            )
+            .unwrap();
+        assert_eq!(current.read(&mut byte).unwrap(), 1);
         let events = pending(root.path(), 100).unwrap();
         read_snapshot(root.path(), "harness-state").unwrap();
         let sequence = events[0].sequence;
@@ -901,6 +1509,83 @@ mod protocol_tests {
         );
     }
     #[test]
+    fn accounting_dedupes_refreshes_and_only_remembers_committed_events() {
+        let root = tempfile::tempdir().unwrap();
+        enable(root.path(), "runtime").unwrap();
+        claim(root.path(), "agent/example", "claude", "provider").unwrap();
+        let mut reading = json!({
+            "schema":"st.harness-context.v1", "incarnation":"provider", "harness":"claude",
+            "observedAtMs":100, "writtenAtMs":100, "usedTokens":10, "windowTokens":100,
+            "sessionTotalTokens":20, "costUsd":0.1,
+            "rateLimits":{"fiveHour":94,"observedAtMs":100}
+        });
+        let write = |value: &Value| {
+            write_snapshot(
+                root.path(),
+                "harness-context",
+                &serde_json::to_vec(value).unwrap(),
+            )
+        };
+        write(&reading).unwrap();
+        acknowledge(root.path(), pending(root.path(), 10).unwrap()[0].sequence).unwrap();
+        enable(root.path(), "runtime").unwrap(); // A driver restart preserves the committed guard.
+        for stamp in 101..201 {
+            reading["observedAtMs"] = stamp.into();
+            reading["writtenAtMs"] = stamp.into();
+            reading["usedTokens"] = stamp.into();
+            write(&reading).unwrap();
+        }
+        assert!(pending(root.path(), 100).unwrap().is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(
+                &read_snapshot(root.path(), "harness-context")
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap()["usedTokens"],
+            200
+        );
+        reading["sessionTotalTokens"] = 21.into();
+        open(root.path())
+            .unwrap()
+            .execute(
+                "UPDATE metadata SET value=?1 WHERE key='pending-bytes'",
+                [MAX_PENDING_BYTES],
+            )
+            .unwrap();
+        assert!(write(&reading).is_err());
+        open(root.path())
+            .unwrap()
+            .execute("UPDATE metadata SET value=0 WHERE key='pending-bytes'", [])
+            .unwrap();
+        write(&reading).unwrap();
+        let events = pending(root.path(), 10).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "failed durable append cannot advance the guard"
+        );
+        assert_eq!(events[0].payload["sessionTotalTokens"], 21);
+        acknowledge(root.path(), events[0].sequence).unwrap();
+        reading["rateLimits"]["fiveHour"] = 95.into();
+        write(&reading).unwrap();
+        let events = pending(root.path(), 10).unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "the stop threshold is durable even when spend is unchanged"
+        );
+        acknowledge(root.path(), events[0].sequence).unwrap();
+        reading["rateLimits"]["observedAtMs"] = 201.into();
+        write(&reading).unwrap();
+        assert_eq!(
+            pending(root.path(), 10).unwrap().len(),
+            1,
+            "new limit-source evidence preserves freshness"
+        );
+    }
+
+    #[test]
     fn account_capture_child() {
         let Some(directory) = std::env::var_os("ST_ACCOUNT_TEST_DIRECTORY") else {
             return;
@@ -909,6 +1594,35 @@ mod protocol_tests {
         let directory = Path::new(&directory);
         enable(directory, &runtime).unwrap();
         claim(directory, "example/seat", "claude", &runtime).unwrap();
+        write_snapshot(
+            directory,
+            "harness-context",
+            &serde_json::to_vec(&json!({
+                "schema":"st.harness-context.v1","incarnation":runtime,
+                "writtenAtMs":crate::message::now_ms(),"harness":"claude","totalTokens":10
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let snapshot: Value = serde_json::from_slice(
+            &read_snapshot(directory, "harness-context")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot["account_ref"],
+            std::env::var("ST3_ACCOUNT").unwrap()
+        );
+        crate::harness_timeline::Writer::new(directory, "claude", &runtime)
+            .append(
+                "usage",
+                Role::System,
+                EntryType::Usage,
+                json!({"total_tokens":10}),
+                true,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -916,7 +1630,10 @@ mod protocol_tests {
         let root = tempfile::tempdir().unwrap();
         for (runtime, account) in [("runtime-one", "ada/one"), ("runtime-two", "ada/two")] {
             let result = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "harness_events::protocol_tests::account_capture_child"])
+                .args([
+                    "--exact",
+                    "harness_events::protocol_tests::account_capture_child",
+                ])
                 .env("ST_ACCOUNT_TEST_DIRECTORY", root.path())
                 .env("ST_ACCOUNT_TEST_RUNTIME", runtime)
                 .env("ST3_ACCOUNT", account)
@@ -941,16 +1658,33 @@ mod protocol_tests {
         let root = tempfile::tempdir().unwrap();
         enable(root.path(), "runtime-old").unwrap();
         let old_seq = claim(root.path(), "example/seat", "claude", "old").unwrap();
+        crate::harness_timeline::Writer::new(root.path(), "claude", "old")
+            .append(
+                "old-source",
+                Role::Assistant,
+                EntryType::Content,
+                json!({"text":"old"}),
+                true,
+            )
+            .unwrap();
         enable(root.path(), "runtime-new").unwrap();
         Writer::new(root.path(), "example/seat", "claude", Some("pty".into()))
             .with_ownership("old", old_seq)
             .observe(active())
             .unwrap();
         claim(root.path(), "example/seat", "claude", "new").unwrap();
+        crate::harness_timeline::Writer::new(root.path(), "claude", "new")
+            .append(
+                "new-source",
+                Role::Assistant,
+                EntryType::Content,
+                json!({"text":"new"}),
+                true,
+            )
+            .unwrap();
         let events = pending(root.path(), 100).unwrap();
         assert_eq!(events[0].runtime_incarnation, "runtime-old");
-        assert_eq!(events[1].runtime_incarnation, "runtime-old");
-        assert_eq!(events[2].runtime_incarnation, "runtime-new");
+        assert_eq!(events[1].runtime_incarnation, "runtime-new");
         open(root.path())
             .unwrap()
             .pragma_update(None, "user_version", 2)

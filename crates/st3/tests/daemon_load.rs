@@ -232,6 +232,12 @@ struct Report {
     fixture_legacy_reconstruction_ms: f64,
     #[serde(default)]
     store_open_ms: f64,
+    #[serde(default)]
+    current_dropped: usize,
+    #[serde(default)]
+    writer_transactions: Value,
+    #[serde(default)]
+    native_admission_control: bool,
     paths: BTreeMap<String, PathReport>,
     failed: BTreeMap<String, usize>,
 }
@@ -288,6 +294,22 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
     let (source, peer_source) = generation.block_on(generated_stores(&keep, scale));
     println!("store ready in {:.0}s", started.elapsed().as_secs_f64());
     drop(generation);
+    // A separately labelled control diagnoses the former policy; it never contributes an
+    // acceptance result or a main baseline. Both production regimes below keep every gate.
+    if std::env::var_os("ST_LOAD_NATIVE_ADMISSION_CONTROL").is_some() {
+        let daemon = make_daemon();
+        let report = run(&daemon, scale, &source, &peer_source, Duration::from_secs(seconds), LoadRegime::Upgrade, true);
+        println!("== DIAGNOSTIC native admission control: not an acceptance result ==");
+        print(&report);
+        println!("diagnostic control failures: {:?}", report_failures(&report));
+        if let Some(path) = std::env::var_os("ST_LOAD_REPORT") {
+            let path = PathBuf::from(path);
+            let parent = path.parent().unwrap().join("native-admission-control");
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::write(parent.join(path.file_name().unwrap()), serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+        drop(daemon);
+    }
     let mut failures = Vec::new();
     for regime in [LoadRegime::Upgrade, LoadRegime::Steady] {
         // Separate runtimes ensure no reconciler/server from the first case affects the second.
@@ -299,6 +321,7 @@ fn the_daemon_keeps_its_budgets_under_a_busy_hosts_load() {
             &peer_source,
             Duration::from_secs(seconds),
             regime,
+            false,
         );
         print(&report);
         if let Some(path) = std::env::var_os("ST_LOAD_REPORT") {
@@ -471,6 +494,14 @@ fn absolute_failures(report: &Report) -> Vec<String> {
             "the daemon used {:.2} cores, over its {} budget",
             report.daemon_cores,
             cpu_budget()
+        ));
+    }
+    // Count classified one-shot drops for diagnosis, but do not use them to waive
+    // writer contention in the acceptance profile.
+    if report.current_dropped != 0 {
+        failures.push(format!(
+            "{} current samples dropped on writer contention",
+            report.current_dropped
         ));
     }
     let requests = report.paths.values().map(|path| path.count).sum::<usize>();
@@ -765,7 +796,12 @@ fn latency_needs_five_main_runs_but_cpu_compares_during_bootstrap() {
             serde_json::to_vec(&baseline.report).unwrap(),
         )
         .unwrap();
-        assert_eq!(worst_of(directory.path(), LoadProfile::Agents).unwrap().runs, run + 1);
+        assert_eq!(
+            worst_of(directory.path(), LoadProfile::Agents)
+                .unwrap()
+                .runs,
+            run + 1
+        );
     }
 }
 
@@ -917,6 +953,13 @@ fn relative_tolerance_keeps_every_absolute_budget_and_correctness_check() {
         );
     }
     assert!(absolute_failures(&report).is_empty());
+    report.current_dropped = 1;
+    assert!(
+        absolute_failures(&report)
+            .iter()
+            .any(|failure| failure.contains("current samples dropped"))
+    );
+    report.current_dropped = 0;
     for name in report.paths.keys().cloned().collect::<Vec<_>>() {
         let path = report.paths.get_mut(&name).unwrap();
         path.p99_ms = path.budget_ms + 0.01;
@@ -983,6 +1026,12 @@ fn print(report: &Report) {
         "\n== load test: {:?} profile, scale {}, {} claims, {:.0}s, daemon {:.2} cores",
         report.profile, report.scale, report.claims, report.seconds, report.daemon_cores
     );
+    println!("current samples dropped on writer contention: {}", report.current_dropped);
+    if let Some(rows) = report.writer_transactions["longest"].as_array() {
+        println!("writer transactions: completed={} missed_connections={} active={} longest={}",
+            report.writer_transactions["completed"], report.writer_transactions["missed_connections"],
+            report.writer_transactions["active"], serde_json::to_string(rows).unwrap());
+    }
     println!(
         "agents roster: {}/{} concurrent subscribers with correct snapshots; {} validated change frames; window limit {}",
         report.roster_subscribers, ROSTER_SUBSCRIBERS, report.roster_change_frames, ROSTER_LIMIT
@@ -1126,6 +1175,8 @@ struct Context {
     subjects: Subjects,
     /// Turns, so each request kind cycles through seats and reads.
     turns: AtomicUsize,
+    current_dropped: AtomicUsize,
+    native_admission_control: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -1256,6 +1307,7 @@ fn run(
     peer_source: &Path,
     duration: Duration,
     regime: LoadRegime,
+    native_admission_control: bool,
 ) -> Report {
     let profile = LoadProfile::from_env();
     let work = tempfile::tempdir().unwrap();
@@ -1283,6 +1335,7 @@ fn run(
     let opened = Instant::now();
     let store = Arc::new(Store::open(&database, NODE).unwrap());
     let store_open_ms = opened.elapsed().as_secs_f64() * 1_000.0;
+    let writer_trace = smallclaims::sqlite::transaction_trace::capture(&database);
     assert!(store.event_payload_migration_pending().unwrap());
     let (migration, mut event_migration) = start_event_migration(daemon, store.clone(), regime);
     store.bind_fleet(FLEET).ok();
@@ -1310,6 +1363,7 @@ fn run(
         st3::api::start_operation_report(&state);
         // As the daemon starts: it folds the roster once and keeps it published.
         st3::api::start_agent_roster(&state);
+        st3::api::start_current_value_maintenance(&state);
         let server_socket = socket.clone();
         daemon.spawn(
             async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
@@ -1379,6 +1433,8 @@ fn run(
         daemon: daemon.handle().clone(),
         subjects,
         turns: AtomicUsize::new(0),
+        current_dropped: AtomicUsize::new(0),
+        native_admission_control,
     });
     // Let the daemon settle after opening: its first reconciler pass is not the load's.
     std::thread::sleep(Duration::from_secs(5));
@@ -1719,6 +1775,9 @@ fn run(
         migration_pending_at_load_end,
         fixture_legacy_reconstruction_ms,
         store_open_ms,
+        current_dropped: context.current_dropped.load(Ordering::Relaxed),
+        writer_transactions: serde_json::to_value(writer_trace.report()).unwrap(),
+        native_admission_control,
         paths,
         failed,
     }
@@ -2169,13 +2228,42 @@ async fn send_one(context: &Context, name: &str) -> Result<(), String> {
                 sequence: turn as u64 + 1,
                 claim,
             };
-            on_daemon(context, move |store| {
-                store
-                    .append_harness_event(&publication)
-                    .map(drop)
-                    .map_err(|error| error.message)
+            let current = kind == "harness.observed";
+            let attempted = Instant::now();
+            let trace_started = smallclaims::sqlite::transaction_trace::elapsed_ms();
+            let native_control = current && context.native_admission_control;
+            let result = on_daemon(context, move |store| {
+                st3::store::with_native_current_admission_for_test(native_control, ||
+                smallclaims::performance::task(if current { "load/current-register" } else { "load/durable-harness-event" }, || {
+                    Ok(if current {
+                        store.append_claim(&publication.claim).map(drop)
+                    } else {
+                        store.append_harness_event(&publication).map(drop)
+                    })
+                }))
             })
-            .await
+            .await?;
+            match result {
+                Err(error)
+                    if current
+                        && (matches!(
+                            error.code,
+                            "current-value-deadline" | "database-busy" | "database-locked"
+                        ) || error.code == "internal"
+                            && (error.message.contains("database is locked")
+                                || error.message.contains("database table is locked"))) =>
+                {
+                    let dropped = context.current_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                    eprintln!(
+                        "current sample dropped #{dropped}: turn={turn} elapsed={:?} error={error:?}",
+                        attempted.elapsed()
+                    );
+                    eprintln!("overlapping writer transactions: {}", serde_json::to_string(
+                        &smallclaims::sqlite::transaction_trace::overlapping(trace_started)).unwrap());
+                    Ok(())
+                }
+                result => result.map_err(|error| error.message),
+            }
         }
         "seat mailbox page" => {
             get(format!(
@@ -2350,7 +2438,11 @@ async fn replication_exchange(context: &Context, turn: usize, key: &str) -> Resu
     let key = key.to_owned();
     // The peer's side runs on the load runtime: on a real fleet it is another machine.
     let (peer_inventory, exchange) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        peer.append_claim(&claim_input("harness.observed", &key, turn, ""))?;
+        // Current observations are outside graph inventories. Exercise durable replication
+        // with a fresh message rather than an empty register-only exchange.
+        let mut input = claim_input("message.sent", &key, turn, "");
+        input.subject = format!("message/{key}");
+        peer.append_claim(&input)?;
         let inventory =
             serde_json::from_value(summary["exchange"]["inventory"].clone()).unwrap_or_default();
         let exchange = peer.export_replication_exchange(FLEET, &inventory)?;

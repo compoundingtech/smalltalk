@@ -73,6 +73,8 @@ struct FollowTest {
     messages: Vec<String>,
 }
 
+pub const LATEST_VALUE_TIMEOUT: Duration = Duration::from_millis(100);
+
 const FOLLOW_OUTAGE_LIMIT: Duration = Duration::from_secs(5 * 60);
 const FOLLOW_DEADLINE_PAUSE: Duration = Duration::from_secs(10);
 const FOLLOW_DEADLINE_CAP: Duration = Duration::from_secs(60);
@@ -441,6 +443,23 @@ impl Client {
     }
 
     pub async fn post<I: Serialize, O: DeserializeOwned>(&self, path: &str, body: &I) -> Result<O> {
+        if path == "/v1/claims" {
+            let value = serde_json::to_value(body)?;
+            if value.get("kind").and_then(serde_json::Value::as_str)
+                .is_some_and(crate::store::is_current_value)
+                && (value["kind"] != "harness.usage"
+                    || value["fields"]["semantics"] == "context_occupancy")
+            {
+                return tokio::time::timeout(
+                    LATEST_VALUE_TIMEOUT,
+                    self.clone()
+                        .with_outage_wait(Duration::ZERO, false)
+                        .request("POST", path, Some(body)),
+                )
+                .await
+                .context("current value POST timed out")?;
+            }
+        }
         self.request("POST", path, Some(body)).await
     }
 
@@ -902,6 +921,36 @@ pub fn http_status(error: &anyhow::Error) -> Option<u16> {
             error
                 .downcast_ref::<UnexpectedResponse>()
                 .map(|error| error.status)
+        })
+}
+
+/// A current sample may be dropped on a deadline or unavailable writer. Protocol and
+/// ownership refusals remain errors; callers must never disguise a stale incarnation.
+pub fn current_publication_dropped(error: &anyhow::Error) -> bool {
+    daemon_unreachable(error).is_some()
+        || http_status(error) == Some(503)
+        || error
+            .chain()
+            .any(|cause| {
+                cause.is::<tokio::time::error::Elapsed>()
+                    || cause.downcast_ref::<serde_json::Error>().is_some_and(serde_json::Error::is_eof)
+                    || cause.downcast_ref::<std::io::Error>().is_some_and(|error| matches!(error.kind(),
+                        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::TimedOut | std::io::ErrorKind::UnexpectedEof))
+            })
+        || api_error_parts(error).is_some_and(|(status, code, message, _)| {
+            status == 503
+                || code == "current-value-deadline"
+                // Older daemons reported their write deadline as internal interrupted.
+                || code == "internal"
+                    && [
+                        "database is locked",
+                        "database table is locked",
+                        "interrupted",
+                    ]
+                    .iter()
+                    .any(|reason| message.contains(reason))
         })
 }
 
@@ -1419,6 +1468,22 @@ fn decode_api_response<O: DeserializeOwned>(bytes: &[u8]) -> Result<O> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn current_write_deadlines_drop_once_across_daemon_versions_and_preserve_fences() {
+        for (status, code, message, dropped) in [
+            (503, "current-value-deadline", "write expired", true),
+            (422, "current-value-deadline", "write expired", true),
+            (500, "internal", "interrupted", true),
+            (422, "stale-harness-event-session", "retired native incarnation", false),
+            (500, "internal", "other error", false),
+        ] {
+            let error = anyhow::Error::new(super::ApiResponseError {
+                status, code: code.into(), message: message.into(), details: Default::default(),
+            });
+            assert_eq!(super::current_publication_dropped(&error), dropped);
+        }
+    }
+
     use super::*;
     use axum::extract::ws::{Message as AxumWsMessage, WebSocketUpgrade};
     use axum::http::{HeaderMap, StatusCode};

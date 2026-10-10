@@ -979,6 +979,7 @@ mod tests {
         // The startup placeholder owns custody while proving no native activity.
         assert!(provider_authority(&serde_json::to_vec(&record).unwrap()).is_ok());
         let peer = NativeDeliveryPeer {
+            start_token: None,
             agent: fence.subject.clone(),
             transport: "app-server",
             pid: owner.pid,

@@ -239,3 +239,12 @@ pub fn admitted_mailbox_protocol_router(state: crate::api::AppState) -> axum::Ro
 pub fn synthetic_mailbox_protocol_router(state: crate::api::AppState, subject: &str) -> axum::Router {
     crate::api::synthetic_mailbox_protocol_router(state, subject)
 }
+
+/// Construct durable observations from the older protocol in history/replication fixtures.
+/// Modern current-value behavior is tested through its separate admission and forwarding path.
+pub fn append_legacy_claim(
+    store: &crate::store::Store,
+    input: &crate::model::ClaimInput,
+) -> Result<crate::model::ClaimRecord, crate::St3Error> {
+    store.append_legacy_claim(input)
+}

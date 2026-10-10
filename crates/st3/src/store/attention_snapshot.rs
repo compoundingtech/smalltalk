@@ -53,6 +53,52 @@ impl Store {
         })))
     }
 
+    /// Record a terminal refusal without treating an ephemeral register reference as a
+    /// durable graph claim. Legacy graph observations still carry ordinary claim evidence.
+    pub(crate) fn record_native_prompt_gone(
+        &self,
+        observation: &ClaimRecord,
+        incarnation: &str,
+    ) -> Result<ClaimRecord, St3Error> {
+        let fields = observation.body.get("fields").unwrap_or(&observation.body);
+        if observation.kind != "harness.observed"
+            || fields["blocked_on"] != "human"
+            || fields["incarnation_id"] != incarnation
+        {
+            return Err(St3Error::new("invalid-harness-prompt", "the prompt does not belong to this incarnation"));
+        }
+        let durable = checkpoint::claim_or_tombstone_exists(&self.readers.get(), &observation.id)
+            .map_err(internal)?;
+        if !durable && !observation.id.starts_with("local-observation/") {
+            return Err(St3Error::new("missing-evidence", "the prompt observation is not stored"));
+        }
+        let episode = Self::native_prompt_episode(observation);
+        let mut fields = BTreeMap::from([
+            ("code".into(), json!("native-prompt-gone")),
+            ("status".into(), json!("resolved")),
+            ("driver".into(), json!("claude")),
+            ("incarnation_id".into(), json!(incarnation)),
+        ]);
+        // Keep legacy graph clears byte-identical for their existing idempotency keys.
+        if !durable {
+            let reference = hex::encode(sha2::Sha256::digest(episode.as_bytes()));
+            fields.insert("reason".into(), json!(format!("The native prompt was refused in the terminal. Reference: {reference}.")));
+        }
+        self.append_claim(&ClaimInput {
+            subject: observation.subject.clone(),
+            kind: "harness.diagnostic".into(),
+            actor: Some(observation.subject.clone()),
+            fields,
+            evidence: if durable { vec![observation.id.clone()] } else { vec![] },
+            expected_subject: None,
+            idempotency_key: Some(native_prompt_gone_key(&episode)),
+        })
+    }
+
+    pub(crate) fn native_prompt_episode(observation: &ClaimRecord) -> String {
+        native_prompt_episode(&observation.id, &observation.subject, &observation.body)
+    }
+
     /// One alert per seat whose harness waits on a person at a native prompt: a permission, a
     /// question or a review it shows in its terminal. It lives in the seat's conversation and
     /// clears when the harness reports the prompt gone, however it was answered, or when the
@@ -68,14 +114,20 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let newest = |subject: &str, kind: &str| -> Result<Option<(String, u128, Value)>> {
+            let query = format!(
+                "{} LIMIT 1",
+                newest_claims_of_kind_query(
+                    "claims.id, claims.accepted_at_unix_ms, claims.body",
+                    kind
+                )
+            );
+            let query = if kind == "harness.observed" {
+                harness_sql(&connection, subject, &query)?
+            } else {
+                query
+            };
             let row = connection
-                .prepare_cached(&format!(
-                    "{} LIMIT 1",
-                    newest_claims_of_kind_query(
-                        "claims.id, claims.accepted_at_unix_ms, claims.body",
-                        kind
-                    )
-                ))?
+                .prepare_cached(&query)?
                 .query_row(params![subject, i64::MAX], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -86,35 +138,37 @@ impl Store {
                 .optional()?;
             row.map(|(id, at, body)| -> Result<(String, u128, Value)> {
                 let body: Value = serde_json::from_str(&body)?;
-                let fields = body.get("fields").cloned().unwrap_or(body);
-                Ok((id, at.parse()?, fields))
+                Ok((id, at.parse()?, body))
             })
             .transpose()
         };
         let mut items = Vec::new();
         for seat in seats {
-            let Some((claim, at, harness)) = newest(&seat, "harness.observed")? else {
+            let Some((claim, at, body)) = newest(&seat, "harness.observed")? else {
                 continue;
             };
+            let harness = body.get("fields").unwrap_or(&body);
             if harness["blocked_on"] != "human" {
                 continue;
             }
             // The prompt was refused in the terminal, which its harness did not report: the
             // reconciler recorded that once, keyed by this observation.
+            let episode = native_prompt_episode(&claim, &seat, &body);
             let gone: bool = connection
                 .prepare_cached(
                     "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_operation_index
                        WHERE json_extract(body, '$._operation.id') IS NOT NULL
                          AND json_extract(body, '$._operation.id')=?1)",
                 )?
-                .query_row([native_prompt_gone_operation(&claim)], |row| row.get(0))?;
-            if gone || native_prompt_answer(&connection, &claim)?.is_some() {
+                .query_row([native_prompt_gone_operation(&episode)], |row| row.get(0))?;
+            if gone || native_prompt_answer(&connection, &episode)?.is_some() {
                 continue;
             }
             // Only the running incarnation's prompt waits: a restarted seat's old prompt is gone.
             let Some((_, _, runtime)) = newest(&seat, "runtime.observed")? else {
                 continue;
             };
+            let runtime = runtime.get("fields").unwrap_or(&runtime);
             if runtime["status"] != "running"
                 || runtime["incarnation_id"] != harness["incarnation_id"]
                 || !person_work::declaration_live(&connection, &seat)?
@@ -139,7 +193,7 @@ impl Store {
                 .filter(|reason| !reason.is_empty())
                 .unwrap_or("its terminal shows a prompt");
             items.push(AttentionItemView {
-                episode: claim,
+                episode,
                 priority: "high".into(),
                 kind: "harness-prompt".into(),
                 review_mode: None,
@@ -149,14 +203,14 @@ impl Store {
                 launch_id: None,
                 variant_id: None,
                 message_id: None,
-                answers: if answerable(&harness) {
+                answers: if prompt_answerable(&body) {
                     vec!["allow".into(), "deny".into()]
                 } else {
                     Vec::new()
                 },
                 conversation: Some(seat.clone()),
                 title: format!("{seat} is waiting for {what}"),
-                detail: if answerable(&harness) {
+                detail: if prompt_answerable(&body) {
                     format!(
                         "Claude asks to use {prompt}; the call it would make is the pending one in the seat's conversation. Allow or deny it here, or answer it in the seat's terminal (Ctrl+] in stui). This alert clears when the prompt is gone, however it was answered."
                     )
@@ -1400,6 +1454,30 @@ pub(super) fn conversation_agent(
     )
 }
 
+// Modern driver ownership and transition counters survive heartbeat re-stamps. Include
+// the register epoch so a restored database cannot suppress a new prompt with an old clear.
+// Durable graph observations and unsequenced legacy publishers retain their original
+// per-observation identity, including existing stored terminal clears.
+fn native_prompt_episode(observation: &str, subject: &str, body: &Value) -> String {
+    let fields = body.get("fields").unwrap_or(body);
+    if !observation.starts_with("local-observation/") {
+        return observation.into();
+    }
+    let (Some(incarnation), Some(owner), Some(transition)) = (
+        fields["incarnation_id"].as_str(),
+        fields["ownership_sequence"].as_u64(),
+        fields["transition_sequence"].as_u64(),
+    ) else { return observation.into(); };
+    let transition = if prompt_transition_witnesses(body).is_some() {
+        body["_native_prompt_start"].as_u64().unwrap_or(transition)
+    } else { transition };
+    let epoch = observation.strip_prefix("local-observation/")
+        .and_then(|rest| rest.rsplit_once('/').map(|(prefix, _)| prefix));
+    let identity = serde_json::to_vec(&(subject, incarnation, owner, transition, epoch))
+        .expect("prompt identity contains only scalar values");
+    format!("native-prompt-episode/{}", hex::encode(sha2::Sha256::digest(identity)))
+}
+
 /// The idempotency key of the record that a native prompt opened by `observation` is gone.
 pub(crate) fn native_prompt_gone_key(observation: &str) -> String {
     format!("native-prompt-gone:{observation}")
@@ -1413,7 +1491,7 @@ fn native_prompt_gone_operation(observation: &str) -> String {
 /// whose hook waits for the answer, that names its tool. The call's input is conversation content
 /// a client reads from the seat's conversation and shows beside the answers; it is never stored
 /// here. Other prompts are answered in the seat's terminal.
-fn answerable(harness: &Value) -> bool {
+pub(super) fn answerable(harness: &Value) -> bool {
     harness["blocked_on"] == "human"
         && harness["ask"] == "permission"
         && harness["driver"] == "claude"
@@ -1458,13 +1536,13 @@ impl Store {
     fn newest_harness_observation(&self, seat: &str) -> Result<Option<(String, u128, Value)>> {
         let connection = self.readers.get();
         let row = connection
-            .prepare_cached(&format!(
+            .prepare_cached(&harness_sql(&connection, seat, &format!(
                 "{} LIMIT 1",
                 newest_claims_of_kind_query(
                     "claims.id, claims.accepted_at_unix_ms, claims.body",
                     "harness.observed"
                 )
-            ))?
+            ))?)?
             .query_row(params![seat, i64::MAX], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1475,7 +1553,7 @@ impl Store {
             .optional()?;
         row.map(|(id, at, body)| -> Result<(String, u128, Value)> {
             let body: Value = serde_json::from_str(&body)?;
-            Ok((id, at.parse()?, body.get("fields").cloned().unwrap_or(body)))
+            Ok((id, at.parse()?, body))
         })
         .transpose()
     }
@@ -1493,14 +1571,49 @@ impl Store {
         // The hook's observation is among the seat's last few: it is published moments after the
         // hook writes it, and a hook that waited past a few later observations has nothing left.
         let recent = connection
-            .prepare_cached(&format!(
+            .prepare_cached(&harness_sql(&connection, seat, &format!(
                 "{} LIMIT 16",
                 newest_claims_of_kind_query("claims.id, claims.body", "harness.observed")
-            ))?
+            ))?)?
             .query_map(params![seat, i64::MAX], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        if let Some((id, body)) = recent.first().filter(|(id, _)| id.starts_with("local-observation/")) {
+            let body: Value = serde_json::from_str(body)?;
+            let fields = body.get("fields").unwrap_or(&body);
+            let (Some(owner), Some(current)) = (fields["ownership_sequence"].as_u64(), fields["transition_sequence"].as_u64()) else {
+                return Ok(NativePromptState::Gone);
+            };
+            // A newer hook can still be unpublished; a replaced owner or past transition
+            // must never consume an answer to this register's prompt.
+            if owner < ownership || (owner == ownership && current < transition) {
+                return Ok(NativePromptState::Open);
+            }
+            if owner != ownership || !prompt_answerable(&body) {
+                return Ok(NativePromptState::Gone);
+            }
+            let runtime = self.latest_claim(seat, Some("runtime.observed"))?;
+            if runtime.is_none_or(|runtime| runtime.body["fields"]["status"] != "running"
+                || runtime.body["fields"]["incarnation_id"] != fields["incarnation_id"]) {
+                return Ok(NativePromptState::Gone);
+            }
+            let chain = prompt_transition_witnesses(&body).unwrap_or_else(|| vec![current]);
+            if !chain.contains(&transition) {
+                return Ok(NativePromptState::Gone);
+            }
+            let episode = native_prompt_episode(id, seat, &body);
+            let refused: bool = connection.prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_operation_index
+                   WHERE json_extract(body, '$._operation.id') IS NOT NULL
+                     AND json_extract(body, '$._operation.id')=?1)")?
+                .query_row([native_prompt_gone_operation(&episode)], |row| row.get(0))?;
+            if refused { return Ok(NativePromptState::Gone); }
+            if let Some(answer) = native_prompt_answer(&connection, &episode)? {
+                return Ok(NativePromptState::Answered { answer });
+            }
+            return Ok(NativePromptState::Open);
+        }
         let own = recent.iter().position(|(_, body)| {
             serde_json::from_str::<Value>(body).is_ok_and(|body| {
                 let fields = body.get("fields").unwrap_or(&body);
@@ -1565,32 +1678,103 @@ impl Store {
             ));
         }
         let current = self.newest_harness_observation(seat).map_err(internal)?;
-        let Some((claim, _, harness)) = current.filter(|(claim, _, _)| claim == episode) else {
+        let Some((claim, _, body)) = current.filter(|(claim, _, body)| {
+            native_prompt_episode(claim, seat, body) == episode
+        }) else {
             return Err(St3Error::new(
                 "stale-fence",
                 "that prompt is no longer waiting: it was answered or replaced",
             ));
         };
-        if !answerable(&harness) {
+        let harness = body.get("fields").unwrap_or(&body);
+        if !prompt_answerable(&body) {
             return Err(St3Error::new(
                 "stale-fence",
                 "that prompt can only be answered in the seat's terminal",
             ));
         }
         let incarnation = harness["incarnation_id"].as_str().unwrap_or_default();
+        let runtime = self.latest_claim(seat, Some("runtime.observed")).map_err(internal)?;
+        if runtime.is_none_or(|runtime| runtime.body["fields"]["status"] != "running"
+            || runtime.body["fields"]["incarnation_id"] != incarnation) {
+            return Err(St3Error::new("stale-fence", "that prompt's incarnation is no longer running"));
+        }
+        let durable = checkpoint::claim_or_tombstone_exists(&self.readers.get(), &claim)
+            .map_err(|error| St3Error::new("internal", format!("{error:#}")))?;
+        let mut fields = BTreeMap::from([
+            ("code".into(), Value::String("native-prompt-answered".into())),
+            ("status".into(), Value::String(answer.into())),
+            ("driver".into(), Value::String("claude".into())),
+            ("incarnation_id".into(), Value::String(incarnation.into())),
+        ]);
+        if !durable {
+            if !claim.starts_with("local-observation/") {
+                return Err(St3Error::new("missing-evidence", "the prompt observation is not stored"));
+            }
+            let reference = hex::encode(sha2::Sha256::digest(episode.as_bytes()));
+            fields.insert("reason".into(), json!(format!("The person answered the native prompt. Reference: {reference}.")));
+        }
         self.append_claim(&ClaimInput {
             subject: seat.to_owned(),
             kind: "harness.diagnostic".into(),
             actor: Some(actor.to_owned()),
-            fields: BTreeMap::from([
-                ("code".into(), Value::String("native-prompt-answered".into())),
-                ("status".into(), Value::String(answer.into())),
-                ("driver".into(), Value::String("claude".into())),
-                ("incarnation_id".into(), Value::String(incarnation.into())),
-            ]),
-            evidence: vec![claim.clone()],
+            fields,
+            evidence: if durable { vec![claim.clone()] } else { vec![] },
             expected_subject: None,
-            idempotency_key: Some(native_prompt_answer_key(&claim)),
+            idempotency_key: Some(native_prompt_answer_key(episode)),
         })
     }
+}
+
+
+/// Sixteen transitions of one permission; an empty list marks terminal-only overflow.
+/// Metadata is bounded within the current row, with no graph or observation-history writes.
+pub(super) fn prompt_transition_witnesses(body: &Value) -> Option<Vec<u64>> {
+    let rows = body.get("_native_prompt_transitions")?.as_array()?;
+    if rows.len() > 16 { return None; }
+    let values = rows.iter().map(Value::as_u64).collect::<Option<Vec<_>>>()?;
+    let fields = body.get("fields").unwrap_or(body);
+    let start = body["_native_prompt_start"].as_u64()?;
+    let current = fields["transition_sequence"].as_u64()?;
+    if !answerable(fields) || fields["ownership_sequence"].as_u64().is_none()
+        || fields["incarnation_id"].as_str().is_none() { return None; }
+    if values.is_empty() {
+        return current.checked_sub(start).filter(|span| *span >= 16).map(|_| values);
+    }
+    if values.first().copied() != Some(start) || values.last().copied() != Some(current)
+        || !values.windows(2).all(|pair| pair[0].checked_add(1) == Some(pair[1])) { return None; }
+    Some(values)
+}
+
+fn prompt_answerable(body: &Value) -> bool {
+    answerable(body.get("fields").unwrap_or(body))
+        && !prompt_transition_witnesses(body).is_some_and(|chain| chain.is_empty())
+}
+
+pub(super) fn next_prompt_transition_witnesses(body: &Value, previous: Option<&Value>) -> Option<(u64, Vec<u64>)> {
+    let fields = &body["fields"];
+    if !answerable(fields) || fields["ownership_sequence"].as_u64().is_none()
+        || fields["incarnation_id"].as_str().is_none() { return None; }
+    let current = fields["transition_sequence"].as_u64()?;
+    let mut start = current;
+    let mut chain = vec![current];
+    if let Some(previous) = previous.filter(|previous| {
+        let old = &previous["fields"];
+        // #2170's reason is the literal tool name, not the tool call or diagnostic prose.
+        answerable(old) && previous["_source_epoch"] == body["_source_epoch"]
+            && ["incarnation_id", "ownership_sequence", "driver", "state", "blocked_on", "ask", "reason"]
+                .iter().all(|name| old[*name] == fields[*name])
+            && old["transition_sequence"].as_u64().is_some_and(|old| old == current || old.checked_add(1) == Some(current))
+    }) {
+        if let Some(witnesses) = prompt_transition_witnesses(previous) {
+            start = previous["_native_prompt_start"].as_u64().unwrap();
+            chain = witnesses;
+        } else {
+            start = previous["fields"]["transition_sequence"].as_u64().unwrap();
+            chain = vec![start];
+        }
+        if !chain.is_empty() && chain.last().copied() != Some(current) { chain.push(current); }
+        if chain.len() > 16 { chain.clear(); }
+    }
+    Some((start, chain))
 }

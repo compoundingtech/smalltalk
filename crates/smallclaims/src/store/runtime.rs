@@ -70,6 +70,25 @@ pub trait Runtime: Send + Sync {
     /// project the same claims differently, so they compare their logs instead of their graphs.
     fn schema_digest(&self) -> String;
 
+    /// Current observations may live outside immutable claim authority. Let the runtime
+    /// select their read sources while the graph retains its existing fold and timestamps.
+    /// Immutable runtimes use the original indexed query unchanged.
+    fn current_observation_sql(&self, _kind: &str, sql: &str) -> String {
+        sql.to_owned()
+    }
+
+    /// Process-local invalidation for replaceable observations committed outside the graph
+    /// writer. Empty kind names the aggregate; otherwise read that kind's revision. These
+    /// are cache hints, never immutable graph or authority frontiers.
+    fn current_observation_revision(&self, _kind: &str) -> u64 {
+        0
+    }
+
+    /// Called only after a current-observation transaction successfully commits. The hook
+    /// must be non-blocking and do no SQL; immutable runtimes need no invalidation.
+    /// A freshness-only restamp advances source identity but leaves semantic kind revisions alone.
+    fn current_observation_committed(&self, _kind: &str, _semantic_changed: bool) {}
+
     /// Check a replicated claim's kind and fields once the graph has verified its hash and batch.
     fn classify_replicated_claim(
         &self,
@@ -140,6 +159,11 @@ pub trait Runtime: Send + Sync {
 
     /// Projections changed beneath whatever the runtime keeps in memory about them.
     fn forget_views(&self);
+
+    /// Incremental catch-up changed a projected prefix at the admitted cut. Fold caches
+    /// must be invalidated; runtimes may retain immutable prior publications as stale
+    /// fallbacks. Full replay/reset continues through forget_views and clears them.
+    fn forget_incremental_views(&self) { self.forget_views(); }
 
     /// Shared tables the projection digest covers, with the columns each leaves out.
     fn digest_tables(&self) -> &'static [(&'static str, &'static [&'static str])];

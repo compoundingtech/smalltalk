@@ -1095,26 +1095,38 @@ mod tests {
         crate::harness_events::enable(root.path(), "runtime-a").unwrap();
         let seq = harness_state::claim(root.path(), "agent/example", "omp", "provider-a").unwrap();
         let mut observer = EventObserver::new(
-            root.path(), "agent/example", "omp", "provider-a", seq, "runtime-a",
-        ).unwrap();
-        observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-a"})).unwrap();
+            root.path(),
+            "agent/example",
+            "omp",
+            "provider-a",
+            seq,
+            "runtime-a",
+        )
+        .unwrap();
+        observer
+            .observe(&serde_json::json!({"type":"ready","sessionId":"native-a"}))
+            .unwrap();
         observer.observe(&todo_frame()).unwrap();
-        let events = crate::harness_events::pending(root.path(), 100).unwrap();
-        let event = events.iter().find(|event| event.kind == "harness-todo").unwrap();
-        assert_eq!(event.runtime_incarnation, "runtime-a");
-        assert_eq!(event.payload["session_id"], "native-a");
-        let prepared = serde_json::json!({"fields":event.payload});
-        assert_eq!(crate::harness_events::prepare_publication(
-            root.path(), event.sequence, "harness.todo.observed:", &prepared,
-        ).unwrap(), prepared);
-        assert_eq!(crate::harness_events::prepare_publication(
-            root.path(), event.sequence, "harness.todo.observed:", &serde_json::json!({"changed":true}),
-        ).unwrap(), prepared);
+        assert!(
+            crate::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .is_empty()
+        );
+        let snapshot: serde_json::Value = serde_json::from_slice(
+            &crate::harness_events::read_snapshot(root.path(), "harness-todo")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(snapshot["session_id"], "native-a");
         crate::harness_events::enable(root.path(), "runtime-b").unwrap();
         harness_state::claim(root.path(), "agent/example", "omp", "provider-b").unwrap();
         assert!(observer.observe(&todo_frame()).is_err());
-        assert_eq!(crate::harness_events::pending(root.path(), 100).unwrap()
-            .iter().filter(|event| event.kind == "harness-todo").count(), 1);
+        assert!(
+            crate::harness_events::pending(root.path(), 100)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

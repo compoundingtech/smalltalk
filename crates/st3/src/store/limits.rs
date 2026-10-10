@@ -158,7 +158,7 @@ pub struct LimitsOutcome {
     pub notified: Vec<String>,
 }
 
-fn reading(origin: &str, body: &Value) -> Option<(AccountLimit, String)> {
+pub(super) fn reading(origin: &str, body: &Value) -> Option<(AccountLimit, String)> {
     let fields = body.get("fields")?;
     let driver = fields["driver"].as_str()?.to_owned();
     let identity = fields["account"]

@@ -220,6 +220,8 @@ impl Side {
             .map(|change| {
                 let mut body: Value = serde_json::from_str(&change.body).unwrap_or(Value::Null);
                 if let Some(object) = body.as_object_mut() {
+                    // Database generations fence delivery but do not change the observation.
+                    object.remove("_source_epoch");
                     object.remove("evidence");
                 }
                 id(&format!(
