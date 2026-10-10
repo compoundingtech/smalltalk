@@ -1420,6 +1420,11 @@ impl Client {
     }
 
     // @st3-codegen:rust-operation-methods
+    /// Local diagnostic acceptance; retry the identical disjoint intervals and report ID.
+    pub async fn observations_report(&self, report: &ObservationReport) -> Result<ObservationResponse, ClientError> {
+        self.post("/v1/client/observations", report).await
+    }
+
     pub async fn pairing_begin(
         &self,
         request: &PairingBegin,

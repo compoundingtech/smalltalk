@@ -2596,6 +2596,14 @@ impl Client {
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
+    /// Local diagnostic acceptance; retry the identical disjoint intervals and report ID.
+    pub async fn observations_report(
+        &self,
+        report: &ObservationReport,
+    ) -> Result<ObservationResponse, ClientError> {
+        self.post("/v1/client/observations", report).await
+    }
+
     pub async fn pairing_begin(
         &self,
         request: &PairingBegin,
