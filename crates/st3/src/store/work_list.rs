@@ -24,9 +24,15 @@ pub(crate) struct WorkRow {
 /// One publication of the current work list.
 #[derive(Clone, Default)]
 pub(crate) struct WorkRows {
-    /// Each seat's queue order at `orders_cut`, for the seats rows show, read in the fold's own
-    /// snapshot: an actor's ready work is ordered by it, never by a newer cut's order.
-    pub(crate) seat_orders: HashMap<String, Arc<Vec<String>>>,
+    /// Each registered seat's queue order at `orders_cut`, read in the fold's own snapshot: an
+    /// actor's ready work is ordered by it, never by a newer cut's order. Only nonempty orders.
+    pub(crate) seat_orders: Arc<HashMap<String, Arc<Vec<String>>>>,
+    /// The runs each registered seat's queue order read (see [`SeatQueue::runs`]), and the
+    /// reverse: the seats that read each run. A seat is registered while it has an order or any
+    /// such run; a change to any run it read rereads it. Shared between publications until a
+    /// fold changes them.
+    pub(crate) seat_runs: Arc<HashMap<String, Arc<BTreeSet<String>>>>,
+    pub(crate) run_seats: Arc<HashMap<String, Arc<BTreeSet<String>>>>,
     /// The cut `seat_orders` was read at. A publication is complete only when it equals the
     /// publication's cut.
     pub(crate) orders_cut: u64,
@@ -49,10 +55,24 @@ pub(crate) struct WorkRows {
 pub(crate) const WORK_LEASES: &str = "SELECT subject, CAST(lease_expires_at_unix_ms AS INTEGER) FROM step_runs
  INDEXED BY step_runs_lease_index
  WHERE lease_owner IS NOT NULL AND lease_expires_at_unix_ms IS NOT NULL";
-/// The seats steps `?1`, a JSON array, are assigned to, whatever their state, by the primary
-/// key: a seat's queue order follows the runs it holds steps in.
-pub(crate) const STEP_ASSIGNEES: &str = "SELECT DISTINCT assignee FROM step_runs
- WHERE subject IN (SELECT value FROM json_each(?1)) AND assignee IS NOT NULL";
+/// The seat each of steps `?1`, a JSON array, is assigned to, if any, and its run, whatever its
+/// state or generation, by the primary key: a seat's queue order follows the runs it holds
+/// steps in.
+pub(crate) const STEP_ASSIGNEES: &str = "SELECT assignee, run_id FROM step_runs
+ WHERE subject IN (SELECT value FROM json_each(?1))";
+
+/// One run key for every source: `mission-run/ID`, whether a source names the run bare.
+pub(crate) fn run_key(run: &str) -> String {
+    normalize_mission_run(run)
+}
+
+/// One seat's queue order and every run its read depends on: the runs it joined (an open run it
+/// holds a current step in), the runs its moves name or anchor on (whether or not it holds a
+/// step there), and those named runs' own joins. A change to any of them can change the order.
+pub(crate) struct SeatQueue {
+    pub(crate) order: Vec<String>,
+    pub(crate) runs: BTreeSet<String>,
+}
 /// The earliest claim about step `?1` accepted after `?2`, by the subject index.
 pub(crate) const NEXT_CLAIM_AFTER: &str = "SELECT MIN(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
  WHERE subject=?1 AND CAST(accepted_at_unix_ms AS INTEGER)>?2";
@@ -66,6 +86,11 @@ pub(crate) struct WorkChanges {
     pub(crate) reorder: bool,
     /// The seats whose queue moved.
     pub(crate) moved_seats: BTreeSet<String>,
+    /// The runs those claims name or reach, as run keys: a seat that read one rereads it.
+    pub(crate) runs: BTreeSet<String>,
+    /// Whether a replica record was repaired: that can drop a seat's move with no claim about
+    /// the seat, so the list folds from nothing.
+    pub(crate) repaired: bool,
 }
 
 /// How many actors' orders one publication keeps. Each holds at most one `u32` per row, so a
@@ -283,6 +308,49 @@ impl WorkRows {
         seats
     }
 
+    /// Register `seat`'s queue as just read, `None` when it has neither queued run nor move:
+    /// its order, its runs, and the reverse index, each link of its earlier runs removed and
+    /// emptied buckets dropped. A seat stays registered while it has an order or any run. Says
+    /// whether its order changed.
+    pub(crate) fn set_seat_queue(&mut self, seat: &str, queue: Option<SeatQueue>) -> bool {
+        let seat_runs = Arc::make_mut(&mut self.seat_runs);
+        let run_seats = Arc::make_mut(&mut self.run_seats);
+        if let Some(runs) = seat_runs.remove(seat) {
+            for run in runs.iter() {
+                if let Some(seats) = run_seats.get_mut(run) {
+                    Arc::make_mut(seats).remove(seat);
+                    if seats.is_empty() {
+                        run_seats.remove(run);
+                    }
+                }
+            }
+        }
+        let orders = Arc::make_mut(&mut self.seat_orders);
+        let old = orders.remove(seat);
+        let mut new = None;
+        if let Some(queue) = queue.filter(|queue| !queue.runs.is_empty() || !queue.order.is_empty()) {
+            for run in &queue.runs {
+                Arc::make_mut(run_seats.entry(run.clone()).or_default()).insert(seat.to_owned());
+            }
+            seat_runs.insert(seat.to_owned(), Arc::new(queue.runs));
+            if !queue.order.is_empty() {
+                new = Some(Arc::new(queue.order));
+            }
+        }
+        let changed = old.as_deref() != new.as_deref();
+        if let Some(order) = new {
+            orders.insert(seat.to_owned(), order);
+        }
+        changed
+    }
+
+    /// Clear every registered seat, as a fold that reads every shown seat's queue again does.
+    pub(crate) fn clear_seat_queues(&mut self) {
+        self.seat_orders = Arc::default();
+        self.seat_runs = Arc::default();
+        self.run_seats = Arc::default();
+    }
+
     /// The rows `actor` sees, as indexes into `order`, in the order the direct read gives it:
     /// its ready work by its seat queue at this publication's own cut. Built on the actor's
     /// first read of this publication; says whether this read built it.
@@ -358,6 +426,7 @@ impl Store {
         let mut steps = BTreeSet::new();
         let mut reorder = false;
         let mut moved_seats = BTreeSet::new();
+        let mut repaired = false;
         let mut runs = BTreeSet::new();
         let mut requesters = BTreeSet::new();
         let mut every_ask = false;
@@ -373,6 +442,7 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (subject, kind, origin) in claims {
+            repaired |= kind == "record.repaired";
             if let Some(run) = subject.strip_prefix("mission-run/") {
                 runs.insert(run.to_owned());
                 // A run's state ends the steps of the runs under it, and decides whether asks
@@ -441,7 +511,8 @@ impl Store {
                 }
             }
         }
-        Ok(WorkChanges { steps, reorder, moved_seats })
+        let runs = runs.iter().map(|run| run_key(run)).collect();
+        Ok(WorkChanges { steps, reorder, moved_seats, runs, repaired })
     }
 
     /// The steps whose worker lease ended after `after` and by `through`: their rows show them
@@ -510,32 +581,85 @@ impl Store {
         self.smalltalk.published_work.newest()
     }
 
-    /// The seats `steps` are assigned to, whatever their state, read in the caller's snapshot.
-    pub(crate) fn step_assignees(&self, steps: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+    /// The seats `steps` are assigned to and the runs they are in, whatever their state or
+    /// generation, read in the caller's snapshot. Every step's run, with or without a seat.
+    pub(crate) fn step_assignees(&self, steps: &BTreeSet<String>) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
         if steps.is_empty() {
-            return Ok(BTreeSet::new());
+            return Ok(Default::default());
         }
         let connection = self.readers.get();
-        let seats = connection
+        let rows = connection
             .prepare_cached(STEP_ASSIGNEES)?
-            .query_map([serde_json::to_string(steps)?], |row| row.get::<_, String>(0))?
+            .query_map([serde_json::to_string(steps)?], |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(seats.iter().filter(|seat| seat.starts_with("agent/")).map(|seat| viewer_seat(seat)).collect())
+        let seats = rows
+            .iter()
+            .filter_map(|(seat, _)| seat.as_deref())
+            .filter(|seat| seat.starts_with("agent/"))
+            .map(viewer_seat)
+            .collect();
+        let runs = rows.iter().map(|(_, run)| run_key(run)).collect();
+        Ok((seats, runs))
     }
 
-    /// Each of `seats`' queue order, read in the caller's snapshot. A seat with no queued run
-    /// is left out, as reading it gives no order.
-    pub(crate) fn seat_orders_of(&self, seats: &BTreeSet<String>) -> Result<HashMap<String, Arc<Vec<String>>>> {
+    /// Each of `seats`' queue order and the runs it read, in the caller's snapshot, from the same
+    /// read [`Store::seat_run_order`] makes. A seat with no queued run and no move is left out.
+    pub(crate) fn seat_queues_of(&self, seats: &BTreeSet<String>) -> Result<HashMap<String, SeatQueue>> {
         #[cfg(test)]
-        self.smalltalk.seat_order_reads.fetch_add(seats.len(), std::sync::atomic::Ordering::Relaxed);
-        let mut orders = HashMap::new();
-        for seat in seats {
-            let order = self.seat_run_order(seat)?;
-            if !order.is_empty() {
-                orders.insert(seat.clone(), Arc::new(order));
-            }
+        {
+            self.smalltalk.seat_order_reads.fetch_add(seats.len(), std::sync::atomic::Ordering::Relaxed);
+            *self.smalltalk.last_seats_read.lock().unwrap() = seats.clone();
         }
-        Ok(orders)
+        smallclaims::touched::note_read(|| format!("kind:{}", seat_queue::MOVED_CLAIM));
+        let connection = self.readers.get();
+        let mut queues = HashMap::new();
+        for seat in seats {
+            let Some(inputs) = seat_queue_inputs_tx(&connection, Some(seat.as_str()))?.remove(seat) else {
+                continue;
+            };
+            let order = inputs.live_order();
+            let mut runs = inputs.joins.iter().map(|join| run_key(&join.run)).collect::<BTreeSet<_>>();
+            for recorded in &inputs.moves {
+                runs.insert(run_key(&recorded.movement.run));
+                runs.extend(recorded.movement.anchor.as_deref().map(run_key));
+            }
+            queues.insert(seat.clone(), SeatQueue { order, runs });
+        }
+        Ok(queues)
+    }
+
+    /// Count `count` runs a warm fold looked up in its reverse index, for tests.
+    pub(crate) fn count_seat_lookups(&self, count: usize) {
+        #[cfg(test)]
+        self.smalltalk.seat_lookups.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let _ = count;
+    }
+
+    /// Record `claim` as a replica record of `state`, as replication would, for tests.
+    #[cfg(test)]
+    pub(crate) fn record_replica_for_test(&self, record_ref: &str, claim: &str, state: &str) {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO replica_records(record_ref, writer, sequence, envelope_hash, position,
+                    raw, state, claim_id, updated_at_unix_ms)
+                 VALUES (?1, 'peer', 1, 'envelope', 0, x'00', ?3, ?2, '0')",
+                params![record_ref, claim, state],
+            )
+            .unwrap();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seat_lookups(&self) -> usize {
+        self.smalltalk.seat_lookups.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_seats_read(&self) -> BTreeSet<String> {
+        self.smalltalk.last_seats_read.lock().unwrap().clone()
     }
 
     /// Count one direct current-work read, which an enabled work list never makes. Counted in

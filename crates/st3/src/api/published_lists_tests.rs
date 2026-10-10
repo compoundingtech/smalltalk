@@ -335,7 +335,17 @@ fn fold_work_checked(store: &Store) -> (Arc<Publication<WorkRows>>, bool) {
             fresh.rows.seat_orders.get(seat),
             "{seat}'s queue order"
         );
+        assert_eq!(publication.rows.seat_runs.get(seat), fresh.rows.seat_runs.get(seat), "the runs {seat}'s queue read");
     }
+    // The reverse index is exactly the inverse of the registered seats' runs.
+    let mut inverse = HashMap::<String, BTreeSet<String>>::new();
+    for (seat, runs) in publication.rows.seat_runs.iter() {
+        for run in runs.iter() {
+            inverse.entry(run.clone()).or_default().insert(seat.clone());
+        }
+    }
+    let index = publication.rows.run_seats.iter().map(|(run, seats)| (run.clone(), (**seats).clone())).collect::<HashMap<_, _>>();
+    assert_eq!(index, inverse, "run_seats inverts seat_runs, with no empty bucket");
     for actor in ACTORS {
         // Every page the HTTP list slices from the publication, in turn, is the direct read.
         let (all, _) = work_oracle(store, time, actor, usize::MAX);
@@ -1125,4 +1135,166 @@ async fn an_edited_or_foreign_published_work_cursor_expires() {
     // 4. A forget since the first page.
     store.published_work_list().forget();
     expired(continue_with(&state, cursor, None).await, "forgotten");
+}
+
+/// Declare `seats` as agents.
+fn agents(store: &Store, seats: &[&str]) {
+    let source = seats
+        .iter()
+        .map(|seat| format!("agent \"{seat}\" {{ workspace \"/tmp\"; command \"true\" }}\n"))
+        .collect::<String>();
+    publish(store, &format!("version 2\n{source}"), &format!("publish-agents-{}", seats.join("-")));
+}
+
+fn claims_rebuilds(store: &Store) -> u64 {
+    store.published_work_list().rebuilds().get("claims").copied().unwrap_or(0)
+}
+
+fn handoff(store: &Store, step: &str, from: &str, to: &str, key: &str) -> Result<crate::model::StepRunView, St3Error> {
+    store.handoff_work(
+        step,
+        &crate::model::WorkHandoffRequest {
+            actor: from.into(),
+            incarnation: Some(format!("{from}-1")),
+            to: to.into(),
+            note: "Yours now.".into(),
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        },
+    )
+}
+
+fn move_run(store: &Store, seat: &str, run: &str, placement: &str, anchor: Option<&str>, key: &str) -> smallclaims::claim::ClaimRecord {
+    store
+        .move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
+            agent: seat.into(),
+            run: run.into(),
+            placement: placement.into(),
+            anchor: anchor.map(str::to_owned),
+            reason: Some("the test's order".into()),
+            actor: "person/operator".into(),
+            idempotency_key: key.into(),
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_step_handed_off_before_it_was_ever_held_rereads_its_old_seat() {
+    let _clock = Clock::at(start_time());
+    let store = Store::open_memory("cedar").unwrap();
+    let (a, b) = ("agent/garden/seat-a", "agent/garden/seat-b");
+    agents(&store, &["garden/seat-a", "garden/seat-b"]);
+    seat_mission(&store, "garden/tend-a", a);
+    ready_run(&store, "garden/tend-a", "tend-a-1");
+    let second = start(&store, "garden/tend-a", "tend-a-2");
+    // The second run first in a's queue, so a may claim its step once it is ready.
+    move_run(&store, a, &second.id, "top", None, "second-first");
+    store.published_work_list().start();
+    let (base, _) = fold_work_checked(&store);
+    let (plant, seat) = step(&second, "plant");
+    assert!(!base.rows.rows.contains_key(&plant), "never held at the base");
+    assert!(base.rows.run_seats[&crate::store::work_list::run_key(&second.id)].contains(a), "a read the second run");
+    let (rebuilds, lookups) = (claims_rebuilds(&store), store.seat_lookups());
+    // In one fold window: ready, claimed by a, handed to b in place.
+    store.set_step_state(&plant, "ready", None).unwrap();
+    act(&store, &plant, &seat, "claim", "claim-second");
+    handoff(&store, &plant, &seat, b, "handoff-second").unwrap();
+    refresh_work_once(&store);
+    assert_eq!(claims_rebuilds(&store), rebuilds, "a warm fold");
+    assert!(store.seat_lookups() > lookups, "the second run was looked up");
+    assert!(store.last_seats_read().contains(a), "a, no longer its assignee, was read again");
+    // And a's order, without the second run, is what a fold from nothing reads.
+    let (after, _) = fold_work_checked(&store);
+    assert!(after.rows.seat_orders[a].iter().all(|run| *run != crate::store::work_list::run_key(&second.id)));
+}
+
+#[test]
+fn a_seat_rereads_when_a_run_its_move_only_anchors_on_changes() {
+    let _clock = Clock::at(start_time());
+    let store = Store::open_memory("cedar").unwrap();
+    let (ash, birch) = ("agent/garden/ash", "agent/garden/birch");
+    agents(&store, &["garden/ash", "garden/birch"]);
+    let proposed = |seat: &str, goal: &str, key: &str| {
+        let source = format!(
+            r#"version 2
+mission "garden/proposed" state="ready" revisions="human-only" revision-reviewer="person/reviewer" {{
+  goal "Grow by proposal."
+  agent "owner" {{ workspace "."; command "true" }}
+  step "plant" {{ assigned-to {seat:?}; goal {goal:?} }}
+}}"#
+        );
+        let intent = crate::graph::parse_intent(&source, store.origin()).unwrap();
+        let preview = store
+            .mission(&intent, crate::model::IntentInput { kdl: source.clone(), source_name: None })
+            .unwrap();
+        store.apply_as(&intent, &preview.subject_tokens, key, Some("person/operator")).unwrap();
+        intent.missions["garden/proposed"].clone()
+    };
+    proposed(ash, "Plant in beds.", "publish-proposed-beds");
+    seat_mission(&store, "garden/tend-ash", ash);
+    let r1 = start(&store, "garden/proposed", "proposed-1");
+    ready_run(&store, "garden/tend-ash", "tend-ash-1");
+    let r3 = ready_run(&store, "garden/tend-ash", "tend-ash-2");
+    // Ash claims R1's step, its first queued run, and anchors a move on R1.
+    let (plant, seat) = step(&r1, "plant");
+    store.set_step_state(&plant, "ready", None).unwrap();
+    act(&store, &plant, &seat, "claim", "claim-r1");
+    move_run(&store, ash, &r3.id, "after", Some(&r1.id), "r3-after-r1");
+    // A revision moves R1's step to birch; ash keeps only its old-generation, draining step.
+    let rows = proposed(birch, "Plant in rows.", "publish-proposed-rows");
+    let proposal = store
+        .create_revision_proposal(&r1.id, &rows, &format!("agent/{}/owner", r1.id), "move to birch", "proposal-birch")
+        .unwrap();
+    store
+        .approve_revision_proposal(&proposal.id, "person/reviewer", proposal.preview_hash.as_deref().unwrap(), "approve-birch")
+        .unwrap();
+    store.published_work_list().start();
+    let (base, _) = fold_work_checked(&store);
+    let r1_key = crate::store::work_list::run_key(&r1.id);
+    assert!(base.rows.seat_runs[ash].contains(&r1_key), "ash's move names R1");
+    assert!(
+        base.rows.seat_orders.get(ash).is_none_or(|order| !order.contains(&r1_key)),
+        "R1 is open but not live for ash at the base"
+    );
+    let (rebuilds, lookups) = (claims_rebuilds(&store), store.seat_lookups());
+    // In the window, ash hands its old-generation step to birch: a named input of ash's queue.
+    match handoff(&store, &plant, &seat, birch, "handoff-old-generation") {
+        Ok(_) => {
+            refresh_work_once(&store);
+            assert_eq!(claims_rebuilds(&store), rebuilds, "a warm fold");
+            assert!(store.seat_lookups() > lookups);
+            assert!(store.last_seats_read().contains(ash), "ash was read again through R1");
+            fold_work_checked(&store);
+        }
+        // The source refuses this handoff: this named input cannot change this way.
+        Err(error) => assert!(!error.code.is_empty(), "{error:?}"),
+    }
+}
+
+#[test]
+fn an_operator_repair_that_drops_a_move_folds_the_list_from_nothing() {
+    let _clock = Clock::at(start_time());
+    let store = Store::open_memory("cedar").unwrap();
+    let ash = "agent/garden/ash";
+    seat_mission(&store, "garden/tend-ash", ash);
+    let r1 = ready_run(&store, "garden/tend-ash", "tend-ash-1");
+    let r2 = ready_run(&store, "garden/tend-ash", "tend-ash-2");
+    let moved = move_run(&store, ash, &r2.id, "top", None, "r2-first");
+    // The move arrived by replication and was found invalid.
+    let record = format!("record/{}", "ab".repeat(32));
+    store.record_replica_for_test(&record, &moved.id, "invalid");
+    store.published_work_list().start();
+    let (base, _) = fold_work_checked(&store);
+    assert_eq!(base.rows.seat_orders[ash].first(), Some(&crate::store::work_list::run_key(&r2.id)), "the move counts");
+    let rebuilds = claims_rebuilds(&store);
+    // The operator repairs the record through apply: no claim about ash, and no forget.
+    publish(
+        &store,
+        &format!("version 2\nrepair \"{record}\" {{\n  replacement \"{}\"\n  reason \"replaced by the operator\"\n}}\n", moved.id),
+        "repair-move",
+    );
+    refresh_work_once(&store);
+    assert_eq!(claims_rebuilds(&store), rebuilds + 1, "the repair folded the list from nothing");
+    let (after, _) = fold_work_checked(&store);
+    assert_eq!(after.rows.seat_orders[ash].first(), Some(&crate::store::work_list::run_key(&r1.id)), "the repaired move no longer counts");
 }

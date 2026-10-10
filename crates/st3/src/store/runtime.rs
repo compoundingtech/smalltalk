@@ -69,9 +69,14 @@ pub struct SmalltalkRuntime {
     /// Direct current-work reads, which an enabled work list never makes.
     #[cfg(test)]
     pub(crate) direct_work_reads: std::sync::atomic::AtomicUsize,
-    /// Seats whose queue order a work fold read.
+    /// Seats whose queue order a work fold read; runs a warm fold looked up in its reverse
+    /// index; and the seats the last fold read.
     #[cfg(test)]
     pub(crate) seat_order_reads: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) seat_lookups: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) last_seats_read: std::sync::Mutex<BTreeSet<String>>,
 }
 
 #[derive(Clone)]
