@@ -119,9 +119,11 @@ message / delivered / failed / state / context frames, PROTOCOL constant). Diffe
   acts on an event whose `ctx.agent.kind` is `"sub"`, so a subagent opens no channel, closes none,
   and never receives the seat's mail; the channel stays bound to the top-level session. The one
   frame a subagent sends is `subagent`, on the seat's channel: `start` at `agent_start`,
-  `progress` at `turn_end`, and `end` with an outcome at the `agent_end` that does not continue,
-  or at `session_shutdown` before that. st records these as the seat's subagents
-  (`docs/st3/subagents.md`). omp exposes `ctx.agent` from 18.3.2; an earlier build reads as
+  `progress` at `turn_end`, at its messages and tool calls (at most every ten seconds) and every
+  minute while `ctx.isIdle()` is false, and `end` with an outcome at the `agent_end` that does
+  not continue, or at `session_shutdown` before that. st records these as the seat's subagents
+  and ends one that has not reported for five minutes (`docs/st3/subagents.md`). omp exposes
+  `ctx.agent` from 18.3.2; an earlier build reads as
   top-level.
 - **Restored context:** seeding uses
   `sendMessage({customType:"st2-session-start", …}, {deliverAs:"nextTurn"})`.

@@ -58,6 +58,14 @@ that does not continue: `failed` after a provider error, `interrupted` after an 
 that runs again is a new run, `ID#2` and so on, as in Codex. The type is omp's agent name. omp
 reports no tokens for a subagent, so its end carries none.
 
+An omp subagent also reports `progress` at each `turn_end`, at most every ten seconds at its
+messages and tool calls, and every minute while omp says its session is busy, as in a long tool
+call or a nested subagent. The driver ends a run that has not reported for five minutes as
+`interrupted`, while the seat keeps running. This ends a subagent whose session stopped without
+its end. `ST3_SUBAGENT_SILENCE_MS` can only shorten the five minutes. The ledger forgets the run
+count of a subagent only after all of its runs have ended and been recorded, so a running
+subagent keeps its ID.
+
 The seat's driver reads the ledger every second and records what changed. A subagent leaves the
 ledger only after its end is recorded, so a daemon outage delays these claims without losing any.
 
@@ -126,5 +134,6 @@ covers:
 minutes.
 
 `crates/st3/tests/subagent_publisher.rs` drives an omp seat's channel observer with the frames the
-extension sends and reads the agents list: a running subagent shows with its ID, type, driver and
-lease, and leaves the list at its end, or when its lease runs out without a renewal.
+extension sends and reads the agents list. A running subagent shows with its ID, type, driver and
+lease, and leaves the list at its end. While the seat's driver ticks and renews, a subagent that
+stops reporting leaves the list after the silence bound, and a sibling that keeps reporting stays.

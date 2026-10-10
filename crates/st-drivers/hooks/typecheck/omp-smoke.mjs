@@ -568,6 +568,39 @@ assert.deepStrictEqual(
     : [],
   "a subagent's events reach the channel only as its runs",
 );
+// While its runs last, st's asset reports each minute every subagent omp says is busy, as in a long
+// tool call. A subagent whose session went idle without its end reports nothing, so st ends it once
+// it has been quiet long enough.
+const heartbeats = [];
+const realSetInterval = globalThis.setInterval;
+globalThis.setInterval = (callback, ms) => {
+  heartbeats.push({ callback, ms });
+  return realSetInterval(() => {}, 2 ** 30);
+};
+const busyCtx = { ...subCtx, isIdle: () => false };
+const quietCtx = { ...subCtx, isIdle: () => true, agent: { ...subCtx.agent, id: "1-Quiet" } };
+const framesBeforeHeartbeat = readFrames().length;
+await subHandlers.get("agent_start")({}, busyCtx);
+await subHandlers.get("agent_start")({}, quietCtx);
+globalThis.setInterval = realSetInterval;
+assert.deepStrictEqual(
+  heartbeats.map(({ ms }) => ms),
+  process.argv[2]?.includes("st-omp-channel") ? [60_000] : [],
+  "one heartbeat serves every running subagent",
+);
+heartbeats[0]?.callback();
+await subHandlers.get("agent_end")(successfulEnd, busyCtx);
+await subHandlers.get("session_shutdown")({}, quietCtx);
+await pause(300);
+const quiet = (event, outcome) => ({ ...run(event, outcome), id: "1-Quiet" });
+assert.deepStrictEqual(
+  readFrames().slice(framesBeforeHeartbeat).filter((frame) => frame.type === "subagent"),
+  process.argv[2]?.includes("st-omp-channel")
+    ? [run("start"), quiet("start"), run("progress"), run("end", "completed"),
+      quiet("end", "interrupted")]
+    : [],
+  "a heartbeat reports only the subagents whose sessions are busy",
+);
 // Still mid-turn from the subagent's point of view; the seat's session is idle, so mail goes now.
 fs.appendFileSync(outboxPath, JSON.stringify({
   type: "message",

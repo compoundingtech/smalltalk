@@ -37,6 +37,10 @@ const MAX_DESCRIPTION_CHARS: usize = 200;
 /// interrupted. Claude lists background subagents at each Stop; one that finishes as the turn ends
 /// reports its own stop a moment later.
 pub const UNLISTED_GRACE_MS: u64 = 10_000;
+/// How long a subagent of a harness that reports it while it runs (omp) may go unreported before
+/// it counts as interrupted. omp's extension reports each turn and tool call, and every minute
+/// while the subagent's session is busy, so only a subagent that stopped running goes this quiet.
+pub const SILENT_GRACE_MS: u64 = 5 * 60_000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
@@ -79,6 +83,9 @@ pub struct Subagent {
     /// Since when the harness stopped listing this subagent as running.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unlisted_since_ms: Option<u64>,
+    /// When the harness last reported this subagent, for a harness that reports it while it runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_at_ms: Option<u64>,
     /// The parent's usage does not include this subagent's responses yet, so the driver adds its
     /// tokens there when it counts them at its end. Claude records them itself; Codex does not.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -156,6 +163,29 @@ impl Ledger {
                 &id,
                 "interrupted",
                 Some("the harness stopped listing it as running".into()),
+                now_ms,
+            );
+        }
+    }
+
+    /// End the subagents their harness reports while they run (omp) and has not reported for
+    /// `grace_ms`.
+    pub fn end_silent(&mut self, now_ms: u64, grace_ms: u64) {
+        let silent = self
+            .running
+            .values()
+            .filter(|subagent| {
+                subagent
+                    .reported_at_ms
+                    .is_some_and(|at| now_ms.saturating_sub(at) >= grace_ms)
+            })
+            .map(|subagent| subagent.id.clone())
+            .collect::<Vec<_>>();
+        for id in silent {
+            self.end(
+                &id,
+                "interrupted",
+                Some("the harness stopped reporting it".into()),
                 now_ms,
             );
         }
@@ -372,6 +402,7 @@ fn apply_claude(ledger: &mut Ledger, event: &str, payload: &Value, now: u64) {
                 session_id: Some(session),
                 started_at_ms: now,
                 unlisted_since_ms: None,
+                reported_at_ms: None,
                 parent_usage: false,
             });
         }
@@ -444,15 +475,27 @@ fn run_id(ledger: &Ledger, thread: &str) -> String {
     }
 }
 
-/// Count a new run of thread `thread` and return its ID.
+/// Count a new run of thread `thread` and return its ID. Past `MAX_THREADS` threads the ledger
+/// forgets one whose runs have all ended and been recorded: forgetting one still running or still
+/// to record would give its next run an ID already in use.
 fn next_run(ledger: &mut Ledger, thread: &str) -> String {
     let run = ledger.runs.get(thread).map_or(1, |run| run + 1);
     ledger.runs.insert(thread.to_owned(), run);
     if ledger.runs.len() > MAX_THREADS {
-        let oldest = ledger.runs.keys().next().cloned();
-        if let Some(oldest) = oldest {
-            ledger.runs.remove(&oldest);
-            ledger.counted.remove(&oldest);
+        let in_use = ledger
+            .running
+            .keys()
+            .chain(ledger.ended.iter().map(|ended| &ended.subagent.id))
+            .map(|id| subagent_thread(id))
+            .collect::<BTreeSet<_>>();
+        let finished = ledger
+            .runs
+            .keys()
+            .find(|known| known.as_str() != thread && !in_use.contains(known.as_str()))
+            .cloned();
+        if let Some(finished) = finished {
+            ledger.runs.remove(&finished);
+            ledger.counted.remove(&finished);
         }
     }
     run_id(ledger, thread)
@@ -508,6 +551,7 @@ fn apply_codex(ledger: &mut Ledger, message: &Value, parent: &str, now: u64) {
                         started_at_ms: now,
                         transcript: None,
                         unlisted_since_ms: None,
+                        reported_at_ms: None,
                         parent_usage: true,
                     });
                 }
@@ -565,7 +609,8 @@ fn apply_omp(ledger: &mut Ledger, frame: &Value, parent: &str, now: u64) {
     match frame.get("event").and_then(Value::as_str) {
         // A progress report starts a run whose start this ledger missed.
         Some("start" | "progress") => {
-            if ledger.running.contains_key(&current) {
+            if let Some(running) = ledger.running.get_mut(&current) {
+                running.reported_at_ms = Some(now);
                 return;
             }
             let id = next_run(ledger, &thread);
@@ -577,6 +622,7 @@ fn apply_omp(ledger: &mut Ledger, frame: &Value, parent: &str, now: u64) {
                 started_at_ms: now,
                 transcript: None,
                 unlisted_since_ms: None,
+                reported_at_ms: Some(now),
                 parent_usage: false,
             });
         }
@@ -1161,6 +1207,62 @@ mod tests {
         let before = ledger.clone();
         apply_omp(&mut ledger, &json!({"type": "subagent", "event": "end"}), "native", 10);
         assert_eq!(ledger, before);
+    }
+
+    #[test]
+    fn an_omp_subagent_that_stops_reporting_is_interrupted_after_the_grace() {
+        let report = |id: &str, event: &str| json!({"type": "subagent", "event": event, "id": id});
+        let mut ledger = Ledger::default();
+        apply_omp(&mut ledger, &report("quiet", "start"), "native", 0);
+        apply_omp(&mut ledger, &report("busy", "start"), "native", 0);
+        apply_omp(&mut ledger, &report("quiet", "progress"), "native", 100);
+        apply_omp(&mut ledger, &report("busy", "progress"), "native", SILENT_GRACE_MS);
+        assert_eq!(ledger.running["quiet"].reported_at_ms, Some(100));
+        ledger.end_silent(100 + SILENT_GRACE_MS - 1, SILENT_GRACE_MS);
+        assert_eq!(ledger.running.len(), 2);
+        ledger.end_silent(100 + SILENT_GRACE_MS, SILENT_GRACE_MS);
+        assert_eq!(ledger.running.keys().collect::<Vec<_>>(), ["busy"]);
+        assert_eq!(ledger.ended[0].subagent.id, "quiet");
+        assert_eq!(ledger.ended[0].outcome, "interrupted");
+        // Claude and Codex do not report a subagent while it runs, so silence ends none of theirs.
+        let mut claude = Ledger::default();
+        started(&mut claude, "claude", "p-1", "general-purpose", 0);
+        let mut codex = Ledger::default();
+        apply_codex(&mut codex, &activity("started", "codex"), "parent", 0);
+        for ledger in [&mut claude, &mut codex] {
+            assert_eq!(ledger.running.len(), 1);
+            ledger.end_silent(u64::MAX, SILENT_GRACE_MS);
+            assert_eq!(ledger.running.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_thread_still_running_or_to_record_keeps_its_run_count() {
+        let report = |id: &str, event: &str| json!({"type": "subagent", "event": event, "id": id});
+        let mut ledger = Ledger::default();
+        // `a-busy` and `a-unrecorded` sort before every other thread, so they are the oldest keys.
+        for event in ["start", "end", "start"] {
+            apply_omp(&mut ledger, &report("a-busy", event), "native", 1);
+        }
+        apply_omp(&mut ledger, &report("a-unrecorded", "start"), "native", 1);
+        apply_omp(&mut ledger, &report("a-unrecorded", "end"), "native", 1);
+        let unrecorded = ledger.ended.pop().unwrap();
+        ledger.ended.clear();
+        ledger.ended.push(unrecorded);
+        for index in 0..=MAX_THREADS {
+            let thread = format!("t-{index:04}");
+            apply_omp(&mut ledger, &report(&thread, "start"), "native", 2);
+            apply_omp(&mut ledger, &report(&thread, "end"), "native", 2);
+            ledger.ended.retain(|ended| ended.subagent.id == "a-unrecorded");
+        }
+        assert!(ledger.runs.len() <= MAX_THREADS);
+        assert_eq!(run_id(&ledger, "a-busy"), "a-busy#2");
+        apply_omp(&mut ledger, &report("a-busy", "progress"), "native", 3);
+        apply_omp(&mut ledger, &report("a-busy", "end"), "native", 3);
+        assert!(ledger.running.is_empty(), "the open run is still the one ending");
+        // A thread whose end is still to record keeps its count too, so its next run is new.
+        apply_omp(&mut ledger, &report("a-unrecorded", "start"), "native", 4);
+        assert!(ledger.running.contains_key("a-unrecorded#2"));
     }
 
     #[test]

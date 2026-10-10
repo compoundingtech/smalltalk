@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "The omp extension sends a new subagent frame on the seat's channel. A channel from an older st ignores it. Older peers accept the claims, because their kinds and fields do not change. A running omp seat starts to report subagents after its next restart."
+    "detail": "The omp extension sends a new subagent frame on the seat's channel. A channel from an older st ignores it. Older peers accept the claims, because their kinds and fields do not change. A running omp seat starts to report subagents after its next restart. For Codex and omp, the ledger now forgets a subagent's run count only after all of its runs have ended and been recorded, so a running subagent keeps its ID."
   },
   "downtime": {
     "status": "none",
@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "none",
-    "detail": "Nothing to recover. A subagent that a stopped omp harness leaves open ends when its lease runs out."
+    "detail": "Nothing to recover. The driver ends an omp subagent that has not reported for five minutes. A subagent that a stopped omp harness leaves open ends when its lease runs out."
   }
 }

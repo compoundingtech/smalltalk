@@ -134,8 +134,17 @@ type Stash = {
   holdTimer?: ReturnType<typeof setTimeout>;
   /** Serializes handoffs so omp receives messages in arrival order. */
   handoff?: Promise<void>;
-  /** Subagents of this process between their `agent_start` and their end. */
-  subagents?: Set<string>;
+  /** Subagents of this process between their `agent_start` and their end, by omp agent ID. */
+  subagents?: Map<string, OpenSubagent>;
+  /** Reports each busy subagent while any runs, so st ends only one that stopped running. */
+  subagentHeartbeat?: NodeJS.Timeout;
+};
+
+type OpenSubagent = {
+  frame: Record<string, unknown>;
+  /** The subagent session's newest context, asked whether the session is still busy. */
+  ctx: ExtensionContext;
+  reportedAt: number;
 };
 
 /**
@@ -212,6 +221,16 @@ const subagentOutcome = (event: AgentEndFrame): "completed" | "failed" | "interr
   }
   return "completed";
 };
+
+/** A subagent's tool calls and messages report it at most this often. */
+const SUBAGENT_PROGRESS_MS = 10_000;
+/**
+ * While a subagent's session is busy, as in a long tool call or a nested subagent, it reports at
+ * least this often. st ends a subagent unreported for five minutes (`SILENT_GRACE_MS`).
+ */
+const SUBAGENT_HEARTBEAT_MS = 60_000;
+const SUBAGENT_SILENT_MS = 5 * 60_000;
+const SUBAGENT_ACTIVITY = new Set(["message_end", "tool_execution_start", "tool_execution_end"]);
 
 /**
  * Compile-time coupling to the pinned pi declarations for the surfaces the context producer reads.
@@ -1118,27 +1137,63 @@ export default function (pi: ExtensionAPI) {
   const isSubagent = (ctx: ExtensionContext | undefined): boolean =>
     (ctx as { agent?: { kind?: unknown } } | undefined)?.agent?.kind === "sub";
   // A subagent session reports only its runs: st records them on the seat as its subagents, with
-  // a lease the seat's driver renews while the run lasts. A run starts at `agent_start`, makes
-  // progress at each `turn_end`, and ends at the `agent_end` that does not continue, or when its
-  // session shuts down first. omp names the subagent in `ctx.agent` (`id`, `name`).
+  // a lease the seat's driver renews while the run lasts. A run starts at `agent_start` and ends at
+  // the `agent_end` that does not continue, or when its session shuts down first. Between them it
+  // reports progress at each `turn_end`, at its messages and tool calls, and each minute while omp
+  // says its session is busy; st ends a run that stops reporting. omp names the subagent in
+  // `ctx.agent` (`id`, `name`).
+  const subagentBusy = (ctx: ExtensionContext): boolean => {
+    try {
+      return ctx.isIdle() === false;
+    } catch {
+      return false;
+    }
+  };
+  const reportSubagent = (open: OpenSubagent, now: number) => {
+    open.reportedAt = now;
+    sendFrame({ ...open.frame, event: "progress" });
+  };
+  const closeSubagent = (id: string): boolean => {
+    const closed = state.subagents?.delete(id) ?? false;
+    if (!state.subagents?.size) {
+      clearInterval(state.subagentHeartbeat);
+      state.subagentHeartbeat = undefined;
+    }
+    return closed;
+  };
+  const heartbeat = () => {
+    const now = Date.now();
+    for (const [id, open] of state.subagents ?? []) {
+      if (subagentBusy(open.ctx)) reportSubagent(open, now);
+      // st has ended a run this quiet; forget it so the heartbeat stops with the last run.
+      else if (now - open.reportedAt >= SUBAGENT_SILENT_MS) closeSubagent(id);
+    }
+  };
   const observeSubagent = (event: string, payload: unknown, ctx: ExtensionContext) => {
     const agent = record(record(ctx)?.agent);
     const id = typeof agent?.id === "string" ? agent.id.trim() : "";
     if (!id) return;
     const name = typeof agent?.name === "string" ? agent.name.trim() : "";
     const frame = { type: "subagent", id, ...(name ? { name } : {}) };
-    const running = (state.subagents ??= new Set<string>());
+    const running = (state.subagents ??= new Map<string, OpenSubagent>());
+    const open = running.get(id);
+    if (open) open.ctx = ctx;
+    const now = Date.now();
     if (event === "agent_start") {
-      running.add(id);
+      running.set(id, { frame, ctx, reportedAt: now });
       sendFrame({ ...frame, event: "start" });
+      state.subagentHeartbeat ??= setInterval(heartbeat, SUBAGENT_HEARTBEAT_MS).unref();
     } else if (event === "turn_end") {
+      if (open) open.reportedAt = now;
       sendFrame({ ...frame, event: "progress" });
+    } else if (SUBAGENT_ACTIVITY.has(event)) {
+      if (open && now - open.reportedAt >= SUBAGENT_PROGRESS_MS) reportSubagent(open, now);
     } else if (event === "agent_end") {
       const end = record(payload) ?? {};
       if (end.willContinue === true) return;
-      running.delete(id);
+      closeSubagent(id);
       sendFrame({ ...frame, event: "end", outcome: subagentOutcome(end) });
-    } else if (event === "session_shutdown" && running.delete(id)) {
+    } else if (event === "session_shutdown" && closeSubagent(id)) {
       sendFrame({ ...frame, event: "end", outcome: "interrupted" });
     }
   };

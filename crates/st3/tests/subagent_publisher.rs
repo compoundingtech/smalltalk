@@ -433,16 +433,20 @@ async fn an_omp_subagent_is_listed_on_its_seat_until_it_ends() {
     server.abort();
 }
 
-/// A harness that stops reporting, as a crashed one does, renews nothing: its subagent leaves the
-/// list when the lease runs out, though no end was recorded.
+/// While the seat's driver runs and renews, an omp subagent that stops reporting (its harness lost
+/// its end) leaves the list once it has been quiet for the bound, ended as interrupted. A sibling
+/// that keeps reporting stays listed and renewed.
 #[cfg(target_os = "linux")]
 #[test]
-fn an_omp_subagent_leaves_the_list_when_its_lease_runs_out() {
+fn an_omp_subagent_that_stops_reporting_leaves_the_list_while_its_seat_runs() {
     if st3::test_support::supervise_test() {
         return;
     }
     // SAFETY: the supervised process runs this test alone, and no other thread runs yet.
-    unsafe { std::env::set_var("ST3_SUBAGENT_LEASE_MS", "1500") };
+    unsafe {
+        std::env::set_var("ST3_SUBAGENT_LEASE_MS", "2000");
+        std::env::set_var("ST3_SUBAGENT_SILENCE_MS", "1500");
+    }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -459,14 +463,33 @@ fn an_omp_subagent_leaves_the_list_when_its_lease_runs_out() {
                 &agent_dir,
                 ledger::now_ms(),
             );
+            let busy = |event: &str| json!({"type": "subagent", "event": event, "id": "1-Busy"});
             channel.observe(&subagent_frame("start")).unwrap();
+            channel.observe(&busy("start")).unwrap();
             publisher.tick(&client).await.unwrap();
-            assert_eq!(listed_subagents(&client).await.as_array().unwrap().len(), 1);
+            assert_eq!(listed_subagents(&client).await.as_array().unwrap().len(), 2);
 
-            tokio::time::sleep(Duration::from_millis(2_000)).await;
-            assert_eq!(listed_subagents(&client).await, json!([]));
-            assert!(fields(&store, OMP_SEAT, "subagent.ended").is_empty());
-            assert!(ledger::read(&agent_dir).running.contains_key("0-Review"));
+            // The driver keeps ticking and the sibling keeps reporting; `0-Review` goes quiet.
+            for _ in 0..12 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                channel.observe(&busy("progress")).unwrap();
+                publisher.tick(&client).await.unwrap();
+            }
+            let listed = listed_subagents(&client).await;
+            let listed = listed.as_array().unwrap();
+            assert_eq!(listed.len(), 1, "{listed:?}");
+            assert_eq!(listed[0]["id"], "1-Busy");
+            let ended = fields(&store, OMP_SEAT, "subagent.ended");
+            assert_eq!(ended.len(), 1, "{ended:?}");
+            assert_eq!(ended[0]["subagent_id"], "0-Review");
+            assert_eq!(ended[0]["outcome"], "interrupted");
+            assert!(
+                fields(&store, OMP_SEAT, "subagent.renewed")
+                    .iter()
+                    .any(|renewed| renewed["subagent_id"] == "1-Busy"),
+                "the seat's driver renews the sibling",
+            );
+            assert!(!ledger::read(&agent_dir).running.contains_key("0-Review"));
             server.abort();
         });
 }
