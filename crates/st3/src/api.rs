@@ -12509,13 +12509,36 @@ fn accept_message_receipt_with_upload_owner(
         .as_ref()
         .filter(|claim| claim.kind == "message.sent" && claim.subject == subject)
     {
-        serde_json::from_value(
+        let stored: Vec<String> = serde_json::from_value(
             previous.body["fields"]
                 .get("tags")
                 .cloned()
                 .unwrap_or_else(|| json!([])),
         )
-        .map_err(ApiError::internal)?
+        .map_err(ApiError::internal)?;
+        // Reuse acceptance metadata while still checking the sender's tag input.
+        let same_tags = if device_signature.is_some() {
+            request.tags == stored
+        } else {
+            let mut requested_on_first_send = stored.clone();
+            if stored
+                .iter()
+                .any(|tag| tag == crate::fyi::HELD_BY_SETTING_TAG)
+            {
+                requested_on_first_send.retain(|tag| tag != crate::fyi::FYI_TAG);
+            }
+            let normalize = |tags: &[String]| {
+                crate::fyi::stored_tags(&from, &to, tags, None, || crate::fyi::WakeOn::All)
+            };
+            normalize(&request.tags) == normalize(&requested_on_first_send)
+        };
+        if !same_tags {
+            return Err(ApiError::bad(St3Error::new(
+                "idempotency-mismatch",
+                "the idempotency key already identifies different message tags",
+            )));
+        }
+        stored
     } else if device_signature.is_some() {
         request.tags.clone()
     } else {
@@ -25778,6 +25801,18 @@ version 2
         let retry = accept_message(&state, request(), None, None).unwrap().0;
         assert_eq!(first.tags, retry.tags);
         assert_eq!(first.subject, retry.subject);
+        for tags in [
+            vec!["different".into()],
+            vec![crate::fyi::QUESTION_TAG.into()],
+            vec![crate::fyi::FYI_TAG.into()],
+        ] {
+            let mut changed = request();
+            changed.tags = tags;
+            assert!(accept_message(&state, changed, None, None).is_err());
+        }
+        let mut changed = request();
+        changed.content = "A different update".into();
+        assert!(accept_message(&state, changed, None, None).is_err());
         assert_eq!(
             state
                 .store
