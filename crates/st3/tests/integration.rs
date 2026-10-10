@@ -49,6 +49,8 @@ mod messaging_faults;
 mod mission_cancellation;
 mod no_st2_seat;
 mod node_identity_cli;
+mod operation_audit;
+mod operation_audit_perf;
 mod operational_state_contract;
 mod otel_export;
 mod owned_sets;

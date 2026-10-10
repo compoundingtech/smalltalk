@@ -3853,10 +3853,11 @@ fn operation_reports() -> std::sync::MutexGuard<'static, BTreeMap<usize, Operati
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Start the daemon's first diagnostic report off the request path, so no read waits for it. The
-/// daemon calls this as its API starts to listen; until the report is made, the operations
-/// collection says that it is being made.
-pub(super) fn start_operation_report(state: &AppState) {
+/// Start the first diagnostic report off the request path and hand its operation audit to the
+/// startup repair. Only this first report shares its audit; refreshes inspect current state.
+pub(super) fn start_operation_report(
+    state: &AppState,
+) -> Option<tokio::sync::oneshot::Receiver<anyhow::Result<Vec<String>>>> {
     let key = Arc::as_ptr(&state.store) as usize;
     let mut reports = operation_reports();
     if reports.get(&key).is_some_and(|report| {
@@ -3865,7 +3866,7 @@ pub(super) fn start_operation_report(state: &AppState) {
             .upgrade()
             .is_some_and(|store| Arc::ptr_eq(&store, &state.store))
     }) {
-        return;
+        return None;
     }
     reports.insert(
         key,
@@ -3876,8 +3877,11 @@ pub(super) fn start_operation_report(state: &AppState) {
             refreshing: true,
         },
     );
+    drop(reports);
+    let (audit_sender, audit_receiver) = tokio::sync::oneshot::channel();
     let state = state.clone();
-    std::thread::spawn(move || refresh_operation_report(&state, key));
+    std::thread::spawn(move || refresh_operation_report(&state, key, Some(audit_sender)));
+    Some(audit_receiver)
 }
 
 /// The last diagnostic report, or `None` while the first one since the daemon started is being
@@ -3900,7 +3904,7 @@ fn operation_checks(
             {
                 report.refreshing = true;
                 let state = state.clone();
-                std::thread::spawn(move || refresh_operation_report(&state, key));
+                std::thread::spawn(move || refresh_operation_report(&state, key, None));
             }
             return Ok(report.checks.clone());
         }
@@ -3920,10 +3924,22 @@ fn operation_checks(
     Ok(Some(checks))
 }
 
-fn refresh_operation_report(state: &AppState, key: usize) {
-    let checks = doctor_report(state)
-        .ok()
-        .map(|report| Arc::new(report.0.checks));
+fn refresh_operation_report(
+    state: &AppState,
+    key: usize,
+    startup_audit: Option<tokio::sync::oneshot::Sender<anyhow::Result<Vec<String>>>>,
+) {
+    let report = if let Some(sender) = startup_audit {
+        let drift = state.store.operation_projection_drift();
+        let report = doctor_report_with_operation_drift(state, &drift);
+        // The repair owns these findings, including any scan error. It re-derives just the
+        // drifted rows from current claims, never reuses expected values from this snapshot.
+        let _ = sender.send(drift);
+        report
+    } else {
+        doctor_report(state)
+    };
+    let checks = report.ok().map(|report| Arc::new(report.0.checks));
     let mut reports = operation_reports();
     let Some(report) = reports.get_mut(&key) else {
         return;
@@ -14744,6 +14760,54 @@ subscription "watch/source" {
         assert_eq!(statements(40), few.get());
     }
 
+    #[test]
+    fn startup_operation_audit_is_shared_and_later_reports_are_fresh() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_client_claim(&ClaimInput {
+            subject: "resource/startup-audit".into(),
+            kind: "resource.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([("kind".into(), json!("custom.test.startup-audit"))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("startup-audit-operation".into()),
+        }).unwrap();
+        let corrupt = || {
+            state.store.connection.write()
+                .execute("UPDATE operations SET state='conflict'", []).unwrap();
+        };
+        corrupt();
+
+        let key = Arc::as_ptr(&state.store) as usize;
+        operation_reports().insert(key, OperationReport {
+            store: Arc::downgrade(&state.store),
+            checks: None,
+            at: Instant::now(),
+            refreshing: true,
+        });
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        refresh_operation_report(&state, key, Some(sender));
+        let drift = receiver.blocking_recv().unwrap().unwrap();
+        assert_eq!(drift.len(), 1);
+        let checks = operation_checks(&state).unwrap().unwrap();
+        let projection = checks.iter().find(|check| check.name == "operation-projection").unwrap();
+        assert_eq!(projection.status, "fail");
+        assert_eq!(projection.message, format!("operation projection drift: {}", drift.join(", ")));
+
+        assert!(state.store.repair_operation_projection_drift_from_audit(&drift).unwrap());
+        let projection_status = || {
+            doctor_report(&state).unwrap().0.checks.into_iter()
+                .find(|check| check.name == "operation-projection").unwrap().status
+        };
+        assert_eq!(projection_status(), "pass");
+        corrupt();
+        assert_eq!(projection_status(), "fail");
+        refresh_operation_report(&state, key, None);
+        let checks = operation_checks(&state).unwrap().unwrap();
+        assert_eq!(checks.iter().find(|check| check.name == "operation-projection").unwrap().status, "fail");
+    }
+
     /// The operations collection answers while the first diagnostic report since a start is
     /// being made, saying so, and lists the report once it is made.
     #[test]
@@ -14770,7 +14834,7 @@ subscription "watch/source" {
         assert_eq!(pending[0]["severity"], "info");
         assert_eq!(pending[0]["state"], "running");
         assert_eq!(pending[0]["updated_at"], "2026-09-30T00:00:00Z");
-        refresh_operation_report(&state, key);
+        refresh_operation_report(&state, key, None);
         let report = operation_resources(&state, "2026-09-30T00:00:00Z").unwrap();
         assert!(
             report.iter().all(|item| item["state"] != "running"),
@@ -14786,7 +14850,12 @@ subscription "watch/source" {
         // A started report is made on its own thread, and a second start keeps it.
         let other = tempfile::tempdir().unwrap();
         let started = test_state(other.path());
-        start_operation_report(&started);
+        let audit = start_operation_report(&started).unwrap();
+        let drift = audit.blocking_recv().unwrap().unwrap();
+        assert!(drift.is_empty());
+        crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+        assert!(!started.store.repair_operation_projection_drift_from_audit(&drift).unwrap());
+        assert_eq!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get), 0);
         let deadline = Instant::now() + Duration::from_secs(30);
         while operation_checks(&started).unwrap().is_none() {
             assert!(
@@ -14796,7 +14865,7 @@ subscription "watch/source" {
             std::thread::sleep(Duration::from_millis(10));
         }
         let made = operation_checks(&started).unwrap().unwrap();
-        start_operation_report(&started);
+        assert!(start_operation_report(&started).is_none());
         assert!(Arc::ptr_eq(
             &made,
             &operation_checks(&started).unwrap().unwrap()
