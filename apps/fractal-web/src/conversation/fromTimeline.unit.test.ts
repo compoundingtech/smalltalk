@@ -81,7 +81,10 @@ describe('mailbox deliveries', () => {
       id, sequence, type, body, role, revision: 1, final: true, timestamp,
     })
 
-  it('shows mailbox mail once at its original position, not again as a later harness delivery', () => {
+  it.each([
+    "The person reads replies in st, not in the agent's session.",
+    'Answer the person in this conversation; people have no inbox, so do not reply with st.',
+  ])('shows mailbox mail once at its original position, not again as a later harness delivery with note %s', (note) => {
     const timeline = new LiveTimeline()
     timeline.apply({
       replace: true, hasMore: false,
@@ -97,7 +100,7 @@ describe('mailbox deliveries', () => {
           text: `<smalltalk-message id="abc" graph="message/abc" from="person/operator" to="agent/example">
 hello
 </smalltalk-message>
-The person reads replies in st, not in the agent's session.`,
+${note}`,
         }),
       ],
     })
