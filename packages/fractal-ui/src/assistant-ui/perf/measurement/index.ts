@@ -1,7 +1,7 @@
 // From compoundingtech/smalltalk#1641, commit 4f74464e0b22ea889a09d9271d076c3c6fd85df8.
 import { mountMeasurementHud, recordCommit } from './developer.ts'
 import { createMeasurementEngine } from './engine.ts'
-export { counters, createCounters, getDebug, incrDebug, incrDebugRuntime, setDebug } from './counters.ts'
+export { counters, createCounters, getDebug, incrDebug, setDebug } from './counters.ts'
 export type { Counters, DebugBag } from './counters.ts'
 export type { MeasurementResult, FrameClock } from './engine.ts'
 

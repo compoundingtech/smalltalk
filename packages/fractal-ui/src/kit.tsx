@@ -87,7 +87,7 @@ export function EmptyState({ title, hint, action }: { title: string; hint: strin
 /* Input / Toggle / Checkbox — form controls. */
 export function Input({ label, value, onChange, placeholder, autoFocusKey = '/', clearKey = 'Escape' }: { label: string; value: string; onChange: (value: string) => void; placeholder?: string; autoFocusKey?: string | null; clearKey?: string | null }) {
   return <Aria.TextField aria-label={label} value={value} onChange={onChange} className="flex w-full min-h-control items-center gap-2 rounded-control border border-line bg-panel px-3 focus-within:border-accent transition-colors">
-    {({ isRequired }) => <><Aria.Input placeholder={placeholder} onKeyDown={event => { if (clearKey && value !== '' && event.key === clearKey) { event.preventDefault(); onChange('') } }} className="w-full bg-transparent text-ink outline-none placeholder:text-muted" />{value === '' && autoFocusKey ? <Kbd>{autoFocusKey}</Kbd> : <Button aria-label={`Clear ${label.toLowerCase()}`} square size="sm" variant="quiet" onPress={() => onChange('')}><XCircleIcon /></Button>}{isRequired ? null : null}</>}
+    <Aria.Input placeholder={placeholder} onKeyDown={event => { if (clearKey && value !== '' && event.key === clearKey) { event.preventDefault(); onChange('') } }} className="w-full bg-transparent text-ink outline-none placeholder:text-muted" />{value === '' && autoFocusKey ? <Kbd>{autoFocusKey}</Kbd> : <Button aria-label={`Clear ${label.toLowerCase()}`} square size="sm" variant="quiet" onPress={() => onChange('')}><XCircleIcon /></Button>}
   </Aria.TextField>
 }
 export function Toggle({ label, isSelected, onChange }: { label: string; isSelected: boolean; onChange: (selected: boolean) => void }) {

@@ -21,4 +21,3 @@ export const createCounters = (): Counters => {
 }
 export const counters = createCounters()
 export const { getDebug, setDebug, incrDebug } = counters
-export const incrDebugRuntime = incrDebug
