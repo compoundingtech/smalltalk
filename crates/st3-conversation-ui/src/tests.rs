@@ -735,6 +735,7 @@ fn task_assignments_render_once_on_invocation_for_pending_and_completed_results(
 }
 
 /// The omp-parity page's entries, as the shared transcript test reads them.
+#[cfg(feature = "ratatui")]
 fn parity_entries() -> Vec<Entry> {
     let page: serde_json::Value = serde_json::from_str(include_str!(
         "../../../fixtures/clients/transcripts/omp-parity.json"

@@ -296,7 +296,7 @@ export function fromHarness(isUser: boolean, raw: string, shown: ReadonlySet<str
     if (id && shown.has(id)) { delivered.add(id); return false; }
     const ping = /^\s*\[PING from st3\] \S+ from (\S+): (.*)$/.exec(line);
     if (!ping) return true;
-    pings.push({ kind: 'event', tone: 'quiet', text: `delivered to the agent: ${shorten(ping[2], 80)} · from ${short(ping[1])}` });
+    pings.push({ kind: 'event', tone: 'quiet', text: `delivered to the agent: ${shorten(ping[2] ?? '', 80)} · from ${short(ping[1] ?? '')}` });
     return false;
   }).join('\n');
   bodies.push(...pings);
@@ -347,8 +347,8 @@ export function toolOutput(content: unknown, full = false): string[] {
   else text = str(record(content).text) ?? JSON.stringify(content);
   // As st3-conversation-ui: no blank lines around the output.
   const lines = text ? text.split('\n') : [];
-  while (lines.length && !lines[0].trim()) lines.shift();
-  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  while (lines.length && !lines[0]?.trim()) lines.shift();
+  while (lines.length && !lines[lines.length - 1]?.trim()) lines.pop();
   return full ? lines : lines.slice(0, 400);
 }
 
@@ -651,7 +651,10 @@ export function headerLine(header: ConversationHeader | undefined, now: string):
   };
   const shared = fields.filter(field => field.source === common);
   const oldest = shared.reduce<HeaderField | undefined>((old, field) => old === undefined || timestamp(field) < timestamp(old) ? field : old, undefined);
-  const rendered = parts.map((part, index) => fields[index].source && fields[index].source !== common ? `${part} [${marker(fields[index])}]` : part);
+  const rendered = parts.map((part, index) => {
+    const field = fields[index];
+    return field?.source && field.source !== common ? `${part} [${marker(field)}]` : part;
+  });
   if (oldest && common) rendered.push(marker(oldest));
   return rendered.join(' · ');
 }
@@ -814,7 +817,7 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
           fromHarness(entry.role === 'user', raw, shown, delivered, filters).forEach((part, index) => push(entry, `${entry.id}#${index}`, part.kind === 'mail' ? { ...part, from: name(part.from), to: name(part.to) } : part));
         } else if (entry.role === 'tool') {
           const lines = raw.split('\n');
-          if (lines.join('').trim()) push(entry, entry.id, { kind: 'tool', title: lines[0], state: 'ok', output: lines.slice(1) });
+          if (lines.join('').trim()) push(entry, entry.id, { kind: 'tool', title: lines[0] ?? '', state: 'ok', output: lines.slice(1) });
         } else {
           const text = raw;
           if (text.trim()) push(entry, entry.id, entry.role === 'assistant' ? { kind: 'assistant', text } : {kind:'event',tone:'quiet',text:`[unknown role]\n${text}`});
@@ -912,14 +915,14 @@ export function foldDeliveryFlaps(entries: ConversationEntry[]): ConversationEnt
   const out: ConversationEntry[] = [];
   const isFlap = (entry: ConversationEntry | undefined) => entry?.body.kind === 'event' && /^Native conversation delivery over \S+ (paused|recovered|failed)/.test(entry.body.text);
   for (let index = 0; index < entries.length;) {
-    if (!isFlap(entries[index])) { out.push(entries[index++]); continue; }
+    if (!isFlap(entries[index])) { out.push(entries[index++]!); continue; }
     const start = index;
     while (index < entries.length && isFlap(entries[index])) index++;
     const run = entries.slice(start, index);
     const last = run.at(-1)!;
     const recovered = last.body.kind === 'event' && last.body.text.includes('recovered');
     const pauses = run.filter(entry => entry.body.kind === 'event' && !entry.body.text.includes('recovered')).length;
-    out.push({ ...last, id: `${run[0].id}…${last.id}`, body: { kind: 'event', tone: recovered ? 'quiet' : 'warning', text: recovered ? `message delivery paused ${pauses === 1 ? 'once' : `${pauses} times`} while st restarted · recovered` : 'message delivery is paused; st will retry' } });
+    out.push({ ...last, id: `${run[0]!.id}…${last.id}`, body: { kind: 'event', tone: recovered ? 'quiet' : 'warning', text: recovered ? `message delivery paused ${pauses === 1 ? 'once' : `${pauses} times`} while st restarted · recovered` : 'message delivery is paused; st will retry' } });
   }
   return out;
 }

@@ -83,15 +83,12 @@ pub fn line(header: &Value, now: &str) -> String {
 
 /// One field's value and, when the field says where it came from, its source and age.
 fn sourced(field: &Value, now: Option<&str>) -> String {
-    let marker = match (
+    match (
         field
             .get("source")
             .and_then(Value::as_str)
             .filter(|source| !source.is_empty()),
-        field
-            .get("as_of")
-            .and_then(Value::as_str)
-            .and_then(|at| now.map(|now| (at, now))),
+        field.get("as_of").and_then(Value::as_str).zip(now),
     ) {
         (Some(source), Some((at, now))) => {
             let age = age(at, now);
@@ -102,9 +99,8 @@ fn sourced(field: &Value, now: Option<&str>) -> String {
             }
         }
         (Some(source), None) => source.to_owned(),
-        _ => return String::new(),
-    };
-    marker
+        _ => String::new(),
+    }
 }
 
 fn model(_: &str, value: &Value) -> Option<String> {

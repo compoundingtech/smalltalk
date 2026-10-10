@@ -203,7 +203,7 @@ enum Fetched {
     Notice(String),
     /// Harness sessions st did not start, found on this machine.
     Sessions(Collection),
-    Session(String, Result<st3_client::Session, String>),
+    Session(String, Result<Box<st3_client::Session>, String>),
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
     /// Token spend over a period of this many hours, or why st could not say.
@@ -390,7 +390,6 @@ pub fn run(context: Context) -> Result<()> {
     let mut missions_sent = false;
     let mut missions_until: Option<Instant> = None;
     let mut content_reads = super::content::Reads::default();
-    let mut repositories_asked: Option<String> = None;
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
     // When the connected clients were last read, while the fleet shows, and whether a read is out.
@@ -691,7 +690,7 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 Fetched::Session(id, outcome) => {
                     match outcome {
-                        Ok(session) => model.add_opened_session(session),
+                        Ok(session) => model.add_opened_session(*session),
                         Err(message) => {
                             ui.flash(format!("Could not open {id}: {message}"));
                             failed.insert(id, message);
@@ -993,6 +992,7 @@ pub fn run(context: Context) -> Result<()> {
                 runtime.spawn(async move {
                     let outcome = Model::read_session(&client, &id)
                         .await
+                        .map(Box::new)
                         .map_err(|error| error.to_string());
                     let _ = tx.send(Fetched::Session(id, outcome));
                 });

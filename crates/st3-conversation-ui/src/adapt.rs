@@ -420,7 +420,7 @@ fn conversation_with_output_mode(
                 } else {
                     forced = None;
                 }
-                let state = forced.unwrap_or_else(|| match result.status {
+                let state = forced.unwrap_or(match result.status {
                     TimelineToolStatus::Error => ToolState::Failed,
                     _ if command_failed => ToolState::Failed,
                     _ => ToolState::Ok,
