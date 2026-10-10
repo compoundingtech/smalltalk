@@ -87,7 +87,7 @@ impl Histogram {
         let rank = (self.count * percent).div_ceil(100).max(1);
         let mut seen = 0;
         for &(bucket, count) in &self.buckets {
-            seen += u64::from(count);
+            seen += count;
             if seen >= rank {
                 return upper(bucket).min(self.max_us);
             }

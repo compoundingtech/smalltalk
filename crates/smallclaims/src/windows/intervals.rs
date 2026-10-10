@@ -37,13 +37,20 @@ impl IntervalSeries {
     /// Merge bounded minute slots for a population total, preserving boundary intervals so
     /// snapshot can disclose exclusions. Never repartitions summaries into event times.
     pub fn absorb(&mut self, other: &Self) {
-        if self.slots.is_empty() { self.slots.clone_from(&other.slots); return; }
+        if self.slots.is_empty() {
+            self.slots.clone_from(&other.slots);
+            return;
+        }
         for ((epoch, hist), (their_epoch, theirs)) in self.slots.iter_mut().zip(&other.slots) {
-            if theirs.count == 0 { continue; }
+            if theirs.count == 0 {
+                continue;
+            }
             if hist.count == 0 || *epoch < *their_epoch {
                 *epoch = *their_epoch;
                 hist.clone_from(theirs);
-            } else if *epoch == *their_epoch { hist.merge(theirs); }
+            } else if *epoch == *their_epoch {
+                hist.merge(theirs);
+            }
         }
     }
 
@@ -205,5 +212,30 @@ mod tests {
         assert!(w["1m"].get("p99_ms").is_none());
         assert_eq!(w["5m"]["foreground_ms"], 70_000);
         assert!(series.snapshot(3_660_001, true)["1m"]["live_share"].is_null());
+    }
+    #[test]
+    fn minute_population_capacity_and_sparse_merging_are_bounded() {
+        let mut series = IntervalSeries::default();
+        let minute = MinuteSummary {
+            start_ms: 3_600_000,
+            count: MAX_SLOT_COUNT,
+            over: 0,
+            max_ms: 100,
+            buckets: vec![(histogram_upper_ms(100), MAX_SLOT_COUNT)],
+        };
+        series.record(3_660_000, &minute);
+        assert!(!series.can_record(&minute));
+        let mut total = IntervalSeries::default();
+        total.absorb(&series);
+        total.absorb(&series);
+        assert_eq!(
+            total.snapshot(3_660_000, false)["1m"]["count"],
+            MAX_SLOT_COUNT * 2
+        );
+        assert_eq!(total.minutes(3_660_000)[0].buckets.len(), 1);
+        assert_eq!(
+            total.snapshot(3_660_001, false)["1m"]["excluded_boundary_intervals"],
+            1
+        );
     }
 }

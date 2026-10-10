@@ -607,7 +607,19 @@ mod tests {
             .unwrap();
         append_history(root.path(), &r, now).unwrap();
         assert!(!stale.exists());
-        let before = std::fs::read(history_path(root.path(), 0)).unwrap();
+        let file = history_path(root.path(), 0);
+        let before = std::fs::read(&file).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(b"{torn")
+            .unwrap();
+        append_history(root.path(), &r, now).unwrap();
+        let recovered = std::fs::read(&file).unwrap();
+        assert!(recovered.starts_with(&before));
+        assert!(!String::from_utf8_lossy(&recovered).contains("torn"));
+        let before = recovered;
         // Restart discards admission/window memory; retained JSONL is independent.
         let new_process = Admission::default();
         assert!(new_process.reports.is_empty());
@@ -767,5 +779,47 @@ mod tests {
             send(app, Some(credential), wire).await.unwrap().status(),
             StatusCode::FORBIDDEN
         );
+    }
+    #[test]
+    fn observation_memory_retention_and_capacity_evict_oldest_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let now = client_now_ms() as u64;
+        let mut admission = Admission::default();
+        for n in 0..REPORTS {
+            admission.reports.push_back(Accepted {
+                id: format!("old-{n}"),
+                digest: [9; 32],
+                scope: [9; 32],
+                accepted_ms: now,
+                intervals: vec![],
+            });
+        }
+        let r = report_at(now / 60_000 * 60_000 - 60_000);
+        admission
+            .accept(
+                root.path(),
+                [8; 32],
+                [8; 32],
+                r.clone(),
+                validate(&r, now).unwrap(),
+                now,
+            )
+            .unwrap();
+        assert_eq!(admission.reports.len(), REPORTS);
+        assert_eq!(admission.reports.front().unwrap().id, "old-1");
+        admission.reports.front_mut().unwrap().accepted_ms = now - AGE_MS - 1;
+        let r = report_at(now / 60_000 * 60_000 - 120_000);
+        admission
+            .accept(
+                root.path(),
+                [8; 32],
+                [7; 32],
+                r.clone(),
+                validate(&r, now).unwrap(),
+                now,
+            )
+            .unwrap();
+        assert_eq!(admission.reports.len(), REPORTS);
+        assert_eq!(admission.reports.front().unwrap().id, "old-2");
     }
 }
