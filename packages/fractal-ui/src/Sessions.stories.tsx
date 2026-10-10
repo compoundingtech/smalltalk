@@ -132,7 +132,7 @@ const exerciseSession = async (canvasElement: HTMLElement, name: SessionName): P
     await expect(canvas.getByRole('table')).toHaveTextContent('Repeated boundary')
     canvas.getByTestId('transcript-scroll').scrollTo({ top: 0 })
     await expect(await canvas.findByText(/^Worked for/)).toBeInTheDocument()
-    await expect(await canvas.findAllByText('No output')).toHaveLength(2)
+    await expect(await canvas.findAllByText(/No output/)).toHaveLength(2)
   }
 }
 const playSession = (name: SessionName): NonNullable<Story['play']> => async ({ canvasElement }) => exerciseSession(canvasElement, name)
