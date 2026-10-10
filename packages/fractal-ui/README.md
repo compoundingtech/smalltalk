@@ -130,6 +130,7 @@ Hosts must not invent `Progress` or `Quiet` observations to fill gaps in the wir
 ### Sidebar agent row
 
 Rows render reported facts only; unreported fields are omitted — never shown as placeholders — and remain in the accessible details. Line-one metric and trailing-signal tracks share the widest intrinsic content width in their row cohort, so rows without a reported since-time keep the same title start as their cohort; tree nesting supplies hierarchy without a second indentation. Hovering a row swaps the time slot for a quick Open action. The hover card stays compact — status, host, current work, spend, duration, Last turn/Last activity, model, PR, branch and subagents — and never shows raw timestamps.
+Row buttons derive their accessible name from visible content; status, attention and unread summaries stay in the accessible description. Reported details, signal titles and the description omit attention and unread entirely when the source never reported them. `Sidebar/Agent Row/CountsUnreported` covers the omission in dark and light, with the fully reported row as its failing control.
 
 The status glyph column holds the glyph only; elapsed time in status stays in the accessible details. Each row is the containing block for its visually hidden details trigger, so a long roster overflows only its scroll pane, never the document. `ThreadHeader` omits the breadcrumb folder when the host reports none.
 
