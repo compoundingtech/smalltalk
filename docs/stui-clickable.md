@@ -83,6 +83,7 @@ from the painted label, so a card's specific action stays visible in the footer.
 | `Actions(agent)` | Agent header's `⋯ actions` opens agent actions card | Agent context | Background; agent actions |
 | `Field(index)` | Form value row focuses field | Context | Background; focus field / Tab |
 | `Revoke(device)` | Device button asks to revoke; `y` confirms | Context | Background; ask to revoke |
+| `Attach` | Unattached terminal placeholder's Attach button runs the existing `Ctrl+]` action | Context | Background; attach terminal |
 | `Detach` | Terminal status row leaves terminal (`Ctrl+\\`) | Context | Background; leave terminal |
 | `GlassMenu` | Space name opens spaces palette (`Ctrl+G`) | Own action | Background; spaces |
 | `PaletteSection(index)` | Top-bar counts open that palette section | Own action | Background; agents / missions / fleet |
