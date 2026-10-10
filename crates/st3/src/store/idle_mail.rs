@@ -440,31 +440,33 @@ mod tests {
                         .unwrap();
                 }
                 let body = json!({"fields":{"to":"agent/idle-bench.worker","tags":["github-watch","bench-watch"],"content":"x".repeat(bytes)}}).to_string();
-                let rows: Vec<_> = (0..1000)
-                    .map(|n| {
-                        (
-                            format!("idle-bench-{n}-sent"),
-                            format!("message/idle-bench-{n}"),
-                            "message.sent",
-                            body.clone(),
-                        )
-                    })
-                    .collect();
-                let receipts: Vec<_> = (0..1000)
-                    .flat_map(|n| {
-                        ["message.delivered", "message.read", "message.closed"]
-                            .into_iter()
-                            .map(move |kind| {
-                                (
-                                    format!("idle-bench-{n}-{kind}"),
-                                    format!("message/idle-bench-{n}"),
-                                    kind,
-                                    "{\"fields\":{}}".to_owned(),
-                                )
-                            })
-                    })
-                    .collect();
                 for round in 0..3 {
+                    let prefix = format!("{bytes}-{mode}-{round}");
+                    let rows: Vec<_> = (0..1000)
+                        .map(|n| {
+                            (
+                                format!("idle-bench-{prefix}-{n}-sent"),
+                                format!("message/idle-bench-{prefix}-{n}"),
+                                "message.sent",
+                                body.clone(),
+                            )
+                        })
+                        .collect();
+                    let receipts: Vec<_> = (0..1000)
+                        .flat_map(|n| {
+                            let prefix = prefix.clone();
+                            ["message.delivered", "message.read", "message.closed"]
+                                .into_iter()
+                                .map(move |kind| {
+                                    (
+                                        format!("idle-bench-{prefix}-{n}-{kind}"),
+                                        format!("message/idle-bench-{prefix}-{n}"),
+                                        kind,
+                                        "{\"fields\":{}}".to_owned(),
+                                    )
+                                })
+                        })
+                        .collect();
                     let insert_phase = |rows: &[(String, String, &str, String)]| {
                         let mut insert = connection.prepare_cached("INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms) VALUES(?1,'idle-insert-bench',?2,?3,'idle-bench',?4,'[]','1')").unwrap();
                         let scope = smallclaims::sqlite::work::SqliteWorkScope::start();
@@ -489,7 +491,7 @@ mod tests {
                     let (sent_ms, sent_max, sent_work) = insert_phase(&rows);
                     let (receipt_ms, receipt_max, receipt_work) = insert_phase(&receipts);
                     results.push(json!({"mode":mode,"body_content_bytes":bytes,"round":round,"sent_claims":1000,"receipt_claims":3000,"sent_ms":sent_ms,"receipt_ms":receipt_ms,"max_writer_batch_ms":sent_max.max(receipt_max),"sent_vm_steps":sent_work.vm_steps,"receipt_vm_steps":receipt_work.vm_steps,"sent_fullscan_steps":sent_work.fullscan_steps,"receipt_fullscan_steps":receipt_work.fullscan_steps}));
-                    connection.execute_batch("DELETE FROM claims WHERE batch_id='idle-insert-bench'; DELETE FROM local_idle_messages WHERE subject LIKE 'message/idle-bench-%';").unwrap();
+                    eprintln!("idle insert round: {}", results.last().unwrap());
                 }
                 // Restore the optimized receipt trigger before testing the next mode.
                 connection

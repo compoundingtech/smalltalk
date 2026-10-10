@@ -888,7 +888,7 @@ pub(super) fn attention_item(body: &Value, at: u128) -> Result<AttentionItemView
         requester_id: body["owner"].as_str().map(str::to_owned),
         launch_id: None,
         variant_id: None,
-        message_id: None,
+        message_id: None, answers: Vec::new(),
         conversation: body["owner"]
             .as_str()
             .and_then(super::attention_snapshot::agent),

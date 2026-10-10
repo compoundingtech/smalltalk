@@ -23,6 +23,7 @@ export function attentionHeadline({ count, loaded, error }: { count: number; loa
 
 const actionLabels: Record<Attention['actions'][number], string> = {
   'custom.reply': 'Reply with the declared fields',
+  'prompt.respond': 'Answer the prompt',
   'work.done': 'Complete step',
   'review.approve': 'Approve review',
   'review.reject': 'Reject review',

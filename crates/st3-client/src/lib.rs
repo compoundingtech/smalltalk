@@ -738,10 +738,33 @@ pub enum ClientError {
 }
 
 impl ClientError {
+    /// What st said of whether it applied the request, when it said: `"none"` (nothing was queued;
+    /// a fresh request is safe) or `"unknown"` (it may still complete; send the identical request,
+    /// with the same key, again). Any other answer, or none, says nothing.
+    pub fn applied(&self) -> Option<&str> {
+        match self {
+            ClientError::Api(_, _, envelope) => envelope
+                .details
+                .get("applied")
+                .and_then(|value| value.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether the request may have been taken without the person hearing so: its answer was lost
+    /// (a transport failure, a deadline) or st said `applied: "unknown"`. A request in this state is
+    /// repeated unchanged, never rebuilt with a new key.
+    pub fn outcome_unknown(&self) -> bool {
+        matches!(self, ClientError::Transport(_)) || self.applied() == Some("unknown")
+    }
+
     /// What went wrong in words a person reads: no codes and no Rust names. st's own message
     /// follows where it says something the sentence does not.
     pub fn plain(&self) -> String {
         match self {
+            ClientError::Api(..) if self.applied() == Some("unknown") => {
+                "st may have taken it and has not confirmed it yet; sending it again is safe".into()
+            }
             ClientError::Api(code, message, _) => plain_message(Some(code), message),
             ClientError::Transport(message) if message.contains("deadline") => {
                 "st took too long to answer; it may or may not have done it".into()
@@ -2273,6 +2296,17 @@ impl Client {
         parameters: TargetParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::pairing_revoke(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn prompt_respond(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PromptRespondParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::prompt_respond(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
@@ -3821,6 +3855,40 @@ mod tests {
                 details: Default::default(),
             }),
         )
+    }
+
+    fn with_applied(applied: &str) -> ClientError {
+        let mut error = api(
+            ErrorCode::Unknown,
+            "the database has not confirmed the send",
+        );
+        if let ClientError::Api(_, _, envelope) = &mut error {
+            envelope
+                .details
+                .insert("applied".into(), serde_json::json!(applied));
+        }
+        error
+    }
+
+    #[test]
+    fn an_answer_that_says_whether_it_applied_decides_what_is_safe() {
+        // A code this client does not know still decodes (to Unknown), and `applied` says the rest.
+        let unknown = with_applied("unknown");
+        assert_eq!(unknown.applied(), Some("unknown"));
+        assert!(unknown.outcome_unknown());
+        assert_eq!(
+            unknown.plain(),
+            "st may have taken it and has not confirmed it yet; sending it again is safe"
+        );
+        let none = with_applied("none");
+        assert_eq!(none.applied(), Some("none"));
+        assert!(!none.outcome_unknown());
+        // A lost answer is unknown too, with or without a word from st; a plain refusal is not.
+        assert!(
+            ClientError::Transport("client-v0 request deadline exceeded".into()).outcome_unknown()
+        );
+        assert!(!api(ErrorCode::Forbidden, "no").outcome_unknown());
+        assert_eq!(api(ErrorCode::Forbidden, "no").applied(), None);
     }
 
     #[test]
