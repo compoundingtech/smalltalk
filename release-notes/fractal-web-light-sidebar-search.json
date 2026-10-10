@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web gives the live sidebar search field a visible fill and hairline border in light mode",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only styling change; no runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Styling only; no data, wire or stored-state change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; the app is not deployed by this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

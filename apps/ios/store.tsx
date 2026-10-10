@@ -3,6 +3,7 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
+import { submitAnswer } from './answer';
 import { API_VERSION, ClientError, St3Client, notApplied, outcomeUnknown, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { keepClosed, personAnswer, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
 import app from './app.json';
@@ -14,6 +15,10 @@ import { rememberBounded } from './boundedCache';
 import { wantsScreenSequence, withFreshTerminalFence, type TerminalFence } from './terminalControls';
 import { sendFences } from './sendFence';
 import { Feed } from './feed';
+import { FabricCarrier, routeLabel, selectRoute, type CarrierChoice, type FabricSnapshot, type Route } from './carrier';
+import { Observations, type Context } from './observations';
+import { buildFabricDefault, decodeFabricTarget, encodeFabricTarget, fabricGatewayId, fabricTargetFromText, isFabricGatewayId, type FabricTarget } from './fabricTarget';
+import { fabricAvailable, fabricIdentity, fabricPathInUse, nativeCarrierPorts } from './fabricBridge';
 import { ForegroundGate } from './foreground';
 import type { FabricProfile } from './fabricProof';
 import { gatewayFetch } from './gatewayFetch';
@@ -43,6 +48,10 @@ type PhoneProfile = { url: string; credential: string; signing?: PhoneSigning; p
 const GLASSES_KEY = 'st3.experiments.glasses';
 // Simplified conversations: this phone's own choice, on unless turned off, never synced.
 const SIMPLE_KEY = 'st3.conversation.simple';
+// The carrier: the saved gateway (default) or fabric, an opt-in; the saved fabric target; and whether
+// a fabric that cannot be used falls back to the saved gateway.
+const OBSERVATIONS_KEY = 'st3.observations';
+const CARRIER_KEY = 'st3.carrier', FABRIC_TARGET_KEY = 'st3.fabric.target', FABRIC_FALLBACK_KEY = 'st3.fabric.fallback';
 
 /** An error as a person reads it: st's errors in plain words (the SDK's plainError). */
 export function errorText(error: unknown): string {
@@ -77,6 +86,16 @@ function items<K extends Resource['kind']>(page: { items: Resource[] }, kind: K)
   return page.items.filter((item): item is Extract<Resource, { kind: K }> => item.kind === kind);
 }
 function actionId() { return `action/ios-${Crypto.randomUUID()}`; }
+
+/** Where a measurement was served from: the route it ran over and, for fabric, the path once measured. */
+function observedContext(route: Route, fabricPath: 'direct' | 'relay' | 'unknown'): Context {
+  switch (route.kind) {
+    case 'fabric': return { carrier: 'fabric', ...(fabricPath === 'direct' || fabricPath === 'relay' ? { path: fabricPath } : {}) };
+    case 'lan': return { carrier: 'lan' };
+    case 'https': return { carrier: 'https' };
+    default: return { carrier: 'tailscale' };
+  }
+}
 
 function useAppStore(proof?: FabricProfile) {
   const proofRef = useRef(proof); proofRef.current = proof;
@@ -119,9 +138,98 @@ function useAppStore(proof?: FabricProfile) {
   // and st no longer lists was not on screen while it closed, so only later windows keep items.
   const attentionLive = useRef(false);
   const missionDetailCache = useRef(new Map<string, Mission>());
-  const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(), client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) }) : null, [url, credential]);
+  // The carrier. The saved gateway `url` is this device's identity and its fallback route; the URL the
+  // client uses is the saved gateway, or, with fabric chosen and ready, the native bridge's own listener.
+  // Fabric is offered only where this build links the bridge.
+  const [carrierChoice, setCarrierChoice] = useState<CarrierChoice>('tailscale');
+  const [fabricTarget, setFabricTarget] = useState<FabricTarget | null>(null);
+  const [fallbackOn, setFallbackOn] = useState(true);
+  const [fabricBuilt, setFabricBuilt] = useState(false);
+  const [fabricNode, setFabricNode] = useState('');
+  const [fabricPath, setFabricPath] = useState<'direct' | 'relay' | 'unknown'>('unknown');
+  const [fabricSnapshot, setFabricSnapshot] = useState<FabricSnapshot>({ phase: 'off', bridgeUrl: '', path: 'unknown', reason: '' });
+  const carrierRef = useRef<FabricCarrier | null>(null);
+  if (!carrierRef.current) carrierRef.current = new FabricCarrier(nativeCarrierPorts(), setFabricSnapshot);
+  const carrier = carrierRef.current;
+  useEffect(() => { if (!proof) carrier.configure(fabricBuilt && carrierChoice === 'fabric', fabricTarget); }, [proof, carrier, fabricBuilt, carrierChoice, fabricTarget]);
+  useEffect(() => {
+    if (proof) return;
+    carrier.foreground(foreground.current.active);
+    return foreground.current.subscribe(active => carrier.foreground(active));
+  }, [proof, carrier]);
+  const selected = useMemo(
+    () => proof
+      ? { baseUrl: url || null, route: { kind: 'none', fellBack: false, why: '' } as Route, pending: false, issue: '' }
+      : selectRoute(fabricBuilt ? carrierChoice : 'tailscale', fallbackOn, url && !isFabricGatewayId(url) ? url : null, fabricSnapshot, !!fabricTarget),
+    [proof, url, fabricBuilt, carrierChoice, fallbackOn, fabricSnapshot, fabricTarget],
+  );
+  const routeRef = useRef<Route>(selected.route); routeRef.current = selected.route;
+  const feedMisses = useRef(0);
+  // What the phone measures of its own service (see observations.ts): timed where the app already
+  // waits, kept on the device, and reported to the member by the reporter.
+  const fabricPathRef = useRef<'direct' | 'relay' | 'unknown'>('unknown');
+  fabricPathRef.current = selected.route.kind === 'fabric' ? fabricPath : 'unknown';
+  const observationsRef = useRef<Observations | null>(null);
+  if (!observationsRef.current) {
+    observationsRef.current = new Observations(
+      { read: () => AsyncStorage.getItem(OBSERVATIONS_KEY), write: value => AsyncStorage.setItem(OBSERVATIONS_KEY, value) },
+      { now: () => Date.now(), id: () => Crypto.randomUUID() },
+      () => observedContext(routeRef.current, fabricPathRef.current),
+    );
+  }
+  const observations = observationsRef.current;
+  const timers = useRef<{ openToLive: number | null; connect: number | null; recover: number | null; everLive: boolean }>({ openToLive: null, connect: null, recover: null, everLive: false });
+  useEffect(() => { if (!proof) void observations.load(); }, [proof, observations]);
+  useEffect(() => {
+    if (proof) return;
+    const gate = foreground.current;
+    const changed = (active: boolean) => {
+      observations.setForeground(active);
+      const held = timers.current;
+      if (active) {
+        if (held.openToLive === null) held.openToLive = observations.begin('ios-open-to-live');
+      } else {
+        // A foreground that ended before the feed was live, a connection that was never made, and a
+        // recovery that was cut off are not measurements.
+        for (const key of ['openToLive', 'connect', 'recover'] as const) { const token = held[key]; if (token !== null) { observations.cancel(token); held[key] = null; } }
+        observations.setLive(false);
+        void observations.flush();
+      }
+    };
+    changed(gate.active);
+    return gate.subscribe(changed);
+  }, [proof, observations]);
+  // Fabric dialing begins the connection; with the saved gateway it begins when its feed is made.
+  useEffect(() => {
+    if (proof || fabricSnapshot.phase !== 'dialing') return;
+    const held = timers.current;
+    if (held.connect !== null) observations.cancel(held.connect);
+    held.connect = observations.begin('ios-connect');
+  }, [proof, observations, fabricSnapshot.phase]);
+  const connectUrl = selected.baseUrl ?? '';
+  const client = useMemo(() => connectUrl ? new St3Client({ baseUrl: connectUrl, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(), client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) }) : null, [connectUrl, credential]);
   // Image bytes go up through Expo's fetch: React Native's cannot send a byte array as a body.
-  const uploader = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(expoFetch as unknown as typeof fetch), client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) }) : null, [url, credential]);
+  const uploader = useMemo(() => connectUrl ? new St3Client({ baseUrl: connectUrl, credential: () => credential ?? undefined, fetchImpl: gatewayFetch(expoFetch as unknown as typeof fetch), client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) }) : null, [connectUrl, credential]);
+
+  // Settings: read once. A build that carries a fabric target (EXPO_PUBLIC_ST3_FABRIC_DEFAULT, set in an
+  // ignored env file on the build host) opens on fabric until the person chooses otherwise.
+  useEffect(() => {
+    if (proof) return;
+    let live = true;
+    void (async () => {
+      const [available, choice, stored, fallback] = await Promise.all([
+        fabricAvailable(),
+        AsyncStorage.getItem(CARRIER_KEY).catch(() => null), AsyncStorage.getItem(FABRIC_TARGET_KEY).catch(() => null), AsyncStorage.getItem(FABRIC_FALLBACK_KEY).catch(() => null),
+      ]);
+      if (!live) return;
+      const built = buildFabricDefault();
+      setFabricBuilt(available);
+      setFabricTarget(decodeFabricTarget(stored) ?? built);
+      setCarrierChoice(choice === 'fabric' || choice === 'tailscale' ? choice : available && built ? 'fabric' : 'tailscale');
+      setFallbackOn(fallback !== '0');
+    })();
+    return () => { live = false; };
+  }, [proof]);
 
   useEffect(() => { if (proof) return; Promise.allSettled([AsyncStorage.getItem(URL_KEY), AsyncStorage.getItem(ORDER_KEY), SecureStore.getItemAsync(CREDENTIAL_KEY), AsyncStorage.getItem(PROJECTION_CACHE_KEY), SecureStore.getItemAsync(PROFILE_KEY)]).then(([u, o, c, p, saved]) => {
     let paired: PhoneProfile | undefined;
@@ -171,10 +279,11 @@ function useAppStore(proof?: FabricProfile) {
   // One collections socket per paired gateway and credential keeps attention, missions, and agents
   // current. It closes in the background and opens fresh, snapshots first, in the foreground.
   useEffect(() => {
-    if (!client || !credential) { setStatus('setup'); return; }
+    if (!client || !credential) { if (!credential) setStatus('setup'); return; }
     const generation = cacheGeneration.current;
     const current = () => generation === cacheGeneration.current;
     attentionLive.current = false;
+    if (!proofRef.current && timers.current.connect === null) timers.current.connect = observations.begin('ios-connect');
     const opened = new Feed(client, {
       onWindow: (name, rows, hasMore, at) => {
         if (!current()) return;
@@ -196,18 +305,43 @@ function useAppStore(proof?: FabricProfile) {
         proofRef.current?.record('feed', { state });
         setStatus(state === 'live' ? 'online' : state === 'connecting' ? 'connecting' : 'offline');
         setConnectionIssue(issue ?? '');
-        if (state === 'live') { setError(''); void loadCapabilities(); }
+        if (!proofRef.current) {
+          const held = timers.current;
+          if (state === 'live') {
+            observations.setLive(true);
+            for (const key of ['openToLive', 'connect', 'recover'] as const) { const token = held[key]; if (token !== null) { observations.end(token); held[key] = null; } }
+            held.everLive = true;
+            // The path a fabric connection took is known once it carries traffic: read it once, now.
+            if (routeRef.current.kind === 'fabric') void fabricPathInUse().then(path => setFabricPath(path));
+          } else {
+            observations.setLive(false);
+            // A dropped connection that had been live starts a recovery, timed until it is live again.
+            if (state === 'reconnecting' && held.everLive && held.recover === null) held.recover = observations.begin('ios-recover');
+          }
+        }
+        if (state === 'live') { setError(''); void loadCapabilities(); carrier.feedLive(); feedMisses.current = 0; }
+        // The bridge's own connection failing twice running (one dropped socket the feed mends itself):
+        // a refusal ends the trial, anything else is redialed.
+        else if (state === 'reconnecting' && routeRef.current.kind === 'fabric' && ++feedMisses.current >= 2) void carrier.feedFailed();
       },
       onWindowError: (name, message) => { if (current()) setLoadErrors(previous => ({ ...previous, [name]: message })); },
       // The missions window is followed only while a missions screen shows: what it held is out of date.
       onWindowStopped: name => { if (current() && name === 'missions') { setData(previous => ({ ...previous, missions: [] })); setMissionsLoaded(false); } },
       onConversationFrame: (rows, replace) => { if (current()) proofRef.current?.record('conversation', { rows, replace }); },
+      onTiming: (target, ms) => { if (current() && !proofRef.current) observations.observe(target, ms); },
     }, foreground.current, actionId, undefined, undefined, false);
     // Paired: connecting from here on, even while the app waits to be active before it dials.
     setStatus(previous => previous === 'setup' ? 'connecting' : previous);
     setFeed(opened);
     return () => { opened.close(); setFeed(held => held === opened ? null : held); };
-  }, [client, credential, loadCapabilities]);
+  }, [client, credential, loadCapabilities, observations, carrier]);
+  // No client yet: either nothing is paired, fabric is opening, or neither route can be used.
+  useEffect(() => {
+    if (client || proof) return;
+    if (!credential || (!url && !fabricTarget)) setStatus('setup');
+    else if (selected.pending) setStatus('connecting');
+    else { setStatus('offline'); setConnectionIssue(selected.issue || (isFabricGatewayId(url) ? 'This device is paired over Fabric only. Turn Fabric on to connect.' : '')); }
+  }, [client, proof, credential, url, fabricTarget, selected.pending, selected.issue]);
   useEffect(() => {
     if (proof) foreground.current.update(proof.ready && url === proof.url ? AppState.currentState : 'background');
   }, [url, proof?.url, proof?.ready]);
@@ -283,7 +417,11 @@ function useAppStore(proof?: FabricProfile) {
     const old: PhoneProfile | undefined = oldRaw ? JSON.parse(oldRaw) : undefined;
     // Anonymous discovery reveals no key material and never receives an old bearer.
     const requestFetch = gatewayFetch();
-    const response = await requestFetch(`${gateway}/v1/client/capabilities`);
+    // With fabric chosen and its bridge open, the pairing requests go over fabric to the same member: the
+    // gateway typed (or saved) stays this device's identity and its fallback route.
+    const requestUrl = fabricBuilt && carrierChoice === 'fabric' && fabricSnapshot.phase === 'ready' ? fabricSnapshot.bridgeUrl : gateway;
+    if (isFabricGatewayId(gateway) && requestUrl === gateway) throw new Error('Fabric is not connected yet, so there is nowhere to pair. Wait a moment and try again, or check the member\'s fabric grant for this phone.');
+    const response = await requestFetch(`${requestUrl}/v1/client/capabilities`);
     const text = await response.text();
     if (!response.ok || text.length > 8192) throw new Error('Member cannot advertise pairing proofs; upgrade it. The code was not submitted.');
     let advertisement: { api_version?: string; capabilities?: Array<{ id: string; version: number; state: string }> };
@@ -296,7 +434,7 @@ function useAppStore(proof?: FabricProfile) {
     let consumed = false;
     let deviceId = '';
     try {
-      const gatewayClient = new St3Client({ baseUrl: gateway, fetchImpl: requestFetch, client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) });
+      const gatewayClient = new St3Client({ baseUrl: requestUrl, fetchImpl: requestFetch, client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) });
       const result = await gatewayClient.completePairing(id, { api_version: API_VERSION, code, device_public_key: made.key, key_storage: made.storage });
       consumed = true; deviceId = result.value.device_id;
       await verifyPairing(result.value, made.key, pin, {
@@ -338,7 +476,9 @@ function useAppStore(proof?: FabricProfile) {
       await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError('');
     },
     async pair(id: string, code: string, fingerprint: string, unpinned = false): Promise<boolean> {
-      const gateway = pairDraft?.gateway ?? url;
+      // With fabric chosen and a target saved, a device with no gateway pairs over fabric alone.
+      const fabricOnly = !pairDraft && !url && fabricBuilt && carrierChoice === 'fabric' && fabricTarget ? fabricGatewayId(fabricTarget) : '';
+      const gateway = pairDraft?.gateway ?? (url || fabricOnly);
       if (!gateway || !id.trim() || !code.trim()) return false;
       setBusy(true);
       try { await completePairing(id.trim(), code.trim(), fingerprint, unpinned, gateway); return true; } catch (e) { setError(errorText(e)); return false; } finally { setBusy(false); }
@@ -353,6 +493,24 @@ function useAppStore(proof?: FabricProfile) {
       setPairingIssue(credential && !pin ? REPAIR_WARNING : 'Enter the fingerprint copied separately from the trusted machine before completing this pairing.');
     },
     cancelPairDraft() { setPairDraft(null); setPairingIssue(''); },
+    /** Choose the carrier. Fabric is an opt-in and needs a saved target; the saved gateway stays as it is. */
+    async setCarrier(choice: CarrierChoice) { await AsyncStorage.setItem(CARRIER_KEY, choice).catch(() => {}); setCarrierChoice(choice); },
+    /** Save the member's fabric target from pasted text (`node=…&service=…`, or a link carrying them). */
+    async saveFabricTarget(text: string): Promise<boolean> {
+      const target = fabricTargetFromText(text);
+      if (!target) { setError('That is not a fabric target. It needs node=NODE_ID (64 hex digits) and service=NAME.'); return false; }
+      await AsyncStorage.setItem(FABRIC_TARGET_KEY, encodeFabricTarget(target)).catch(() => {});
+      setFabricTarget(target); setError('');
+      return true;
+    },
+    async clearFabricTarget() { await AsyncStorage.removeItem(FABRIC_TARGET_KEY).catch(() => {}); setFabricTarget(null); },
+    /** Whether a fabric that cannot be used falls back to the saved gateway. */
+    async setFabricFallback(on: boolean) { await AsyncStorage.setItem(FABRIC_FALLBACK_KEY, on ? '1' : '0').catch(() => {}); setFallbackOn(on); },
+    retryFabric() { carrier.retry(); },
+    /** This phone's public fabric node ID, for the member's grant; created on first use. */
+    async loadFabricNode() { if (!fabricBuilt) return; try { setFabricNode(await fabricIdentity()); } catch { setFabricNode(''); } },
+    /** The path the live fabric connection uses, read on demand. */
+    async refreshFabricPath() { setFabricPath(await fabricPathInUse()); },
     async forget() {
       if (proof) { proof.close(); return; }
       const saved = await SecureStore.getItemAsync(PROFILE_KEY);
@@ -368,7 +526,25 @@ function useAppStore(proof?: FabricProfile) {
       acted.current.add(item.id);
       const typed = personAnswer(item.request, answer, summary);
       if (typeof typed === 'string') { setError(typed); return false; }
-      return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }); });
+      if (status !== 'online' || (proof && !proof.ready)) { setError('Still connecting; try again in a moment.'); return false; }
+      setBusy(true);
+      try {
+        // An answer that landed is an answer, however the reply came back (Cos, 2026-10-10: the app
+        // said it failed for a decision that was recorded, and Nathan answered it again).
+        const outcome = await submitAnswer({
+          build: async () => { const id = actionId(); return { id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }; },
+          send: request => client.workDone(request),
+          stillWaiting: async () => {
+            try { const current = (await client.attentionGet(item.id)).value; return current.kind !== 'attention' || current.state === 'open'; }
+            catch (e) { if (e instanceof ClientError && e.response.code === 'not-found') return false; throw e; }
+          },
+          wait: ms => new Promise(resolve => setTimeout(resolve, ms)),
+        });
+        if (!outcome.ok) { setError(errorText(outcome.error)); return false; }
+        setError('');
+        await loadLists([]);
+        return true;
+      } finally { setBusy(false); }
     },
     /** Clear an item st closed: only the person's own word removes it from Home. */
     clearClosed(id: string) {
@@ -431,6 +607,8 @@ function useAppStore(proof?: FabricProfile) {
           }
         }, notApplied);
         proof?.record('message-accepted', { elapsedMs: performance.now() - began });
+        // The person's wait, fence read and any repeat included, to st's acknowledgement.
+        if (!proof) observations.observe('ios-message-ack', performance.now() - began);
         return null;
       } catch (e) { proof?.record('message-failed', { elapsedMs: performance.now() - began }); return errorText(e); }
     },
@@ -565,6 +743,7 @@ function useAppStore(proof?: FabricProfile) {
     gatewayMachineId, gatewayHost, canControlTerminal, loadLists, actions,
     treeView, setTreeView, scrollRequest, requestScroll: (y: number) => setScrollRequest({ y, at: Date.now() }),
     glassesOn, glassesGranted, glasses, glassesIssue, simpleOn,
+    carrierInfo: { choice: carrierChoice, built: fabricBuilt, target: fabricTarget, fallback: fallbackOn, route: selected.route, routeText: routeLabel(selected.route), pending: selected.pending, issue: selected.issue, fabric: fabricSnapshot, node: fabricNode, path: fabricPath },
   };
 }
 

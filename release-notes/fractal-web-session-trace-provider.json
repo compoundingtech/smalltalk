@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "fractal-web supports an injectable session trace provider and reports unavailable or unattributed usage as Unknown instead of zero.",
+  "replay": {"status": "none", "detail": "No runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "No server protocol change. The default provider reads native usage and leaves time buckets and subagents Unknown. Self-only token and cost meters require attribution evidence."},
+  "downtime": {"status": "none", "detail": "No service interruption required."},
+  "manual": {"status": "none", "detail": "No installation action required. A deployment can inject a provider for additional trace facts. Provider results remain in memory."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

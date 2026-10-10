@@ -99,6 +99,7 @@ pub fn words() -> Value {
         AgentState::NeedsLogin,
         AgentState::Fault,
         AgentState::Working,
+        AgentState::Compacting,
         AgentState::Idle,
         AgentState::Starting,
         AgentState::Stopped,

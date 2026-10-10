@@ -8,16 +8,17 @@ import StFabricRust
 
 public class StFabricModule: Module {
   private let bridge = FabricBridge()
-  private let queue = DispatchQueue(label: "smalltalk.fabric-proof")
+  private let queue = DispatchQueue(label: "smalltalk.fabric")
 
   public func definition() -> ModuleDefinition {
     Name("StFabric")
-    OnCreate { self.bridge.observePaths(on: self.queue) }
+    // Linked and usable. It makes no identity and opens nothing.
+    AsyncFunction("available") { () -> Bool in true }
     AsyncFunction("identity") { () -> [String: Any] in
       try self.bridge.identity()
     }.runOnQueue(queue)
     AsyncFunction("dial") { (node: String, service: String, address: String?, mode: String) -> [String: Any] in
-      try self.bridge.dial(node: node, service: service, address: address, mode: mode)
+      try self.bridge.dial(node: node, service: service, address: address, mode: mode, queue: self.queue)
     }.runOnQueue(queue)
     AsyncFunction("stats") { () -> [String: Any] in
       try self.bridge.stats()
@@ -34,12 +35,15 @@ private final class FabricBridge {
   // This key is separate from the device bearer and P-256 action-signing key.
   private let service = "com.compoundingtech.smalltalk.fabric-proof"
   private let account = "iroh-secret-v1"
-  private let monitor = NWPathMonitor()
+  // The path monitor runs only while a bridge is open (a monitor cannot restart once cancelled, so each
+  // dial makes its own). An app that never chose fabric never starts one.
+  private var monitor: NWPathMonitor?
   private var networkType = "unknown"
   private var networkSatisfied = false
 
-  func observePaths(on queue: DispatchQueue) {
-    #if DEBUG
+  private func observePaths(on queue: DispatchQueue) {
+    guard monitor == nil else { return }
+    let monitor = NWPathMonitor()
     monitor.pathUpdateHandler = { path in
       self.networkType = path.usesInterfaceType(.cellular) ? "cellular" : path.usesInterfaceType(.wifi) ? "wifi" : path.usesInterfaceType(.wiredEthernet) ? "wired" : "other"
       self.networkSatisfied = path.status == .satisfied
@@ -47,21 +51,20 @@ private final class FabricBridge {
       st_fabric_string_free(result)
     }
     monitor.start(queue: queue)
-    #endif
+    self.monitor = monitor
   }
 
-  func destroy() { monitor.cancel(); stop() }
+  func destroy() { stop() }
 
   func identity() throws -> [String: Any] {
-    try requireDebug()
     let secret = try loadOrCreateKey()
     return try secret.withUnsafeBytes { bytes in
       try response(st_fabric_identity(bytes.bindMemory(to: UInt8.self).baseAddress, secret.count))
     }
   }
 
-  func dial(node: String, service: String, address: String?, mode: String) throws -> [String: Any] {
-    try requireDebug()
+  func dial(node: String, service: String, address: String?, mode: String, queue: DispatchQueue) throws -> [String: Any] {
+    observePaths(on: queue)
     let secret = try loadOrCreateKey()
     var target: [String: Any] = ["node": node, "service": service, "mode": mode]
     if let address {
@@ -79,7 +82,6 @@ private final class FabricBridge {
   }
 
   func stats() throws -> [String: Any] {
-    try requireDebug()
     var result = try response(st_fabric_stats())
     var usage = rusage()
     getrusage(RUSAGE_SELF, &usage)
@@ -99,16 +101,10 @@ private final class FabricBridge {
   }
 
   func stop() {
-    #if DEBUG
+    monitor?.cancel()
+    monitor = nil
     let result = st_fabric_stop()
     st_fabric_string_free(result)
-    #endif
-  }
-
-  private func requireDebug() throws {
-    #if !DEBUG
-    throw Exception(name: "FabricDisabled", description: "Fabric proof is available only in a development build")
-    #endif
   }
 
   private func loadOrCreateKey() throws -> Data {

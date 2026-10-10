@@ -68,6 +68,10 @@ mod client_v0;
 mod custom;
 mod delivery_presence;
 pub(crate) mod agent_harness;
+#[cfg(test)]
+mod harness_health_controls;
+#[cfg(test)]
+mod harness_health_output_controls;
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
@@ -2249,6 +2253,7 @@ fn client_work_values(
                 "title": work.title,
                 "assigned_to": work.assigned_to,
                 "last_progress": work.progress_summary,
+                "progress_at": work.progress_at_unix_ms.map(client_timestamp),
                 "state": state,
                 "agentless": work.agentless,
                 "gate_kind": gate_kind,
@@ -4063,7 +4068,7 @@ fn launch_compact_preview(
         .collect::<BTreeSet<_>>();
     let mut agents_by_id = state
         .store
-        .desired_subjects()?
+        .desired_subjects_named(&assigned_agents.iter().cloned().collect::<Vec<_>>())?
         .into_iter()
         .filter(|subject| subject.kind == "agent" && assigned_agents.contains(&subject.subject))
         .map(|subject| (subject.subject.clone(), subject))
@@ -4249,54 +4254,80 @@ fn client_launch_approval_resources(
     Ok(approvals)
 }
 
-fn client_launch_resources(state: &AppState, history: bool) -> anyhow::Result<Vec<Value>> {
+fn client_launch_resource(
+    state: &AppState,
+    session: &PlanningSessionView,
+) -> anyhow::Result<Value> {
     let store = &state.store;
-    let sessions = store.planning_sessions(history)?;
-    let mut resources = sessions
+    let phase = match session.status.as_str() {
+        "planning" | "revision-requested" => "authoring",
+        "review" => "review",
+        "approved" => "approved",
+        "cancelled" => "cancelled",
+        _ => "failed",
+    };
+    let historical = matches!(phase, "approved" | "cancelled" | "failed");
+    let target = match (&session.target_mission_run, &session.source_generation) {
+        (Some(run), Some(generation)) => json!({
+            "type": "mission-run",
+            "mission_run_id": run,
+            "generation_id": generation
+        }),
+        _ => json!({ "type": "new-mission" }),
+    };
+    let decisions = client_launch_decision_resources(store, session)?;
+    let latest_variant = client_launch_variant_resources(state, session)?
         .into_iter()
-        .map(|session| {
-            let phase = match session.status.as_str() {
-                "planning" | "revision-requested" => "authoring",
-                "review" => "review",
-                "approved" => "approved",
-                "cancelled" => "cancelled",
-                _ => "failed",
-            };
-            let historical = matches!(phase, "approved" | "cancelled" | "failed");
-            let target = match (&session.target_mission_run, &session.source_generation) {
-                (Some(run), Some(generation)) => json!({
-                    "type": "mission-run",
-                    "mission_run_id": run,
-                    "generation_id": generation
-                }),
-                _ => json!({ "type": "new-mission" }),
-            };
-            let decisions = client_launch_decision_resources(store, &session)?;
-            let latest_variant = client_launch_variant_resources(state, &session)?.into_iter().rev().next();
-            let visualization = latest_variant.as_ref().and_then(|variant| variant.get("visualization").cloned());
-            let preview = latest_variant.as_ref().and_then(|variant| variant.get("preview").cloned());
-            let preview_token = latest_variant.as_ref().and_then(|variant| variant.get("preview_token").cloned());
-            let approval_ids = store.claims_for(&session.subject, None)?.into_iter().filter(|claim| claim.kind == "planning-session.approved").filter_map(|claim| claim.body.pointer("/fields/candidate_revision").and_then(Value::as_u64).map(|revision| format!("launch-approval/{}/{revision}", session.id))).collect::<Vec<_>>();
-            Ok(json!({
-                "id": format!("launch/{}", session.id),
-                "kind": "launch",
-                "revision": format!("launch/{}", session.updated_at_unix_ms),
-                "updated_at": client_timestamp(session.updated_at_unix_ms),
-                "title": session.mission,
-                "phase": phase,
-                "request": session.request,
-                "planner": session.planner,
-                "planner_config": session.planner_config,
-                "target": target,
-                "variants": session.variants.iter().map(|variant| format!("launch-variant/{}/{}", session.id, variant.name)).collect::<Vec<_>>(),
-                "decisions": decisions.iter().filter_map(|decision| decision["id"].as_str()).collect::<Vec<_>>(),
-                "approvals": approval_ids,
-                "visualization": visualization,
-                "preview": preview,
-                "preview_token": preview_token,
-                "operational": { "layer": if historical { "history" } else { "current" }, "actionable": !historical, "reasons": if historical { vec![phase] } else { Vec::<&str>::new() } }
-            }))
+        .rev()
+        .next();
+    let visualization = latest_variant
+        .as_ref()
+        .and_then(|variant| variant.get("visualization").cloned());
+    let preview = latest_variant
+        .as_ref()
+        .and_then(|variant| variant.get("preview").cloned());
+    let preview_token = latest_variant
+        .as_ref()
+        .and_then(|variant| variant.get("preview_token").cloned());
+    let approval_ids = store
+        .claims_for(&session.subject, None)?
+        .into_iter()
+        .filter(|claim| claim.kind == "planning-session.approved")
+        .filter_map(|claim| {
+            claim
+                .body
+                .pointer("/fields/candidate_revision")
+                .and_then(Value::as_u64)
+                .map(|revision| format!("launch-approval/{}/{revision}", session.id))
         })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "id": format!("launch/{}", session.id),
+        "kind": "launch",
+        "revision": format!("launch/{}", session.updated_at_unix_ms),
+        "updated_at": client_timestamp(session.updated_at_unix_ms),
+        "title": session.mission,
+        "phase": phase,
+        "request": session.request,
+        "planner": session.planner,
+        "planner_config": session.planner_config,
+        "target": target,
+        "variants": session.variants.iter().map(|variant| format!("launch-variant/{}/{}", session.id, variant.name)).collect::<Vec<_>>(),
+        "decisions": decisions.iter().filter_map(|decision| decision["id"].as_str()).collect::<Vec<_>>(),
+        "approvals": approval_ids,
+        "visualization": visualization,
+        "preview": preview,
+        "preview_token": preview_token,
+        "operational": { "layer": if historical { "history" } else { "current" }, "actionable": !historical, "reasons": if historical { vec![phase] } else { Vec::<&str>::new() } }
+    }))
+}
+
+fn client_launch_resources(state: &AppState, history: bool) -> anyhow::Result<Vec<Value>> {
+    let mut resources = state
+        .store
+        .planning_sessions(history)?
+        .iter()
+        .map(|session| client_launch_resource(state, session))
         .collect::<anyhow::Result<Vec<_>>>()?;
     resources.sort_by(|left, right| {
         right["updated_at"]
@@ -4305,6 +4336,30 @@ fn client_launch_resources(state: &AppState, history: bool) -> anyhow::Result<Ve
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(resources)
+}
+
+/// Select a visible native session before rendering. A native ID may itself start with
+/// `launch/`; only if it is absent from this listing does the public-ID fallback apply.
+fn client_launch_detail_at(
+    state: &AppState,
+    id: &str,
+    history: bool,
+) -> anyhow::Result<Option<Value>> {
+    for native_id in std::iter::once(id).chain(id.strip_prefix("launch/")) {
+        // Strip exactly this synthetic prefix in Store::planning_session, preserving a
+        // native ID that itself begins with `planning-session/`.
+        let Some(session) = state
+            .store
+            .planning_session(&format!("planning-session/{native_id}"))?
+        else {
+            continue;
+        };
+        if !history && matches!(session.status.as_str(), "approved" | "cancelled" | "failed") {
+            continue;
+        }
+        return client_launch_resource(state, &session).map(Some);
+    }
+    Ok(None)
 }
 
 fn client_history_resource(claim: ClaimRecord) -> Value {
@@ -4542,6 +4597,7 @@ async fn client_agents_published(
     snapshot: ClientSnapshot,
     query: ClientListQuery,
 ) -> Result<ClientPageResponse, ApiError> {
+    state.store.note_agent_roster_read();
     if query.cursor.is_some() {
         let reader = state.clone();
         return blocking_store(move || Ok(client_agents_published_continuation(&reader, snapshot, &query)))
@@ -5308,18 +5364,27 @@ async fn client_launches(
 
 async fn client_launches_detail(
     State(state): State<AppState>,
+    Extension(session): Extension<client_v0::ClientSession>,
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<Value>, ApiError> {
-    let items = client_launch_resources(&state, query.history).map_err(ApiError::internal)?;
-    // The route carries a session ID. A native ID may itself start with `launch/`.
-    let resource_id = format!("launch/{id}");
-    let id = if items.iter().any(|item| item["id"] == resource_id) {
-        resource_id
-    } else {
-        id
-    };
-    client_detail(items, "launch", &id)
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    client_v0::require_scope(&session, "read.projections")?;
+    let (snapshot, value) = blocking_store(move || {
+        state.store.read_snapshot(|index| {
+            let value = client_launch_detail_at(&state, &id, query.history)?.ok_or_else(|| {
+                anyhow::anyhow!(St3Error::new(
+                    "not-found",
+                    format!(
+                        "launch `{}` does not exist",
+                        client_detail_id("launch", &id)
+                    ),
+                ))
+            })?;
+            Ok((client_snapshot_at(&state, index), value))
+        })
+    })
+    .await?;
+    Ok((Extension(snapshot), Json(value)))
 }
 
 fn client_launch_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
@@ -5733,6 +5798,8 @@ pub fn start_agent_roster(state: &AppState) {
                 crate::performance::task("roster/refresh", || if first {
                     reader.read_snapshot(|index| client_agent_roster_head(&reader, index))
                 } else {
+                    // Nothing published to start from: every card folds again from the log.
+                    let cold = reader.published_agent_roster(u64::MAX, false).is_none();
                     let folded = Instant::now();
                     let refreshed = reader.answer_agent_roster_requests(|| {
                         refresh_agent_roster(&reader, false)?;
@@ -5741,7 +5808,11 @@ pub fn start_agent_roster(state: &AppState) {
                         }
                         Ok(())
                     });
-                    record_roster_stage(request_latency::RosterStage::Refresh, folded.elapsed());
+                    record_roster_stage(if cold {
+                        request_latency::RosterStage::RefreshCold
+                    } else {
+                        request_latency::RosterStage::Refresh
+                    }, folded.elapsed());
                     refreshed
                 })
             })
@@ -21328,6 +21399,7 @@ mission "visible-agentless" state="ready" {
         assert_eq!(step["title"], "Keep watch");
         assert_eq!(step["assigned_to"], Value::Null);
         assert_eq!(step["last_progress"], Value::Null);
+        assert_eq!(step["progress_at"], Value::Null);
         assert_eq!(step["agentless"], true);
         assert!(
             client_work_resources(
@@ -23986,6 +24058,40 @@ mission "wake" state="ready" {
         {
             println!("roster fold task {}: n={} total_ms={} max_ms={}",
                 row["kind"], row["count"], row["total_ms"], row["max_ms"]);
+        }
+    }
+
+    /// What a refresh costs after a backlog of real claims: the roster folded at a cut that many
+    /// claims back, then refreshed at the newest, as after an idle refresher or a slow one.
+    /// `ST_ROSTER_BACKLOG_STORE` names a disposable store copy, opened in place; and
+    /// `ST_ROSTER_BACKLOGS` the backlogs in claims, comma separated.
+    #[test]
+    #[ignore = "roster refresh timing after a backlog; set ST_ROSTER_BACKLOG_STORE and run with --ignored --nocapture"]
+    fn agent_roster_backlog_refresh_timing_on_a_store_copy() {
+        let Some(database) = std::env::var_os("ST_ROSTER_BACKLOG_STORE").map(PathBuf::from) else {
+            return;
+        };
+        let backlogs = std::env::var("ST_ROSTER_BACKLOGS").unwrap_or_else(|_| "20,200,2000".into());
+        smallclaims::profile::init_from_env();
+        for backlog in backlogs.split(',').map(|n| n.trim().parse::<u64>().unwrap()) {
+            // A fresh store each time: no fold kept from the previous backlog.
+            let store = Store::open(&database, "bench-host").unwrap();
+            let newest = store.index().unwrap();
+            let timed = |label: &str, work: &dyn Fn()| {
+                let before = smallclaims::sqlite::work::total();
+                let started = Instant::now();
+                smallclaims::profile::task("roster-backlog-timing", work);
+                println!("roster backlog {backlog}: {label} {:.1} ms; sqlite_work={:?}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    smallclaims::sqlite::work::total() - before);
+            };
+            timed("cold", &|| { client_agent_resources_cached(&store, false, newest - backlog).unwrap(); });
+            let reason = store.agent_roster_unbounded_because(newest, false, AGENT_ROSTER_WARM_CHUNK)
+                .unwrap();
+            let refolded = store.agent_resources_refolded_cards_for_test();
+            timed("refresh", &|| refresh_agent_roster(&store, false).unwrap());
+            println!("roster backlog {backlog}: chunked because {reason:?}; cards refolded {}",
+                store.agent_resources_refolded_cards_for_test() - refolded);
         }
     }
 
