@@ -3518,6 +3518,11 @@ impl Store {
         })
     }
 
+    /// Note that an agents list read asked for the roster now, so a forget refolds it at once.
+    pub(crate) fn note_agent_roster_read(&self) {
+        self.smalltalk.agent_roster_read_at.store(now_ms() as u64, std::sync::atomic::Ordering::Release);
+    }
+
     /// Whether a refresher keeps the roster published, so readers must never fold it.
     pub(crate) fn agent_roster_refresher_running(&self) -> bool {
         self.smalltalk.agent_roster_refresh.get().is_some()

@@ -4542,6 +4542,7 @@ async fn client_agents_published(
     snapshot: ClientSnapshot,
     query: ClientListQuery,
 ) -> Result<ClientPageResponse, ApiError> {
+    state.store.note_agent_roster_read();
     if query.cursor.is_some() {
         let reader = state.clone();
         return blocking_store(move || Ok(client_agents_published_continuation(&reader, snapshot, &query)))

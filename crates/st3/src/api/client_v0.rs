@@ -442,6 +442,7 @@ async fn collection_items_with_windows(
                 let mut published = None;
                 let mut published_at = None;
                 let cached_agents = if collection == "agents" {
+                    store.note_agent_roster_read();
                     match store.agent_resources_published_at(index, false, None)? {
                         Some((cards, at)) => {
                             published_at = Some(at);
@@ -1540,6 +1541,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 reread_due.extend(others);
                 if reread_due.is_empty() && !roster_wanted || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
                 if std::mem::take(&mut roster_wanted) {
+                    state.store.note_agent_roster_read();
                     state.store.request_agent_roster_refresh();
                     last_reread = tokio::time::Instant::now();
                 }
@@ -12229,10 +12231,24 @@ mission "queue-parity" state="ready" {
         };
         tokio::time::timeout(Duration::from_secs(5), published.wait_for(complete.clone()))
             .await.expect("the refresher publishes the roster as it starts").unwrap();
+        let plain = || client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default()));
 
         // A chunked replication projection, a trim or a repair forgets every kept reduction,
-        // the published roster with them. The refresher folds it again on its own: no read
-        // asks, so none finds the roster missing and waits for a fold from the log.
+        // the published roster with them. Where no agents list was read lately, the roster
+        // folds again only when a read asks: a catch-up that forgets per chunk refolds nothing.
+        state.store.forget_current_views();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), published.wait_for(complete.clone()))
+                .await.is_err(),
+            "a forget on a node nobody reads must not refold the roster",
+        );
+        assert!(plain().await.is_err(), "the first read after that finds no roster yet");
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(complete.clone()))
+            .await.expect("the read's request republishes the roster").unwrap();
+
+        // Once agents are being read, the refresher folds it again on its own: no read asks,
+        // so none finds the roster missing and waits for a fold from the log.
         let cold_folds = || crate::api::request_latency_snapshot().into_iter()
             .find(|row| row["scope"] == "agents-roster" && row["stage"] == "refresh-cold")
             .map_or(0, |row| row["count"].as_u64().unwrap());
@@ -12242,9 +12258,7 @@ mission "queue-parity" state="ready" {
         tokio::time::timeout(Duration::from_secs(5), published.wait_for(complete))
             .await.expect("the refresher republishes a forgotten roster unasked").unwrap();
         assert!(cold_folds() > before, "the refold from the log lands in the refresh-cold row");
-        let (Extension(_), Json(page)) = client_agents(State(state.clone()),
-            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default()))
-            .await.expect("a plain read after the refold finds a roster");
+        let (Extension(_), Json(page)) = plain().await.expect("a plain read after the refold finds a roster");
         assert_eq!(page.items[0]["id"], "agent/forgotten");
     }
 
@@ -12281,6 +12295,8 @@ mission "queue-parity" state="ready" {
                 (started.elapsed().as_secs_f64() * 1000.0, answer.is_ok())
             }
         };
+        // Agents are being read, as on a node people watch.
+        let _ = read(false).await;
         for round in 0..5 {
             state.store.forget_current_views();
             tokio::time::sleep(delay).await;
