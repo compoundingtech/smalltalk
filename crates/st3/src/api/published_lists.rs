@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::store::mission_list::MissionRows;
-use crate::store::work_list::{WorkRow, WorkRows, work_state_rank};
+use crate::store::work_list::{WorkRow, WorkRows};
 use crate::store::published_list::{Publication, PublishedList};
 use std::collections::HashMap;
 use smallclaims::store::now_ms;
@@ -32,8 +32,9 @@ const FAILURE_RETRY: Duration = Duration::from_secs(5);
 /// publication, as after a replication backlog or a heal, the list folds from nothing in chunks.
 const FOLD_CLAIMS: u64 = 10_000;
 
-/// Stop serving a list: readers fold on read and its windows follow commits again. The view is
-/// withdrawn whether or not the list was being served, as after a forget.
+/// Stop serving a list and withdraw its view, whether or not the list was being served, as after
+/// a forget. For a list its refresher does not govern, readers then fold on read and its windows
+/// follow commits again; a governed list is withdrawn this way only when its refresher ends.
 fn withdraw<R>(store: &Store, list: fn(&Store) -> &PublishedList<R>, name: &'static str) {
     if list(store).withdraw() {
         eprintln!("st3: WARN the {name} list is no longer published; windows fold on read until it is");
@@ -41,7 +42,9 @@ fn withdraw<R>(store: &Store, list: fn(&Store) -> &PublishedList<R>, name: &'sta
     store.withdraw_collection_view(name);
 }
 
-/// Withdraws its list when the refresher task ends, by any path.
+/// Ends its list when the refresher task ends, by any path: nothing publishes it again until
+/// the daemon restarts. Readers of a governed list refuse, rather than wait or fold; readers of
+/// another list fold on read again.
 struct Withdraw<R: 'static> {
     store: Arc<Store>,
     list: fn(&Store) -> &PublishedList<R>,
@@ -50,9 +53,55 @@ struct Withdraw<R: 'static> {
 
 impl<R> Drop for Withdraw<R> {
     fn drop(&mut self) {
+        eprintln!(
+            "st3: ERROR the {} list's refresher stopped; it is not published again until the daemon restarts",
+            self.name
+        );
+        (self.list)(&self.store).end();
         withdraw(&self.store, self.list, self.name);
     }
 }
+
+/// The work list's refresher runs but has nothing current to serve: before its first
+/// publication, after it withdrew rows it could not keep current, or after a forget until its
+/// fold from nothing publishes. A reader never folds the list itself meanwhile.
+pub(crate) fn work_list_not_ready() -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: WORK_LIST_NOT_READY.into(),
+        message: "the work list is still being prepared; retry shortly".into(),
+        details: Box::new(serde_json::Map::from_iter([("reason".to_owned(), json!(WORK_LIST_NOT_READY))])),
+    }
+}
+
+/// A fresh read waited its whole bound and no publication reached the cut it froze.
+pub(crate) fn work_list_not_fresh(wanted_cut: u64, newest_cut: Option<u64>) -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: WORK_LIST_NOT_FRESH.into(),
+        message: format!("the work list has not yet been published at index {wanted_cut}; retry shortly"),
+        details: Box::new(serde_json::Map::from_iter([
+            ("reason".to_owned(), json!(WORK_LIST_NOT_FRESH)),
+            ("wanted_cut".to_owned(), json!(wanted_cut)),
+            ("newest_cut".to_owned(), json!(newest_cut)),
+        ])),
+    }
+}
+
+/// The work list's refresher stopped after it started: nothing publishes the list until the
+/// daemon restarts, and no reader folds it meanwhile. Not retryable.
+pub(crate) fn work_list_ended() -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: WORK_LIST_ENDED.into(),
+        message: "the work list's refresher stopped; restart the daemon (work-list-ended)".into(),
+        details: Box::new(serde_json::Map::from_iter([("reason".to_owned(), json!(WORK_LIST_ENDED))])),
+    }
+}
+
+pub(crate) const WORK_LIST_NOT_READY: &str = "work-list-not-ready";
+pub(crate) const WORK_LIST_NOT_FRESH: &str = "work-list-not-fresh";
+pub(crate) const WORK_LIST_ENDED: &str = "work-list-ended";
 
 /// Grace periods and checkpoint waits move runs in and out of waiting on a person without a
 /// claim, so the missions list rereads them at least this often.
@@ -75,6 +124,7 @@ pub fn start_published_lists(state: &AppState) {
         "missions",
         "missions/refresh",
         fold_missions,
+        false,
     );
     spawn(
         state.store.clone(),
@@ -82,7 +132,36 @@ pub fn start_published_lists(state: &AppState) {
         "work",
         "work/refresh",
         fold_work,
+        true,
     );
+}
+
+/// Start only the work list's refresher, for tests that hold work windows beside windows read
+/// directly.
+#[cfg(test)]
+pub(crate) fn start_published_work(state: &AppState) {
+    spawn(state.store.clone(), |store| store.published_work_list(), "work", "work/refresh", fold_work, true);
+}
+
+/// Fold and publish the work list once, as its refresher does, for tests that drive it.
+#[cfg(test)]
+pub(crate) fn refresh_work_once(store: &Store) {
+    let list = store.published_work_list();
+    let (base, generation) = list.base();
+    match fold_work(store, base.as_deref()).unwrap() {
+        Some((publication, changed)) => {
+            if let Some(served) = list.publish(publication, generation)
+                && (changed || !served)
+            {
+                store.publish_collection_view("work");
+            }
+        }
+        None => {
+            if list.serve_again(generation) {
+                store.publish_collection_view("work");
+            }
+        }
+    }
 }
 
 /// Fold a collection at the current cut, from the previous publication when there is one. `None`
@@ -91,14 +170,23 @@ pub fn start_published_lists(state: &AppState) {
 type Fold<R> = fn(&Store, Option<&Publication<R>>) -> anyhow::Result<Option<(Publication<R>, bool)>>;
 
 /// Keep one collection published: fold after commits, when a row's deadline passes, and again
-/// shortly after a failed fold, never more than one fold at a time.
+/// shortly after a failed fold, never more than one fold at a time. A `governed` list is never
+/// folded on read while its refresher runs: its view stays held, so its windows wait for its
+/// next publication rather than follow commits, from the start and after a withdrawal.
 fn spawn<R: Send + Sync + 'static>(
     store: Arc<Store>,
     list: fn(&Store) -> &PublishedList<R>,
     name: &'static str,
     label: &'static str,
     fold: Fold<R>,
+    governed: bool,
 ) {
+    // Held before it starts: from then on a reader refuses rather than reads the list directly,
+    // and a window that finds it not ready waits for its next change. A second spawn holds
+    // nothing again.
+    if governed && !list(&store).is_started() {
+        store.hold_collection_view(name);
+    }
     let Some(wake) = list(&store).start() else {
         return;
     };
@@ -158,10 +246,19 @@ fn spawn<R: Send + Sync + 'static>(
                 }
             };
             failures = if failed { failures + 1 } else { 0 };
-            // A refresher that keeps failing stops serving rows it cannot keep current: its
-            // windows fold on read and follow commits until a fold publishes again.
+            // A refresher that keeps failing stops serving rows it cannot keep current until a
+            // fold publishes again. An ungoverned list's windows fold on read and follow commits
+            // meanwhile; a governed list's readers refuse, and its windows read once and wait.
             if failures == FAILURES_BEFORE_WITHDRAWING {
-                withdraw(&store, list, name);
+                if governed {
+                    // Its readers refuse until a fold publishes again; its windows read once.
+                    if list(&store).withdraw() {
+                        eprintln!("st3: WARN the {name} list is withdrawn; readers wait until it publishes again");
+                    }
+                    store.hold_collection_view(name);
+                } else {
+                    withdraw(&store, list, name);
+                }
             }
             tokio::time::sleep(started.elapsed().max(REFRESH_PAUSE)).await;
             let deadline = list(&store).newest().and_then(|newest| newest.valid_until_unix_ms);
@@ -617,7 +714,13 @@ fn work_since(store: &Store, base: &Publication<WorkRows>) -> anyhow::Result<Adv
                 || passed(row.timing_lease_unix_ms)
                 || passed(row.next_claim_unix_ms)
         }).map(|(step, _)| step.clone()));
-        if cut == base.cut && frontier == rows.frontier && steps.is_empty() && !changes.reorder {
+        // Rows whose seat orders were read at another cut, as after chunks, are not complete.
+        if cut == base.cut
+            && frontier == rows.frontier
+            && steps.is_empty()
+            && !changes.reorder
+            && rows.orders_cut == cut
+        {
             return Ok(Advance::Current);
         }
         if steps.len() > FOLD_CHUNK {
@@ -625,7 +728,13 @@ fn work_since(store: &Store, base: &Publication<WorkRows>) -> anyhow::Result<Adv
         }
         let mut rows = rows.clone();
         refold_work(store, &mut rows, &steps, time, cut)?;
-        let changed = retime_work(&mut rows, time) || !steps.is_empty() || changes.reorder;
+        // Every shown seat's queue order at this same cut: an actor's ready work is ordered by
+        // its queue as it stood at the rows' own cut, never a newer one.
+        let orders = store.seat_orders_of(&rows.seats_shown())?;
+        let reordered = orders != rows.seat_orders;
+        rows.seat_orders = orders;
+        rows.orders_cut = cut;
+        let changed = retime_work(&mut rows, time) || !steps.is_empty() || changes.reorder || reordered;
         rows.time_unix_ms = time;
         rows.frontier = frontier;
         rows.sort();
@@ -637,62 +746,14 @@ fn work_since(store: &Store, base: &Publication<WorkRows>) -> anyhow::Result<Adv
 }
 
 /// A current work window from a publication: the first `limit` rows the actor, if any, sees,
-/// in the list's order, and whether more follow. An actor's ready work follows its seat
-/// queue's order, read at the current cut.
-pub(super) fn work_window(
-    store: &Store,
-    rows: &WorkRows,
-    actor: Option<&str>,
-    limit: usize,
-) -> anyhow::Result<(Vec<Value>, bool)> {
-    let mut items = match actor {
-        None => rows
-            .order
-            .iter()
-            .take(limit + 1)
-            .map(|step| (*rows.rows[step].value).clone())
-            .collect::<Vec<_>>(),
+/// in the list's order, and whether more follow. An actor's ready work follows its seat queue's
+/// order at the publication's own cut.
+pub(super) fn work_window(rows: &WorkRows, actor: Option<&str>, limit: usize) -> (Vec<Value>, bool) {
+    match actor {
+        None => rows.page_of(None, 0, limit),
         Some(actor) => {
-            // As the direct read: rows by the normalized actor, queue order by its seat.
-            let viewer = smallclaims::store::normalize_actor(actor, "agent");
-            let seat = if actor.contains('/') { actor.to_owned() } else { format!("agent/{actor}") };
-            let mut shown = rows
-                .order
-                .iter()
-                .map(|step| &rows.rows[step])
-                .filter(|row| {
-                    let view = &row.view;
-                    !view.agentless
-                        && (view.assigned_to.as_deref() == Some(viewer.as_str())
-                            || view.claimant.as_deref() == Some(viewer.as_str())
-                            || (matches!(view.status.as_str(), "ready" | "blocked")
-                                && view.available_to.contains(&viewer)))
-                })
-                .collect::<Vec<_>>();
-            let order = store.seat_run_order(&seat)?;
-            let steps = shown
-                .iter()
-                .map(|row| crate::seat_queue::SeatStep::from(&*row.view))
-                .collect::<Vec<_>>();
-            let ready = crate::seat_queue::select(&seat, &steps, &order)
-                .ready
-                .into_iter()
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            let rank = |subject: &str| ready.iter().position(|step| step == subject).unwrap_or(usize::MAX);
-            shown.sort_by(|left, right| {
-                let (left, right) = (&left.view, &right.view);
-                work_state_rank(&left.status)
-                    .cmp(&work_state_rank(&right.status))
-                    .then_with(|| rank(&left.subject).cmp(&rank(&right.subject)))
-                    .then_with(|| left.readiness_epoch.cmp(&right.readiness_epoch))
-                    .then_with(|| left.step.cmp(&right.step))
-                    .then_with(|| left.subject.cmp(&right.subject))
-            });
-            shown.into_iter().take(limit + 1).map(|row| (*row.value).clone()).collect()
+            let (indexes, _) = rows.actor_rows(actor);
+            rows.page_of(Some(&indexes), 0, limit)
         }
-    };
-    let has_more = items.len() > limit;
-    items.truncate(limit);
-    Ok((items, has_more))
+    }
 }

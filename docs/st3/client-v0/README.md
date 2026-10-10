@@ -1688,14 +1688,38 @@ work row. After commits, each refresher refolds only the missions or steps whose
 leases or attention changed, at most once a second, and keeps the rest. Each frame's `snapshot`
 names the list's own cut (`store_index`, `created_at`) and when it was folded (`published_at`),
 which can be older than the subscription by about a second plus one fold. A work window with an
-`actor` filters the published list; its ready work follows the seat's queue order. A work row's
-`execution_elapsed_ms` counts to the list's time, the projection time of its cut. Before the
-first publication, and while a refresher fails three folds in a row or after it stops, windows
-fold on read and follow commits as before, until a fold publishes again. When projections are
-replaced without a claim (a replay, trim or heal), windows keep the newest rows, under their own
-cut, until the list's fold from nothing publishes. HTTP pages of
-`/v1/client/missions` and `/v1/client/work` are unchanged. A daemon started with
-`ST3_PUBLISHED_LISTS=off` folds each window on read instead.
+`actor` filters the published list; its ready work follows the seat's queue order as it stood at
+the list's own cut. A work row's `execution_elapsed_ms` counts to the list's time, the
+projection time of its cut.
+
+Before the missions list's first publication, and while its refresher fails three folds in a
+row or after it stops, missions windows fold on read and follow commits as before, until a fold
+publishes again. When projections are replaced without a claim (a replay, trim or heal), they
+keep the newest rows, under their own cut, until the list's fold from nothing publishes.
+
+The work list is never folded on read while its refresher runs. Until it has a current
+publication (at startup, after its refresher withdrew it on three failed folds in a row, and
+after a replay, trim or heal until its fold from nothing publishes), a work window receives one
+retryable `resync`, then waits for the list's next publication; neither commits, the reread
+interval nor a repeat of that answer sends it anything more. A paired session's clock still
+rechecks its grant meanwhile, and an expired or revoked grant ends the window. If the work
+list's refresher stops for good, a work window receives one `error` frame that names
+`work-list-ended` and ends; the daemon must restart.
+
+`GET /v1/client/work` (the current list, not `history=true`) answers the same way. A first
+page is a slice of the newest publication, under that publication's snapshot. A continuation
+is a slice of the same publication, even after a newer one, until its cursor expires or a
+replay, trim or heal replaced the projections behind it (`page-cursor-expired`). While there is
+no current publication, a first page answers HTTP 503, retryable, with
+`details.reason: "work-list-not-ready"`; after the refresher stops for good, HTTP 503, not
+retryable, with `details.reason: "work-list-ended"`. With `fresh=true`, the daemon waits up to
+two seconds for a publication at or after the store index when the request arrived; if none
+comes, it answers HTTP 503, retryable, with `details.reason: "work-list-not-fresh"` and the
+`wanted_cut` and `newest_cut`, and never older rows as fresh. `st work ls` asks for a fresh first
+page and asks again on a not-ready or not-fresh answer within `--daemon-wait`, measured once
+across every attempt. HTTP pages of `/v1/client/missions` are unchanged.
+
+A daemon started with `ST3_PUBLISHED_LISTS=off` folds each window and page on read instead.
 
 ## Exact terminal lookup
 

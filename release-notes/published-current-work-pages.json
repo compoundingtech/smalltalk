@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Serve current work pages and windows only from the published work list, never folding it on a request",
+  "replay": {"status": "none", "detail": "No claim replay or stored history changes."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes; the list and its per-actor orders live in memory."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."},
+  "compatibility": {"status": "changed", "detail": "GET /v1/client/work (current, not history) now answers from the published work list: a first page is a slice of the newest publication under its own snapshot, and a continuation keeps that publication until its cursor expires or a replay, trim or heal replaces the projections behind it. While the list has no current publication, a first page answers HTTP 503, retryable, with details.reason work-list-not-ready, and a work window gets one retryable resync and then waits for the next publication. fresh=true waits up to two seconds for a publication at the request's index, else answers 503 with details.reason work-list-not-fresh. If the work refresher stops for good, pages answer 503, not retryable, with details.reason work-list-ended, and windows get one error frame. st work ls asks for a fresh first page and retries not-ready and not-fresh answers within --daemon-wait. Error codes on the wire are unchanged (internal); the reason is in details."},
+  "downtime": {"status": "none", "detail": "No additional service interruption; current work pages and windows wait for the list's first fold after start, which st work ls retries within --daemon-wait."},
+  "manual": {"status": "none", "detail": "No action is required."},
+  "recovery": {"status": "none", "detail": "Only volatile in-memory lists change; restart with ST3_PUBLISHED_LISTS=off to read current work directly."}
+}

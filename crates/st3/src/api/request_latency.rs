@@ -200,6 +200,36 @@ impl RosterStage {
     }
 }
 
+/// Where a current-work read's time goes when the work list is published: a fresh read's wait
+/// for a publication at its cut, a page served from a publication, and a page whose actor's
+/// order in that publication its read built. Descriptive only: no target of its own.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum WorkStage {
+    FreshWait,
+    Page,
+    ActorBuild,
+}
+
+impl WorkStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::FreshWait => "fresh-wait",
+            Self::Page => "page",
+            Self::ActorBuild => "actor-build",
+        }
+    }
+
+    fn population(self) -> &'static str {
+        match self {
+            Self::FreshWait => "fresh-reads",
+            Self::Page | Self::ActorBuild => "first-pages",
+        }
+    }
+}
+
+/// The client current-work route, which work stages are reported beside.
+const CLIENT_WORK: &str = "/v1/client/work";
+
 #[derive(Default)]
 pub(super) struct Meter {
     routes: BTreeMap<String, Sample>,
@@ -208,6 +238,7 @@ pub(super) struct Meter {
     work_actions: BTreeMap<WorkAction, Sample>,
     agents_reads: BTreeMap<AgentsRead, Sample>,
     roster_stages: BTreeMap<RosterStage, Sample>,
+    work_stages: BTreeMap<WorkStage, Sample>,
     /// Windows by path: `GET /route`, `stream COLLECTION`, or a long poll's route.
     paths: BTreeMap<String, smallclaims::windows::Series>,
     /// Windows by target position in `slo/targets.toml`: served here, then from another machine.
@@ -272,6 +303,11 @@ impl Meter {
     /// Count one roster stage's duration.
     pub(super) fn record_roster_stage(&mut self, stage: RosterStage, elapsed: Duration) {
         self.roster_stages.entry(stage).or_default().record(elapsed);
+    }
+
+    /// Count one published current-work stage's duration.
+    pub(super) fn record_work_stage(&mut self, stage: WorkStage, elapsed: Duration) {
+        self.work_stages.entry(stage).or_default().record(elapsed);
     }
 
     /// Count one sample in its path's windows and its target's.
@@ -365,6 +401,13 @@ impl Meter {
                 let mut row = sample.snapshot(AGENTS, "agents-roster");
                 row["stage"] = json!(stage.name());
                 row["duration_scope"] = json!("roster-stage");
+                row["population"] = json!(stage.population());
+                row
+            }))
+            .chain(self.work_stages.iter().map(|(stage, sample)| {
+                let mut row = sample.snapshot(CLIENT_WORK, "work-list");
+                row["stage"] = json!(stage.name());
+                row["duration_scope"] = json!("work-stage");
                 row["population"] = json!(stage.population());
                 row
             }))
@@ -579,6 +622,30 @@ mod tests {
         assert_eq!(stage("fresh-page")["route"], AGENTS);
         // Stages are not requests: no route row appears for them.
         assert!(meter.snapshot().iter().all(|row| row["scope"] != "route"));
+    }
+
+    #[test]
+    fn work_stages_report_their_own_samples_and_leave_the_roster_keys_alone() {
+        let mut meter = Meter::default();
+        meter.record_roster_stage(RosterStage::FreshWait, Duration::from_millis(90));
+        for (stage, ms) in [
+            (WorkStage::FreshWait, 700), (WorkStage::Page, 2), (WorkStage::Page, 3), (WorkStage::ActorBuild, 9),
+        ] {
+            meter.record_work_stage(stage, Duration::from_millis(ms));
+        }
+        let rows = meter.snapshot();
+        let stage = |name: &str| rows.iter()
+            .find(|row| row["scope"] == "work-list" && row["stage"] == name).unwrap();
+        assert_eq!(stage("fresh-wait")["p99_ms"], 700);
+        assert_eq!(stage("fresh-wait")["population"], "fresh-reads");
+        assert_eq!(stage("page")["count"], 2);
+        assert_eq!(stage("actor-build")["population"], "first-pages");
+        assert_eq!(stage("page")["route"], CLIENT_WORK);
+        assert_eq!(stage("page")["duration_scope"], "work-stage");
+        // The roster's rows keep their keys, and stages are not requests.
+        let roster = rows.iter().find(|row| row["scope"] == "agents-roster").unwrap();
+        assert_eq!((roster["stage"].clone(), roster["route"].clone()), (json!("fresh-wait"), json!(AGENTS)));
+        assert!(rows.iter().all(|row| row["scope"] != "route"));
     }
 
     #[test]

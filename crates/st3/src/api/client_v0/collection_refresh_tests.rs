@@ -5,6 +5,11 @@ use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 type Reads = Arc<Mutex<BTreeMap<String, usize>>>;
 
+/// [`Fixture::open_with`]'s gate: reads refuse as not ready, read rows, or refuse as revoked.
+const NOT_READY: u8 = 0;
+const READY: u8 = 1;
+const REVOKED: u8 = 2;
+
 struct Fixture {
     state: AppState,
     reads: Reads,
@@ -27,12 +32,26 @@ impl Fixture {
         fail: Option<&'static str>,
         collections: &[&str],
     ) -> Self {
+        Self::open_with(state, session, real, fail, None, collections).await
+    }
+
+    /// As [`Self::open_as`]; with `gate`, each counted read is the work list's not-ready refusal
+    /// while it is [`NOT_READY`], and a revoked grant's refusal once it is [`REVOKED`].
+    async fn open_with(
+        state: AppState,
+        session: ClientSession,
+        real: bool,
+        fail: Option<&'static str>,
+        gate: Option<Arc<std::sync::atomic::AtomicU8>>,
+        collections: &[&str],
+    ) -> Self {
         let reads = Reads::default();
         let (serving, counted) = (state.clone(), reads.clone());
         let app = axum::Router::new().route(
             "/stream",
             axum::routing::get(move |upgrade: WebSocketUpgrade| {
                 let (state, reads, session) = (serving.clone(), counted.clone(), session.clone());
+                let gate = gate.clone();
                 async move {
                     upgrade.on_upgrade(move |socket| {
                         let windows = collection_windows::Windows::attach(&state.store);
@@ -43,6 +62,7 @@ impl Fixture {
                             None,
                             move |state, session, request, permit| {
                                 let (reads, windows) = (reads.clone(), windows.clone());
+                                let gate = gate.clone();
                                 async move {
                                     let count = {
                                         let mut reads = reads.lock().unwrap();
@@ -57,6 +77,20 @@ impl Fixture {
                                         .await;
                                     }
                                     let _permit = permit;
+                                    match gate.as_ref().map(|gate| gate.load(std::sync::atomic::Ordering::SeqCst)) {
+                                        Some(NOT_READY) => {
+                                            return Err(super::super::published_lists::work_list_not_ready());
+                                        }
+                                        Some(REVOKED) => {
+                                            return Err(ApiError {
+                                                status: StatusCode::FORBIDDEN,
+                                                code: "forbidden".into(),
+                                                message: "the pairing grant was revoked".into(),
+                                                details: Box::default(),
+                                            });
+                                        }
+                                        _ => {}
+                                    }
                                     if fail == Some(request.id.as_str()) && count == 1 {
                                         return Err(ApiError::internal("injected first read failure"));
                                     }
@@ -354,6 +388,18 @@ async fn assert_parity(fixture: &Fixture, session: &ClientSession, held: &BTreeM
         let window = &held[&request.id];
         assert_eq!(window.items(), items, "{step}: window {} differs from a full read", request.id);
         assert_eq!(window.has_more, has_more, "{step}: window {}", request.id);
+        // A published work window is also what the direct read it replaces gives at its cut.
+        if request.collection == "work" {
+            let store = &fixture.state.store;
+            let index = store.index().unwrap();
+            let published = store.published_work().expect("the work list is published");
+            assert_eq!(published.cut, index, "{step}: the work list is published at the current cut");
+            let mut direct = client_work_resources(
+                store, request.actor.as_deref(), false, store.projection_time_at(index).unwrap(), index,
+            ).unwrap();
+            direct.truncate(request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS));
+            assert_eq!(window.items(), direct, "{step}: work window {} differs from a direct read", request.id);
+        }
     }
 }
 
@@ -411,6 +457,8 @@ async fn clients_hold_what_full_reads_give_through_replication_rollback_checkpoi
     let state = super::tests::test_state_named(root.path(), "alder");
     orchard(&state.store);
     crate::api::start_agent_roster(&state);
+    // Work windows serve the published list; each is also checked against a direct read.
+    super::super::published_lists::start_published_work(&state);
     let requests = [
         json!({"kind":"subscribe","id":"agents","collection":"agents","limit":200}),
         json!({"kind":"subscribe","id":"missions","collection":"missions","limit":200}),
@@ -503,6 +551,7 @@ async fn clients_hold_what_full_reads_give_through_replication_rollback_checkpoi
     drop(fixture);
     let reopened = super::tests::test_state_named(root.path(), "alder");
     crate::api::start_agent_roster(&reopened);
+    super::super::published_lists::start_published_work(&reopened);
     let mut fixture = Fixture::open(reopened.clone(), true, None, &[]).await;
     for request in &requests {
         fixture.send(request.clone()).await;
@@ -531,4 +580,147 @@ async fn clients_hold_what_full_reads_give_through_replication_rollback_checkpoi
     assert_eq!(mine["mine"].order, reconnected["avery"].order);
     assert_parity(&own, &avery, &mine,
         &[json!({"kind":"subscribe","id":"mine","collection":"attention","limit":200})], "person").await;
+}
+
+/// A session paired from another device: the clock rereads every window it holds.
+fn paired_session() -> ClientSession {
+    ClientSession {
+        actor: "person/avery/session/phone".into(),
+        authority_actor: "person/avery".into(),
+        pairing_grant: None,
+        transport: "paired",
+        custom_forms: false,
+        conversation_blocks: false,
+        scopes: ["read.projections".into()].into_iter().collect(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_held_view_that_is_not_ready_resyncs_once_and_waits_for_its_next_change() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for session in [ClientSession::local(None).unwrap(), paired_session()] {
+        let paired = session.transport != "unix";
+        let root = tempfile::tempdir().unwrap();
+        let state = super::tests::test_state_named(root.path(), "alder");
+        state.store.hold_collection_view("work");
+        let gate = Arc::new(std::sync::atomic::AtomicU8::new(NOT_READY));
+        let mut fixture =
+            Fixture::open_with(state.clone(), session.clone(), false, None, Some(gate.clone()), &["work"]).await;
+        let first = fixture.frame().await;
+        assert_eq!((first["kind"].as_str(), first["retryable"].as_bool()), (Some("resync"), Some(true)), "{first}");
+        // Neither a commit nor the reread interval reads it again meanwhile. A paired session's
+        // clock does, to recheck its grant, and sends nothing.
+        fixture.claim("daemon/fixture", "daemon.diagnostic",
+            json!({"code":"fixture", "severity":"error", "reason":"unrelated"}));
+        tokio::time::advance(ATTENTION_CLOCK_INTERVAL + COLLECTION_REREAD_INTERVAL).await;
+        fixture.quiet().await;
+        let clock_reads = usize::from(paired);
+        assert_eq!(fixture.counts(), counts(&[("work", 1 + clock_reads)]), "{}", session.transport);
+        // The view's next change reads it, and the window gets its rows.
+        gate.store(READY, SeqCst);
+        state.store.publish_collection_view("work");
+        assert_eq!(fixture.frame().await["kind"], "snapshot");
+        let reads = fixture.counts()["work"];
+        // Withdrawn again: one resync, then quiet until the view changes once more.
+        gate.store(NOT_READY, SeqCst);
+        state.store.hold_collection_view("work");
+        assert_eq!(fixture.frame().await["kind"], "resync");
+        fixture.claim("daemon/fixture", "daemon.diagnostic",
+            json!({"code":"fixture", "severity":"error", "reason":"unrelated again"}));
+        tokio::time::advance(ATTENTION_CLOCK_INTERVAL + COLLECTION_REREAD_INTERVAL).await;
+        fixture.quiet().await;
+        assert_eq!(fixture.counts()["work"], reads + 1 + clock_reads, "{}", session.transport);
+        if paired {
+            // A grant revoked while the window waits ends it at the clock's next recheck, and it
+            // gets no rows after.
+            gate.store(REVOKED, SeqCst);
+            tokio::time::advance(ATTENTION_CLOCK_INTERVAL).await;
+            let revoked = fixture.frame().await;
+            assert_eq!((revoked["kind"].as_str(), revoked["retryable"].as_bool()), (Some("error"), Some(false)), "{revoked}");
+            gate.store(READY, SeqCst);
+            state.store.publish_collection_view("work");
+            fixture.quiet().await;
+        } else {
+            gate.store(READY, SeqCst);
+            state.store.publish_collection_view("work");
+            // Its rows changed meanwhile: the read count is in them.
+            assert_eq!(fixture.frame().await["kind"], "changes");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_held_view_still_retries_any_other_failed_read_on_the_interval() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "alder");
+    state.store.hold_collection_view("work");
+    let mut fixture = Fixture::open(state, false, Some("work"), &["work"]).await;
+    assert_eq!(fixture.frame().await["kind"], "resync");
+    let recovered = fixture.frame().await;
+    assert_eq!(recovered["kind"], "snapshot", "{recovered}");
+    assert_eq!(fixture.counts(), counts(&[("work", 2)]));
+}
+
+/// A run with an agentless step and an agent's step, both ready: rows in the work list.
+fn ready_work(store: &Store) {
+    let source = r#"version 2
+mission "orchard-chores" state="ready" {
+  goal "Keep the orchard's work list honest."
+  step "rake" { agentless; goal "Rake." }
+  step "pick" { assigned-to "agent/alder.plain"; goal "Pick." }
+}"#;
+    let intent = crate::graph::parse_intent(source, "alder").unwrap();
+    let planned = store.mission(&intent, crate::model::IntentInput { kdl: source.into(), source_name: None }).unwrap();
+    store.apply(&intent, &planned.subject_tokens, "orchard-chores").unwrap();
+    let run = store.create_mission_run(&crate::model::MissionRunRequest {
+        mission: "orchard-chores".into(), revision: None, workspace: "/tmp".into(),
+        requester: Some("person/avery".into()), mode: Some("run".into()),
+        inputs: BTreeMap::new(), idempotency_key: "orchard-chores-run".into(),
+    }).unwrap();
+    for step in &run.steps {
+        store.set_step_state(&step.subject, "ready", None).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_real_work_window_waits_for_the_published_list_and_ends_with_its_refresher() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "alder");
+    ready_work(&state.store);
+    let list = state.store.published_work_list();
+    state.store.hold_collection_view("work");
+    list.start();
+    let direct = state.store.direct_work_reads();
+    let mut fixture = Fixture::open(state.clone(), true, None, &["work"]).await;
+    let first = fixture.frame().await;
+    assert_eq!(first["kind"], "resync", "cold: {first}");
+    fixture.claim("daemon/fixture", "daemon.diagnostic",
+        json!({"code":"fixture", "severity":"error", "reason":"unrelated"}));
+    fixture.quiet().await;
+    assert_eq!(fixture.counts(), counts(&[("work", 1)]));
+    // The first publication delivers its rows.
+    super::super::published_lists::refresh_work_once(&state.store);
+    let snapshot = fixture.frame().await;
+    assert_eq!(snapshot["kind"], "snapshot", "{snapshot}");
+    assert_eq!(snapshot["items"].as_array().unwrap().len(), 2);
+    // A forget: one resync at most, then the refold's rows.
+    state.store.forget_current_views();
+    let forgotten = fixture.frame().await;
+    assert_eq!(forgotten["kind"], "resync", "{forgotten}");
+    super::super::published_lists::refresh_work_once(&state.store);
+    fixture.quiet().await;
+    assert_eq!(fixture.counts(), counts(&[("work", 4)]), "the refold reread it once, with nothing new");
+    assert_eq!(state.store.direct_work_reads(), direct, "no window read the list directly");
+    // The refresher ends: one error that says so, and the subscription is gone.
+    list.end();
+    state.store.withdraw_collection_view("work");
+    let ended = fixture.frame().await;
+    assert_eq!((ended["kind"].as_str(), ended["retryable"].as_bool()), (Some("error"), Some(false)), "{ended}");
+    assert!(ended["message"].as_str().unwrap().contains("work-list-ended"), "{ended}");
+    fixture.claim("daemon/fixture", "daemon.diagnostic",
+        json!({"code":"fixture", "severity":"error", "reason":"after the end"}));
+    state.store.publish_collection_view("work");
+    fixture.quiet().await;
+    assert_eq!(fixture.counts(), counts(&[("work", 5)]), "read once for the end, then removed");
+    assert_eq!(state.store.direct_work_reads(), direct);
 }

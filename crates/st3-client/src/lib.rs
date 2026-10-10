@@ -1263,6 +1263,68 @@ impl Client {
         self.list_internal_with_filters("agents", cursor, limit, history, &filters)
             .await
     }
+    /// The current work list's first page as of this request: the daemon waits briefly for a
+    /// publication at least as new as the request. While the list is not ready, or not yet that
+    /// fresh, and while the daemon is unreachable, it asks again within the client's daemon
+    /// wait, measured once from the first attempt across every attempt and pause. A zero wait
+    /// asks once. Only these answers are asked again; any other error returns at once.
+    pub async fn work_list_fresh(
+        &self,
+        actor: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Envelope<Page>, ClientError> {
+        let mut query = vec!["fresh=true".to_owned()];
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        if let Some(actor) = actor {
+            query.push(format!("actor={}", percent_encode(actor)));
+        }
+        let path = format!("/v1/client/work?{}", query.join("&"));
+        let started = tokio::time::Instant::now();
+        let deadline = started + self.outage_wait;
+        let mut pause = Duration::from_millis(100);
+        loop {
+            let attempt = self.request_once::<Envelope<Page>>(Method::GET, &path, None, None, "application/json");
+            let outcome = if self.outage_wait.is_zero() {
+                attempt.await
+            } else {
+                // No attempt outlasts what remains of the wait.
+                match tokio::time::timeout_at(deadline, attempt).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        return Err(ClientError::Transport(format!(
+                            "the work list did not answer within the daemon wait of {}s",
+                            self.outage_wait.as_secs()
+                        )));
+                    }
+                }
+            };
+            let again = match &outcome {
+                Err(ClientError::Unreachable(_)) => true,
+                Err(ClientError::Api(_, _, envelope)) => {
+                    envelope.retryable
+                        && matches!(
+                            envelope.details.get("reason").and_then(serde_json::Value::as_str),
+                            Some("work-list-not-ready" | "work-list-not-fresh")
+                        )
+                }
+                _ => false,
+            };
+            let now = tokio::time::Instant::now();
+            if !again || self.outage_wait.is_zero() || now >= deadline {
+                return match outcome {
+                    Err(ClientError::Unreachable(mut outage)) => {
+                        outage.waited = Some(now - started);
+                        Err(ClientError::Unreachable(outage))
+                    }
+                    outcome => outcome,
+                };
+            }
+            tokio::time::sleep(pause.min(deadline - now)).await;
+            pause = (pause * 2).min(Duration::from_secs(1));
+        }
+    }
     /// List only native sessions that are not already managed by st3.
     pub async fn sessions_list_native(
         &self,

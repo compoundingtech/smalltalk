@@ -5,7 +5,9 @@
 //! [`PublishedList`] holds the newest publication and the refresher's wake. The refresher loop is
 //! `api::published_lists::spawn`; each collection supplies how to fold its rows, from nothing or
 //! from the previous publication. Until the first publication, and while the refresher keeps
-//! failing or after it stops, the list is not served and readers fold on read.
+//! failing or after it stops, the list is not served. Readers of a list its refresher governs,
+//! as the work list's does, then refuse (see [`PublishedList::current`]); readers of another
+//! fold on read.
 
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,11 +25,19 @@ pub(crate) struct Publication<R> {
     pub(crate) rows: R,
 }
 
+/// Numbers every list this process makes, so no two lists' publications share an identity.
+static LISTS: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) struct PublishedList<R> {
+    /// This list's number in the process: see [`PublicationId`].
+    instance: u64,
     newest: Mutex<Option<Arc<Publication<R>>>>,
     wake: Arc<tokio::sync::Notify>,
     /// Whether a refresher was started; there is at most one.
     started: AtomicBool,
+    /// Whether the started refresher's task has ended. Nothing publishes again until the daemon
+    /// restarts, so readers that need a publication refuse rather than wait for one.
+    ended: AtomicBool,
     /// Whether readers may serve the newest publication.
     serving: AtomicBool,
     /// Set when the projections this list folds were replaced without a new claim, as a replay
@@ -35,6 +45,13 @@ pub(crate) struct PublishedList<R> {
     forgotten: AtomicBool,
     /// Rises with every forget, so a fold that began before one never publishes.
     generation: AtomicU64,
+    /// The generation the newest publication was folded in. Written under the `newest` lock.
+    newest_generation: AtomicU64,
+    /// Numbers every publication this list swapped in, from one, so two publications at one cut
+    /// never share an identity. Written under the `newest` lock.
+    sequence: AtomicU64,
+    /// Rises with every publication, withdrawal, forget and end, for readers that wait for one.
+    changes: tokio::sync::watch::Sender<u64>,
     /// Folds from nothing or in chunks, by why: each refolded many rows, not a few.
     rebuilds: Mutex<BTreeMap<String, u64>>,
 }
@@ -43,21 +60,102 @@ pub(crate) struct PublishedList<R> {
 impl<R> Default for PublishedList<R> {
     fn default() -> Self {
         Self {
+            instance: LISTS.fetch_add(1, Ordering::Relaxed) + 1,
             newest: Mutex::new(None),
             wake: Arc::default(),
             started: AtomicBool::new(false),
+            ended: AtomicBool::new(false),
             serving: AtomicBool::new(false),
             forgotten: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            newest_generation: AtomicU64::new(0),
+            sequence: AtomicU64::new(0),
+            changes: tokio::sync::watch::Sender::new(0),
             rebuilds: Mutex::default(),
         }
     }
+}
+
+/// What a reader that never folds the list can serve now. See [`PublishedList::current`].
+pub(crate) enum ListRead<R> {
+    /// No refresher was started. Unless the list's view is held, as a governing refresher holds
+    /// it before it starts, nothing governs the list, as with `ST3_PUBLISHED_LISTS=off` or a
+    /// tool or test that starts none: the reader keeps its own direct read.
+    NeverStarted,
+    /// The refresher's task ended: nothing publishes again until the daemon restarts.
+    Ended,
+    /// The refresher runs but has nothing current to serve: before its first publication,
+    /// after it withdrew the list, or after a forget until the fold from nothing publishes.
+    NotReady,
+    /// The newest publication, of the current generation.
+    Served(Arc<Publication<R>>, PublicationId),
+}
+
+/// One publication's identity within the process: its list, the generation it was folded in
+/// and its number among the list's publications. No two publications share one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublicationId {
+    pub(crate) list: u64,
+    pub(crate) generation: u64,
+    pub(crate) sequence: u64,
 }
 
 impl<R> PublishedList<R> {
     /// Register the one refresher, and return its wake. `None` when one is already registered.
     pub(crate) fn start(&self) -> Option<Arc<tokio::sync::Notify>> {
         (!self.started.swap(true, Ordering::AcqRel)).then(|| Arc::clone(&self.wake))
+    }
+
+    /// Whether a refresher was started for this list.
+    pub(crate) fn is_started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    /// The refresher's task ended, by any path: stop serving, for good.
+    pub(crate) fn end(&self) {
+        let _newest = self.newest.lock().unwrap_or_else(PoisonError::into_inner);
+        self.ended.store(true, Ordering::Release);
+        self.serving.store(false, Ordering::Release);
+        self.changes.send_modify(|changes| *changes += 1);
+    }
+
+    /// What a reader may serve now, for a reader that never folds the list. A publication is
+    /// served only while the list is and only in the generation it was folded in, so rows of
+    /// projections a forget replaced are never served.
+    pub(crate) fn current(&self) -> ListRead<R> {
+        let newest = self.newest.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.started.load(Ordering::Acquire) {
+            return ListRead::NeverStarted;
+        }
+        if self.ended.load(Ordering::Acquire) {
+            return ListRead::Ended;
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        match &*newest {
+            Some(publication)
+                if self.serving.load(Ordering::Acquire)
+                    && self.newest_generation.load(Ordering::Acquire) == generation =>
+            {
+                let sequence = self.sequence.load(Ordering::Acquire);
+                ListRead::Served(Arc::clone(publication), PublicationId { list: self.instance, generation, sequence })
+            }
+            _ => ListRead::NotReady,
+        }
+    }
+
+    /// The list's generation now: a cursor of an earlier one reads projections a forget replaced.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Follows every publication, withdrawal, forget and end.
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes.subscribe()
+    }
+
+    /// Ask the refresher to fold now rather than wait for its next commit or deadline.
+    pub(crate) fn request_refresh(&self) {
+        self.wake.notify_one();
     }
 
     /// The newest publication, while the refresher keeps the list served. Its rows carry their
@@ -89,7 +187,11 @@ impl<R> PublishedList<R> {
         if newest.is_none() || self.generation.load(Ordering::Acquire) != generation {
             return false;
         }
-        !self.serving.swap(true, Ordering::AcqRel)
+        let served = !self.serving.swap(true, Ordering::AcqRel);
+        if served {
+            self.changes.send_modify(|changes| *changes += 1);
+        }
+        served
     }
 
     /// Swap in a newer publication and serve it, unless the projections were replaced after its
@@ -102,13 +204,20 @@ impl<R> PublishedList<R> {
             return None;
         }
         *newest = Some(Arc::new(publication));
-        Some(self.serving.swap(true, Ordering::AcqRel))
+        self.newest_generation.store(generation, Ordering::Release);
+        self.sequence.fetch_add(1, Ordering::AcqRel);
+        let served = self.serving.swap(true, Ordering::AcqRel);
+        self.changes.send_modify(|changes| *changes += 1);
+        Some(served)
     }
 
-    /// Stop serving the list, as when its refresher keeps failing or stops: readers fold on
-    /// read until a fold publishes again. Says whether it was served.
+    /// Stop serving the list, as when its refresher keeps failing or stops, until a fold
+    /// publishes again. Readers of a list its refresher governs refuse meanwhile; readers of
+    /// another fold on read. Says whether it was served.
     pub(crate) fn withdraw(&self) -> bool {
-        self.serving.swap(false, Ordering::AcqRel)
+        let served = self.serving.swap(false, Ordering::AcqRel);
+        self.changes.send_modify(|changes| *changes += 1);
+        served
     }
 
     /// The projections were replaced without a new claim: fold from nothing at once, and drop
@@ -119,6 +228,7 @@ impl<R> PublishedList<R> {
         let _newest = self.newest.lock().unwrap_or_else(PoisonError::into_inner);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.fold_from_nothing_next();
+        self.changes.send_modify(|changes| *changes += 1);
         self.wake.notify_one();
     }
 
@@ -327,5 +437,47 @@ mod tests {
         list.note_rebuild("start");
         list.note_rebuild("start");
         assert_eq!(list.rebuilds(), BTreeMap::from([("start".to_owned(), 2)]));
+    }
+
+    fn served(list: &PublishedList<Vec<u64>>) -> Option<(u64, PublicationId)> {
+        match list.current() {
+            ListRead::Served(publication, id) => Some((publication.cut, id)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_reader_that_never_folds_sees_whether_it_may_serve_and_which_publication() {
+        let list = PublishedList::<Vec<u64>>::default();
+        assert!(matches!(list.current(), ListRead::NeverStarted));
+        assert!(!list.is_started());
+        list.start();
+        assert!(matches!(list.current(), ListRead::NotReady), "cold");
+        let mut changes = list.subscribe();
+        list.publish(publication(4), 0);
+        assert!(changes.has_changed().unwrap());
+        let (cut, first) = served(&list).unwrap();
+        assert_eq!((cut, first.generation), (4, 0));
+        // Two publications at one cut never share an identity.
+        list.publish(publication(4), 0);
+        let (_, second) = served(&list).unwrap();
+        assert_ne!(first, second);
+        // A forget stops serving rows of the replaced projections at once, unlike `newest`.
+        list.forget();
+        assert!(matches!(list.current(), ListRead::NotReady));
+        assert_eq!(list.newest().unwrap().cut, 4);
+        assert_eq!(list.generation(), 1);
+        let (_, generation) = list.base();
+        list.publish(publication(6), generation);
+        let (cut, third) = served(&list).unwrap();
+        assert_eq!((cut, third.generation), (6, 1));
+        list.withdraw();
+        assert!(matches!(list.current(), ListRead::NotReady), "withdrawn");
+        assert!(list.serve_again(1));
+        assert_eq!(served(&list).unwrap().1, third, "the same publication, served again");
+        drop(changes.borrow_and_update());
+        list.end();
+        assert!(changes.has_changed().unwrap());
+        assert!(matches!(list.current(), ListRead::Ended));
     }
 }

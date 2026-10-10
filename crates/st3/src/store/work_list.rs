@@ -24,6 +24,15 @@ pub(crate) struct WorkRow {
 /// One publication of the current work list.
 #[derive(Clone, Default)]
 pub(crate) struct WorkRows {
+    /// Each seat's queue order at `orders_cut`, for the seats rows show, read in the fold's own
+    /// snapshot: an actor's ready work is ordered by it, never by a newer cut's order.
+    pub(crate) seat_orders: HashMap<String, Arc<Vec<String>>>,
+    /// The cut `seat_orders` was read at. A publication is complete only when it equals the
+    /// publication's cut.
+    pub(crate) orders_cut: u64,
+    /// The actors' orders over these rows, built on an actor's first read and dropped with the
+    /// publication. A clone for the next fold starts empty.
+    pub(crate) actors: ActorOrders,
     pub(crate) rows: HashMap<String, Arc<WorkRow>>,
     /// The steps in the unfiltered list's order.
     pub(crate) order: Vec<String>,
@@ -53,6 +62,91 @@ pub(crate) struct WorkChanges {
     pub(crate) reorder: bool,
 }
 
+/// How many actors' orders one publication keeps. Each holds at most one `u32` per row, so a
+/// publication's memo retains at most this many times four bytes per row.
+pub(crate) const ACTOR_ORDERS: usize = 64;
+
+/// The rows each actor sees of one publication, as indexes into its `order`, in the order the
+/// direct read gives that actor. An actor's order is built once per publication, by its first
+/// read; concurrent reads of the same actor wait for that one build, and no lock is held across
+/// it. The least recently read actor is dropped past [`ACTOR_ORDERS`].
+#[derive(Default)]
+pub(crate) struct ActorOrders {
+    entries: Mutex<std::collections::VecDeque<(String, Arc<std::sync::OnceLock<Arc<Vec<u32>>>>)>>,
+    /// Rows scanned building actors' orders, and the builds and reuses, for tests.
+    #[cfg(test)]
+    pub(crate) scanned: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) builds: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) hits: std::sync::atomic::AtomicUsize,
+}
+
+// A clone for the next fold's rows starts with no actor's order: they are of these rows only.
+impl Clone for ActorOrders {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl ActorOrders {
+    /// `viewer`'s order, built by `build` unless an earlier read built it. Says whether this
+    /// read built it.
+    fn get_or_build(&self, viewer: &str, build: impl FnOnce() -> Vec<u32>) -> (Arc<Vec<u32>>, bool) {
+        let cell = {
+            let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+            match entries.iter().position(|(actor, _)| actor == viewer) {
+                Some(position) => {
+                    let entry = entries.remove(position).expect("the entry just found");
+                    let cell = Arc::clone(&entry.1);
+                    entries.push_back(entry);
+                    cell
+                }
+                None => {
+                    if entries.len() >= ACTOR_ORDERS {
+                        entries.pop_front();
+                    }
+                    let cell = Arc::new(std::sync::OnceLock::new());
+                    entries.push_back((viewer.to_owned(), Arc::clone(&cell)));
+                    cell
+                }
+            }
+        };
+        let mut built = false;
+        let order = Arc::clone(cell.get_or_init(|| {
+            built = true;
+            Arc::new(build())
+        }));
+        #[cfg(test)]
+        {
+            let counter = if built { &self.builds } else { &self.hits };
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        (order, built)
+    }
+
+    /// The bytes the kept orders hold: four per row index.
+    #[cfg(test)]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.iter().filter_map(|(_, cell)| cell.get()).map(|order| order.len() * 4).sum()
+    }
+}
+
+/// The seat whose queue orders `viewer`'s ready work, as the direct read names it.
+fn viewer_seat(viewer: &str) -> String {
+    normalize_seat(viewer)
+}
+
+/// Whether `viewer` sees `view` in its own work list, as the direct read's actor filter does.
+fn visible_to(view: &StepRunView, viewer: &str) -> bool {
+    !view.agentless
+        && (view.assigned_to.as_deref() == Some(viewer)
+            || view.claimant.as_deref() == Some(viewer)
+            || (matches!(view.status.as_str(), "ready" | "blocked")
+                && view.available_to.iter().any(|seat| seat == viewer)))
+}
+
 /// How the work list ranks a step's state: ready work first, ended work last.
 pub(crate) fn work_state_rank(status: &str) -> u8 {
     match status {
@@ -78,6 +172,73 @@ impl WorkRows {
                 .then_with(|| left.subject.cmp(&right.subject))
         });
         self.order = order.into_iter().map(|view| view.subject.clone()).collect();
+    }
+
+    /// The agent seats the rows name, each of which may read its own list: whose queue order
+    /// the publication keeps.
+    pub(crate) fn seats_shown(&self) -> BTreeSet<String> {
+        let mut seats = BTreeSet::new();
+        for row in self.rows.values().filter(|row| !row.view.agentless) {
+            let view = &row.view;
+            let named = view.assigned_to.iter().chain(view.claimant.iter()).chain(view.available_to.iter());
+            seats.extend(named.filter(|seat| seat.starts_with("agent/")).map(|seat| viewer_seat(seat)));
+        }
+        seats
+    }
+
+    /// The rows `actor` sees, as indexes into `order`, in the order the direct read gives it:
+    /// its ready work by its seat queue at this publication's own cut. Built on the actor's
+    /// first read of this publication; says whether this read built it.
+    pub(crate) fn actor_rows(&self, actor: &str) -> (Arc<Vec<u32>>, bool) {
+        let viewer = smallclaims::store::normalize_actor(actor, "agent");
+        self.actors.get_or_build(&viewer, || self.actor_order(&viewer))
+    }
+
+    fn actor_order(&self, viewer: &str) -> Vec<u32> {
+        #[cfg(test)]
+        self.actors.scanned.fetch_add(self.order.len(), std::sync::atomic::Ordering::Relaxed);
+        let mut shown = self
+            .order
+            .iter()
+            .enumerate()
+            .map(|(index, step)| (index as u32, &self.rows[step].view))
+            .filter(|(_, view)| visible_to(view, viewer))
+            .collect::<Vec<_>>();
+        let seat = viewer_seat(viewer);
+        let queue = self.seat_orders.get(&seat).map_or(&[][..], |order| order.as_slice());
+        let steps = shown
+            .iter()
+            .map(|(_, view)| crate::seat_queue::SeatStep::from(&***view))
+            .collect::<Vec<_>>();
+        let ready = crate::seat_queue::select(&seat, &steps, queue)
+            .ready
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let rank = |subject: &str| ready.iter().position(|step| step == subject).unwrap_or(usize::MAX);
+        shown.sort_by(|(_, left), (_, right)| {
+            work_state_rank(&left.status)
+                .cmp(&work_state_rank(&right.status))
+                .then_with(|| rank(&left.subject).cmp(&rank(&right.subject)))
+                .then_with(|| left.readiness_epoch.cmp(&right.readiness_epoch))
+                .then_with(|| left.step.cmp(&right.step))
+                .then_with(|| left.subject.cmp(&right.subject))
+        });
+        shown.into_iter().map(|(index, _)| index).collect()
+    }
+
+    /// The rendered rows at `indexes[offset..]`, at most `limit` of them, and whether more
+    /// follow. Clones only the rows it returns.
+    pub(crate) fn page_of(&self, indexes: Option<&[u32]>, offset: usize, limit: usize) -> (Vec<Value>, bool) {
+        let len = indexes.map_or(self.order.len(), <[u32]>::len);
+        let end = offset.saturating_add(limit).min(len);
+        let items = (offset.min(end)..end)
+            .map(|position| {
+                let index = indexes.map_or(position, |indexes| indexes[position] as usize);
+                (*self.rows[&self.order[index]].value).clone()
+            })
+            .collect();
+        (items, end < len)
     }
 }
 
@@ -239,9 +400,36 @@ impl Store {
         Ok(step_timing_lease_at(&self.readers.get(), subject, attempt, at)?)
     }
 
-    /// The published work list, while a refresher keeps one.
+    /// The published work list, while a refresher keeps one. Readers use
+    /// [`published_list::PublishedList::current`], which also refuses a forgotten generation.
+    #[cfg(test)]
     pub(crate) fn published_work(&self) -> Option<Arc<published_list::Publication<WorkRows>>> {
         self.smalltalk.published_work.newest()
+    }
+
+    /// Each of `seats`' queue order, read in the caller's snapshot. A seat with no queued run
+    /// is left out, as reading it gives no order.
+    pub(crate) fn seat_orders_of(&self, seats: &BTreeSet<String>) -> Result<HashMap<String, Arc<Vec<String>>>> {
+        let mut orders = HashMap::new();
+        for seat in seats {
+            let order = self.seat_run_order(seat)?;
+            if !order.is_empty() {
+                orders.insert(seat.clone(), Arc::new(order));
+            }
+        }
+        Ok(orders)
+    }
+
+    /// Count one direct current-work read, which an enabled work list never makes. Counted in
+    /// tests only.
+    pub(crate) fn count_direct_work_read(&self) {
+        #[cfg(test)]
+        self.smalltalk.direct_work_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_work_reads(&self) -> usize {
+        self.smalltalk.direct_work_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn published_work_list(&self) -> &published_list::PublishedList<WorkRows> {

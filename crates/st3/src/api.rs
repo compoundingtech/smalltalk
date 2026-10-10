@@ -1241,6 +1241,11 @@ fn request_latency() -> &'static Mutex<request_latency::Meter> {
     REQUEST_LATENCY.get_or_init(|| Mutex::new(request_latency::Meter::default()))
 }
 
+/// Count one published current-work stage's duration beside the request rows.
+fn record_work_stage(stage: request_latency::WorkStage, elapsed: Duration) {
+    request_latency().lock().unwrap_or_else(std::sync::PoisonError::into_inner).record_work_stage(stage, elapsed);
+}
+
 /// Count one agents roster stage's duration beside the request rows.
 fn record_roster_stage(stage: request_latency::RosterStage, elapsed: Duration) {
     // A poisoned diagnostic lock must not stop the refresher that records into it.
@@ -1456,6 +1461,10 @@ fn client_error_envelope(status: StatusCode, raw: &Value, request_id: &str) -> V
 }
 
 fn client_error_retryable(status: StatusCode, code: Option<&str>) -> bool {
+    // The work list's refresher ended: nothing publishes it until the daemon restarts.
+    if code == Some(published_lists::WORK_LIST_ENDED) {
+        return false;
+    }
     if matches!(code, Some(
         "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired"
         | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle"
@@ -1989,6 +1998,9 @@ fn client_work_resources(
     snapshot_unix_ms: u128,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
+    if !history {
+        store.count_direct_work_read();
+    }
     let mut work = if history {
         store.client_work_history_at_snapshot(actor, snapshot_unix_ms)?
     } else {
@@ -4332,6 +4344,16 @@ async fn client_work(
     if query.history {
         return client_work_history(&state, snapshot, &query).await;
     }
+    // While a refresher governs the work list (from when it holds the list's view, before it
+    // starts), pages come from its publications and never fold the list on read. With none,
+    // as with ST3_PUBLISHED_LISTS=off, they read directly, as before.
+    if !matches!(
+        state.store.published_work_list().current(),
+        crate::store::published_list::ListRead::NeverStarted
+    ) || state.store.collection_view_published("work")
+    {
+        return client_work_published(state, snapshot, query).await;
+    }
     let actor = query.actor.clone();
     client_snapshot_page(&state, snapshot, "work", &query, move |state, snapshot| {
         client_work_resources(
@@ -4343,6 +4365,275 @@ async fn client_work(
         )
     })
     .await
+}
+
+/// How long a fresh current-work read waits for a publication at least as new as itself.
+const WORK_LIST_FRESH_WAIT: Duration = Duration::from_secs(2);
+
+/// Where a published current-work page's cursor continues: the publication its first page
+/// served and the actor's rows in it, kept as the page cache keeps a first page's items.
+struct PublishedWorkPage {
+    digest: String,
+    generation: u64,
+    publication: Arc<crate::store::published_list::Publication<crate::store::work_list::WorkRows>>,
+    indexes: Option<Arc<Vec<u32>>>,
+    expires_at_unix_ms: u128,
+}
+
+static PUBLISHED_WORK_PAGES: OnceLock<Mutex<VecDeque<PublishedWorkPage>>> = OnceLock::new();
+
+fn published_work_pages() -> &'static Mutex<VecDeque<PublishedWorkPage>> {
+    PUBLISHED_WORK_PAGES.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// The first `items_digest` segment of a cursor that continues a published work page.
+const PUBLISHED_WORK_DIGEST: &str = "published-work:";
+
+/// A published work page's identity: the host, the publication (its list, generation and
+/// number, unique within the process) and the actor, hex-encoded so no actor can spell
+/// another's.
+fn published_work_digest(
+    state: &AppState,
+    id: crate::store::published_list::PublicationId,
+    actor: Option<&str>,
+) -> String {
+    let actor = actor.map_or_else(|| "-".to_owned(), |actor| hex::encode(actor.as_bytes()));
+    format!(
+        "{PUBLISHED_WORK_DIGEST}{}:{}:{}:{}:{actor}",
+        hex::encode(state.node.as_bytes()),
+        id.list,
+        id.generation,
+        id.sequence
+    )
+}
+
+/// A current work page from the work list's publications. A first page serves the newest
+/// current publication, or with `fresh=true` one at least as new as the request; a continuation
+/// serves the publication its first page did. Neither folds the list: with nothing current to
+/// serve it is not ready, and once the refresher has ended, unavailable.
+async fn client_work_published(
+    state: AppState,
+    snapshot: ClientSnapshot,
+    query: ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    use crate::store::published_list::ListRead;
+    if let Some(encoded) = &query.cursor {
+        let cursor = decode_client_cursor(encoded)?;
+        // A first page read before the refresher started continues from the page cache.
+        if !cursor.items_digest.starts_with(PUBLISHED_WORK_DIGEST) {
+            let page = client_page(&state, &snapshot, "work", Vec::new(), &query)?;
+            return Ok((Extension(snapshot), Json(page)));
+        }
+        let page = client_work_published_continuation(&state, &snapshot, &query, cursor)?;
+        return Ok((Extension(snapshot), Json(page)));
+    }
+    let list = state.store.published_work_list();
+    let (publication, id) = if query.fresh {
+        let waited = Instant::now();
+        let fresh = wait_for_work_list(&state.store).await;
+        record_work_stage(request_latency::WorkStage::FreshWait, waited.elapsed());
+        fresh?
+    } else {
+        match list.current() {
+            ListRead::Served(publication, id) => (publication, id),
+            ListRead::NotReady | ListRead::NeverStarted => {
+                list.request_refresh();
+                return Err(published_lists::work_list_not_ready());
+            }
+            ListRead::Ended => return Err(published_lists::work_list_ended()),
+        }
+    };
+    let reader = state.clone();
+    blocking_store(move || Ok(client_work_published_page(&reader, &publication, id, &query))).await?
+}
+
+/// Wait up to [`WORK_LIST_FRESH_WAIT`] for a current publication at or after the store's index
+/// when the request arrived. Each way it can end answers differently: such a publication; not
+/// fresh, once the wait is over; not ready, if the list is withdrawn or forgotten meanwhile or
+/// its change channel closes; unavailable, if the refresher ends. Never stale rows as fresh.
+async fn wait_for_work_list(
+    store: &Arc<Store>,
+) -> Result<
+    (
+        Arc<crate::store::published_list::Publication<crate::store::work_list::WorkRows>>,
+        crate::store::published_list::PublicationId,
+    ),
+    ApiError,
+> {
+    use crate::store::published_list::ListRead;
+    let list = store.published_work_list();
+    let wanted = store.index().map_err(ApiError::internal)?;
+    let mut changes = list.subscribe();
+    let deadline = tokio::time::Instant::now() + WORK_LIST_FRESH_WAIT;
+    list.request_refresh();
+    loop {
+        drop(changes.borrow_and_update());
+        let newest = match list.current() {
+            ListRead::Served(publication, id) if publication.cut >= wanted => return Ok((publication, id)),
+            ListRead::Served(publication, _) => publication.cut,
+            ListRead::Ended => return Err(published_lists::work_list_ended()),
+            ListRead::NotReady | ListRead::NeverStarted => return Err(published_lists::work_list_not_ready()),
+        };
+        match tokio::time::timeout_at(deadline, changes.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err(published_lists::work_list_not_ready()),
+            Err(_) => return Err(published_lists::work_list_not_fresh(wanted, Some(newest))),
+        }
+    }
+}
+
+/// A first page of `publication`, under the snapshot of its own cut. An actor's rows come from
+/// its order in the publication, built on its first read. The page is emitted only if no
+/// forget replaced the projections since `id` was acquired.
+fn client_work_published_page(
+    state: &AppState,
+    publication: &Arc<crate::store::published_list::Publication<crate::store::work_list::WorkRows>>,
+    id: crate::store::published_list::PublicationId,
+    query: &ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    let started = Instant::now();
+    let limit = query.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS).clamp(1, CLIENT_MAX_PAGE_ITEMS);
+    let mut built = false;
+    let indexes = query.actor.as_deref().map(|actor| {
+        let (indexes, fresh) = publication.rows.actor_rows(actor);
+        built = fresh;
+        indexes
+    });
+    let (items, has_more) = publication.rows.page_of(indexes.as_deref().map(Vec::as_slice), 0, limit);
+    let list = state.store.published_work_list();
+    if list.generation() != id.generation {
+        return Err(published_lists::work_list_not_ready());
+    }
+    let snapshot = roster_snapshot(state, publication.cut, publication.published_at_unix_ms);
+    let expires_at_unix_ms = client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS);
+    let digest = published_work_digest(state, id, query.actor.as_deref());
+    let next_cursor = if has_more {
+        let mut pages = published_work_pages().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = client_now_ms();
+        pages.retain(|page| page.expires_at_unix_ms > now);
+        while pages.len() >= CLIENT_PAGE_CACHE_CAPACITY {
+            pages.pop_front();
+        }
+        pages.push_back(PublishedWorkPage {
+            digest: digest.clone(),
+            generation: id.generation,
+            publication: Arc::clone(publication),
+            indexes: indexes.clone(),
+            expires_at_unix_ms,
+        });
+        Some(encode_client_cursor(&published_work_cursor(&snapshot, query, items.len(), limit, digest, expires_at_unix_ms))?)
+    } else {
+        None
+    };
+    let page = ClientResourcePage {
+        kind: "page".into(),
+        collection: "work".into(),
+        filters: client_page_filters("work", query),
+        items,
+        page: ClientPageInfo {
+            limit,
+            has_more,
+            next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+        },
+        sync: client_sync_notice(state),
+        replicated: None,
+    };
+    let stage = if built { request_latency::WorkStage::ActorBuild } else { request_latency::WorkStage::Page };
+    record_work_stage(stage, started.elapsed());
+    Ok((Extension(snapshot), Json(page)))
+}
+
+fn published_work_cursor(
+    snapshot: &ClientSnapshot,
+    query: &ClientListQuery,
+    offset: usize,
+    limit: usize,
+    items_digest: String,
+    expires_at_unix_ms: u128,
+) -> ClientPageCursor {
+    ClientPageCursor {
+        snapshot: snapshot.clone(),
+        collection: "work".into(),
+        offset,
+        limit,
+        history: false,
+        person: query.person.clone(),
+        actor: query.actor.clone(),
+        owner_run: query.owner_run.clone(),
+        status: query.status.clone(),
+        owner: None,
+        state: None,
+        native_only: query.native_only,
+        items_digest,
+        before_index: None,
+        after_key: None,
+        expires_at_unix_ms,
+    }
+}
+
+/// The next page of a published work page: the same publication and actor rows, sliced at the
+/// cursor. It expires as a cached page does, and also once a forget replaced the projections
+/// its rows were folded from. A later publication of the same generation leaves it valid.
+fn client_work_published_continuation(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    query: &ClientListQuery,
+    cursor: ClientPageCursor,
+) -> Result<ClientResourcePage, ApiError> {
+    if cursor.collection != "work"
+        || cursor.history != query.history
+        || cursor.person != query.person
+        || cursor.actor != query.actor
+        || cursor.owner_run != query.owner_run
+        || cursor.owner.is_some()
+        || cursor.state.is_some()
+        || cursor.status != query.status
+        || cursor.native_only != query.native_only
+        || query.limit.is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
+        || cursor.snapshot.id != snapshot.id
+        || cursor.snapshot.store_index != snapshot.store_index
+    {
+        return Err(client_page_expired(
+            "the page cursor does not match this collection, snapshot, or filter",
+        ));
+    }
+    if client_now_ms() > cursor.expires_at_unix_ms {
+        return Err(client_page_expired("the page cursor expired"));
+    }
+    let (publication, indexes, generation) = {
+        let pages = published_work_pages().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let page = pages
+            .iter()
+            .find(|page| page.digest == cursor.items_digest && page.expires_at_unix_ms == cursor.expires_at_unix_ms)
+            .ok_or_else(|| client_page_expired("the page snapshot is no longer available; restart pagination"))?;
+        (Arc::clone(&page.publication), page.indexes.clone(), page.generation)
+    };
+    if state.store.published_work_list().generation() != generation {
+        return Err(client_page_expired("the work list was refolded since this page was read; restart pagination"));
+    }
+    let (items, has_more) = publication.rows.page_of(indexes.as_deref().map(Vec::as_slice), cursor.offset, cursor.limit);
+    let next_cursor = if has_more {
+        let mut next = cursor.clone();
+        next.offset = cursor.offset.saturating_add(items.len());
+        Some(encode_client_cursor(&next)?)
+    } else {
+        None
+    };
+    Ok(ClientResourcePage {
+        kind: "page".into(),
+        collection: "work".into(),
+        filters: client_page_filters("work", query),
+        items,
+        page: ClientPageInfo {
+            limit: cursor.limit,
+            has_more,
+            next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(cursor.expires_at_unix_ms)),
+        },
+        sync: client_sync_notice(state),
+        replicated: None,
+    })
 }
 
 /// The work history, read a page at a time in the order it shows, each page inside one SQLite

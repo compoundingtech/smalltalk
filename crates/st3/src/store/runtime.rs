@@ -66,6 +66,9 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_resources_refolded_cards: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) agent_resources_largest_fold: std::sync::atomic::AtomicUsize,
+    /// Direct current-work reads, which an enabled work list never makes.
+    #[cfg(test)]
+    pub(crate) direct_work_reads: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone)]

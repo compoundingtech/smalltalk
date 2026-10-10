@@ -88,6 +88,10 @@ struct CollectionSubscription {
     view_revision: u64,
     /// When the client subscribed, until its first snapshot is sent.
     opened: Option<std::time::Instant>,
+    /// The window's last read found its governed view not ready, and the client was told: it
+    /// waits for the view's next change. A paired session's clock still reads it, so an expired
+    /// or revoked grant still ends it, but another not-ready read sends nothing.
+    waiting_for_view: bool,
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
@@ -461,8 +465,29 @@ async fn collection_items_with_windows(
                 let published_missions = (collection == "missions")
                     .then(|| store.published_missions())
                     .flatten();
-                // So does a work window, filtering the published list for its actor.
-                let published_work = (collection == "work").then(|| store.published_work()).flatten();
+                // A work window serves the published list for its actor while its refresher runs,
+                // and never folds it on read meanwhile: with no current publication it is not
+                // ready, and once the refresher has ended, unavailable. With no refresher started
+                // it reads directly, as before.
+                let published_work = if collection == "work" {
+                    use crate::store::published_list::ListRead;
+                    match store.published_work_list().current() {
+                        ListRead::Served(publication, _) => Some(publication),
+                        // Held: a refresher governs it, though it has not started yet.
+                        ListRead::NeverStarted if store.collection_view_published("work") => {
+                            return Ok(Err(super::published_lists::work_list_not_ready()));
+                        }
+                        // Explicit off, or nothing ever governed it: the direct read.
+                        ListRead::NeverStarted => None,
+                        ListRead::NotReady => {
+                            store.published_work_list().request_refresh();
+                            return Ok(Err(super::published_lists::work_list_not_ready()));
+                        }
+                        ListRead::Ended => return Ok(Err(super::published_lists::work_list_ended())),
+                    }
+                } else {
+                    None
+                };
                 let list_cut = published_missions.as_ref().map(|list| (list.cut, list.published_at_unix_ms))
                     .or_else(|| published_work.as_ref().map(|list| (list.cut, list.published_at_unix_ms)));
                 if let Some((cut, at)) = list_cut {
@@ -524,9 +549,9 @@ async fn collection_items_with_windows(
                         }
                         "work" if published_work.is_some() => {
                             let publication = published_work.as_ref().expect("published work");
-                            return super::published_lists::work_window(
-                                &store, &publication.rows, actor.as_deref(), limit,
-                            );
+                            return Ok(super::published_lists::work_window(
+                                &publication.rows, actor.as_deref(), limit,
+                            ));
                         }
                         "work" => client_work_resources(
                             &store,
@@ -655,6 +680,9 @@ enum Refreshed {
     Current,
     /// A retryable read failed; keep the subscription and schedule another read.
     Retry,
+    /// A published view's refresher has nothing current to serve: keep the subscription. A view
+    /// its refresher governs is read again when it next changes, not on the reread interval.
+    NotReady,
     /// A permanent refusal ended the subscription.
     Dropped,
     /// The socket closed.
@@ -683,6 +711,8 @@ async fn deliver_collection(
             .await;
             return if !sent {
                 Refreshed::Closed
+            } else if retryable && error.code == super::published_lists::WORK_LIST_NOT_READY {
+                Refreshed::NotReady
             } else if retryable {
                 Refreshed::Retry
             } else {
@@ -1441,7 +1471,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         refresh.push(request.id.clone());
                         // Collection results and conversation frames share the same generation fence.
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, view_revision: 0, opened: Some(std::time::Instant::now()), request });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, view_revision: 0, opened: Some(std::time::Instant::now()), waiting_for_view: false, request });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -1453,15 +1483,31 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 if subscription.generation != generation { continue; }
                 subscription.reading = None;
                 if std::mem::take(&mut subscription.dirty) { refresh.push(id.clone()); }
+                let governed = state.store.collection_view_published(&subscription.request.collection);
                 let refreshed = match result {
+                    // Already told: the same not-ready answer is not sent again. The read still
+                    // rechecked a paired session's authority before it got this far.
+                    CollectionRead::Legacy(Err(error)) if subscription.waiting_for_view && governed
+                        && error.code == super::published_lists::WORK_LIST_NOT_READY
+                        && client_error_retryable(error.status, Some(&error.code)) => Refreshed::NotReady,
                     CollectionRead::Legacy(result) => deliver_collection(&mut socket, subscription, result).await,
                     CollectionRead::Ivm(result) => deliver_ivm_collection(&mut socket, subscription, *result, &mut refresh).await,
                 };
+                subscription.waiting_for_view = matches!(refreshed, Refreshed::NotReady) && governed;
                 match refreshed {
                     Refreshed::Current => {}
                     Refreshed::Retry => {
                         if subscription.ivm.is_some() { subscription.dirty = true; }
                         else { reread_due.insert(id.clone()); }
+                    }
+                    // A governed view rereads when it next changes: its next publication, hold
+                    // or invalidation bumps the revision this read started at. A reread already
+                    // due stays due: it may be that change's.
+                    Refreshed::NotReady => {
+                        if !governed {
+                            if subscription.ivm.is_some() { subscription.dirty = true; }
+                            else { reread_due.insert(id.clone()); }
+                        }
                     }
                     Refreshed::Dropped => { subscriptions.remove(&id); reread_due.remove(&id); }
                     Refreshed::Closed => return,

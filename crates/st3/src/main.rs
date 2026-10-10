@@ -15723,7 +15723,14 @@ async fn run_work(
                 .await;
             }
             let generated = generated_client(endpoint, None)?;
-            let response = if let Some(actor) = actor.as_deref() {
+            // A current list's first page is as of this command: it sees the command's own
+            // writes, waiting for the work list to be published and retrying within the daemon
+            // wait. Later pages continue the publication the first page read.
+            let response = if cursor.is_none() && !all {
+                generated
+                    .work_list_fresh(actor.as_deref(), Some(limit))
+                    .await?
+            } else if let Some(actor) = actor.as_deref() {
                 generated
                     .work_list_for_actor(actor, cursor.as_deref(), Some(limit), all)
                     .await?
