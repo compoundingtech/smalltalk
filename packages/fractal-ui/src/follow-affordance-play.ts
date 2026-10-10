@@ -2,14 +2,19 @@ import { expect, userEvent } from 'storybook/test'
 
 type Fault = 'none' | 'instant' | 'late-hide' | 'omit-input'
 
+export interface AffordanceMotionOptions {
+  readonly cancel?: boolean
+  readonly fault?: Fault
+  readonly activation?: 'pointer' | 'Enter' | 'Space'
+  readonly readerInput?: 'wheel' | 'key' | 'touch'
+}
+
 /** Measures real painted scroll positions and pointer intent in either production lane. */
-export async function proveAffordanceMotion({ lane, pill, stream, cancel = false, fault = 'none' }: {
+export async function proveAffordanceMotion({ lane, pill, stream, cancel = false, fault = 'none', activation = 'pointer', readerInput = 'wheel' }: {
   readonly lane: HTMLElement
   readonly pill: HTMLButtonElement
   readonly stream: () => void
-  readonly cancel?: boolean
-  readonly fault?: Fault
-}) {
+} & AffordanceMotionOptions) {
   const nativeFrame = window.requestAnimationFrame
   // Capture the scheduling stack, not the later callback stack, for the instant-motion control.
   if (fault === 'instant') window.requestAnimationFrame = callback => {
@@ -24,7 +29,8 @@ export async function proveAffordanceMotion({ lane, pill, stream, cancel = false
   let grew = false
   let cancelledTop: number | undefined
   const intent = () => { clickedAt = performance.now() }
-  pill.addEventListener('pointerdown', intent, { once: true, capture: true })
+  const intentType = activation === 'pointer' ? 'pointerdown' : 'keydown'
+  pill.addEventListener(intentType, intent, { once: true, capture: true })
   const began = performance.now()
   let frame: number | undefined
   const lateHide = new MutationObserver(() => {
@@ -44,7 +50,9 @@ export async function proveAffordanceMotion({ lane, pill, stream, cancel = false
         // Interrupt while the virtual live row is mounted, so streamed growth is measured too.
         if (samples.length >= 3 && !grew && (!cancel || end - top <= 20)) {
           if (cancel && fault !== 'omit-input') {
-            lane.dispatchEvent(new WheelEvent('wheel', { deltaY: -40, bubbles: true }))
+            if (readerInput === 'wheel') lane.dispatchEvent(new WheelEvent('wheel', { deltaY: -40, bubbles: true }))
+            else if (readerInput === 'key') lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }))
+            else lane.dispatchEvent(new Event('touchmove', { bubbles: true }))
             lane.scrollTop -= 40
             lane.dispatchEvent(new Event('scroll'))
             cancelledTop = lane.scrollTop
@@ -59,9 +67,13 @@ export async function proveAffordanceMotion({ lane, pill, stream, cancel = false
     frame = nativeFrame.call(window, sample)
   })
   try {
-    await userEvent.click(pill)
+    if (activation === 'pointer') await userEvent.click(pill)
+    else {
+      pill.focus({ preventScroll: true })
+      await userEvent.keyboard(activation === 'Enter' ? '{Enter}' : '[Space]')
+    }
     await measured
-    await expect(hiddenAfter, 'click intent must hide the follow pill within 100ms').toBeLessThanOrEqual(100)
+    await expect(hiddenAfter, 'press intent must hide the follow pill within 100ms').toBeLessThanOrEqual(100)
     await expect(samples.length, 'return to end must paint at least three intermediate scroll frames').toBeGreaterThanOrEqual(3)
     await expect(lane.scrollHeight, 'the live edge must grow during the return animation').toBeGreaterThan(startHeight)
     if (cancel) {
@@ -82,7 +94,37 @@ export async function proveAffordanceMotion({ lane, pill, stream, cancel = false
   } finally {
     if (frame !== undefined) cancelAnimationFrame(frame)
     lateHide.disconnect()
-    pill.removeEventListener('pointerdown', intent, true)
+    pill.removeEventListener(intentType, intent, true)
     window.requestAnimationFrame = nativeFrame
+  }
+}
+
+/** This story runs under actual browser reduced-motion emulation, not a positive media-query mock. */
+export async function proveReducedMotion(lane: HTMLElement, pill: HTMLButtonElement, ignorePreference = false) {
+  const nativeMedia = window.matchMedia
+  await expect(nativeMedia.call(window, '(prefers-reduced-motion: reduce)').matches, 'run this accessibility story with reduced motion enabled').toBe(true)
+  // Negative control: deliberately consult the opposite native query, reproducing ignored preference.
+  if (ignorePreference) window.matchMedia = query => nativeMedia.call(window, query === '(prefers-reduced-motion: reduce)' ? '(prefers-reduced-motion: no-preference)' : query)
+  let immediateGap = Infinity
+  let hideAfter = Infinity
+  const intent = () => {
+    const started = performance.now()
+    queueMicrotask(() => {
+      immediateGap = lane.scrollHeight - lane.clientHeight - lane.scrollTop
+      if (pill.hidden) hideAfter = performance.now() - started
+    })
+  }
+  pill.addEventListener('pointerdown', intent, { once: true, capture: true })
+  try {
+    await userEvent.click(pill)
+    await expect(hideAfter, 'reduced-motion press intent must hide within 100ms').toBeLessThanOrEqual(100)
+    await expect(immediateGap, 'reduced-motion return must reach the current end immediately').toBeLessThanOrEqual(1)
+    for (let frame = 0; frame < 3; frame++) {
+      await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+      await expect(lane.scrollHeight - lane.clientHeight - lane.scrollTop, 'reduced-motion return must not paint intermediate positions').toBeLessThanOrEqual(1)
+    }
+  } finally {
+    pill.removeEventListener('pointerdown', intent, true)
+    window.matchMedia = nativeMedia
   }
 }
