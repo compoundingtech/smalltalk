@@ -6082,21 +6082,6 @@ async fn run_up(args: UpArgs) -> Result<()> {
     )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()).with_person(config.person.clone()));
     reconciler.set_max_passes_per_minute(config.reconcile.max_passes_per_minute)?;
     tokio::spawn(reconciler.clone().supervise());
-    // A start no longer rebuilds the operation projection; check it once the API serves.
-    tokio::spawn({
-        let store = store.clone();
-        async move {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            match tokio::task::spawn_blocking(move || store.repair_operation_projection_drift())
-                .await
-            {
-                Ok(Ok(true)) => eprintln!("st3: rebuilt an operation projection that drifted"),
-                Ok(Ok(false)) => {}
-                Ok(Err(error)) => eprintln!("st3: operation projection check failed: {error:#}"),
-                Err(error) => eprintln!("st3: operation projection check stopped: {error}"),
-            }
-        }
-    });
     tokio::spawn(st3::profile::watch_runtime_lag());
     // The policy reads `[limits]` again on every pass, so an edit applies without a restart.
     st3::config::set_daemon_config(args_config.as_deref());
@@ -6154,8 +6139,35 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let local_socket = config.socket.clone();
     let state_socket = config.state_dir.join("run/st3.sock");
     let client_gateway_socket = config.client_gateway_socket.clone();
-    // The first diagnostic report reads the whole claim log; no read waits for it.
-    st3::api::start_operation_report(&state);
+    // The first diagnostic report and delayed repair share one operation audit. Later reports
+    // audit current state independently; no request waits for this startup report.
+    if let Some(audit) = st3::api::start_operation_report(&state) {
+        let store = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            let drift = match audit.await {
+                Ok(Ok(drift)) => drift,
+                Ok(Err(error)) => {
+                    eprintln!("st3: operation projection check failed: {error:#}");
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("st3: operation projection check stopped: {error}");
+                    return;
+                }
+            };
+            match tokio::task::spawn_blocking(move || {
+                store.repair_operation_projection_drift_from_audit(&drift)
+            })
+            .await
+            {
+                Ok(Ok(true)) => eprintln!("st3: rebuilt an operation projection that drifted"),
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => eprintln!("st3: operation projection check failed: {error:#}"),
+                Err(error) => eprintln!("st3: operation projection check stopped: {error}"),
+            }
+        });
+    }
     // Nor does the first session list wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
     // Nor does the first agents roster read fold every agent's card.

@@ -5492,10 +5492,13 @@ pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
 }
 
 /// Make the daemon's first diagnostic report, which the operations collection lists, off the
-/// request path. Some of its checks read the whole claim log, seconds of work on a busy host's
-/// store; until it is made, the collection says so instead of making a read wait for it.
-pub fn start_operation_report(state: &AppState) {
-    client_v0::start_operation_report(state);
+/// request path. Until it is made, the collection says so instead of making a read wait for it.
+/// A newly started report returns its operation audit for the delayed startup repair to consume;
+/// later doctor calls and diagnostic refreshes always audit the current store themselves.
+pub fn start_operation_report(
+    state: &AppState,
+) -> Option<tokio::sync::oneshot::Receiver<anyhow::Result<Vec<String>>>> {
+    client_v0::start_operation_report(state)
 }
 
 /// Read the headers of this host's native session transcripts off the request path as the
@@ -6797,6 +6800,14 @@ fn terminal_exec_gates_check(store: &Store) -> anyhow::Result<DoctorCheck> {
 }
 
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
+    let drift = state.store.operation_projection_drift();
+    doctor_report_with_operation_drift(state, &drift)
+}
+
+fn doctor_report_with_operation_drift(
+    state: &AppState,
+    drift: &anyhow::Result<Vec<String>>,
+) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
     match state.store.index() {
         Ok(index) => checks.push(DoctorCheck {
@@ -6818,7 +6829,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: error.to_string(),
         }),
     }
-    match state.store.operation_projection_drift() {
+    match drift {
         Ok(drift) if drift.is_empty() => checks.push(DoctorCheck {
             name: "operation-projection".into(),
             status: "pass".into(),
@@ -17444,7 +17455,7 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
         }
 
         // As the daemon does when it starts, so no read makes the first diagnostic report.
-        start_operation_report(&state);
+        let _ = start_operation_report(&state);
         let app = router(state);
         for path in [
             "/v1/messages/page?include_closed=false&limit=100&to=agent%2Fprobe",

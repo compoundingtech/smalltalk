@@ -1,11 +1,11 @@
 {
   "version": 1,
-  "summary": "Walk the partial operation index in the operation drift audit",
-  "replay": {"status": "none", "detail": "No replay or projection rebuild is introduced; the audit returns the same expected rows from the same store state."},
-  "schema": {"status": "none", "detail": "No table, index, trigger or version change; the existing partial claims_operation_index is selected explicitly."},
+  "summary": "Stream operation projection audits and share the first startup audit with delayed repair",
+  "replay": {"status": "none", "detail": "No new replay or unconditional projection rebuild is introduced. Audits read bounded pages of claim metadata, tombstones and projected operations up to fixed claim store-index, checkpoint and operation-row frontiers. Each drift candidate is reverified against current metadata before reporting; startup repair still rebuilds only identified drifted rows from current claims under the writer transaction."},
+  "schema": {"status": "none", "detail": "No table, index, trigger or version change; the audit walks the existing partial claims_operation_index."},
   "rules": {"status": "none", "detail": "No checkpoint rules or replicated digest change."},
-  "compatibility": {"status": "none", "detail": "The audit's results and every API response are unchanged; only the query plan differs."},
-  "downtime": {"status": "none", "detail": "No migration or startup work is added."},
+  "compatibility": {"status": "changed", "detail": "API response shapes are unchanged. The audit is a drift detector, not a globally consistent snapshot gate: a concurrent mutation below the captured frontiers that introduces a new inconsistency can be missed in that pass and detected by a later audit. Pages contain at most 128 metadata rows; the audit retains compact per-operation reductions and drift findings instead of full claim bodies or a second complete operation map. Reader snapshots yield cooperatively with a 100 ms target, though scheduling, I/O and individual SQLite extractions cannot be preempted. The first background diagnostic report passes its audit result to delayed startup repair instead of scanning twice; subsequent doctor calls and diagnostic refreshes inspect current state."},
+  "downtime": {"status": "none", "detail": "No migration or startup blocking work is added. Initial diagnostics and the delayed targeted repair remain off the request path."},
   "manual": {"status": "none", "detail": "No operator action is required."},
-  "recovery": {"status": "none", "detail": "Behavioral no-op beyond query cost; binary rollback needs no store changes."}
+  "recovery": {"status": "none", "detail": "No new recovery procedure or store conversion is required. Delayed repair re-derives affected operations from current claims, and later doctor calls continue to detect new drift. Binary rollback needs no store changes."}
 }

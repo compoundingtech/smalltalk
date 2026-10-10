@@ -30,6 +30,7 @@ mod roster_controls;
 #[cfg(test)]
 mod agents_window_deadline_tests;
 pub(crate) mod step_labels;
+mod operation_audit;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -3696,14 +3697,20 @@ impl Store {
         // only the drifted rows: rebuilding the whole table held the only writer for a minute
         // and more on a populated store, stalling every write behind it.
         let drift = self.operation_projection_drift()?;
+        self.repair_operation_projection_drift_from_audit(&drift)
+    }
+
+    /// Repair only keys found by an earlier audit, re-deriving them from current claims.
+    /// A concurrent append cannot make an old finding overwrite the new canonical row.
+    pub fn repair_operation_projection_drift_from_audit(&self, drift: &[String]) -> Result<bool> {
         if drift.is_empty() {
             return Ok(false);
         }
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
-        repair_operations_tx(&transaction, &drift)?;
+        let changed = repair_operations_tx(&transaction, drift)?;
         transaction.commit()?;
-        Ok(true)
+        Ok(changed != 0)
     }
 
     /// Idempotency keys that two requests with different content used, which only members
@@ -3739,40 +3746,7 @@ impl Store {
     }
 
     pub fn operation_projection_drift(&self) -> Result<Vec<String>> {
-        let connection = self.readers.get();
-        // Replication and harness observations can append claims while doctor runs. Both
-        // sides of this comparison must see the same SQLite snapshot, or a healthy
-        // projection can appear to drift between the two reads.
-        let transaction = connection.unchecked_transaction()?;
-        let expected = expected_operations(&transaction)?;
-        let mut statement = transaction.prepare(
-            "SELECT id, request_digest, canonical_claim_id, state FROM operations ORDER BY id",
-        )?;
-        let actual = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    (
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ),
-                ))
-            })?
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        drop(statement);
-        transaction.commit()?;
-        let mut drift = Vec::new();
-        for id in expected
-            .keys()
-            .chain(actual.keys())
-            .collect::<BTreeSet<_>>()
-        {
-            if expected.get(id) != actual.get(id) {
-                drift.push((*id).clone());
-            }
-        }
-        Ok(drift)
+        self.operation_audit(&mut |_| {})
     }
 
     /// Rebuild only the planning tables. A planning claim written through the generic claim path
@@ -46217,7 +46191,7 @@ version 2
     }
 
     #[test]
-    fn operation_projection_drift_uses_one_snapshot_during_writes() {
+    fn operation_projection_drift_does_not_report_consistent_concurrent_writes() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&directory.path().join("state.sqlite3"), "node").unwrap());
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
