@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Join operation logical-cache comparison and separate SQL work characterization from DML counts",
+  "replay": {
+    "status": "none",
+    "detail": "Existing canonical expected_operations reducer and full rebuild callers unchanged. One raw actual/cache LEFT JOIN replaces the per-exact-row prepared query, preserving the same writer cut and known-key cache parity."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema/migration/index change. Existing cache primary key provides a known-key join; CASE excludes unsupported NULL/BLOB operation fields from JSON construction, while Rust raw-byte equality retains malformed TEXT refusal/repair semantics."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No source authority, membership, canonical ordering or rules change. Logical cache cannot grant canonical authority."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire/helper signature/Runtime dispatch/off-writer API change. Source/static candidate only; eight prepared controls remain unrun."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Prepared characterization separately captures same-thread completed SQL statements, VM steps, fullscan steps, sorts and autoindex rows for old complete oracle/no-op/all-changed helpers. Scoped DML phases include TEMP operation audit triggers and normal projection triggers; exclude setup/damage/SAVEPOINT/rollback/assertions/outer COMMIT/finalizers/writer return. No measured saving, SQL-count result, hold bound or whole replay acceptance."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No compiler/SQLite/native/load/production repair/push/PR/queue/adoption requested in this source slice."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Existing malformed actual/source, known-key cache parity, canonical precedence, rollback/FK/finalizer and complete oracle controls preserved. Arbitrary physically corrupt logical digest state remains outside coverage."
+  }
+}

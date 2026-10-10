@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Construct malformed checkpoint source explicitly before operation refusal controls",
+  "replay": {
+    "status": "none",
+    "detail": "Isolated test fixture only: temporarily suspend the two checkpoint operation-cache UPDATE refresh triggers to inject raw invalid UTF-8 TEXT, restore their exact SQL before both old/new oracles, and retain immutable source identity/time guards. Production code/schema/triggers, refusal/rollback assertions and work budgets unchanged. No local execution or production corruption action."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Isolated test fixture only: temporarily suspend the two checkpoint operation-cache UPDATE refresh triggers to inject raw invalid UTF-8 TEXT, restore their exact SQL before both old/new oracles, and retain immutable source identity/time guards. Production code/schema/triggers, refusal/rollback assertions and work budgets unchanged. No local execution or production corruption action."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Isolated test fixture only: temporarily suspend the two checkpoint operation-cache UPDATE refresh triggers to inject raw invalid UTF-8 TEXT, restore their exact SQL before both old/new oracles, and retain immutable source identity/time guards. Production code/schema/triggers, refusal/rollback assertions and work budgets unchanged. No local execution or production corruption action."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Isolated test fixture only: temporarily suspend the two checkpoint operation-cache UPDATE refresh triggers to inject raw invalid UTF-8 TEXT, restore their exact SQL before both old/new oracles, and retain immutable source identity/time guards. Production code/schema/triggers, refusal/rollback assertions and work budgets unchanged. No local execution or production corruption action."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Isolated test fixture only: temporarily suspend the two checkpoint operation-cache UPDATE refresh triggers to inject raw invalid UTF-8 TEXT, restore their exact SQL before both old/new oracles, and retain immutable source identity/time guards. Production code/schema/triggers, refusal/rollback assertions and work budgets unchanged. No local execution or production corruption action."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Isolated test fixture only: temporarily suspend the two checkpoint operation-cache UPDATE refresh triggers to inject raw invalid UTF-8 TEXT, restore their exact SQL before both old/new oracles, and retain immutable source identity/time guards. Production code/schema/triggers, refusal/rollback assertions and work budgets unchanged. No local execution or production corruption action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Isolated test fixture only: temporarily suspend the two checkpoint operation-cache UPDATE refresh triggers to inject raw invalid UTF-8 TEXT, restore their exact SQL before both old/new oracles, and retain immutable source identity/time guards. Production code/schema/triggers, refusal/rollback assertions and work budgets unchanged. No local execution or production corruption action."
+  }
+}
