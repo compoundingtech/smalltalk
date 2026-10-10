@@ -135,6 +135,8 @@ pub struct Inputs<'a> {
 /// new claim. The existing roster owner can combine this with its queue deadline;
 /// this helper does not register a timer, read a source, or build a cached card.
 /// Expired boundaries are excluded so an UNKNOWN image does not spin a refresher.
+/// A retained `since` stamp is not itself a deadline. Only its future-skew entry
+/// is included where crossing that boundary can change evidence admission.
 pub fn valid_until(inputs: &Inputs<'_>) -> Option<u64> {
     let mut next = None;
     let mut include = |boundary: u64| {
@@ -223,7 +225,7 @@ pub fn reduce(inputs: Inputs<'_>) -> Health {
         harness_state: inputs.harness.map(|harness| harness.state.clone()),
     };
     let stable_since = native.map(|native| native.since_ms);
-    let make = |status, reason, since| Health {
+    let make = |status: Status, reason: Reason, since: Option<u64>| Health {
         status,
         reason,
         since: since.map(stamp),
