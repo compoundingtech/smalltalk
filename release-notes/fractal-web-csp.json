@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "fractal-web enforces a Content Security Policy in the app server and Vite development/preview servers so agent-selected remote images cannot load even after a Markdown renderer regression",
+  "replay": {"status": "none", "detail": "Response-header enforcement only; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "changed", "detail": "The CSP may block cross-origin resources that were not used before. Images are restricted to same-origin, data and blob URLs; deferred remote-image actions open the original URL in a new tab with noopener,noreferrer instead of loading inline. External OTLP collectors require an explicit exact connect origin. Inline application scripts use hashes, and cross-origin Vite HMR is rejected."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No deployed installation action required; the app is not deployed by this change."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

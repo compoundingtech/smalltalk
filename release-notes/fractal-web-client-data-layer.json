@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "fractal-web loads the selected conversation, retains bounded live follows, reports sync state, and reconciles optimistic sends without duplicate messages.",
+  "replay": {"status": "none", "detail": "No runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "Client data and SDK changes only; no server protocol change. Send and Resend are explicit client operations. Person-authored mailbox headers are suppressed only when their st-minted content pair is in the window; separate agent mail and header-only mail remain visible. Echo reconciliation still reads the underlying message identities. Rejected rows produce typed diagnostics without row content."},
+  "downtime": {"status": "none", "detail": "No service interruption required."},
+  "manual": {"status": "none", "detail": "No installation action required. Conversation follows and pending sends remain in memory."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}
