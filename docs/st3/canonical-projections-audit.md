@@ -289,3 +289,8 @@ arrival cursor, ceiling, progress time and completion marker. Writers derive the
 subjects after ten milliseconds to leave room for the rest of the writer transaction.
 They are outside the shared logical rows and checkpoint digests, contain no message body, and
 are not replicated. Count readers query the metadata without advancing the backfill.
+
+The local `coordination_offer` trigger runs after lifecycle claims are inserted into `claims`:
+for staged, delivered, read and closed receipts it clears `coordination_sends.held` with one
+guarded primary-key update in the existing writer transaction. It adds no reader write or
+conversation payload and is outside shared projection digests.

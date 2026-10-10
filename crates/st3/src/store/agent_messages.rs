@@ -74,7 +74,14 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
     // still bootstrap in bounded pages rather than piggyback on that legacy rebuild.
     flush_with_coordination(transaction, filled)?;
     coordination::initialize(transaction)?;
-    coordination::backfill(transaction)?;
+    // A corrupt historical body must leave counts incomplete without preventing startup.
+    // Roll back this entire bounded page, including any counts preceding the bad body.
+    transaction.execute_batch("SAVEPOINT coordination_startup")?;
+    if let Err(error) = coordination::backfill(transaction) {
+        transaction.execute_batch("ROLLBACK TO coordination_startup")?;
+        eprintln!("st3: WARN coordination bootstrap remains incomplete: {error}");
+    }
+    transaction.execute_batch("RELEASE coordination_startup")?;
     if !filled {
         transaction.execute(
             "INSERT INTO meta(key,value) VALUES('agent_message_days_v1','1')",

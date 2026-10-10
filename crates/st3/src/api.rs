@@ -12478,11 +12478,22 @@ fn accept_message_receipt_with_upload_owner(
         && request
             .tags
             .iter()
-            .any(|tag| crate::fyi::always_wakes("agent/example", std::slice::from_ref(tag)))
+            .any(|tag| crate::fyi::reserved_event_tag(tag))
     {
         return Err(ApiError::bad(St3Error::new(
             "reserved-message-tag",
             "daemon event tags cannot be asserted by conversation senders",
+        )));
+    }
+    if device_signature.is_some()
+        && request
+            .tags
+            .iter()
+            .any(|tag| tag.starts_with(crate::fyi::REMAINING_PREFIX))
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "reserved-message-tag",
+            "remaining-count tags are delivery metadata",
         )));
     }
     let attachments = client_blobs::resolve_attachments(
@@ -12606,6 +12617,16 @@ fn accept_message_receipt_with_upload_owner(
         None => state.store.append_claim_outcome(&input),
     }
     .map_err(ApiError::bad)?;
+    // A concurrent sender may have accepted this key first with the same canonical input.
+    // Return its accepted classification, rather than this attempt's speculative tags.
+    let tags = record.body["fields"]["tags"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|tag| !tag.starts_with(crate::fyi::REMAINING_PREFIX))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let mut work_wake = is_work_wake(&tags);
     if let Some(reference) = request.in_reply_to.as_deref() {
         // Settling the parent writes its lifecycle claims too.
@@ -25825,6 +25846,27 @@ version 2
         forged.idempotency_key = "forged-tag".into();
         forged.tags = vec!["st3-fault:fake".into()];
         assert!(accept_message(&state, forged, None, None).is_err());
+        let mut launch = request();
+        launch.idempotency_key = "ordinary-launch-tag".into();
+        launch.tags = vec!["launch".into(), crate::fyi::FYI_TAG.into()];
+        assert!(crate::fyi::is_held(
+            &accept_message(&state, launch, None, None).unwrap().0
+        ));
+        let mut marker = request();
+        marker.from = "person/example".into();
+        marker.idempotency_key = "signed-marker".into();
+        marker.tags = vec![format!("{}{}", crate::fyi::REMAINING_PREFIX, usize::MAX)];
+        let (key, _) = smallclaims::fleet::MemberKey::generate().unwrap();
+        let signature = smallclaims::principal::ClaimSignature::sign(
+            &key,
+            "",
+            "person/example",
+            None,
+            vec![],
+            client_now_ms() as u64,
+        );
+        let rejected = accept_message(&state, marker, None, Some(signature)).unwrap_err();
+        assert_eq!(rejected.code, "reserved-message-tag");
         let mut contradictory = request();
         contradictory.idempotency_key = "contradictory".into();
         contradictory.tags = vec![crate::fyi::FYI_TAG.into(), crate::fyi::QUESTION_TAG.into()];

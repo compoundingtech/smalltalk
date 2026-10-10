@@ -233,6 +233,110 @@ impl Store {
 mod tests {
     use super::*;
     #[test]
+    fn malformed_historical_body_keeps_bootstrap_incomplete_without_blocking_open() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("graph.db");
+        let store = Store::open(&path, "node").unwrap();
+        let claim = store
+            .append_claim(&ClaimInput {
+                subject: "message/corrupt-history".into(),
+                kind: "message.sent".into(),
+                actor: Some("agent/example/writer".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("agent/example/writer")),
+                    ("to".into(), json!("agent/example/reader")),
+                    ("content".into(), json!("history")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        // SQLite accepts this JSON; serde's recursion guard rejects it.
+        let body = format!(
+            "{},\"deep\":{}0{}}}",
+            serde_json::to_string(&claim.body)
+                .unwrap()
+                .strip_suffix('}')
+                .unwrap(),
+            "[".repeat(140),
+            "]".repeat(140)
+        );
+        store
+            .connection
+            .batched(|tx| {
+                tx.execute(
+                    "UPDATE claims SET body=?1 WHERE id=?2",
+                    params![body, claim.id],
+                )?;
+                // The old allowance projection is already populated. The source edit
+                // above dirties it through an UPDATE trigger; remove that fixture-only
+                // rebuild request so startup reaches the new historical bootstrap.
+                tx.execute("DELETE FROM local_agent_message_pending", [])?;
+                tx.execute("DELETE FROM coordination_sends", [])?;
+                tx.execute(
+                    "UPDATE local_coordination_backfill SET cursor=0,ceiling=?1,complete=0",
+                    [current_index(tx)?],
+                )?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .unwrap()
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(&path, "node")
+            .expect("a failed count bootstrap must not block daemon startup");
+        assert_eq!(
+            reopened.coordination_counts(0, u64::MAX / 2).unwrap()["complete"],
+            false
+        );
+        assert_eq!(reopened.coordination_backfill_status().unwrap().0, 0);
+        assert!(reopened.advance_coordination_counts().is_err());
+    }
+
+    #[test]
+    fn remaining_markers_from_raw_claims_never_enter_message_views() {
+        let store = Store::open_memory("node").unwrap();
+        let marker = format!("{}{}", crate::fyi::REMAINING_PREFIX, usize::MAX);
+        store
+            .append_claim(&ClaimInput {
+                subject: "message/raw-marker".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/example".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("person/example")),
+                    ("to".into(), json!("agent/example/reader")),
+                    ("content".into(), json!("raw")),
+                    ("tags".into(), json!([marker, "dictated"])),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert_eq!(
+            store.message("message/raw-marker").unwrap().unwrap().tags,
+            ["dictated"]
+        );
+        assert_eq!(
+            store
+                .messages_for_delivery_through("agent/example/reader", store.index().unwrap())
+                .unwrap()[0]
+                .tags,
+            ["dictated"]
+        );
+        assert_eq!(
+            store
+                .latest_claim("message/raw-marker", Some("message.sent"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["tags"][0],
+            marker
+        );
+    }
+
+    #[test]
     fn reconnect_hydrates_eight_held_subjects_and_doctor_reads_at_most_128() {
         let store = Store::open_memory("node").unwrap();
         for n in 0..140 {

@@ -1790,4 +1790,4 @@ URLs. External images use an `image_link` block for explicit client opening; fil
 reads are restricted to content-addressed files in the bound Pi/OMP blob store. MIME comes from passive image
 signatures, with SVG/HTML/unrecognized bytes returned only as opaque octets.
 
-`message.send` accepts mutually exclusive `fyi`/`question` flags; `agents.wake-on` lets the seat itself or a person choose `all`/`questions`. Inspect receipt tags on mixed versions: old daemons silently ignore typed flags. See [FYI messages](../fyi-messages.md).
+`message.send` accepts mutually exclusive `fyi`/`question` flags; the CLI command `st agents wake-on` lets the seat itself or a person choose `all`/`questions`. Inspect receipt tags on mixed versions: old daemons silently ignore typed flags. See [FYI messages](../fyi-messages.md).

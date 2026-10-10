@@ -91,6 +91,7 @@ impl Mailbox {
             &mut self.admitted,
         )
         .unwrap();
+        MailboxOrder::default().bound_held(&mut oracle.1, true);
         serde_json::to_value(oracle).unwrap()
     }
 
@@ -216,4 +217,36 @@ fn incremental_updates_with_kept_order_match_a_full_read_at_every_step() {
             || mailbox.order.keys.is_empty(),
         "kept keys describe only the current mailbox"
     );
+}
+
+#[test]
+fn incremental_held_backlog_above_eight_matches_the_bounded_full_oracle() {
+    let mut mailbox = Mailbox::new();
+    mailbox.update();
+    for number in 0..20 {
+        mailbox
+            .store
+            .append_claim(&ClaimInput {
+                subject: format!("message/held-{number:03}"),
+                kind: "message.sent".into(),
+                actor: Some("agent/example/writer".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("agent/example/writer")),
+                    ("to".into(), json!(mailbox.fence.subject)),
+                    ("content".into(), json!("held")),
+                    ("tags".into(), json!([crate::fyi::FYI_TAG])),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    mailbox.update();
+    assert_eq!(mailbox.view(), mailbox.oracle());
+    assert_eq!(mailbox.previous.as_ref().unwrap().1.1.len(), 8);
+    mailbox.append("message/waking", "sent", None);
+    mailbox.update();
+    assert_eq!(mailbox.view(), mailbox.oracle());
 }

@@ -35,7 +35,7 @@ agent "example/builder" {
 ```
 
 `st agents wake-on agent/example/builder questions --as agent/example/builder` sets the same
-choice without restarting the seat; `all` (the default) restores it. Only the seat itself or a person may change this choice. Under `questions`, ordinary
+choice without restarting the seat; `all` (the default) restores it. Only the seat itself or a person may change this choice. A terminal-bound seat requires its person owner to make this change, preserving the terminal declaration ownership fence. Under `questions`, ordinary
 conversation messages that ask the seat nothing are held as FYI. A message asks the seat something when:
 
 - its sender declared it a question (`--question`), or
@@ -51,7 +51,7 @@ These always wake, whatever the seat chose and whatever the sender marked:
 - a work handoff (`st work handoff`);
 - daemon run reports, provider-capacity retry nudges, product-wait and planning notices.
 
-Daemon-built notifications bypass ordinary conversation acceptance. Their explicit event families always wake. A plain conversation described as a handoff needs `--question` to wake a questions-only seat. `--question` is a cooperative cost filter, not access control; st never infers questions from the body. Ordinary senders cannot assert the reserved daemon event tags.
+Daemon-built notifications bypass ordinary conversation acceptance. Their explicit event families always wake. A plain conversation described as a handoff needs `--question` to wake a questions-only seat. `--question` is a cooperative cost filter, not access control; st never infers questions from the body. The conversation API rejects reserved daemon event tags from non-daemon sender identities. This also is a cooperative filter: the raw message endpoint trusts its `from` identity; it does not add an authentication boundary. The generic `launch` tag is reserved for no one and always wakes only when its sender is a daemon.
 
 ## How it works
 
@@ -66,7 +66,7 @@ frame it sends until a message that wakes the seat is in it. At most the eight n
 A line reports `K older FYI held; st conversations ls`; the remaining mail stays held for
 on-demand reads or a later wake. Each harness shows a held message with
 `(FYI: held without waking you until this turn)`. Once offered, held mail follows the ordinary
-staged, delivered and read receipts. Reconnects load bodies for at most eight held subjects, regardless of age; all others remain durable.
+staged, delivered and read receipts. Reconnects load bodies for at most eight held subjects, regardless of age; all others remain durable. A changed-claim update coalesces waking messages into one held-batch refill. The existing delivery query still sorts mailbox metadata, so this bounds held body hydration rather than total mailbox work. Remaining-count notices can stay stale until the next wake after an on-demand read. Native harnesses also forward `dictated` on person messages so their existing dictated notice is visible.
 
 Held mail is never lost. Until it is read it is unread like any other message:
 `st conversations ls` lists it, and `st conversations read` reads it on demand. Held mail waiting
@@ -93,12 +93,22 @@ those messages can wake their recipients. Old CLIs reject the new flags. The CLI
 an agent's requested FYI is absent from the receipt. Swift and TypeScript receipt warnings
 are deferred; their callers must verify returned tags when using mixed versions.
 Upgrade every owner daemon before setting `wake-on`: an old owner treats that declaration
-revision as a changed launch and can restart the seat. A downgrade has the same risk and
-removes no-wake delivery guarantees. Rust callers constructing `MessageSendParameters`
+revision as a changed launch and can restart the seat. Downgrading below this build is unsupported; use forward recovery. Earlier FYI preview binaries use positional inserts incompatible with the new local metadata columns and can fail sends or startup. Pre-feature binaries lose no-wake delivery guarantees and can restart policy-bearing seats. Rust callers constructing `MessageSendParameters`
 explicitly must supply the two new boolean fields.
 
 Bootstrap reports `cursor`, `ceiling`, `progress_ms` and `complete` from local metadata;
 doctor warns if unfinished bootstrap makes no progress for 15 minutes. On reopening after
 an old binary ran, the writer reopens the uncovered send tail in bounded jobs. Corrupt source
 claims are not skipped: bootstrap fails closed and keeps counts incomplete so a collector
-cannot publish a plausible undercount. Repair the source using existing recovery procedures.
+cannot publish a plausible undercount. A failed startup bootstrap page rolls back and logs the error while allowing the daemon to start; later bootstrap remains incomplete. Repair the source using existing recovery procedures.
+
+At eight subjects per job with a 100-millisecond pause, 100,000 historical sends need at
+least about 20.8 minutes and one million about 3.5 hours, plus writer contention. Until
+bootstrap completes, ratios are unavailable, held-mail diagnostics are partial, and the
+backlog banner is suppressed to avoid reporting held mail as late. Separating held-only
+bootstrap and displaying a pending-exclusion banner are deferred. Terminal-bound self
+policy changes are also deferred until they can preserve the recorded actor and owner fence.
+Held counts use the canonical earliest send timestamp; a replicated duplicate's later unread
+timestamp can make the cosmetic backlog count conservative. Cleanup revalidates each message
+and still preserves unoffered FYIs. Optimizing the existing metadata sort and refreshing
+remaining notices after on-demand reads are deferred.

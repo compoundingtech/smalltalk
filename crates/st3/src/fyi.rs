@@ -66,6 +66,17 @@ pub fn declared_wake_on(desired: Option<&Value>) -> WakeOn {
         .unwrap_or_default()
 }
 
+/// Closed daemon event families reserved by conversation admission.
+pub fn reserved_event_tag(tag: &str) -> bool {
+    tag.starts_with("st3-work:")
+        || tag.starts_with("st3-work-handoff:")
+        || tag.starts_with("st3-fault:")
+        || tag == crate::github_watch::WATCH_TAG
+        || tag.starts_with("st3-run-report:")
+        || tag == "st3-provider-capacity-retry"
+        || tag.starts_with("st3-product-wait:")
+}
+
 /// A person's message (including one an adapter imports, such as from a chat bridge), anything
 /// ready step, a fault, a gh watch event, and a work handoff always wake the recipient,
 /// whatever it chose. Daemon run reports, retry nudges, product-wait and planning notices
@@ -73,16 +84,8 @@ pub fn declared_wake_on(desired: Option<&Value>) -> WakeOn {
 pub fn always_wakes(from: &str, tags: &[String]) -> bool {
     from.starts_with("person/")
         || from.starts_with("external/")
-        || tags.iter().any(|tag| {
-            tag.starts_with("st3-work:")
-                || tag.starts_with("st3-work-handoff:")
-                || tag.starts_with("st3-fault:")
-                || tag == crate::github_watch::WATCH_TAG
-                || tag.starts_with("st3-run-report:")
-                || tag == "st3-provider-capacity-retry"
-                || tag.starts_with("st3-product-wait:")
-                || tag == "launch"
-        })
+        || tags.iter().any(|tag| reserved_event_tag(tag))
+        || (from.starts_with("daemon/") && tags.iter().any(|tag| tag == "launch"))
 }
 
 /// Whether a stored message is held: it wakes nobody until something else wakes its recipient.
@@ -184,7 +187,7 @@ pub fn release(messages: &mut Vec<MessageView>) {
             .iter_mut()
             .find(|m| m.status == "sent" && !is_held(m))
         {
-            let remaining = previous + omitted;
+            let remaining = previous.saturating_add(omitted);
             if remaining > 0 {
                 m.tags.push(format!("{REMAINING_PREFIX}{remaining}"));
             }
@@ -213,11 +216,11 @@ pub fn release_page(messages: &mut Vec<MessageView>, pending: &mut Vec<MessageVi
         for m in pending.iter_mut() {
             m.tags.retain(|tag| !tag.starts_with(REMAINING_PREFIX));
         }
-        if previous + omitted > 0
+        let remaining = previous.saturating_add(omitted);
+        if remaining > 0
             && let Some(m) = pending.first_mut()
         {
-            m.tags
-                .push(format!("{REMAINING_PREFIX}{}", previous + omitted));
+            m.tags.push(format!("{REMAINING_PREFIX}{remaining}"));
         }
     }
 }
@@ -330,6 +333,38 @@ mod tests {
                 .tags
                 .contains(&format!("{REMAINING_PREFIX}392"))
         );
+    }
+
+    #[test]
+    fn remaining_notices_saturate_and_agent_launch_stays_held() {
+        let marker = format!("{REMAINING_PREFIX}{}", usize::MAX);
+        let mut held = (0..10)
+            .map(|n| {
+                let mut item = message(
+                    &format!("message/{n}"),
+                    "agent/example/writer",
+                    "sent",
+                    &[FYI_TAG],
+                );
+                item.created_index = n;
+                item
+            })
+            .collect::<Vec<_>>();
+        held[0].tags.push(marker.clone());
+        let mut pending = Vec::new();
+        release_page(&mut held, &mut pending);
+        assert_eq!(pending.len(), BATCH_LIMIT);
+        assert!(pending[0].tags.contains(&marker));
+        let mut wake = vec![message("message/wake", "person/operator", "sent", &[])];
+        release_page(&mut wake, &mut pending);
+        assert!(wake.last().unwrap().tags.contains(&marker));
+        assert!(!reserved_event_tag("launch"));
+        assert!(is_held(&message(
+            "message/launch",
+            "agent/example/writer",
+            "sent",
+            &[FYI_TAG, "launch"]
+        )));
     }
 
     #[test]

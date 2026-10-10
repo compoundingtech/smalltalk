@@ -13779,7 +13779,7 @@ impl Store {
             for (subject, created_index, remaining) in subjects {
                 let mut message = self.message_view_cached(&connection, &subject, created_index)?;
                 if message.to == recipient && (include_closed || message.status != "closed") {
-                    if remaining > 0 && message.status == "sent" {
+                    if remaining > 0 && crate::fyi::waits_for_turn(&message) {
                         message
                             .tags
                             .push(format!("{}{remaining}", crate::fyi::REMAINING_PREFIX));
@@ -22403,13 +22403,19 @@ fn message_view_tx(
                 values
                     .iter()
                     .filter_map(Value::as_str)
+                    .filter(|tag| !tag.starts_with(crate::fyi::REMAINING_PREFIX))
                     .map(str::to_owned)
                     .collect()
             })
             .unwrap_or_else(|| {
                 desired
                     .as_ref()
-                    .map(|value| canonical_child_strings(value, "tag"))
+                    .map(|value| {
+                        canonical_child_strings(value, "tag")
+                            .into_iter()
+                            .filter(|tag| !tag.starts_with(crate::fyi::REMAINING_PREFIX))
+                            .collect()
+                    })
                     .unwrap_or_default()
             }),
         // A replicated claim is another member's word: keep only references a file name can be

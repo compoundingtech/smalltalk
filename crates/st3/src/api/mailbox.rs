@@ -240,7 +240,9 @@ impl MailboxOrder {
             .map(|m| (m.created_index, m.subject.clone()))
             .collect::<Vec<_>>();
         held.sort();
-        self.remaining += held.len().saturating_sub(crate::fyi::BATCH_LIMIT);
+        self.remaining = self
+            .remaining
+            .saturating_add(held.len().saturating_sub(crate::fyi::BATCH_LIMIT));
         let selected = held
             .into_iter()
             .rev()
@@ -1621,6 +1623,27 @@ mod tests {
         // No boot floor: legacy polling must not synthesize closed for held mail.
         hold_pre_boot_mail(&store, Some(&peer), Some(&peer.agent), &mut messages).unwrap();
         assert_eq!(messages[0].status, "sent");
+        store
+            .append_claim(&ClaimInput {
+                subject: peer.agent.clone(),
+                kind: "runtime.observed".into(),
+                actor: Some("daemon/runtime".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("incarnation_id".into(), json!("current")),
+                    ("runtime_id".into(), json!("fixture-runtime")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(store.native_mail_boot_floor(&peer.agent).unwrap().is_some());
+        hold_pre_boot_mail(&store, Some(&peer), Some(&peer.agent), &mut messages).unwrap();
+        assert_eq!(
+            messages[0].status, "sent",
+            "a boot floor must also preserve held mail"
+        );
         let mut offered = messages.clone();
         crate::fyi::release(&mut offered);
         assert!(offered.is_empty(), "reconnect alone cannot wake the seat");
