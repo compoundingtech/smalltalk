@@ -9,9 +9,11 @@ import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
 import { darkTheme as embraceDarkTheme } from './assistant-ui/embrace-theme'
 import { surfaceVars as surface, textVars as ink, spaceVars as s, typeVars as t, geometryVars as g } from './assistant-ui/composition-tokens.stylex'
 
-interface Row { readonly id: string; readonly chunks: number }
+interface Row { readonly id: string; readonly label: string; readonly chunks: number }
 let stream: (() => void) | undefined
 let resizeComposer: ((lines: number) => void) | undefined
+let acknowledge: (() => void) | undefined
+let estimateRows: ((height: number) => void) | undefined
 const expanders = new Map<string, (open: boolean) => void>()
 function VirtualRow({ row }: { readonly row: Row }) {
   const [open, setOpen] = React.useState(false)
@@ -19,19 +21,26 @@ function VirtualRow({ row }: { readonly row: Row }) {
     expanders.set(row.id, value => flushSync(() => setOpen(value)))
     return () => { expanders.delete(row.id) }
   }, [row.id])
-  return <article {...stylex.props(styles.row)}><p {...stylex.props(styles.text)}>Message {row.id}: measured conversation history preserves the reader's line.{row.chunks > 0 ? '\nA streamed line extends the live reply.'.repeat(row.chunks) : ''}</p>{open && <pre {...stylex.props(styles.text)}>{'An expanded observation above the reader.\n'.repeat(8)}</pre>}</article>
+  return <article {...stylex.props(styles.row)}><p {...stylex.props(styles.text)}>Message {row.label}: measured conversation history preserves the reader's line.{row.chunks > 0 ? '\nA streamed line extends the live reply.'.repeat(row.chunks) : ''}</p>{open && <pre {...stylex.props(styles.text)}>{'An expanded observation above the reader.\n'.repeat(8)}</pre>}</article>
 }
 const renderRow = (row: Row) => <VirtualRow row={row} />
 function VirtualStory({ scheme = 'dark' }: { readonly scheme?: Scheme }) {
   const [chunks, setChunks] = React.useState(0)
   const [lines, setLines] = React.useState(2)
-  const rows = React.useMemo(() => Array.from({ length: 60 }, (_, index) => ({ id: `entry-${index}`, chunks: index === 59 ? chunks : 0 })), [chunks])
+  const [latestKey, setLatestKey] = React.useState('entry-59')
+  const [estimatedHeight, setEstimatedHeight] = React.useState(80)
+  const rows = React.useMemo(() => Array.from({ length: 60 }, (_, index) => {
+    const label = `entry-${index}`
+    return { id: index === 59 ? latestKey : label, label, chunks: index === 59 ? chunks : 0 }
+  }), [chunks, latestKey])
   React.useLayoutEffect(() => {
     stream = () => flushSync(() => setChunks(value => value + 1))
     resizeComposer = value => flushSync(() => setLines(value))
-    return () => { stream = undefined; resizeComposer = undefined }
+    acknowledge = () => flushSync(() => setLatestKey('timeline-entry/ack'))
+    estimateRows = value => flushSync(() => setEstimatedHeight(value))
+    return () => { stream = undefined; resizeComposer = undefined; acknowledge = undefined; estimateRows = undefined }
   }, [])
-  return <main {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' ? lightTheme : embraceDarkTheme)}><section {...stylex.props(styles.frame)}><EmbraceVirtualConversation items={rows} renderItem={renderRow} estimatedRowHeight={80} /></section><form data-follow-composer aria-label="Composer" {...stylex.props(styles.composer)}><textarea aria-label="Message" rows={lines} readOnly value="Draft reply" {...stylex.props(styles.draft)} /></form></main>
+  return <main {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' ? lightTheme : embraceDarkTheme)}><section {...stylex.props(styles.frame)}><EmbraceVirtualConversation items={rows} renderItem={renderRow} estimatedRowHeight={estimatedHeight} /></section><form data-follow-composer aria-label="Composer" {...stylex.props(styles.composer)}><textarea aria-label="Message" rows={lines} readOnly value="Draft reply" {...stylex.props(styles.draft)} /></form></main>
 }
 const meta = { title: 'Fractal UI/Virtual conversation', component: VirtualStory, args: { scheme: 'dark' }, parameters: { layout: 'fullscreen' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof VirtualStory>
 export default meta
@@ -180,6 +189,44 @@ export const MomentumRefollows: Story = { play: async ({ canvasElement }) => { a
 export const MomentumRefollowsLight: Story = { ...MomentumRefollows, args: { scheme: 'light' } }
 export const MomentumStopsShortControl: Story = { play: async ({ canvasElement }) => { await expect(proveMomentum(canvasElement, 60)).rejects.toThrow(/momentum at the virtual end/) } }
 export const MomentumStopsShortControlLight: Story = { ...MomentumStopsShortControl, args: { scheme: 'light' } }
+/** A same-height acknowledgement and non-reader displacement cannot leave an attached lane away from its end. */
+async function proveAckRekey(canvasElement: HTMLElement, readerInput = false) {
+  const { canvas, lane } = await ready(canvasElement)
+  const previous = lane.querySelector<HTMLElement>('[data-embrace-entry-id="entry-59"]')!
+  const text = previous.textContent
+  // Keep newly overscanned rows at their real measured height in this no-size-change path.
+  estimateRows!(Math.ceil(previous.getBoundingClientRect().height))
+  await settle()
+  const height = lane.scrollHeight
+  acknowledge!()
+  await settle()
+  await expect(lane.querySelector('[data-embrace-entry-id="entry-59"]')).toBeNull()
+  await expect(lane.querySelector('[data-embrace-entry-id="timeline-entry/ack"]')?.textContent).toBe(text)
+  await expect(lane.scrollHeight, 'acknowledgement must not resize the virtual content').toBe(height)
+  for (const event of ['scroll', 'scrollend']) {
+    let immediate = Infinity
+    const painted = await paintedAfter(() => {
+      if (readerInput) lane.dispatchEvent(new WheelEvent('wheel', { deltaY: -47, bubbles: true }))
+      lane.scrollTop -= 47
+      lane.dispatchEvent(new Event(event))
+      immediate = gap(lane)
+    }, () => gap(lane))
+    await expect(immediate, `non-reader virtual ${event} displacement must repin synchronously`).toBeLessThanOrEqual(1)
+    await expect(painted, `non-reader virtual ${event} displacement must paint the end`).toBeLessThanOrEqual(1)
+    await expect(lane.scrollHeight).toBe(height)
+    await expect(lane.dataset['followState']).toBe('attached')
+    await expect(canvas.queryByRole('button', { name: pillName })).toBeNull()
+  }
+  const painted = await paintedAfter(() => stream!(), () => gap(lane))
+  await expect(painted, 'virtual streaming after a no-size-change re-key must stay pinned').toBeLessThanOrEqual(1)
+}
+export const AckRekeyKeepsFollowing: Story = { play: async ({ canvasElement }) => { await proveAckRekey(canvasElement) } }
+export const AckRekeyKeepsFollowingLight: Story = { ...AckRekeyKeepsFollowing, args: { scheme: 'light' } }
+export const AckRekeyReaderInputControl: Story = { play: async ({ canvasElement }) => {
+  await expect(proveAckRekey(canvasElement, true)).rejects.toThrow(/non-reader virtual scroll displacement must repin/)
+} }
+export const AckRekeyReaderInputControlLight: Story = { ...AckRekeyReaderInputControl, args: { scheme: 'light' } }
+
 export const AllStates: Story = { render: args => <VirtualStory {...args} /> }
 export const AllStatesLight: Story = { ...AllStates, args: { scheme: 'light' } }
 const styles = stylex.create({
