@@ -140,32 +140,48 @@ mod tests {
     fn historical_backfill_is_bounded_and_reads_leave_partial_state_untouched() {
         let store = Store::open_memory("node").unwrap();
         for n in 0..19 {
-            store.append_claim(&ClaimInput {
-                subject: format!("message/history-{n}"), kind: "message.sent".into(),
-                actor: Some("agent/example/writer".into()),
-                fields: BTreeMap::from([
-                    ("from".into(),json!("agent/example/writer")),
-                    ("to".into(),json!("agent/example/reader")),
-                    ("tags".into(),json!([crate::fyi::FYI_TAG])),
-                ]), evidence: vec![], expected_subject: None, idempotency_key: None,
-            }).unwrap();
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/history-{n}"),
+                    kind: "message.sent".into(),
+                    actor: Some("agent/example/writer".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), json!("agent/example/writer")),
+                        ("to".into(), json!("agent/example/reader")),
+                        ("tags".into(), json!([crate::fyi::FYI_TAG])),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
         }
-        store.connection.batched(|tx| {
-            tx.execute("DELETE FROM coordination_sends", [])?;
-            tx.execute("UPDATE local_coordination_backfill SET cursor=0,ceiling=?1,complete=0", [current_index(tx)?])?;
-            backfill(tx)
-        }).unwrap().unwrap();
-        let partial = store.coordination_counts(0,u64::MAX/2).unwrap();
-        assert_eq!(partial["agent_to_agent"],8);
-        assert_eq!(partial["complete"],false);
-        assert_eq!(store.coordination_counts(0,u64::MAX/2).unwrap(),partial);
+        store
+            .connection
+            .batched(|tx| {
+                tx.execute("DELETE FROM coordination_sends", [])?;
+                tx.execute(
+                    "UPDATE local_coordination_backfill SET cursor=0,ceiling=?1,complete=0",
+                    [current_index(tx)?],
+                )?;
+                backfill(tx)
+            })
+            .unwrap()
+            .unwrap();
+        let partial = store.coordination_counts(0, u64::MAX / 2).unwrap();
+        assert_eq!(partial["agent_to_agent"], 8);
+        assert_eq!(partial["complete"], false);
+        assert_eq!(store.coordination_counts(0, u64::MAX / 2).unwrap(), partial);
         store.connection.batched(backfill).unwrap().unwrap();
-        assert_eq!(store.coordination_counts(0,u64::MAX/2).unwrap()["agent_to_agent"],16);
+        assert_eq!(
+            store.coordination_counts(0, u64::MAX / 2).unwrap()["agent_to_agent"],
+            16
+        );
         store.connection.batched(backfill).unwrap().unwrap();
-        let complete = store.coordination_counts(0,u64::MAX/2).unwrap();
-        assert_eq!(complete["agent_to_agent"],19);
-        assert_eq!(complete["fyi"],19);
-        assert_eq!(complete["complete"],true);
+        let complete = store.coordination_counts(0, u64::MAX / 2).unwrap();
+        assert_eq!(complete["agent_to_agent"], 19);
+        assert_eq!(complete["fyi"], 19);
+        assert_eq!(complete["complete"], true);
     }
 
     #[test]
