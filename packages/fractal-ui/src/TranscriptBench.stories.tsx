@@ -67,6 +67,9 @@ const turnCount = (root: ParentNode) => root.querySelectorAll('[data-testid="tra
 const completeTurnCount = (root: ParentNode) => root.querySelectorAll('[data-testid="user-message"]').length
 /** Resolves once explicit native find mounts every turn, fonts load and two frames paint. */
 async function settled(root: ParentNode, count: number): Promise<void> {
+  // Initial runtime adoption can commit the bounded suffix after the story's first frame.
+  // Wait for that mounted lane before giving its passive native-find listener one frame to attach.
+  while (completeTurnCount(root) === 0) await frame()
   await frame()
   window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true }))
   while (completeTurnCount(root) < count) await frame()
