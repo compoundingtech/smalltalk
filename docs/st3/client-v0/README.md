@@ -34,6 +34,11 @@ The collections socket's `CollectionCommand` and `CollectionFrame` definitions l
 schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
 command/frame definitions, and subscription bound; see [collections](collections.md).
 
+Design proposal: [selected agent details, execution tree and observations](agent-details-design.md)
+describes a bounded, single-snapshot read model for a web client, with retained child summaries,
+owner-routed child transcripts and typed activity/health facts with explicit freshness.
+It is not implemented and does not change the normative schemas or current subscription contract.
+
 ### Mission run timing
 
 `GET /v1/client/missions/{id}` requires `read.projections`, like other projection reads.

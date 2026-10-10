@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Extend the selected-agent details proposal with an execution tree and typed activity and health observations",
+  "replay": {"status": "none", "detail": "Documentation only. No claim admission, replay, or child lifecycle producer changes."},
+  "schema": {"status": "none", "detail": "Execution identities, child inventory, observations, and capabilities are proposed wire sketches. No stored or wire schema or generated client changes."},
+  "rules": {"status": "none", "detail": "Summary and transcript retention horizons remain design questions. No checkpoint rules, retention rules, or upgrade requirements change."},
+  "compatibility": {"status": "none", "detail": "Existing agent details, subagent DTOs, conversations, and subscriptions remain unchanged. The documentation proposes durable finished-child summaries, separately expiring content, owner-routed child follow, Known/Unknown facts, and adapter Support without advertising them as shipped."},
+  "downtime": {"status": "none", "detail": "No runtime change or deployment is required."},
+  "manual": {"status": "none", "detail": "No configuration, state conversion, or client migration is required."},
+  "recovery": {"status": "none", "detail": "No stored state changes or rollback conversion."}
+}
