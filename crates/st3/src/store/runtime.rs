@@ -31,6 +31,8 @@ pub struct SmalltalkRuntime {
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,
     pub(crate) conversation_owner_generation: std::sync::atomic::AtomicU64,
     pub(crate) conversation_owners: Mutex<VecDeque<(u64, Arc<conversation_reads::Owners>)>>,
+    /// Reuse at most one exclusive current writer connection between attempts.
+    pub(super) current_connections: latest_values::CurrentConnections,
     /// Successful register commits bypass the managed graph writer's commit callbacks.
     current_observation_revision: std::sync::atomic::AtomicU64,
     current_observation_kinds: [std::sync::atomic::AtomicU64; CURRENT_VALUE_KINDS.len()],
@@ -167,6 +169,7 @@ impl RosterFallback {
 
 impl SmalltalkRuntime {
     fn forget_cached_views(&self, incremental: bool) {
+        if !incremental { self.current_connections.reset(); }
         #[cfg(any(test, feature = "test-support"))]
         if smallclaims::sqlite::transaction_trace::is_active() {
             crate::performance::record_request("roster/cache-reset", None, std::time::Duration::ZERO);
@@ -446,6 +449,10 @@ impl Runtime for SmalltalkRuntime {
         store: &GraphStore,
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
+        if is_current_input(input) {
+            validate_claim_input(input)?;
+            return latest_values::append_with_connections(store, input, now_ms(), None, Some(&self.current_connections));
+        }
         append_claim_fenced_outcome(store, input, None)
     }
 

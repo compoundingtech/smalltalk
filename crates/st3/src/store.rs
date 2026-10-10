@@ -10993,7 +10993,7 @@ impl Store {
                 input.actor.as_deref(),
             )
             .map_err(|error| St3Error::new(error.code, error.message))?;
-        latest_values::append(&self.graph, input, now_ms(), Some(runtime))
+        latest_values::append_with_connections(&self.graph, input, now_ms(), Some(runtime), Some(&self.smalltalk.current_connections))
     }
 
     /// Append a native driver's observation, as `POST /v1/harness-events` does once it has

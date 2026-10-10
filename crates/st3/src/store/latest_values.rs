@@ -322,20 +322,161 @@ pub fn with_native_current_admission_for_test<T>(native: bool, work: impl FnOnce
 // SQLite admission uses only time remaining in this attempt, reserving a short write.
 // Schema work, validation, mutation and commit share the unchanged 100 ms deadline.
 const CURRENT_WRITE_RESERVE: std::time::Duration = std::time::Duration::from_millis(10);
-const CURRENT_WRITER_WAIT: std::time::Duration =
-    crate::client::LATEST_VALUE_TIMEOUT.saturating_sub(CURRENT_WRITE_RESERVE);
 
-/// Only this fresh connection's progress deadline can interrupt a current transaction.
+/// One exclusive connection per store. Waiting loans contain no SQL job or sample.
+/// The original current-attempt deadline includes checkout and managed admission.
+#[derive(Default)]
+pub(super) struct CurrentConnections {
+    state: Mutex<CurrentConnectionState>,
+    available: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct CurrentConnectionState {
+    idle: Option<(Connection, Option<i64>, String)>,
+    leased: bool,
+    generation: u64,
+    #[cfg(test)]
+    opened: usize,
+}
+
+impl CurrentConnections {
+    pub(super) fn reset(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.generation = state.generation.wrapping_add(1);
+        state.idle = None;
+    }
+
+    fn checkout(&self, path: &Path, deadline: std::time::Instant) -> Result<CurrentConnection<'_>, St3Error> {
+        let result = self.checkout_inner(path, deadline);
+        // A woken waiter can fail before taking the loan; hand availability onward.
+        if result.is_err() { self.available.notify_one(); }
+        result
+    }
+
+    fn checkout_inner(&self, path: &Path, deadline: std::time::Instant) -> Result<CurrentConnection<'_>, St3Error> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        while state.leased {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(St3Error::new("database-busy", "current connection checkout exceeded its remaining bound"));
+            }
+            state = self.available.wait_timeout(state, remaining).unwrap_or_else(PoisonError::into_inner).0;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(St3Error::new("database-busy", "current connection checkout exceeded its remaining bound"));
+        }
+        let (mut connection, mut schema, cached_epoch) = match state.idle.take() {
+            Some((connection, schema, epoch)) => (connection, schema, Some(epoch)),
+            None => {
+                let mut connection = Connection::open_with_flags(path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI).map_err(internal)?;
+                smallclaims::sqlite::observe(&mut connection);
+                connection.busy_timeout(std::time::Duration::ZERO).map_err(internal)?;
+                #[cfg(test)] { state.opened += 1; }
+                (connection, None, None)
+            }
+        };
+        connection.progress_handler(100, Some(move || std::time::Instant::now() >= deadline));
+        let epoch = connection.query_row("SELECT value FROM meta WHERE key='current-value-epoch'", [], |row| row.get::<_, String>(0));
+        connection.progress_handler(0, None::<fn() -> bool>);
+        if std::time::Instant::now() >= deadline {
+            return Err(St3Error::new("current-value-deadline", "the current value exceeded its write deadline"));
+        }
+        let epoch = epoch.map_err(internal)?;
+        if cached_epoch.is_some_and(|old| old != epoch) {
+            drop(connection);
+            connection = Connection::open_with_flags(path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI).map_err(internal)?;
+            smallclaims::sqlite::observe(&mut connection);
+            connection.busy_timeout(std::time::Duration::ZERO).map_err(internal)?;
+            schema = None;
+            #[cfg(test)] { state.opened += 1; }
+        }
+        state.leased = true;
+        Ok(CurrentConnection { pool: self, connection: Some(connection), schema, epoch, generation: state.generation, reusable: false })
+    }
+}
+
+struct CurrentConnection<'a> {
+    pool: &'a CurrentConnections,
+    connection: Option<Connection>,
+    schema: Option<i64>,
+    epoch: String,
+    generation: u64,
+    reusable: bool,
+}
+
+impl Drop for CurrentConnection<'_> {
+    fn drop(&mut self) {
+        let Some(connection) = self.connection.take() else { return; };
+        connection.progress_handler(0, None::<fn() -> bool>);
+        let mut clean = connection.is_autocommit();
+        if !clean {
+            let _ = connection.execute_batch("ROLLBACK");
+            clean = connection.is_autocommit();
+        }
+        // Cached statements may be dormant; no stepped statement or read snapshot can
+        // survive a loan. The connection is exclusively owned during this inspection.
+        // SAFETY: handle and statements belong to this live, exclusively owned connection.
+        let pending = unsafe {
+            let db = connection.handle();
+            let mut statement = rusqlite::ffi::sqlite3_next_stmt(db, std::ptr::null_mut());
+            let mut pending = false;
+            while !statement.is_null() {
+                pending |= rusqlite::ffi::sqlite3_stmt_busy(statement) != 0;
+                statement = rusqlite::ffi::sqlite3_next_stmt(db, statement);
+            }
+            pending
+        };
+        debug_assert!(clean && !pending, "current connection returned with an active transaction or statement");
+        let mut state = self.pool.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.reusable && clean && !pending && state.generation == self.generation {
+            state.idle = Some((connection, self.schema, self.epoch.clone()));
+        } else {
+            drop(connection);
+        }
+        state.leased = false;
+        self.pool.available.notify_one();
+    }
+}
+
+fn pooled_current_transaction<T>(
+    graph: &GraphStore,
+    pool: &CurrentConnections,
+    background: bool,
+    work: impl FnOnce(&Transaction<'_>) -> Result<T, St3Error>,
+) -> Result<T, St3Error> {
+    let deadline = std::time::Instant::now() + crate::client::LATEST_VALUE_TIMEOUT;
+    let mut loan = pool.checkout(&graph.path, deadline - CURRENT_WRITE_RESERVE)?;
+    let result = current_transaction_until(loan.connection.as_mut().unwrap(),
+        Some((&graph.connection, background)), deadline, Some(&mut loan.schema), work);
+    loan.reusable = result.is_ok();
+    result
+}
+
+/// Only this exclusively loaned connection's progress deadline can interrupt a current transaction.
 /// Preserve ownership/protocol errors; do not infer interruption from an error's text.
+#[cfg(test)]
 fn current_transaction<T>(
     connection: &mut Connection,
     writer: Option<(&smallclaims::sqlite::WriterConnection, bool)>,
     work: impl FnOnce(&Transaction<'_>) -> Result<T, St3Error>,
 ) -> Result<T, St3Error> {
+    current_transaction_until(connection, writer,
+        std::time::Instant::now() + crate::client::LATEST_VALUE_TIMEOUT, None, work)
+}
+
+fn current_transaction_until<T>(
+    connection: &mut Connection,
+    writer: Option<(&smallclaims::sqlite::WriterConnection, bool)>,
+    deadline: std::time::Instant,
+    schema: Option<&mut Option<i64>>,
+    work: impl FnOnce(&Transaction<'_>) -> Result<T, St3Error>,
+) -> Result<T, St3Error> {
     use std::sync::atomic::{AtomicBool, Ordering};
     let expired = Arc::new(AtomicBool::new(false));
     let interrupted = expired.clone();
-    let deadline = std::time::Instant::now() + crate::client::LATEST_VALUE_TIMEOUT;
     #[cfg(test)]
     let steps = Arc::new(std::sync::atomic::AtomicU64::new(0));
     #[cfg(test)]
@@ -358,6 +499,13 @@ fn current_transaction<T>(
         }),
     );
     let result = (|| {
+        if let Some(schema) = schema {
+            let cookie: i64 = connection.query_row("PRAGMA schema_version", [], |row| row.get(0)).map_err(internal)?;
+            if *schema != Some(cookie) {
+                connection.flush_prepared_statement_cache();
+                *schema = Some(cookie);
+            }
+        }
         // A fresh SQLite connection loads and parses the database schema on its first
         // table access. Do that before acquiring the write lock, under the same deadline.
         // Preparing without stepping writes nothing and leaves no read transaction open.
@@ -733,20 +881,21 @@ pub(super) fn append(
     now: u128,
     event_runtime: Option<&str>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
+    append_with_connections(graph, input, now, event_runtime, None)
+}
+
+pub(super) fn append_with_connections(
+    graph: &GraphStore,
+    input: &ClaimInput,
+    now: u128,
+    event_runtime: Option<&str>,
+    pool: Option<&CurrentConnections>,
+) -> Result<(ClaimRecord, bool), St3Error> {
     validate_local_observation(input)?;
-    // This connection waits only for bounded admission inside this current attempt. A
-    // longer collision drops it; only a subsequent observation can replace this value.
-    let mut connection = Connection::open_with_flags(
-        &graph.path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(internal)?;
-    smallclaims::sqlite::observe(&mut connection);
-    connection
-        .busy_timeout(CURRENT_WRITER_WAIT)
-        .map_err(internal)?;
+    let uncached = CurrentConnections::default();
+    let pool = pool.unwrap_or(&uncached);
     let mut semantic_changed = false;
-    let result = current_transaction(&mut connection, Some((&graph.connection, false)), |tx| {
+    let result = pooled_current_transaction(graph, pool, false, |tx| {
         // A bound driver announces starting before reconciliation records runtime.running.
         // This hint only permits mailbox startup to wait; it grants no delivery or ready authority.
         if input.fields.get("state").and_then(Value::as_str) != Some("starting") {
@@ -1234,19 +1383,10 @@ impl Store {
                 after: next,
             });
         }
-        let mut connection = Connection::open_with_flags(
-            &self.graph.path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(internal)?;
-        smallclaims::sqlite::observe(&mut connection);
-        connection
-            .busy_timeout(std::time::Duration::ZERO)
-            .map_err(internal)?;
         let (removed, kinds) = if obsolete.is_empty() {
             (0, BTreeSet::new())
         } else {
-            current_transaction(&mut connection, Some((&self.graph.connection, true)), |tx| {
+            pooled_current_transaction(&self.graph, &self.smalltalk.current_connections, true, |tx| {
                 let mut removed = 0;
                 let mut kinds = BTreeSet::new();
                 let mut deleted_subjects = BTreeSet::new();
@@ -1302,7 +1442,7 @@ impl Store {
         let history = match history_work {
             Err(error) => Err(error),
             Ok(None) => Ok(0),
-            Ok(Some(job)) => current_transaction(&mut connection, Some((&self.graph.connection, true)), |tx| {
+            Ok(Some(job)) => pooled_current_transaction(&self.graph, &self.smalltalk.current_connections, true, |tx| {
                 let bounds: Option<(i64, i64)> = tx
                     .query_row(
                         "SELECT cursor,cutoff FROM current_value_retirements
@@ -1431,17 +1571,8 @@ impl Store {
         } else {
             String::new()
         };
-        let mut connection = Connection::open_with_flags(
-            &self.graph.path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-        )
-        .map_err(internal)?;
-        smallclaims::sqlite::observe(&mut connection);
-        connection
-            .busy_timeout(CURRENT_WRITER_WAIT)
-            .map_err(internal)?;
         let mut semantic_changed = false;
-        let changed = current_transaction(&mut connection, Some((&self.graph.connection, false)), |tx| {
+        let changed = pooled_current_transaction(&self.graph, &self.smalltalk.current_connections, false, |tx| {
             let mut incarnation_bound = false;
             if record.kind != "transport.observed" {
                 let owner: Option<String> = tx
@@ -1636,6 +1767,104 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_connection_reuses_only_success_and_sees_schema_and_epoch_changes() {
+        let store = Store::open_memory("node").unwrap();
+        let pool = &store.smalltalk.current_connections;
+        let run = || pooled_current_transaction(&store.graph, pool, false, |_| Ok(()));
+        run().unwrap();
+        run().unwrap();
+        assert_eq!(pool.state.lock().unwrap().opened, 1);
+        let error = pooled_current_transaction::<()>(&store.graph, pool, false, |tx| {
+            tx.execute("INSERT INTO meta VALUES('must-rollback','1')", []).map_err(internal)?;
+            Err(St3Error::new("invalid-current-value", "test refusal"))
+        }).unwrap_err();
+        assert_eq!(error.code, "invalid-current-value");
+        assert!(pool.state.lock().unwrap().idle.is_none());
+        assert_eq!(store.readers.get().query_row("SELECT COUNT(*) FROM meta WHERE key='must-rollback'", [], |r| r.get::<_,usize>(0)).unwrap(), 0);
+        run().unwrap();
+        assert_eq!(pool.state.lock().unwrap().opened, 2);
+        let old_schema = pool.state.lock().unwrap().idle.as_ref().unwrap().1;
+        {
+            let connection = store.connection.write();
+            connection.execute_batch("CREATE TABLE current_schema_probe(value INTEGER); INSERT INTO current_schema_probe VALUES(7);").unwrap();
+        }
+        let value = pooled_current_transaction(&store.graph, pool, false, |tx| {
+            tx.query_row("SELECT value FROM current_schema_probe", [], |r| r.get::<_,i64>(0)).map_err(internal)
+        }).unwrap();
+        assert_eq!(value, 7);
+        assert_ne!(pool.state.lock().unwrap().idle.as_ref().unwrap().1, old_schema);
+        assert_eq!(pool.state.lock().unwrap().opened, 2);
+        store.connection.write().execute("UPDATE meta SET value='changed-test-epoch' WHERE key='current-value-epoch'", []).unwrap();
+        run().unwrap();
+        assert_eq!(pool.state.lock().unwrap().opened, 3);
+        store.graph.runtime.forget_incremental_views();
+        run().unwrap();
+        assert_eq!(pool.state.lock().unwrap().opened, 3);
+        store.graph.runtime.forget_views();
+        run().unwrap();
+        assert_eq!(pool.state.lock().unwrap().opened, 4);
+        // A reset while a connection is checked out cannot repopulate the old generation.
+        let mut loan = pool.checkout(&store.graph.path, std::time::Instant::now()+std::time::Duration::from_secs(1)).unwrap();
+        pool.reset();
+        loan.reusable = true;
+        drop(loan);
+        assert!(pool.state.lock().unwrap().idle.is_none());
+        run().unwrap();
+        assert_eq!(pool.state.lock().unwrap().opened, 5);
+    }
+
+    #[test]
+    fn current_connection_deadline_rolls_back_and_discards_the_loan() {
+        let store = Store::open_memory("node").unwrap();
+        let pool = &store.smalltalk.current_connections;
+        let error = pooled_current_transaction(&store.graph, pool, false, |tx| {
+            tx.execute("INSERT INTO meta VALUES('pooled-timeout','1')", []).map_err(internal)?;
+            tx.query_row("WITH RECURSIVE n(v) AS (VALUES(0) UNION ALL SELECT v+1 FROM n WHERE v<1000000000) SELECT SUM(v) FROM n", [], |r| r.get::<_,i64>(0)).map_err(internal)
+        }).unwrap_err();
+        assert_eq!(error.code, "current-value-deadline");
+        assert!(pool.state.lock().unwrap().idle.is_none());
+        assert!(!pool.state.lock().unwrap().leased);
+        assert_eq!(store.readers.get().query_row("SELECT COUNT(*) FROM meta WHERE key='pooled-timeout'", [], |r| r.get::<_,usize>(0)).unwrap(), 0);
+        pooled_current_transaction(&store.graph, pool, false, |_| Ok(())).unwrap();
+        assert_eq!(pool.state.lock().unwrap().opened, 2);
+    }
+
+    #[test]
+    fn current_connection_burst_is_exclusive_bounded_and_checkout_expires() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let pool = &store.smalltalk.current_connections;
+        let first = pool.checkout(&store.graph.path, std::time::Instant::now()+std::time::Duration::from_secs(1)).unwrap();
+        let contender = store.clone();
+        let refused = std::thread::spawn(move || {
+            contender.smalltalk.current_connections.checkout(&contender.graph.path, std::time::Instant::now()).err().unwrap().code
+        }).join().unwrap();
+        assert_eq!(refused, "database-busy");
+        assert_eq!(pool.state.lock().unwrap().opened, 1);
+        let mut first = first;
+        first.reusable = true;
+        drop(first);
+        let barrier = Arc::new(std::sync::Barrier::new(9));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads = (0..8).map(|_| {
+            let store = store.clone(); let barrier = barrier.clone(); let active = active.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let mut loan = store.smalltalk.current_connections.checkout(&store.graph.path, std::time::Instant::now()+std::time::Duration::from_secs(1)).unwrap();
+                assert_eq!(active.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(loan.connection.as_ref().unwrap().is_autocommit());
+                assert_eq!(active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst), 1);
+                loan.reusable = true;
+            })
+        }).collect::<Vec<_>>();
+        barrier.wait();
+        for thread in threads { thread.join().unwrap(); }
+        assert_eq!(pool.state.lock().unwrap().opened, 1);
+        let before = pool.state.lock().unwrap().opened;
+        store.current_observation_boundary().unwrap();
+        assert_eq!(pool.state.lock().unwrap().opened, before);
+    }
 
     #[test]
     fn diagnostic_native_admission_is_thread_local_and_restored_after_unwind() {
