@@ -71,8 +71,16 @@ resumption condition, causes refusal at this boundary: the incumbent stays runni
 stays open and the published manual change stays pending. Successful validation uses the existing
 native drain, resume and session verification flow. The command works even when the set was published
 without `--rollout`; its default deadline is thirty minutes. `--force-after-deadline` is an
-explicit choice at that command. Ordinary restart, suspend and resume cannot bypass a pending
-manual cutover. If the incumbent exits before an explicit rollout, the changed declaration
+explicit choice at that command. Ordinary restart and suspend cannot bypass a pending manual
+cutover. A suspension taken before publication survives a manual pending launch change, even
+when suspend is still in flight. The seat stays suspended without a launch. Same-host resume
+runs the incumbent declaration on its saved native session and leaves the new declaration
+pending. Explicit rollout refuses with `rollout-suspended` while suspension holds the seat:
+resume first, then request rollout to apply the new declaration through strict native resume.
+An immediate non-manual launch change still ends suspension.
+This refusal keeps a rollout from waking a suspended seat or replacing its saved snapshot.
+
+If the incumbent exits before an explicit rollout, the changed declaration
 remains pending; normal crash recovery cannot apply it. An explicit rollout can resume its
 recorded native binding after positive exit evidence, with the same declaration and incarnation
 fences. An absent binding or unknown exit remains a refusal. A newly added seat starts normally.
