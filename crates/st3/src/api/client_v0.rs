@@ -12144,7 +12144,6 @@ mission "queue-parity" state="ready" {
         let _ = list(false).await;
         tokio::time::timeout(Duration::from_secs(5), published.wait_for(publishes(working)))
             .await.expect("the refresher publishes the asked-for cut").unwrap();
-        let _admission = state.store.admit_agent_resources().await;
 
         // Unchanged: plain reads during the pause answer from the publication and do not cut it
         // short, however many ask.
@@ -12161,6 +12160,9 @@ mission "queue-parity" state="ready" {
         );
 
         // A healthy attempt is already in flight; a fresh read must wait for its result.
+        let _admission = state.store.admit_agent_resources().await;
+        let idle = append(json!({"state":"idle", "driver":"codex", "incarnation_id":"one",
+            "observed_at_ms":2}));
         let store = state.store.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();

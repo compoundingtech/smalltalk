@@ -23952,7 +23952,10 @@ mission "wake" state="ready" {
                     _ = &mut request => panic!("an unpublished mode answered before its bounded wait"),
                     _ = tokio::time::sleep(AGENT_ROSTER_READ_WAIT - Duration::from_millis(1)) => {}
                 }
-                let error = request.await.err().expect("an unpublished mode must return 503");
+                let error = match request.await {
+                    Ok(_) => panic!("an unpublished mode must return 503"),
+                    Err(error) => error,
+                };
                 assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
                 assert_eq!(error.code, "agent-roster-not-ready");
                 assert_eq!(started.elapsed(), AGENT_ROSTER_READ_WAIT);
