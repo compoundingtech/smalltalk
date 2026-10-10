@@ -380,14 +380,14 @@ mod tests {
         Attention {
             id: id.into(),
             tier: Tier::Stopped,
-            title: "agent/fleet/atlas is waiting for a permission".into(),
+            title: "agent/example/atlas is waiting for a permission".into(),
             waiting: None,
             age: "1m".into(),
             mission: None,
-            agent: Some("agent/fleet/atlas".into()),
+            agent: Some("agent/example/atlas".into()),
             kind: AttentionKind::Prompt {
                 seat: "atlas".into(),
-                seat_id: "agent/fleet/atlas".into(),
+                seat_id: "agent/example/atlas".into(),
                 text: "Claude asks to use Bash".into(),
                 answers: answers.iter().map(|answer| (*answer).to_owned()).collect(),
                 episode: "episode-1".into(),
@@ -400,7 +400,7 @@ mod tests {
             related: vec![],
             raised_by: None,
             blocked: None,
-            conversations: vec!["agent/fleet/atlas".into()],
+            conversations: vec!["agent/example/atlas".into()],
         }
     }
 
@@ -444,24 +444,24 @@ mod tests {
     #[test]
     fn nothing_waiting_shows_no_band() {
         let ui = with_alerts(vec![]);
-        assert!(ui.alert_band("agent/fleet/atlas", 80).is_empty());
+        assert!(ui.alert_band("agent/example/atlas", 80).is_empty());
     }
 
     #[test]
     fn an_alert_shows_only_in_the_conversation_it_belongs_to() {
         let ui = with_alerts(vec![prompt("attention/one", &["allow", "deny"])]);
-        assert!(!ui.alert_band("agent/fleet/atlas", 80).is_empty());
-        assert!(ui.alert_band("agent/fleet/other", 80).is_empty());
+        assert!(!ui.alert_band("agent/example/atlas", 80).is_empty());
+        assert!(ui.alert_band("agent/example/other", 80).is_empty());
     }
 
     #[test]
     fn a_pending_claude_call_is_shown_in_full_beside_allow_and_deny() {
         let mut ui = with_alerts(vec![prompt("attention/one", &["allow", "deny"])]);
         ui.world.conversations.insert(
-            "agent/fleet/atlas".into(),
+            "agent/example/atlas".into(),
             Load::Ready(vec![running_call("Bash · rm -rf build/cache")]),
         );
-        let rows = ui.alert_band("agent/fleet/atlas", 80);
+        let rows = ui.alert_band("agent/example/atlas", 80);
         let shown = texts(&rows);
         assert!(shown.contains("1 alert"), "{shown}");
         assert!(shown.contains("rm -rf build/cache"), "{shown}");
@@ -480,7 +480,7 @@ mod tests {
     fn allow_is_withheld_when_the_call_cannot_be_shown() {
         let mut ui = with_alerts(vec![prompt("attention/one", &["allow", "deny"])]);
         // No call in the conversation yet.
-        let taps_without = taps(&ui.alert_band("agent/fleet/atlas", 80));
+        let taps_without = taps(&ui.alert_band("agent/example/atlas", 80));
         assert!(!taps_without.contains(&Hit::Alert(
             "attention/one".into(),
             AlertTap::Answer("allow".into())
@@ -492,10 +492,10 @@ mod tests {
         // A call too long to read in full is not allowed from here either.
         let long = format!("Bash · {}", "word ".repeat(200));
         ui.world.conversations.insert(
-            "agent/fleet/atlas".into(),
+            "agent/example/atlas".into(),
             Load::Ready(vec![running_call(&long)]),
         );
-        let rows = ui.alert_band("agent/fleet/atlas", 60);
+        let rows = ui.alert_band("agent/example/atlas", 60);
         assert!(!taps(&rows).contains(&Hit::Alert(
             "attention/one".into(),
             AlertTap::Answer("allow".into())
@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn another_harnesss_prompt_is_answered_in_the_terminal() {
         let ui = with_alerts(vec![prompt("attention/one", &[])]);
-        let rows = ui.alert_band("agent/fleet/atlas", 80);
+        let rows = ui.alert_band("agent/example/atlas", 80);
         let shown = texts(&rows);
         assert!(shown.contains("answer it in the terminal"), "{shown}");
         assert_eq!(
@@ -530,7 +530,7 @@ mod tests {
             body: "hi".into(),
         };
         let ui = with_alerts(vec![update, message]);
-        assert!(ui.alert_band("agent/fleet/atlas", 80).is_empty());
+        assert!(ui.alert_band("agent/example/atlas", 80).is_empty());
     }
 
     #[test]
@@ -540,7 +540,7 @@ mod tests {
             prompt("attention/b", &[]),
             prompt("attention/c", &[]),
         ]);
-        let shown = texts(&ui.alert_band("agent/fleet/atlas", 80));
+        let shown = texts(&ui.alert_band("agent/example/atlas", 80));
         assert!(shown.contains("3 alerts"), "{shown}");
         assert!(shown.contains("+1 more in Now"), "{shown}");
     }
