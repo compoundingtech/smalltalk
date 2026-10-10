@@ -2922,6 +2922,11 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
     };
     field(&mut doc, "harness", Some(agent.harness.name()));
     field(&mut doc, "model", details.model.as_deref());
+    // Beside the model, only when the seat is configured with one: an unset effort is the
+    // harness's own default, which is not worth a row of "unknown".
+    if let Some(effort) = details.effort.as_deref() {
+        field(&mut doc, "effort", Some(effort));
+    }
     field(&mut doc, "state", details.harness_state.as_deref());
     field(&mut doc, "runtime", details.runtime.as_deref());
     field(&mut doc, "host", Some(&agent.host));

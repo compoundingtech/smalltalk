@@ -366,6 +366,8 @@ pub struct AgentDetails {
     pub under: Option<String>,
     /// The model its harness last reported using, as reported ("claude-sonnet-5-5").
     pub model: Option<String>,
+    /// The effort level its seat is configured to run at ("high"), when it names one.
+    pub effort: Option<String>,
     /// What the step it holds last reported (`st work progress`): the status a person reads first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<String>,

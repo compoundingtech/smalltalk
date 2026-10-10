@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "stui's agent details sidebar shows the seat's configured effort level beside its model",
+  "replay": {"status": "none", "detail": "No replay, backfill, stored data or transcript change."},
+  "schema": {"status": "none", "detail": "No schema, operation or contract digest change. stui reads the effort field the client gateway already serves on an agent."},
+  "rules": {"status": "none", "detail": "No claim, checkpoint, retention or authority rule change."},
+  "compatibility": {"status": "none", "detail": "A daemon that does not serve effort shows no row. The shared demo-world fixture gains the details effort field."},
+  "downtime": {"status": "none", "detail": "Client-only change; no deployment ordering."},
+  "manual": {"status": "none", "detail": "No manual action."},
+  "recovery": {"status": "none", "detail": "No recovery, durable payload or initialization changes."}
+}
