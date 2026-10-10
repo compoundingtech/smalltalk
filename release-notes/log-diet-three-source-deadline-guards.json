@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Bound diagnostic checkout, Nix setup actions and retention by the original phase deadlines",
+  "replay": {
+    "status": "none",
+    "detail": "No replay implementation change; the original test oracles remain unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim rules or authority change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Qualification-only automation on the frozen main snapshot; ordinary Performance events retain their existing path."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No production runtime or deployment change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Source preparation does not authorize dispatch; a separately reviewed immutable execution assignment is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Incomplete setup, inventory, diagnostics, output or cleanup stops remaining arms and preserves initial outcomes; no automatic retry."
+  }
+}

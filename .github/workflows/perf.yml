@@ -90,9 +90,61 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as f:
               f.write('LOG_DIET_ROOT=' + str(root) + '\nLOG_DIET_DEADLINE=' + str(root / 'deadline.json') + '\n')
           PYBOOT
+      - id: admit_setup_0
+        name: Admit setup action 0 within the first-step deadline
+        timeout-minutes: 1
+        run: |
+          python3 - <<'PYSETUP'
+          import json, os, time, math, hashlib
+          from pathlib import Path
+          r = json.loads(Path(os.environ['LOG_DIET_DEADLINE']).read_text())
+          keys = ('ST_AGENT','ST3_SUBJECT','GITHUB_ACTIONS','GITHUB_EVENT_NAME','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_JOB','RUNNER_NAME')
+          identity = {k: os.environ.get(k) for k in keys}
+          now = time.monotonic()
+          if r.get('identity') != identity or r.get('boot_sha256') != hashlib.sha256(Path('/proc/sys/kernel/random/boot_id').read_bytes()).hexdigest():
+              raise SystemExit('setup identity mismatch')
+          for key in ('start','setup_end','cutoff','upload_end'):
+              v = r.get(key)
+              if isinstance(v, bool) or not isinstance(v, (int,float)) or not math.isfinite(v) or v < 0:
+                  raise SystemExit('malformed setup deadline')
+          if (r['setup_end'],r['cutoff'],r['upload_end']) != (r['start']+600,r['start']+6000,r['start']+6900) or not r['start'] <= now < r['setup_end']:
+              raise SystemExit('expired/future/reset setup deadline')
+          minutes = int((r['setup_end'] - now - 60) // 60)
+          if minutes < 1:
+              raise SystemExit('insufficient setup action budget')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write('minutes=' + str(minutes) + '\n')
+          PYSETUP
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+        if: success() && steps.admit_setup_0.outputs.minutes != ''
+        timeout-minutes: ${{ fromJSON(steps.admit_setup_0.outputs.minutes) }}
+      - id: admit_setup_1
+        name: Admit setup action 1 within the first-step deadline
+        timeout-minutes: 1
+        run: |
+          python3 - <<'PYSETUP'
+          import json, os, time, math, hashlib
+          from pathlib import Path
+          r = json.loads(Path(os.environ['LOG_DIET_DEADLINE']).read_text())
+          keys = ('ST_AGENT','ST3_SUBJECT','GITHUB_ACTIONS','GITHUB_EVENT_NAME','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_JOB','RUNNER_NAME')
+          identity = {k: os.environ.get(k) for k in keys}
+          now = time.monotonic()
+          if r.get('identity') != identity or r.get('boot_sha256') != hashlib.sha256(Path('/proc/sys/kernel/random/boot_id').read_bytes()).hexdigest():
+              raise SystemExit('setup identity mismatch')
+          for key in ('start','setup_end','cutoff','upload_end'):
+              v = r.get(key)
+              if isinstance(v, bool) or not isinstance(v, (int,float)) or not math.isfinite(v) or v < 0:
+                  raise SystemExit('malformed setup deadline')
+          if (r['setup_end'],r['cutoff'],r['upload_end']) != (r['start']+600,r['start']+6000,r['start']+6900) or not r['start'] <= now < r['setup_end']:
+              raise SystemExit('expired/future/reset setup deadline')
+          minutes = int((r['setup_end'] - now - 60) // 60)
+          if minutes < 1:
+              raise SystemExit('insufficient setup action budget')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write('minutes=' + str(minutes) + '\n')
+          PYSETUP
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -105,6 +157,8 @@ jobs:
             extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
             access-tokens = github.com=${{ github.token }}
           summarize: true
+        if: success() && steps.admit_setup_1.outputs.minutes != ''
+        timeout-minutes: ${{ fromJSON(steps.admit_setup_1.outputs.minutes) }}
       - name: Full generation, actionlint and three original cases under shared deadlines
         run: python3 scripts/ci-log-diet-study.py study --repo "$GITHUB_WORKSPACE" --root "$LOG_DIET_ROOT" --deadline "$LOG_DIET_DEADLINE" --assignment "$LOG_DIET_ASSIGNMENT"
       - id: retain

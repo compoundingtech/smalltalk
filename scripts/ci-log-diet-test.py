@@ -233,16 +233,139 @@ class Control(unittest.TestCase):
         for lines in ('', json.dumps(row)+'\n'+json.dumps(row), json.dumps(dict(row, features=[]))):
             with self.assertRaises(ValueError): a.artifact(lines, m)
 
+    def retention_caller(self, mode='complete', now=100):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); record = self.record(0); c.write_json(root/'deadline.json',record)
+            (root/'negative.txt').write_text('original FAIL retained')
+            (root/'sources').mkdir(); (root/'sources/excluded.txt').write_text('never hashed')
+            args = argparse.Namespace(root=tmp,deadline=str(root/'deadline.json'))
+            ticks = [now]; commands = []
+            class FakeRunner:
+                def __init__(self, output, clock): self.commands = commands
+                def interrupt(self, *args): pass
+                def run(self, label, argv, cwd, active, end):
+                    commands.append({'label':label,'argv':argv,'active':active,'end':end})
+                    assert label=='retention-worker' and argv[2]=='retain-worker'
+                    assert float(argv[-1])==active and end<=record['upload_end']-90
+                    if mode=='complete':
+                        s.retain_worker(argparse.Namespace(root=tmp,deadline=args.deadline,retain_end=active),lambda:ticks[0])
+                    elif mode=='slow':
+                        original=s.c.sha
+                        def slow_hash(path): ticks[0]=active+1; return original(path)
+                        with patch.object(s.c,'sha',side_effect=slow_hash):
+                            with self_outer.assertRaises(ValueError):
+                                s.retain_worker(argparse.Namespace(root=tmp,deadline=args.deadline,retain_end=active),lambda:ticks[0])
+                    else:
+                        (root/'artifact-manifest.partial.jsonl').write_text('partial prior bytes\n')
+                        ticks[0]=end
+                    return {'exit':0 if mode=='complete' else 1,'timed_out':mode=='blocked',
+                            'cancelled':mode=='cancel','cleanup_confirmed':mode!='cleanup', 'output_complete':True}
+            self_outer=self
+            with patch.object(s.c,'hosted',return_value=IDENTITY),patch.object(s.signal,'signal'), \
+                    patch.dict(os.environ,{'GITHUB_OUTPUT':str(root/'output')}):
+                code=s.retain(args,FakeRunner,lambda:ticks[0])
+            return code,c.load(root/'retention-result.json'),commands,(root/'output').read_text(), \
+                   (root/'negative.txt').read_text(), c.load(root/'artifact-manifest.json') if (root/'artifact-manifest.json').exists() else None
+
     def test_upload_expired_crossrun_and_negative_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); record = self.record(0); c.write_json(root/'deadline.json', record)
-            args = argparse.Namespace(root=tmp, deadline=str(root/'deadline.json'))
-            with patch.object(s.c,'hosted',return_value=IDENTITY), patch.object(s.time,'monotonic',return_value=6900):
-                with self.assertRaises(ValueError): s.retain(args)
-            with patch.object(s.c,'hosted',return_value=dict(IDENTITY,GITHUB_RUN_ID='other')), patch.object(s.time,'monotonic',return_value=100):
-                with self.assertRaises(ValueError): s.retain(args)
-            with patch.object(s.c,'hosted',return_value=IDENTITY), patch.object(s.time,'monotonic',return_value=100): s.retain(args)
-            self.assertEqual(c.load(root/'artifact-manifest.json')['terminal_status'], 'NOT_QUALIFIED')
+            root=Path(tmp);c.write_json(root/'deadline.json',self.record(0))
+            args=argparse.Namespace(root=tmp,deadline=str(root/'deadline.json'))
+            for identity,now in [(IDENTITY,6900),(dict(IDENTITY,GITHUB_RUN_ID='other'),100)]:
+                with patch.object(s.c,'hosted',return_value=identity):
+                    with self.assertRaises(ValueError): s.retain(args,clock=lambda:now)
+        code,report,commands,output,negative,manifest=self.retention_caller()
+        self.assertEqual(code,0);self.assertTrue(report['retention_complete'])
+        self.assertEqual(manifest['terminal_status'],'NOT_QUALIFIED')
+        self.assertNotIn('sources/excluded.txt',[r['path'] for r in manifest['files']])
+        self.assertEqual(negative,'original FAIL retained');self.assertIn('upload_minutes=',output)
+
+    def test_retention_blocked_slow_cancel_cleanup_preserves_incomplete(self):
+        for mode in ('blocked','slow','cancel','cleanup'):
+            code,report,commands,output,negative,manifest=self.retention_caller(mode)
+            self.assertEqual(code,1);self.assertFalse(report['retention_complete'])
+            self.assertEqual(report['status'],'INCOMPLETE');self.assertIsNone(manifest)
+            self.assertEqual(negative,'original FAIL retained');self.assertIn('upload_minutes=',output)
+            self.assertEqual(len(commands),1)
+
+    def test_actual_retention_supervisor_stops_blocked_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);c.write_json(root/'deadline.json',self.record(0))
+            args=argparse.Namespace(root=tmp,deadline=str(root/'deadline.json'))
+            ticks=[100];proc=Mock(pid=4242)
+            # No real child. The mocked hash process remains running past the
+            # parent's fixed active deadline; the actual Runner sends TERM.
+            def blocked_poll():ticks[0]=401;return None
+            proc.poll.side_effect=blocked_poll;proc.wait.return_value=143
+            with patch.object(s.c,'hosted',return_value=IDENTITY),patch.object(s.signal,'signal'), \
+                 patch.object(s.c.subprocess,'Popen',return_value=proc) as popen, \
+                 patch.object(s.c.os,'pidfd_open',return_value=999),patch.object(s.c.os,'close'), \
+                 patch.object(s.c.os,'killpg') as kill,patch.object(s.c,'cleanup',return_value=True), \
+                 patch.dict(os.environ,{'GITHUB_OUTPUT':str(root/'out')}):
+                code=s.retain(args,clock=lambda:ticks[0])
+            self.assertEqual(code,1);kill.assert_called_once_with(4242,s.c.signal.SIGTERM)
+            self.assertEqual(popen.call_count,1)
+            report=c.load(root/'retention-result.json')
+            self.assertEqual(report['active_deadline'],400)
+            self.assertTrue(report['process']['timed_out']);self.assertFalse(report['retention_complete'])
+            self.assertEqual(report['upload_deadline'],6900)
+            self.assertIn('upload_minutes=',(root/'out').read_text())
+
+    def test_retention_fixed_end_no_reset_late_upload(self):
+        code,report,commands,output,negative,manifest=self.retention_caller('blocked',now=6750)
+        self.assertEqual(commands[0]['active'],6780);self.assertEqual(commands[0]['end'],6810)
+        self.assertEqual(report['upload_deadline'],6900);self.assertEqual(output,'upload_minutes=1\n')
+        with self.assertRaises(ValueError):self.retention_caller(now=6780)
+
+    def setup_action(self, elapsed, reset=False):
+        import re,textwrap
+        workflow=(Path(__file__).resolve().parents[1]/'.github/workflows/perf.yml').read_text()
+        # Execute ONLY the inline admission scalar control extracted from the
+        # actual generated workflow, with synthetic clock/environment/files.
+        blocks=re.findall(r"python3 - <<'PYSETUP'\n(.*?)\n\s*PYSETUP",workflow,re.S)
+        self.assertEqual(len(blocks),2)
+        guard=textwrap.dedent(blocks[0])
+        for index in (0,1):
+            self.assertIn('${{ fromJSON(steps.admit_setup_'+str(index)+'.outputs.minutes) }}',workflow)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            bootstrap=textwrap.dedent(re.search(r"python3 - <<'PYBOOT'\n(.*?)\n\s*PYBOOT",workflow,re.S)[1])
+            env={k:v for k,v in IDENTITY.items() if v is not None};env.update(RUNNER_TEMP=tmp,GITHUB_ENV=str(root/'env'),GITHUB_OUTPUT=str(root/'out'))
+            with patch.dict(os.environ,env,clear=True),patch.object(s.time,'monotonic',return_value=0):
+                exec(compile(bootstrap,'actual-generated-first-step','exec'),{})
+            additions=dict(line.split('=',1) for line in (root/'env').read_text().splitlines())
+            self.assertEqual(set(additions),{'LOG_DIET_ROOT','LOG_DIET_DEADLINE'})
+            record=c.load(additions['LOG_DIET_DEADLINE'])
+            self.assertEqual((record['setup_end'],record['cutoff'],record['upload_end']),(600,6000,6900))
+            if reset:
+                record['setup_end']+=1
+                Path(additions['LOG_DIET_DEADLINE']).write_text(json.dumps(record))
+            env.update(additions)
+            with patch.dict(os.environ,env,clear=True),patch.object(s.time,'monotonic',return_value=elapsed):
+                exec(compile(guard,'actual-generated-setup-admission','exec'),{})
+            return (root/'out').read_text()
+
+    def test_actual_checkout_and_install_slow_preparation_budget(self):
+        self.assertEqual(self.setup_action(0),'minutes=9\n')
+        self.assertEqual(self.setup_action(360),'minutes=3\n')
+        # The second admission consumes the original first-step budget, never
+        # starts a new 600-second clock after checkout.
+        self.assertEqual(self.setup_action(479),'minutes=1\n')
+
+    def test_actual_checkout_and_install_expired_insufficient_reset_refuse(self):
+        for elapsed in (481,600,601,-1):
+            with self.assertRaises(SystemExit):self.setup_action(elapsed)
+        with self.assertRaises(SystemExit):self.setup_action(10,reset=True)
+
+    def test_actual_workflow_slow_checkout_install_never_reset_setup(self):
+        # Same extracted inline guard supplies the actual action timeout. A
+        # slow checkout leaving <120s refuses the next Install Nix action.
+        self.assertEqual(self.setup_action(0),'minutes=9\n')
+        with self.assertRaises(SystemExit):self.setup_action(540)
+        # Slow installation reaching the original boundary starts no arm.
+        code,report,commands,windows=self.caller(setup_time=600)
+        self.assertEqual(code,1);self.assertEqual(windows,[])
+        self.assertEqual(report['status'],'NOT_QUALIFIED')
 
     def test_malformed_and_crosshost_deadline_refuse(self):
         for change in ({'start':True},{'cutoff':'6000'},{'upload_end':float('inf')},{'boot_sha256':'other-host'}):

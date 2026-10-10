@@ -2,6 +2,7 @@
 """Hosted-only three-source controller. Local imports and pure controls launch nothing."""
 import argparse
 import importlib.util
+import math
 import os
 from pathlib import Path
 import re
@@ -125,38 +126,89 @@ def study(args, runner_factory=c.Runner, clock=time.monotonic, prepare=prepare_a
     return 0 if report['status'] == 'COMPLETE' else 1
 
 
-def retain(args):
-    root = Path(args.root); r = c.load(args.deadline)
-    # Upload has its own fixed reserve, never a reset work clock or a success substitution.
-    if r.get('identity') != c.hosted() or time.monotonic() >= r.get('upload_end', 0):
-        raise ValueError('expired/cross-run upload reserve')
-    if (root / 'terminal.json').exists():
-        terminal = c.load(root / 'terminal.json')
-    else:
-        terminal = {'status': 'NOT_QUALIFIED', 'reason': 'controller did not reach terminal'}
-        c.write_json(root / 'terminal.json', terminal)
+def upload_record(args, clock):
+    r = c.load(args.deadline)
+    now = clock()
+    # Validate immutable identity and all phase offsets without pretending the
+    # work cutoff is also the upload cutoff.
+    c.deadline(r, c.hosted(), r['start'])
+    if not math.isfinite(now) or now < r['start'] or now >= r['upload_end']:
+        raise ValueError('expired/future upload reserve')
+    return r
+
+
+def retain_worker(args, clock=time.monotonic):
+    root = Path(args.root); r = upload_record(args, clock)
+    end = min(r['upload_end'] - 120, args.retain_end)
+    if clock() >= end: raise ValueError('retention deadline expired')
     rows = []
-    for path in sorted(root.rglob('*')):
-        if path.is_symlink():
-            continue  # Never dereference a fixture link to host/credential data.
-        if path.is_file() and not path.is_relative_to(root / 'sources'):
-            rows.append({'path': str(path.relative_to(root)), 'bytes': path.stat().st_size, 'sha256': c.sha(path)})
-    if time.monotonic() >= r['upload_end']: raise ValueError('upload reserve consumed by retention')
-    minutes = min(15, int((r['upload_end'] - time.monotonic()) // 60))
-    if minutes < 1: raise ValueError('insufficient whole-minute upload reserve')
-    if os.environ.get('GITHUB_OUTPUT'):
-        with open(os.environ['GITHUB_OUTPUT'], 'a') as f: f.write('upload_minutes=' + str(minutes) + '\n')
-    c.write_json(root / 'artifact-manifest.json', {'files': rows, 'terminal_status': terminal['status'],
-                                                 'upload_deadline': r['upload_end']})
+    # Prune source/build trees BEFORE descending. A blocked stat/read/hash is
+    # stopped by the outer owned-process supervisor, not only by these checks.
+    with (root / 'artifact-manifest.partial.jsonl').open('x') as progress:
+        for directory, dirs, files in os.walk(root, followlinks=False):
+            if clock() >= end: raise ValueError('retention deadline expired')
+            base = Path(directory)
+            dirs[:] = sorted(d for d in dirs if not (base/d).is_symlink() and base/d != root/'sources')
+            for name in sorted(files):
+                if name.startswith(('artifact-manifest', 'retention-')): continue
+                path = base / name
+                if clock() >= end: raise ValueError('retention deadline expired')
+                if path.is_symlink() or not path.is_file(): continue
+                row = {'path': str(path.relative_to(root)), 'bytes': path.stat().st_size, 'sha256': c.sha(path)}
+                if clock() >= end: raise ValueError('retention hash crossed deadline')
+                rows.append(row); progress.write(__import__('json').dumps(row) + '\n'); progress.flush()
+        c.write_json(root / 'artifact-manifest.json', {'files': rows,
+                     'terminal_status': c.load(root / 'terminal.json')['status'],
+                     'scan_complete': True, 'upload_deadline': r['upload_end']})
+
+
+def retain(args, runner_factory=c.Runner, clock=time.monotonic):
+    root = Path(args.root); r = upload_record(args, clock)
+    if not (root / 'terminal.json').exists():
+        c.write_json(root / 'terminal.json', {'status': 'NOT_QUALIFIED', 'reason': 'controller did not reach terminal'})
+    # At most 300 seconds to hash; 30 seconds to terminate/reap this child;
+    # leave at least 90 seconds for the remaining minute-bounded upload.
+    active = min(clock() + 300, r['upload_end'] - 120)
+    end = min(active + 30, r['upload_end'] - 90)
+    if clock() >= active: raise ValueError('insufficient retention plus upload reserve')
+    runner = runner_factory(root, clock)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP): signal.signal(sig, runner.interrupt)
+    report = {'retention_complete': False, 'status': 'INCOMPLETE', 'upload_deadline': r['upload_end'],
+              'active_deadline': active, 'cleanup_deadline': end, 'partial_preserved': True}
+    try:
+        row = runner.run('retention-worker', [sys.executable, str(Path(__file__).resolve()), 'retain-worker',
+                         '--root', str(root), '--deadline', str(args.deadline), '--retain-end', str(active)],
+                         Path(__file__).resolve().parent, active, end)
+        report['process'] = row
+        complete = (row['exit'] == 0 and not row['timed_out'] and not row['cancelled'] and
+                    row['cleanup_confirmed'] and row['output_complete'] and (root/'artifact-manifest.json').exists())
+        report['retention_complete'] = complete
+        report['cleanup_confirmed'] = row['cleanup_confirmed']
+        report['status'] = 'COMPLETE' if complete else 'INCOMPLETE'
+    except BaseException as exc:
+        report['refusal_type'] = type(exc).__name__
+        report['cleanup_confirmed'] = c.cleanup(end)
+    finally:
+        report['commands'] = runner.commands
+        # Original negative/incomplete receipts and partial manifest remain in
+        # place. Never turn interruption into COMPLETE or discard those bytes.
+        c.write_json(root / 'retention-result.json', report)
+        minutes = min(15, int((r['upload_end'] - clock()) // 60))
+        if minutes >= 1 and os.environ.get('GITHUB_OUTPUT'):
+            with open(os.environ['GITHUB_OUTPUT'], 'a') as f: f.write('upload_minutes=' + str(minutes) + '\n')
+    return 0 if report['retention_complete'] else 1
 
 
 def main():
-    p = argparse.ArgumentParser(); p.add_argument('mode', choices=['study','retain'])
+    p = argparse.ArgumentParser(); p.add_argument('mode', choices=['study','retain','retain-worker'])
     p.add_argument('--repo', default='.'); p.add_argument('--root', required=True)
     p.add_argument('--deadline', required=True); p.add_argument('--assignment', default='')
+    p.add_argument('--retain-end', type=float, default=0)
     args = p.parse_args()
-    if args.mode == 'retain': retain(args); return 0
-    c.subreaper(); return study(args)
+    if args.mode == 'retain-worker': retain_worker(args); return 0
+    c.subreaper()
+    if args.mode == 'retain': return retain(args)
+    return study(args)
 
 
 if __name__ == '__main__': raise SystemExit(main())

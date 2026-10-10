@@ -6,13 +6,13 @@
   "files": [
     {
       "path": ".github/workflows/perf.yml",
-      "bytes": 9765,
-      "sha256": "fb26c5e659b7991e98dde2777a1380b156a1890fc517831d72b8965ffe757aad"
+      "bytes": 13137,
+      "sha256": "9e3e9a422a5d72d9d78c27e19f9543d2411d2d847e9dbe3df4ccda78c57fa2db"
     },
     {
       "path": ".github/workflows/perf.yml.genie.ts",
-      "bytes": 9250,
-      "sha256": "f24eb0d9e274ad340810394469e3eace575b5e188fdf825a9967a2a98d6b8ac9"
+      "bytes": 11043,
+      "sha256": "d1a8fbb235625fe44fb3abb6ee74cca33d8a292818703067e9e58d15d02600e9"
     },
     {
       "path": "scripts/ci-log-diet-actionlint.py",
@@ -21,8 +21,8 @@
     },
     {
       "path": "scripts/ci-log-diet-arm.py",
-      "bytes": 8407,
-      "sha256": "430ccc73fdc6e7a89ff174335fe5807a41eb967c2116a8ea4cd32a5e0e76b6b7"
+      "bytes": 8619,
+      "sha256": "ac0b612eb01cf5bb3af37c54460264f42e4e550e5321429c2db9b35d9e2e3fa4"
     },
     {
       "path": "scripts/ci-log-diet-common.py",
@@ -31,13 +31,13 @@
     },
     {
       "path": "scripts/ci-log-diet-study.py",
-      "bytes": 10106,
-      "sha256": "7f2572ee50fe718335f7d94b3e27b822bd52859bf24f9d097016bb4eb5c9d925"
+      "bytes": 13153,
+      "sha256": "00e8bd8b4e4a65eb774224d061933d32fd68de71eba7e55fcf8287e34a1c9d84"
     },
     {
       "path": "scripts/ci-log-diet-test.py",
-      "bytes": 19538,
-      "sha256": "5f7afe66be2684a43d293a447413ca2e54e5dbd9be84e04e069ae20536d13c9c"
+      "bytes": 27817,
+      "sha256": "722736d4360bd14e9c6e6557d269bcfe99dab40e46c74bb4cdffd599ea68230c"
     },
     {
       "path": "data/log-diet-three-source/actionlint.yaml",
@@ -78,6 +78,11 @@
       "path": "release-notes/log-diet-three-source-diagnostic.json",
       "bytes": 1131,
       "sha256": "a0dd23d5bfdea25fda0eaf620956c2507a79d5c69905bf6c7ffdc430bd29d4e3"
+    },
+    {
+      "path": "release-notes/log-diet-three-source-deadline-guards.json",
+      "bytes": 1081,
+      "sha256": "8b41fecfa3e95dbb78f87be8a29417ca1a22a409be2aafa671120dfbb2cea11a"
     }
   ],
   "manifest_self_hash_excluded": true,
@@ -95,5 +100,9 @@
     "job": 7200
   },
   "known_source_correction": "Frozen flakes have devShells.default and devShells.genie, not #ci. Source pins unchanged.",
-  "snapshot_not_live_main": true
+  "snapshot_not_live_main": true,
+  "deadline_correction_review_request": "message/cc84016babefca14",
+  "setup_actions": "Actual checkout and Install Nix each require immutable first-step admission; minute timeout floors remaining setup minus60s dispatch/return margin; insufficient/future/reset/cross-identity refuse. Subsequent controller refuses phase overrun.",
+  "retention": "Owned hashing child, fixed upload_end; active=min(now+300,upload_end-120), cleanup<=upload_end-90; partial JSONL and explicit INCOMPLETE retained on interruption. No reset/retry.",
+  "metadata_scope": "Actual cargo metadata invocation resolution and separate compiler-artifact features; no complete compiled dependency-graph equality claim."
 }

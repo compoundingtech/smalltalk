@@ -3,6 +3,41 @@ import { buildEnv, linuxRunner, linuxStageRunner, readOnlyBinaryCaches } from '.
 
 const diagnosticRunner = ['nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=2', 'namespace-features:github.run-id=${{ github.run_id }}']
 
+// Guard BEFORE each external action; charge minute-granular timeouts to the
+// immutable setup deadline, with 60 seconds reserved for action dispatch/return.
+const setupAdmission = String.raw`python3 - <<'PYSETUP'
+import json, os, time, math, hashlib
+from pathlib import Path
+r = json.loads(Path(os.environ['LOG_DIET_DEADLINE']).read_text())
+keys = ('ST_AGENT','ST3_SUBJECT','GITHUB_ACTIONS','GITHUB_EVENT_NAME','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_JOB','RUNNER_NAME')
+identity = {k: os.environ.get(k) for k in keys}
+now = time.monotonic()
+if r.get('identity') != identity or r.get('boot_sha256') != hashlib.sha256(Path('/proc/sys/kernel/random/boot_id').read_bytes()).hexdigest():
+    raise SystemExit('setup identity mismatch')
+for key in ('start','setup_end','cutoff','upload_end'):
+    v = r.get(key)
+    if isinstance(v, bool) or not isinstance(v, (int,float)) or not math.isfinite(v) or v < 0:
+        raise SystemExit('malformed setup deadline')
+if (r['setup_end'],r['cutoff'],r['upload_end']) != (r['start']+600,r['start']+6000,r['start']+6900) or not r['start'] <= now < r['setup_end']:
+    raise SystemExit('expired/future/reset setup deadline')
+minutes = int((r['setup_end'] - now - 60) // 60)
+if minutes < 1:
+    raise SystemExit('insufficient setup action budget')
+with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+    f.write('minutes=' + str(minutes) + '\n')
+PYSETUP`
+
+const boundedSetupSteps = [
+  { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+  ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+].flatMap((step, index) => {
+  const id = `admit_setup_${index}`
+  return [
+    { id, name: `Admit setup action ${index} within the first-step deadline`, 'timeout-minutes': 1, run: setupAdmission },
+    { ...step, if: `success() && steps.${id}.outputs.minutes != ''`, 'timeout-minutes': '$' + '{{ fromJSON(steps.' + id + '.outputs.minutes) }}' },
+  ]
+})
+
 const snapshotAttempt = "!cancelled() && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main') && (steps.load.outcome == 'success' || steps.load.outcome == 'failure')"
 const snapshotPublished = "!cancelled() && steps.cache.outcome == 'success' && steps.cache.outputs.publish == 'true'"
 const paths = [
@@ -55,8 +90,7 @@ export default githubWorkflow({
           name: 'Bind the first-step absolute deadline before checkout or installation',
           run: "python3 - <<'PYBOOT'\nimport json, os, time, hashlib\nfrom pathlib import Path\nstart = time.monotonic()\nroot = Path(os.environ['RUNNER_TEMP']) / 'log-diet-three-source'\nroot.mkdir()\nkeys = ('ST_AGENT','ST3_SUBJECT','GITHUB_ACTIONS','GITHUB_EVENT_NAME','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_JOB','RUNNER_NAME')\nidentity = {k: os.environ.get(k) for k in keys}\nrecord = {'identity': identity, 'start': start, 'cutoff': start + 6000, 'setup_end': start + 600, 'upload_end': start + 6900, 'boot_sha256': hashlib.sha256(Path('/proc/sys/kernel/random/boot_id').read_bytes()).hexdigest()}\nwith (root / 'deadline.json').open('x') as f: json.dump(record, f)\nwith open(os.environ['GITHUB_ENV'], 'a') as f:\n    f.write('LOG_DIET_ROOT=' + str(root) + '\\nLOG_DIET_DEADLINE=' + str(root / 'deadline.json') + '\\n')\nPYBOOT",
         },
-        { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
-        ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+        ...boundedSetupSteps,
         {
           name: 'Full generation, actionlint and three original cases under shared deadlines',
           run: 'python3 scripts/ci-log-diet-study.py study --repo "$GITHUB_WORKSPACE" --root "$LOG_DIET_ROOT" --deadline "$LOG_DIET_DEADLINE" --assignment "$LOG_DIET_ASSIGNMENT"',

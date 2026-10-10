@@ -73,6 +73,7 @@ def run_arm(args, runner_factory=c.Runner, clock=time.monotonic):
         if not binary.is_relative_to(Path(metadata['target_directory']).resolve()):
             raise ValueError('binary outside actual arm source target tree')
         c.write_json(root / 'binary.json', {'compiler_artifact': row, 'resolved_package': package,
+                                           'metadata_scope': 'Actual cargo metadata --locked --offline --format-version 1 --features st3/test-support invocation resolution; not complete compiled-graph equality',
                                            'resolved_node': node, 'path': str(binary), 'sha256': c.sha(binary)})
         runner.checked('inventory', [str(binary), '--exact', c.CASE, '--list', '--format', 'terse'],
                        source, window['active'], window['end'])
