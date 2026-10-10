@@ -64,12 +64,11 @@ pub fn declared_wake_on(desired: Option<&Value>) -> WakeOn {
 }
 
 /// A person's message (including one an adapter imports, such as from a chat bridge), anything
-/// st itself sends (a ready step, a fault, a gh watch event, an answer from a person), and a work
-/// handoff always wake the recipient, whatever it chose.
+/// ready step, a fault, a gh watch event, and a work handoff always wake the recipient,
+/// whatever it chose. Other daemon mail has no blanket exception.
 pub fn always_wakes(from: &str, tags: &[String]) -> bool {
     from.starts_with("person/")
         || from.starts_with("external/")
-        || from.starts_with("daemon/")
         || tags.iter().any(|tag| {
             tag.starts_with("st3-work:")
                 || tag.starts_with("st3-work-handoff:")
@@ -226,6 +225,11 @@ mod tests {
             let mut delivered = vec![message("message/x", from, "sent", &[FYI_TAG, tag])];
             release(&mut delivered);
             assert_eq!(delivered.len(), 1, "{from} {tag} wakes");
+        }
+        for from in ["agent/example/writer", "daemon/example"] {
+            let unrelated = tags(&[FYI_TAG, "unrelated-event"]);
+            assert!(!always_wakes(from, &unrelated));
+            assert!(is_held(&message("message/unrelated", from, "sent", &[FYI_TAG])));
         }
     }
 

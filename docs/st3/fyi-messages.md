@@ -46,8 +46,10 @@ st never guesses from the words. Every message in a thread carries a
 These always wake, whatever the seat chose and whatever the sender marked:
 
 - a person's message, including one an adapter imports (`external/…`);
-- anything st itself sends (`daemon/…`): a ready step, a fault, a gh watch event, a person's answer;
+- a ready step (`st3-work:…`), fault (`st3-fault:…`), or gh watch event (`github-watch`);
 - a work handoff (`st work handoff`).
+
+Other daemon messages have no blanket exception to FYI holding.
 
 ## How it works
 
