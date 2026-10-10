@@ -14585,6 +14585,11 @@ impl Store {
         launch_lineage_tx(&connection, subject)
     }
 
+    /// Presentation-only lineage of a recorded launch, even when it is no longer desired.
+    pub(crate) fn launch_lineage_from(&self, token: &str) -> Result<Vec<String>> {
+        launch_lineage_from_tx(&self.readers.get(), token.to_owned())
+    }
+
     /// Only seats whose durable resume requests name this host need transfer reconciliation.
     pub(crate) fn cross_host_resume_targets(&self, host: &str) -> Result<BTreeSet<String>> {
         smallclaims::touched::note_read(|| "kind:runtime.action.requested".to_owned());
@@ -21202,8 +21207,11 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
     let Some(row) = current_desired_row(connection, subject)? else {
         return Ok(Vec::new());
     };
-    let mut lineage = vec![row.claim_id.clone()];
-    let mut current = row.claim_id;
+    launch_lineage_from_tx(connection, row.claim_id)
+}
+
+fn launch_lineage_from_tx(connection: &Connection, mut current: String) -> Result<Vec<String>> {
+    let mut lineage = vec![current.clone()];
     while let Some(claim) = claim_by_id_tx(connection, &current)? {
         // A claim that merges concurrent revisions has one predecessor per fork; follow the
         // first one that is still the same launch.
@@ -21214,7 +21222,7 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
             }
             if let Some(previous) = claim_by_id_tx(connection, predecessor)?
                 && previous.kind == "intent.desired"
-                && previous.subject == subject
+                && previous.subject == claim.subject
                 && presentation_only_change(&previous.body, &claim.body)
             {
                 next = Some(previous.id);

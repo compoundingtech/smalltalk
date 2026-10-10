@@ -381,6 +381,15 @@ impl Store {
         policy
             .validate()
             .map_err(|e| St3Error::new("invalid-rollout-policy", e.to_string()))?;
+        if crate::suspension::current(self, subject)
+            .map_err(internal)?
+            .is_some_and(|suspension| suspension.holds_seat())
+        {
+            return Err(St3Error::new(
+                "rollout-suspended",
+                "the seat is suspended; resume it before requesting a rollout",
+            ));
+        }
         self.connection.batched(|tx| -> Result<ClaimRecord, St3Error> {
             if let Some(prior) = tx.query_row(
                 "SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM claims

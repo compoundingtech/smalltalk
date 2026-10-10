@@ -10530,9 +10530,6 @@ fn suspension_target(
         .rollout(subject)
         .map_err(ApiError::bad)?
         .is_some_and(|o| o.holds_seat())
-        || crate::rollout::status(&state.store, subject)
-            .map_err(ApiError::internal)?
-            .is_some_and(|s| s["mode"] == "manual" && s["phase"] == "pending")
     {
         return Err(ApiError::bad(St3Error::new(
             "rollout-in-progress",
@@ -10559,7 +10556,7 @@ fn suspension_target(
             "resolve the seat's conflicting declarations first",
         )));
     }
-    let member = state
+    let mut member = state
         .store
         .desired_subject_with_writer(subject)
         .map_err(ApiError::internal)?
@@ -10573,6 +10570,11 @@ fn suspension_target(
                 "only a declared, started seat can be suspended or resumed",
             ))
         })?;
+    if let Some((_, incumbent)) =
+        crate::rollout::pending_manual_launch(&state.store, subject).map_err(ApiError::internal)?
+    {
+        member = incumbent;
+    }
     let token = current.desired_token.clone().ok_or_else(|| {
         ApiError::bad(St3Error::new(
             "suspend-not-declared",
@@ -10645,6 +10647,15 @@ pub(crate) fn request_suspend(
         .map_err(ApiError::internal)?
     {
         return Ok(prior);
+    }
+    if crate::rollout::status(&state.store, &subject)
+        .map_err(ApiError::internal)?
+        .is_some_and(|s| s["mode"] == "manual" && s["phase"] == "pending")
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "rollout-in-progress",
+            "the seat has a rollout; inspect it or retry with st agents rollout",
+        )));
     }
     let (current, member, token) = suspension_target(state, &subject)?;
     if let Some(suspension) =
@@ -10810,6 +10821,19 @@ pub(crate) fn request_resume(
             "resume needs a host name",
         )));
     }
+    let launch_token = if let Some((incumbent, old)) =
+        crate::rollout::pending_manual_launch(&state.store, &subject).map_err(ApiError::internal)?
+    {
+        if host != old.host {
+            return Err(ApiError::bad(St3Error::new(
+                "rollout-in-progress",
+                "resume on the current host before applying the pending manual rollout",
+            )));
+        }
+        incumbent
+    } else {
+        token.clone()
+    };
     let mut fields = BTreeMap::from([
         ("action".into(), Value::String("resume".into())),
         (
@@ -10847,7 +10871,7 @@ pub(crate) fn request_resume(
             kind: "runtime.action.requested".into(),
             actor: Some(actor),
             fields,
-            evidence: vec![token, suspend],
+            evidence: vec![launch_token, suspend],
             expected_subject: None,
             idempotency_key: Some(key),
         })
