@@ -5324,6 +5324,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         launch_member
             .environment
             .remove(crate::suspension::CONTINUE_PATH_ENV);
+        let selector_scope = crate::native_resume::selection_scope(member);
+        launch_member.environment.remove(crate::suspension::SELECTOR_SCOPE_ENV);
+        if let Some(scope) = &selector_scope {
+            launch_member.environment.insert(crate::suspension::SELECTOR_SCOPE_ENV.into(), scope.clone());
+        }
         let continued = if subject.kind == "agent"
             && !member
                 .environment
@@ -5335,6 +5340,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 &subject.subject,
                 harness,
                 launch_member.environment.get("ST3_ACCOUNT").map(String::as_str),
+                selector_scope.as_deref(),
             )?
         } else {
             None
@@ -16475,6 +16481,25 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             assert_eq!(reason(&store), reason(&replica));
             replica.import_replication("node", &batch).unwrap();
             assert_eq!(reason(&store), reason(&replica));
+            // Compare the dormant predicate with the independent Store oracle only in
+            // its narrower domain. These are supplied fixture facts, not an extractor
+            // or certification of runtime selection/dispatch coverage.
+            if restart == "never" && exit_code.is_some() {
+                let mut facts = crate::store::terminal_gate_evidence::tests::facts();
+                facts["gate"]["subject"] = serde_json::json!("exec/orchid/probe");
+                facts["gate"]["expected"] = serde_json::json!(expected);
+                facts["desired"]["subject"] = serde_json::json!("exec/orchid/probe");
+                facts["observed"]["status"] = serde_json::json!(status);
+                facts["observed"]["exit_code"] = serde_json::json!(exit_code);
+                let encoded = Value::String(facts.to_string());
+                assert_eq!(
+                    crate::store::terminal_gate_evidence::witness(&encoded)
+                        .unwrap()
+                        .into_witness(),
+                    reason(&store),
+                    "dormant predicate differs from selected-launch oracle"
+                );
+            }
             if let GateOutcome::Fail(reason) = outcome {
                 assert!(reason.contains("exec/orchid/probe"), "{reason}");
                 assert!(
@@ -26781,6 +26806,28 @@ mission "waiting" state="ready" {
                 "{person:?}"
             );
         }
+
+        // Each is an alert in the conversation of the agent behind it: the gate in the builder's
+        // whose work it reviews, the mission's person step in the run's requester's.
+        let conversations = store
+            .attention_items(Some("person/alex"))
+            .unwrap()
+            .into_iter()
+            .map(|item| (item.kind.clone(), (item.is_alert(), item.conversation)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            conversations,
+            BTreeMap::from([
+                (
+                    "human-gate".to_owned(),
+                    (true, Some("agent/node.builder".to_owned()))
+                ),
+                (
+                    "person-step".to_owned(),
+                    (true, Some("agent/node.lead".to_owned()))
+                ),
+            ])
+        );
 
         // Each owner heard about its fault once, however many passes ran.
         let faults_for = |agent: &str| {

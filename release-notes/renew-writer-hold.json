@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Hold the writer for a work renewal's lease only: its view is filled from a reader after commit, and the quiet-renewal lease check no longer sorts the step's claim history",
+  "replay": {
+    "status": "none",
+    "detail": "No source, projection, retention or replay changes. The last replicated lease query returns the same claim as before, read through the existing subject-kind-accepted index."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No new tables or indexes. A renewal's idempotency row now caches the committed step row without its derived fields; older cached rows are re-enriched on retry."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Lease, incarnation, ownership and idempotency fences, the quiet/publish decision and when work.renewed is appended remain unchanged; acknowledgements follow durable commit."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "The renewal response shape is unchanged. Its derived fields (timing, summaries, wake, definition) are read after commit, so a retry shows current values."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal binary rollout; no migration or startup backfill."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new persisted state; ordinary rollback to prior binary remains available."
+  }
+}

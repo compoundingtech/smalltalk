@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Rust clients preserve detail-refusal messages and their non-retryable behavior.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or initialization change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or index change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule or retention change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Handles the two typed observer/subscription detail refusal codes in the Rust client exhaustive plain-message match, displaying the existing server message and retaining nontransient behavior when retryable is false. Templates and checked-in output agree; client error documentation lists both existing codes. No new wire code, status, retry policy, cap or admission change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart or interruption beyond ordinary deployment."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual migration or rebuild."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No writer, checkpoint or rollback changes; existing source data is preserved."
+  }
+}

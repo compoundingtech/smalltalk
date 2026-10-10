@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
+# Client, shared-view and iOS checks over the root workspace's frozen installation
+# (`pnpm install --frozen-lockfile`).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-client=clients/typescript/st3-client
-npm test --prefix "$client"
-npm run typecheck --prefix "$client"
-views=clients/typescript/st3-views
-npm test --prefix "$views"
-npm run typecheck --prefix "$views"
-apps/ios/node_modules/.bin/tsc --noEmit -p apps/ios
-npm test --prefix apps/ios
+pnpm --filter @smalltalk/st3-client test
+pnpm --filter @smalltalk/st3-client typecheck
+pnpm --filter @smalltalk/st3-views test
+pnpm --filter @smalltalk/st3-views typecheck
+pnpm --filter smalltalk-ios-starter exec tsc --noEmit -p .
+pnpm --filter smalltalk-ios-starter test

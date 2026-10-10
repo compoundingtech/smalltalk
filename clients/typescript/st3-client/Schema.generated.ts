@@ -1063,10 +1063,16 @@ export type PersonUpdateEncoded = typeof PersonUpdate.Encoded
 export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "action_parameters": optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
   "actions": Schema.Array(Schema.Literals(["custom.reply","work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"])),
+  /** Whether this item is an alert: it blocks or waits on its person (an ask, a human gate, a launch or revision approval, an agent or custom request, a harness prompt or login, or a broken gate the person published). An update is not one. Absent on daemons that predate alerts. */
+  "alert": optionalKey(Schema.Boolean).annotate({ description: "Whether this item is an alert: it blocks or waits on its person (an ask, a human gate, a launch or revision approval, an agent or custom request, a harness prompt or login, or a broken gate the person published). An update is not one. Absent on daemons that predate alerts." }),
   "attention_kind": Schema.Union([Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault"]), Schema.String.check(Schema.isPattern(new RegExp("^custom\\.[a-zA-Z0-9_.-]+$", "u")))]),
   "because": optionalKey(Schema.String),
   /** The mission step waiting on this ask, on an ask a mission step made; absent on a standalone ask. */
   "blocked": optionalKey(AttentionBlocked),
+  /** The agent whose conversation this item belongs to: the agent that asked, whose work a gate reviews, that planned the launch or proposed the revision, or the seat itself. Absent when no agent is behind it. */
+  "conversation_id": optionalKey(Id),
+  /** Every agent conversation this item shows in, starting with conversation_id. A harness login alert names every seat that shares the login, since one sign-in answers them all. */
+  "conversation_ids": optionalKey(Schema.Array(Id)).annotate({ description: "Every agent conversation this item shows in, starting with conversation_id. A harness login alert names every seat that shares the login, since one sign-in answers them all." }),
   /** Data-only registered reply form; absent on native attention. */
   "custom_form": optionalKey(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "Data-only registered reply form; absent on native attention." }),
   "detail": Schema.String,
@@ -1564,7 +1570,7 @@ export type MissionRunOutcomeEncoded = typeof MissionRunOutcome.Encoded
 
 export const MissionWake = /*#__PURE__*/ (() => Schema.Struct({
   "acknowledged_by": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
-  "assignee": AgentId,
+  "assignee": ActorRef,
   "assignee_state": Schema.String,
   "attempts": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "failure": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -1576,12 +1582,12 @@ export type MissionWakeEncoded = typeof MissionWake.Encoded
 
 export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   "agentless": optionalKey(Schema.Boolean),
-  "assignee": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
+  "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE),
   "attempt": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "blocked_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "blockers": optionalKey(Schema.Array(Id)),
   "claim_expires_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
-  "claimant": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE),
+  "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE),
   "constraints": optionalKey(Schema.Array(Schema.String)),
   "goals": optionalKey(Schema.Array(Schema.String)),
   "id": Id,
@@ -1611,7 +1617,7 @@ export type MustActEncoded = typeof MustAct.Encoded
 export const MissionRunSummary = /*#__PURE__*/ (() => Schema.Struct({
   "after": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),
   "blocker": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE),
-  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(AgentId, NULL_NONE), "id": StepRunId, "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
+  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "id": StepRunId, "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
   "deadline": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "generation_id": optionalKey(RunGenerationId),
   "id": MissionRunId,
@@ -1797,10 +1803,13 @@ export const Summary = /*#__PURE__*/ (() => Schema.Struct({
   "active_missions": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   /** The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself. */
   "agents_as_of": optionalKey(Schema.Struct({ "published_at": Timestamp, "store_index": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) })).annotate({ description: "The published agents roster the agent counts came from, when a background refresher prepares it: its graph cut and when it was published. Absent when the counts come from this snapshot itself." }),
+  /** Open alerts: items that block or wait on this person. Updates are not counted. Absent on daemons that predate alerts. */
+  "alerts": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))).annotate({ description: "Open alerts: items that block or wait on this person. Updates are not counted. Absent on daemons that predate alerts." }),
   "id": Id,
   "kind": Schema.Literal("summary"),
   "machines": SummaryMachines,
-  "needs_you": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  /** The alert count; an older daemon also counted unread updates. */
+  "needs_you": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).annotate({ description: "The alert count; an older daemon also counted unread updates." }),
   "operational": optionalKey(Operational),
   "person_id": Schema.OptionFromNullOr(Schema.String),
   "revision": Revision,
@@ -2492,7 +2501,7 @@ export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded
 
 /** Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer. */
-export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","arrangement-exists","arrangement-folder-exists","arrangement-retired","arrangement-limit","arrangement-folder-deleted","arrangement-cycle","arrangement-body-too-large","arrangement-owner-forbidden","invalid-arrangement-subject","invalid-arrangement-action","invalid-arrangement-operations","invalid-arrangement-folder","invalid-arrangement-name","invalid-arrangement-key","invalid-subject-reference","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","issuer-required","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","conversation-content-invalidated","transcript-unavailable","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer." }))()
+export const ErrorCode = /*#__PURE__*/ (() => openEnum(["attention-migrated","arrangement-exists","arrangement-folder-exists","arrangement-retired","arrangement-limit","arrangement-folder-deleted","arrangement-cycle","arrangement-body-too-large","arrangement-owner-forbidden","invalid-arrangement-subject","invalid-arrangement-action","invalid-arrangement-operations","invalid-arrangement-folder","invalid-arrangement-name","invalid-arrangement-key","invalid-subject-reference","not-found","forbidden","unsupported-capability","validation-failed","idempotency-conflict","issuer-required","stale-fence","cursor-gap","page-cursor-expired","rate-limited","runtime-not-local","runtime-authority-indeterminate","remote-unavailable","terminal-unavailable","terminal-ended","timeline-history-incomplete","projection-detail-too-large","projection-detail-invalid-source","conversation-content-invalidated","transcript-unavailable","blob-too-large","unsupported-media-type","blob-content-mismatch","blob-quota-exceeded","blob-not-found","blob-expired","internal"]).annotate({ identifier: "ErrorCode", description: "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer." }))()
 export type ErrorCode = typeof ErrorCode.Type
 export type ErrorCodeEncoded = typeof ErrorCode.Encoded
 

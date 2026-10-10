@@ -12,6 +12,12 @@ An action row has a static route such as `/v1/work/renew/{*subject}`, `method: "
 route totals, so do not add counts across scopes. The seven action buckets are independent of the
 256 general-route limit.
 
+`GET /v1/client/agents` also gets `scope: "agents-read"` rows, `method: "GET"`, with `read` set to
+`first-page`, `fresh` or `continuation` (any page with a `cursor`). A `fresh=true` first page waits
+by design, up to two seconds, until the roster refresher publishes a roster at or after the
+read's own cut. The other two answer at once from a published roster. Count the fresh row against
+its own target rather than leaving it out: the route total still includes it.
+
 Each row's `count` is its completed-response count since this process started, including error
 responses. Percentiles use its last at most 512 completions (`recent_count`), in whole milliseconds.
 Renew and claim have separate counts and percentile samples. `duration_scope: "response-envelope"`
@@ -124,6 +130,37 @@ client request records provide that detail. Profiling remains off unless `ST3_PR
 Capability admission seeks the attachment's indexed hash and its subject-head fence in one
 SQLite snapshot instead of decoding a bounded page of the whole fleet graph. Single-use CAS,
 session, person, and mode binding, expiry, and owner/incarnation checks remain unchanged.
+
+## Checkpoint scratch memory
+
+Checkpoint capture filters envelope cuts in SQLite and sorts only claim identities and canonical
+keys, then decodes retained bodies in bounded pages. Each metadata, body, protection and tombstone
+page has its own read snapshot and checks the persistent capture invalidation epoch. Mutations
+that affect the registered below-cut envelope prefix, canonical ordering, its protection references
+or below-cut tombstones restart capture; three invalidated attempts fail closed with a clear error.
+The seal rowid is fixed once per capture. A short atomic writer statement advances the monotonic
+frontier and accepted-time cut only when their persisted bounds need to grow; retries and repeated
+captures within covered bounds do not rewrite them. Admission of newer above-cut envelopes,
+identical duplicate re-offers and projection writes referring only to newer history do not
+invalidate capture. Delayed admission into the captured prefix and repairs that protect captured
+claims still invalidate it. The WAL is released between pages rather than pinned across sorting
+and the full body pass. The default and maximum capture page sizes are 64 envelopes/records.
+The compact metadata pass strictly decodes claim acceptance timestamps before envelope exclusion;
+malformed, negative or overflowing values return an error rather than silently counting as early.
+Capture mutation guards seek batch and record membership through their existing indexes, then
+look up the exact envelope identity. They do not scan the retained envelope frontier for each
+deleted claim during trim. Guard trigger version 3 replaces the earlier envelope-side OR
+predicate atomically while preserving the cut/frontier and invalidation rules.
+Mission-run and planning replay retain the canonical list of IDs and load one claim body at a
+time. Base replay uses a temporary ID order and bounded body pages. Both close their ordering
+or body statements before projection savepoints.
+
+Proof copies use a disk rollback journal and temporary storage, with a fixed 2 MiB SQLite cache
+target. The scratch directory needs space for the database copy and its rollback journal.
+This does not change the sealed set, canonical ordering, proof digests, or reader-equivalence
+checks. Large retained sealed sets still consume memory; reader page-cache settings do not
+bound decoded claim bodies or allocator retention. Compare live allocations and SQLite's
+allocator counters with RSS before attributing an RSS plateau to retained read connections.
 
 ## Read connections and SQLite allocation
 

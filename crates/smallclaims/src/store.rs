@@ -48,6 +48,7 @@ mod binary_payloads;
 pub mod events;
 pub mod idempotency;
 mod inventory_generation;
+mod checkpoint_capture_epoch;
 pub use binary_payloads::PayloadConversion;
 pub mod canonical;
 pub mod checkpoint;
@@ -611,6 +612,18 @@ CREATE TABLE IF NOT EXISTS graph_generation (
 );
 INSERT OR IGNORE INTO graph_generation(id, value) VALUES (1, 0);
 
+-- A checkpoint capture fences relevant mutations across independently released read pages.
+-- The registered envelope frontier and accepted-time cut only grow, including across reopens.
+-- Trigger versions migrate atomically with an epoch bump; no history rewrite is needed.
+CREATE TABLE IF NOT EXISTS checkpoint_capture_epoch (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    value INTEGER NOT NULL,
+    envelope_frontier INTEGER NOT NULL DEFAULT 0,
+    cut_unix_ms INTEGER NOT NULL DEFAULT 0,
+    trigger_version INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO checkpoint_capture_epoch(id, value, envelope_frontier) VALUES (1, 0, 0);
+
 CREATE TABLE IF NOT EXISTS replica_envelope_signatures (
     writer TEXT NOT NULL,
     sequence INTEGER NOT NULL,
@@ -697,7 +710,7 @@ ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 "#;
 
 /// The store's schema version, set once the graph's and the runtime's tables exist.
-pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 17;";
+pub const SCHEMA_VERSION: &str = "PRAGMA user_version = 18;";
 
 /// `(host/NAME, key)` for every member incarnation fleet membership admits.
 pub type MemberRoots = BTreeSet<(String, String)>;
@@ -898,13 +911,14 @@ impl Store {
         // Reassigning user_version dirties the database header even when it is unchanged.
         // Upgrade once, then let ordinary reopens avoid that write and its durable commit.
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 17 {
+        if version != 18 {
             connection.execute_batch(SCHEMA_VERSION)?;
         }
         document_index::initialize(connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(connection, runtime.legacy_digest_tables())?;
         projection_digest::initialize(connection, runtime.digest_tables())?;
+        checkpoint_capture_epoch::initialize(connection)?;
         Ok(())
     }
 
@@ -1496,11 +1510,11 @@ pub fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10..=17),
+        table_count == 0 || matches!(version, 10..=18),
         "this database uses an unsupported st schema; start with a new state directory"
     );
     anyhow::ensure!(
-        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17),
+        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18),
         "this database uses unsupported st schema version {version}"
     );
     Ok(())
@@ -1643,12 +1657,19 @@ pub fn selected_index(current: u64, requested: Option<u64>) -> Result<u64, St3Er
 }
 
 pub fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> {
+    let accepted = row.get::<_, String>(9)?;
+    claim_from_row_with_accepted_time(row, accepted.parse().unwrap_or_default())
+}
+
+pub(crate) fn claim_from_row_with_accepted_time(
+    row: &rusqlite::Row<'_>,
+    accepted_at_unix_ms: u128,
+) -> rusqlite::Result<ClaimRecord> {
     if crate::read_budget::check().is_err() {
         return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_INTERRUPT), None));
     }
     let body = row.get::<_, String>(7)?;
     let predecessors = row.get::<_, String>(8)?;
-    let accepted = row.get::<_, String>(9)?;
     let body = serde_json::from_str(&body).unwrap_or(Value::Null);
     Ok(ClaimRecord {
         id: row.get(0)?,
@@ -1662,7 +1683,7 @@ pub fn claim_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimRecord> 
         request_digest: operation_parts(&body).map(|(_, digest)| digest.to_owned()),
         body,
         predecessors: serde_json::from_str(&predecessors).unwrap_or_default(),
-        accepted_at_unix_ms: accepted.parse().unwrap_or_default(),
+        accepted_at_unix_ms,
     })
 }
 
@@ -8112,6 +8133,13 @@ pub fn create_graph_generation_triggers(
 pub fn graph_generation(connection: &Connection) -> Result<i64> {
     Ok(connection
         .prepare_cached("SELECT value FROM graph_generation WHERE id=1")?
+        .query_row([], |row| row.get(0))?)
+}
+
+/// The persistent mutation fence used by checkpoint pages on any SQLite connection.
+pub fn checkpoint_capture_epoch(connection: &Connection) -> Result<i64> {
+    Ok(connection
+        .prepare_cached("SELECT value FROM checkpoint_capture_epoch WHERE id=1")?
         .query_row([], |row| row.get(0))?)
 }
 

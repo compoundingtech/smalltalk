@@ -50,12 +50,18 @@ use `namespace-profile-linux-x86-64` when they overflow. The `linux-gate` aggreg
 until 2026-10-03, when that label stopped getting runners; on the profile they queued behind its
 limit of about five runners at once.
 
-All Linux Namespace jobs use run affinity and the same inline `job.priority=1`: required
-Workspace jobs, optional benchmarks, manual Performance controls, main upkeep and releases.
-Using one class prevents a continuous stream of required jobs from overtaking older performance
-requests. Run affinity ensures that a runner started for a request is assigned to that run,
-so GitHub cannot hand it to a newer run with the same shape. Local `ci1-priority` and `ci1-merge`
-reservations continue to select only the primary test shard.
+Required Workspace checks for PRs and merge groups use Namespace `job.priority=1`.
+Optional Performance and `perf-cost`, manual controls, main upkeep and releases retain
+priority 2. Required PR checks must finish before a PR can enter the merge queue; merge-first
+ordering previously allowed new merge jobs to overtake these prerequisites. This policy orders
+waiting jobs and neither preempts running work nor reserves capacity. The picker, local pools,
+runner shapes, run affinity and required checks are unchanged.
+
+The 2026-10-09 investigation retained a PR build waiting 55.1 minutes at priority 2 before
+15.7 minutes of execution; two sampled merge builds at priority 1 waited 0.3 and 1.7 minutes.
+One 116.6-minute PR had 41.0 minutes of producer wait and 28.8 minutes of shard wait.
+This motivates queue ordering; it does not establish a cache or compiler defect, nor promise
+that the 20-minute run SLO is met under overload.
 
 Profile labels carry affinity inline, for example
 `namespace-profile-linux-x86-64;job.priority=1;github.run-id=${{ github.run_id }}`.
@@ -64,12 +70,10 @@ Shape labels retain `-with-features` and a separate
 separate `namespace-features:` label with profiles; see the
 [Runner Controls syntax](https://namespace.so/docs/solutions/github-actions/runner-controls).
 
-The queue still shares the existing Linux limit of 320 vCPUs / 640 GiB and must drain its older
-backlog. Queue time is measured separately from execution time; the shared class removes
-indefinite overtaking, rather than promising a fixed start time under arbitrary overload.
-An already queued job retains the labels from its immutable workflow revision. Recover old
-unprioritized controls with label-only revisions and new dispatches, preserving their source,
-fixtures and budgets; retain completed failures as evidence. See Namespace's
+The documented Linux limit is 320 vCPUs / 640 GiB; this change does not increase it.
+Queue time is measured separately from execution time. Already queued jobs retain the labels
+from their immutable workflow revision and finish naturally; this change does not rerun them.
+Optional jobs remain subject to capacity after required checks. See Namespace's
 [job ordering and priority controls](https://namespace.so/docs/solutions/github-actions/runner-controls/job-ordering).
 
 `scripts/ci-linux STAGE` runs one stage:
@@ -352,21 +356,73 @@ records the KVM probe and each phase's elapsed time.
 ### TypeScript client
 
 `typescript-client` runs on every PR and merge-group entry. Main retains the queue check;
-Main upkeep preserves the dependency cache. It installs Node 24.18.0
-(the workspace uses Node 24), the client's pinned TypeScript 6.0.3 and
-`effect@4.0.0-rc.118` development dependencies from its own lockfile. Both `node_modules`
-directories are cached together, keyed by both lockfiles and the Node version; a miss runs `npm ci --ignore-scripts` in each package.
-The lockfile fingerprint uses `sha256sum` in Bash so ci1's Nix runner needs no Node 20
+Main upkeep's `warm-typescript` fills the pnpm store with `pnpm fetch`. The job installs
+Node 24.18.0 through `actions/setup-node`, runs `corepack enable`, then installs the root
+workspace with `pnpm install --frozen-lockfile`. The client, shared views and iOS app share
+one root `pnpm-lock.yaml`; install scripts are disabled by the workspace configuration.
+The store cache key is
+`typescript-client-<os>-node24.18.0-pnpm12.7.0-<sha256 of pnpm-lock.yaml>`.
+The lockfile fingerprint uses `sha256sum` in Bash so the Nix runner needs no Node 20
 `hashFiles` helper when it evaluates the cache key.
 
-The client package's `npm test` runs the contract and schema tests with `node --test`;
-`npm run typecheck` runs its strict compiler checks. CI installs and checks the client before
-installing the iOS dependencies for the separate project typecheck.
-`bash scripts/ci-typescript-client` runs the client commands and `tsc --noEmit -p apps/ios` locally
-when both packages' dependencies are installed.
-The iOS project allows explicit TypeScript import extensions for generated-client consumers.
-The main ruleset requires `typescript-client`. It was enabled after the new job passed on main
-in [#1256](https://github.com/compoundingtech/smalltalk/pull/1256).
+After the root frozen install, `bash scripts/ci-typescript-client` runs the client's
+contract/schema tests and both compiler projects, the views' tests and typecheck,
+`tsc --noEmit -p .` in `apps/ios`, and the iOS tests. The client packages pin TypeScript
+6.0.3 and Effect 4.0.0-rc.118. The iOS project allows explicit TypeScript import extensions
+for generated-client consumers. The main ruleset requires `typescript-client`.
+
+### Fractal web
+
+The non-required Fractal web jobs run on GitHub-hosted `ubuntu-latest` without
+workflow-level path filters. `linux-gate` does not depend on them.
+
+- `fractal-web-changes` always runs, with a one-minute timeout and no checkout. Its
+  embedded `scripts/ci-fractal-web-changes` fetches both commits explicitly without
+  blobs and diffs PR base/head SHAs from their merge base, or a merge group's
+  `base_sha..head_sha`. `--no-renames` counts both sides of a rename. Missing or malformed
+  SHAs, failed fetches and failed diffs fail closed; `workflow_dispatch` forces execution.
+  Relevant paths are `apps/fractal-web/**`, `packages/fractal-ui/**`,
+  `clients/typescript/st3-views/**` and `fixtures/**`. Within `clients/typescript/st3-client`,
+  only the consumed export graph (`index.ts`, `Models.generated.ts`, `Client.generated.ts`,
+  `Schema.generated.ts`, `errors.ts`), `package.json`, `tsconfig.json`, `tsconfig.schema.json`,
+  `types.test.ts` and `BUCK*` trigger web execution. Rust generators and their schema/docs
+  inputs do not trigger it without a changed generated client file; root flake-only changes
+  also do not trigger it. Other relevant paths are
+  root `package.json*`, `pnpm-workspace.yaml*`, `pnpm-lock.yaml`,
+  `pnpm-install-contract.json*`, `.npmrc`, root `tsconfig*.json*`, `.buckroot*`,
+  `.buckconfig*`, root `BUCK*`, `buck2/**`, `genie/**`, `nix/web/**`,
+  `nix/fractal-web*.nix`, `scripts/ci-fractal-web*`,
+  `scripts/ci-typescript-client*`,
+  `.github/workflows/{fleet.yml*,workspace-ci.ts,main-upkeep.yml*,cache-audit.ts}`,
+  and `.github/repo-settings.json*`.
+- `fractal-web-execution` runs only for relevant changes after successful detection
+  and `genie-freshness`, with a 25-minute timeout and no retries. It runs
+  `nix develop .#web -c bash scripts/ci-fractal-web`. Timed lanes check toolchain/Buck-root
+  identity, run `pnpm install --frozen-lockfile`, then `buck2 build //:typecheck`.
+  It restores the pnpm store with key
+  `fractal-web-pnpm-<os>-pnpm12.7.0-node24.20.0-<hashFiles pnpm-lock.yaml>`;
+  only Main upkeep's `warm-fractal-web` saves this cache. App, UI kit, Storybook,
+  browser and performance lanes join the script with the packages that add them.
+- `fractal-web` is always emitted (`if: always()`), with a one-minute timeout. Its
+  embedded `scripts/ci-fractal-web-gate` passes only when detection succeeded and
+  either no relevant paths changed and execution was skipped, or execution succeeded.
+  Failure, timeout, cancellation and unexpected skips fail the gate. It is not a required
+  check; the ruleset adds it only after successful PR and merge-group emissions.
+
+`scripts/ci-fractal-web-test`, run by `genie-freshness`, covers detection, fail-closed
+paths, the gate truth table and generated job shape.
+
+The web shell supplies pnpm 12.7.0, Node 24.20, Bun 1.4.2 and Buck2 from the pinned
+effect-utils input; the Rust shells are unchanged. An empty `.buckroot` marks the Buck
+root; Genie generates `.buckconfig`, root `BUCK` and `buck2/toolchains/BUCK` from `buck2/root.ts`,
+mirroring `effect-utils.lib.mkConsumerBuckRoot` with cell `smalltalk`. Remote caching
+and uploads are disabled, with no remote endpoints. The shell links `rules` and
+`capabilities` cells into ignored `.buck2/`; CI fails if checked-in root files drift
+from the Nix rendering. `buck2/dependencies/BUCK` and its SHA-256 sidecar project the
+client and views importers from `pnpm-lock.yaml`; package `BUCK` files come from
+`buck2/typescript-package.ts`. The root typecheck runs tsgo over the client's two
+tsconfig projects and the views. Dependency archives are fetched from
+`registry.npmjs.org` at build time; nothing is uploaded.
 
 ### macOS
 
@@ -904,3 +960,13 @@ explicit reserve-reached error. It retained 4,836.67 observed minutes as partial
 window evidence. This confirms the quota-reserve behavior with local authentication,
 not the scheduled credential, full window, or a successful daily total. No automatic
 retry follows quota exhaustion.
+
+Test archive transfer verifies the complete ZIP before exposing consumer inputs. The four
+archive consumers download only the successful producer artifact ID, verify its API size
+and SHA256, verify the producer-output manifest hash and all five ZIP members, then
+publish a fresh private directory atomically. A failed or incomplete transfer gets at most
+one repeat download of that same ID (each ZIP request has a 10-minute limit); interrupted
+requests retain their signal status. No compiler or test is retried. Source, run, successful
+producer attempt, toolchain and individual file hashes are still checked before extraction.
+The job logs the ZIP size/digest and transfer attempt. This protects the transfer boundary;
+it does not establish the cause of earlier digest mismatches or a measured speedup.

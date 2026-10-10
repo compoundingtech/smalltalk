@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Read an events page's per-event cut times and subject attributions in constant statements",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes; the events feed reads the same claims and events in the same order."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers, schema-version changes or data rewrites. The page's cut times are read with indexed seeks on the existing claims primary key."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "Event ids, cursors, timestamps, snapshot ids, ordering and redaction are unchanged; each event keeps the acceptance time of its own cut."},
+  "downtime": {"status": "none", "detail": "No additional startup work or expected interruption; an events page runs fewer read statements and holds no transaction longer."},
+  "manual": {"status": "none", "detail": "No operator actions, client re-pairing or configuration changes required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or new swap-back restrictions; schema and rules versions are unchanged."}
+}

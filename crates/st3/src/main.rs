@@ -17658,7 +17658,7 @@ async fn run_st2_native_driver(
         predecessor_harness_record: fs::read(&harness_state_path).ok(),
         ..NativeLoopState::default()
     };
-    let task = spawn_st2_provider(
+    let task = spawn_st3_provider(
         driver,
         &paths,
         ProviderStart::Launch(
@@ -17796,7 +17796,7 @@ enum ProviderStart {
     Adopt(st_drivers::provider_session::DetachedSession),
 }
 
-fn spawn_st2_provider(
+fn spawn_st3_provider(
     driver: &str,
     paths: &NativePaths,
     start: ProviderStart,
@@ -18010,7 +18010,7 @@ async fn resume_native_driver(
         paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
     }
     resume.loop_state.paths = Some(paths.resolved());
-    let task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(resume.session));
+    let task = spawn_st3_provider(driver, &paths, ProviderStart::Adopt(resume.session));
     drive_st2_native(
         client,
         subject,
@@ -18237,7 +18237,7 @@ async fn drive_st2_native(
                     };
                     let _ = replacement.exec(subject, &paths.state_root(), &resume);
                     loop_state = resume.loop_state;
-                    task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
+                    task = spawn_st3_provider(driver, &paths, ProviderStart::Adopt(session));
                     completion_announced = false;
                     continue;
                 }
@@ -19681,7 +19681,10 @@ async fn skip_native_continue(
         subject,
         &json!({"type":"native_continue_skipped","driver":driver,"session":session,"code":refusal.code,"reason":refusal.reason}).to_string(),
     );
-    let diagnostic = ClaimInput {
+    let selector_scope = (refusal.code == "authored-session-selection")
+        .then(|| std::env::var(st3::suspension::SELECTOR_SCOPE_ENV).ok())
+        .flatten();
+    let mut diagnostic = ClaimInput {
         subject: subject.into(),
         kind: "harness.diagnostic".into(),
         actor: Some(subject.into()),
@@ -19700,11 +19703,17 @@ async fn skip_native_continue(
                 )),
             ),
             ("incarnation_id".into(), Value::String(incarnation.into())),
+            ("session_id".into(), Value::String(session.into())),
         ]),
         evidence: Vec::new(),
         expected_subject: None,
-        idempotency_key: Some(st3::suspension::continue_unavailable_key(subject, session)),
+        idempotency_key: Some(st3::suspension::typed_continue_unavailable_key(
+            subject, session, refusal.code, selector_scope.as_deref(),
+        )),
     };
+    if let Some(scope) = selector_scope {
+        diagnostic.fields.insert("selector_scope".into(), Value::String(scope));
+    }
     if let Err(error) = retry_while_daemon_unreachable(subject, || {
         client.post::<_, ClaimRecord>("/v1/claims", &diagnostic)
     })

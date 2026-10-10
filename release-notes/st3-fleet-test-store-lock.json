@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Stop the fleet test fixture daemon during direct claims store inspection.",
+  "replay": { "status": "none", "detail": "Test-only change; no runtime replay changes." },
+  "schema": { "status": "none", "detail": "Test-only change; no database schema changes." },
+  "rules": { "status": "none", "detail": "Test-only change; no checkpoint or fleet coordination changes." },
+  "compatibility": { "status": "none", "detail": "Test-only change; no client, protocol or harness compatibility changes." },
+  "downtime": { "status": "none", "detail": "Test-only change; no deployed service interruption." },
+  "manual": { "status": "none", "detail": "No manual upgrade steps." },
+  "recovery": { "status": "none", "detail": "Test-only change; no runtime rollback or roll-forward changes." }
+}

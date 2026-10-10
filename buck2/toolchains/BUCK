@@ -1,0 +1,24 @@
+# Generated file - DO NOT EDIT
+# Source: BUCK.genie.ts
+
+load("@capabilities//:defs.bzl", "CAPABILITIES", "GENERATION")
+load("@rules//buck2/platforms:defs.bzl", "host_platform_label")
+load("@rules//buck2/rust:toolchains.bzl", "native_rust_toolchains")
+load("@rules//buck2/toolchains:configured.bzl", "support_tool")
+load("@rules//buck2/toolchains:defs.bzl", "bun_toolchain", "effect_tsgo_toolchain", "nix_go_bootstrap_toolchain", "nix_python_bootstrap_toolchain")
+
+support_tool(name = "archive_tool", protocol = "effect-utils/buck2-archive-tool/v2", tool_id = "archive-tool", visibility = ["PUBLIC"])
+support_tool(name = "product_tool", protocol = "effect-utils/buck2-product/v1", tool_id = "product", visibility = ["PUBLIC"])
+support_tool(name = "tool_coreutils_readlink", protocol = "gnu/coreutils/v9", tool_id = "coreutils-readlink", visibility = ["PUBLIC"])
+native_rust_toolchains(capabilities = CAPABILITIES, generation = GENERATION, target_platform = "@rules" + host_platform_label())
+nix_python_bootstrap_toolchain(name = "python_bootstrap", capabilities = CAPABILITIES, generation = GENERATION, visibility = ["PUBLIC"])
+nix_go_bootstrap_toolchain(name = "go_bootstrap", capabilities = CAPABILITIES, generation = GENERATION, visibility = ["PUBLIC"])
+bun_toolchain(name = "bun", capabilities = CAPABILITIES, generation = GENERATION, visibility = ["PUBLIC"])
+effect_tsgo_toolchain(
+    name = "effect_tsgo",
+    capabilities = CAPABILITIES,
+    generation = GENERATION,
+    runner = "@rules//:packages/@overeng/buck2-tools/src/typescript-runner.ts",
+    visibility = ["PUBLIC"],
+)
+

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add default-off, one-request private phase diagnostics for conversation relays",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, derived state or conversation content storage is introduced."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index, migration or schema version changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, signature, admission or retention rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Existing requests, signed bodies and headers, response envelopes, authority, routing, limits and deadlines are preserved; selected traces reuse the existing response UUID and authenticated body digest."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "This change adds no service interruption beyond the existing deployment lifecycle. Diagnostics remain disabled unless explicitly selected before process startup."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No mandatory operator action. Any optional private diagnostic selection or live activation remains a separately scoped operational decision."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No durable state to recover. One-shot selectors and bounded trace state are process-local and are discarded at exit."
+  }
+}
