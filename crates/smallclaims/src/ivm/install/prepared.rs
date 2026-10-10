@@ -95,6 +95,12 @@ struct Table {
     columns: Vec<String>,
     keys: Vec<String>,
 }
+// Private, one-call staging only: no schema authority or reusable proof. The image
+// is consumed after the caller's final cookie check and is dropped on refusal.
+struct TableImage {
+    tables: BTreeMap<String, Table>,
+}
+
 #[derive(Clone, Debug)]
 struct Write {
     sql: String,
@@ -211,6 +217,16 @@ impl PreparedPage {
         // The caller owns one preparation snapshot. Stage read-only metadata privately;
         // the final schema check below rejects a changed cut before accepting any table.
         // A second cookie read here does not strengthen that same-cut acceptance check.
+        let image = self.capture_table_image(db, names)?;
+        ensure!(
+            schema_version(db)? == self.schema_version,
+            "prepared table schema changed"
+        );
+        self.tables.extend(image.tables);
+        Ok(())
+    }
+
+    fn capture_table_image(&self, db: &Connection, names: &[&str]) -> Result<TableImage> {
         let tables = self.capture_table_shapes(db, names)?;
         // The materialized inventory preserves the old 256-table refusal. A LEFT JOIN
         // emits a row even for a table with no foreign keys. Stream counts per table to
@@ -260,12 +276,7 @@ impl PreparedPage {
                 "prepared schema inventory exceeds bound"
             );
         }
-        ensure!(
-            schema_version(db)? == self.schema_version,
-            "prepared table schema changed"
-        );
-        self.tables.extend(tables);
-        Ok(())
+        Ok(TableImage { tables })
     }
 
     fn capture_table_shapes(

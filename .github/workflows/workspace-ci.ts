@@ -41,7 +41,8 @@ export const linuxActionlintConfig = {
  * GitHub API how many ci1 runners are idle before the other jobs start, and their `runs-on` reads its
  * output. Trusted PRs labelled `ci-priority` use the reserved `ci1-priority` lane.
  * Merge groups use the local pool only when five workers are idle and two general
- * workers remain for PRs; otherwise the whole group uses Namespace. Explicit
+ * workers remain for PRs. Smaller pools may take the primary test shard and mail
+ * canaries, retaining two general slots even if a merge job takes a mixed worker. Explicit
  * CI_MERGE_CI1=on retains the incident's forced-local override.
  *
  * Off unless the repository variable `CI1_RUNNERS` is `on`: then `pick-runner` is skipped, its output
@@ -65,6 +66,8 @@ export const pickRunnerJob = {
     ci1_secondary: '${{ steps.pick.outputs.ci1_secondary }}',
     ci1_mail: '${{ steps.pick.outputs.ci1_mail }}',
     merge_ci1: '${{ steps.pick.outputs.merge_ci1 }}',
+    merge_primary: '${{ steps.pick.outputs.merge_primary }}',
+    merge_mail: '${{ steps.pick.outputs.merge_mail }}',
   },
   steps: [
     {
@@ -108,19 +111,28 @@ if [ "$EVENT" = merge_group ] && [ "$MERGE_LOCAL_ONLY" != on ]; then
   if ! runners=$(timeout 20s gh api --paginate --slurp "orgs/$OWNER/actions/runners?per_page=100" 2>/dev/null); then
     namespace "merge overflow: runner status unavailable"
   fi
-  if ! capacity=$(jq -er '
+  if ! capacity=$(jq -ec '
     [.[].runners[] | select(.status == "online" and .busy == false)] | unique_by(.id) |
     def has($label): any(.labels[]; .name == $label);
     ([.[] | select(has("ci1-merge") and (has("ci1-priority") | not))]) as $merge |
     ([.[] | select(has("ci1") and (has("ci1-priority") | not))] | length) as $general |
     ([$merge[] | select(has("ci1") | not)] | length) as $dedicated |
-    if ($merge | length) >= 5 and ($general - ([0, 5 - $dedicated] | max)) >= 2
-    then "local" else "namespace" end' <<< "$runners"); then
+    {whole: (($merge | length) >= 5 and ($general - ([0, 5 - $dedicated] | max)) >= 2),
+     partial: ([2, ($merge | length), ([0, $general - 2] | max)] | min)}' <<< "$runners"); then
     namespace "merge overflow: invalid runner status"
   fi
-  [ "$capacity" = local ] || namespace "merge overflow: retain two PR slots or wait for local capacity"
-  printf 'merge_ci1=["ci1-merge"]\\n' >> "$GITHUB_OUTPUT"
-  printf 'Merge group: **ci1** (five idle workers, two general PR slots retained)\\n' >> "$GITHUB_STEP_SUMMARY"
+  if [ "$(jq -r '.whole' <<< "$capacity")" = true ]; then
+    printf 'merge_ci1=["ci1-merge"]\\n' >> "$GITHUB_OUTPUT"
+    printf 'Merge group: **ci1** (five idle workers, two general PR slots retained)\\n' >> "$GITHUB_STEP_SUMMARY"
+    exit 0
+  fi
+  partial=$(jq -r '.partial' <<< "$capacity")
+  [ "$partial" -ge 1 ] || namespace "merge overflow: retain two PR slots or wait for local capacity"
+  printf 'merge_primary=["ci1-merge"]\\n' >> "$GITHUB_OUTPUT"
+  if [ "$partial" -ge 2 ]; then
+    printf 'merge_mail=["ci1-merge"]\\n' >> "$GITHUB_OUTPUT"
+  fi
+  printf 'Merge consumers: **ci1** (primary shard%s; two general PR slots retained); producer and other jobs: **Namespace**\\n' "$( [ "$partial" -ge 2 ] && printf ' and mail canaries' || true )" >> "$GITHUB_STEP_SUMMARY"
   exit 0
 fi
 if [ "$EVENT" = merge_group ]; then
@@ -168,8 +180,8 @@ done`,
 // Merge routing applies to the whole group. The explicit local override is retained;
 // otherwise the picker may admit a local group only with room left for PR checks.
 const mergeCi1Labels = `github.event_name == 'merge_group' && (vars.CI_MERGE_CI1 == 'on' && '["ci1-merge"]' || needs.pick-runner.outputs.merge_ci1)`
-const pickedOr = (namespaceLabels: string, output = 'ci1') =>
-  `\${{ fromJSON(${mergeCi1Labels} || (github.event_name != 'merge_group' && needs.${pickRunnerJobId}.outputs.${output}) || ${namespaceLabels}) }}`
+const pickedOr = (namespaceLabels: string, output = 'ci1', mergeOutput?: string) =>
+  `\${{ fromJSON(${mergeCi1Labels} || ${mergeOutput ? `(github.event_name == 'merge_group' && needs.${pickRunnerJobId}.outputs.${mergeOutput}) || ` : ''}(github.event_name != 'merge_group' && needs.${pickRunnerJobId}.outputs.${output}) || ${namespaceLabels}) }}`
 
 // Required PR and merge checks share the first class. PR checks are prerequisites
 // for the merge queue: serving every new merge ahead of them can starve that input.
@@ -185,6 +197,9 @@ export const linuxStageRunsOn = pickedOr(
   namespaceLabels(linuxStageRunner),
 )
 
+/** A partial merge allocation goes only to the primary consumer, never its producer. */
+export const primaryTestRunsOn = pickedOr(namespaceLabels(linuxStageRunner), 'ci1', 'merge_primary')
+
 /** Extra jobs use idle general slots unless all merge work is routed to the provisioned reserve. */
 export const secondaryStageRunsOn = pickedOr(
   namespaceLabels(linuxStageRunner),
@@ -193,6 +208,7 @@ export const secondaryStageRunsOn = pickedOr(
 export const mailStageRunsOn = pickedOr(
   namespaceLabels(linuxStageRunner),
   'ci1_mail',
+  'merge_mail',
 )
 
 /** `runs-on` for a Linux profile job: picked ci1, else the shared Namespace queue class. */

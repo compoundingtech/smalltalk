@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Use smaller idle local merge capacity for the primary test consumer and mail canaries when a whole merge group does not fit, retaining two general PR slots in the admission snapshot.",
+  "replay": {
+    "status": "none",
+    "detail": "CI routing only; production code, source/artifact guards, test selection, budgets and retry policy are unchanged. Existing repository switches and runner configuration require no change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI routing only; production code, source/artifact guards, test selection, budgets and retry policy are unchanged. Existing repository switches and runner configuration require no change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI routing only; production code, source/artifact guards, test selection, budgets and retry policy are unchanged. Existing repository switches and runner configuration require no change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI routing only; production code, source/artifact guards, test selection, budgets and retry policy are unchanged. Existing repository switches and runner configuration require no change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI routing only; production code, source/artifact guards, test selection, budgets and retry policy are unchanged. Existing repository switches and runner configuration require no change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "CI routing only; production code, source/artifact guards, test selection, budgets and retry policy are unchanged. Existing repository switches and runner configuration require no change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI routing only; production code, source/artifact guards, test selection, budgets and retry policy are unchanged. Existing repository switches and runner configuration require no change."
+  }
+}
