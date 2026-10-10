@@ -12,6 +12,23 @@
     { "$ref": "#/$defs/PairingAdvertisement" }
   ],
   "$defs": {
+    "DirectiveNote": {
+      "description": "A person's current advisory note. It never assigns work, grants authority or satisfies a gate.",
+      "type": "object", "additionalProperties": false,
+      "required": ["person", "author", "time", "text", "revision"],
+      "properties": {
+        "person": {"type": "string", "pattern": "^person/[^/\\s]+$"},
+        "author": {"type": "string", "pattern": "^person/[^/\\s]+$"},
+        "time": {"$ref": "#/$defs/Timestamp"},
+        "text": {"type": "string", "minLength": 1, "maxLength": 4096, "description": "At most 4096 UTF-8 bytes; whitespace-only text is refused."},
+        "expires_at": {"oneOf": [{"$ref": "#/$defs/Timestamp"}, {"type": "null"}]},
+        "revision": {"type": "string"}
+      }
+    },
+    "DirectiveNotes": {
+      "type": "object", "additionalProperties": false, "required": ["notes"],
+      "properties": {"notes": {"type": "array", "items": {"$ref": "#/$defs/DirectiveNote"}}}
+    },
     "PairingAdvertisement": {
       "description": "Static unauthenticated pairing preflight; no envelope, presence update or graph information.",
       "type": "object", "additionalProperties": false,
@@ -143,6 +160,7 @@
         "snapshot": { "$ref": "#/$defs/Snapshot" },
         "value": {
           "oneOf": [
+            { "$ref": "#/$defs/DirectiveNotes" },
             { "$ref": "#/$defs/Capabilities" },
             { "$ref": "#/$defs/DocumentContent" },
             { "$ref": "#/$defs/SubjectDefinition" },

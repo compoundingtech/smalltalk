@@ -221,6 +221,8 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn subject_definition(&self, subject: &str, show_env_values: bool) -> Result<Envelope<SubjectDefinition>, ClientError> {{ self.get(&format!(\"/v1/client/subject-definition?subject={{}}&show_env_values={{show_env_values}}\", percent_encode(subject))).await }}"
             )?;
+        } else if id == "notes.list" {
+            writeln!(out, "    pub async fn notes_list(&self) -> Result<Envelope<DirectiveNotes>, ClientError> {{ self.get(\"/v1/client/notes\").await }}")?;
         } else if id == "clients.list" {
             writeln!(
                 out,
@@ -380,6 +382,8 @@ fn swift_operation_methods(
                 out,
                 "    public func conversationSearch(text: String, agent: String? = nil, since: String? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ConversationSearch> {{ var query: [URLQueryItem] = [.init(name: \"text\", value: text)]; for (name, value) in [(\"agent\", agent), (\"since\", since), (\"cursor\", cursor)] {{ if let value {{ query.append(.init(name: name, value: value)) }} }}; if let limit {{ query.append(.init(name: \"limit\", value: String(limit))) }}; return try await get(\"v1/client/conversations/search\", query: query) }}"
             )?;
+        } else if id == "notes.list" {
+            writeln!(out, "    public func notesList() async throws -> Envelope<DirectiveNotes> {{ try await get(\"v1/client/notes\") }}")?;
         } else if id == "clients.list" {
             writeln!(
                 out,
@@ -631,6 +635,8 @@ fn validate_surfaces(
         bail!("KNOWN_RESOURCE_KINDS has {listed} kinds; the schema knows {}", known.len());
     }
     for definition in [
+        "DirectiveNote",
+        "DirectiveNotes",
         "ResourceObservation",
         "ResourcesFilter",
         "ResourcesPage",
@@ -1192,6 +1198,8 @@ fn typescript_operation_methods(
                 out,
                 "    async {method}(options: EventOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events'); }}"
             )?;
+        } else if id == "notes.list" {
+            writeln!(out, "    async notesList(): Promise<EnvelopeOf<DirectiveNotes>> {{ return this.get('/v1/client/notes'); }}")?;
         } else if id == "clients.list" {
             writeln!(
                 out,

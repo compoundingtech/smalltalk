@@ -6,6 +6,21 @@ import FoundationNetworking
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
+    func testDirectiveNoteFixturePreservesCurrentAdvisoryMetadata() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/directive-notes.json"))
+        let result = try JSONDecoder().decode(Envelope<DirectiveNotes>.self, from: data)
+        let note = try XCTUnwrap(result.value.notes.first)
+        XCTAssertEqual(note.person, "person/ada")
+        XCTAssertEqual(note.author, note.person)
+        XCTAssertEqual(note.time, "2026-10-10T09:00:00Z")
+        XCTAssertEqual(note.expiresAt, "2026-10-12T09:00:00Z")
+        XCTAssertEqual(note.revision, "claim/example")
+        let empty = try JSONDecoder().decode(DirectiveNotes.self, from: Data(#"{"notes":[]}"#.utf8))
+        XCTAssertTrue(empty.notes.isEmpty)
+    }
+
     func testCreationActionFixtures() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }

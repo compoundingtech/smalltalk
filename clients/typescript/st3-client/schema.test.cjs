@@ -4,6 +4,21 @@ const assert = require('node:assert/strict');
 // Node 24 loads the generated TypeScript directly, without a transpilation copy.
 const modules = Promise.all([import('effect'), import('./Schema.generated.ts')]);
 
+test('directive notes decode metadata and expiry without becoming gate evidence', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const wire = require('../../../docs/st3/client-v0/fixtures/directive-notes.json').value;
+    const decode = Rich.decodeUnknownSync(Rich.DirectiveNotes, 'strict');
+    const result = Schema.encodeSync(Rich.DirectiveNotes)(decode(wire));
+    assert.equal(result.notes[0].person, 'person/ada');
+    assert.equal(result.notes[0].author, 'person/ada');
+    assert.equal(result.notes[0].expires_at, '2026-10-12T09:00:00.000Z');
+    assert.equal(result.notes[0].text, wire.notes[0].text);
+    assert.deepEqual(Schema.encodeSync(Rich.DirectiveNotes)(decode({ notes: [] })), { notes: [] });
+    const invalid = structuredClone(wire);
+    invalid.notes[0].time = '2026-02-30T09:00:00Z';
+    assert.throws(() => decode(invalid));
+});
+
 test('person-ask mission rows retain actor references through the generated decoder', async () => {
     const [{ Schema }, Rich] = await modules;
     const wire = require('../../../docs/st3/client-v0/fixtures/person-ask-mission.json');

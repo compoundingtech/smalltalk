@@ -1,0 +1,23 @@
+{
+  "api_version": "st3.client.v0",
+  "request_id": "request/example",
+  "snapshot": {
+    "id": "snapshot/example",
+    "host_id": "host/example",
+    "store_index": 12,
+    "projection_version": "client-projection.v0",
+    "created_at": "2026-10-10T10:00:00Z"
+  },
+  "value": {
+    "notes": [
+      {
+        "person": "person/ada",
+        "author": "person/ada",
+        "time": "2026-10-10T09:00:00Z",
+        "text": "Travelling until Monday; only ask blockers. This is not approval.",
+        "expires_at": "2026-10-12T09:00:00Z",
+        "revision": "claim/example"
+      }
+    ]
+  }
+}

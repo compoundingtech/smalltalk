@@ -22,6 +22,25 @@ const capabilityFixture = require('../../../docs/st3/client-v0/fixtures/capabili
 const cursorGapFixture = require('../../../docs/st3/client-v0/fixtures/cursor-gap-error.json');
 const capabilities = { ...capabilityFixture.value, limits: { ...capabilityFixture.value.limits, max_page_items: 2, max_event_items: 3, max_wait_ms: 10 } };
 
+test('notesList reads the typed advisory current notes endpoint', async () => {
+    const wire = require('../../../docs/st3/client-v0/fixtures/directive-notes.json');
+    const calls = [];
+    const client = new St3Client({
+        baseUrl: 'https://example.test',
+        credential: () => 'test-credential',
+        fetchImpl: async (url, init) => {
+            calls.push([String(url), init]);
+            return response(String(url).endsWith('/capabilities') ? capabilityFixture : wire);
+        },
+    });
+    const result = await client.notesList();
+    assert.deepEqual(result, wire);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0][0], 'https://example.test/v1/client/capabilities');
+    assert.equal(calls[1][0], 'https://example.test/v1/client/notes');
+    assert.equal(calls[1][1].headers.Authorization, 'Bearer test-credential');
+});
+
 const validTraceparent = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
 const traceCases = [
     ['absent callback', undefined, undefined],

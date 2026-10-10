@@ -4,6 +4,23 @@ import Foundation
 public let st3ClientAPIVersion = "st3.client.v0"
 public let st3ClientTerminalSubprotocol = "st3.client.terminal.v0"
 
+/// Current advisory text; never authority, approval, assignment or an answer to an ask.
+public struct DirectiveNote: Codable, Sendable, Equatable {
+    public let person: String
+    public let author: String
+    public let time: String
+    public let text: String
+    public let expiresAt: String?
+    public let revision: String
+    enum CodingKeys: String, CodingKey {
+        case person, author, time, text, revision, expiresAt = "expires_at"
+    }
+}
+
+public struct DirectiveNotes: Codable, Sendable, Equatable {
+    public let notes: [DirectiveNote]
+}
+
 public struct Envelope<Value: Codable & Sendable>: Codable, Sendable {
     public let apiVersion: String
     public let requestID: String

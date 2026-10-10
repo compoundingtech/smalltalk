@@ -6,6 +6,7 @@ description = "Authoritative st3 subject, resource, and claim registry"
 license = "MIT"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 hex = "0.4"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

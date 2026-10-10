@@ -701,7 +701,7 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
 }
 
 /// Tables projected from claims, children before the tables their foreign keys name.
-pub(crate) const PROJECTION_TABLES: [&str; 23] = [
+pub(crate) const PROJECTION_TABLES: [&str; 26] = [
     "operations",
     "arrangement_registers",
     "arrangements",
@@ -709,6 +709,9 @@ pub(crate) const PROJECTION_TABLES: [&str; 23] = [
     "glass_heads",
     "local_glass_head_pending",
     "local_glass_head_dirty",
+    "person_directive_notes",
+    "local_directive_note_pending",
+    "local_directive_note_dirty",
     "desired",
     "documents",
     "event_positions",
@@ -754,6 +757,7 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
     rebuild_planning_tx(transaction)?;
     resources::rebuild(transaction)?;
     glass_heads::rebuild(transaction)?;
+    directive_notes::rebuild(transaction)?;
     arrangements::rebuild(transaction)?;
     Ok(())
 }

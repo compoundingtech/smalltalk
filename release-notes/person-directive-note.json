@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep one current person note that authorized agents can explicitly read",
+  "replay": {
+    "status": "changed",
+    "detail": "The person.directive-note-set claim projects one current note per person, including clear and expired tombstones; canonical claim order and replay preserve the current revision."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Adds the current person-note projection and the person.directive-note-set claim with nullable text and optional UTC expires_at. Notes are nonblank and bounded to 4096 UTF-8 bytes."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Only a person may set or clear their own note. Persons read their own note; agents read only people they work for or who own them. Notes inform and never assign work, approve decisions or grant authority."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Publishing requires anchored fleet membership and every active member advertising features.person_directive_note=1. Legacy peers must be fenced from replication before enabling notes; advertisements alone do not prove complete legacy-peer discovery. GET /v1/client/notes adds explicit reads and PUT /v1/notes provides local person-only writes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No data-dependent startup migration or additional service interruption is required."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Upgrade all active members and fence legacy peers before publishing. Use st note to read, st note set TEXT with optional --expires-at RFC3339 to replace, and st note clear to remove your note. CLI calls use the trusted authenticated local Unix socket. This slice adds no launch delivery, notifications or UI."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Clear or replace your current note through st note. Immutable claim history remains authoritative; rebuild the projection through the existing replay path when needed."
+  }
+}
