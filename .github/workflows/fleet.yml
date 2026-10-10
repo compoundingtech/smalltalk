@@ -1,3 +1,6 @@
+# Generated file - DO NOT EDIT
+# Source: fleet.yml.genie.ts
+
 name: Workspace CI
 
 on:

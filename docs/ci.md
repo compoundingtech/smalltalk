@@ -901,6 +901,12 @@ runner state. Measure actual new-group consumer wait and PR wait after rollout; 
 slow local test or loss of PR headroom must remain visible.
 `CI_MERGE_CI1=on` retains the explicit forced-local switch for supported incidents.
 PR/fork/priority routing is unchanged. No job is migrated after it starts.
+If a selected local consumer waits for more than five minutes, the CI capacity owner
+checks that named runner registration and job. Preserve running work; restore an
+intentionally admitted healthy local worker or repair its supported registration.
+A queued job cannot acquire new runs-on labels. If no compatible worker can be
+restored, retain the failure and use the ordinary curator requeue path after a
+reviewed routing correction; do not blind-retry or reopen an isolated runner.
 
 `CI_MERGE_NAMESPACE_PROFILE` may name an existing, verified Linux profile; unset
 uses the existing 8x16 stage labels and Linux profile for supporting jobs, including
