@@ -130,7 +130,7 @@ impl Store {
     /// One bounded bootstrap job on the existing FIFO writer. The daemon awaits this job
     /// and pauses between jobs, so several per-claim projections cannot multiply its budget.
     pub fn advance_coordination_counts(&self) -> Result<bool> {
-        self.connection.batched(backfill)?
+        self.connection.batched(backfill).map_err(anyhow::Error::msg)?
     }
 
     /// One covering range read; counts distinct message subjects, including already read mail.
