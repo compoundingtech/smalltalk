@@ -10,6 +10,7 @@ import { colorVars as c, typeVars as t, spaceVars as s } from '../../../../packa
 import { compactTime } from '../../../../packages/fractal-ui/src/assistant-ui/sidebar/model.ts'
 import { useDataSource, useNow } from '../data/react.tsx'
 import { unavailable, waiting, type Feed } from '../data/source.ts'
+import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
 import { resourceState, resourceTitle, type ResourcePage } from '../resources/agent/model.ts'
 import { systemEventsPreference } from './conversationPreferences.ts'
 
@@ -62,6 +63,10 @@ const ResourceContents = ({ agentRef, resources }: {
   const queue = useAtomValue(source.subjectReads.agentQueue.feed(agentRef))
   const now = useNow()
   return <div {...stylex.props(styles.contents)}>
+    <section aria-label="Todos">
+      <h2 {...stylex.props(styles.sectionTitle)}>Todos</h2>
+      <LiveAgentTodos agentRef={agentRef} placement="resources" />
+    </section>
     <section aria-label="Agent queue">
       <h2 {...stylex.props(styles.sectionTitle)}>Agent queue</h2>
       {queue._tag !== 'Observed' ? <ReadNotice feed={queue} label="Agent queue" /> : <>

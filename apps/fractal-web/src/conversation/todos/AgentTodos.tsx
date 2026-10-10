@@ -17,6 +17,7 @@ const occurrenceKey = ({ counts, parts }: { counts: Map<string, number>; parts: 
 }
 
 const styles = stylex.create({
+  resources: { color: 'inherit', fontSize: '0.75rem' },
   pinned: {
     width: '100%',
     minWidth: 0,
@@ -103,14 +104,17 @@ const statusMarks = { pending: '○', in_progress: '◉', completed: '✓', bloc
 export const AgentTodos = ({
   state,
   detail = false,
+  placement = 'pinned',
 }: {
   readonly state: TodoState
   readonly detail?: boolean
+  /** `resources`: a section of the Resources view; it names every state instead of hiding unobserved ones. */
+  readonly placement?: 'pinned' | 'resources'
 }): React.ReactNode => {
   if (state._tag !== 'Observed') {
-    if (!detail) return null
+    if (!detail && placement !== 'resources') return null
     return (
-      <p role="status" {...stylex.props(styles.detail)}>
+      <p role="status" {...stylex.props(placement === 'resources' ? styles.resources : styles.detail)}>
         {state._tag === 'Waiting'
           ? 'Waiting for todo observations…'
           : state._tag === 'Unavailable'
@@ -218,8 +222,8 @@ export const AgentTodos = ({
       {list}
     </section>
   ) : (
-    <div {...stylex.props(styles.pinned)}>
-      <details aria-label="Harness todos" {...stylex.props(styles.strip)}>
+    <div {...stylex.props(placement === 'resources' ? styles.resources : styles.pinned)}>
+      <details aria-label="Harness todos" {...stylex.props(placement === 'pinned' && styles.strip)}>
         <summary {...stylex.props(styles.summary)}>
           <span {...stylex.props(styles.summaryRow)}>
             <span title={label} {...stylex.props(styles.phase)}>
@@ -248,11 +252,13 @@ export const AgentTodos = ({
 export const LiveAgentTodos = ({
   agentRef,
   detail = false,
+  placement,
 }: {
   readonly agentRef: string
   readonly detail?: boolean
+  readonly placement?: 'pinned' | 'resources'
 }): React.ReactNode => {
   const source = useDataSource()
   const state = useAtomValue(agentTodosAtom({ source, agentRef }))
-  return <AgentTodos state={state} detail={detail} />
+  return <AgentTodos state={state} detail={detail} {...(placement === undefined ? {} : { placement })} />
 }
