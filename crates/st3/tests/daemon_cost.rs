@@ -21,6 +21,9 @@
 //! list that answers ten times more rows may read ten times more, and a request that answers the
 //! same must read about the same. Small differences under [`SLACK`] steps pass.
 //!
+//! Additive work/mission `progress_at` serialization uses timestamps already hydrated by these
+//! routes; lightweight mission cards return null and do not add summary reads.
+//!
 //! It covers every route the daemon serves: each is measured or listed in [`NOT_MEASURED`] with
 //! the reason, and a new route fails the check until it is one or the other. Beyond the routes it
 //! measures replication receive and export as the replication worker calls them, and the deletes
