@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "A database target per member: pages in use, and their daily growth",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers. The daemon keeps up to two days of hourly size samples in meta under database_size_samples."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "changed", "detail": "slo/targets.toml gains a [database] table (max_live_gb, max_growth_mb_per_day); the request-latency read adds a database row with the newest size sample, and st doctor adds an slo/database line, info when missed."},
+  "downtime": {"status": "none", "detail": "None. The hourly sample reads three pragmas and writes one meta row."},
+  "manual": {"status": "none", "detail": "No manual step. Growth appears an hour after start; a full day's growth after a day of samples."},
+  "recovery": {"status": "none", "detail": "Binary rollback ignores the meta row."}
+}

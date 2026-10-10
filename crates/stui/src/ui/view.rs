@@ -147,6 +147,26 @@ pub struct Attention {
     pub raised_by: Option<String>,
     /// The mission step waiting on this ask, on an ask a mission step made.
     pub blocked: Option<Blocked>,
+    /// Every agent conversation this item shows in, as st names them: the item is an alert in
+    /// each. Empty when st does not name one (an older st), and then `agent` is the guess.
+    pub conversations: Vec<String>,
+}
+
+impl Attention {
+    /// Whether it blocks or waits on the person. An update asks nothing and a message stays in
+    /// its conversation; every other card waits on an answer.
+    pub fn is_alert(&self) -> bool {
+        self.kind.is_alert()
+    }
+
+    /// Whether it shows in the conversation of `agent`.
+    pub fn is_in(&self, agent: &str) -> bool {
+        if self.conversations.is_empty() {
+            self.agent.as_deref() == Some(agent)
+        } else {
+            self.conversations.iter().any(|conversation| conversation == agent)
+        }
+    }
 }
 
 /// The mission step that asked and waits for the answer.
@@ -199,6 +219,25 @@ pub enum AttentionKind {
         from: String,
         body: String,
     },
+    /// A native prompt a seat's harness shows in its terminal and waits on: a permission, a
+    /// question or a review. It clears when the harness reports it gone, however it was answered.
+    Prompt {
+        /// The seat, and its graph id.
+        seat: String,
+        seat_id: String,
+        /// What st says it is about; the call it would make is in the seat's conversation.
+        text: String,
+        /// Answers a client may send (`allow`, `deny`); empty when the prompt is answered in
+        /// the seat's terminal.
+        answers: Vec<String>,
+        /// The harness observation that opened it, which an answer names.
+        episode: String,
+    },
+    /// A harness not signed in to its provider; one sign-in answers every seat that shares it.
+    Login {
+        text: String,
+        seats: Vec<String>,
+    },
     /// An agent is stopped until the person decides or answers something.
     Request {
         /// Who asks, named, and its graph id to reply to.
@@ -222,6 +261,11 @@ pub enum AttentionKind {
 }
 
 impl AttentionKind {
+    /// Whether a card of this kind blocks or waits on the person.
+    pub fn is_alert(&self) -> bool {
+        !matches!(self, AttentionKind::Update { .. } | AttentionKind::Message { .. })
+    }
+
     pub fn word(&self) -> &'static str {
         match self {
             AttentionKind::Review { .. } => "review",
@@ -230,6 +274,8 @@ impl AttentionKind {
             AttentionKind::Revision { .. } => "revision",
             AttentionKind::Fault { .. } => "fault",
             AttentionKind::Message { .. } => "message",
+            AttentionKind::Prompt { .. } => "prompt",
+            AttentionKind::Login { .. } => "login",
             AttentionKind::Request { .. } => "request",
             AttentionKind::Update { .. } => "update",
         }
@@ -294,6 +340,9 @@ pub enum AgentState {
     NeedsLogin,
     Fault,
     Working,
+    /// Its harness is compacting its conversation. A status of the seat, not work and never an
+    /// alert: nothing waits on the person.
+    Compacting,
     Idle,
     Starting,
     Stopped,

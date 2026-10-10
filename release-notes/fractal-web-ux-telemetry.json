@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Measure browser reload, conversation data-ready and painted UX with end-to-end trace propagation and early roster connection",
+  "replay": { "status": "none", "detail": "No event replay or claim behavior changes." },
+  "schema": { "status": "none", "detail": "No durable schema or migration changes. Trace context is optional transport metadata." },
+  "rules": { "status": "none", "detail": "No daemon checkpoint or fleet rules change." },
+  "compatibility": { "status": "none", "detail": "Legacy daemons ignore the optional subscribe-frame trace field. Browser HTTP and WebSocket upgrades continue through validated gateway trace parents. Transcript paint and send-echo completion remain feature-owned hooks; this stack emits real conversation data-ready observations without fabricating a painted transcript." },
+  "downtime": { "status": "none", "detail": "Normal browser reload adopts a page-owned early roster socket; no persistent socket or cache state is introduced." },
+  "manual": { "status": "none", "detail": "Dogfood sampling is 100% of pages, including cheap budget roots and SDK detail. Feature renderers call transcriptCommitted after DOM commit; composer implementations complete beginSendEcho only on a verified matching echo commit." },
+  "recovery": { "status": "none", "detail": "Reloading the previous frontend removes page-local bootstrap and tracing behavior; no persistent state requires recovery." }
+}

@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""Small adversarial fixtures for the fail-closed read diagnostic."""
+
+import importlib.machinery
+import hashlib
+import json
+import pathlib
+import tempfile
+import time
+import unittest
+from unittest import mock
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+report = importlib.machinery.SourceFileLoader(
+    "read_contract_report", str(ROOT / "scripts/read-contract-report")
+).load_module()
+HEAD = "a" * 40
+class ReadContractReportTest(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.artifact = pathlib.Path(scratch.name) / "evidence.txt"
+        self.artifact.write_bytes(b"populated exact answer\n")
+        self.hash = hashlib.sha256(self.artifact.read_bytes()).hexdigest()
+
+    def evidence(self, *names):
+        return {field: value for name in names for field, value in (
+            (f"{name}_sha256", self.hash), (f"{name}_path", str(self.artifact))
+        )}
+
+    def receipt(self, **overrides):
+        row = {
+            "source_head": HEAD, "result": "pass", "populated": True,
+            "selected_tests": 1, "meaningful_units": 1, "successful_calls": 1,
+            "error_count": 0, "exit_code": 0,
+            **self.evidence("fixture", "oracle", "raw_log", "canonical_expected", "canonical_actual"),
+        }
+        row.update(overrides)
+        return row
+
+    def test_private_class_policy_is_omitted_and_cannot_qualify(self):
+        self.assertIn(
+            "class target policy and decision provenance are omitted from this public diagnostic",
+            report.UNIMPLEMENTED_SAFETY_GATES,
+        )
+        self.assertIsNone(report.APPROVED_TARGET_CONFIG_SHA256)
+        self.assertIsNone(report.APPROVED_TARGET_APPROVAL_SHA256)
+
+    def mutation_edge(self, kind):
+        after_path = self.artifact.parent / "affected-after.txt"
+        after_path.write_bytes(b"affected row changed\n")
+        after_sha = hashlib.sha256(after_path.read_bytes()).hexdigest()
+        case = {"mutation": "insert", "populated": True,
+                "successful_calls": 1, "error_count": 0,
+                "changed_rows": 1, "unrelated_changed_rows": 0,
+                "invalidation_events": 1,
+                **self.evidence("affected_before", "unrelated_before", "unrelated_after",
+                                "canonical_expected", "canonical_actual"),
+                "affected_after_path": str(after_path), "affected_after_sha256": after_sha,
+                **{name: 10 for name in report.WORK_METRICS}}
+        log = self.artifact.parent / f"mutation-{hashlib.sha256(kind.encode()).hexdigest()[:16]}.json"
+        log.write_text(json.dumps({"source_head": HEAD, "kind": kind, "view": "invented-view",
+                                   "invalidation_key": "invented-key", "result": "pass",
+                                   "cases": [{**case, "scale": "small", "graph_claims": 100},
+                                             {**case, "scale": "large", "graph_claims": 1000}]}))
+        return {"view": "invented-view", "invalidation_key": "invented-key",
+                "work_caps": {name: 100 for name in report.WORK_METRICS},
+                "mutation_receipt": {"mutation_log_path": str(log),
+                                     "mutation_log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(),
+                                     **self.evidence("fixture")}}
+
+    def test_real_source_registration_matches_pinned_inventory(self):
+        api_source = (ROOT / "crates/st3/src/api.rs").read_text()
+        peer_source = (ROOT / "crates/st3/src/peer.rs").read_text()
+        handlers = report.registered_route_handlers(api_source, peer_source)
+        actual = report.registered_routes(api_source, peer_source)
+        self.assertEqual(set(handlers), actual)
+        self.assertEqual(handlers["POST /v1/internal/client-read/forward"],
+                         "forward_client_read")
+        self.assertEqual(handlers["GET /v1/client/capabilities"],
+                         "client_capabilities")
+        definitions = report.registered_handler_definitions(ROOT, handlers)
+        self.assertEqual(set(definitions), actual)
+        self.assertIn(
+            "handler lexical resolution lacks exhaustive Rust cfg, macro and conditional-compilation validation",
+            report.UNIMPLEMENTED_SAFETY_GATES,
+        )
+        self.assertEqual(
+            definitions["GET /v1/client/capabilities"]["source_file"],
+            "crates/st3/src/api.rs",
+        )
+        self.assertEqual(
+            definitions["POST /v1/internal/client-read/forward"]["handler"],
+            "forward_client_read",
+        )
+        with self.assertRaisesRegex(report.InventoryError, "0 lexical candidate definitions"):
+            report.registered_handler_definitions(ROOT, {"GET /invented": "missing_handler"})
+        invented_root = self.artifact.parent / "invented-source"
+        invented_api = invented_root / "crates/st3/src/api.rs"
+        invented_api.parent.mkdir(parents=True, exist_ok=True)
+        invented_api.write_text('''#[cfg(test)]
+mod alternate_test_module {
+    fn missing_production_handler() { let _ = r#"}"#; }
+    mod nested { fn other() { /* } */ } }
+}
+async fn real_production_handler() {}
+''')
+        with self.assertRaisesRegex(report.InventoryError, "0 lexical candidate definitions"):
+            report.registered_handler_definitions(
+                invented_root, {"GET /invented": "missing_production_handler"}
+            )
+        self.assertEqual(
+            report.registered_handler_definitions(
+                invented_root, {"GET /real": "real_production_handler"}
+            )["GET /real"]["source_line"], 6,
+        )
+        with self.assertRaisesRegex(report.InventoryError, "unresolved handler expression"):
+            report.registered_route_handlers(
+                api_source.replace("get(health)", "get(|| async { health() })", 1),
+                peer_source,
+            )
+        # The private pinned ledger supplies full equality in the diagnostic invocation.
+        self.assertEqual(len(actual), 241)
+        self.assertIn("POST /v1/internal/client-read/forward", actual)
+        self.assertEqual(handlers["GET /v1/events/page"], "events_page")
+        self.assertEqual(handlers["POST /v1/internal/replication/worker-status"],
+                         "replication_worker_status")
+        self.assertEqual(handlers["POST /v1/work/delegation"], "set_delegation_policy")
+        specs = report.registered_claim_specs((ROOT / "crates/st3-schema/src/lib.rs").read_text())
+        kinds = set(specs)
+        self.assertEqual(len(kinds), 139)
+        self.assertIn("custom.*.*", kinds)
+        self.assertEqual(specs["agent.account"]["subject_types"], ["agent"])
+        self.assertEqual(specs["agent.account"]["declared_primary_projection"], "agents")
+        self.assertIsNone(specs["custom.*.*"]["declared_primary_projection"])
+        peer = (ROOT / "crates/st3/src/peer.rs").read_text()
+        self.assertEqual(len(report.registered_client_read_variants(peer)), 10)
+        self.assertEqual(report.registered_peer_protocol_routes(peer), {
+            "POST /v1/peer/client-read", "POST /v1/internal/client-read/forward"
+        })
+
+    def test_cfg_macro_and_ambiguous_handler_locations_remain_nonqualifying(self):
+        invented_root = self.artifact.parent / "conditional-source"
+        api = invented_root / "crates/st3/src/api.rs"
+        api.parent.mkdir(parents=True, exist_ok=True)
+        api.write_text('''#[cfg(feature = "invented")]
+async fn conditional_handler() {}
+macro_rules! define_handler { ($name:ident) => { async fn $name() {} }; }
+define_handler!(macro_handler);
+async fn ambiguous_handler() {}
+async fn ambiguous_handler() {}
+''')
+        location = report.registered_handler_definitions(
+            invented_root, {"GET /conditional": "conditional_handler"}
+        )["GET /conditional"]
+        self.assertEqual(location["qualification"], "source-location-only")
+        self.assertEqual(location["source_line"], 2)
+        self.assertIn(
+            "handler lexical resolution lacks exhaustive Rust cfg, macro and conditional-compilation validation",
+            report.UNIMPLEMENTED_SAFETY_GATES,
+        )
+        with self.assertRaisesRegex(report.InventoryError, "0 lexical candidate definitions"):
+            report.registered_handler_definitions(
+                invented_root, {"GET /macro": "macro_handler"}
+            )
+        with self.assertRaisesRegex(report.InventoryError, "2 lexical candidate definitions"):
+            report.registered_handler_definitions(
+                invented_root, {"GET /ambiguous": "ambiguous_handler"}
+            )
+
+    def test_lifetimes_do_not_hide_test_module_braces(self):
+        source = '''#[cfg(test)]
+mod tests {
+    fn first<'a>() { let _ = { 1 }; }
+    mod nested { fn second<'b>() {} }
+}
+async fn real_handler() {}
+'''
+        production = report.without_root_test_modules(source)
+        self.assertNotIn("first", production)
+        self.assertNotIn("second", production)
+        self.assertEqual(production.count("\n"), source.count("\n"))
+        self.assertIn("async fn real_handler()", production)
+
+    def test_new_client_read_variant_changes_inventory(self):
+        peer = (ROOT / "crates/st3/src/peer.rs").read_text()
+        changed = peer.replace("pub enum ClientReadOperation {",
+                               "pub enum ClientReadOperation {\n    Invented { value: String },", 1)
+        self.assertIn("Invented", report.registered_client_read_variants(changed))
+        for declaration in ("InventedUnit,", "InventedTuple(String),"):
+            with self.subTest(declaration=declaration):
+                unsupported = peer.replace("pub enum ClientReadOperation {",
+                                           f"pub enum ClientReadOperation {{\n    {declaration}", 1)
+                with self.assertRaisesRegex(report.InventoryError,
+                                            "unsupported client-read operation variant form"):
+                    report.registered_client_read_variants(unsupported)
+
+    def test_unknown_path_expression_is_rejected(self):
+        source = (ROOT / "crates/st3/src/api.rs").read_text().replace(
+            '"/v1/health", get(health)', 'crate::peer::UNKNOWN_PATH, get(health)', 1
+        )
+        peer = (ROOT / "crates/st3/src/peer.rs").read_text()
+        with self.assertRaisesRegex(report.InventoryError, "unknown route path expression"):
+            report.registered_routes(source, peer)
+
+    def test_unknown_method_nest_and_helper_registrations_are_rejected(self):
+        source = (ROOT / "crates/st3/src/api.rs").read_text()
+        peer = (ROOT / "crates/st3/src/peer.rs").read_text()
+        variants = (
+            (source.replace("get(health)", "get(health).head(other)", 1),
+             "unknown route method chain"),
+            (source.replace('        .route("/v1/health"',
+                            '        .nest("/invented", helper())\n        .route("/v1/health"', 1),
+             "unknown router method, nest or helper"),
+            (source.replace(".with_state(state)\n}\n\nasync fn schema()",
+                            ".merge(helper()).with_state(state)\n}\n\nasync fn schema()", 1),
+             "unknown router helper or middleware"),
+        )
+        for changed, error in variants:
+            with self.subTest(error=error), self.assertRaisesRegex(report.InventoryError, error):
+                report.registered_routes(changed, peer)
+
+    def test_zero_empty_error_and_wrong_head_never_cover_semantics(self):
+        self.assertTrue(report.complete_receipt(self.receipt(), HEAD))
+        for change in (
+            {"source_head": "c" * 40},
+            {"selected_tests": 0},
+            {"meaningful_units": 0},
+            {"successful_calls": 0},
+            {"error_count": 1},
+            {"exit_code": 1},
+            {"populated": False},
+            {"canonical_actual_sha256": "c" * 64},
+            {"raw_log_sha256": "missing"},
+            {"raw_log_path": "/nonexistent/read-contract-log"},
+        ):
+            with self.subTest(change=change):
+                self.assertFalse(report.complete_receipt(self.receipt(**change), HEAD))
+
+    def test_artifact_bytes_are_verified(self):
+        good = self.receipt()
+        self.assertTrue(report.complete_receipt(good, HEAD))
+        self.artifact.write_bytes(b"different answer\n")
+        self.assertFalse(report.complete_receipt(good, HEAD))
+
+    def test_missing_skipped_cancelled_and_zero_selected_shards_are_red(self):
+        good = {"name": "read-semantics", "status": "passed", "source_head": HEAD,
+                "selected_tests": 1, **self.evidence("raw_log")}
+        manifest = {"required_shards": ["read-semantics"], "shard_receipts": [good]}
+        self.assertTrue(report.complete_shards(manifest, HEAD))
+        for change in ({"status": "skipped"}, {"status": "cancelled"},
+                       {"selected_tests": 0}, {"source_head": "c" * 40}):
+            with self.subTest(change=change):
+                self.assertFalse(report.complete_shards(
+                    {**manifest, "shard_receipts": [{**good, **change}]}, HEAD
+                ))
+        self.assertFalse(report.complete_shards({"required_shards": ["read-semantics"]}, HEAD))
+
+    def test_absolute_receipt_requires_independent_qualified_samples(self):
+        target = {"budget_ms": 100, "min_samples": 300}
+        good = {"source_head": HEAD, "result": "pass", "sample_count": 300,
+                "max_ms": 99.5, "exceedances": 0, "error_count": 0, "empty_count": 0,
+                "host_qualified": True, "independent_reset": True,
+                **self.evidence("binary", "fixture", "raw_log")}
+        self.assertTrue(report.complete_absolute_receipt(good, target, HEAD))
+        for change in ({"sample_count": 299}, {"max_ms": 100.1}, {"max_ms": -1},
+                       {"max_ms": float("nan")},
+                       {"exceedances": 1}, {"error_count": 1}, {"empty_count": 1},
+                       {"host_qualified": False}, {"independent_reset": False},
+                       {"source_head": "c" * 40}, {"raw_log_sha256": "bad"}):
+            with self.subTest(change=change):
+                self.assertFalse(report.complete_absolute_receipt({**good, **change}, target, HEAD))
+
+    def test_two_scale_work_caps_require_populated_absolute_counters(self):
+        caps = {name: 100 for name in report.WORK_METRICS}
+        target = {"work_caps": caps}
+        rows = [
+            {"scale": scale, "graph_claims": claims, "populated": True,
+             "successful_calls": 1, "error_count": 0,
+             **{name: 10 for name in report.WORK_METRICS}}
+            for scale, claims in (("small", 100), ("large", 1000))
+        ]
+
+        def checked(observations):
+            path = self.artifact.parent / "work-log.json"
+            path.write_text(json.dumps({"source_head": HEAD, "result": "pass",
+                                        "observations": observations}))
+            receipt = {"work_log_path": str(path),
+                       "work_log_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            return report.complete_work_receipt(receipt, target, HEAD)
+
+        self.assertTrue(checked(rows))
+        for changed in (
+            [{**rows[0], "vm_steps": 101}, rows[1]],
+            [{**rows[0], "answer_count": 0}, rows[1]],
+            [{**rows[0], "populated": False}, rows[1]],
+            [{**rows[0], "graph_claims": 1000}, rows[1]],
+            [rows[0]],
+        ):
+            with self.subTest(changed=changed):
+                self.assertFalse(checked(changed))
+
+    def test_target_approval_requires_reviewed_source_pins_and_bytes(self):
+        config_path = self.artifact.parent / "targets.json"
+        config_path.write_text(json.dumps({"source_head": HEAD, "source_tree": HEAD,
+                                           "targets": {"GET /invented": {"budget_ms": 100}}}))
+        config_sha = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        approval_path = self.artifact.parent / "approval.json"
+        approval_path.write_text(json.dumps({"status": "approved", "source_head": HEAD,
+                                             "source_tree": HEAD,
+                                             "target_config_sha256": config_sha,
+                                             "reviewer": "invented/reviewer"}))
+        approval_sha = hashlib.sha256(approval_path.read_bytes()).hexdigest()
+        manifest = {"target_config_path": str(config_path), "target_config_sha256": config_sha,
+                    "target_approval_path": str(approval_path),
+                    "target_approval_sha256": approval_sha,
+                    "approved_absolute_targets": {"GET /invented": {"budget_ms": 100}}}
+        self.assertFalse(report.complete_target_approval(manifest, HEAD, HEAD))
+        with mock.patch.object(report, "APPROVED_TARGET_CONFIG_SHA256", config_sha), \
+             mock.patch.object(report, "APPROVED_TARGET_APPROVAL_SHA256", approval_sha):
+            self.assertTrue(report.complete_target_approval(manifest, HEAD, HEAD))
+            self.assertFalse(report.complete_target_approval(manifest, HEAD, "different-tree"))
+            approval_path.write_text(approval_path.read_text() + " ")
+            self.assertFalse(report.complete_target_approval(manifest, HEAD, HEAD))
+
+    def test_cli_inventory_is_executed_from_a_pinned_binary(self):
+        commands = ["invented read", "invented write"]
+        payload = json.dumps({"kind": "st3.cli-inventory.v1", "modes": ["human", "json"],
+                              "commands": commands,
+                              "aliases": {"invented": ["i"], "invented read": ["r"]}}) + "\n"
+        binary = self.artifact.parent / "invented-st"
+        binary.write_text("#!/usr/bin/env python3\nimport sys\n"
+                          "assert sys.argv[1:] == ['--read-contract-inventory-json']\n"
+                          f"sys.stdout.write({payload!r})\n")
+        binary.chmod(0o755)
+        binary_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+        manifest = {
+            "cli_binary_path": str(binary), "cli_binary_sha256": binary_sha,
+            "cli_inventory_sha256": hashlib.sha256(payload.encode()).hexdigest(),
+            "cli_aliases": {"invented": ["i"], "invented read": ["r"]},
+        }
+        self.assertFalse(report.complete_cli_registration(manifest, set(commands)))
+        self.assertTrue(report.complete_cli_registration(
+            manifest, set(commands), trusted_build=True))
+        forged = self.artifact.parent / "forged-ci-attestation.json"
+        forged.write_text(json.dumps({"result": "pass", "checkout_head": HEAD,
+                                      "checkout_tree": HEAD, "binary_sha256": binary_sha,
+                                      "ci_run_id": "invented/run", "workflow_sha256": self.hash}))
+        manifest["cli_ci_attestation_path"] = str(forged)
+        manifest["cli_ci_attestation_sha256"] = hashlib.sha256(forged.read_bytes()).hexdigest()
+        self.assertFalse(report.complete_cli_source_provenance(manifest, HEAD, HEAD))
+        self.assertFalse(report.complete_cli_registration(
+            manifest, {"invented read"}, trusted_build=True))
+        self.assertFalse(report.complete_cli_registration(
+            {**manifest, "cli_aliases": {}}, set(commands), trusted_build=True))
+        binary.write_text(binary.read_text() + "# changed\n")
+        self.assertFalse(report.complete_cli_registration(
+            manifest, set(commands), trusted_build=True))
+
+    def test_unattested_manifest_cannot_execute_its_binary(self):
+        source_head = report.subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip()
+        ledger = self.artifact.parent / "ledger.json"
+        ledger.write_text(json.dumps({"get": [], "operations": [], "cli": []}))
+        binary = self.artifact.parent / "untrusted-cli"
+        marker = self.artifact.parent / "executed"
+        binary.write_text(f"#!/usr/bin/env python3\nopen({str(marker)!r}, 'w').write('ran')\n")
+        binary.chmod(0o755)
+        manifest = self.artifact.parent / "manifest.json"
+        manifest.write_text(json.dumps({
+            "source_head": source_head,
+            "routes": {}, "cli": {}, "claim_view_edges": {},
+            "client_read_variants": {}, "peer_protocol_routes": {},
+            "cli_binary_path": str(binary),
+            "cli_binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+        }))
+        with mock.patch.object(report, "run_bounded_cli_inventory",
+                               side_effect=AssertionError("untrusted execution")):
+            result = report.report(ROOT, ledger, manifest)
+        self.assertEqual(result["gate_status"], "red")
+        self.assertFalse(marker.exists())
+        self.assertIn("CLI build/source provenance lacks independently qualified CI attestation",
+                      result["blockers"])
+
+    def test_malformed_ledger_returns_red_blocker(self):
+        ledger = self.artifact.parent / "malformed-ledger.json"
+        ledger.write_text(json.dumps({"get": [{}], "operations": [], "cli": []}))
+        result = report.report(ROOT, ledger)
+        self.assertEqual(result["gate_status"], "red")
+        self.assertIn("historical ledger is malformed or unreadable", result["blockers"])
+
+    def test_cli_aliases_expand_to_exact_semantic_invocations(self):
+        commands = {"st invented read", "st invented write"}
+        aliases = {"st invented": ["i"], "st invented read": ["r"]}
+        forms = report.expanded_cli_alias_forms(commands, aliases)
+        self.assertEqual(forms, {"st i read", "st invented r", "st i r", "st i write"})
+        manifest = {"cli_aliases": aliases, "cli_alias_forms": {
+            form: {"invoked_command": form, "semantic_receipt": self.receipt()}
+            for form in forms}}
+        self.assertTrue(report.complete_cli_alias_semantics(manifest, commands, HEAD))
+        manifest["cli_alias_forms"]["st i r"]["invoked_command"] = "st invented read"
+        self.assertFalse(report.complete_cli_alias_semantics(manifest, commands, HEAD))
+        manifest["cli_alias_forms"].pop("st i r")
+        self.assertFalse(report.complete_cli_alias_semantics(manifest, commands, HEAD))
+        self.assertIsNone(report.expanded_cli_alias_forms(commands,
+            {**aliases, "st phantom": ["p"]}))
+        self.assertIsNone(report.expanded_cli_alias_forms(commands,
+            {"st invented": ["invented"]}))
+
+    def test_cli_inventory_output_and_child_pipe_are_bounded(self):
+        binary = self.artifact.parent / "invented-st"
+        binary.write_text("#!/usr/bin/env python3\nimport sys\n"
+                          "sys.stdout.write('x' * 4096)\n")
+        binary.chmod(0o755)
+        self.assertIsNone(report.run_bounded_cli_inventory(binary, timeout_s=1,
+                                                            limit_bytes=128))
+        binary.write_text("#!/usr/bin/env python3\nimport subprocess, sys\n"
+                          "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(5)'])\n"
+                          "sys.stdout.write('{}')\n")
+        started = time.monotonic()
+        self.assertIsNone(report.run_bounded_cli_inventory(binary, timeout_s=0.2))
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_kind_mutation_receipt_checks_affected_and_unrelated_rows(self):
+        edge = self.mutation_edge("invented.kind")
+        self.assertTrue(report.complete_kind_mutation_edge("invented.kind", edge, HEAD))
+        self.assertFalse(report.complete_kind_mutation_edge("wrong.kind", edge, HEAD))
+        changed = {**edge, "work_caps": {name: 0 for name in report.WORK_METRICS}}
+        self.assertFalse(report.complete_kind_mutation_edge("invented.kind", changed, HEAD))
+        (self.artifact.parent / "affected-after.txt").write_bytes(b"tampered\n")
+        self.assertFalse(report.complete_kind_mutation_edge("invented.kind", edge, HEAD))
+
+    def test_otherwise_complete_self_reported_manifest_stays_red(self):
+        peer = (ROOT / "crates/st3/src/peer.rs").read_text()
+        routes = report.registered_routes((ROOT / "crates/st3/src/api.rs").read_text(), peer)
+        # Invented baseline assembled from checked source: no private survey path is needed.
+        ledger = {"get": [], "operations": [], "cli": [{"command": "invented read"}]}
+        for key in sorted(routes):
+            method, path = key.split(" ", 1)
+            if method == "GET":
+                ledger["get"].append({"route": path})
+            else:
+                ledger["operations"].append({"method": method, "route": path})
+        ledger_path = self.artifact.parent / "invented-ledger.json"
+        ledger_path.write_text(json.dumps(ledger))
+        cli = {row["command"] for row in ledger["cli"]}
+        kinds = report.registered_claim_kinds((ROOT / "crates/st3-schema/src/lib.rs").read_text())
+        work_path = self.artifact.parent / "work-log.json"
+        work_path.write_text(json.dumps({
+            "source_head": HEAD, "result": "pass", "observations": [
+                {"scale": scale, "graph_claims": claims, "populated": True,
+                 "successful_calls": 1, "error_count": 0,
+                 **{name: 10 for name in report.WORK_METRICS}}
+                for scale, claims in (("small", 100), ("large", 1000))
+            ],
+        }))
+        work_receipt = {"work_log_path": str(work_path),
+                        "work_log_sha256": hashlib.sha256(work_path.read_bytes()).hexdigest()}
+        absolute = {"source_head": HEAD, "result": "pass", "sample_count": 300,
+                    "max_ms": 1, "exceedances": 0, "error_count": 0, "empty_count": 0,
+                    "host_qualified": True, "independent_reset": True,
+                    **self.evidence("binary", "fixture", "raw_log")}
+        row = {"semantic_receipt": self.receipt(), "absolute_receipt": absolute,
+               "work_receipt": work_receipt, "dependency_edges": ["self-reported"]}
+        all_keys = routes | cli
+        manifest = {
+            "source_head": HEAD,
+            "routes": {key: row for key in routes},
+            "cli": {key: row for key in cli},
+            "claim_view_edges": {kind: [self.mutation_edge(kind)] for kind in kinds},
+            "client_read_variants": {key: {} for key in report.registered_client_read_variants(peer)},
+            "peer_protocol_routes": {key: {} for key in report.registered_peer_protocol_routes(peer)},
+            "runtime_cli_registration": sorted(cli),
+            "cli_binary_source_head": HEAD,
+            "cli_binary_sha256": self.hash,
+            "approved_absolute_targets": {
+                key: {"budget_ms": 100, "min_samples": 300,
+                      "approval_receipt": "self-reported",
+                      "work_caps": {name: 100 for name in report.WORK_METRICS}}
+                for key in all_keys
+            },
+            "required_shards": ["all"],
+            "shard_receipts": [{"name": "all", "status": "passed", "source_head": HEAD,
+                                "selected_tests": 1, **self.evidence("raw_log")}],
+        }
+        manifest_path = self.artifact.parent / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest))
+
+        def git_output(args, **kwargs):
+            if args[:2] == ["git", "rev-parse"]:
+                return HEAD + "\n"
+            if args[:2] == ["git", "status"]:
+                return b""
+            raise AssertionError(args)
+
+        with mock.patch.object(report.subprocess, "check_output", side_effect=git_output):
+            result = report.report(ROOT, ledger_path, manifest_path)
+        self.assertEqual(result["gate_status"], "red")
+        self.assertEqual(set(result["blockers"]), set(report.UNIMPLEMENTED_SAFETY_GATES) | {
+            "absolute target approval lacks a source-pinned reviewed config and receipt",
+            "checked-tree CLI executable commands/aliases inventory is missing or differs",
+            "CLI alias forms lack exact invocation and populated semantic receipts",
+            "CLI build/source provenance lacks independently qualified CI attestation",
+        })
+        with mock.patch.object(report.subprocess, "check_output", side_effect=git_output), \
+             mock.patch.object(report, "APPROVED_TARGET_CONFIG_SHA256", self.hash):
+            same_revision = report.report(ROOT, ledger_path, manifest_path)
+        self.assertIn("approved policy revision is not separate from measured source HEAD",
+                      same_revision["blockers"])
+
+        measured = self.artifact.parent / "measured-source"
+        for relative in ("crates/st3/src/api.rs", "crates/st3/src/peer.rs",
+                         "crates/st3-schema/src/lib.rs"):
+            destination = measured / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.symlink_to(ROOT / relative)
+
+        def separate_git_output(args, **kwargs):
+            if args[:2] == ["git", "status"]:
+                return b""
+            if args[:2] == ["git", "rev-parse"]:
+                return (HEAD if kwargs["cwd"] == ROOT else "b" * 40) + "\n"
+            raise AssertionError(args)
+
+        with mock.patch.object(report.subprocess, "check_output", side_effect=separate_git_output):
+            separate = report.report(measured, ledger_path, manifest_path)
+        self.assertEqual(separate["checker_head"], HEAD)
+        self.assertEqual(separate["source_head"], "b" * 40)
+        self.assertEqual(separate["gate_status"], "red")
+        self.assertNotIn("approved policy revision is not separate from measured source HEAD",
+                         separate["blockers"])
+
+
+if __name__ == "__main__":
+    unittest.main()

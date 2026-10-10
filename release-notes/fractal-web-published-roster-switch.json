@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "commits": [
+    "44c382151e08f3441dfa1eb315bcc38bce6c087f",
+    "e47bcc82a15d6895d786243dfc3b55d45455119c",
+    "6253f08d67ed687c8f70f3f87db13a4947db4b4b",
+    "a7eb23659a3979a863933924802328a462037f57"
+  ],
+  "summary": "fractal-web removes closed-inspector reads and redundant pane suspense from seat switches and shows waiting roster geometry. The live socket owns initial roster delivery; a bounded published roster is read only after transport failure or a three-second first-snapshot stall, never as a parallel bootstrap",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only changes introduce no store replay or runtime recovery wait. Conversation and roster observations remain memory-only."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database changes, wire schema additions, or generated-client changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or retention rules change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The SDK exposes a bounded read through the existing agentsList endpoint, without fresh=true, and reuses the collections discovery probe. The app marks its HTTP publication stale until a collection frame is observed; late publications cannot replace live data. A page with has_more=true carries explicit partial coverage and a fixed partial-roster notice until live data arrives; the app does not fetch additional bootstrap pages. Earlier daemons retain the same endpoint but may still fold inline, so the latency benefit depends on the published-roster server changes. Scripted gateway tests cover publication-first, partial coverage, late response, absent publication and read refusal including live-first then refusal, not a deployed daemon/client pair."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service restart or interruption is introduced by these app changes. No deployed latency or restart timing was measured."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "For cheap published-roster reads, the serving daemon must include the publication and replica-readiness changes merged at ca8a73622. The chunked-card optimization in 0ebd0f7d1, merged at 8cd4e4c06, further reduces cold publication cost. Main at 164bdff6f includes both. This app layer does not update or restart that daemon."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No durable migration; replacing or reloading the app drops its memory-only observations and reads them again. A cold daemon with no published roster still waits for its real collection data rather than rendering an empty roster."
+  }
+}
