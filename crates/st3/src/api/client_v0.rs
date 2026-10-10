@@ -10747,14 +10747,21 @@ async fn action_with_send_wait(
         .await;
     }
     validate_action_admission(&session, &request)?;
+    let deadline = tokio::time::Instant::now() + wait;
     let action_id = request.id.clone();
     let key = request.idempotency_key.clone();
     // Reserve the same gate the dispatch holds through receipt persistence BEFORE
     // taking capacity. A retry cannot create another worker or race the first send.
     let gate = action_gate(&state, &session, &key);
-    let reserved_gate = gate
-        .try_lock_owned()
+    // Healthy concurrent retries still receive the durable receipt. Waiting for
+    // this key allocates neither a worker nor a pending-send permit, and shares
+    // the same absolute confirmation deadline with the later worker wait.
+    let reserved_gate = tokio::time::timeout_at(deadline, gate.lock_owned())
+        .await
         .map_err(|_| send_unconfirmed(&action_id, &key))?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(send_unconfirmed(&action_id, &key));
+    }
     let permit = pending.try_acquire_owned().map_err(|_| ApiError {
         status: StatusCode::TOO_MANY_REQUESTS,
         code: "rate-limited".into(),
@@ -10786,7 +10793,7 @@ async fn action_with_send_wait(
             })
         })
     });
-    match tokio::time::timeout(wait, task).await {
+    match tokio::time::timeout_at(deadline, task).await {
         Ok(result) => result.map_err(ApiError::internal)?,
         Err(_) => Err(send_unconfirmed(&action_id, &key)),
     }
@@ -15619,7 +15626,7 @@ subscription "watch/source" {
                     snapshot.clone(),
                     session.clone(),
                     request.clone(),
-                    std::time::Duration::from_secs(10),
+                    std::time::Duration::from_millis(25),
                     pending.clone(),
                 ),
             )

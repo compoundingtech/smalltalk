@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Preserve healthy concurrent send receipts within one confirmation deadline",
+  "replay": {"status":"none","detail":"No heal or projection change in this correction; existing unbounded-replay and native qualification limits remain."},
+  "schema": {"status":"none","detail":"No schema, index, trigger or storage version change."},
+  "rules": {"status":"none","detail":"No claim admission, checkpoint or retention rule change."},
+  "compatibility": {"status":"changed","detail":"Concurrent message.send retries wait for their existing key without a pending-worker permit. The key wait and worker confirmation use one absolute deadline; healthy retries recover the same durable receipt and stalled retries keep applied:unknown with the original identity. No response shape or generated contract change."},
+  "downtime": {"status":"none","detail":"No additional restart requirement."},
+  "manual": {"status":"none","detail":"No data or configuration conversion."},
+  "recovery": {"status":"none","detail":"An expired confirmation does not cancel an admitted send or allocate a second worker while its key is held. Retry the identical request, preserving the action ID, idempotency key and payload."}
+}

@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "An already-held message.send key returns the existing unconfirmed outcome before allocating another pending worker. Identical retries retain original identity; completed receipt and changed-payload conflict handling remain. No new response shape or generated contract."
+    "detail": "An already-held message.send key waits asynchronously within the shared confirmation deadline before allocating another pending worker. Healthy identical retries receive the original durable receipt; an expired wait returns the existing unconfirmed outcome. Completed receipt and changed-payload conflict handling remain. No new response shape or generated contract."
   },
   "downtime": {
     "status": "none",
