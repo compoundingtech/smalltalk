@@ -2,7 +2,7 @@
   "generated": "Do not edit; run nix develop .#web -c python3 scripts/ci-fractal-web-licenses",
   "source": "pnpm-lock.yaml packages; installed package.json license (legacy licenses fallback); missing manifests from lock-integrity-verified npm archives",
   "schemaVersion": 1,
-  "lockfileSha256": "040fb6bed8b31b6380995d3ae6875263dccfee54203f014b665bc6e013dbb36d",
+  "lockfileSha256": "f86e905ea2be4a59839a668029fa59ff1da36a9d927071751549fb95e872733e",
   "packages": [
     {
       "name": "@adobe/css-tools",
@@ -367,6 +367,11 @@
     {
       "name": "@blazediff/core",
       "version": "1.10.0",
+      "license": "MIT"
+    },
+    {
+      "name": "@blazediff/core",
+      "version": "1.9.1",
       "license": "MIT"
     },
     {
@@ -2411,12 +2416,17 @@
     },
     {
       "name": "@vitest/browser",
+      "version": "4.1.9",
+      "license": "MIT"
+    },
+    {
+      "name": "@vitest/browser",
       "version": "5.0.3",
       "license": "MIT"
     },
     {
       "name": "@vitest/browser-playwright",
-      "version": "5.0.3",
+      "version": "4.1.9",
       "license": "MIT"
     },
     {
@@ -5310,11 +5320,6 @@
       "license": "MIT"
     },
     {
-      "name": "tinybench",
-      "version": "6.2.1",
-      "license": "MIT"
-    },
-    {
       "name": "tinyexec",
       "version": "1.3.1",
       "license": "MIT"
@@ -5600,11 +5605,6 @@
       "license": "MIT"
     },
     {
-      "name": "vitest",
-      "version": "5.0.3",
-      "license": "MIT"
-    },
-    {
       "name": "vlq",
       "version": "1.0.1",
       "license": "MIT"
@@ -5677,11 +5677,6 @@
     {
       "name": "why-is-node-running",
       "version": "2.3.0",
-      "license": "MIT"
-    },
-    {
-      "name": "why-is-node-running",
-      "version": "3.2.1",
       "license": "MIT"
     },
     {

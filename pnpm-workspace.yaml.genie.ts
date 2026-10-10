@@ -13,6 +13,12 @@ export default pnpmWorkspaceYaml.root({
   extraMembers: workspaceMembers,
   ...pnpmPolicy,
   nodeLinker: 'hoisted',
+  // SDK exec scripts and effect-utils workspace members must share the same Vitest runner.
+  overrides: {
+    ...pnpmPolicy.overrides,
+    vitest: '4.1.9',
+    '@vitest/browser-playwright': '4.1.9',
+  },
   // effect-utils members resolve their devDependencies through this lock, not effect-utils' own.
   peerDependencyRules: {
     ...pnpmPolicy.peerDependencyRules,

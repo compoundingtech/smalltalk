@@ -25,6 +25,10 @@ packages:
   - repos/effect-utils/packages/@overeng/utils-dev
   - repos/effect-utils/packages/@overeng/utils-storybook
 
+overrides:
+  vitest: 4.1.9
+  "@vitest/browser-playwright": 4.1.9
+
 peerDependencyRules:
   allowedVersions:
     typescript: ">=6.0.0"
