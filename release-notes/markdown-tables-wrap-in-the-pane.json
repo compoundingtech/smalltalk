@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A markdown table in a conversation stays a table when its cells are long or the pane is narrow: columns narrow and cells wrap, links read as their text, and only a pane too narrow for any grid stacks rows as records",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, stored data or transcript change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Published schema, operations and contract digest are unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "stui draws wide markdown tables as wrapped grids where it drew each row as one line joined with dots, and draws links inside cells as their text. The Swift and TypeScript renderers are not changed."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; no data conversion or extra startup work."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, durable payload or initialization changes."
+  }
+}

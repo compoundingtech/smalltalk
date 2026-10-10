@@ -835,6 +835,8 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
             "this image was removed after its retention window; the message text remains".into()
         }
         ErrorCode::ValidationFailed
+        | ErrorCode::ProjectionDetailTooLarge
+        | ErrorCode::ProjectionDetailInvalidSource
         | ErrorCode::AttentionMigrated
         | ErrorCode::IssuerRequired
         | ErrorCode::RuntimeNotLocal
@@ -3842,6 +3844,14 @@ mod tests {
         assert_eq!(gone.plain(), "it is gone: agent `agent/x` does not exist");
         assert!(!gone.is_transient());
         assert!(!api(ErrorCode::Forbidden, "no").is_transient());
+        for code in [
+            ErrorCode::ProjectionDetailTooLarge,
+            ErrorCode::ProjectionDetailInvalidSource,
+        ] {
+            let refusal = api(code, "the requested detail was refused");
+            assert_eq!(refusal.plain(), "the requested detail was refused");
+            assert!(!refusal.is_transient());
+        }
         // A terminal out of reach comes back; one whose process exited does not.
         let away = api(
             ErrorCode::TerminalUnavailable,

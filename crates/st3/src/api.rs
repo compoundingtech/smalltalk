@@ -1135,6 +1135,15 @@ async fn response_envelope_unbounded(
         Some(caller.clone()),
     );
     let client_request = request.uri().path().starts_with("/v1/client/");
+    // These point readers admit snapshot metadata inside their pinned read before
+    // formatting it. Authentication still runs here; their response extension
+    // supplies the envelope snapshot. All other routes keep admission snapshots.
+    let defer_detail_snapshot = (request_method == axum::http::Method::GET
+        || request_method == axum::http::Method::HEAD)
+        && matches!(
+            request_route.as_str(),
+            "/v1/client/observers/{*id}" | "/v1/client/subscriptions/{*id}"
+        );
     let fabric_boundary_error = (matches!(transport, ClientTransportBoundary::FabricLoopback)
         && !client_request
         && request.uri().path() != "/v1/health")
@@ -1180,16 +1189,19 @@ async fn response_envelope_unbounded(
                     client_v0::authenticate(&auth_state, &auth_request, transport)
                 });
             drop(authentication_span);
-            let snapshot_span = crate::profile::span("admission/snapshot");
-            let snapshot = crate::relay_trace::work(crate::relay_trace::Phase::Snapshot, || {
-                client_request_snapshot(&auth_state, cursor_snapshot.flatten())
+            let snapshot = (!defer_detail_snapshot).then(|| {
+                let snapshot_span = crate::profile::span("admission/snapshot");
+                let snapshot = crate::relay_trace::work(crate::relay_trace::Phase::Snapshot, || {
+                    client_request_snapshot(&auth_state, cursor_snapshot.flatten())
+                });
+                drop(snapshot_span);
+                snapshot
             });
-            drop(snapshot_span);
             (authentication, snapshot)
         })
         .await;
         match admitted {
-            Ok((authentication, snapshot)) => (authentication.map(Some), Some(snapshot)),
+            Ok((authentication, snapshot)) => (authentication.map(Some), snapshot),
             Err(error) => (Err(ApiError::internal(error)), None),
         }
     } else {
@@ -1471,6 +1483,8 @@ fn client_request_snapshot(
 }
 
 fn client_snapshot_at(state: &AppState, store_index: u64) -> ClientSnapshot {
+    #[cfg(test)]
+    client_v0::observer_subscription_detail_tests::note_snapshot_construction(state);
     client_snapshot_with_time(
         state,
         store_index,
@@ -1580,6 +1594,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "invalid-subject-reference"
         | "stale-fence"
         | "timeline-history-incomplete"
+        | "projection-detail-too-large"
+        | "projection-detail-invalid-source"
         | "cursor-gap"
         | "page-cursor-expired"
         | "rate-limited"
@@ -24128,6 +24144,61 @@ mission "wake" state="ready" {
             let (_, cards, _) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
             assert_eq!(cards.len(), 1, "history {history}");
         }
+    }
+
+    async fn assert_agent_roster_survives_other_mode_publications(history: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.store = Arc::new(roster_followup_store());
+        let store = &state.store;
+        let wake = store.start_agent_roster_refresher().unwrap();
+        let advance = |marker| {
+            store.append_claim(&ClaimInput {
+                subject: format!("custom/test/roster-retention-{marker}"),
+                kind: "custom.test.marker".into(), actor: None, fields: BTreeMap::new(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        refresh_agent_roster(store, history).unwrap();
+        advance(0);
+        refresh_agent_roster(store, history).unwrap();
+        let (cut, _, published_at) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+        let (_, Json(before)) = client_agents(
+            State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery { history, ..ClientListQuery::default() }),
+        ).await.unwrap();
+        let mut first_other_cut = None;
+        for marker in 1..=12 {
+            advance(marker);
+            refresh_agent_roster(store, !history).unwrap();
+            let other_cut = store.published_agent_roster(store.index().unwrap(), !history).unwrap().0;
+            assert_eq!(other_cut, store.index().unwrap(), "each refresh must publish a distinct cut");
+            first_other_cut.get_or_insert(other_cut);
+        }
+        assert!(store.index().unwrap() > cut);
+        assert!(store.published_agent_roster_at(first_other_cut.unwrap(), !history).is_none(),
+            "old publications of the busy mode must still be evicted");
+        assert!(!store.take_agent_roster_history_request());
+        let (Extension(snapshot), Json(after)) = client_agents(
+            State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery { history, fresh: true, ..ClientListQuery::default() }),
+        ).await.expect("the retained publication must answer, not return agent-roster-not-ready");
+        assert_eq!(snapshot.store_index, cut, "serve the newest retained publication's own cut");
+        assert_eq!(snapshot.published_at, Some(client_timestamp(published_at)));
+        assert_eq!(after.items, before.items);
+        assert_eq!(store.take_agent_roster_history_request(), history);
+        tokio::time::timeout(Duration::from_secs(1), wake.notified()).await
+            .expect("the stale first page must request a refresh");
+    }
+
+    #[tokio::test]
+    async fn client_agents_agent_roster_retains_history_during_current_publications() {
+        assert_agent_roster_survives_other_mode_publications(true).await;
+    }
+
+    #[tokio::test]
+    async fn client_agents_agent_roster_retains_current_during_history_publications() {
+        assert_agent_roster_survives_other_mode_publications(false).await;
     }
 
     #[test]

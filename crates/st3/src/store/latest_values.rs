@@ -303,6 +303,22 @@ thread_local! {
     static CURRENT_TRANSACTION_STEPS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static NATIVE_ADMISSION_CONTROL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Compare the rejected native busy policy in one synchronous benchmark sample. Other
+/// threads and all production entrypoints retain the production admission policy.
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_native_current_admission_for_test<T>(native: bool, work: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) { NATIVE_ADMISSION_CONTROL.with(|flag| flag.set(self.0)); }
+    }
+    let _reset = Reset(NATIVE_ADMISSION_CONTROL.with(|flag| flag.replace(native)));
+    work()
+}
+
 // SQLite admission uses only time remaining in this attempt, reserving a short write.
 // Schema work, validation, mutation and commit share the unchanged 100 ms deadline.
 const CURRENT_WRITE_RESERVE: std::time::Duration = std::time::Duration::from_millis(10);
@@ -358,24 +374,33 @@ fn current_transaction<T>(
         // SQLite's escalating busy sleeps can skip brief release windows between managed
         // transactions. Retry only BEGIN at short intervals within this same attempt; no
         // mutation or ownership validation runs until admission, and no sample is queued.
-        connection.busy_timeout(std::time::Duration::ZERO).map_err(internal)?;
         let admission_deadline = deadline - CURRENT_WRITE_RESERVE;
-        let tx = loop {
-            if std::time::Instant::now() >= deadline {
-                return Err(St3Error::new("current-value-deadline", "the current value exceeded its write deadline"));
-            }
-            match Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate) {
-                Ok(tx) => break tx,
-                Err(error) => {
-                    let retryable = matches!(error.sqlite_error_code(),
-                        Some(rusqlite::ErrorCode::DatabaseBusy));
-                    let remaining = admission_deadline.saturating_duration_since(std::time::Instant::now());
-                    if !retryable || remaining.is_zero() {
-                        return Err(internal(error));
-                    }
-                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
-                    if std::time::Instant::now() >= admission_deadline {
-                        return Err(internal(error));
+        #[cfg(any(test, feature = "test-support"))]
+        let native_control = NATIVE_ADMISSION_CONTROL.with(std::cell::Cell::get);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let native_control = false;
+        let tx = if native_control {
+            connection.busy_timeout(admission_deadline.saturating_duration_since(std::time::Instant::now())).map_err(internal)?;
+            Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate).map_err(internal)?
+        } else {
+            connection.busy_timeout(std::time::Duration::ZERO).map_err(internal)?;
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err(St3Error::new("current-value-deadline", "the current value exceeded its write deadline"));
+                }
+                match Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate) {
+                    Ok(tx) => break tx,
+                    Err(error) => {
+                        let retryable = matches!(error.sqlite_error_code(),
+                            Some(rusqlite::ErrorCode::DatabaseBusy));
+                        let remaining = admission_deadline.saturating_duration_since(std::time::Instant::now());
+                        if !retryable || remaining.is_zero() {
+                            return Err(internal(error));
+                        }
+                        std::thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
+                        if std::time::Instant::now() >= admission_deadline {
+                            return Err(internal(error));
+                        }
                     }
                 }
             }
@@ -1595,6 +1620,24 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_native_admission_is_thread_local_and_restored_after_unwind() {
+        assert!(!NATIVE_ADMISSION_CONTROL.with(std::cell::Cell::get));
+        let result = std::panic::catch_unwind(|| with_native_current_admission_for_test(true, || {
+            assert!(NATIVE_ADMISSION_CONTROL.with(std::cell::Cell::get));
+            std::thread::spawn(|| assert!(!NATIVE_ADMISSION_CONTROL.with(std::cell::Cell::get)))
+                .join().unwrap();
+            with_native_current_admission_for_test(false, || {
+                assert!(!NATIVE_ADMISSION_CONTROL.with(std::cell::Cell::get));
+            });
+            assert!(NATIVE_ADMISSION_CONTROL.with(std::cell::Cell::get));
+            panic!("restore diagnostic flag");
+        }));
+        assert!(result.is_err());
+        assert!(!NATIVE_ADMISSION_CONTROL.with(std::cell::Cell::get));
+    }
+
 
     fn state(state: &str, incarnation: &str, at: u64) -> ClaimInput {
         ClaimInput {

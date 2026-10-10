@@ -401,6 +401,11 @@ impl Runtime for SmalltalkRuntime {
     }
 
     fn forget_views(&self) {
+        #[cfg(any(test, feature = "test-support"))]
+        if smallclaims::sqlite::transaction_trace::is_active() {
+            crate::performance::record_request("roster/cache-reset", None, std::time::Duration::ZERO);
+            eprintln!("published roster cache reset at trace_ms={:.3}", smallclaims::sqlite::transaction_trace::elapsed_ms());
+        }
         let mut cache = self
             .subject_cache
             .lock()

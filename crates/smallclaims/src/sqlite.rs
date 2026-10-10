@@ -1484,7 +1484,35 @@ pub fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
 pub fn observe(connection: &mut Connection) {
     #[cfg(any(test, feature = "test-support"))]
     work::count(connection);
+    #[cfg(not(any(test, feature = "test-support")))]
     connection.profile(Some(record_sqlite_time));
+    #[cfg(any(test, feature = "test-support"))]
+    // SAFETY: SQLite keeps this context (its own connection handle) live throughout each
+    // callback. This installs the same legacy profile hook, with connection identity added.
+    unsafe {
+        rusqlite::ffi::sqlite3_profile(connection.handle(), Some(profile_with_transaction_trace), connection.handle().cast());
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod transaction_trace;
+
+#[cfg(any(test, feature = "test-support"))]
+unsafe extern "C" fn profile_with_transaction_trace(
+    db: *mut std::ffi::c_void,
+    statement: *const std::ffi::c_char,
+    nanoseconds: u64,
+) {
+    // Profiling must never unwind through SQLite's C stack, just like rusqlite's callback.
+    let _ = std::panic::catch_unwind(|| {
+        if statement.is_null() { return; }
+        // SAFETY: SQLite supplies a live, nul-terminated statement for this callback.
+        let sql = unsafe { std::ffi::CStr::from_ptr(statement) }.to_string_lossy();
+        let duration = std::time::Duration::from_nanos(nanoseconds);
+        // SAFETY: observe registered this still-live connection as its context.
+        unsafe { transaction_trace::statement(db.cast(), &sql, duration); }
+        record_sqlite_time(&sql, duration);
+    });
 }
 
 /// Every statement this process ran since the last [`histogram::take`], by normalized text, so a

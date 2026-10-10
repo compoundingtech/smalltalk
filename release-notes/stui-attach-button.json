@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "stui unattached terminal tabs offer a clickable Attach button",
+  "replay": { "status": "none", "detail": "No replay changes." },
+  "schema": { "status": "none", "detail": "No schema changes." },
+  "rules": { "status": "none", "detail": "No rule changes." },
+  "compatibility": { "status": "changed", "detail": "The stui terminal placeholder adds a mouse action equivalent to Ctrl+] and keeps its keyboard hints." },
+  "downtime": { "status": "none", "detail": "No downtime required." },
+  "manual": { "status": "none", "detail": "No manual migration required." },
+  "recovery": { "status": "none", "detail": "No recovery changes." }
+}
