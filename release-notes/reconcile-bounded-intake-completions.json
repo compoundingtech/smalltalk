@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Register bounded intake completion state before asynchronous work",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or durable format change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No SQL, DDL, index or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission, canonical and fresh effect authority remain unchanged. Completion marks do not authorize work."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Selected active intake items register completion state before initial evaluation. Completions for an initial or failed evaluation select only that item, and completion during successful evaluation remains needed. Unregistered/pruned callbacks allocate no state; a reborn item is new and a callback on an already registered reused name conservatively selects that item."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption beyond normal binary swap; no deployment implied."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No configuration or pass/load budget changes."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Unevaluated completion placeholders use the existing item map and are capped at 4096 entries, 4096 UTF-8 bytes/key and 1 MiB cumulative key bytes before cloning. Successful evaluation converts a placeholder to normal retained state; complete-roster pruning releases its registration count/bytes. Callback threads never register arbitrary keys or allocate a completion queue. Registration refusal or generation wrap enables conservative global invalidation for missing completions until process restart, without retaining refused keys; completion-version exhaustion also globally invalidates. This exhaustion fallback can still cost whole-inventory evaluation and is not a performance acceptance. Existing successful item/history storage, full-pass safety, physical-mutation/gap limitations and independent fresh effect fences remain. No full-pass under 500 or production savings result."
+  }
+}

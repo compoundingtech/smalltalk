@@ -43,6 +43,13 @@ struct State {
     values: HashMap<String, String>,
     /// Bounded fingerprints of fresh declaration/context inputs, never authority answers.
     contexts: HashMap<String, [u8; 32]>,
+    /// Only first/failed intake evaluations need a placeholder; successful generic item
+    /// storage keeps its existing contract. Callback threads never allocate registrations.
+    completion_placeholders: usize,
+    completion_placeholder_bytes: usize,
+    /// A refused registration may still arm work. Preserve conservative completion marks
+    /// for that process lifetime, without retaining its refused key or a callback queue.
+    untracked_completions: bool,
     /// When each polled key (such as a terminal's screen) was last looked at.
     polled_at: HashMap<String, u128>,
 }
@@ -52,6 +59,9 @@ pub const FULL_PASS_INTERVAL_MS: u128 = 60_000;
 const CONTEXT_KEYS: usize = 4096;
 const CONTEXT_KEY_BYTES: usize = 4096;
 const CONTEXT_BYTES: usize = 1024 * 1024;
+const COMPLETION_PLACEHOLDERS: usize = 4096;
+const COMPLETION_KEY_BYTES: usize = 4096;
+const COMPLETION_TOTAL_BYTES: usize = 1024 * 1024;
 
 struct ContextDigest {
     hash: sha2::Sha256,
@@ -82,6 +92,8 @@ struct Item {
     generation: u64,
     /// Async intake completion can arrive while a selected evaluation records its reads.
     completion: u64,
+    /// Synchronous registration before an intake's first successful evaluation.
+    completion_placeholder: bool,
 }
 
 /// The keys a change can affect: its subject, its actor's work, its kind, and for some kinds a
@@ -304,6 +316,9 @@ impl Incremental {
         } else {
             state.items.clear();
             state.readers.clear();
+            state.completion_placeholders = 0;
+            state.completion_placeholder_bytes = 0;
+            state.untracked_completions = true;
             state.generation = 0;
         }
         // Generation mismatch already selects every retained item. Keep the periodic safety
@@ -319,22 +334,59 @@ impl Incremental {
         Self::mark_locked(&mut state, key);
     }
 
-    /// Mark only this retained intake item when an arm completes, including completion with
-    /// no claim write. No completion queue is allocated. Missing/overflowed state conservatively
-    /// invalidates retained work, including a first arm that finishes before its first evaluation.
+    /// Register a selected active intake synchronously before its evaluation token and arm.
+    /// Limit unevaluated placeholders before cloning the key; completion callbacks may only
+    /// mark existing state. Budget refusal preserves conservative global completion fallback.
+    pub(crate) fn register_intake_completion(&self, item: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.items.contains_key(item) {
+            return;
+        }
+        if state.completion_placeholders >= COMPLETION_PLACEHOLDERS
+            || item.len() > COMPLETION_KEY_BYTES
+            || item.len() > COMPLETION_TOTAL_BYTES - state.completion_placeholder_bytes
+        {
+            state.untracked_completions = true;
+            Self::invalidate_locked(&mut state);
+            return;
+        }
+        state.completion_placeholders += 1;
+        state.completion_placeholder_bytes += item.len();
+        let generation = state.generation;
+        state.items.insert(
+            item.to_owned(),
+            Item {
+                reads: BTreeSet::new(),
+                due: None,
+                dirty: true,
+                generation,
+                completion: 0,
+                completion_placeholder: true,
+            },
+        );
+    }
+
+    /// Mark only a registered intake on completion, including a first/failed evaluation.
+    /// A late callback for a pruned or never-selected item cannot allocate a key or invalidate
+    /// unrelated items, except after registration/version exhaustion's explicit fallback.
     pub(crate) fn intake_completed(&self, item: &str) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = state.items.get_mut(item)
-            && let Some(next) = cached.completion.checked_add(1)
-        {
-            cached.completion = next;
-            cached.dirty = true;
-            return;
+        if let Some(cached) = state.items.get_mut(item) {
+            if let Some(next) = cached.completion.checked_add(1) {
+                cached.completion = next;
+                cached.dirty = true;
+                return;
+            }
+            Self::invalidate_locked(&mut state);
+        } else if state.untracked_completions {
+            Self::invalidate_locked(&mut state);
         }
-        Self::invalidate_locked(&mut state);
     }
 
     pub(crate) fn intake_completion_token(&self, item: &str) -> (u64, Option<u64>) {
@@ -631,6 +683,14 @@ impl Incremental {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let generation = state.generation;
         let completion = state.items.get(item).map_or(0, |item| item.completion);
+        if state
+            .items
+            .get(item)
+            .is_some_and(|item| item.completion_placeholder)
+        {
+            state.completion_placeholders -= 1;
+            state.completion_placeholder_bytes -= item.len();
+        }
         let State { items, readers, .. } = &mut *state;
         if let Some(previous) = items.get(item) {
             for key in &previous.reads {
@@ -656,6 +716,7 @@ impl Incremental {
                 dirty: false,
                 generation,
                 completion,
+                completion_placeholder: false,
             },
         );
     }
@@ -682,6 +743,10 @@ impl Incremental {
 
     fn forget_locked(&self, state: &mut State, item: &str) {
         if let Some(previous) = state.items.remove(item) {
+            if previous.completion_placeholder {
+                state.completion_placeholders -= 1;
+                state.completion_placeholder_bytes -= item.len();
+            }
             for key in previous.reads {
                 if let Some(set) = state.readers.get_mut(&key) {
                     set.remove(item);
@@ -840,6 +905,220 @@ mod tests {
 
         check(&"x".repeat(CONTEXT_BYTES + 1));
         check(&Unencodable);
+    }
+
+    #[test]
+    fn absent_completions_allocate_nothing_and_leave_unrelated_items_clean() {
+        let incremental = Incremental::default();
+        incremental.evaluated("observer:kept", BTreeSet::new(), None);
+        let before = incremental.intake_completion_token("observer:kept");
+        for n in 0..(COMPLETION_PLACEHOLDERS + 1) {
+            incremental.intake_completed(&format!("observer:unregistered:{n}"));
+        }
+        let state = incremental.state.lock().unwrap();
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.completion_placeholders, 0);
+        assert_eq!(state.completion_placeholder_bytes, 0);
+        assert!(!state.untracked_completions);
+        drop(state);
+        assert_eq!(incremental.intake_completion_token("observer:kept"), before);
+        assert!(!incremental.needs("observer:kept", 0));
+    }
+
+    #[test]
+    fn first_and_failed_intake_completions_survive_overlapping_success_only_for_their_item() {
+        let incremental = Incremental::default();
+        let item = "observer:first";
+        let unrelated = "observer:kept";
+        incremental.evaluated(unrelated, BTreeSet::new(), None);
+        incremental.register_intake_completion(item);
+        let first = incremental.intake_completion_token(item);
+        assert_eq!(first.1, Some(0));
+        incremental.intake_completed(item);
+        incremental.evaluated(item, BTreeSet::from([item.to_owned()]), None);
+        incremental.retain_intake_completion(item, first);
+        assert!(
+            incremental.needs(item, 0),
+            "completion during initial success survives"
+        );
+        assert!(!incremental.needs(unrelated, 0));
+        let observed = incremental.intake_completion_token(item);
+        incremental.evaluated(item, BTreeSet::from([item.to_owned()]), Some(10));
+        incremental.retain_intake_completion(item, observed);
+        assert!(!incremental.needs(item, 9));
+        assert!(incremental.needs(item, 10));
+
+        let failed = "observer:failed";
+        incremental.register_intake_completion(failed);
+        // Failed evaluations do not call evaluated: the bounded placeholder stays dirty.
+        let attempt = incremental.intake_completion_token(failed);
+        incremental.intake_completed(failed);
+        assert!(incremental.needs(failed, 0));
+        assert!(!incremental.needs(unrelated, 0));
+        incremental.evaluated(failed, BTreeSet::from([failed.to_owned()]), None);
+        incremental.retain_intake_completion(failed, attempt);
+        assert!(incremental.needs(failed, 0));
+        let retry = incremental.intake_completion_token(failed);
+        incremental.evaluated(failed, BTreeSet::from([failed.to_owned()]), Some(20));
+        incremental.retain_intake_completion(failed, retry);
+        assert!(!incremental.needs(failed, 19));
+        assert!(incremental.needs(failed, 20));
+        assert_eq!(incremental.state.lock().unwrap().completion_placeholders, 0);
+    }
+
+    #[test]
+    fn pruned_completion_cannot_register_and_reborn_or_restarted_items_remain_needed() {
+        let incremental = Incremental::default();
+        let item = "observer:removed";
+        let unrelated = "observer:kept";
+        incremental.evaluated(unrelated, BTreeSet::new(), None);
+        incremental.register_intake_completion(item);
+        incremental.retain("observer:", &BTreeSet::from([unrelated.to_owned()]));
+        incremental.intake_completed(item);
+        assert_eq!(incremental.intake_completion_token(item).1, None);
+        assert!(
+            incremental.needs(item, 0),
+            "removed state cannot certify a reborn item clean"
+        );
+        assert!(!incremental.needs(unrelated, 0));
+        {
+            let state = incremental.state.lock().unwrap();
+            assert_eq!(state.completion_placeholders, 0);
+            assert_eq!(state.completion_placeholder_bytes, 0);
+        }
+        incremental.register_intake_completion(item);
+        let before = incremental.intake_completion_token(item);
+        // Reused names conservatively consume a later completion by re-evaluating that
+        // item, not by treating the completion as authority or dirtying unrelated state.
+        incremental.intake_completed(item);
+        incremental.evaluated(item, BTreeSet::new(), None);
+        incremental.retain_intake_completion(item, before);
+        assert!(incremental.needs(item, 0));
+        assert!(!incremental.needs(unrelated, 0));
+        let restarted = Incremental::default();
+        restarted.intake_completed(item);
+        assert!(restarted.state.lock().unwrap().items.is_empty());
+        assert!(restarted.needs(item, 0));
+        restarted.register_intake_completion(item);
+        assert_eq!(restarted.intake_completion_token(item).1, Some(0));
+    }
+
+    #[test]
+    fn completion_registration_count_is_inclusive_and_overflow_keeps_conservative_progress() {
+        let incremental = Incremental::default();
+        incremental.evaluated("unrelated", BTreeSet::new(), None);
+        for n in 0..COMPLETION_PLACEHOLDERS {
+            incremental.register_intake_completion(&format!("observer:pending:{n}"));
+        }
+        let last = format!("observer:pending:{}", COMPLETION_PLACEHOLDERS - 1);
+        assert_eq!(incremental.intake_completion_token(&last).1, Some(0));
+        assert!(!incremental.needs("unrelated", 0));
+        incremental.register_intake_completion("observer:overflow");
+        assert_eq!(
+            incremental.intake_completion_token("observer:overflow").1,
+            None
+        );
+        assert!(incremental.needs("unrelated", 0));
+        {
+            let state = incremental.state.lock().unwrap();
+            assert_eq!(state.completion_placeholders, COMPLETION_PLACEHOLDERS);
+            assert!(state.untracked_completions);
+            assert!(!state.items.contains_key("observer:overflow"));
+        }
+        // A completion after refusal still survives an overlapping successful recorder.
+        let before = incremental.intake_completion_token("observer:overflow");
+        incremental.intake_completed("observer:overflow");
+        incremental.evaluated("observer:overflow", BTreeSet::new(), None);
+        incremental.retain_intake_completion("observer:overflow", before);
+        assert!(incremental.needs("observer:overflow", 0));
+        incremental.retain("observer:", &BTreeSet::new());
+        assert_eq!(incremental.state.lock().unwrap().completion_placeholders, 0);
+        assert_eq!(
+            incremental
+                .state
+                .lock()
+                .unwrap()
+                .completion_placeholder_bytes,
+            0
+        );
+        // Exhaustion fallback stays process-local until restart: unknown callbacks remain
+        // conservative after registration capacity is freed, without retaining their keys.
+        incremental.evaluated("unrelated", BTreeSet::new(), None);
+        incremental.intake_completed("observer:late-overflow");
+        assert!(incremental.needs("unrelated", 0));
+        assert_eq!(
+            incremental
+                .intake_completion_token("observer:late-overflow")
+                .1,
+            None
+        );
+    }
+
+    #[test]
+    fn completion_registration_charges_key_and_cumulative_bytes_before_cloning() {
+        let incremental = Incremental::default();
+        let wide = "x".repeat(COMPLETION_KEY_BYTES + 1);
+        incremental.register_intake_completion(&wide);
+        {
+            let state = incremental.state.lock().unwrap();
+            assert!(state.items.is_empty());
+            assert_eq!(state.completion_placeholder_bytes, 0);
+            assert!(state.untracked_completions);
+        }
+        let cumulative = Incremental::default();
+        let entries = COMPLETION_TOTAL_BYTES / COMPLETION_KEY_BYTES;
+        assert!(entries < COMPLETION_PLACEHOLDERS);
+        for n in 0..entries {
+            let prefix = format!("observer:{n}:");
+            let key = format!(
+                "{prefix}{}",
+                "x".repeat(COMPLETION_KEY_BYTES - prefix.len())
+            );
+            cumulative.register_intake_completion(&key);
+            assert_eq!(cumulative.intake_completion_token(&key).1, Some(0));
+        }
+        assert_eq!(
+            cumulative
+                .state
+                .lock()
+                .unwrap()
+                .completion_placeholder_bytes,
+            COMPLETION_TOTAL_BYTES
+        );
+        cumulative.register_intake_completion("observer:byte-overflow");
+        let state = cumulative.state.lock().unwrap();
+        assert_eq!(state.completion_placeholders, entries);
+        assert_eq!(state.completion_placeholder_bytes, COMPLETION_TOTAL_BYTES);
+        assert!(state.untracked_completions);
+        assert!(!state.items.contains_key("observer:byte-overflow"));
+    }
+
+    #[test]
+    fn completion_version_and_generation_exhaustion_cannot_certify_pending_work_clean() {
+        let incremental = Incremental::default();
+        incremental.register_intake_completion("observer:version");
+        {
+            let mut state = incremental.state.lock().unwrap();
+            state.items.get_mut("observer:version").unwrap().completion = u64::MAX;
+        }
+        let before = incremental.intake_completion_token("observer:version");
+        incremental.intake_completed("observer:version");
+        incremental.evaluated("observer:version", BTreeSet::new(), None);
+        incremental.retain_intake_completion("observer:version", before);
+        assert!(incremental.needs("observer:version", 0));
+        incremental.register_intake_completion("observer:pending");
+        {
+            let mut state = incremental.state.lock().unwrap();
+            state.generation = u64::MAX;
+            Incremental::invalidate_locked(&mut state);
+            assert!(state.items.is_empty());
+            assert_eq!(state.completion_placeholders, 0);
+            assert_eq!(state.completion_placeholder_bytes, 0);
+            assert!(state.untracked_completions);
+        }
+        incremental.evaluated("observer:version", BTreeSet::new(), None);
+        incremental.intake_completed("observer:pending");
+        assert!(incremental.needs("observer:version", 0));
     }
 
     #[test]
