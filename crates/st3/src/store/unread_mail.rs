@@ -18,8 +18,6 @@ CREATE TABLE IF NOT EXISTS unread_mail (
     subject TEXT PRIMARY KEY,
     sent_time INTEGER NOT NULL
 ) WITHOUT ROWID;
--- Lists the oldest unread mail, such as held FYI mail past a day, without a table scan.
-CREATE INDEX IF NOT EXISTS unread_mail_sent_time_index ON unread_mail(sent_time);
 CREATE TABLE IF NOT EXISTS unread_mail_prefixes (
     shift INTEGER NOT NULL,
     prefix INTEGER NOT NULL,
@@ -149,7 +147,8 @@ pub(super) fn count_in_snapshot(connection: &Connection, before_unix_ms: u128) -
 }
 
 /// Unread messages sent before the cutoff, with their recipient, sender and tags. The queued
-/// subjects are read as they stand, without folding the queue: a read never writes.
+/// subjects are read as they stand, without folding the queue: a read never writes. This
+/// diagnostic visits unread metadata, avoiding a new startup index build over retained mail.
 pub(super) struct UnreadSent {
     pub to: String,
     pub from: String,

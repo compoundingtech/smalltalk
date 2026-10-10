@@ -7,7 +7,7 @@
   },
   "schema": {
     "status": "changed",
-    "detail": "Adds coordination_sends, its covering sent_ms/count-flags index, local_coordination_backfill, and an unread_mail sent_time index. Numeric schema version is unchanged. These are derived count metadata, not new conversation payload storage."
+    "detail": "Adds coordination_sends, its covering sent_ms/count-flags index, local_coordination_backfill. Numeric schema version is unchanged. These are derived count metadata, not new conversation payload storage."
   },
   "rules": {
     "status": "none",
@@ -19,7 +19,7 @@
   },
   "downtime": {
     "status": "unknown",
-    "detail": "Requires the normal daemon binary swap and restart. New tables are empty at creation and coordination backfill is bounded; the unread-mail index is built on startup. Restart-to-API and restart-to-health times for populated installations have not been measured."
+    "detail": "Requires the normal daemon binary swap and restart. New tables are empty at creation and coordination backfill is bounded. Held-mail diagnostics read existing unread metadata without a new startup index build. Restart-to-API and restart-to-health times for populated installations have not been measured."
   },
   "manual": {
     "status": "changed",
