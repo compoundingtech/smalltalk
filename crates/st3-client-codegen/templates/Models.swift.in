@@ -722,3 +722,63 @@ public struct ConversationContentChunk: Codable, Sendable {
     public let offset: UInt64; public let size: UInt64; public let data: String; public let nextOffset: UInt64?
     enum CodingKeys: String, CodingKey { case kind, ref, mediaType = "media_type", offset, size, data, nextOffset = "next_offset" }
 }
+
+public struct ObservationReport: Codable, Sendable {
+    public let reportID: String
+    public let samples: [ObservationSample]
+    public init(reportID: String, samples: [ObservationSample]) {self.reportID = reportID; self.samples = samples}
+    enum CodingKeys: String, CodingKey {case reportID = "report_id", samples}
+}
+public struct ObservationAccepted: Codable, Sendable {public let accepted: Bool}
+public struct ObservationResponse: Codable, Sendable {
+    public let apiVersion: String
+    public let requestID: String
+    public let value: ObservationAccepted
+    enum CodingKeys: String, CodingKey {case apiVersion = "api_version", requestID = "request_id", value}
+}
+public struct ObservationLatency: Codable, Sendable {
+    public let kind: String = "latency"
+    public let target: String
+    public let carrier: String
+    public let path: String?
+    public let intervalStart: String
+    public let intervalEnd: String
+    public let count: UInt64
+    public let overTarget: UInt64
+    public let maxMS: UInt64
+    public let buckets: [[UInt64]]
+    public init(target: String, carrier: String, path: String? = nil, intervalStart: String, intervalEnd: String, count: UInt64, overTarget: UInt64, maxMS: UInt64, buckets: [[UInt64]]) {
+        self.target = target; self.carrier = carrier; self.path = path; self.intervalStart = intervalStart; self.intervalEnd = intervalEnd; self.count = count; self.overTarget = overTarget; self.maxMS = maxMS; self.buckets = buckets
+    }
+    enum CodingKeys: String, CodingKey {case kind, target, carrier, path, intervalStart = "interval_start", intervalEnd = "interval_end", count, overTarget = "over_target", maxMS = "max_ms", buckets}
+}
+public struct ObservationLiveShare: Codable, Sendable {
+    public let kind: String = "live-share"
+    public let target: String = "ios-live-share"
+    public let carrier: String
+    public let path: String?
+    public let intervalStart: String
+    public let intervalEnd: String
+    public let foregroundMS: UInt64
+    public let liveMS: UInt64
+    public init(carrier: String, path: String? = nil, intervalStart: String, intervalEnd: String, foregroundMS: UInt64, liveMS: UInt64) {
+        self.carrier = carrier; self.path = path; self.intervalStart = intervalStart; self.intervalEnd = intervalEnd; self.foregroundMS = foregroundMS; self.liveMS = liveMS
+    }
+    enum CodingKeys: String, CodingKey {case kind, target, carrier, path, intervalStart = "interval_start", intervalEnd = "interval_end", foregroundMS = "foreground_ms", liveMS = "live_ms"}
+}
+public enum ObservationSample: Codable, Sendable {
+    case latency(ObservationLatency)
+    case liveShare(ObservationLiveShare)
+    private enum Keys: String, CodingKey {case kind}
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        switch try c.decode(String.self, forKey: .kind) {
+        case "latency": self = .latency(try ObservationLatency(from: decoder))
+        case "live-share": self = .liveShare(try ObservationLiveShare(from: decoder))
+        default: throw DecodingError.dataCorruptedError(forKey: .kind, in: c, debugDescription: "Unknown observation sample")
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        switch self {case .latency(let value): try value.encode(to: encoder); case .liveShare(let value): try value.encode(to: encoder)}
+    }
+}

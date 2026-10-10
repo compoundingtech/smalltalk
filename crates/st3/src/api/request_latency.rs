@@ -213,6 +213,7 @@ pub(super) struct Meter {
     /// Windows by target position in `slo/targets.toml`: served here, then from another machine.
     targets: Vec<[smallclaims::windows::Series; 2]>,
     cpu: smallclaims::windows::Cpu,
+    client_intervals: BTreeMap<(String, String, Option<String>), smallclaims::windows::IntervalSeries>,
 }
 
 /// How a completed sample is counted in the windows. Build it with [`Timed::resolve`] before
@@ -309,6 +310,7 @@ impl Meter {
             .latency
             .iter()
             .enumerate()
+            .filter(|(_, latency)| !latency.paths.iter().any(|p| p.starts_with("client/ios/")))
             .map(|(index, latency)| {
                 let windows = |remote: bool| {
                     self.targets
@@ -330,7 +332,7 @@ impl Meter {
             })
             .collect::<Vec<_>>();
         rows.extend(crate::slo::store_report(self.cpu.snapshot(now)));
-        let paths = self
+        let mut paths = self
             .paths
             .iter()
             .filter(|(_, series)| !series.is_empty(now))
@@ -342,7 +344,47 @@ impl Meter {
                 })
             })
             .collect::<Vec<_>>();
+        let wall = crate::api::client_now_ms() as u64;
+        for latency in targets.latency.iter().filter(|t| t.paths.iter().any(|p| p.starts_with("client/ios/"))) {
+            let windows = self.client_windows(wall, &latency.name, false);
+            rows.push(json!({"name":latency.name,"about":latency.about,"p99_ms":latency.p99_ms,
+                "population":"client-observed-latencies", "windows":windows}));
+        }
+        for share in &targets.share {
+            rows.push(json!({"name":share.name,"about":share.about,"min_percent":share.min_percent,
+                "population":"client-observed-foreground-ms","windows":self.client_windows(wall,&share.name,true)}));
+        }
+        for ((target,carrier,path),series) in &self.client_intervals {
+            let share = target == "ios-live-share";
+            paths.push(json!({"path":format!("client/ios/{}", target.strip_prefix("ios-").unwrap_or(target)),
+                "target":target,"carrier":carrier,"carrier_path":path,
+                "population":if share {"client-observed-foreground-ms"} else {"client-observed-latencies"},
+                "windows":series.snapshot(wall,share)}));
+        }
         json!({"targets": rows, "paths": paths})
+    }
+
+    pub(super) fn can_report(&self, samples: &[super::client_observations::Validated]) -> bool {
+        samples.iter().all(|s| self.client_intervals.get(&s.key).is_none_or(|series| series.can_record(&s.minute)))
+    }
+
+    pub(super) fn report(&mut self, now_ms: u64, samples: &[super::client_observations::Validated]) {
+        for s in samples {
+            if s.minute.start_ms >= now_ms.saturating_sub(3_600_000) {
+                self.client_intervals.entry(s.key.clone()).or_default().record(now_ms,&s.minute);
+            }
+        }
+    }
+
+    fn client_windows(&self, now_ms: u64, target: &str, share: bool) -> Value {
+        let mut total = smallclaims::windows::IntervalSeries::default();
+        // At most 9 carrier/path combinations per target and 60 minutes per series.
+        for ((name,_,_),series) in &self.client_intervals {
+            if name == target {
+                total.absorb(series);
+            }
+        }
+        total.snapshot(now_ms,share)
     }
 
     pub(super) fn snapshot(&self) -> Vec<Value> {

@@ -4138,6 +4138,7 @@ fn action_inventory_matches_contract_and_has_existing_test_references() {
     }
     let root = Path::new(test_env!("CARGO_MANIFEST_DIR")).join("../..");
     for group in [
+        "client_commands",
         "typed_actions",
         "cli",
         "stui_effects",

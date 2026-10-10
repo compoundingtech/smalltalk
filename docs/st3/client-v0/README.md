@@ -34,6 +34,12 @@ The collections socket's `CollectionCommand` and `CollectionFrame` definitions l
 schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
 command/frame definitions, and subscription bound; see [collections](collections.md).
 
+### Phone observations
+
+Paired sessions can send bounded disjoint UTC minute diagnostics with
+[`observations.report`](observations.md). This command has no action receipt, replication
+or snapshot fence. Live-share is typed foreground/live time, separate from latency histograms.
+
 ### Mission run timing
 
 `GET /v1/client/missions/{id}` requires `read.projections`, like other projection reads.

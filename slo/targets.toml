@@ -89,3 +89,47 @@ max_ms = 100
 [cpu]
 about = "Daemon CPU: near zero when idle, at most 2 cores under daemon_load"
 max_cores = 2.0
+
+# Closed UTC minutes reported by paired clients; distinct from daemon response timing.
+
+[[latency]]
+name = "ios-open-to-live"
+about = "Foreground to first live Home snapshot; reported phone population only"
+p99_ms = 3000
+paths = ["client/ios/open-to-live"]
+
+[[latency]]
+name = "ios-connect"
+about = "Client connection; reported phone population only"
+p99_ms = 1500
+paths = ["client/ios/connect"]
+
+[[latency]]
+name = "ios-message-ack"
+about = "Client message acknowledgement; reported phone population only"
+p99_ms = 500
+paths = ["client/ios/message-ack"]
+
+[[latency]]
+name = "ios-conversation-open"
+about = "Client conversation opening; reported phone population only"
+p99_ms = 1000
+paths = ["client/ios/conversation-open"]
+
+[[latency]]
+name = "ios-terminal-open"
+about = "Client terminal opening; reported phone population only"
+p99_ms = 1500
+paths = ["client/ios/terminal-open"]
+
+[[latency]]
+name = "ios-recover"
+about = "Client feed recovery; reported phone population only"
+p99_ms = 10000
+paths = ["client/ios/recover"]
+
+[[share]]
+name = "ios-live-share"
+about = "Live foreground time / reported foreground time; disconnected foreground is over-target"
+min_percent = 99
+path = "client/ios/live-share"

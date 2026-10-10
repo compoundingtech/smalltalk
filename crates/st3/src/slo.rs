@@ -16,6 +16,7 @@ pub const SOURCE: &str = include_str!("../../../slo/targets.toml");
 #[serde(deny_unknown_fields)]
 pub struct Targets {
     pub latency: Vec<Latency>,
+    pub share: Vec<Share>,
     pub statement: Statement,
     pub transaction: Transaction,
     pub cpu: Cpu,
@@ -30,6 +31,15 @@ pub struct Latency {
     /// The same reads served through this daemon from another machine that owns them.
     pub remote_p99_ms: Option<u64>,
     pub paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Share {
+    pub name: String,
+    pub about: String,
+    pub min_percent: u64,
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +96,10 @@ pub fn parse(text: &str) -> Result<Targets> {
         );
         ensure!(!latency.paths.is_empty(), "target {} has no paths", latency.name);
         for path in &latency.paths {
+            if path.starts_with("client/ios/") {
+                ensure!(paths.insert(path.as_str()), "path {path:?} has two targets");
+                continue;
+            }
             let (method, route) = path
                 .split_once(' ')
                 .with_context(|| format!("path {path:?} names no method"))?;
@@ -99,6 +113,11 @@ pub fn parse(text: &str) -> Result<Targets> {
             );
             ensure!(paths.insert(path.as_str()), "path {path:?} has two targets");
         }
+    }
+    for share in &targets.share {
+        ensure!(names.insert(share.name.as_str()), "duplicate share target");
+        ensure!(share.min_percent > 0 && share.min_percent <= 100, "invalid share target");
+        ensure!(share.path.starts_with("client/ios/") && paths.insert(&share.path), "invalid share path");
     }
     ensure!(
         targets.statement.p99_ms > 0 && targets.statement.max_ms >= targets.statement.p99_ms,
@@ -248,6 +267,18 @@ pub fn doctor_lines(report: &Value) -> Vec<(String, &'static str, String)> {
     let mut lines = Vec::new();
     for target in report["targets"].as_array().into_iter().flatten() {
         let name = target["name"].as_str().unwrap_or_default();
+        if target["population"].as_str().is_some_and(|p| p.starts_with("client-observed")) {
+            let share = target.get("min_percent").is_some();
+            let seen = WINDOWS.iter().any(|w| target["windows"][*w]["count"].as_u64().unwrap_or(0) > 0);
+            let text = WINDOWS.iter().map(|w| {
+                let row = &target["windows"][*w];
+                if share {format!("{w} {} live / {} foreground ms",row["live_ms"],row["foreground_ms"])}
+                else {describe_window(w,row)}
+            }).collect::<Vec<_>>().join(" · ");
+            lines.push((format!("slo/{name}"), if seen {status(verdict(&target["windows"],true).met)} else {"info"},
+                format!("client-observed; closed UTC minutes, delayed/incomplete reported population: {text}")));
+            continue;
+        }
         match name {
             "sql-statement" => {
                 let max = target["max_ms"].as_f64().unwrap_or_default();
