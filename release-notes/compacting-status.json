@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Additive optional Agent.activity ('compacting'); older clients ignore it. The Claude driver now records reason compaction at PreCompact, and the omp channel from its pre_compact frame to its compaction context frame; pi reports only the end and shows no status. Codex already reported reason compaction. st agents ls (enriched) prints the activity line."
+    "detail": "Additive optional Agent.activity ('compacting'); older clients ignore it. The Claude driver now records reason compaction at PreCompact, and the omp channel from its pre_compact frame to its compaction context frame; pi reports only the end and shows no status. Codex already reported reason compaction. st agents ls (enriched) prints the activity line. On Claude the status lasts until the next hook event: if Claude never sends the ending event (PostCompact or SessionStart compact) the seat can show compacting until its next tool use, turn or restart. On omp the end edge restores the activity recorded before the compaction, so a compaction inside a working turn ends working."
   },
   "downtime": {
     "status": "none",

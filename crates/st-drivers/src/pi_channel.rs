@@ -409,6 +409,10 @@ fn channel_loop(
     // Whether this channel saw a compaction start and not yet its end. pi reports only the end,
     // so it never shows as compacting rather than showing a status it cannot clear.
     let mut compacting = false;
+    // The activity this channel last recorded, which a compaction's end restores: omp compacts
+    // mid-turn too, and says a turn is active only when it starts.
+    let mut activity = None;
+    let mut activity_before_compaction = None;
     let label = kind.label;
     let mut next_heartbeat = Instant::now() + heartbeat_every;
     loop {
@@ -454,13 +458,16 @@ fn channel_loop(
                 {
                     writer.interrupt();
                 }
-                if let Some(observation) = observation
+                if let Some(observation) = observation {
+                    activity = Some(observation.state);
                     // A queued live frame must never overwrite the wrapper's terminal record:
                     // the channel and the wrapper are separate processes, so the flock alone
                     // serializes but does not order their writes.
-                    && let Err(error) = writer.observe_unless_ended(observation)
-                {
-                    tracing::warn!("st {label} channel: recording observed state failed: {error}");
+                    if let Err(error) = writer.observe_unless_ended(observation) {
+                        tracing::warn!(
+                            "st {label} channel: recording observed state failed: {error}"
+                        );
+                    }
                 }
                 // The credential axis is a third record, independent of the numbers and of the
                 // categorical state: a rejection stands until a turn reaches its ordinary end,
@@ -488,6 +495,9 @@ fn channel_loop(
                 let compaction = if frame.as_ref().is_some_and(|frame| {
                     frame.get("type").and_then(Value::as_str) == Some("pre_compact")
                 }) {
+                    if !compacting {
+                        activity_before_compaction = activity;
+                    }
                     compacting = true;
                     Some(match ensure_pre_compact_context(agent_dir) {
                         Ok(_) => harness_state::Observation::new(
@@ -510,8 +520,12 @@ fn channel_loop(
                     })
                 } else if compaction_ended {
                     compacting = false;
+                    // Back to what the seat was doing: a turn that compacted mid-way still
+                    // works, and a `/compact` from idle is idle again.
                     Some(harness_state::Observation::new(
-                        harness_state::Activity::Idle,
+                        activity_before_compaction
+                            .take()
+                            .unwrap_or(harness_state::Activity::Idle),
                         harness_state::BlockedOn::None,
                         harness_state::InputBuffer::Unknown,
                     ))
@@ -1422,10 +1436,20 @@ mod tests {
         let compacting = run(&[start]).unwrap();
         assert_eq!(compacting["state"], "active");
         assert_eq!(compacting["reason"], "compaction");
+        // A `/compact` with nothing running before it ends idle.
         let done = run(&[start, end]).unwrap();
         assert_eq!(done["state"], "idle");
         assert!(done["reason"].is_null(), "{done}");
         assert!(run(&[end]).is_none(), "an end alone writes no status");
+        // A compaction inside a working turn ends with the turn still working: omp says a turn is
+        // active only when it starts.
+        let working = r#"{"type":"state","state":"active"}"#;
+        let idle = r#"{"type":"state","state":"idle"}"#;
+        let mid_turn = run(&[working, start, end]).unwrap();
+        assert_eq!(mid_turn["state"], "active", "{mid_turn}");
+        assert!(mid_turn["reason"].is_null(), "{mid_turn}");
+        let from_idle = run(&[idle, start, end]).unwrap();
+        assert_eq!(from_idle["state"], "idle", "{from_idle}");
     }
 
     /// The stdio connection is the evidence. While it lives, the record's heartbeat advances
