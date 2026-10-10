@@ -303,9 +303,11 @@ thread_local! {
     static CURRENT_TRANSACTION_STEPS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
-// SQLite may retry a brief collision inside this same current attempt. Keep half of the
-// unchanged 100 ms deadline for schema work, validation, mutation and commit.
-const CURRENT_WRITER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+// SQLite admission uses only time remaining in this attempt, reserving a short write.
+// Schema work, validation, mutation and commit share the unchanged 100 ms deadline.
+const CURRENT_WRITE_RESERVE: std::time::Duration = std::time::Duration::from_millis(10);
+const CURRENT_WRITER_WAIT: std::time::Duration =
+    crate::client::LATEST_VALUE_TIMEOUT.saturating_sub(CURRENT_WRITE_RESERVE);
 
 /// Only this fresh connection's progress deadline can interrupt a current transaction.
 /// Preserve ownership/protocol errors; do not infer interruption from an error's text.
@@ -355,8 +357,9 @@ fn current_transaction<T>(
         }
         connection
             .busy_timeout(
-                CURRENT_WRITER_WAIT
-                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .saturating_sub(CURRENT_WRITE_RESERVE),
             )
             .map_err(internal)?;
         let tx = connection
@@ -3289,7 +3292,7 @@ mod tests {
     }
 
     #[test]
-    fn current_publication_admits_a_brief_collision_without_a_later_retry() {
+    fn current_publication_uses_the_remaining_attempt_after_a_managed_writer_hold() {
         let root = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&root.path().join("graph.sqlite"), "owner").unwrap());
         declare(&store, "owner");
@@ -3306,7 +3309,7 @@ mod tests {
             )
             .unwrap();
             locked.send(()).unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(60));
             tx.commit().unwrap();
         });
         acquired.recv().unwrap();

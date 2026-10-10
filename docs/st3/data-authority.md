@@ -29,8 +29,8 @@ of the same node as evidence; a claim can cite only claims.
 
 Current categorical status, context occupancy, todo, workspace availability and peer connectivity
 are replaceable values in `latest_values`. There is one row per subject and kind (per observing
-host for connectivity). A separate SQLite connection allows at most 50 ms for write admission
-inside the same 100 ms current attempt. The immediate transaction keeps its 100 ms SQLite
+host for connectivity). A separate SQLite connection uses the remaining current attempt for write admission,
+reserving 10 ms for register work (at most 90 ms admission). The immediate transaction keeps its 100 ms SQLite
 progress deadline, with explicit deadline checks before beginning and committing. A longer
 collision drops the attempt without entering the ordered graph writer or retaining a later retry. A new
 sample replaces the previous value and its local feed row. Status keeps the current episode's

@@ -2050,6 +2050,7 @@ async fn send_one(context: &Context, name: &str) -> Result<(), String> {
                 claim,
             };
             let current = kind == "harness.observed";
+            let attempted = Instant::now();
             let result = on_daemon(context, move |store| {
                 Ok(if current {
                     store.append_claim(&publication.claim).map(drop)
@@ -2068,7 +2069,11 @@ async fn send_one(context: &Context, name: &str) -> Result<(), String> {
                             && (error.message.contains("database is locked")
                                 || error.message.contains("database table is locked"))) =>
                 {
-                    context.current_dropped.fetch_add(1, Ordering::Relaxed);
+                    let dropped = context.current_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                    eprintln!(
+                        "current sample dropped #{dropped}: turn={turn} elapsed={:?} error={error:?}",
+                        attempted.elapsed()
+                    );
                     Ok(())
                 }
                 result => result.map_err(|error| error.message),
