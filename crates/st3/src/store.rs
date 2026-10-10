@@ -124,6 +124,7 @@ pub use smallclaims::store::{
 mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
+#[cfg(test)]
 pub(crate) use attention_snapshot::native_prompt_gone_key;
 // Registration stays opt-in until the shared installer certifies every source family.
 #[cfg_attr(
@@ -56322,7 +56323,7 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         assert_eq!(prompts()[0].episode, episode);
         assert!(store.record_native_prompt_gone(&heartbeat, "other").is_err());
         let clear = store.record_native_prompt_gone(&heartbeat, "one").unwrap();
-        assert_eq!(clear.body["fields"]["prompt_observation"], episode);
+        assert_eq!(clear.body["fields"]["reason"], format!("native prompt {episode} was refused in the terminal"));
         assert_eq!(clear.body["evidence"], json!([]));
         assert!(prompts().is_empty());
         let later = sample(10);

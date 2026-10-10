@@ -81,7 +81,7 @@ impl Store {
                 ("status".into(), json!("resolved")),
                 ("driver".into(), json!("claude")),
                 ("incarnation_id".into(), json!(incarnation)),
-                ("prompt_observation".into(), json!(Self::native_prompt_episode(observation))),
+                ("reason".into(), json!(format!("native prompt {} was refused in the terminal", Self::native_prompt_episode(observation)))),
             ]),
             evidence: if durable { vec![observation.id.clone()] } else { vec![] },
             expected_subject: None,
