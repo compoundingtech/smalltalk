@@ -923,8 +923,8 @@ fn an_actors_order_is_built_once_per_publication_by_its_first_read() {
         rows.actor_rows(&format!("agent/garden/other-{n}"));
     }
     assert!(rows.actor_rows("agent/garden/ash").1, "evicted, so built again");
-    let (kept, in_flight) = rows.actors.kept();
-    assert_eq!((kept, in_flight), (crate::store::work_list::ACTOR_ORDERS, 0));
+    let (kept, in_flight, overflow) = rows.actors.kept();
+    assert_eq!((kept, in_flight, overflow), (crate::store::work_list::ACTOR_ORDERS, 0, 0));
     // Each kept actor holds at most four bytes a row of this publication, besides its name and
     // its entry's fixed size.
     assert!(rows.actors.retained_bytes() <= kept * (rows.order.len() * 4 + 256));

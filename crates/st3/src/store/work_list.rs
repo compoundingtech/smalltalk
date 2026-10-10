@@ -73,16 +73,17 @@ pub(crate) struct WorkChanges {
 pub(crate) const ACTOR_ORDERS: usize = 64;
 
 /// The rows each actor sees of one publication, as indexes into its `order`, in the order the
-/// direct read gives that actor. An actor's order is built once per publication, by its first
-/// read; concurrent reads of the same actor wait for that one build, and no lock is held across
-/// it. Past [`ACTOR_ORDERS`] the least recently read actor whose order is built is dropped; one
-/// still being built is never dropped, so a second read of it never builds it again. When every
-/// kept actor is still being built, a new actor's order is built for its read alone and not
-/// kept. A dropped order lives on only while a read or a page cursor still holds it.
+/// direct read gives that actor. Every in-flight build has one cell per actor: concurrent reads
+/// of the same actor wait on it, so an actor's order is built once, and no lock is held across a
+/// build. Up to [`ACTOR_ORDERS`] actors are kept, the least recently read built one dropped
+/// first; one still being built is never dropped. When every kept actor is still being built, a
+/// new actor's cell is registered as overflow: reads of that actor share it, and it is removed
+/// once built. A dropped order lives on only while a read or a page cursor still holds it.
 #[derive(Default)]
 pub(crate) struct ActorOrders {
-    entries: Mutex<std::collections::VecDeque<(String, Arc<std::sync::OnceLock<Arc<Vec<u32>>>>)>>,
-    /// Rows scanned building actors' orders, and the builds and reuses, for tests.
+    entries: Mutex<std::collections::VecDeque<ActorEntry>>,
+    /// Rows scanned building actors' orders, builds, reuses and overflow registrations, for
+    /// tests.
     #[cfg(test)]
     pub(crate) scanned: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -90,7 +91,16 @@ pub(crate) struct ActorOrders {
     #[cfg(test)]
     pub(crate) hits: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
-    pub(crate) unkept: std::sync::atomic::AtomicUsize,
+    pub(crate) overflow: std::sync::atomic::AtomicUsize,
+}
+
+type OrderCell = Arc<std::sync::OnceLock<Arc<Vec<u32>>>>;
+
+/// One actor's registered cell: kept, or overflow until it is built.
+struct ActorEntry {
+    actor: String,
+    cell: OrderCell,
+    kept: bool,
 }
 
 // A clone for the next fold's rows starts with no actor's order: they are of these rows only.
@@ -100,46 +110,81 @@ impl Clone for ActorOrders {
     }
 }
 
+/// A read's registration of its cell, released however the read ends, its build's panic
+/// included. It removes only the very cell it registered, never a later one for the same actor.
+struct Registration<'a> {
+    orders: &'a ActorOrders,
+    actor: &'a str,
+    cell: &'a OrderCell,
+    kept: bool,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        let mut entries = self.orders.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(position) =
+            entries.iter().position(|entry| entry.actor == self.actor && Arc::ptr_eq(&entry.cell, self.cell))
+        else {
+            return;
+        };
+        let remove = if self.cell.get().is_some() {
+            // Built: an overflow cell has served the reads that shared it; a kept one stays.
+            !self.kept
+        } else {
+            // Its build panicked. With another read still waiting on this cell, that read builds
+            // it next and new reads find it; with none, a new read registers a new cell.
+            Arc::strong_count(self.cell) == 2
+        };
+        if remove {
+            entries.remove(position);
+        }
+    }
+}
+
 impl ActorOrders {
-    /// `viewer`'s order, built by `build` unless an earlier read built it. Says whether this
-    /// read built it.
+    /// `viewer`'s order, built by `build` unless another read of the same cell built it. Says
+    /// whether this read built it.
     fn get_or_build(&self, viewer: &str, build: impl FnOnce() -> Vec<u32>) -> (Arc<Vec<u32>>, bool) {
-        let cell = {
+        let (cell, kept) = {
             let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-            match entries.iter().position(|(actor, _)| actor == viewer) {
+            match entries.iter().position(|entry| entry.actor == viewer) {
                 Some(position) => {
-                    let entry = entries.remove(position).expect("the entry just found");
-                    let cell = Arc::clone(&entry.1);
-                    entries.push_back(entry);
-                    cell
+                    let (cell, kept) = (Arc::clone(&entries[position].cell), entries[position].kept);
+                    if kept {
+                        let entry = entries.remove(position).expect("the entry just found");
+                        entries.push_back(entry);
+                    }
+                    (cell, kept)
                 }
                 None => {
-                    if entries.len() >= ACTOR_ORDERS {
-                        match entries.iter().position(|(_, cell)| cell.get().is_some()) {
-                            Some(built) => drop(entries.remove(built)),
-                            // Every kept actor is mid-build: build this one unkept.
-                            None => {
-                                drop(entries);
-                                #[cfg(test)]
-                                {
-                                    self.builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    self.unkept.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                return (Arc::new(build()), true);
+                    let kept = entries.iter().filter(|entry| entry.kept).count() < ACTOR_ORDERS
+                        || match entries.iter().position(|entry| entry.kept && entry.cell.get().is_some()) {
+                            Some(built) => {
+                                entries.remove(built);
+                                true
                             }
+                            // Every kept actor is mid-build: this one is overflow.
+                            None => false,
+                        };
+                    #[cfg(test)]
+                    {
+                        if !kept {
+                            self.overflow.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
-                    let cell = Arc::new(std::sync::OnceLock::new());
-                    entries.push_back((viewer.to_owned(), Arc::clone(&cell)));
-                    cell
+                    let cell = OrderCell::default();
+                    entries.push_back(ActorEntry { actor: viewer.to_owned(), cell: Arc::clone(&cell), kept });
+                    (cell, kept)
                 }
             }
         };
+        let registration = Registration { orders: self, actor: viewer, cell: &cell, kept };
         let mut built = false;
         let order = Arc::clone(cell.get_or_init(|| {
             built = true;
             Arc::new(build())
         }));
+        drop(registration);
         #[cfg(test)]
         {
             let counter = if built { &self.builds } else { &self.hits };
@@ -148,28 +193,35 @@ impl ActorOrders {
         (order, built)
     }
 
-    /// The bytes the kept actors hold: each order's allocated row indexes, its actor's name, and
-    /// its entry and cell. Orders dropped while a read or cursor still holds them are not here.
+    /// The bytes the kept and overflow actors hold: each order's allocated row indexes, its
+    /// actor's name, and its entry and cell. Orders dropped while a read or cursor still holds
+    /// them are not here.
     #[cfg(test)]
     pub(crate) fn retained_bytes(&self) -> usize {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries
             .iter()
-            .map(|(actor, cell)| {
-                let order = cell.get().map_or(0, |order| order.capacity() * 4 + std::mem::size_of::<Vec<u32>>());
-                actor.capacity()
-                    + std::mem::size_of::<(String, Arc<std::sync::OnceLock<Arc<Vec<u32>>>>)>()
+            .map(|entry| {
+                let order = entry.cell.get().map_or(0, |order| order.capacity() * 4 + std::mem::size_of::<Vec<u32>>());
+                entry.actor.capacity()
+                    + std::mem::size_of::<ActorEntry>()
                     + std::mem::size_of::<std::sync::OnceLock<Arc<Vec<u32>>>>()
                     + order
             })
             .sum()
     }
 
-    /// How many actors are kept, and how many of them are still being built.
+    /// How many actors are kept, how many of those are still being built, and how many overflow
+    /// cells are registered.
     #[cfg(test)]
-    pub(crate) fn kept(&self) -> (usize, usize) {
+    pub(crate) fn kept(&self) -> (usize, usize, usize) {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        (entries.len(), entries.iter().filter(|(_, cell)| cell.get().is_none()).count())
+        let kept = entries.iter().filter(|entry| entry.kept);
+        (
+            kept.clone().count(),
+            kept.filter(|entry| entry.cell.get().is_none()).count(),
+            entries.iter().filter(|entry| !entry.kept).count(),
+        )
     }
 }
 
@@ -571,8 +623,7 @@ mod tests {
             for n in 0..ACTOR_ORDERS {
                 orders.get_or_build(&format!("agent/other-{n}"), || vec![n as u32]);
             }
-            let (kept, in_flight) = orders.kept();
-            assert_eq!((kept, in_flight), (ACTOR_ORDERS, 1), "a, mid-build, was not evicted");
+            assert_eq!(orders.kept(), (ACTOR_ORDERS, 1, 0), "a, mid-build, was not evicted");
             // A second read of a waits for the one build rather than building again.
             let second = scope.spawn(|| orders.get_or_build("agent/a", || panic!("a second build of agent/a")));
             release.send(()).unwrap();
@@ -582,10 +633,11 @@ mod tests {
             assert_eq!(*order, vec![3, 1, 2]);
         });
         assert_eq!(orders.builds.load(Relaxed), ACTOR_ORDERS + 1);
-        assert_eq!(orders.unkept.load(Relaxed), 0);
-        // With every slot mid-build, a new actor is built for its read alone, never kept.
-        let full = ActorOrders::default();
-        let full = &full;
+        assert_eq!(orders.overflow.load(Relaxed), 0);
+    }
+
+    /// Block every kept slot's build, run `then` while they are all mid-build, then release them.
+    fn while_saturated(orders: &ActorOrders, then: impl FnOnce()) {
         let (started, building) = std::sync::mpsc::channel();
         let (release, held) = std::sync::mpsc::channel::<()>();
         let held = std::sync::Arc::new(std::sync::Mutex::new(held));
@@ -594,7 +646,7 @@ mod tests {
                 .map(|n| {
                     let (started, held) = (started.clone(), std::sync::Arc::clone(&held));
                     scope.spawn(move || {
-                        full.get_or_build(&format!("agent/slow-{n}"), move || {
+                        orders.get_or_build(&format!("agent/slow-{n}"), move || {
                             started.send(()).unwrap();
                             held.lock().unwrap().recv().unwrap();
                             vec![n as u32]
@@ -605,11 +657,8 @@ mod tests {
             for _ in 0..ACTOR_ORDERS {
                 building.recv().unwrap();
             }
-            assert_eq!(full.kept(), (ACTOR_ORDERS, ACTOR_ORDERS));
-            let (order, built) = full.get_or_build("agent/late", || vec![7]);
-            assert!(built && *order == vec![7]);
-            assert_eq!(full.unkept.load(Relaxed), 1);
-            assert_eq!(full.kept().0, ACTOR_ORDERS, "the late actor was not kept");
+            assert_eq!(orders.kept(), (ACTOR_ORDERS, ACTOR_ORDERS, 0), "every kept slot mid-build");
+            then();
             for _ in 0..ACTOR_ORDERS {
                 release.send(()).unwrap();
             }
@@ -617,6 +666,77 @@ mod tests {
                 assert!(builder.join().unwrap().1);
             }
         });
+    }
+
+    #[test]
+    fn with_every_kept_slot_mid_build_one_overflow_cell_serves_every_read_of_an_actor() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let orders = ActorOrders::default();
+        while_saturated(&orders, || {
+            let (started, building) = std::sync::mpsc::channel();
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            std::thread::scope(|scope| {
+                let first = scope.spawn(|| {
+                    orders.get_or_build("agent/late", move || {
+                        started.send(()).unwrap();
+                        held.recv().unwrap();
+                        vec![7]
+                    })
+                });
+                building.recv().unwrap();
+                assert_eq!(orders.kept().2, 1, "one overflow cell, registered");
+                // A second read of the same actor shares that cell: one build.
+                let second = scope.spawn(|| orders.get_or_build("agent/late", || panic!("a second build of agent/late")));
+                release.send(()).unwrap();
+                assert_eq!(first.join().unwrap(), (std::sync::Arc::new(vec![7]), true));
+                assert_eq!(second.join().unwrap(), (std::sync::Arc::new(vec![7]), false));
+            });
+            // Built, it served its reads and is gone; still saturated, a later read is overflow
+            // again, built once more and removed.
+            assert_eq!(orders.kept(), (ACTOR_ORDERS, ACTOR_ORDERS, 0));
+            assert_eq!(orders.get_or_build("agent/late", || vec![8]), (std::sync::Arc::new(vec![8]), true));
+            assert_eq!(orders.kept().2, 0);
+            assert_eq!(orders.overflow.load(Relaxed), 2);
+        });
+        // Slots built again: the next read of it is kept.
+        orders.get_or_build("agent/late", || vec![9]);
+        assert_eq!(orders.kept(), (ACTOR_ORDERS, 0, 0));
+        assert_eq!(orders.get_or_build("agent/late", || panic!("kept, so not built again")).1, false);
+    }
+
+    #[test]
+    fn a_build_that_panics_releases_its_cell_unless_another_read_waits_on_it() {
+        let orders = ActorOrders::default();
+        // Alone: its registration is removed, and the next read registers and builds afresh.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            orders.get_or_build("agent/a", || panic!("the build failed"))
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(orders.kept(), (0, 0, 0), "nothing stranded");
+        assert_eq!(orders.get_or_build("agent/a", || vec![1]), (std::sync::Arc::new(vec![1]), true));
+        // With another read waiting on its cell, that read builds it once, in the same cell.
+        let (started, building) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let failing = scope.spawn(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    orders.get_or_build("agent/b", move || {
+                        started.send(()).unwrap();
+                        held.recv().unwrap();
+                        panic!("the first build failed")
+                    })
+                }))
+            });
+            building.recv().unwrap();
+            let waiting = scope.spawn(|| orders.get_or_build("agent/b", || vec![2]));
+            // Give the waiting read time to block on the cell; either way it builds once.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            release.send(()).unwrap();
+            assert!(failing.join().unwrap().is_err());
+            assert_eq!(waiting.join().unwrap(), (std::sync::Arc::new(vec![2]), true));
+        });
+        assert_eq!(orders.kept(), (2, 0, 0), "a and b kept, built, nothing orphaned");
+        assert_eq!(orders.get_or_build("agent/b", || panic!("kept, so not built again")).1, false);
     }
 
     #[test]
