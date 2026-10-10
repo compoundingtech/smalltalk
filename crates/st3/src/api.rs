@@ -4775,8 +4775,27 @@ fn client_agents_published_page(
     state: &AppState,
     query: &ClientListQuery,
 ) -> Result<Option<ClientPageResponse>, ApiError> {
+    for recheck in [false, true] {
+        let current = state.store.index().map_err(ApiError::internal)?;
+        #[cfg(test)]
+        state.store.roster_window_snapshot_for_test(current);
+        let page = client_agents_published_page_at(state, query, current)?;
+        if page.is_some() || recheck || !state.store.agent_roster_publication_after(current,
+            query.history, (!query.history && query.status.is_none()).then_some(CLIENT_MAX_PAGE_ITEMS + 1)) {
+            return Ok(page);
+        }
+        // A newer publication overtook this cut. Read the clock once more, without
+        // folding cards or changing continuation semantics.
+    }
+    unreachable!("the second page lookup always returns")
+}
+
+fn client_agents_published_page_at(
+    state: &AppState,
+    query: &ClientListQuery,
+    current: u64,
+) -> Result<Option<ClientPageResponse>, ApiError> {
     let store = &state.store;
-    let current = store.index().map_err(ApiError::internal)?;
     let index = current;
     let Some((index, cards, published_at)) = store.published_agent_roster(index, query.history) else {
         // Before the first complete roster, an unfiltered first page can come from its head.

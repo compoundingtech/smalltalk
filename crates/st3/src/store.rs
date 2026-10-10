@@ -3191,6 +3191,17 @@ impl Store {
             .unwrap_or_default())
     }
 
+    #[cfg(test)]
+    pub(crate) fn on_next_roster_window_snapshot_for_test(&self, hook: impl FnOnce(u64) + Send + 'static) {
+        *self.smalltalk.roster_window_snapshot_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn roster_window_snapshot_for_test(&self, index: u64) {
+        let hook = self.smalltalk.roster_window_snapshot_hook.lock().unwrap().take();
+        if let Some(hook) = hook { hook(index); }
+    }
+
     /// Never waits; multi-gate readers release unrelated guards before queuing on a miss.
     pub(crate) fn try_admit_agent_resources(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         self.smalltalk.agent_resources_admission.clone().try_lock_owned().ok()
@@ -3456,6 +3467,29 @@ impl Store {
             .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
             .max_by_key(|entry| (entry.index, entry.local))
             .map(|entry| (entry.index, Arc::clone(&entry.items), entry.published_at_unix_ms))
+    }
+
+    /// Whether a newer publication can answer a window whose physical snapshot was
+    /// overtaken. Check cached metadata and head coverage without copying any cards.
+    pub(crate) fn agent_roster_publication_after(&self, index: u64, history: bool, head_count: Option<usize>) -> bool {
+        let cache = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned");
+        if cache.iter().any(|entry| entry.history == history && entry.covered.is_none() && entry.index > index) {
+            return true;
+        }
+        drop(cache);
+        let Some(count) = head_count else { return false; };
+        let refs = self.smalltalk.agent_page_refs_cache.lock()
+            .expect("agent page refs cache poisoned").iter()
+            .filter(|entry| !entry.history && entry.index > index)
+            .max_by_key(|entry| entry.index)
+            .map(|entry| (entry.index, Arc::clone(&entry.items)));
+        let Some((cut, refs)) = refs else { return false; };
+        self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .any(|entry| !entry.history && entry.index == cut && entry.covered.as_ref().is_none_or(|covered|
+                refs.iter().take(count).all(|reference|
+                    reference["id"].as_str().is_some_and(|id| covered.contains(id)))))
     }
 
     /// The complete roster published at exactly `cut`, for a page continuing from a first page

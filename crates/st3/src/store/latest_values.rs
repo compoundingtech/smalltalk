@@ -355,16 +355,31 @@ fn current_transaction<T>(
                 "the current value exceeded its write deadline",
             ));
         }
-        connection
-            .busy_timeout(
-                deadline
-                    .saturating_duration_since(std::time::Instant::now())
-                    .saturating_sub(CURRENT_WRITE_RESERVE),
-            )
-            .map_err(internal)?;
-        let tx = connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(internal)?;
+        // SQLite's escalating busy sleeps can skip brief release windows between managed
+        // transactions. Retry only BEGIN at short intervals within this same attempt; no
+        // mutation or ownership validation runs until admission, and no sample is queued.
+        connection.busy_timeout(std::time::Duration::ZERO).map_err(internal)?;
+        let admission_deadline = deadline - CURRENT_WRITE_RESERVE;
+        let tx = loop {
+            if std::time::Instant::now() >= deadline {
+                return Err(St3Error::new("current-value-deadline", "the current value exceeded its write deadline"));
+            }
+            match Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate) {
+                Ok(tx) => break tx,
+                Err(error) => {
+                    let retryable = matches!(error.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::DatabaseBusy));
+                    let remaining = admission_deadline.saturating_duration_since(std::time::Instant::now());
+                    if !retryable || remaining.is_zero() {
+                        return Err(internal(error));
+                    }
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(1)));
+                    if std::time::Instant::now() >= admission_deadline {
+                        return Err(internal(error));
+                    }
+                }
+            }
+        };
         #[cfg(test)]
         let started = std::time::Instant::now();
         if std::time::Instant::now() >= deadline {

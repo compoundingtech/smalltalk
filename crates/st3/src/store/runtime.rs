@@ -13,6 +13,9 @@ pub(crate) struct ActualCacheKey {
 
 /// smalltalk's half of the store. The graph holds it as its runtime, and `Store` keeps it beside
 /// the graph for the caches its reads use.
+#[cfg(test)]
+type RosterWindowSnapshotHook = Box<dyn FnOnce(u64) + Send>;
+
 #[derive(Default)]
 pub struct SmalltalkRuntime {
     /// One registry per graph. Registration alone does not certify source coverage.
@@ -44,6 +47,8 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
     pub(crate) latest_cache_id: Mutex<u64>,
     pub(crate) agent_resources_cache: Mutex<VecDeque<AgentResourcesEntry>>,
+    #[cfg(test)]
+    pub(crate) roster_window_snapshot_hook: Mutex<Option<RosterWindowSnapshotHook>>,
     /// Ordering and queue metadata for lazy HTTP pages, shared at the same graph cuts.
     pub(crate) agent_page_refs_cache: Mutex<VecDeque<AgentResourcesEntry>>,
     /// Acquire before opening a SQLite snapshot, never while pinning a WAL read mark.

@@ -353,6 +353,7 @@ async fn collection_items_with_windows(
     let custom_forms = session.custom_forms;
     let arrangement_window = collection == "arrangements";
     let mut admitted = collection != "agents";
+    let mut rechecked_publication = false;
     let (snapshot, mut items, mut has_more) = loop {
         // Summary reads the published roster once a refresher keeps one; only a store without
         // one folds it here, behind the shared admission.
@@ -374,16 +375,19 @@ async fn collection_items_with_windows(
         let prepared = prepared.clone();
         let windows = windows.clone();
         let worker_store = state.store.clone();
-        let (result, read_permit, returned_admission) = super::blocking_store(move || {
+        let (result, read_permit, returned_admission, snapshot_overtaken) = super::blocking_store(move || {
             worker_store.readers.request_read_with_permit(reader_permit, move || {
         // The worker owns both guards until its physical snapshot finishes, including
         // after caller cancellation. A miss returns them without allocating shared guards.
         let mut admission = admission;
+        let mut snapshot_overtaken = false;
         let result = crate::profile::task(collection_window_label(&collection), || {
             let _roster_admission = roster_admission;
             let store = state.store.clone();
             let commits = windows.as_ref().map(|windows| windows.commits());
             store.read_snapshot(|index| {
+                #[cfg(test)]
+                if collection == "agents" { store.roster_window_snapshot_for_test(index); }
                 let now = client_now_ms();
                 // Recheck paired grants, including expiry and changed scopes, before any reuse.
                 let (current, person) = match (|| {
@@ -434,6 +438,11 @@ async fn collection_items_with_windows(
                             // A daemon's readers never fold the roster: until its refresher
                             // has published one, the window is not ready yet.
                             None if store.agent_roster_refresher_running() => {
+                                // The cache may have evicted this pinned cut while publishing
+                                // a newer one. Retry once with a fresh physical snapshot, after
+                                // returning all read guards; never fold a roster on this path.
+                                snapshot_overtaken = store.agent_roster_publication_after(
+                                    index, false, status.is_none().then_some(limit + 1));
                                 store.request_agent_roster_refresh();
                                 return Ok(Err(super::agent_roster_not_ready()));
                             }
@@ -549,12 +558,16 @@ async fn collection_items_with_windows(
                 Ok(Ok(Some((snapshot, items, has_more))))
             })
         });
-        Ok((result?, read_permit, admission))
+        Ok((result?, read_permit, admission, snapshot_overtaken))
         })?
         })
         .await?;
         gates.socket = Some(read_permit);
         gates.window = returned_admission;
+        if snapshot_overtaken && !rechecked_publication {
+            rechecked_publication = true;
+            continue;
+        }
         if let Some(rows) = result? {
             break rows;
         }
@@ -12230,6 +12243,102 @@ mission "queue-parity" state="ready" {
         let (cut, _, published_at) = state.store.published_agent_roster(state.store.index().unwrap(), false).unwrap();
         assert_eq!(items[0]["agents_as_of"]["store_index"], cut);
         assert_eq!(items[0]["agents_as_of"]["published_at"], client_timestamp(published_at));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_window_survives_publications_that_overtake_its_read_snapshot() {
+        agent_window_overtaken_by_publication(false, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_window_survives_heads_that_overtake_its_read_snapshot() {
+        agent_window_overtaken_by_publication(true, false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_page_survives_publications_that_overtake_its_cut() {
+        agent_window_overtaken_by_publication(false, true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_page_survives_heads_that_overtake_its_cut() {
+        agent_window_overtaken_by_publication(true, true).await;
+    }
+
+    async fn agent_window_overtaken_by_publication(head_only: bool, http_page: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/window-race".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"window-race", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let _wake = state.store.start_agent_roster_refresher().unwrap();
+        let publish = |store: &Store| {
+            if head_only {
+                store.read_snapshot(|index| crate::api::client_agent_roster_head(store, index)).unwrap();
+            } else {
+                crate::api::refresh_agent_roster(store, false).unwrap();
+            }
+        };
+        publish(&state.store);
+        let request: CollectionSubscribe = serde_json::from_value(json!({"kind":"subscribe",
+            "id":"racing-window", "collection":"agents", "limit":200})).unwrap();
+        let permit = Arc::new(tokio::sync::Semaphore::new(1)).acquire_owned().await.unwrap();
+        let (_, expected, _) = collection_items_with_windows(&state,
+            &ClientSession::local(None).unwrap(), &request, permit, None).await.unwrap();
+        let (entered, captured) = tokio::sync::oneshot::channel();
+        let (resume, released) = std::sync::mpsc::channel();
+        state.store.on_next_roster_window_snapshot_for_test(move |index| {
+            entered.send(index).unwrap();
+            released.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let reader = state.clone();
+        let read = tokio::spawn(async move {
+            let permit = Arc::new(tokio::sync::Semaphore::new(1)).acquire_owned().await.unwrap();
+            let request = serde_json::from_value(json!({"kind":"subscribe",
+                "id":"racing-window", "collection":"agents", "limit":200})).unwrap();
+            if http_page {
+                let (Extension(snapshot), Json(page)) = client_agents(State(reader.clone()),
+                    Extension(new_client_snapshot(&reader)), Query(ClientListQuery {limit: Some(200),
+                        ..ClientListQuery::default()})).await?;
+                Ok((snapshot, page.items, page.page.has_more))
+            } else {
+                collection_items_with_windows(&reader, &ClientSession::local(None).unwrap(),
+                    &request, permit, collection_windows::Windows::attach(&reader.store)).await
+            }
+        });
+        let captured = tokio::time::timeout(Duration::from_secs(5), captured).await.unwrap().unwrap();
+        let publisher = state.store.clone();
+        tokio::task::spawn_blocking(move || {
+            for n in 0..12 {
+                publisher.append_claim(&ClaimInput {
+                    subject: format!("custom/window-race/{n}"), kind:"custom.test.marker".into(), actor:None,
+                    fields:BTreeMap::new(), evidence:Vec::new(), expected_subject:None, idempotency_key:None,
+                }).unwrap();
+                if head_only {
+                    publisher.read_snapshot(|index| crate::api::client_agent_roster_head(&publisher, index)).unwrap();
+                } else {
+                    crate::api::refresh_agent_roster(&publisher, false).unwrap();
+                }
+            }
+            assert!(publisher.published_agent_roster(captured, false).is_none()
+                && publisher.published_agent_roster_head(captured, 201).is_none(),
+                "the captured cut must really have lost its publication");
+        }).await.unwrap();
+        let index = state.store.index().unwrap();
+        let folds = state.store.agent_resources_refolded_cards_for_test();
+        resume.send(()).unwrap();
+        let (snapshot, rows, more) = tokio::time::timeout(Duration::from_secs(5), read).await
+            .expect("the reader must release its old snapshot and use a current publication")
+            .unwrap().expect("a concurrent publication must not force a resync");
+        assert_eq!(snapshot.store_index, index);
+        assert_eq!(rows, expected);
+        assert!(!more);
+        assert_eq!(state.store.index().unwrap(), index, "the read writes nothing");
+        assert_eq!(state.store.agent_resources_refolded_cards_for_test(), folds,
+            "the reader must not fold a roster");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
