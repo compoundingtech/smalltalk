@@ -28,8 +28,8 @@ const meta = {
   render: (args, context) => <ScenarioSync scheme={args.scheme === 'dark' ? 'dark' : 'light'} {...scenarioTime(context)} />,
 } satisfies Meta<Args>
 export default meta
-export const Explore = {} satisfies StoryObj<typeof meta>
-export const Pinned = { parameters: { scenario: { world: 'fleet-mid-refactor' } } } satisfies StoryObj<typeof meta>
-export const SocketDropped = { args: { sync: 'socket-dropped' } } satisfies StoryObj<typeof meta>
-export const Reconnected = { args: { sync: 'reconnected' } } satisfies StoryObj<typeof meta>
-export const SubscriptionLimitLocal = { args: { sync: 'subscription-limit-local' } } satisfies StoryObj<typeof meta>
+export const Explore = {} satisfies StoryObj<Args>
+export const Pinned = { parameters: { scenario: { world: 'fleet-mid-refactor' } } } satisfies StoryObj<Args>
+export const SocketDropped = { args: { sync: 'socket-dropped' } } satisfies StoryObj<Args>
+export const Reconnected = { args: { sync: 'reconnected' } } satisfies StoryObj<Args>
+export const SubscriptionLimitLocal = { args: { sync: 'subscription-limit-local' } } satisfies StoryObj<Args>

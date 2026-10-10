@@ -28,8 +28,8 @@ const meta = {
   render: (args, context) => <ScenarioRoster scheme={args.scheme === 'dark' ? 'dark' : 'light'} now={scenarioTime(context).now} />,
 } satisfies Meta<Args>
 export default meta
-export const Explore = {} satisfies StoryObj<typeof meta>
-export const Pinned = { parameters: { scenario: { world: 'fleet-mid-refactor' } } } satisfies StoryObj<typeof meta>
+export const Explore = {} satisfies StoryObj<Args>
+export const Pinned = { parameters: { scenario: { world: 'fleet-mid-refactor' } } } satisfies StoryObj<Args>
 
 const styles = stylex.create({
   roster: { borderWidth: 1, borderStyle: 'solid', borderColor: borderVars.border, backgroundColor: surfaceVars.sidebar, color: textVars.fg, padding: spaceVars.md },

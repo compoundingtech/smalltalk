@@ -59,7 +59,10 @@ export function projectConversation(slice: WireSlice<'conversation'>) {
       const common = { id: entry.id, sequence: entry.sequence, revision: entry.revision, final: entry.final, role: entry.role, timestamp: DateTime.formatIso(entry.timestamp) }
       switch (entry.type) {
         case 'message': supported.push({ ...common, type: 'message', body: { ...entry.body, reply_to: Option.getOrNull(entry.body.reply_to) } }); break
-        case 'content': supported.push({ ...common, type: 'content', body: entry.body }); break
+        case 'content':
+          if (entry.body.text === undefined) unprojected.add('content without plain text')
+          else supported.push({ ...common, type: 'content', body: { ...entry.body, text: entry.body.text } })
+          break
         case 'tool_call': supported.push({ ...common, type: 'tool_call', body: entry.body }); break
         case 'tool_result': supported.push({ ...common, type: 'tool_result', body: entry.body }); break
         default: unprojected.add(typeof entry.type === 'string' ? entry.type : entry.type.raw)

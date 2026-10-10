@@ -12,7 +12,11 @@ function ScenarioConversation({ scheme }: { readonly scheme: 'light' | 'dark' })
     {conversation.loading ? <p role="status">Loading conversations</p> : conversation.threads.length === 0 ? <p>No conversation history</p> : conversation.threads.map(thread => <section key={thread.agent}>
       <h2>{thread.agent}</h2>
       {thread.unprojected.length > 0 && <p>Not yet projected: {thread.unprojected.join(', ')}</p>}
-      <EmbraceRuntimeProvider options={{ messages: thread.items, isRunning: thread.items.some(item => item._tag === 'Text' && item.streaming) }}>
+      <EmbraceRuntimeProvider options={{
+        messages: thread.items,
+        isRunning: thread.items.some(item => item._tag === 'Text' && item.streaming),
+        onNew: async () => { throw new Error('Scenario conversations are read-only') },
+      }}>
         <EmbraceThread items={thread.items} composer={false} embrace="E3" />
       </EmbraceRuntimeProvider>
     </section>)}
@@ -31,5 +35,5 @@ const meta = {
   render: args => <ScenarioConversation scheme={args.scheme === 'dark' ? 'dark' : 'light'} />,
 } satisfies Meta<Args>
 export default meta
-export const Explore = {} satisfies StoryObj<typeof meta>
-export const Pinned = { parameters: { scenario: { world: 'fleet-mid-refactor' } } } satisfies StoryObj<typeof meta>
+export const Explore = {} satisfies StoryObj<Args>
+export const Pinned = { parameters: { scenario: { world: 'fleet-mid-refactor' } } } satisfies StoryObj<Args>

@@ -224,6 +224,12 @@ importers:
       '@effect/atom-react':
         specifier: 4.0.0-rc.118
         version: 4.0.0-rc.118(effect@4.0.0-rc.118)(react@19.2.3)(scheduler@0.27.0)
+      '@smalltalk/st3-client':
+        specifier: workspace:*
+        version: link:../../clients/typescript/st3-client
+      '@smalltalk/st3-scenarios':
+        specifier: workspace:*
+        version: link:../../clients/typescript/st3-scenarios
       '@stylexjs/stylex':
         specifier: 0.19.0
         version: 0.19.0
