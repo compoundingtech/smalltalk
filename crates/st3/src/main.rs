@@ -21404,8 +21404,10 @@ fn codex_prompt_answers(
     let client = client.clone();
     let runtime = tokio::runtime::Handle::current();
     let agent = urlencoding::encode(subject).into_owned();
-    st_drivers::session_control::PromptAnswers::new(move |since| {
-        let path = format!("/v1/harness-prompts/state?agent={agent}&since={since}");
+    st_drivers::session_control::PromptAnswers::new(move |ownership, transition| {
+        let path = format!(
+            "/v1/harness-prompts/state?agent={agent}&ownership={ownership}&transition={transition}"
+        );
         runtime.block_on(async {
             // Bounded: the control thread reads Codex's socket between these reads.
             tokio::time::timeout(

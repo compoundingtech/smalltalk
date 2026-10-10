@@ -97,18 +97,21 @@ pub enum PromptAnswer {
     Gone,
 }
 
-/// How a native driver reads a person's answer to the prompt it saw open at a unix-ms time. The
-/// owning control plane supplies it; `None` means st could not say this time.
+type PromptAnswerRead = dyn Fn(u64, u64) -> Option<PromptAnswer> + Send + Sync;
+
+/// How a native driver reads a person's answer to its prompt, named by the (ownership,
+/// transition) sequences of the state record observation the prompt wrote. The owning control
+/// plane supplies it; `None` means st could not say this time.
 #[derive(Clone)]
-pub struct PromptAnswers(Arc<dyn Fn(u128) -> Option<PromptAnswer> + Send + Sync>);
+pub struct PromptAnswers(Arc<PromptAnswerRead>);
 
 impl PromptAnswers {
-    pub fn new(read: impl Fn(u128) -> Option<PromptAnswer> + Send + Sync + 'static) -> Self {
+    pub fn new(read: impl Fn(u64, u64) -> Option<PromptAnswer> + Send + Sync + 'static) -> Self {
         Self(Arc::new(read))
     }
 
-    pub(crate) fn read(&self, since_unix_ms: u128) -> Option<PromptAnswer> {
-        (self.0)(since_unix_ms)
+    pub(crate) fn read(&self, ownership: u64, transition: u64) -> Option<PromptAnswer> {
+        (self.0)(ownership, transition)
     }
 }
 

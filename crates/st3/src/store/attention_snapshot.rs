@@ -1519,9 +1519,9 @@ impl Store {
                 NativePromptState::Open
             });
         };
-        // Claude shows one prompt at a time: while every observation since the hook's own still
-        // waits on that permission, it is the same prompt, and an answer to any of them is the
-        // hook's. Anything else in between means the prompt is gone.
+        // Claude and Codex show one prompt at a time: while every observation since the waiter's
+        // own still waits on that permission, it is the same prompt, and an answer to any of them
+        // is the waiter's. Anything else in between means the prompt is gone.
         let mut chain = Vec::new();
         for (claim, body) in &recent[..=own] {
             let body: Value = serde_json::from_str(body)?;

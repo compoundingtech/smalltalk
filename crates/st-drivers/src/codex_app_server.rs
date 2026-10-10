@@ -4995,7 +4995,9 @@ struct PendingCodexApproval {
     id: Value,
     method: String,
     params: Value,
-    seen_unix_ms: u128,
+    /// The state record's (ownership, transition) sequences of the observation this wait wrote:
+    /// the exact prompt st's answer must be for.
+    prompt: Option<(u64, u64)>,
     polled: Option<Instant>,
 }
 
@@ -5003,13 +5005,20 @@ struct PendingCodexApproval {
 /// broadcasts the request to every client and takes the first response, so the TUI's prompt and
 /// st race; `serverRequest/resolved` or the thread moving on forgets the request, and st's answer
 /// is sent at most once. A request for another thread is never remembered or answered.
+///
+/// Like Claude's prompt hook, the request binds to the observation its wait wrote, named by the
+/// seat's state record, and st answers only that observation (or a restatement of it). A request
+/// whose wait wrote no new transition (a second request while the record still shows the first)
+/// never binds: it is answered in the terminal, never with the earlier request's answer.
 #[derive(Debug, Default)]
 struct CodexApprovalAnswer {
     pending: Option<PendingCodexApproval>,
+    /// The last observation a request bound to; a later request never reuses it.
+    last_prompt: Option<(u64, u64)>,
 }
 
 impl CodexApprovalAnswer {
-    fn observe(&mut self, message: &Value, thread_id: &str, now_unix_ms: u128) {
+    fn observe(&mut self, message: &Value, thread_id: &str) {
         let Some(method) = message.get("method").and_then(Value::as_str) else {
             return;
         };
@@ -5034,7 +5043,7 @@ impl CodexApprovalAnswer {
                         id: id.clone(),
                         method: method.to_owned(),
                         params: message.get("params").cloned().unwrap_or(Value::Null),
-                        seen_unix_ms: now_unix_ms,
+                        prompt: None,
                         polled: None,
                     });
                 }
@@ -5060,11 +5069,14 @@ impl CodexApprovalAnswer {
         }
     }
 
-    /// The response to send once st reports the person's answer, read at most once a second.
+    /// The response to send once st reports the person's answer, checked at most once a second.
+    /// `record` reads the seat's state record, which the request's wait has written by the time
+    /// this runs; `read` asks st about the bound observation.
     fn answer_if_due(
         &mut self,
         now: Instant,
-        read: impl FnOnce(u128) -> Option<crate::session_control::PromptAnswer>,
+        record: impl FnOnce() -> Option<harness_state::Observed>,
+        read: impl FnOnce(u64, u64) -> Option<crate::session_control::PromptAnswer>,
     ) -> Option<Value> {
         use crate::session_control::PromptAnswer;
         let pending = self.pending.as_mut()?;
@@ -5075,7 +5087,24 @@ impl CodexApprovalAnswer {
             return None;
         }
         pending.polled = Some(now);
-        match read(pending.seen_unix_ms)? {
+        if pending.prompt.is_none() {
+            pending.prompt = record()
+                .filter(|observed| {
+                    observed.blocked_on == harness_state::BlockedOn::Human
+                        && observed.ask == harness_state::Ask::Permission
+                })
+                .and_then(|observed| {
+                    observed
+                        .ownership_sequence
+                        .zip(observed.transition_sequence)
+                })
+                .filter(|prompt| self.last_prompt != Some(*prompt));
+            if pending.prompt.is_some() {
+                self.last_prompt = pending.prompt;
+            }
+        }
+        let (ownership, transition) = pending.prompt?;
+        match read(ownership, transition)? {
             PromptAnswer::Open => None,
             PromptAnswer::Gone => {
                 self.pending = None;
@@ -5092,7 +5121,10 @@ impl CodexApprovalAnswer {
 
 /// The result of an approval request for a person's `allow` or `deny`, in the method's words:
 /// legacy requests take a `ReviewDecision`, v2 command and file requests `accept`/`decline`, and a
-/// permissions request the profile it grants (the one requested, or none).
+/// permissions request the profile it grants (the one requested, or none). Measured live on Codex
+/// 0.160.1: only `item/commandExecution/requestApproval` answered `accept` from a non-TUI client.
+/// Every other shape here (`decline`, file changes, the legacy `approved` and object-form
+/// `denied`, permissions grants) follows that version's generated app-server schema only.
 fn approval_decision(method: &str, params: &Value, answer: &str) -> Option<Value> {
     let allow = match answer {
         "allow" => true,
@@ -5114,12 +5146,6 @@ fn approval_decision(method: &str, params: &Value, answer: &str) -> Option<Value
         "item/permissions/requestApproval" => json!({ "permissions": {} }),
         _ => return None,
     })
-}
-
-fn unix_now_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis())
 }
 
 fn pump_control(
@@ -5159,9 +5185,15 @@ fn pump_control(
         let mut last_transcript_turn_recovery = None;
         let mut peer_closed = false;
         let delivery_ledger_path = control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
-        let prompt_answers = delivery
-            .as_ref()
-            .and_then(|config| config.prompt_answers.clone());
+        // The answer source, and the state record the approval's observation is written to.
+        let prompt_answers = delivery.as_ref().and_then(|config| {
+            config.prompt_answers.clone().map(|answers| {
+                (
+                    answers,
+                    harness_state::harness_state_path(&config.agent_dir),
+                )
+            })
+        });
         let mut approval_answer = CodexApprovalAnswer::default();
         let mut delivery = delivery
             .map(|config| {
@@ -5204,9 +5236,12 @@ fn pump_control(
             if let Some(delivery) = delivery.as_mut() {
                 delivery.sync_safe_fallback_diagnostic();
             }
-            if let Some(answers) = prompt_answers.as_ref()
-                && let Some(response) =
-                    approval_answer.answer_if_due(Instant::now(), |since| answers.read(since))
+            if let Some((answers, record)) = prompt_answers.as_ref()
+                && let Some(response) = approval_answer.answer_if_due(
+                    Instant::now(),
+                    || harness_state::read(record, None),
+                    |ownership, transition| answers.read(ownership, transition),
+                )
             {
                 write_json_message(&mut websocket, &response)
                     .context("answering a Codex approval request from st")?;
@@ -5383,7 +5418,7 @@ fn pump_control(
             let state = control_state
                 .as_mut()
                 .context("Codex control state is unbound")?;
-            approval_answer.observe(&message, state.thread_id(), unix_now_ms());
+            approval_answer.observe(&message, state.thread_id());
             if let Some(delivery) = delivery.as_mut() {
                 // Some Codex builds keep a secondary subscriber busy with status traffic while
                 // omitting the compaction item itself. Rate-limit this independently of socket
