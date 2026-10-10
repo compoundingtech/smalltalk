@@ -185,13 +185,26 @@ const contentVersion = (item: ConversationItem): string => {
   contentVersions.set(item, version)
   return version
 }
-/** Which committed turns are mounted: the newest page first, then older turns from a kept turn id, then all. */
+/** The window is counted in source rows, not turns: a single agent turn can contain thousands of entries. */
 type MountedTurns = { readonly _tag: 'NewestPage' } | { readonly _tag: 'From'; readonly id: string } | { readonly _tag: 'All' }
-const newestPageTurns = 6
-const backfillChunkTurns = 4
-/** Index of the oldest mounted turn. A kept id that left the transcript mounts everything. */
-const mountedStart = (mounted: MountedTurns, turns: readonly TranscriptTurn[]) =>
-  mounted._tag === 'All' ? 0 : mounted._tag === 'NewestPage' ? Math.max(0, turns.length - newestPageTurns) : Math.max(0, turns.findIndex(turn => turn.id === mounted.id))
+const newestPageRows = 8
+const backfillChunkRows = 4
+const mountedStart = (mounted: MountedTurns, rows: readonly ConversationItem[]) =>
+  mounted._tag === 'All' ? 0 : mounted._tag === 'NewestPage' ? Math.max(0, rows.length - newestPageRows) : Math.max(0, rows.findIndex(row => row.id === mounted.id))
+/** Keep the owning turn's identity and summary while revealing only the mounted suffix of its source rows. */
+const windowTurns = (turns: readonly TranscriptTurn[], start: number): readonly TranscriptTurn[] => {
+  let offset = 0
+  return turns.flatMap(turn => {
+    const length = turn.items.length + (turn.prompt === undefined ? 0 : 1)
+    const skip = Math.max(0, start - offset)
+    offset += length
+    if (length > 0 && skip >= length) return []
+    if (skip === 0) return [turn]
+    const items = turn.items.slice(skip - (turn.prompt === undefined ? 0 : 1))
+    const ids = new Set(items.map(item => item.id))
+    return [{ ...turn, prompt: undefined, items, work: { ...turn.work, calls: turn.work.calls.filter(call => ids.has(call.id)) } }]
+  })
+}
 const whenIdle = (task: () => void): (() => void) => {
   if (typeof requestIdleCallback === 'function') {
     const handle = requestIdleCallback(task, { timeout: 250 })
@@ -200,13 +213,17 @@ const whenIdle = (task: () => void): (() => void) => {
   const handle = setTimeout(task, 16)
   return () => clearTimeout(handle)
 }
+/** Growing a partial turn must not re-render the already mounted message subtrees. */
+const PreparedMessage = React.memo(function PreparedMessage({ item, stranded, caption }: { readonly item: ConversationItem; readonly stranded: boolean; readonly caption?: string }) {
+  return stranded ? <StrandedItem item={item} /> : <SenderCaption.Provider value={caption}><ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} /></SenderCaption.Provider>
+})
 const PreparedTurn = React.memo(function PreparedTurn({ turn, stranded, onOpenTool, onRetryRun, landmarkContext }: { turn: TranscriptTurn; stranded?: ReadonlySet<string>; onOpenTool: TranscriptProps['onOpenTool']; onRetryRun?: () => void; landmarkContext?: string }) {
   const detail = React.useCallback((call: WorkLogCall) => <ToolDetailPreview call={call} onOpen={onOpenTool} />, [onOpenTool])
   const reasoning = turn.items.filter(item => item._tag === 'Reasoning')
   return <section ref={React.useContext(TurnProximityRef)} data-testid="transcript-turn" data-item-id={turn.id} {...stylex.props(styles.turn, styles.turnSkip)}>
-    {turn.prompt !== undefined && (stranded?.has(turn.prompt.id) ? <StrandedItem item={turn.prompt} /> : <ThreadPrimitive.Unstable_MessageById messageId={turn.prompt.id} components={messageComponents} />)}
+    {turn.prompt !== undefined && <PreparedMessage item={turn.prompt} stranded={stranded?.has(turn.prompt.id) ?? false} />}
     {(turn.work.calls.length > 0 || reasoning.length > 0) && <WorkLogV1 turn={turn.work} summaryAnchorId={JSON.stringify(['work-summary', turn.id])} ariaLabel={`Work log ${turn.id}${landmarkContext ? `, ${landmarkContext}` : ''}`} listStyle={styles.workList} renderCallDetail={detail} previewCallDetail={!turn.work.running} interactiveCalls={onOpenTool !== undefined} hideLiveRow onRetry={onRetryRun} onOpenOutput={onOpenTool} expandedBody={reasoning.map(item => <ThinkingEntry key={item.id} itemId={item.id} text={item.text} streaming={item.streaming} />)} />}
-    {turn.items.filter(item => item._tag !== 'ToolCall' && item._tag !== 'Reasoning').map(item => stranded?.has(item.id) ? <StrandedItem key={item.id} item={item} /> : <SenderCaption.Provider key={item.id} value={turn.senderCaptions?.[item.id]}><ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} /></SenderCaption.Provider>)}
+    {turn.items.filter(item => item._tag !== 'ToolCall' && item._tag !== 'Reasoning').map(item => <PreparedMessage key={item.id} item={item} stranded={stranded?.has(item.id) ?? false} caption={turn.senderCaptions?.[item.id]} />)}
     {turn.work.running && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.liveActivity)}><span aria-hidden="true">◌</span></div>}
   </section>
 })
@@ -262,11 +279,13 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
   const timeline = React.useRef<HTMLDivElement>(null)
   const [proximity] = React.useState(() => new TurnProximity())
   React.useLayoutEffect(() => proximity.attach(scrollerOf(timeline.current)), [proximity, committed.length === 0])
-  // First open commits only the newest page. Older turns backfill in capped chunks while the main thread is idle,
-  // and all at once when the reader nears the top or searches the page (Mod+F), so find and the accessibility
-  // tree see every turn.
+  // Each commit mounts a bounded source-row suffix, including oversized single turns. Idle backfill
+  // and history-top reveal use the same budget; only explicit browser find mounts the complete history.
   const [mounted, setMounted] = React.useState<MountedTurns>({ _tag: 'NewestPage' })
-  const start = mountedStart(mounted, committed)
+  const source = React.useMemo(() => committed.flatMap(turn => turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]), [committed])
+  const start = mountedStart(mounted, source)
+  const visibleTurns = React.useMemo(() => windowTurns(committed, start), [committed, start])
+  const turnStart = committed.length - visibleTurns.length
   // The group grid hangs off the first turn this transcript showed, for as long as that turn stays in it.
   const [gridTurn, setGridTurn] = React.useState<string | undefined>(undefined)
   let gridOrigin = committed.findIndex(turn => turn.id === gridTurn)
@@ -274,19 +293,15 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     gridOrigin = 0
     setGridTurn(committed[0]!.id)
   }
-  const latest = React.useRef({ committed, start })
-  React.useLayoutEffect(() => { latest.current = { committed, start } })
+  const latest = React.useRef({ source, start })
+  React.useLayoutEffect(() => { latest.current = { source, start } })
   const mountOlder = React.useCallback((all: boolean) => {
-    const { committed, start } = latest.current
+    const { source, start } = latest.current
     if (start === 0) return
-    const first = timeline.current?.querySelector('[data-testid="transcript-turn"]')
-    const scroller = scrollerOf(timeline.current)
-    const before = first?.getBoundingClientRect().top
-    // A reader already near the top gets every turn, before compensation moves them away from it.
-    const everything = all || scroller != null && scroller.scrollTop < scroller.clientHeight
-    flushSync(() => setMounted(everything ? { _tag: 'All' } : { _tag: 'From', id: committed[Math.max(0, start - backfillChunkTurns)]!.id }))
-    // Turns land above the reader: the previously oldest turn stays where it was on screen.
-    if (first?.isConnected && scroller != null && before !== undefined) scroller.scrollTop += first.getBoundingClientRect().top - before
+    const update = () => flushSync(() => setMounted(all ? { _tag: 'All' } : { _tag: 'From', id: source[Math.max(0, start - backfillChunkRows)]!.id }))
+    // The lane owns compensation: followers stay at the end, readers keep their row.
+    if (viewport.current === null) update()
+    else viewport.current.preserveLayout(update)
   }, [])
   const backfilling = start > 0
   React.useEffect(() => {
@@ -308,7 +323,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
   React.useEffect(() => {
     const scroller = scrollerOf(timeline.current)
     if (!backfilling || scroller == null) return
-    const nearTop = () => { if (scroller.scrollTop < scroller.clientHeight) mountOlder(true) }
+    const nearTop = () => { if (scroller.scrollTop < scroller.clientHeight) mountOlder(false) }
     const find = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 'f') mountOlder(true) }
     const view = scroller.ownerDocument.defaultView
     scroller.addEventListener('scroll', nearTop, { passive: true })
@@ -354,7 +369,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     </header>
     <ErrorOverlayHost lane><EmbraceScrollViewport items={rows} anchorHistory={anchorHistory} stateKey={viewportKey} scrollToBottomKey={scrollToBottomKey} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
       {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
-      {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(committed, start, gridOrigin).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
+      {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(visibleTurns, 0, gridOrigin - turnStart).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
     </EmbraceScrollViewport>{failure?.tone === 'error' && <ErrorOverlay id={`sync-${failure.text}`} title={failure.text} detail="History stays on screen." onRetry={onRetrySync} />}</ErrorOverlayHost>
   </ThreadPrimitive.Root></RetrySend.Provider></MarkdownImagePolicy.Provider>
 }

@@ -467,6 +467,98 @@ for (const beforeFocus of [false, true]) test(`focus scrolling ${beforeFocus ? '
   assert.equal(lane.scrollTop, 900)
 })
 
+const mountTranscriptRows = async (singleTurn = true, withPrompt = false) => {
+  const now = Date.parse('2032-01-18T12:00:00Z')
+  const items = Array.from({ length: 2000 }, (_, index) => ({ _tag: 'Text', id: `row/${index}`, role: 'assistant', text: `Answer ${index}`, attachments: [], streaming: false, at: new Date(now).toISOString() }))
+  const work = { calls: [], running: false, failed: false, interrupted: false }
+  const prompt = withPrompt ? { _tag: 'Text', id: 'newest-prompt', role: 'user', text: 'Keep this question visible', attachments: [], streaming: false, at: new Date(now).toISOString() } : undefined
+  const turns = singleTurn ? [{ id: 'long-turn', prompt, items, work }] : Array.from({ length: 1000 }, (_, index) => ({ id: `pair/${index}`, items: items.slice(index * 2, index * 2 + 2), work }))
+  await act(async () => root.render(React.createElement(EmbraceRuntimeProvider, { options: { messages: prompt === undefined ? items : [prompt, ...items], isRunning: false, onNew: async () => {} } }, React.createElement(Transcript, { turns, title: 'Bounded history', sync: { _tag: 'Live', since: now }, now, observedAt: now }))))
+  const lane = container.querySelector('[data-testid="transcript-scroll"]')
+  const messages = () => [...lane.querySelectorAll('[data-testid="agent-message"]')]
+  Object.defineProperties(lane, { scrollHeight: { configurable: true, get: () => messages().length * 100 }, clientHeight: { configurable: true, get: () => 200 } })
+  lane.getBoundingClientRect = () => ({ top: 0, bottom: 200, left: 0, right: 800, width: 800, height: 200 })
+  const geometry = () => {
+    messages().forEach(row => { row.getBoundingClientRect = () => { const top = messages().indexOf(row) * 100 - lane.scrollTop; return { top, bottom: top + 100, left: 0, right: 800, width: 800, height: 100 } } })
+    for (const turn of lane.querySelectorAll('[data-testid="transcript-turn"]')) turn.getBoundingClientRect = () => ({ top: -lane.scrollTop, bottom: lane.scrollHeight - lane.scrollTop })
+  }
+  geometry()
+  return { lane, messages, geometry }
+}
+
+for (const singleTurn of [true, false]) test(`initial 2000-row transcript mounts at most six source rows (${singleTurn ? 'one oversized turn' : '1000 two-row turns'})`, async () => {
+  const { messages } = await mountTranscriptRows(singleTurn)
+  assert.equal(messages().length, 6)
+  assert.equal(messages()[0].dataset.itemId, 'row/1994')
+  assert.equal(messages().at(-1).dataset.itemId, 'row/1999')
+})
+
+test('initial oversized newest turn retains its prompt alongside six newest source rows', async () => {
+  const { lane, messages } = await mountTranscriptRows(true, true)
+  const prompt = lane.querySelector('[data-testid="user-message"]')
+  assert.ok(prompt, 'the newest prompt must be mounted on the first commit')
+  assert.equal(prompt.dataset.itemId, 'newest-prompt')
+  assert.equal(messages().length, 6)
+  assert.equal(lane.querySelectorAll('[data-testid="user-message"], [data-testid="agent-message"]').length, 7)
+  assert.equal(messages()[0].dataset.itemId, 'row/1994')
+})
+
+test('initial source window retains a whole adjacent reasoning run when its edge cuts inside it', async () => {
+  const now = Date.parse('2032-01-18T12:00:00Z')
+  const at = new Date(now).toISOString()
+  const thoughts = Array.from({ length: 11 }, (_, index) => ({ _tag: 'Reasoning', id: `thought/${index}`, text: `Thought ${index + 1}`, streaming: false, at }))
+  const answer = { _tag: 'Text', id: 'reasoning-answer', role: 'assistant', text: 'The final answer', attachments: [], streaming: false, at }
+  const items = [...thoughts, answer]
+  const turns = [{ id: 'reasoning-turn', items, work: { calls: [], running: false, failed: false, interrupted: false } }]
+  await act(async () => root.render(React.createElement(EmbraceRuntimeProvider, { options: { messages: items, isRunning: false, onNew: async () => {} } }, React.createElement(Transcript, { turns, title: 'Reasoning history', sync: { _tag: 'Live', since: now }, now, observedAt: now }))))
+  // The bounded branch retains all thoughts; grouping belongs to the thinking branch.
+  const entries = [...container.querySelectorAll('[data-testid="thinking-entry"]')]
+  assert.equal(entries.length, 11)
+  assert.equal(container.querySelectorAll('[data-testid="agent-message"]').length, 1)
+  for (const entry of entries) await act(async () => entry.querySelector('button').click())
+  const thoughtsShown = entries.map(entry => entry.textContent)
+  assert.equal(thoughtsShown.length, 11, 'the source window must not truncate an adjacent reasoning run')
+  for (let index = 1; index <= 11; index++) assert.ok(thoughtsShown[index - 1].includes(`Thought ${index}`))
+})
+test('history-top reveal stays bounded and preserves an existing row before idle backfill', async () => {
+  const { lane, messages, geometry } = await mountTranscriptRows()
+  await flush()
+  await act(async () => {
+    lane.dispatchEvent(new WheelEvent('wheel', { deltaY: -400 }))
+    lane.scrollTop = 100
+  })
+  const anchor = messages()[1]
+  const before = anchor.getBoundingClientRect().top
+  Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => anchor })
+  await act(async () => lane.dispatchEvent(new Event('scroll')))
+  geometry()
+  await flush()
+  assert.equal(messages().length, 10)
+  assert.equal(anchor.getBoundingClientRect().top, before)
+  assert.equal(anchor.isConnected, true)
+  Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => null })
+})
+
+test('browser find exposes all source rows including an oversized turn', async () => {
+  const { messages } = await mountTranscriptRows()
+  assert.equal(messages().length, 6)
+  await act(async () => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true })))
+  assert.equal(messages().length, 2000)
+  assert.equal(messages()[0].dataset.itemId, 'row/0')
+})
+
+test('work-log backfill renders only newly mounted call output', async () => {
+  const calls = Array.from({ length: 3 }, (_, index) => ({ id: `call/${index}`, kind: 'read', title: 'Read', status: 'success', startedAt: '2032-01-18T12:00:00Z', detail: `Output ${index}` }))
+  const rendered = []
+  const renderCallDetail = call => { rendered.push(call.id); return React.createElement('pre', null, call.detail) }
+  const render = selected => React.createElement(WorkLogV1, { turn: { calls: selected, running: false, failed: false, interrupted: false }, interactiveCalls: false, renderCallDetail })
+  await act(async () => root.render(render(calls.slice(1))))
+  assert.deepEqual(rendered, ['call/1', 'call/2'])
+  rendered.length = 0
+  await act(async () => root.render(render(calls)))
+  assert.deepEqual(rendered, ['call/0'])
+  assert.equal(container.querySelectorAll('pre').length, 3)
+})
 
 for (const kind of ['tool', 'reasoning']) test(`bounded backfill within a turn anchors its ${kind} row, not the turn wrapper`, async () => {
   const lane = await mount()
@@ -492,6 +584,33 @@ for (const kind of ['tool', 'reasoning']) test(`bounded backfill within a turn a
   Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => null })
 })
 
+test('idle backfill without checkVisibility waits for a retained hidden ancestor', async () => {
+  const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'checkVisibility')
+  delete HTMLElement.prototype.checkVisibility
+  try {
+    const { messages } = await mountTranscriptRows()
+    assert.equal(messages().length, 6)
+    container.style.contentVisibility = 'hidden'
+    await flush()
+    await act(async () => {
+      const pending = [...idleTasks.values()]
+      idleTasks.clear()
+      pending.forEach(callback => callback())
+    })
+    assert.equal(messages().length, 6)
+    container.style.contentVisibility = 'visible'
+    await act(async () => {
+      const pending = [...idleTasks.values()]
+      idleTasks.clear()
+      pending.forEach(callback => callback())
+    })
+    assert.equal(messages().length, 10)
+  } finally {
+    container.style.contentVisibility = ''
+    if (descriptor === undefined) delete HTMLElement.prototype.checkVisibility
+    else Object.defineProperty(HTMLElement.prototype, 'checkVisibility', descriptor)
+  }
+})
 
 for (const kind of ['message', 'work summary']) test(`row-gap backfill anchors the nested ${kind}, not its unmoving turn wrapper`, async () => {
   const lane = await mount()

@@ -64,9 +64,10 @@ const benchTurns = (count: number) => {
 
 const frame = () => new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
 const turnCount = (root: ParentNode) => root.querySelectorAll('[data-testid="transcript-turn"]').length
+const completeTurnCount = (root: ParentNode) => root.querySelectorAll('[data-testid="user-message"]').length
 /** Resolves once every turn is in the DOM, fonts are loaded and two frames have painted. */
 async function settled(root: ParentNode, count: number): Promise<void> {
-  while (turnCount(root) < count) await frame()
+  while (completeTurnCount(root) < count) await frame()
   await document.fonts.ready
   await frame()
   await frame()
@@ -113,7 +114,7 @@ function TranscriptBench({ turns: count, scheme, history, earlier = 0, onOpenToo
         if (generation !== sampling) return
         const present = turnCount(pane)
         if (!first && present > 0) { first = true; performance.mark('bench:turns') }
-        if (present >= count) { performance.mark('bench:all-turns'); return }
+        if (completeTurnCount(pane) >= count) { performance.mark('bench:all-turns'); return }
         requestAnimationFrame(step)
       }
       requestAnimationFrame(step)
@@ -167,7 +168,7 @@ function centerTurn(scroll: HTMLElement): { readonly element: Element; readonly 
 async function anchorDrift(root: ParentNode, scroll: HTMLElement, total: number): Promise<number> {
   const anchor = centerTurn(scroll)
   let drift = 0
-  while (turnCount(root) < total) {
+  while (completeTurnCount(root) < total) {
     await frame()
     drift = Math.max(drift, Math.abs(anchor.element.getBoundingClientRect().top - scroll.getBoundingClientRect().top - anchor.offset))
   }
@@ -192,6 +193,7 @@ export const NewestPageFirst: Story = { play: async ({ canvasElement }) => {
 export const BackfillKeepsReaderAnchor: Story = { play: async ({ canvasElement }) => {
   await expect(await reopen(canvasElement)).toBeLessThan(200)
   const scroll = scroller(canvasElement)
+  while (completeTurnCount(canvasElement) < 6) await frame()
   await frame()
   scroll.dispatchEvent(new WheelEvent('wheel', { deltaY: -scroll.clientHeight / 2 }))
   scroll.scrollTop -= scroll.clientHeight / 2
@@ -276,7 +278,7 @@ export const InitialFollowWithoutLayoutShift: Story = { args: { turns: 50, initi
   }
 } }
 const loadEarlier = fn()
-/** Reaching the top mounts the older turns at once; the history boundary above them still loads earlier history. */
+/** Reaching the top reveals a bounded older chunk; idle backfill eventually makes the boundary reachable. */
 export const TopMountsOlderTurns: Story = { args: { history: { _tag: 'HasOlder', onLoadEarlier: loadEarlier } }, play: async ({ canvasElement }) => {
   loadEarlier.mockClear()
   await expect(await reopen(canvasElement)).toBeLessThan(200)
@@ -286,7 +288,9 @@ export const TopMountsOlderTurns: Story = { args: { history: { _tag: 'HasOlder',
   scroll.scrollTop = 0
   await frame()
   await frame()
-  await expect(turnCount(canvasElement)).toBe(200)
+  await expect(turnCount(canvasElement)).toBeGreaterThan(2)
+  await expect(turnCount(canvasElement)).toBeLessThan(200)
+  await settled(canvasElement, 200)
   scroll.scrollTop = 0
   const boundary = await within(canvasElement).findByTestId('history-boundary')
   await expect(boundary.compareDocumentPosition(canvasElement.querySelector('[data-testid="transcript-turn"]')!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
@@ -303,7 +307,7 @@ export const BackfillKeepsTurnState: Story = { args: { earlier: 40, onOpenTool: 
   disclosure.focus()
   await expect(disclosure).toHaveAttribute('aria-expanded', 'true')
   await expect(disclosure).toHaveFocus()
-  while (turnCount(canvasElement) < 200) await frame()
+  while (completeTurnCount(canvasElement) < 200) await frame()
   await expect(turn.isConnected).toBe(true)
   await expect(disclosure.isConnected).toBe(true)
   await expect(disclosure).toHaveAttribute('aria-expanded', 'true')
@@ -311,7 +315,7 @@ export const BackfillKeepsTurnState: Story = { args: { earlier: 40, onOpenTool: 
   // A virtual click presses the boundary button without moving focus off the disclosure.
   within(await within(canvasElement).findByTestId('history-boundary')).getByRole('button', { name: 'Load earlier messages' }).click()
   // Prepended turns backfill above the reader like the first older turns did.
-  while (turnCount(canvasElement) < 240) await frame()
+  while (completeTurnCount(canvasElement) < 240) await frame()
   await expect(canvasElement.querySelector('[data-testid="transcript-turn"]')).toHaveAttribute('data-item-id', 'bench/0')
   await expect(turn.isConnected).toBe(true)
   await expect(disclosure.isConnected).toBe(true)
