@@ -1,7 +1,6 @@
 import * as stylex from '@stylexjs/stylex'
 import * as React from 'react'
 import {
-  Button,
   ButtonContext,
   GridList,
   GridListItem,
@@ -10,6 +9,7 @@ import {
 } from 'react-aria-components'
 
 import { readScrollAnchor, saveScrollAnchor, ScrollController } from './embrace-virtual/ScrollController'
+import { FollowAffordance } from './embrace-virtual/FollowAffordance'
 import { accentTokens, tokens } from './embrace-tokens.stylex'
 
 export interface EmbraceVirtualConversationProps<T extends { readonly id: string }> {
@@ -48,14 +48,12 @@ function VirtualConversationBody<T extends { readonly id: string }>({
 }: EmbraceVirtualConversationProps<T>) {
   // Keep the actual instance so the source controller reads public row geometry.
   const [layout] = React.useState(() => new ListLayout())
-  const [unread, setUnread] = React.useState(false)
   const [scroll] = React.useState(() => new ScrollController({
     layout,
     initial: persistAnchor ? readScrollAnchor(anchorKey) : { _tag: 'Following' },
     save: (anchor) => {
       if (persistAnchor) saveScrollAnchor(anchorKey, anchor)
     },
-    setUnread,
   }))
   React.useLayoutEffect(() => scroll.afterRowsChange(items), [scroll, items])
   const layoutOptions = React.useMemo(() => ({ estimatedRowHeight }), [estimatedRowHeight])
@@ -89,13 +87,7 @@ function VirtualConversationBody<T extends { readonly id: string }>({
           {renderRow}
         </GridList>
       </Virtualizer>
-      {unread ? (
-        <div {...stylex.props(styles.jump)}>
-          <Button onPress={scroll.jump} {...stylex.props(styles.jumpButton)}>
-            New messages ↓
-          </Button>
-        </div>
-      ) : null}
+      <FollowAffordance buttonRef={scroll.attachJump} onPress={scroll.jump} />
     </div>
   )
 }
@@ -144,24 +136,5 @@ const styles = stylex.create({
   entry: {
     display: 'flow-root',
     minWidth: 0,
-  },
-  jump: {
-    position: 'absolute',
-    bottom: '12px',
-    alignSelf: 'center',
-  },
-  jumpButton: {
-    minHeight: '28px',
-    paddingInline: '12px',
-    borderWidth: 1,
-    borderStyle: 'solid',
-    borderColor: tokens.line,
-    borderRadius: '4px',
-    backgroundColor: { default: tokens.panel, ':hover': tokens.selection },
-    color: tokens.ink,
-    fontFamily: 'inherit',
-    fontSize: '12px',
-    cursor: 'pointer',
-    outlineColor: accentTokens.accent,
   },
 })
