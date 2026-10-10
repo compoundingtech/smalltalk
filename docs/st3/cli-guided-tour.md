@@ -250,6 +250,7 @@ st agents new --help
 st agents new example --host HOST --print-kdl
 st agents suspend --help
 st agents resume --help
+st agents acknowledge-seed --help
 st machines --help
 st machines
 ```
@@ -278,6 +279,14 @@ and the typed refusal reason in `agents show`.
 `agents new --print-kdl` shows the seat declaration without applying it. Check that its workspace is
 a new directory below that host's home and that the harness defaults match the fleet's existing
 seats. Run it without `--print-kdl` only for an agent we agreed to start.
+
+`agents acknowledge-seed AGENT --reason REASON` is a recorded recovery mutation for an interrupted
+OMP seed attempt. Review help here; use only disposable state for the mutation. Check that the
+claim cites the original receipt and records the actor and reason. With or without acknowledgement,
+the next launch is fresh without rearming seed, even if the declaration still carries it.
+An unacknowledged attempt prints and records a durable incomplete warning; acknowledgement
+suppresses later warnings, never gates launch. A plain fresh seat never needs this recovery,
+including a restart before its first message.
 
 ### 8. `terminals` — inspect and attach without shell nesting
 

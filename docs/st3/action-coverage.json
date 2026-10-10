@@ -416,6 +416,14 @@
       "verification": "real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child"
     },
     {
+      "command": "st agents acknowledge-seed",
+      "description": "Acknowledge an interrupted seed attempt and its warning; never gate launch or rearm seed",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_seed_acknowledgement_survives_restart_without_rearming_seed"
+      ],
+      "verification": "real CLI over private Unix socket; seeded receipt and acknowledgement survive disk-store reopen, replay is idempotent, and fresh launches never restage or rearm seed"
+    },
+    {
       "command": "st agents apply",
       "description": "Preview and apply one KDL file containing durable agent seats",
       "tests": [

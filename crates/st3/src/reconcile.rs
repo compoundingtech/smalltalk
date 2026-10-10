@@ -5355,6 +5355,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .insert(crate::suspension::CONTINUE_PATH_ENV.into(), path);
             }
         }
+        crate::native_seed::omit_seed_for_native_resume(&mut launch_member);
         launch_member
             .environment
             .insert("ST3_ENDPOINT".into(), self.endpoint.clone());

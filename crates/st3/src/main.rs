@@ -2949,6 +2949,8 @@ enum AgentsCommand {
     Stop(AgentStopArgs),
     /// Restart a top-level or mission seat, preserving its declaration; wait for a new incarnation.
     Restart(AgentRestartArgs),
+    /// Acknowledge an interrupted seed attempt and its warning; never gate launch or rearm seed.
+    AcknowledgeSeed(AgentAcknowledgeSeedArgs),
     /// Retry a published owned-seat cutover with fresh desired and incarnation fences.
     Rollout(AgentRolloutArgs),
     /// Stop a quiet seat at a clean boundary, keeping its native session to resume.
@@ -2966,6 +2968,17 @@ enum AgentsCommand {
     Queue(AgentQueueArgs),
     /// Inspect, set, or release a Codex/OpenCode delivery hold; the provider keeps running.
     Hold(AgentHoldArgs),
+}
+
+#[derive(Args)]
+struct AgentAcknowledgeSeedArgs {
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
+    subject: String,
+    #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+    reason: String,
+    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
+    #[arg(long = "as")]
+    actor: Option<String>,
 }
 
 #[derive(Args)]
@@ -4470,6 +4483,9 @@ struct DriverArgs {
     initial_message: Option<String>,
     #[arg(long, requires = "initial_message")]
     initial_message_id: Option<String>,
+    /// OMP transcript selected only for the durable first native launch.
+    #[arg(long)]
+    seed: Option<PathBuf>,
     #[arg(last = true)]
     argv: Vec<String>,
 }
@@ -5322,6 +5338,9 @@ fn guard_mutating_cli_actor(
             AgentsCommand::Rollout(args) => Some(args.actor.as_str()),
             AgentsCommand::Suspend(args) => Some(args.actor.as_str()),
             AgentsCommand::Resume(args) => Some(args.actor.as_str()),
+            AgentsCommand::AcknowledgeSeed(args) => Some(args.actor.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("a harness seed acknowledgement needs explicit --as {own}")
+            })?),
             AgentsCommand::Hold(args) if args.duration.is_some() || args.release => Some(args.actor.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("a harness delivery hold needs explicit --as {own}")
             })?),
@@ -12573,6 +12592,14 @@ async fn run_agents(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        AgentsCommand::AcknowledgeSeed(args) => {
+            let actor = args.actor.as_deref().or(configured_person)
+                .context("st agents acknowledge-seed needs --as ACTOR or a configured person")?;
+            let claim = st3::native_seed::acknowledge(
+                &cli_client(endpoint), &normalize_agent_subject(&args.subject), actor, &args.reason,
+            ).await?;
+            print_value(&claim, json_output)
+        }
         AgentsCommand::Hold(args) => {
             let client = cli_client(endpoint);
             let subject = seat_subject(&args.subject);
@@ -13683,6 +13710,7 @@ async fn run_agent_inspection(
         | AgentsCommand::Stop(_)
         | AgentsCommand::Rollout(_)
         | AgentsCommand::Restart(_)
+        | AgentsCommand::AcknowledgeSeed(_)
         | AgentsCommand::Suspend(_)
         | AgentsCommand::Resume(_)
         | AgentsCommand::Rename(_)
@@ -17436,7 +17464,101 @@ fn parse_publication_actor(actor: &str) -> std::result::Result<String, String> {
     Ok(actor.to_owned())
 }
 
+#[cfg(test)]
+mod native_seed_driver_tests {
+    use super::*;
+
+    #[test]
+    fn seed_recovery_uses_agent_control_cli_and_requires_reason() {
+        let cli = Cli::try_parse_from([
+            "st", "agents", "acknowledge-seed", "example",
+            "--reason", "accept fresh", "--as", "person/operator",
+        ]).unwrap();
+        let Command::Agents { command: AgentsCommand::AcknowledgeSeed(args) } = cli.command else {
+            panic!("agent seed acknowledgement expected");
+        };
+        assert_eq!(args.subject, "example");
+        assert_eq!(args.reason, "accept fresh");
+        assert_eq!(args.actor.as_deref(), Some("person/operator"));
+        assert!(Cli::try_parse_from(["st", "agents", "acknowledge-seed", "example"]).is_err());
+        assert!(Cli::try_parse_from(["st", "agents", "acknowledge-seed", "example", "--reason", ""]).is_err());
+    }
+
+    #[test]
+    fn rejects_effective_resume_environment_before_receipt() {
+        const CHILD: &str = "ST3_TEST_NATIVE_SEED_CONFLICT";
+        if let Some(variable) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(std::env::var_os("ST3_TEST_NATIVE_SEED_ROOT").unwrap());
+            let client = Client::new(Endpoint::Unix(root.join("no-daemon.sock")));
+            let args = DriverArgs {
+                driver: "omp".into(),
+                subject: Some("agent/example".into()),
+                identity: None,
+                initial_message: None,
+                initial_message_id: None,
+                seed: Some(root.join("missing-seed.jsonl")),
+                argv: vec!["omp".into()],
+            };
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all().build().unwrap();
+            let error = runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(1), run_driver(&client, args, None))
+                    .await.expect("seed conflict must fail before daemon access")
+                    .unwrap_err()
+            });
+            assert_eq!(error.to_string(), format!(
+                "native seed cannot accompany resume environment ({})", variable.to_string_lossy()
+            ));
+            assert!(!root.join("drivers").exists(), "no inventory or first-launch setup may occur");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let variables = [
+            st3::suspension::RESUME_ENV,
+            st3::suspension::CONTINUE_ENV,
+            st3::suspension::CONTINUE_PATH_ENV,
+        ];
+        for variable in variables {
+            for value in ["native", ""] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child.args([
+                    "--exact",
+                    "native_seed_driver_tests::rejects_effective_resume_environment_before_receipt",
+                    "--nocapture",
+                ]);
+                for variable in variables {
+                    child.env_remove(variable);
+                }
+                let output = child.env(variable, value).env(CHILD, variable)
+                    .env("ST3_TEST_NATIVE_SEED_ROOT", root.path())
+                    .env("ST3_DRIVER_STATE_DIR", root.path().join("drivers"))
+                    .env("HOME", root.path()).output().unwrap();
+                assert!(output.status.success(), "{variable}={value:?}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr));
+            }
+        }
+    }
+}
+
 async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -> Result<()> {
+    if args.seed.is_some() {
+        anyhow::ensure!(
+            args.driver == "omp"
+                && st3::native_resume::selector_scope(&args.driver, &args.argv).is_none(),
+            "native seed cannot accompany an authored session selector"
+        );
+        for variable in [
+            st3::suspension::RESUME_ENV,
+            st3::suspension::CONTINUE_ENV,
+            st3::suspension::CONTINUE_PATH_ENV,
+        ] {
+            anyhow::ensure!(
+                std::env::var_os(variable).is_none(),
+                "native seed cannot accompany resume environment ({variable})"
+            );
+        }
+    }
     if args.driver == "claude-mcp" {
         anyhow::ensure!(
             args.argv.is_empty(),
@@ -17530,6 +17652,16 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         if let Some(state) = st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV) {
             return resume_native_driver(client, subject, &args.driver, argv, &state).await;
         }
+        let incarnation = wait_for_agent_incarnation(client, subject).await?;
+        let paths = NativePaths::prepare(subject, &args.driver)?;
+        let sessions = paths.session_dir.join("provider-sessions");
+        if let Some(session) = st3::native_seed::first_launch(
+            client, subject, &incarnation, &args.driver, args.seed.as_deref(), &sessions,
+            st3::native_resume::requested().is_some(),
+        ).await? {
+            argv = st3::native_resume::pi_family_argv("omp", argv, &sessions, &session)
+                .map_err(|refusal| anyhow::anyhow!("{}: {}", refusal.code, refusal.reason))?;
+        }
         if let (Some(message), Some(id)) = (&args.initial_message, &args.initial_message_id) {
             // The durable launch receipt precedes invocation. A fresh incarnation never repeats
             // the first message; adoption resumes above without invoking a new provider.
@@ -17545,7 +17677,7 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         if args.driver == "codex" {
             return run_codex_native(client, subject, argv).await;
         }
-        return run_st2_native_driver(client, subject, &args.driver, argv).await;
+        return run_st2_native_driver(client, subject, &args.driver, argv, paths).await;
     }
     let (program, arguments) = args.argv.split_first().context("driver argv is empty")?;
     let mut child = tokio::process::Command::new(program)
@@ -17602,12 +17734,12 @@ async fn run_st2_native_driver(
     subject: &str,
     driver: &str,
     argv: Vec<String>,
+    paths: NativePaths,
 ) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the {driver} driver argv is empty");
     if driver == "claude" {
         reject_noninteractive_claude_argv(&argv)?;
     }
-    let paths = NativePaths::prepare(subject, driver)?;
     #[cfg(unix)]
     if matches!(driver, "pi" | "omp")
         && let Err(skip) = st3::native_resume::pi_family_link_transcript(

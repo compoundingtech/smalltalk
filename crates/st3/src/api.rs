@@ -17598,6 +17598,112 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_seed_first_launch_contract_survives_concurrency_and_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        let database = root.path().join("seed.sqlite3");
+        state.store = Arc::new(Store::open(&database, "node").unwrap());
+        let socket = root.path().join("seed.sock");
+        let server_socket = socket.clone();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move { serve_unix(&server_socket, router(server_state)).await });
+        while !socket.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+        let client = crate::client::Client::new(crate::client::Endpoint::Unix(socket));
+        let id = uuid::Uuid::now_v7().to_string();
+        let seed = root.path().join(format!("time_{id}.jsonl"));
+        let invalid = root.path().join("missing.jsonl");
+        std::fs::write(&seed, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n")).unwrap();
+        let launch = |seat: &'static str, incarnation: &'static str, driver: &'static str, seed: Option<PathBuf>, strict: bool| {
+            let client = client.clone();
+            let inventory = root.path().join(seat.replace('/', "-"));
+            async move { crate::native_seed::first_launch(&client, seat, incarnation, driver, seed.as_deref(), &inventory, strict).await }
+        };
+        assert!(launch("agent/invalid", "one", "omp", Some(invalid.clone()), false).await.is_err());
+        let corrupt = root.path().join(format!("corrupt_{id}.jsonl"));
+        std::fs::write(&corrupt, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\nbroken\n")).unwrap();
+        assert!(launch("agent/invalid", "corrupt", "omp", Some(corrupt), false).await.is_err());
+        assert_eq!(launch("agent/invalid", "two", "omp", Some(seed.clone()), false).await.unwrap(), Some(id.clone()), "invalid input must not consume the opportunity");
+        assert_eq!(launch("agent/invalid", "three", "omp", Some(seed.clone()), false).await.unwrap(), None, "an unbound seeded receipt starts fresh even while seed remains declared");
+
+        let (one, two) = tokio::join!(
+            launch("agent/concurrent", "one", "omp", Some(seed.clone()), false),
+            launch("agent/concurrent", "two", "omp", Some(seed.clone()), false)
+        );
+        let outcomes = [one.unwrap(), two.unwrap()];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_some()).count(), 1, "only the receipt winner launches seeded; the other launch proceeds fresh");
+        let append = |seat: &str, kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput { subject: seat.into(), kind: kind.into(), actor: Some(seat.into()), fields: serde_json::from_value(fields).unwrap(), evidence: vec![], expected_subject: None, idempotency_key: None }).unwrap();
+        };
+        append("agent/legacy-binding", "harness.session-file", json!({"harness":"omp","session_id":"legacy"}));
+        assert_eq!(launch("agent/legacy-binding", "adopt", "omp", Some(invalid.clone()), false).await.unwrap(), None, "an existing binding wins even without a first-launch receipt");
+        append("agent/concurrent", "harness.session-file", json!({"harness":"omp","session_id":id}));
+        assert_eq!(launch("agent/concurrent", "restart", "omp", Some(invalid.clone()), false).await.unwrap(), None, "bound history beats edits and invalid seeds");
+        assert_eq!(launch("agent/concurrent", "other-account", "claude", None, false).await.unwrap(), None, "history fence is not harness or account scoped");
+        let reopened = Store::open(&database, "node").unwrap();
+        assert_eq!(crate::suspension::continue_session(&reopened, "agent/concurrent", "omp", None, None).unwrap().unwrap().0, id, "a restarted daemon continues the bound session");
+        assert_eq!(reopened.claims_for("agent/concurrent", Some("harness.session-file")).unwrap().len(), 1);
+        append("agent/concurrent", "runtime.action.requested", json!({"action":"fresh-context"}));
+        append("agent/concurrent", "harness.diagnostic", json!({"code":crate::suspension::CONTINUE_UNAVAILABLE_CODE,"status":"transcript-missing"}));
+        assert_eq!(launch("agent/concurrent", "fresh", "omp", Some(seed.clone()), false).await.unwrap(), None);
+
+        assert_eq!(launch("agent/fresh", "one", "claude", None, false).await.unwrap(), None);
+        assert_eq!(launch("agent/fresh", "two", "omp", Some(seed.clone()), false).await.unwrap(), None, "a fresh receipt never blocks or re-arms, even if seed is later added");
+        for driver in crate::skill::HARNESSES {
+            assert_eq!(launch("agent/fresh", "seedless-second-launch", driver, None, false).await.unwrap(), None, "seedless restarts must work for every harness");
+        }
+        assert_eq!(launch("agent/invalid", "seedless-incomplete", "omp", None, false).await.unwrap(), None, "an incomplete seeded launch proceeds fresh when seed is removed");
+        let notice = state.store.latest_claim("agent/invalid", Some("harness.diagnostic")).unwrap().unwrap();
+        assert_eq!(notice.body["fields"]["code"], "first-native-launch-incomplete");
+        assert_eq!(notice.body["fields"]["severity"], "warning");
+        assert_eq!(launch("agent/invalid", "still-declared", "omp", Some(invalid.clone()), false).await.unwrap(), None, "even a missing still-declared seed is not validated or staged again");
+        let declared_notice = state.store.latest_claim("agent/invalid", Some("harness.diagnostic")).unwrap().unwrap();
+        assert_eq!(declared_notice.body["fields"]["code"], "first-native-launch-incomplete");
+        assert_eq!(declared_notice.body["fields"]["incarnation_id"], "still-declared");
+        assert!(declared_notice.body["fields"]["reason"].as_str().unwrap().contains("starting fresh"));
+        assert!(!declared_notice.body["fields"]["reason"].as_str().unwrap().contains("acknowledge-seed"), "launch notices do not prescribe recovery before starting");
+        assert!(crate::native_seed::acknowledge(&client, "agent/fresh", "person/operator", "fresh needs no recovery").await.is_err());
+        assert!(crate::native_seed::acknowledge(&client, "agent/invalid", "person/operator", " ").await.is_err());
+        let acknowledgement = crate::native_seed::acknowledge(&client, "agent/invalid", "person/operator", "accept fresh after interrupted import").await.unwrap();
+        assert_eq!(acknowledgement.kind, "custom.agent.first-native-launch-acknowledged");
+        assert_eq!(acknowledgement.actor.as_deref(), Some("person/operator"));
+        assert_eq!(acknowledgement.body["fields"]["reason"], "accept fresh after interrupted import");
+        assert_eq!(acknowledgement.body["evidence"][0], acknowledgement.body["fields"]["receipt"]);
+        assert_eq!(launch("agent/invalid", "recovered", "omp", Some(invalid.clone()), false).await.unwrap(), None, "acknowledgement records acceptance without reseeding or changing fresh launch behavior");
+        assert_eq!(state.store.latest_claim("agent/invalid", Some("harness.diagnostic")).unwrap().unwrap().id, declared_notice.id, "acknowledgement suppresses later incomplete notices, not launches");
+        append("agent/deliberately-fresh", "runtime.action.requested", json!({"action":"fresh-context"}));
+        assert_eq!(launch("agent/deliberately-fresh", "one", "omp", Some(invalid.clone()), false).await.unwrap(), None);
+        assert!(launch("agent/strict", "conflicting", "omp", Some(invalid), true).await.unwrap_err().to_string().contains("native seed cannot accompany resume environment"));
+        assert_eq!(launch("agent/strict", "one", "omp", None, true).await.unwrap(), None, "a rejected seed conflict must not consume the opportunity; strict resume proceeds without a seed");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_seed_restart_before_first_message_never_wedges_fresh_seat() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("restart.sqlite3");
+        let inventory = root.path().join("inventory");
+        for attempt in 0..2 {
+            let mut state = state(root.path());
+            state.store = Arc::new(Store::open(&database, "node").unwrap());
+            let socket = root.path().join(format!("restart-{attempt}.sock"));
+            let client = crate::client::Client::new(crate::client::Endpoint::Unix(socket.clone()));
+            let server_socket = socket.clone();
+            let server = tokio::spawn(async move { serve_unix(&server_socket, router(state)).await });
+            while !socket.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            assert_eq!(crate::native_seed::first_launch(
+                &client, "agent/before-message", &format!("incarnation-{attempt}"), "omp",
+                None, &inventory, false,
+            ).await.unwrap(), None);
+            server.abort();
+            let _ = server.await;
+        }
+        let reopened = Store::open(&database, "node").unwrap();
+        assert!(reopened.claims_for("agent/before-message", Some("harness.session-file")).unwrap().is_empty());
+        assert!(reopened.claims_for("agent/before-message", Some("custom.agent.initial-message")).unwrap().is_empty());
+        assert!(!inventory.exists(), "unseeded restarts require no seed inventory");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn isolated_daemon_answers_health_under_stalled_attaches() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
