@@ -2394,6 +2394,11 @@ async fn cli_fyi_settings_and_count_reads_survive_restart() {
     assert!(st3::fyi::is_held(&daemon.store().message(&held).unwrap().unwrap()));
     daemon.restart().await;
     assert_eq!(cli_value(daemon.cli(PEER, &fyi_args).await)["subject"], held);
+    // An unoffered FYI is readable on demand, before any question wakes the seat.
+    let read = cli_value(daemon.cli(WORKER, &[
+        "conversations", "read", &held, "--as", WORKER,
+    ]).await);
+    assert_eq!(read["status"], "read");
     let question = cli_value(daemon.cli(PEER, &send("copper-question", "--question")).await);
     assert!(!st3::fyi::is_held(&daemon.store().message(question["subject"].as_str().unwrap()).unwrap().unwrap()));
     let asked = cli_value(daemon.cli(WORKER, &[
