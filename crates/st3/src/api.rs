@@ -23924,6 +23924,42 @@ mission "wake" state="ready" {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn roster_resilience_unpublished_mode_keeps_the_bounded_wait_and_503() {
+        for history in [false, true] {
+            for forget in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let state = state(root.path());
+                let store = &state.store;
+                let _wake = store.start_agent_roster_refresher().unwrap();
+                roster_resilience_runtime(store, "agent/current-only", "current");
+                if history || forget {
+                    refresh_agent_roster(store, false).unwrap();
+                }
+                if forget {
+                    store.forget_current_views();
+                }
+                assert!(store.published_agent_roster(store.index().unwrap(), history).is_none());
+                assert!(store.answer_agent_roster_requests::<()>(||
+                    anyhow::bail!("injected refresh failure")).is_err());
+                let started = tokio::time::Instant::now();
+                let request = client_agents(
+                    State(state.clone()), Extension(new_client_snapshot(&state)), Query(ClientListQuery {
+                        history, fresh: true, ..ClientListQuery::default()
+                    }));
+                tokio::pin!(request);
+                tokio::select! {
+                    _ = &mut request => panic!("an unpublished mode answered before its bounded wait"),
+                    _ = tokio::time::sleep(AGENT_ROSTER_READ_WAIT - Duration::from_millis(1)) => {}
+                }
+                let error = request.await.err().expect("an unpublished mode must return 503");
+                assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(error.code, "agent-roster-not-ready");
+                assert_eq!(started.elapsed(), AGENT_ROSTER_READ_WAIT);
+            }
+        }
+    }
+
     #[test]
     fn roster_resilience_chunk_deadlines_publish_without_retrying_in_the_same_attempt() {
         let root = tempfile::tempdir().unwrap();
