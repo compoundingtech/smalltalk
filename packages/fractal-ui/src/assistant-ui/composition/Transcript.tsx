@@ -200,7 +200,10 @@ const windowTurns = (turns: readonly TranscriptTurn[], start: number): readonly 
     offset += length
     if (length > 0 && skip >= length) return []
     if (skip === 0) return [turn]
-    const items = turn.items.slice(skip - (turn.prompt === undefined ? 0 : 1))
+    let itemStart = skip - (turn.prompt === undefined ? 0 : 1)
+    // Keep a contiguous reasoning disclosure whole, including its first-item key, across prefix reveals.
+    while (itemStart > 0 && turn.items[itemStart]?._tag === 'Reasoning' && turn.items[itemStart - 1]?._tag === 'Reasoning') itemStart--
+    const items = turn.items.slice(itemStart)
     const ids = new Set(items.map(item => item.id))
     return [{ ...turn, prompt: index === turns.length - 1 ? turn.prompt : undefined, items, work: { ...turn.work, calls: turn.work.calls.filter(call => ids.has(call.id)) } }]
   })
