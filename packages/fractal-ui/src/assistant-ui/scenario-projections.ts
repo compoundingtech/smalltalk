@@ -4,7 +4,6 @@ import { DateTime, Option } from 'effect'
 import { normalizePublicConversation } from './embrace-data/normalize-public-world'
 import type { PublicTimelineEntry } from './embrace-data/public-world'
 import { statuses, type AgentStatus, type SidebarAgentRow } from './sidebar/model'
-import type { SyncStatus } from './st3-views/sync-status'
 
 const decodeAgent = Native.decodeUnknownSync(Native.Agent, 'strict')
 const decodeAttention = Native.decodeUnknownSync(Native.Attention, 'strict')
@@ -72,19 +71,9 @@ export function projectConversation(slice: WireSlice<'conversation'>) {
 
 export function projectSync(slice: WireSlice<'sync'>, anchor: number, now: number) {
   decodeCapabilities(slice.state.capabilities)
-  return Object.entries(slice.status).map(([surface, source]) => {
+  return Object.entries(slice.status).map(([surface, status]) => {
     const expectation = slice.state.expected.filter(item => item.surface === surface && item.at_ms <= now - anchor).at(-1)
     const observedAt = expectation === undefined ? now : anchor + expectation.at_ms
-    let status: SyncStatus | undefined
-    if (source._tag === 'Failed') {
-      const cause = source.cause
-      if (cause._tag === 'Server') status = { _tag: 'Failed', code: cause.code, message: cause.message }
-      else if (cause._tag === 'Local') status = { _tag: 'Failed', code: cause.kind, message: cause.detail?.message ?? cause.kind }
-    } else if (source._tag === 'Stale') {
-      if (source.reason._tag !== 'Unknown') status = { ...source, reason: source.reason }
-    } else {
-      status = source
-    }
     return { surface, status, observedAt }
   })
 }

@@ -10,7 +10,7 @@ function ScenarioSync({ scheme, anchor, now }: { readonly scheme: 'light' | 'dar
   return <ScenarioPresentation scheme={scheme} title="Sync observations">
     {lines.map(line => <section key={line.surface}>
       <h2>{line.surface}</h2>
-      {line.status === undefined ? <p>Sync observation unavailable</p> : <SyncLine status={line.status} label={line.surface} now={now} observedAt={line.observedAt} socket gateway="Scenario gateway" />}
+      <SyncLine status={line.status} label={line.surface} now={now} observedAt={line.observedAt} socket gateway="Scenario gateway" />
     </section>)}
   </ScenarioPresentation>
 }
