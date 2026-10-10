@@ -616,6 +616,16 @@ impl EventObserver {
             self.native_session = frame["sessionId"].as_str()
                 .filter(|id| !id.is_empty()).map(str::to_owned);
         }
+        // A subagent's runs go to the ledger the seat's driver records on the seat. Only a bound
+        // native session vouches for them.
+        if frame["type"] == "subagent" {
+            return match self.native_session.as_deref() {
+                Some(parent) if self.driver == "omp" => {
+                    crate::subagents::observe_omp(&self.agent_dir, frame, parent)
+                }
+                _ => Ok(()),
+            };
+        }
         if let Some(fields) = todo_observation(
             frame, self.driver, self.native_session.as_deref(), &self.runtime,
         ) {
@@ -1105,6 +1115,28 @@ mod tests {
         assert!(observer.observe(&todo_frame()).is_err());
         assert_eq!(crate::harness_events::pending(root.path(), 100).unwrap()
             .iter().filter(|event| event.kind == "harness-todo").count(), 1);
+    }
+
+    #[test]
+    fn omp_subagent_frames_reach_the_ledger_only_from_a_bound_session() {
+        let root = tempfile::tempdir().unwrap();
+        crate::harness_events::enable(root.path(), "runtime-a").unwrap();
+        let seq = harness_state::claim(root.path(), "agent/example", "omp", "provider-a").unwrap();
+        let mut observer = EventObserver::new(
+            root.path(), "agent/example", "omp", "provider-a", seq, "runtime-a",
+        ).unwrap();
+        let start = serde_json::json!({"type":"subagent","event":"start","id":"0-Review","name":"task"});
+        observer.observe(&start).unwrap();
+        assert!(crate::subagents::read(root.path()).running.is_empty());
+        observer.observe(&serde_json::json!({"type":"ready","sessionId":"native-a"})).unwrap();
+        observer.observe(&start).unwrap();
+        let ledger = crate::subagents::read(root.path());
+        assert_eq!(ledger.session_id.as_deref(), Some("native-a"));
+        assert_eq!(ledger.running["0-Review"].subagent_type.as_deref(), Some("task"));
+        observer.observe(&serde_json::json!({"type":"subagent","event":"end","id":"0-Review"})).unwrap();
+        let ledger = crate::subagents::read(root.path());
+        assert!(ledger.running.is_empty());
+        assert_eq!(ledger.ended[0].outcome, "completed");
     }
 
     #[test]

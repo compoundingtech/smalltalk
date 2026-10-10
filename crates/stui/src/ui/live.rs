@@ -1315,7 +1315,7 @@ pub fn run(context: Context) -> Result<()> {
                             // st saying no, or never reaching it.
                             let unconfirmed = error
                                 .downcast_ref::<ClientError>()
-                                .is_some_and(|error| matches!(error, ClientError::Transport(_)));
+                                .is_some_and(ClientError::outcome_unknown);
                             (plain(error), unconfirmed)
                         }),
                     ));
@@ -1810,6 +1810,8 @@ fn not_applied(error: &anyhow::Error, effect: &Effect) -> bool {
         .chain()
         .filter_map(|cause| cause.downcast_ref::<ClientError>())
         .any(|error| match error {
+            // st said it queued nothing, so a fresh try with a fresh fence is safe.
+            _ if error.applied() == Some("none") => true,
             ClientError::Api(st3_client::ErrorCode::StaleFence, ..) => !attention,
             ClientError::Api(st3_client::ErrorCode::RateLimited, ..)
             | ClientError::Unreachable(_) => true,
@@ -2342,6 +2344,48 @@ async fn send_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_send_st_may_have_taken_is_unconfirmed_and_one_it_never_queued_is_tried_afresh() {
+        let answer = |applied: &str, code: st3_client::ErrorCode| -> anyhow::Error {
+            let envelope = st3_client::ErrorEnvelope {
+                api_version: "st3.client.v0".into(),
+                error_version: "st3.client.error.v0".into(),
+                request_id: "request/test".into(),
+                code: code.clone(),
+                message: "the database has not confirmed the send".into(),
+                retryable: false,
+                retry_after_ms: None,
+                details: std::collections::BTreeMap::from([(
+                    "applied".to_owned(),
+                    serde_json::json!(applied),
+                )]),
+            };
+            ClientError::Api(code, envelope.message.clone(), Box::new(envelope)).into()
+        };
+        let send = Effect::Send {
+            agent: "agent/x".into(),
+            text: "hello".into(),
+            in_reply_to: None,
+            tags: Vec::new(),
+            images: Vec::new(),
+        };
+        // `applied: "unknown"` (a code this build does not know decodes as Unknown): the exact
+        // request may have been taken. It is not retried here, and it is shown as unconfirmed.
+        let unknown = answer("unknown", st3_client::ErrorCode::Unknown);
+        assert!(!not_applied(&unknown, &send));
+        assert!(unknown.downcast_ref::<ClientError>().unwrap().outcome_unknown());
+        assert_eq!(
+            super::plain(&unknown),
+            "st may have taken it and has not confirmed it yet; sending it again is safe"
+        );
+        // `applied: "none"` with a full queue (rate limited): nothing was queued, so try again.
+        assert!(not_applied(&answer("none", st3_client::ErrorCode::RateLimited), &send));
+        assert!(!answer("none", st3_client::ErrorCode::RateLimited)
+            .downcast_ref::<ClientError>()
+            .unwrap()
+            .outcome_unknown());
+    }
+
     #[test]
     fn a_different_machine_count_in_the_live_summary_means_the_machine_list_is_out_of_date() {
         let summary = |connected: u64, indirect: u64, offline: u64| -> st3_client::Summary {
