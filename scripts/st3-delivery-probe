@@ -165,8 +165,10 @@ class Probe:
         # Replication status is one of the daemon's most expensive reads. Every route shares one
         # reading, at most this old, instead of asking for it once a second per peer.
         self.presence_ttl = int(config.get("presence_ttl_ms", 15_000))
-        # Each report is a replicated document write, which wakes every member's reconciler. A
-        # changed report publishes at once; an unchanged one only proves the probe is alive.
+        # Each report is a replicated document version, kept on every member, that wakes every
+        # member's reconciler. A changed outcome publishes at once; otherwise a heartbeat carries
+        # the newest latencies and proves the probe is alive. Each latency is a series point and
+        # stays in the local events log, not in a document version of its own.
         self.heartbeat = int(config.get("heartbeat_ms", 300_000))
         self.directory = Path(config["state_dir"])
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -178,7 +180,10 @@ class Probe:
         self.st3 = config.get("binary") or os.environ["ST3_BIN"]
         self.child = None
         self.last_publish = 0
-        self.changed = True
+        # What doctor read from the last published report: each route's outcome, and the routes
+        # it showed still in flight.
+        self.published = None
+        self.published_in_flight = set()
         self.presence_reading = None
         self.alert_reading = None
         self.tasks = set()
@@ -186,7 +191,6 @@ class Probe:
 
     def persist(self):
         save(self.path, self.state)
-        self.changed = True
 
     def event(self, event, **fields):
         descriptor = os.open(self.directory / "events.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -604,6 +608,38 @@ class Probe:
                 "routes": [dict(self.state["routes"][target], status="last-seen") if self.state["routes"].get(target, {}).get("waiting_for_member") else self.state["routes"].get(target, {"target": host, "to": target, "status": "unstarted"})
                            for target, host in sorted(self.peers.items())]}
 
+    def outcomes(self):
+        """What doctor reports from each route, apart from which message it was and its latency.
+        A result still in flight keeps the outcome last published, so an ordinary probe cycle
+        (read, a new send, read again) changes nothing."""
+        published = self.published or {}
+        outcomes = {}
+        for route in self.report()["routes"]:
+            target = route.get("to") or route.get("target")
+            if route.get("status") in ("sending", "pending"):
+                if target in published:
+                    outcomes[target] = published[target]
+                continue
+            outcomes[target] = [route.get("status"), bool(route.get("late")),
+                                bool((route.get("previous_read") or {}).get("late")),
+                                bool(route.get("attention") or route.get("agent_alert") or route.get("reviewer_alert"))]
+        return outcomes
+
+    def in_flight(self):
+        return {route.get("to") or route.get("target") for route in self.report()["routes"]
+                if route.get("status") in ("sending", "pending")}
+
+    def publish_due(self, now):
+        if self.published is None or self.outcomes() != self.published:
+            return True
+        # Doctor counts a published send that is still waiting as overdue once its deadline
+        # passes, so a report that showed one is replaced as soon as it resolves.
+        if self.published_in_flight - self.in_flight():
+            return True
+        since = now - self.last_publish
+        # A heartbeat waits, for at most one deadline, until nothing is in flight.
+        return since >= self.heartbeat and (not self.in_flight() or since >= self.heartbeat + self.deadline)
+
     async def publish(self):
         report = self.report()
         # No personal paths, environment, credentials or native message bodies
@@ -616,7 +652,8 @@ class Probe:
                             "bytes": list(data), "idempotency_key": "delivery-probe-report:" + hashlib.sha256(data).hexdigest()})
         save(self.directory / "latest.json", report)
         self.last_publish = now_ms()
-        self.changed = False
+        self.published = self.outcomes()
+        self.published_in_flight = self.in_flight()
 
     async def monitor(self):
         async def safely(operation):
@@ -628,7 +665,7 @@ class Probe:
             # One failed route cannot prevent the other deadlines or receipts.
             await asyncio.gather(*(safely(self.route(target)) for target in self.peers),
                                  *(safely(self.acknowledge(subject)) for subject in list(self.state["receipts"])))
-            if self.changed or now_ms() - self.last_publish >= self.heartbeat:
+            if self.publish_due(now_ms()):
                 await safely(self.publish())
             await asyncio.sleep(1)
 
