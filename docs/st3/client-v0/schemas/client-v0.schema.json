@@ -888,7 +888,7 @@
         "status": { "type": "string" },
         "phase": { "type": "string" },
         "progress": { "type": "object", "required": ["done", "total"], "properties": { "done": { "type": "integer" }, "total": { "type": "integer" } } },
-        "current_steps": { "type": "array", "items": { "type": "object", "required": ["id", "title", "state", "since"], "properties": { "id": { "$ref": "#/$defs/StepRunId" }, "title": { "type": ["string", "null"] }, "assignee": { "oneOf": [{ "$ref": "#/$defs/ActorRef" }, { "type": "null" }] }, "claimant": { "oneOf": [{ "$ref": "#/$defs/ActorRef" }, { "type": "null" }] }, "state": { "$ref": "#/$defs/WorkState" }, "since": { "$ref": "#/$defs/Timestamp" } } } },
+        "current_steps": { "type": "array", "items": { "type": "object", "required": ["id", "title", "state", "since"], "properties": { "id": { "$ref": "#/$defs/StepRunId" }, "title": { "type": ["string", "null"] }, "assignee": { "oneOf": [{ "$ref": "#/$defs/ActorRef" }, { "type": "null" }] }, "claimant": { "oneOf": [{ "$ref": "#/$defs/ActorRef" }, { "type": "null" }] }, "state": { "$ref": "#/$defs/WorkState" }, "since": { "$ref": "#/$defs/Timestamp" }, "progress_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." } } } },
         "must_act": {"$ref": "#/$defs/MustAct"},
         "state_since": { "$ref": "#/$defs/Timestamp" },
         "outcome": { "oneOf": [{ "$ref": "#/$defs/MissionRunOutcome" }, { "type": "null" }], "description": "The outcome a person or an authorized agent set after the run finished." },
@@ -926,6 +926,7 @@
         "agentless": { "type": "boolean" },
         "since": { "$ref": "#/$defs/Timestamp" },
         "last_progress": { "type": ["string", "null"] },
+        "progress_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." },
         "blocked_reason": { "type": ["string", "null"] },
         "blockers": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
         "goals": { "type": "array", "items": { "type": "string" } },
@@ -984,6 +985,7 @@
             "title": { "type": ["string", "null"] },
             "assigned_to": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "last_progress": { "type": ["string", "null"] },
+            "progress_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." },
             "state": { "$ref": "#/$defs/WorkState" },
             "attempt": { "type": "integer", "minimum": 0 },
             "readiness_epoch": { "type": "integer", "minimum": 0 },
@@ -1974,7 +1976,7 @@
             "type": { "const": "message.send" },
             "parameters": {
               "type": "object", "additionalProperties": false, "required": ["to", "content"],
-              "properties": { "to": { "$ref": "#/$defs/Id" }, "session_id": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }, "signature": { "$ref": "#/$defs/DeviceSignature" }, "attachments": { "type": "array", "maxItems": 4, "items": { "$ref": "#/$defs/AttachmentInput" } } }
+              "properties": { "to": { "$ref": "#/$defs/Id" }, "session_id": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }, "kind": { "type": "string", "enum": ["silent", "wake"], "description": "Wake is the default; silent holds unread mail until the next real wake." }, "signature": { "$ref": "#/$defs/DeviceSignature" }, "attachments": { "type": "array", "maxItems": 4, "items": { "$ref": "#/$defs/AttachmentInput" } } }
             }
           }
         },

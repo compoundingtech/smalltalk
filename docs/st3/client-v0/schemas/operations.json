@@ -90,7 +90,7 @@
     "review.reject": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.request-changes": { "capability": "control.attention", "parameters": "TargetParameters" },
     "attention.resolve": { "capability": "control.attention", "parameters": "AttentionResolveParameters" },
-    "message.send": { "capability": "control.messages", "parameters": "MessageSendParameters" },
+    "message.send": { "capability": "control.messages", "parameters": "MessageSendParameters", "description": "Message kind is silent or wake (default). Silent stays unread and is offered in capped batches at the next wake. Replies default to wake independently of their parent. Person and system wake events always wake. Signed silent messages carry st3-silent in signed tags. Old daemons ignore the kind field and do not hold silent mail; upgrade all owner daemons before relying on silent delivery. Raw send/by-key receipts confirm the accepted kind; unfamiliar tags alone do not confirm holding." },
     "message.read": { "capability": "control.messages", "parameters": "TargetParameters" },
     "message.close": { "capability": "control.messages", "parameters": "TargetParameters" },
     "launch.create": { "capability": "control.launches", "parameters": "LaunchCreateParameters" },

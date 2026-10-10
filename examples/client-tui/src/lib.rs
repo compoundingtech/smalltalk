@@ -38,6 +38,7 @@ pub async fn send(client: &Client, request: &Send) -> Result<String, ClientError
                 in_reply_to: None,
                 session_id: None,
                 tags: vec![],
+                kind: st3_client::MessageKind::Wake,
                 attachments: vec![],
                 signature: None,
             },

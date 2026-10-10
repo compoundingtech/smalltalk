@@ -2583,11 +2583,12 @@ fn mission_list_cards_at(
                 "id":step.subject,"path":step.step,"title":step.title,"state":client_work_state(&step.status),
                 "attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,
                 "agentless":step.agentless,"since":client_timestamp(step.updated_at_unix_ms),
+                "progress_at": null,
                 "blocked_reason":step.blocked_reason.as_deref().or_else(|| scheduler_fault.as_deref().filter(|_| step.status=="pending")),"blockers":step.blockers,
                 "goals":step.goals,"constraints":step.constraints
             })).collect::<Vec<_>>();
             let current=shown.iter().filter(|s| matches!(s["state"].as_str(),Some("ready"|"claimed"|"verifying"|"blocked")))
-                .map(|s| json!({"id":s["id"],"title":s["title"],"assignee":s["assignee"],"claimant":s["claimant"],"state":s["state"],"since":s["since"]})).collect::<Vec<_>>();
+                .map(|s| json!({"id":s["id"],"title":s["title"],"assignee":s["assignee"],"claimant":s["claimant"],"state":s["state"],"since":s["since"],"progress_at":s["progress_at"]})).collect::<Vec<_>>();
             Ok::<Value,anyhow::Error>(json!({
                 "id":run["id"],"generation_id":run["generation_id"],"requester":run["requester"],
                 "status":run["status"],"phase":run["phase"],"progress":{"done":done,"total":total},
@@ -2820,6 +2821,7 @@ fn mission_resources_filtered(
                                 "claimant": step.claimant,
                                 "state": client_work_state(&step.status),
                                 "since": client_timestamp(step.updated_at_unix_ms),
+                                "progress_at": step.progress_at_unix_ms.map(client_timestamp),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -2912,6 +2914,7 @@ fn mission_resources_filtered(
                                     "agentless": step.agentless,
                                     "since": client_timestamp(step.updated_at_unix_ms),
                                     "last_progress": step.progress_summary,
+                                    "progress_at": step.progress_at_unix_ms.map(client_timestamp),
                                     "blocked_reason": step.blocked_reason.as_deref().or_else(|| run.scheduler_fault.as_deref().filter(|_| step.status == "pending")),
                                     "blockers": step.blockers,
                                     "goals": step.goals,
@@ -9021,6 +9024,80 @@ fn parameter_string(parameters: &Value, key: &str) -> Result<String, ApiError> {
         .ok_or_else(|| validation(format!("action parameters require `{key}`")))
 }
 
+#[cfg(test)]
+#[test]
+fn message_kinds_default_to_wake_and_replies_do_not_inherit_silence() {
+    assert!(message_send_tags(&json!({})).unwrap().is_empty());
+    assert!(
+        message_send_tags(&json!({"kind":"wake", "in_reply_to":"message/silent"}))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        message_send_tags(&json!({"kind":"silent"})).unwrap(),
+        vec![crate::silent::SILENT_TAG]
+    );
+    for value in [
+        json!({"kind":"question"}),
+        json!({"kind":false}),
+        json!({"kind":null}),
+        json!({"fyi":true}),
+        json!({"question":true}),
+        json!({"silent":true}),
+        json!({"kind":"wake","tags":[crate::silent::SILENT_TAG]}),
+    ] {
+        assert!(message_send_tags(&value).is_err(), "{value}");
+    }
+    assert!(message_send_tags(&json!({"kind":"silent","signature":{}})).is_err());
+    assert_eq!(
+        message_send_tags(
+            &json!({"kind":"silent","tags":[crate::silent::SILENT_TAG],"signature":{}})
+        )
+        .unwrap(),
+        vec![crate::silent::SILENT_TAG]
+    );
+}
+
+/// Silent is recorded in accepted tags; wake is the default for every sender and seat.
+fn message_send_tags(parameters: &Value) -> Result<Vec<String>, ApiError> {
+    if ["fyi", "silent", "question"]
+        .iter()
+        .any(|field| parameters.get(field).is_some())
+    {
+        return Err(validation(
+            "message.send uses kind: silent | wake, not boolean message types",
+        ));
+    }
+    let kind = match parameters.get("kind") {
+        None => "wake",
+        Some(Value::String(kind)) if matches!(kind.as_str(), "silent" | "wake") => kind.as_str(),
+        _ => return Err(validation("message kind must be silent or wake")),
+    };
+    let mut tags: Vec<String> = parameters
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let marked_silent = tags.iter().any(|tag| crate::silent::is_silent_tag(tag));
+    if kind == "wake" && marked_silent {
+        return Err(validation(
+            "wake messages cannot carry the silent delivery tag",
+        ));
+    }
+    if kind == "silent" && !marked_silent {
+        if parameters.get("signature").is_some() {
+            return Err(validation(
+                "a signed silent message carries st3-silent in its signed tags",
+            ));
+        }
+        tags.push(crate::silent::SILENT_TAG.into());
+    }
+    Ok(tags)
+}
+
 fn validate_message_session(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -9870,14 +9947,7 @@ async fn dispatch_action(
                         .get("in_reply_to")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
-                    tags: p
-                        .get("tags")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect(),
+                    tags: message_send_tags(p)?,
                     attachments: p
                         .get("attachments")
                         .cloned()
@@ -16015,6 +16085,44 @@ mission "example/steps" state="ready" {
             .collect::<BTreeMap<_, _>>();
         assert_eq!(progress[runs[0].as_str()], "Half built.");
         assert_eq!(progress[runs[1].as_str()], Value::Null);
+        let progressed = claimed
+            .steps
+            .iter()
+            .find(|step| step.step == "build")
+            .unwrap();
+        let expected_at = progressed.progress_at_unix_ms.map(client_timestamp);
+        assert!(expected_at.is_some());
+        let projected = details.iter().find(|run| run["id"] == runs[0]).unwrap();
+        let build = projected["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["path"] == "build")
+            .unwrap();
+        assert_eq!(build["progress_at"], json!(expected_at));
+        assert_eq!(projected["current_steps"][0]["progress_at"], json!(expected_at));
+        let no_progress = details.iter().find(|run| run["id"] == runs[1]).unwrap();
+        assert!(no_progress["steps"].as_array().unwrap().iter().all(|step| step["progress_at"].is_null()));
+        // Renewing the operational lease does not prove the claimant made progress.
+        state.store.work_action(&progressed.subject, "renew", &crate::model::WorkRequest {
+            actor: progressed.claimant.clone(),
+            incarnation: Some("builder-1".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: "progress-timestamp-renew".into(),
+        }).unwrap();
+        let index = state.store.index().unwrap();
+        let work = super::client_work_resources(&state.store, None, false, client_now_ms(), index).unwrap();
+        let item = work.iter().find(|step| step["id"] == progressed.subject).unwrap();
+        assert_eq!(item["progress_at"], json!(expected_at));
+        let item_detail = super::client_work_item(&state.store, &progressed.subject, None, client_now_ms(), index)
+            .unwrap()
+            .unwrap();
+        assert_eq!(item_detail["progress_at"], json!(expected_at));
+        let cards = mission_list_cards(&state.store, &["mission/example/steps".into()]).unwrap();
+        assert!(cards[0]["run_details"].as_array().unwrap().iter().all(|run|
+            run["steps"].as_array().unwrap().iter().all(|step| step.get("progress_at") == Some(&Value::Null))));
         let tree_runs = tree["runs"]
             .as_array()
             .unwrap()
