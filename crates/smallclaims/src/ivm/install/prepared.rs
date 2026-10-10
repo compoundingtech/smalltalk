@@ -208,10 +208,9 @@ impl PreparedPage {
                 <= self.limits.tables,
             "prepared table bound exceeded"
         );
-        ensure!(
-            schema_version(db)? == self.schema_version,
-            "prepared table schema changed"
-        );
+        // The caller owns one preparation snapshot. Stage read-only metadata privately;
+        // the final schema check below rejects a changed cut before accepting any table.
+        // A second cookie read here does not strengthen that same-cut acceptance check.
         let tables = self.capture_table_shapes(db, names)?;
         // The materialized inventory preserves the old 256-table refusal. A LEFT JOIN
         // emits a row even for a table with no foreign keys. Stream counts per table to

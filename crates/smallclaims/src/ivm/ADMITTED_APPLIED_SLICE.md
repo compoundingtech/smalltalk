@@ -287,3 +287,24 @@ work-accounting test may expose a needed metadata-cost
 correction; its assertions must not be waived or weakened. Native writer startup,
 supervisor/quarantine and actual work questions remain explicit before adoption.
 Current PR checks supply the live dependency; no historical callback is invented.
+
+
+## Composed-main accounting successor
+
+The PR-head 1b67 cohort passed all25 names and unchanged strict accounting, but
+merge-group38019093612 (dc4d1abe, main plus2154 plus1b67) failed the strict control
+on all3automatic attempts at129statements/6350VM/642fullscan/1sort/0autoindex.
+The new main schema adds checkpoint_capture_epoch; the whole-inventory FK walk
+now probes this additional table. This is a source-supported explanation, not a
+fabricated per-statement execution witness. The composed failure stays failed.
+The successor merges actual main1e52d310 and removes the redundant pre-discovery
+cookie query: all metadata is read-only/private on the caller's single snapshot,
+and final schema validation still precedes atomic acceptance. The publication
+cookie check is unchanged. A new changed-schema control refuses the second table,
+preserves earlier owned metadata, and proves that stale output cannot publish.
+Strict accounting prints its observed tuple after physical guard returns; an exact
+CI package/binary/test override makes only that successful output visible; its
+positive/128SQL/50000VM/zeroautoindex assertions and measured interval are unchanged.
+All26successor names/work outcomes areUNRUN; no general schema-scale work bound,
+authority/lifetime proof or activation follows. Current-main hosted/Intake and
+curator eligibility remain required; the curator owns the next queue action.

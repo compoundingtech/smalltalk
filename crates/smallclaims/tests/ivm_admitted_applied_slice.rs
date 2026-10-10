@@ -1430,6 +1430,7 @@ fn full_page_accounting_includes_metadata_and_physical_reader_writer_return() ->
     let page = slice.capture()?.reduce()?;
     slice.publish(&page)?;
     let work = scope.finish(); // includes both guard returns, before oracle queries
+    eprintln!("whole-page accounted work including physical guard return: {work:?}");
     assert!(
         work.statements > 0,
         "zero traced statements is not qualified work evidence"

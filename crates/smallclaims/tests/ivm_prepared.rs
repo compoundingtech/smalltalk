@@ -797,6 +797,39 @@ fn grouped_shape_reads_main_columns_and_refuses_generated_or_missing_sibling() {
     }
 }
 
+#[test]
+fn grouped_metadata_final_schema_check_rejects_changed_cut_without_accepting_sibling() {
+    let (mut db, i, job) = fixture();
+    ready(&mut db, &i, &job);
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    page.capture_table(&db, "cards").unwrap();
+    db.execute_batch("CREATE TABLE main.later_namespace(k INTEGER)")
+        .unwrap();
+    let error = page
+        .capture_tables(&db, &["cards", "coverage"])
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("prepared table schema changed"));
+    assert!(page.upsert("coverage", vec![Sql::Integer(1)]).is_err());
+    // Prior metadata remains owned, but its old schema cut can never publish now.
+    page.upsert(
+        "cards",
+        vec![Sql::Text("amber".into()), Sql::Text("stale body".into())],
+    )
+    .unwrap();
+    let tx = db.transaction().unwrap();
+    let error = i.publish_prepared(&tx, &page, 3).unwrap_err();
+    assert!(format!("{error:#}").contains("prepared publication schema changed"));
+    tx.commit().unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM main.cards", [], |r| r
+            .get::<_, usize>(0))
+            .unwrap(),
+        0
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_worker_preserves_notice_during_owned_page_and_propagates_failure() {
     use smallclaims::ivm::{
