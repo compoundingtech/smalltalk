@@ -20,6 +20,7 @@ import {
   mailStageRunsOn,
   pickRunnerJob,
   pickRunnerJobId,
+  primaryTestRunsOn,
   pnpmStoreEnv,
   supportingLinuxRunsOn,
   supportingStageRunsOn,
@@ -281,7 +282,7 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         name: 'linux-tests',
         stage: 'tests',
         setup: testArchiveConsumerSetup,
-        runsOn: linuxStageRunsOn,
+        runsOn: primaryTestRunsOn,
         // CI_RUN_ID keeps the messaging-fault evidence under target/messaging-faults and a failed
         // boot canary's evidence under target/boot-canaries.
         env: { CI_RUN_ID: '${{ github.run_id }}', CI_TEST_PARTITION: 'hash:1/2', CI_TEST_THREADS: '8' },

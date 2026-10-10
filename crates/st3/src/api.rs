@@ -2995,6 +2995,13 @@ fn client_agent_resources_from_status(
                 "blocked_on": subject.harness.as_ref().and_then(|harness| harness.blocked_on.as_deref()),
                 "ask": subject.harness.as_ref().and_then(|harness| harness.ask.as_deref()),
                 "reason": subject.harness.as_ref().and_then(|harness| harness.reason.as_deref()),
+                // What the seat is doing that is neither work nor a wait on anyone: a status,
+                // never an alert.
+                "activity": subject
+                    .harness
+                    .as_ref()
+                    .filter(|harness| harness.reason.as_deref() == Some("compaction"))
+                    .map(|_| "compacting"),
                 "host_id": desired_agents.get(&subject.subject).map(|(host, _, _)| host),
                 "workspace": desired_agents.get(&subject.subject).map(|(_, workspace, _)| workspace),
                 "checkout": desired_agents.get(&subject.subject).and_then(|(_, _, checkout)| checkout.as_ref()),
@@ -24669,6 +24676,15 @@ mission "agent-human" state="ready" {
         assert!(answered.blocked_on.is_none());
         assert!(answered.ask.is_none());
         assert!(answered.reason.is_none());
+        assert!(answered.activity.is_none());
+        // Compacting is the seat's status: it runs, it waits on nobody.
+        append("harness.observed", json!({
+            "state": "working", "driver": "omp", "incarnation_id": "human-1",
+            "blocked_on": null, "ask": null, "reason": "compaction", "input_buffer": null, "exit": null,
+        }));
+        let compacting: st3_client::Agent = serde_json::from_value(agent()).unwrap();
+        assert_eq!(compacting.state, "running");
+        assert_eq!(compacting.activity.as_deref(), Some("compacting"));
         // The harness schema's terminal activity keeps precedence over a stale ask.
         observe_harness("ended");
         assert_eq!(agent()["state"], "failed");

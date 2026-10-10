@@ -90,6 +90,9 @@ activity makes the canonical agent `state: "waiting"`; clients present that comb
 a person. It takes precedence over working or idle, not over a terminal runtime, an ended/failed or
 indeterminate harness, a reconcile fault, or an observation fenced out by the current incarnation.
 `ask` names the structured question, permission, or review, not text inferred from the terminal.
+The optional `activity` is a status that is neither work nor a wait on a person, never an alert:
+`compacting` while the harness compacts its conversation (reason `compaction`; Claude Code, Codex
+and omp report both edges, pi only the end, so pi never shows it).
 
 The omp extension correlates an ask with its tool-call ID. Unrelated results leave it blocked; the
 matching answer emits a new unblocked activity frame. The pi-family channel retains all three axes

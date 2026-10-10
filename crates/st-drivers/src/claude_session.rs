@@ -1853,6 +1853,13 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
             Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown)
                 .with_reason("sessionStart"),
         ),
+        // Compacting is a status of the seat, not a wait on anyone: it ends at the next tool use
+        // or turn when auto-compaction runs inside a turn, and at `SessionStart` (source
+        // `compact`) after a `/compact`, which reads as idle.
+        "PreCompact" => Some(
+            Observation::new(Activity::Active, BlockedOn::None, InputBuffer::Unknown)
+                .with_reason("compaction"),
+        ),
         "UserPromptSubmit" | "PreToolUse" | "PostToolUse" => Some(Observation::new(
             Activity::Active,
             BlockedOn::None,
@@ -2379,6 +2386,18 @@ mod tests {
 
         // Unmapped events say nothing rather than guessing.
         assert_eq!(observe_hook_event("Notification", &none), None);
+        // Compacting is a status, not a wait on anyone; the session that resumes after it reads
+        // as idle.
+        let compacting = observe_hook_event("PreCompact", &none).unwrap();
+        assert_eq!(compacting.state, Activity::Active);
+        assert_eq!(compacting.blocked_on, BlockedOn::None);
+        assert_eq!(compacting.reason.as_deref(), Some("compaction"));
+        assert_eq!(
+            observe_hook_event("SessionStart", &serde_json::json!({"source":"compact"}))
+                .unwrap()
+                .state,
+            Activity::Idle
+        );
         assert_eq!(observe_hook_event("SubagentStop", &none), None);
     }
 
