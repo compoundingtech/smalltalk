@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Give each seat a private session inventory for an authored pi or omp transcript",
+  "replay": {"status": "none", "detail": "No graph replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "changed", "detail": "On the next authored-transcript start, replace the legacy shared-directory link atomically with a private directory containing only the transcript link and its own artifact directory link. Original transcripts and other sessions stay in place. Native seed receipts and refusal re-arming are unchanged."},
+  "downtime": {"status": "none", "detail": "No additional interruption or service lifecycle change."},
+  "manual": {"status": "none", "detail": "No operator steps required."},
+  "recovery": {"status": "none", "detail": "Migration does not delete or move original transcripts or artifact directories."}
+}

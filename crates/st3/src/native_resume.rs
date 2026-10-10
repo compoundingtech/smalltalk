@@ -375,15 +375,28 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
     }
     let parent = fs::canonicalize(transcript.parent().expect("absolute file has a parent"))
         .map_err(|error| Refusal::new("transcript-unreadable", error.to_string()))?;
+    // Serialize starters on the containing directory, without adding inventory entries.
+    use std::os::fd::AsRawFd as _;
+    let container = sessions.parent().expect("managed directory has a parent");
+    let lock = fs::File::open(container)
+        .map_err(|error| Refusal::new("managed-directory-unreadable", error.to_string()))?;
+    // SAFETY: lock owns a valid descriptor for the duration of the operation.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(Refusal::new(
+            "managed-directory-unreadable",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    let mut migrate = false;
     match fs::symlink_metadata(sessions) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            if fs::canonicalize(sessions).ok().as_ref() == Some(&parent) {
-                return Ok(false);
+            if fs::canonicalize(sessions).ok().as_ref() != Some(&parent) {
+                return Err(Refusal::new(
+                    "managed-directory-foreign-link",
+                    "managed directory links elsewhere",
+                ));
             }
-            return Err(Refusal::new(
-                "managed-directory-foreign-link",
-                "managed directory links elsewhere",
-            ));
+            migrate = true;
         }
         Ok(metadata) if metadata.is_dir() => {
             if fs::read_dir(sessions)
@@ -415,10 +428,64 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
             ));
         }
     }
-    // Creation is exclusive: a concurrent starter's directory or link is never overwritten.
-    symlink(&parent, sessions)
+    let prepared = tempfile::Builder::new()
+        .prefix(".transcript-inventory-")
+        .tempdir_in(container)
         .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
+    let filename = transcript.file_name().expect("validated transcript filename");
+    symlink(parent.join(filename), prepared.path().join(filename))
+        .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
+    // OMP stores session artifacts beside the transcript, in its extensionless directory.
+    let artifacts = parent.join(transcript.file_stem().expect("validated transcript filename"));
+    if artifacts.is_dir() {
+        symlink(&artifacts, prepared.path().join(artifacts.file_name().unwrap()))
+            .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
+    }
+    if migrate {
+        exchange_transcript_inventory(prepared.path(), sessions)
+            .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
+        // After exchange, this path is the old symlink, not the user's directory.
+        fs::remove_file(prepared.path())
+            .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
+    } else {
+        fs::rename(prepared.path(), sessions)
+            .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
+    }
     Ok(true)
+}
+
+/// Swap the prepared directory and legacy symlink without an absent-path window.
+#[cfg(unix)]
+fn exchange_transcript_inventory(prepared: &Path, sessions: &Path) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    let prepared = CString::new(prepared.as_os_str().as_bytes())?;
+    let sessions = CString::new(sessions.as_os_str().as_bytes())?;
+    #[cfg(target_os = "linux")]
+    // SAFETY: both C strings are live, NUL-terminated paths; the syscall retains no pointers.
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            prepared.as_ptr(),
+            libc::AT_FDCWD,
+            sessions.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    // SAFETY: both C strings are live, NUL-terminated paths; the syscall retains no pointers.
+    let result = unsafe {
+        libc::renamex_np(prepared.as_ptr(), sessions.as_ptr(), libc::RENAME_SWAP)
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let result = {
+        let _ = (prepared, sessions);
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic transcript inventory migration is unsupported on this platform",
+        ));
+    };
+    if result == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
 }
 
 /// pi resumes by transcript path, omp by session ID. pi silently starts a new session at a
@@ -566,7 +633,7 @@ mod tests {
         // Absent, then already linked. Appending remains visible through both paths.
         assert!(pi_family_link_transcript(&arguments, &managed).unwrap());
         assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
-        assert_eq!(fs::read_link(&managed).unwrap(), legacy);
+        assert!(!fs::symlink_metadata(&managed).unwrap().file_type().is_symlink());
         fs::OpenOptions::new()
             .append(true)
             .open(&transcript)
@@ -578,7 +645,7 @@ mod tests {
             fs::read(&transcript).unwrap()
         );
         assert_eq!(arguments, original_arguments);
-        fs::remove_file(&managed).unwrap();
+        fs::remove_dir_all(&managed).unwrap();
         // Empty directory and the equals form.
         fs::create_dir(&managed).unwrap();
         assert!(
@@ -588,7 +655,7 @@ mod tests {
             )
             .unwrap()
         );
-        fs::remove_file(&managed).unwrap();
+        fs::remove_dir_all(&managed).unwrap();
         // An existing inventory with the same inode is left as a directory.
         fs::create_dir(&managed).unwrap();
         fs::hard_link(&transcript, managed.join(transcript.file_name().unwrap())).unwrap();
@@ -691,10 +758,8 @@ mod tests {
             pi_family_transcript(&managed, id).unwrap(),
             managed.join(transcript.file_name().unwrap())
         );
-        assert_eq!(
-            fs::read_to_string(managed.join("another.jsonl")).unwrap(),
-            "another session"
-        );
+        assert!(!managed.join("another.jsonl").exists());
+        assert_eq!(fs::read_to_string(legacy.join("another.jsonl")).unwrap(), "another session");
     }
 
     #[cfg(unix)]
@@ -734,8 +799,64 @@ mod tests {
                 }
             }
         });
-        assert_eq!(fs::read_link(&managed).unwrap(), legacy);
+        assert!(!fs::symlink_metadata(&managed).unwrap().file_type().is_symlink());
         assert_eq!(pi_family_header_id(&transcript).as_deref(), Some(id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authored_transcripts_have_disjoint_inventories() {
+        assert_private_authored_inventories(false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authored_transcripts_migrate_legacy_shared_links() {
+        assert_private_authored_inventories(true);
+    }
+
+    #[cfg(unix)]
+    fn assert_private_authored_inventories(migrate: bool) {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let shared = root.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let ids = [
+            "5f9a6e16-5e30-4bce-b327-9a8241321bd6",
+            "a5e213bc-c28e-42ba-a548-17aaf21ec32f",
+        ];
+        let transcripts: Vec<_> = ids.iter().enumerate().map(|(index, id)| {
+            let path = shared.join(format!("2026-10-0{}_{id}.jsonl", index + 1));
+            fs::write(&path, format!("{{\"type\":\"session\",\"id\":\"{id}\",\"timestamp\":\"2026-10-0{}T00:00:00Z\",\"cwd\":\"/example\"}}\n", index + 1)).unwrap();
+            fs::create_dir(path.with_extension("")).unwrap();
+            fs::write(path.with_extension("").join("artifact"), id).unwrap();
+            path
+        }).collect();
+        let inventories: Vec<_> = (0..2).map(|index| {
+            let managed = root.path().join(format!("inventory-{migrate}-{index}"));
+            if migrate { symlink(&shared, &managed).unwrap(); }
+            let arguments = argv(&["omp", "--resume", transcripts[index].to_str().unwrap()]);
+            assert!(pi_family_link_transcript(&arguments, &managed).unwrap());
+            assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
+            assert!(!fs::symlink_metadata(&managed).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read_dir(&managed).unwrap().count(), 2);
+            assert!(pi_family_transcript(&managed, ids[index]).is_some());
+            assert!(pi_family_transcript(&managed, ids[1 - index]).is_none());
+            let latest = crate::external_sessions::find_managed_omp_transcript(&managed, 0)
+                .unwrap().unwrap();
+            assert_eq!(latest.native_id, ids[index]);
+            assert_eq!(
+                fs::read_to_string(managed.join(transcripts[index].file_stem().unwrap()).join("artifact")).unwrap(),
+                ids[index],
+            );
+            managed
+        }).collect();
+        assert_ne!(fs::canonicalize(&inventories[0]).unwrap(), fs::canonicalize(&inventories[1]).unwrap());
+        assert_eq!(fs::read_dir(&shared).unwrap().count(), 4);
+        for (index, transcript) in transcripts.iter().enumerate() {
+            assert_eq!(pi_family_header_id(transcript).as_deref(), Some(ids[index]));
+            assert_eq!(fs::read_to_string(transcript.with_extension("").join("artifact")).unwrap(), ids[index]);
+        }
     }
 
     #[test]
