@@ -55,6 +55,13 @@ export const proseItem = (item: TextItem): TextItem => {
   return { ...item, text: envelope[2]!, sender, role: sender.kind === 'human' ? 'user' : 'system' }
 }
 
+/** The lines st adds beside a delivery for the agent (st-drivers `ding`); the earlier sentence stays recognized in old history. */
+const deliveryNotes: ReadonlySet<string> = new Set([
+  'Answer the person in this conversation; people have no inbox, so do not reply with st.',
+  "The person reads replies in st, not in the agent's session.",
+  '(dictated by voice; it may contain transcription mistakes)',
+])
+
 /**
  * Mirrors st3-views' shown/delivered semantics for envelope, channel and PING delivery links.
  * That package is not a dependency here. Only explicit graph links suppress mail, never prose.
@@ -84,10 +91,7 @@ export const withoutShownDeliveries = (raw: string, shown: ReadonlySet<string>):
     return false
   }).join('\n')
   if (!delivered) return raw
-  return text.split('\n').filter((line) =>
-    line.trim() !== "The person reads replies in st, not in the agent's session." &&
-    line.trim() !== '(dictated by voice; it may contain transcription mistakes)',
-  ).join('\n').trim()
+  return text.split('\n').filter((line) => !deliveryNotes.has(line.trim())).join('\n').trim()
 }
 
 /** Deliberately decode an event envelope; arbitrary prose and JSON remain prose. */
