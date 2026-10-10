@@ -2270,7 +2270,7 @@ async fn send_message(
         in_reply_to,
         session_id,
         tags,
-        fyi: false,
+        silent: false,
         question: false,
         attachments,
         signature: None,

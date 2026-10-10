@@ -235,7 +235,7 @@ fn incremental_held_backlog_above_eight_matches_the_bounded_full_oracle() {
                     ("from".into(), json!("agent/example/writer")),
                     ("to".into(), json!(mailbox.fence.subject)),
                     ("content".into(), json!("held")),
-                    ("tags".into(), json!([crate::fyi::FYI_TAG])),
+                    ("tags".into(), json!([crate::silent::SILENT_TAG])),
                 ]),
                 evidence: vec![],
                 expected_subject: None,

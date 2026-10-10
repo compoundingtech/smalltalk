@@ -12549,53 +12549,6 @@ impl Store {
         if name == Some("") {
             return Err(St3Error::new("invalid-agent-name", "a seat label must be a non-empty string"));
         }
-        self.revise_agent_in_place(
-            subject,
-            json!({ "agent": subject, "display_name": name }),
-            idempotency_key,
-            None,
-            |desired| desired.set_display_name(name),
-        )
-    }
-
-    /// Choose what wakes a seat, without restarting its harness. Messages already sent keep
-    /// the delivery they were sent with.
-    pub fn set_agent_wake_on(
-        &self,
-        subject: &str,
-        wake_on: crate::fyi::WakeOn,
-        idempotency_key: &str,
-        actor: &str,
-    ) -> Result<ApplyResponse, St3Error> {
-        if actor != subject && !actor.starts_with("person/") {
-            return Err(St3Error::new(
-                "foreign-wake-on",
-                "only the seat itself or a person can change its wake-on policy",
-            ));
-        }
-        self.revise_agent_in_place(
-            subject,
-            json!({ "agent": subject, "wake_on": wake_on.as_str(), "actor": actor }),
-            idempotency_key,
-            Some(actor),
-            |desired| {
-                if crate::fyi::declared_wake_on(Some(&desired.desired)) == wake_on {
-                    return Ok(());
-                }
-                desired.set_wake_on(wake_on)
-            },
-        )
-    }
-
-    /// Republish a seat's current declaration with one change that keeps its launch.
-    fn revise_agent_in_place(
-        &self,
-        subject: &str,
-        normalized: Value,
-        idempotency_key: &str,
-        actor_override: Option<&str>,
-        revise: impl FnOnce(&mut DesiredSubject) -> Result<(), St3Error>,
-    ) -> Result<ApplyResponse, St3Error> {
         let (mut desired, heads, writer) = {
             let connection = self.readers.get();
             let transaction = connection.unchecked_transaction().map_err(internal)?;
@@ -12625,20 +12578,8 @@ impl Store {
             let heads = intent_leaves_tx(&transaction, subject).map_err(internal)?;
             (desired.0, heads, desired.1)
         };
-        let previous = desired.clone();
-        revise(&mut desired)?;
-        if actor_override.is_some() && desired == previous {
-            return Ok(ApplyResponse {
-                changed: false,
-                store_index: self.index().map_err(internal)?,
-                batch_id: None,
-                claim_ids: Vec::new(),
-                subject_tokens: BTreeMap::from([(subject.to_owned(), heads)]),
-                reconcile_subjects: Vec::new(),
-                resolved_kdl: String::new(),
-                operations: Vec::new(),
-            });
-        }
+        desired.set_display_name(name)?;
+        let normalized = json!({ "agent": subject, "display_name": name });
         let intent = NormalizedIntent {
             direct_message_registrations: BTreeSet::new(),
             schema: "st3.v1".into(),
@@ -12658,7 +12599,7 @@ impl Store {
             &intent,
             &BTreeMap::from([(subject.to_owned(), heads)]),
             idempotency_key,
-            actor_override.or(writer.as_deref()),
+            writer.as_deref(),
         )
     }
 
@@ -13434,8 +13375,8 @@ impl Store {
     pub fn held_mail_before(&self, before_unix_ms: u128) -> Result<Vec<(String, u64, u128)>> {
         let mut seats = BTreeMap::<String, (u64, u128)>::new();
         for sent in unread_mail::sent_before(&self.readers.get(), before_unix_ms)? {
-            if sent.tags.iter().any(|tag| tag == crate::fyi::FYI_TAG)
-                && !crate::fyi::always_wakes(&sent.from, &sent.tags)
+            if sent.tags.iter().any(|tag| tag == crate::silent::SILENT_TAG)
+                && !crate::silent::always_wakes(&sent.from, &sent.tags)
             {
                 let seat = seats.entry(sent.to).or_insert((0, sent.sent_unix_ms));
                 seat.0 += 1;
@@ -13779,10 +13720,10 @@ impl Store {
             for (subject, created_index, remaining) in subjects {
                 let mut message = self.message_view_cached(&connection, &subject, created_index)?;
                 if message.to == recipient && (include_closed || message.status != "closed") {
-                    if remaining > 0 && crate::fyi::waits_for_turn(&message) {
+                    if remaining > 0 && crate::silent::waits_for_turn(&message) {
                         message
                             .tags
-                            .push(format!("{}{remaining}", crate::fyi::REMAINING_PREFIX));
+                            .push(format!("{}{remaining}", crate::silent::REMAINING_PREFIX));
                     }
                     output.push(message);
                 }
@@ -21399,14 +21340,12 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
     Ok(lineage)
 }
 
-/// Two agent declarations that differ only in their human label or in what wakes the seat
-/// share one launch.
+/// Two agent declarations that differ only in their human label share one launch.
 fn presentation_only_change(previous: &Value, next: &Value) -> bool {
     let parse = |body: &Value| {
         let mut desired = serde_json::from_value::<DesiredSubject>(body.clone()).ok()?;
         (desired.kind == "agent").then_some(())?;
         desired.set_display_name(None).ok()?;
-        desired.set_wake_on(crate::fyi::WakeOn::All).ok()?;
         Some(desired)
     };
     matches!((parse(previous), parse(next)), (Some(previous), Some(next)) if previous == next)
@@ -22403,7 +22342,7 @@ fn message_view_tx(
                 values
                     .iter()
                     .filter_map(Value::as_str)
-                    .filter(|tag| !tag.starts_with(crate::fyi::REMAINING_PREFIX))
+                    .filter(|tag| !tag.starts_with(crate::silent::REMAINING_PREFIX))
                     .map(str::to_owned)
                     .collect()
             })
@@ -22413,7 +22352,7 @@ fn message_view_tx(
                     .map(|value| {
                         canonical_child_strings(value, "tag")
                             .into_iter()
-                            .filter(|tag| !tag.starts_with(crate::fyi::REMAINING_PREFIX))
+                            .filter(|tag| !tag.starts_with(crate::silent::REMAINING_PREFIX))
                             .collect()
                     })
                     .unwrap_or_default()
@@ -34333,90 +34272,6 @@ agent "test/worker" { workspace "."; command "true"; name "Initial" }
         let cleared = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap().0;
         assert_eq!(crate::model::effective_agent_name("agent/test/worker", Some(&cleared.desired)), "test/worker");
         assert_eq!(cleared.member.unwrap().display_name, None);
-    }
-
-    #[test]
-    fn wake_on_is_declared_in_kdl_and_set_by_command_without_a_new_launch() {
-        use crate::fyi::{WakeOn, declared_wake_on};
-        let store = Store::open_memory("node").unwrap();
-        let intent = parse_intent(r#"version 2
-agent "test/worker" { command "true"; wake-on "questions" }
-"#, "node").unwrap();
-        let preview = store.mission(&intent, IntentInput {
-            kdl: String::new(), source_name: None,
-        }).unwrap();
-        store.apply(&intent, &preview.subject_tokens, "declared").unwrap();
-        let wake_on = |store: &Store| {
-            let seat = store.desired_subjects_named(&["agent/test/worker".into()]).unwrap();
-            declared_wake_on(seat.first().map(|seat| &seat.desired))
-        };
-        assert_eq!(wake_on(&store), WakeOn::Questions);
-        let launch = store
-            .selected_desired_token("agent/test/worker")
-            .unwrap()
-            .unwrap();
-        store
-            .set_agent_wake_on("agent/test/worker", WakeOn::All, "all", "agent/test/worker")
-            .unwrap();
-        assert_eq!(wake_on(&store), WakeOn::All);
-        store
-            .set_agent_wake_on(
-                "agent/test/worker",
-                WakeOn::Questions,
-                "questions",
-                "person/operator",
-            )
-            .unwrap();
-        assert_eq!(wake_on(&store), WakeOn::Questions);
-        let changed = store
-            .latest_claim("agent/test/worker", Some("desired"))
-            .unwrap();
-        let desired_claim = store
-            .claims_for("agent/test/worker", None)
-            .unwrap()
-            .into_iter()
-            .find(|claim| claim.actor.as_deref() == Some("person/operator"));
-        assert!(
-            desired_claim.is_some(),
-            "the operator is recorded: {changed:?}"
-        );
-        let index = store.index().unwrap();
-        assert!(
-            !store
-                .set_agent_wake_on(
-                    "agent/test/worker",
-                    WakeOn::Questions,
-                    "noop",
-                    "agent/test/worker"
-                )
-                .unwrap()
-                .changed
-        );
-        assert_eq!(
-            store.index().unwrap(),
-            index,
-            "same policy adds no replicated claim"
-        );
-        assert_eq!(
-            store
-                .set_agent_wake_on(
-                    "agent/test/worker",
-                    WakeOn::All,
-                    "foreign",
-                    "agent/test/other"
-                )
-                .unwrap_err()
-                .code,
-            "foreign-wake-on"
-        );
-        // The setting changes what wakes the seat, never its launch: no restart.
-        let lineage = store.launch_lineage("agent/test/worker").unwrap();
-        assert_eq!(lineage.last(), Some(&launch), "{lineage:?}");
-        assert_eq!(lineage.len(), 3);
-        for invalid in [r#"wake-on "sometimes""#, r#"wake-on"#, r#"wake-on "all"; wake-on "all""#] {
-            let kdl = format!("version 2\nagent \"test/other\" {{ command \"true\"; {invalid} }}\n");
-            assert!(parse_intent(&kdl, "node").is_err(), "{invalid}");
-        }
     }
 
     #[test]

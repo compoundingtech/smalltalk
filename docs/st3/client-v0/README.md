@@ -1790,4 +1790,4 @@ URLs. External images use an `image_link` block for explicit client opening; fil
 reads are restricted to content-addressed files in the bound Pi/OMP blob store. MIME comes from passive image
 signatures, with SVG/HTML/unrecognized bytes returned only as opaque octets.
 
-`message.send` accepts mutually exclusive `fyi`/`question` flags; the CLI command `st agents wake-on` lets the seat itself or a person choose `all`/`questions`. Inspect receipt tags on mixed versions: old daemons silently ignore typed flags. See [FYI messages](../fyi-messages.md).
+`message.send` accepts `kind: "silent" | "wake"`; omitted kind means wake. Silent mail stays unread until a real wake offers at most eight held messages, or it is read on demand. Replies default to wake independently of their parent; there is no question tag or per-seat wake policy. Person and system wake events always wake. Signed silent requests carry `st3-silent` in signed tags. Old daemons ignore the kind field and do not hold silent tags; inspect receipt tags in mixed-version fleets. See [silent messages](../silent-messages.md).

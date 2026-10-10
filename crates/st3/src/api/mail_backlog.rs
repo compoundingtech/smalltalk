@@ -14,7 +14,7 @@ fn overdue(
     // Include retained mail for retired seats: those are precisely the messages a current
     // agents projection would hide. Inspection never changes their lifecycle.
     for message in store.messages(to, false)? {
-        if crate::fyi::waits_for_turn(&message) {
+        if crate::silent::waits_for_turn(&message) {
             continue;
         }
         if !matches!(message.status.as_str(), "sent" | "staged" | "delivered")
@@ -135,7 +135,7 @@ pub(super) async fn cleanup(
                     .message(&message.subject)
                     .map_err(ApiError::internal)?
                     .unwrap();
-                if crate::fyi::waits_for_turn(&current) {
+                if crate::silent::waits_for_turn(&current) {
                     continue;
                 }
                 if !matches!(current.status.as_str(), "sent" | "staged" | "delivered")
@@ -187,7 +187,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn backlog_cleanup_never_archives_an_unoffered_fyi() {
+    async fn backlog_cleanup_never_archives_an_unoffered_silent() {
         let root = tempfile::tempdir().unwrap();
         let state = super::super::tests::state(root.path());
         let now = client_now_ms();
@@ -206,7 +206,7 @@ mod tests {
                     ("from".into(), json!("agent/example/writer")),
                     ("to".into(), json!("agent/example/reader")),
                     ("content".into(), json!("Held update")),
-                    ("tags".into(), json!([crate::fyi::FYI_TAG])),
+                    ("tags".into(), json!([crate::silent::SILENT_TAG])),
                 ]),
                 evidence: vec![],
                 expected_subject: None,

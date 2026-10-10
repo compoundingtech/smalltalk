@@ -2854,7 +2854,6 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "bind-terminal",
         "one-shot",
         "handles-faults",
-        "wake-on",
         "mission-authority",
         "queue-authority",
         "seat-authority",
@@ -2897,7 +2896,6 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "bind-terminal",
         "one-shot",
         "handles-faults",
-        "wake-on",
         "mission-authority",
         "queue-authority",
         "seat-authority",
@@ -2918,17 +2916,6 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
     }
     if let Some(flag) = unique_child(document, "handles-faults")? {
         ensure_bare(flag)?;
-    }
-    if let Some(wake_on) = unique_child(document, "wake-on")? {
-        ensure_no_properties(wake_on)?;
-        ensure_no_children(wake_on)?;
-        let value = one_string(wake_on)?;
-        if crate::fyi::WakeOn::parse(&value).is_none() {
-            return Err(St3Error::new(
-                "invalid-agent-wake-on",
-                format!("agent wake-on `{value}` must be all or questions"),
-            ));
-        }
     }
     if let Some(flag) = unique_child(document, "one-shot")? {
         ensure_bare(flag)?;

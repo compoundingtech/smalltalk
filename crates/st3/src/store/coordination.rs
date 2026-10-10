@@ -6,12 +6,12 @@ CREATE TABLE IF NOT EXISTS coordination_sends (
     subject TEXT PRIMARY KEY,
     sent_ms INTEGER NOT NULL,
     agent_to_agent INTEGER NOT NULL,
-    fyi INTEGER NOT NULL,
+    silent INTEGER NOT NULL,
     to_person INTEGER NOT NULL,
     held INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS coordination_sends_time
-ON coordination_sends(sent_ms, agent_to_agent, fyi, to_person);
+ON coordination_sends(sent_ms, agent_to_agent, silent, to_person);
 CREATE TABLE IF NOT EXISTS local_coordination_backfill (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
     cursor INTEGER NOT NULL,
@@ -108,9 +108,9 @@ pub(super) fn sync(
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let tagged_held =
-        tags.iter().any(|tag| tag == crate::fyi::FYI_TAG) && !crate::fyi::always_wakes(from, &tags);
-    let fyi = agent_to_agent && tagged_held;
+    let tagged_held = tags.iter().any(|tag| tag == crate::silent::SILENT_TAG)
+        && !crate::silent::always_wakes(from, &tags);
+    let silent = agent_to_agent && tagged_held;
     let held = tagged_held
         && transaction.query_row(
             "SELECT NOT EXISTS(SELECT 1 FROM claims WHERE subject=?1
@@ -125,11 +125,11 @@ pub(super) fn sync(
     transaction.execute(
         "INSERT INTO coordination_sends VALUES(?1,?2,?3,?4,?5,?6)
          ON CONFLICT(subject) DO UPDATE SET sent_ms=excluded.sent_ms,
-             agent_to_agent=excluded.agent_to_agent, fyi=excluded.fyi, to_person=excluded.to_person,
+             agent_to_agent=excluded.agent_to_agent, silent=excluded.silent, to_person=excluded.to_person,
              held=excluded.held
          WHERE sent_ms!=excluded.sent_ms OR agent_to_agent!=excluded.agent_to_agent
-             OR fyi!=excluded.fyi OR to_person!=excluded.to_person OR held!=excluded.held",
-        params![subject, at, agent_to_agent, fyi, to_person, held],
+             OR silent!=excluded.silent OR to_person!=excluded.to_person OR held!=excluded.held",
+        params![subject, at, agent_to_agent, silent, to_person, held],
     )?;
     Ok(())
 }
@@ -211,11 +211,11 @@ impl Store {
     }
 
     /// One covering range read; counts distinct message subjects, including already read mail.
-    /// FYI is the held subset of agent-to-agent sends. Person-directed sends are separate.
+    /// silent is the held subset of agent-to-agent sends. Person-directed sends are separate.
     pub fn coordination_counts(&self, since: u64, until: u64) -> Result<Value> {
         let connection = self.readers.get();
-        let (agents, fyi, people, complete, cursor, ceiling, progress): (u64, u64, u64, bool, u64, u64, u64) = connection.query_row(
-            "SELECT COALESCE(SUM(agent_to_agent),0),COALESCE(SUM(fyi),0),COALESCE(SUM(to_person),0),
+        let (agents, silent, people, complete, cursor, ceiling, progress): (u64, u64, u64, bool, u64, u64, u64) = connection.query_row(
+            "SELECT COALESCE(SUM(agent_to_agent),0),COALESCE(SUM(silent),0),COALESCE(SUM(to_person),0),
                 COALESCE((SELECT complete FROM local_coordination_backfill WHERE singleton=1),0),
                 COALESCE((SELECT cursor FROM local_coordination_backfill WHERE singleton=1),0),
                 COALESCE((SELECT ceiling FROM local_coordination_backfill WHERE singleton=1),0),
@@ -224,7 +224,7 @@ impl Store {
             params![i64::try_from(since).unwrap_or(i64::MAX), i64::try_from(until).unwrap_or(i64::MAX)], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         )?;
         Ok(
-            json!({"since_ms":since,"until_ms":until,"agent_to_agent":agents,"fyi":fyi,"to_person":people,"complete":complete,"cursor":cursor,"ceiling":ceiling,"progress_ms":progress}),
+            json!({"since_ms":since,"until_ms":until,"agent_to_agent":agents,"silent":silent,"to_person":people,"complete":complete,"cursor":cursor,"ceiling":ceiling,"progress_ms":progress}),
         )
     }
 }
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn remaining_markers_from_raw_claims_never_enter_message_views() {
         let store = Store::open_memory("node").unwrap();
-        let marker = format!("{}{}", crate::fyi::REMAINING_PREFIX, usize::MAX);
+        let marker = format!("{}{}", crate::silent::REMAINING_PREFIX, usize::MAX);
         store
             .append_claim(&ClaimInput {
                 subject: "message/raw-marker".into(),
@@ -350,7 +350,7 @@ mod tests {
                         ("from".into(), json!("agent/example/writer")),
                         ("to".into(), json!("agent/example/reader")),
                         ("content".into(), json!("held")),
-                        ("tags".into(), json!([crate::fyi::FYI_TAG])),
+                        ("tags".into(), json!([crate::silent::SILENT_TAG])),
                     ]),
                     evidence: vec![],
                     expected_subject: None,
@@ -361,12 +361,12 @@ mod tests {
         let delivery = store
             .messages_for_delivery_through("agent/example/reader", store.index().unwrap())
             .unwrap();
-        assert_eq!(delivery.len(), crate::fyi::BATCH_LIMIT);
+        assert_eq!(delivery.len(), crate::silent::BATCH_LIMIT);
         assert_eq!(delivery[0].subject, "message/held-132");
         assert!(
             delivery[0]
                 .tags
-                .contains(&format!("{}132", crate::fyi::REMAINING_PREFIX))
+                .contains(&format!("{}132", crate::silent::REMAINING_PREFIX))
         );
         assert_eq!(
             store
@@ -428,7 +428,7 @@ mod tests {
                         ("status".into(), json!("sent")),
                         ("from".into(), json!("agent/example/writer")),
                         ("to".into(), json!("agent/example/reader")),
-                        ("tags".into(), json!([crate::fyi::FYI_TAG])),
+                        ("tags".into(), json!([crate::silent::SILENT_TAG])),
                     ]),
                     evidence: vec![],
                     expected_subject: None,
@@ -481,7 +481,7 @@ mod tests {
             assert!(next >= previous && next <= previous + 8);
         }
         assert_eq!(complete["agent_to_agent"], 19);
-        assert_eq!(complete["fyi"], 19);
+        assert_eq!(complete["silent"], 19);
         assert_eq!(complete["complete"], true);
         assert_eq!(graph_digest(&store.readers.get()).unwrap(), digest);
     }
@@ -494,28 +494,28 @@ mod tests {
             (
                 "message/probe",
                 "agent/example/delivery-probe/reader",
-                vec![crate::fyi::FYI_TAG],
+                vec![crate::silent::SILENT_TAG],
             ),
             (
                 "message/soak",
                 "agent/example/reader",
-                vec!["soak", crate::fyi::FYI_TAG],
+                vec!["soak", crate::silent::SILENT_TAG],
             ),
             (
-                "message/fyi",
+                "message/silent",
                 "agent/example/reader",
-                vec![crate::fyi::FYI_TAG],
+                vec![crate::silent::SILENT_TAG],
             ),
             (
                 "message/person",
                 "person/example",
-                vec![crate::fyi::FYI_TAG],
+                vec![crate::silent::SILENT_TAG],
             ),
             (
                 "message/handoff",
                 "agent/example/reader",
                 vec![
-                    crate::fyi::FYI_TAG,
+                    crate::silent::SILENT_TAG,
                     "st3-work-handoff:step-run/example/task",
                 ],
             ),
@@ -541,7 +541,7 @@ mod tests {
         for status in ["staged", "delivered", "read", "read", "closed"] {
             store
                 .append_claim(&ClaimInput {
-                    subject: "message/fyi".into(),
+                    subject: "message/silent".into(),
                     kind: format!("message.{status}"),
                     actor: Some("agent/example/reader".into()),
                     fields: BTreeMap::from([("status".into(), json!(status))]),
@@ -554,7 +554,7 @@ mod tests {
         let before = store.index().unwrap();
         let counts = store.coordination_counts(0, u64::MAX / 2).unwrap();
         assert_eq!(counts["agent_to_agent"], 3);
-        assert_eq!(counts["fyi"], 1);
+        assert_eq!(counts["silent"], 1);
         assert_eq!(counts["to_person"], 1);
         assert_eq!(counts["complete"], true);
         assert_eq!(
@@ -563,7 +563,7 @@ mod tests {
         );
         assert_eq!(store.index().unwrap(), before);
         let plan:String=store.readers.get().query_row(
-            "EXPLAIN QUERY PLAN SELECT SUM(fyi) FROM coordination_sends INDEXED BY coordination_sends_time WHERE sent_ms>=1 AND sent_ms<2", [], |row| row.get(3)).unwrap();
+            "EXPLAIN QUERY PLAN SELECT SUM(silent) FROM coordination_sends INDEXED BY coordination_sends_time WHERE sent_ms>=1 AND sent_ms<2", [], |row| row.get(3)).unwrap();
         assert!(plan.contains("COVERING INDEX"), "{plan}");
     }
 }

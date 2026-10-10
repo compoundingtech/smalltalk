@@ -718,16 +718,6 @@ const PROBES: &[Probe] = &[
     get("GET /v1/claims/by-id/{id}", "/v1/claims/by-id/{claim}"),
     get("GET /v1/usage", "/v1/usage"),
     get("GET /v1/usage/messages", "/v1/usage/messages"),
-    post(
-        "POST /v1/agents/wake-on",
-        "/v1/agents/wake-on",
-        |_, attempt| json!({
-            "subject": "agent/bench/cost/mover",
-            "wake_on": if attempt.is_multiple_of(2) { "questions" } else { "all" },
-            "actor": "person/bench-operator",
-            "idempotency_key": format!("cost-wake-on-{attempt}"),
-        }),
-    ),
     get("GET /v1/reviews", "/v1/reviews"),
     get("GET /v1/attention", "/v1/attention"),
     get(

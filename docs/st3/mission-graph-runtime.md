@@ -1637,8 +1637,7 @@ agent "example/cos/standing/cos" {
 
 The subject is exactly `agent/example/cos/standing/cos`; placement does not change its identity.
 The seat's bare `fresh-context` node starts a new harness session before each step it claims, even when the step has no `fresh-context` node. Omit it when the seat should retain context across ordinary steps.
-A seat's `wake-on "questions"` node holds every message that asks it nothing as FYI, unread until
-its next turn; see [FYI messages](fyi-messages.md). `wake-on "all"` is the default.
+Messages use sender-chosen `kind: silent | wake`, defaulting to wake for every seat. Silent messages wait for a real wake; see [silent messages](silent-messages.md).
 
 A seat's bare `handles-faults` node makes it the fleet's fault agent: it receives each fault that no step assignee or agent requester owns, such as a failed loop on a run a person requested. When several live seats carry it, the first by subject takes them. Faults never go to a person's attention.
 

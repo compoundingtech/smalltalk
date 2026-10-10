@@ -262,19 +262,19 @@ pub fn st3_notification_with_attachments(
     envelope
 }
 
-/// Annotate a dictated or FYI delivery without changing the durable message or its body digest.
+/// Annotate a dictated or silent delivery without changing the durable message or its body digest.
 pub fn with_tag_notices(notification: String, tags: &[String]) -> String {
     let mut notification = notification;
-    // st3's FYI tag: the message was held, without waking the seat, until this turn.
-    if tags.iter().any(|tag| tag == "st3-fyi") {
-        notification = format!("(FYI: held without waking you until this turn)\n{notification}");
+    // st3's silent tag: the message was held, without waking the seat, until this turn.
+    if tags.iter().any(|tag| tag == "st3-silent") {
+        notification = format!("(silent: held without waking you until this turn)\n{notification}");
     }
     if let Some(count) = tags.iter().find_map(|tag| {
-        tag.strip_prefix("st3-fyi-remaining:")?
+        tag.strip_prefix("st3-silent-remaining:")?
             .parse::<usize>()
             .ok()
     }) {
-        notification = format!("({count} older FYI held; st conversations ls)\n{notification}");
+        notification = format!("({count} older silent held; st conversations ls)\n{notification}");
     }
     if tags.iter().any(|tag| tag == "dictated") {
         notification =

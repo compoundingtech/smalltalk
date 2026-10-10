@@ -38,7 +38,7 @@ pub async fn send(client: &Client, request: &Send) -> Result<String, ClientError
                 in_reply_to: None,
                 session_id: None,
                 tags: vec![],
-                fyi: false,
+                silent: false,
                 question: false,
                 attachments: vec![],
                 signature: None,

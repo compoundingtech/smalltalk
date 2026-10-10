@@ -8998,9 +8998,55 @@ fn parameter_string(parameters: &Value, key: &str) -> Result<String, ApiError> {
         .ok_or_else(|| validation(format!("action parameters require `{key}`")))
 }
 
-/// `fyi` and `question` are the same as their tags. A signed message carries them in the tags its
-/// device signed, since st cannot add a tag to a signed message.
+#[cfg(test)]
+#[test]
+fn message_kinds_default_to_wake_and_replies_do_not_inherit_silence() {
+    assert!(message_send_tags(&json!({})).unwrap().is_empty());
+    assert!(
+        message_send_tags(&json!({"kind":"wake", "in_reply_to":"message/silent"}))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        message_send_tags(&json!({"kind":"silent"})).unwrap(),
+        vec![crate::silent::SILENT_TAG]
+    );
+    for value in [
+        json!({"kind":"question"}),
+        json!({"kind":false}),
+        json!({"kind":null}),
+        json!({"fyi":true}),
+        json!({"question":true}),
+        json!({"silent":true}),
+        json!({"kind":"wake","tags":[crate::silent::SILENT_TAG]}),
+    ] {
+        assert!(message_send_tags(&value).is_err(), "{value}");
+    }
+    assert!(message_send_tags(&json!({"kind":"silent","signature":{}})).is_err());
+    assert_eq!(
+        message_send_tags(
+            &json!({"kind":"silent","tags":[crate::silent::SILENT_TAG],"signature":{}})
+        )
+        .unwrap(),
+        vec![crate::silent::SILENT_TAG]
+    );
+}
+
+/// Silent is recorded in accepted tags; wake is the default for every sender and seat.
 fn message_send_tags(parameters: &Value) -> Result<Vec<String>, ApiError> {
+    if ["fyi", "silent", "question"]
+        .iter()
+        .any(|field| parameters.get(field).is_some())
+    {
+        return Err(validation(
+            "message.send uses kind: silent | wake, not boolean message types",
+        ));
+    }
+    let kind = match parameters.get("kind") {
+        None => "wake",
+        Some(Value::String(kind)) if matches!(kind.as_str(), "silent" | "wake") => kind.as_str(),
+        _ => return Err(validation("message kind must be silent or wake")),
+    };
     let mut tags: Vec<String> = parameters
         .get("tags")
         .and_then(Value::as_array)
@@ -9009,26 +9055,19 @@ fn message_send_tags(parameters: &Value) -> Result<Vec<String>, ApiError> {
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
-    for (flag, tag) in [
-        ("fyi", crate::fyi::FYI_TAG),
-        ("question", crate::fyi::QUESTION_TAG),
-    ] {
-        if parameters.get(flag).and_then(Value::as_bool) != Some(true)
-            || tags.iter().any(|existing| existing == tag)
-        {
-            continue;
-        }
-        if parameters.get("signature").is_some() {
-            return Err(validation(format!(
-                "a signed message with `{flag}` carries `{tag}` in its signed tags"
-            )));
-        }
-        tags.push(tag.into());
+    let marked_silent = tags.iter().any(|tag| tag == crate::silent::SILENT_TAG);
+    if kind == "wake" && marked_silent {
+        return Err(validation(
+            "wake messages cannot carry the silent delivery tag",
+        ));
     }
-    if tags.iter().any(|tag| tag == crate::fyi::FYI_TAG)
-        && tags.iter().any(|tag| tag == crate::fyi::QUESTION_TAG)
-    {
-        return Err(validation("a message is FYI or a question, not both"));
+    if kind == "silent" && !marked_silent {
+        if parameters.get("signature").is_some() {
+            return Err(validation(
+                "a signed silent message carries st3-silent in its signed tags",
+            ));
+        }
+        tags.push(crate::silent::SILENT_TAG.into());
     }
     Ok(tags)
 }

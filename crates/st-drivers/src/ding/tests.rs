@@ -3084,8 +3084,8 @@ fn dictated_deliveries_keep_the_message_body_and_digest() {
         ordinary
     );
     assert_eq!(
-        with_tag_notices(ordinary.clone(), &["st3-fyi".into()])
-            .strip_prefix("(FYI: held without waking you until this turn)\n"),
+        with_tag_notices(ordinary.clone(), &["st3-silent".into()])
+            .strip_prefix("(silent: held without waking you until this turn)\n"),
         Some(ordinary.as_str())
     );
 }

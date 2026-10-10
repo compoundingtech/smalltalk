@@ -227,7 +227,7 @@ impl MailboxOrder {
                 .iter()
                 .flat_map(|m| &m.tags)
                 .filter_map(|tag| {
-                    tag.strip_prefix(crate::fyi::REMAINING_PREFIX)?
+                    tag.strip_prefix(crate::silent::REMAINING_PREFIX)?
                         .parse::<usize>()
                         .ok()
                 })
@@ -236,30 +236,30 @@ impl MailboxOrder {
         }
         let mut held = messages
             .iter()
-            .filter(|m| crate::fyi::waits_for_turn(m))
+            .filter(|m| crate::silent::waits_for_turn(m))
             .map(|m| (m.created_index, m.subject.clone()))
             .collect::<Vec<_>>();
         held.sort();
         self.remaining = self
             .remaining
-            .saturating_add(held.len().saturating_sub(crate::fyi::BATCH_LIMIT));
+            .saturating_add(held.len().saturating_sub(crate::silent::BATCH_LIMIT));
         let selected = held
             .into_iter()
             .rev()
-            .take(crate::fyi::BATCH_LIMIT)
+            .take(crate::silent::BATCH_LIMIT)
             .map(|(_, subject)| subject)
             .collect::<std::collections::BTreeSet<_>>();
-        messages.retain(|m| !crate::fyi::waits_for_turn(m) || selected.contains(&m.subject));
+        messages.retain(|m| !crate::silent::waits_for_turn(m) || selected.contains(&m.subject));
         for m in messages.iter_mut() {
             m.tags
-                .retain(|tag| !tag.starts_with(crate::fyi::REMAINING_PREFIX));
+                .retain(|tag| !tag.starts_with(crate::silent::REMAINING_PREFIX));
         }
         if self.remaining > 0
             && let Some(m) = messages.iter_mut().find(|m| m.status == "sent")
         {
             m.tags.push(format!(
                 "{}{remaining}",
-                crate::fyi::REMAINING_PREFIX,
+                crate::silent::REMAINING_PREFIX,
                 remaining = self.remaining
             ));
         }
@@ -299,7 +299,7 @@ fn retain_live_mail(
             && sent.accepted_at_unix_ms >= since;
         if after_connection || recovered.contains(&message.subject) {
             live.push(message);
-        } else if (crate::fyi::is_held(&message)
+        } else if (crate::silent::is_held(&message)
             || sent.accepted_at_unix_ms
                 > since.saturating_sub(u128::from(super::mail_backlog::THRESHOLD_MS)))
             && never_offered(store, &message)?
@@ -325,7 +325,7 @@ pub(super) fn hold_pre_boot_mail(
     };
     let Some((since, through)) = store.native_mail_boot_floor(&peer.agent)? else {
         for message in messages {
-            if !crate::fyi::waits_for_turn(message) {
+            if !crate::silent::waits_for_turn(message) {
                 message.status = "closed".into();
             }
         }
@@ -334,7 +334,7 @@ pub(super) fn hold_pre_boot_mail(
     // A closed projection only removes old native inbox files. Explicit conversation
     // reads still see the original graph status, with no synthetic receipt or close.
     for message in messages {
-        if crate::fyi::waits_for_turn(message) {
+        if crate::silent::waits_for_turn(message) {
             continue;
         }
         let Some(sent) = store.latest_claim(&message.subject, Some("message.sent"))? else {
@@ -504,7 +504,7 @@ where
                     waking_added |= old.is_none()
                         && changed
                             .first()
-                            .is_some_and(|m| m.status == "sent" && !crate::fyi::is_held(m));
+                            .is_some_and(|m| m.status == "sent" && !crate::silent::is_held(m));
                     if serde_json::to_value(old)? != serde_json::to_value(changed.first())? {
                         messages.retain(|message| message.subject != subject);
                         messages.extend(changed);
@@ -884,7 +884,7 @@ async fn stream_with_timers_inner<F, S, H>(
             subscription.messages(&subjects);
             // Held mail stays admitted to this stream, so the next waking message releases it
             // without another read; until then the seat is offered none of it.
-            crate::fyi::release(&mut messages);
+            crate::silent::release(&mut messages);
             let bytes = serde_json::to_vec(&messages).unwrap_or_default();
             if fence.component == "delivery" && bytes != previous_mailbox {
                 if send(&mut socket, &Frame::Mailbox { messages })
@@ -1587,7 +1587,7 @@ mod tests {
         let store = Store::open_memory("node").unwrap();
         store
             .append_claim(&ClaimInput {
-                subject: "message/old-fyi".into(),
+                subject: "message/old-silent".into(),
                 kind: "message.sent".into(),
                 actor: Some("agent/example/writer".into()),
                 fields: BTreeMap::from([
@@ -1595,14 +1595,14 @@ mod tests {
                     ("from".into(), json!("agent/example/writer")),
                     ("to".into(), json!("agent/example/reader")),
                     ("content".into(), json!("A held update.")),
-                    ("tags".into(), json!([crate::fyi::FYI_TAG])),
+                    ("tags".into(), json!([crate::silent::SILENT_TAG])),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
                 idempotency_key: None,
             })
             .unwrap();
-        let since = client_now_ms() + crate::fyi::HELD_TOO_LONG_MS + 1;
+        let since = client_now_ms() + crate::silent::HELD_TOO_LONG_MS + 1;
         let mut messages = store.messages(Some("agent/example/reader"), false).unwrap();
         let mut recovered = std::collections::BTreeSet::new();
         retain_live_mail(
@@ -1645,21 +1645,21 @@ mod tests {
             "a boot floor must also preserve held mail"
         );
         let mut offered = messages.clone();
-        crate::fyi::release(&mut offered);
+        crate::silent::release(&mut offered);
         assert!(offered.is_empty(), "reconnect alone cannot wake the seat");
         let mut waking = messages[0].clone();
         waking.subject = "message/question".into();
-        waking.tags = vec![crate::fyi::QUESTION_TAG.into()];
+        waking.tags.clear();
         messages.push(waking);
-        crate::fyi::release(&mut messages);
+        crate::silent::release(&mut messages);
         assert_eq!(messages.len(), 2);
         assert_eq!(
-            store.message("message/old-fyi").unwrap().unwrap().status,
+            store.message("message/old-silent").unwrap().unwrap().status,
             "sent"
         );
         assert!(
             store
-                .claims_for("message/old-fyi", Some("message.read"))
+                .claims_for("message/old-silent", Some("message.read"))
                 .unwrap()
                 .is_empty()
         );
@@ -2050,7 +2050,8 @@ mod tests {
         let mut state = super::super::tests::state(root.path());
         state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
         crate::mailbox::tests::ready(&state.store, "session-1");
-        let kdl = "version 2\nagent \"eval.worker\" { workspace \"/work\"; command \"sleep 60\"; wake-on \"questions\"; }\n";
+        let kdl =
+            "version 2\nagent \"eval.worker\" { workspace \"/work\"; command \"sleep 60\"; }\n";
         let intent = crate::graph::parse_test_intent(kdl, "node").unwrap();
         let planned = state
             .store
@@ -2099,27 +2100,46 @@ mod tests {
             .unwrap()
             .0
         };
-        // An FYI wakes nobody, and neither does a status the seat's setting holds.
-        let fyi = send("fyi", "agent/eval.peer", &[crate::fyi::FYI_TAG], None);
-        let status = send("status", "agent/eval.peer", &[], None);
-        assert!(status.tags.iter().any(|tag| tag == crate::fyi::HELD_BY_SETTING_TAG));
+        // Two explicit silent messages wake nobody.
+        let silent = send(
+            "silent",
+            "agent/eval.peer",
+            &[crate::silent::SILENT_TAG],
+            None,
+        );
+        let status = send(
+            "status",
+            "agent/eval.peer",
+            &[crate::silent::SILENT_TAG],
+            None,
+        );
         signal_changed(&state);
         no_mail(&mut socket).await;
         // Nothing is lost: both are unread, in the seat's mailbox.
-        for held in [&fyi, &status] {
-            assert_eq!(state.store.message(&held.subject).unwrap().unwrap().status, "sent");
+        for held in [&silent, &status] {
+            assert_eq!(
+                state.store.message(&held.subject).unwrap().unwrap().status,
+                "sent"
+            );
         }
         let listed = state.store.held_mail_before(u128::MAX).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!((listed[0].0.as_str(), listed[0].1), ("agent/eval.worker", 2));
 
-        // A question wakes the seat, and the held mail goes out with it, oldest first.
-        let question = send("question", "agent/eval.peer", &[crate::fyi::QUESTION_TAG], None);
+        // An ordinary default-wake question releases the held mail in send order.
+        let question = send("question", "agent/eval.peer", &[], None);
         signal_changed(&state);
         let batch = next_mail(&mut socket).await;
         assert_eq!(
-            batch.iter().map(|message| message.subject.as_str()).collect::<Vec<_>>(),
-            [fyi.subject.as_str(), status.subject.as_str(), question.subject.as_str()]
+            batch
+                .iter()
+                .map(|message| message.subject.as_str())
+                .collect::<Vec<_>>(),
+            [
+                silent.subject.as_str(),
+                status.subject.as_str(),
+                question.subject.as_str()
+            ]
         );
         read_all(&client, &fence, &batch).await;
         drained(&mut socket).await;
@@ -2129,7 +2149,7 @@ mod tests {
             send(
                 &format!("backlog-{n}"),
                 "agent/eval.peer",
-                &[crate::fyi::FYI_TAG],
+                &[crate::silent::SILENT_TAG],
                 None,
             );
         }
@@ -2139,7 +2159,7 @@ mod tests {
             send(
                 &format!("wake-backlog-{turn}"),
                 "agent/eval.peer",
-                &[crate::fyi::QUESTION_TAG],
+                &[],
                 None,
             );
             signal_changed(&state);
@@ -2148,7 +2168,7 @@ mod tests {
             let notices = batch
                 .iter()
                 .flat_map(|m| &m.tags)
-                .filter_map(|tag| tag.strip_prefix(crate::fyi::REMAINING_PREFIX))
+                .filter_map(|tag| tag.strip_prefix(crate::silent::REMAINING_PREFIX))
                 .collect::<Vec<_>>();
             if remaining > 0 {
                 assert_eq!(notices, vec![remaining.to_string()]);
@@ -2159,7 +2179,7 @@ mod tests {
             drained(&mut socket).await;
         }
 
-        // An answer in a thread the seat started with a question wakes it.
+        // A reply defaults to wake even when its parent was silent.
         let asked = super::super::accept_message(
             &state,
             MessageSendRequest {
@@ -2169,7 +2189,7 @@ mod tests {
                 content: "Which branch?".into(),
                 title: None,
                 in_reply_to: None,
-                tags: vec![crate::fyi::QUESTION_TAG.into()],
+                tags: vec![crate::silent::SILENT_TAG.into()],
                 attachments: Vec::new(),
             },
             None,
@@ -2178,14 +2198,14 @@ mod tests {
         .unwrap()
         .0;
         let answer = send("answer", "agent/eval.peer", &[], Some(&asked.subject));
-        assert!(!crate::fyi::is_held(&answer), "{:?}", answer.tags);
+        assert!(!crate::silent::is_held(&answer), "{:?}", answer.tags);
         signal_changed(&state);
         let woken = next_mail(&mut socket).await;
         assert_eq!(woken.len(), 1);
         read_all(&client, &fence, &woken).await;
         drained(&mut socket).await;
 
-        // Each kind that always wakes still wakes a seat that wakes only on questions.
+        // Each system kind still wakes and releases held mail.
         let kinds: [(&str, &str, &[&str]); 8] = [
             ("person", "person/eval", &[]),
             (
@@ -2205,7 +2225,12 @@ mod tests {
             ),
         ];
         for (kind, from, tags) in kinds {
-            let held = send(&format!("held-before-{kind}"), "agent/eval.peer", &[crate::fyi::FYI_TAG], None);
+            let held = send(
+                &format!("held-before-{kind}"),
+                "agent/eval.peer",
+                &[crate::silent::SILENT_TAG],
+                None,
+            );
             signal_changed(&state);
             no_mail(&mut socket).await;
             // st's own messages are appended as claims, like the daemon does; the others are sent.

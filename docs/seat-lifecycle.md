@@ -378,4 +378,4 @@ any seat. A bound harness must act as itself, and rename preserves the original 
 
 [`examples/st3/seats`](../examples/st3/seats) has a seat file for each harness.
 
-Ordinary conversation delivery supports `fyi`/`question` and agent `wake-on "all"` or `"questions"`. FYIs stay unread without waking; each real wake offers at most eight, with older mail available on demand. Only the seat itself or a person may change its policy; terminal-bound seats require their person owner. Upgrade every owner daemon before setting it. See [FYI messages](st3/fyi-messages.md).
+Ordinary messages are `silent` or `wake` (the default for every sender and seat). Silent mail stays unread without waking; each real wake offers at most eight, with older mail available on demand. There is no per-seat wake policy or inferred question type. See [silent messages](st3/silent-messages.md).

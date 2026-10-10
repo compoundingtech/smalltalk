@@ -2966,13 +2966,6 @@ enum AgentsCommand {
     Resume(AgentResumeArgs),
     /// Change only a seat's human label, without restarting its harness.
     Rename(AgentRenameArgs),
-    /// Choose what wakes a seat, without restarting its harness.
-    ///
-    /// `questions` holds every message that asks the seat nothing as FYI: stored unread, and
-    /// shown at the seat's next turn. A person's message, a work handoff, a fault, a ready step
-    /// and a gh watch event still wake it. `all`, the default, wakes it for every message not
-    /// sent `--fyi`. The same choice is `wake-on "questions"` in the agent's KDL.
-    WakeOn(AgentWakeOnArgs),
     /// Show one seat's current claim and its queued mission runs in order, or move a run.
     /// The show form is also available as `st missions queued AGENT`.
     Queue(AgentQueueArgs),
@@ -3002,17 +2995,6 @@ struct AgentHoldArgs {
     release: bool,
     #[arg(long)]
     reason: Option<String>,
-    #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
-    #[arg(long = "as")]
-    actor: Option<String>,
-}
-
-#[derive(Args)]
-struct AgentWakeOnArgs {
-    #[arg(add = ArgValueCompleter::new(Complete(Entity::Agent { running_only: false })))]
-    subject: String,
-    #[arg(value_parser = ["all", "questions"])]
-    wake_on: String,
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Actor)))]
     #[arg(long = "as")]
     actor: Option<String>,
@@ -4219,7 +4201,7 @@ enum MessageCommand {
     /// Send one durable normalized message to an agent.
     ///
     /// A message is a direct connection: it wakes the recipient agent for a full turn,
-    /// which rereads its context. Use `--question` for a question or conversational handoff, `st work handoff` for work, and `--fyi` for anything
+    /// which rereads its context. Use `--kind wake` (the default) for a question, answer or conversational handoff, `st work handoff` for work, and `--kind silent` for anything
     /// else, which wakes nobody and reaches the recipient at its next turn. Status goes to
     /// `work progress` (it lands in the graph and wakes nobody), run events to report-to.
     /// People have no inbox: a send or reply to a person fails. To reach a person, print in
@@ -4235,7 +4217,7 @@ enum MessageCommand {
     /// Reply to one canonical message ID while preserving its thread.
     ///
     /// A message is a direct connection: it wakes the recipient agent for a full turn,
-    /// which rereads its context. A reply that only acknowledges or reports is `--fyi`.
+    /// which rereads its context. A reply that only acknowledges or reports is `--kind silent`.
     Reply(MessageReplyArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
@@ -4333,26 +4315,26 @@ struct MessageSendArgs {
 
 /// Whether a message wakes its recipient. A person's message, a handoff, a fault, a ready step
 /// and a gh watch event always wake it.
-#[derive(Args, Clone, Copy, Default)]
+#[derive(Args)]
 struct MessageWakeArgs {
-    /// Store it unread without waking the recipient; it sees the message at its next turn.
-    #[arg(long, conflicts_with = "question")]
-    fyi: bool,
-    /// It asks the recipient something: it wakes a seat that wakes only on questions, and so
-    /// does each reply to you in its thread.
-    #[arg(long)]
-    question: bool,
+    /// Wake the recipient (default), or hold unread mail for its next real turn.
+    #[arg(long, value_parser = ["silent", "wake"], default_value = "wake")]
+    kind: String,
+}
+
+impl Default for MessageWakeArgs {
+    fn default() -> Self {
+        Self {
+            kind: "wake".into(),
+        }
+    }
 }
 
 impl MessageWakeArgs {
-    fn tags(self) -> impl Iterator<Item = String> {
-        [
-            self.fyi.then_some(st3::fyi::FYI_TAG),
-            self.question.then_some(st3::fyi::QUESTION_TAG),
-        ]
-        .into_iter()
-        .flatten()
-        .map(str::to_owned)
+    fn tags(&self) -> impl Iterator<Item = String> {
+        (self.kind == "silent")
+            .then(|| st3::silent::SILENT_TAG.to_owned())
+            .into_iter()
     }
 }
 
@@ -5399,9 +5381,6 @@ fn guard_mutating_cli_actor(
             })?),
             AgentsCommand::Rename(args) => Some(args.actor.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("a harness rename needs explicit --as {own}")
-            })?),
-            AgentsCommand::WakeOn(args) => Some(args.actor.as_deref().ok_or_else(|| {
-                anyhow::anyhow!("a harness wake-on change needs explicit --as {own}")
             })?),
             AgentsCommand::Queue(args) => match &args.command {
                 Some(AgentQueueCommand::Move(args)) => Some(args.actor.as_deref().ok_or_else(|| {
@@ -12766,21 +12745,6 @@ async fn run_agents(
             ).await?;
             print_value(&response, json_output)
         }
-        AgentsCommand::WakeOn(args) => {
-            let actor = args.actor.as_deref().or(configured_person).context(
-                "st3 agents wake-on needs --as ACTOR or a configured person",
-            )?;
-            let response: Value = cli_client(endpoint).post(
-                "/v1/agents/wake-on",
-                &json!({
-                    "subject": normalize_agent_subject(&args.subject),
-                    "wake_on": args.wake_on,
-                    "actor": actor,
-                    "idempotency_key": uuid::Uuid::now_v7().to_string(),
-                }),
-            ).await?;
-            print_value(&response, json_output)
-        }
         AgentsCommand::Queue(args) => {
             run_agent_queue(endpoint, configured_person, args, json_output).await
         }
@@ -13803,7 +13767,6 @@ async fn run_agent_inspection(
         | AgentsCommand::Suspend(_)
         | AgentsCommand::Resume(_)
         | AgentsCommand::Rename(_)
-        | AgentsCommand::WakeOn(_)
         | AgentsCommand::Queue(_)
         | AgentsCommand::Hold(_) => {
             unreachable!("agent mutation and queue commands return before inspection")
@@ -16886,6 +16849,9 @@ async fn send_message(
     reject_foreign_agent_actor(&args.from)?;
     let from = normalize_message_subject(&args.from);
     let mut args = args;
+    if args.wake.kind == "wake" && args.tags.iter().any(|tag| tag == st3::silent::SILENT_TAG) {
+        anyhow::bail!("wake messages cannot carry the silent delivery tag; use --kind silent");
+    }
     for tag in args.wake.tags() {
         if !args.tags.contains(&tag) {
             args.tags.push(tag);
@@ -16947,15 +16913,18 @@ async fn send_message(
     match client.send_message(&request).await {
         Ok(receipt) => {
             if request.from.starts_with("agent/")
-                && request.tags.iter().any(|tag| tag == st3::fyi::FYI_TAG)
+                && request
+                    .tags
+                    .iter()
+                    .any(|tag| tag == st3::silent::SILENT_TAG)
                 && !receipt
                     .message
                     .tags
                     .iter()
-                    .any(|tag| tag == st3::fyi::FYI_TAG)
+                    .any(|tag| tag == st3::silent::SILENT_TAG)
             {
                 eprintln!(
-                    "st: daemon did not confirm FYI holding; this message may wake its recipient. Upgrade the sender and recipient owner daemons."
+                    "st: daemon did not confirm silent holding; this message may wake its recipient. Upgrade the sender and recipient owner daemons."
                 );
             }
             Ok(Some(receipt))
@@ -20187,7 +20156,7 @@ fn pi_family_message_frame(
             body,
             &st_drivers::ding::st3_body_sha256(body),
             attachments,
-        ), &message.tags.iter().filter(|tag| tag.as_str() != st3::fyi::FYI_TAG || st3::fyi::is_held(message)).cloned().collect::<Vec<_>>()),
+        ), &message.tags.iter().filter(|tag| tag.as_str() != st3::silent::SILENT_TAG || st3::silent::is_held(message)).cloned().collect::<Vec<_>>()),
         "meta": {
             "from": message.from,
             "messageId": message.subject,
@@ -20650,7 +20619,7 @@ async fn run_pi_channel(
                     subscription.report(serde_json::from_str(&report)?);
                 }
                 let mut cursor = None;
-                let mut pending_fyi = Vec::new();
+                let mut pending_silent = Vec::new();
                 loop {
                     let page = if subscription.is_some() {
                         MessagePage { items: pushed_messages.clone(), has_more: false, next_cursor: None, limit: pushed_messages.len() }
@@ -20674,7 +20643,7 @@ async fn run_pi_channel(
                     // A prior incarnation's handoff is not proof that the model consumed mail.
                     // The incarnation-local set survives channel reexec and prevents repeats here.
                     let mut items = page.items;
-                    st3::fyi::release_page(&mut items, &mut pending_fyi);
+                    st3::silent::release_page(&mut items, &mut pending_silent);
                     for message in items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered")) {
                     if state.retry_after_ms.get(&message.subject).is_some_and(|after|
                         current_unix_ms().unwrap_or_default() < u128::from(*after)) {
@@ -23251,9 +23220,9 @@ fn native_queued_message(
         view.tags
             .iter()
             .filter(|tag| {
-                (tag.as_str() == st3::fyi::FYI_TAG && st3::fyi::is_held(view))
+                (tag.as_str() == st3::silent::SILENT_TAG && st3::silent::is_held(view))
                     || tag.as_str() == "dictated"
-                    || tag.starts_with(st3::fyi::REMAINING_PREFIX)
+                    || tag.starts_with(st3::silent::REMAINING_PREFIX)
             })
             .cloned(),
     );
@@ -23496,7 +23465,7 @@ async fn forward_projected_messages_reporting(
     }?;
     let mut cursor = None;
     let mut failures = Vec::new();
-    let mut pending_fyi = Vec::new();
+    let mut pending_silent = Vec::new();
     loop {
         let page = message_page_reporting(
             client,
@@ -23508,7 +23477,7 @@ async fn forward_projected_messages_reporting(
         .await?;
         let mut items = page.items;
         // Held mail goes to the seat only beside a message that wakes it.
-        st3::fyi::release_page(&mut items, &mut pending_fyi);
+        st3::silent::release_page(&mut items, &mut pending_silent);
         for message in items {
             active_subjects.insert(message.subject.clone());
             if matches!(message.status.as_str(), "read" | "closed") {
@@ -25867,24 +25836,24 @@ mod tests {
             title: None,
             in_reply_to: None,
             tags: vec![
-                st3::fyi::FYI_TAG.into(),
+                st3::silent::SILENT_TAG.into(),
                 "dictated".into(),
-                format!("{}12", st3::fyi::REMAINING_PREFIX),
+                format!("{}12", st3::silent::REMAINING_PREFIX),
             ],
             attachments: vec![],
             created_index: 1,
         };
         let queued = native_queued_message(&view, "body".into(), &[]);
         let rendered = st_drivers::ding::with_tag_notices("body".into(), &queued.tags);
-        assert!(rendered.contains("FYI: held"));
-        assert!(rendered.contains("12 older FYI held; st conversations ls"));
+        assert!(rendered.contains("silent: held"));
+        assert!(rendered.contains("12 older silent held; st conversations ls"));
         assert!(rendered.contains("dictated by voice"));
         assert_eq!(queued.body, "body");
         view.from = "person/operator".into();
         let queued = native_queued_message(&view, "body".into(), &[]);
-        assert!(!queued.tags.iter().any(|tag| tag == st3::fyi::FYI_TAG));
+        assert!(!queued.tags.iter().any(|tag| tag == st3::silent::SILENT_TAG));
         assert!(
-            view.tags.iter().any(|tag| tag == st3::fyi::FYI_TAG),
+            view.tags.iter().any(|tag| tag == st3::silent::SILENT_TAG),
             "signed durable tags are unchanged"
         );
     }
