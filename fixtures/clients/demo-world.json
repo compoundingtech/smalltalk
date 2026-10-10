@@ -6,6 +6,7 @@
         "activity": "33m",
         "details": {
           "claimed": "33m ago",
+          "effort": "high",
           "fault": null,
           "goal": "Cut over to the new store once a person approves.",
           "harness_state": "idle, waiting for review",
@@ -48,6 +49,7 @@
         "activity": "12m",
         "details": {
           "claimed": "12m ago",
+          "effort": "high",
           "fault": null,
           "goal": "Draft the pricing page and get feedback.",
           "harness_state": "idle, waiting for feedback",
@@ -74,6 +76,7 @@
         "activity": "8m",
         "details": {
           "claimed": "1h ago",
+          "effort": null,
           "fault": "401 Unauthorized: the API key expired at 08:40.",
           "goal": "Tag this week's release.",
           "harness_state": "exited 4 times in 10 minutes",
@@ -100,6 +103,7 @@
         "activity": "now",
         "details": {
           "claimed": "standing",
+          "effort": "high",
           "fault": null,
           "goal": "Keep Robin's fleet moving; answer questions.",
           "harness_state": "working",
@@ -128,6 +132,7 @@
         "activity": "1m",
         "details": {
           "claimed": "4m ago",
+          "effort": "high",
           "fault": null,
           "goal": "Review pull request #218.",
           "harness_state": "working",
@@ -154,6 +159,7 @@
         "activity": "19m",
         "details": {
           "claimed": null,
+          "effort": null,
           "fault": null,
           "goal": null,
           "harness_state": null,
@@ -180,6 +186,7 @@
         "activity": "3h",
         "details": {
           "claimed": null,
+          "effort": null,
           "fault": null,
           "goal": null,
           "harness_state": null,
@@ -206,6 +213,7 @@
         "activity": "2d",
         "details": {
           "claimed": null,
+          "effort": null,
           "fault": null,
           "goal": null,
           "harness_state": null,
@@ -232,6 +240,7 @@
         "activity": "1h",
         "details": {
           "claimed": null,
+          "effort": null,
           "fault": null,
           "goal": null,
           "harness_state": null,
@@ -258,6 +267,7 @@
         "activity": "5m",
         "details": {
           "claimed": null,
+          "effort": null,
           "fault": null,
           "goal": null,
           "harness_state": null,

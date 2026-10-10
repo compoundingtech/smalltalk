@@ -6380,6 +6380,28 @@ mod tests {
     }
 
     #[test]
+    fn an_agents_details_name_its_effort_beside_its_model() {
+        // Nathan, 2026-10-10: "I'd like to see the effort level too" in the details sidebar.
+        let mut world = demo::world();
+        let Load::Ready(agents) = &mut world.agents else { panic!() };
+        let id = agents[0].id.clone();
+        agents[0].details.model = Some("claude-sonnet-5-5".into());
+        agents[0].details.effort = Some("high".into());
+        let mut ui = Ui::new(world);
+        ui.switch_tab(1);
+        ui.open(&id);
+        let shown = frame(&ui, 140, 50).join("\n");
+        let model = shown.lines().position(|line| line.contains("model ") && line.contains("claude-sonnet-5-5")).expect(&shown);
+        let effort = shown.lines().position(|line| line.contains("effort") && line.contains("high")).expect(&shown);
+        assert_eq!(effort, model + 1, "{shown}");
+        // An agent whose seat names none shows no row for it.
+        let Load::Ready(agents) = &mut ui.world.agents else { panic!() };
+        agents[0].details.effort = None;
+        let shown = frame(&ui, 140, 50).join("\n");
+        assert!(!shown.contains("effort"), "{shown}");
+    }
+
+    #[test]
     fn shift_o_simplifies_every_conversation_and_back() {
         let mut ui = Ui::new(demo::world());
         ui.tab = 1;
