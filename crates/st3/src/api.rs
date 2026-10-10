@@ -177,8 +177,7 @@ struct ClientListQuery {
     state: Option<String>,
     #[serde(default)]
     native_only: bool,
-    /// Agents only: wait briefly for a roster at least as new as this request, rather than
-    /// answering at once from the newest published one.
+    /// Agents only: best-effort fresh; await a healthy refresh, otherwise serve its last publication.
     #[serde(default)]
     fresh: bool,
 }
@@ -2784,7 +2783,19 @@ fn client_agent_resources_from_status(
         .collect::<BTreeMap<_, _>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
-    let mailbox_faults = store.mailbox_faults_for(&agent_subjects, snapshot_index)?;
+    let mailbox_faults = match store.mailbox_faults_for(&agent_subjects, snapshot_index) {
+        Ok(faults) => Some(faults),
+        Err(error) if error.downcast_ref::<St3Error>().is_some_and(|error| error.code == "read-deadline") => None,
+        Err(error) => return Err(error),
+    };
+    store.record_agent_roster_fault_read(history, &agent_subjects, mailbox_faults.is_none(), changed.map(|(names, _)| names));
+    // An optional fault read cannot discard current status, usage, queues or other card fields.
+    // Retain even a known null fault; a card never published before states that it is unknown.
+    let previous_faults = if mailbox_faults.is_none() {
+        store.previous_agent_faults(snapshot_index, history, &agent_subjects)
+    } else {
+        BTreeMap::new()
+    };
     // Harnesses, activity, and who can have a suspension or rollout, for many agents at once.
     // Each status names the actual-state claim it selected, the newest runtime observation
     // whenever the agent has one.
@@ -2827,7 +2838,7 @@ fn client_agent_resources_from_status(
         .map(|mut subject| -> anyhow::Result<(String, Value)> {
             subject.harness = card_reads.take_harness(store, &subject.subject)?;
             let member_fault = member_faults.get(&subject.subject);
-            let mailbox_fault = mailbox_faults.get(&subject.subject);
+            let mailbox_fault = mailbox_faults.as_ref().and_then(|faults| faults.get(&subject.subject));
             let fault = member_fault.or(mailbox_fault);
             let fields = subject
                 .actual
@@ -3032,6 +3043,10 @@ fn client_agent_resources_from_status(
                     None
                 },
             });
+            if mailbox_faults.is_none() && member_fault.is_none() {
+                value["fault"] = previous_faults.get(&subject.subject).cloned()
+                    .unwrap_or_else(|| json!("fault status unknown"));
+            }
             if let Some(lifecycle) = crate::model::declared_agent_lifecycle(subject.desired.as_ref()) {
                 value["lifecycle"] = json!(lifecycle);
             }
@@ -4607,6 +4622,7 @@ const AGENT_ROSTER_ASSEMBLY_ROUNDS: usize = 3;
 /// roster meanwhile, with its own cut and publication time; if it cannot be assembled, the
 /// refresh fails and is tried again on the next request.
 fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
+    store.begin_agent_roster_fault_retries(history);
     if store.read_snapshot(|index| store.agent_roster_current(index, history))? {
         return Ok(());
     }
@@ -4666,6 +4682,10 @@ async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) {
     let mut publications = store.subscribe_agent_roster();
     let _ = tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
         while published(store).is_none_or(|cut| cut < wanted) {
+            store.request_fresh_agent_roster(history);
+            if published(store).is_some() && !store.agent_roster_refresh_can_answer() {
+                return;
+            }
             // Claims on unrelated subjects move the cut all the time; the paced refresher
             // would publish the same cards. One bounded range read tells.
             let reader = Arc::clone(store);
@@ -4674,7 +4694,6 @@ async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) {
             }).await {
                 return;
             }
-            store.request_fresh_agent_roster(history);
             if publications.changed().await.is_err() {
                 return;
             }
@@ -5724,7 +5743,9 @@ pub fn start_agent_roster(state: &AppState) {
                 // The first fold publishes only what windows and first pages show; the rest
                 // follows at once.
                 crate::performance::task("roster/refresh", || if first {
-                    reader.read_snapshot(|index| client_agent_roster_head(&reader, index))
+                    reader.answer_agent_roster_requests(|| {
+                        reader.read_snapshot(|index| client_agent_roster_head(&reader, index))
+                    })
                 } else {
                     let folded = Instant::now();
                     let refreshed = reader.answer_agent_roster_requests(|| {
@@ -23797,6 +23818,248 @@ mission "wake" state="ready" {
             assert_eq!(cards.len(), 1, "history {history}");
         }
     }
+    fn roster_resilience_runtime(store: &Store, subject: &str, runtime: &str) {
+        store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running", "runtime_id":runtime,
+                "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+
+    fn roster_resilience_ended(store: &Store) {
+        store.append_claim(&ClaimInput {
+            subject: "agent/ended".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"stopped", "terminal":true,
+                "runtime_id":"ended", "incarnation_id":"ended"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn roster_resilience_fault_deadline_publishes_current_fields_and_retries() {
+        for history in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let state = state(root.path());
+            let store = &state.store;
+            let _wake = store.start_agent_roster_refresher().unwrap();
+            roster_resilience_runtime(store, "agent/retained-fault", "old");
+            roster_resilience_runtime(store, "agent/known-clear", "old");
+            let failure = store.append_claim(&ClaimInput {
+                subject: "agent/retained-fault".into(), kind: "operational.failure".into(),
+                actor: Some("daemon/runtime".into()),
+                fields: serde_json::from_value(json!({"condition":"mailbox-channel-lost",
+                    "incarnation":"one", "reason":"previous failure", "reviewer":"agent/retained-fault",
+                    "title":"Mailbox lost", "severity":"error", "targets":["agent/retained-fault"]})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            refresh_agent_roster(store, history).unwrap();
+            let (_, before, _) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+            let card = |cards: &[Value], id: &str| cards.iter().find(|card| card["id"] == id).unwrap().clone();
+            assert_eq!(card(&before, "agent/retained-fault")["fault"], "previous failure");
+            assert!(card(&before, "agent/known-clear")["fault"].is_null());
+            store.append_claim(&ClaimInput {
+                subject: "agent/retained-fault".into(), kind: "operational.recovered".into(),
+                actor: Some("daemon/runtime".into()),
+                fields: serde_json::from_value(json!({"failure":failure.id, "reason":"recovered"})).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            for subject in ["agent/retained-fault", "agent/known-clear", "agent/new-unknown"] {
+                roster_resilience_runtime(store, subject, "new");
+            }
+            Store::expire_next_card_fault_read_for_test();
+            refresh_agent_roster(store, history).expect("an optional deadline must still publish");
+            let cut = store.index().unwrap();
+            let (published, after, _) = store.published_agent_roster(cut, history).unwrap();
+            assert_eq!(published, cut);
+            for subject in ["agent/retained-fault", "agent/known-clear", "agent/new-unknown"] {
+                assert_eq!(card(&after, subject)["runtime_id"], "new");
+            }
+            assert_eq!(card(&after, "agent/retained-fault")["fault"], "previous failure");
+            assert!(card(&after, "agent/known-clear")["fault"].is_null());
+            assert_eq!(card(&after, "agent/new-unknown")["fault"], "fault status unknown");
+            let (Extension(snapshot), Json(page)) = client_agents(State(state.clone()),
+                Extension(new_client_snapshot(&state)), Query(ClientListQuery { history, fresh: true, ..ClientListQuery::default() }))
+                .await.expect("a deadline-degraded publication must answer, not return 503");
+            assert_eq!(snapshot.store_index, cut);
+            assert_eq!(card(&page.items, "agent/retained-fault")["fault"], "previous failure");
+            // No new claim is needed: the next refresh retries exactly the degraded subjects.
+            refresh_agent_roster(store, history).unwrap();
+            let (_, retried, _) = store.published_agent_roster(cut, history).unwrap();
+            for subject in ["agent/retained-fault", "agent/known-clear", "agent/new-unknown"] {
+                assert!(card(&retried, subject)["fault"].is_null());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn roster_resilience_always_expired_fault_reads_publish_from_the_first_attempt_per_mode() {
+        for history in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let state = state(root.path());
+            let store = &state.store;
+            let _wake = store.start_agent_roster_refresher().unwrap();
+            assert!(store.published_agent_roster(store.index().unwrap(), history).is_none());
+            Store::expire_card_fault_reads_for_test(usize::MAX);
+            for round in 0..3 {
+                if round == 1 {
+                    store.forget_current_views();
+                    assert!(store.published_agent_roster(store.index().unwrap(), history).is_none(),
+                        "a full reset must keep its existing invalidation policy");
+                }
+                let runtime = format!("round-{round}");
+                roster_resilience_runtime(store, "agent/first-publication", &runtime);
+                refresh_agent_roster(store, history)
+                    .expect("a fault deadline from the first attempt must not prevent publication");
+                let cut = store.index().unwrap();
+                let (published, _, _) = store.published_agent_roster(cut, history).unwrap();
+                assert_eq!(published, cut);
+                let (status, page) = get_request(router(state.clone()),
+                    &format!("/v1/client/agents?history={history}&fresh=true")).await;
+                assert_eq!(status, StatusCode::OK, "never-published fault degradation must answer 200");
+                assert_eq!(page["items"][0]["runtime_id"], runtime);
+                assert_eq!(page["items"][0]["fault"], "fault status unknown");
+            }
+            Store::expire_card_fault_reads_for_test(0);
+        }
+    }
+
+    #[test]
+    fn roster_resilience_chunk_deadlines_publish_without_retrying_in_the_same_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        let count = AGENT_ROSTER_WARM_CHUNK * 2 + 1;
+        for n in 0..count {
+            roster_resilience_runtime(store, &format!("agent/chunk-{n:04}"), "old");
+        }
+        refresh_agent_roster(store, false).unwrap();
+        for n in 0..count {
+            roster_resilience_runtime(store, &format!("agent/chunk-{n:04}"), "new");
+        }
+        let last = format!("agent/chunk-{:04}", count - 1);
+        store.append_claim(&ClaimInput {
+            subject: last.clone(), kind: "operational.failure".into(), actor: Some("daemon/runtime".into()),
+            fields: serde_json::from_value(json!({"condition":"mailbox-channel-lost",
+                "incarnation":"one", "reason":"new failure", "reviewer":last,
+                "title":"Mailbox lost", "severity":"error", "targets":[last]})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let before = store.agent_resources_refolded_cards_for_test();
+        Store::expire_card_fault_reads_for_test(3);
+        refresh_agent_roster(store, false).expect("degrading every chunk must still complete this attempt");
+        let cut = store.index().unwrap();
+        let (published, cards, _) = store.published_agent_roster(cut, false).unwrap();
+        assert_eq!(published, cut);
+        assert_eq!(cards.len(), count);
+        assert!(cards.iter().all(|card| card["runtime_id"] == "new" && card["fault"].is_null()));
+        assert_eq!(store.agent_resources_refolded_cards_for_test() - before, count,
+            "a deadline must not trigger another fold inside this refresh attempt");
+        let before = store.agent_resources_refolded_cards_for_test();
+        refresh_agent_roster(store, false).unwrap();
+        assert_eq!(store.agent_resources_refolded_cards_for_test() - before, count,
+            "the next attempt must retry the faults even at the same graph cut");
+        let (_, cards, _) = store.published_agent_roster(cut, false).unwrap();
+        assert_eq!(cards.iter().find(|card| card["id"] == last).unwrap()["fault"], "new failure",
+            "a same-cut complete publication must replace the old degraded fault values");
+    }
+
+    async fn assert_roster_resilience_failed_attempt(history: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        roster_resilience_runtime(store, "agent/retained", "old");
+        roster_resilience_ended(store);
+        refresh_agent_roster(store, history).unwrap();
+        let (cut, cards, published_at) = store.published_agent_roster(store.index().unwrap(), history).unwrap();
+        assert_eq!(cards.iter().any(|card| card["id"] == "agent/ended"), history);
+        let (_, Json(before)) = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery { history, ..ClientListQuery::default() })).await.unwrap();
+        roster_resilience_runtime(store, "agent/retained", "new");
+        assert!(store.answer_agent_roster_requests::<()>(|| anyhow::bail!("injected refresh failure")).is_err());
+        for status in [None, Some("running".to_owned()), Some("stopped".to_owned())] {
+            let expected = before.items.iter().filter(|card| status.as_deref().is_none_or(|status| card["state"] == status))
+                .cloned().collect::<Vec<_>>();
+            let read = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+                Query(ClientListQuery { history, status, fresh: true, ..ClientListQuery::default() }));
+            let (Extension(snapshot), Json(page)) = tokio::time::timeout(Duration::from_millis(200), read).await
+                .expect("a failed refresher must not impose the two-second wait").unwrap();
+            assert_eq!(snapshot.store_index, cut);
+            assert_eq!(snapshot.published_at, Some(client_timestamp(published_at)));
+            assert_eq!(page.items, expected);
+        }
+        store.answer_agent_roster_requests(|| Ok(())).unwrap();
+        let reader = Arc::clone(store);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || reader.answer_agent_roster_requests::<()>(|| {
+            started.send(()).unwrap();
+            proceed.recv().unwrap();
+            anyhow::bail!("injected in-flight failure")
+        }));
+        ready.await.unwrap();
+        let read = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery { history, fresh: true, ..ClientListQuery::default() }));
+        tokio::pin!(read);
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut read).await.is_err());
+        release.send(()).unwrap();
+        let (Extension(snapshot), Json(page)) = tokio::time::timeout(Duration::from_millis(200), read)
+            .await.expect("a failed attempt must wake its waiting readers").unwrap();
+        assert!(worker.await.unwrap().is_err());
+        assert_eq!(snapshot.store_index, cut);
+        assert_eq!(page.items, before.items);
+    }
+
+    #[tokio::test]
+    async fn roster_resilience_fresh_failed_attempt_returns_last_publication_promptly() {
+        assert_roster_resilience_failed_attempt(false).await;
+    }
+
+    #[tokio::test]
+    async fn roster_resilience_fresh_failed_history_attempt_returns_last_publication_promptly() {
+        assert_roster_resilience_failed_attempt(true).await;
+    }
+
+    #[tokio::test]
+    async fn roster_resilience_fresh_idle_returns_but_healthy_inflight_waits_for_new_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = &state.store;
+        let _wake = store.start_agent_roster_refresher().unwrap();
+        roster_resilience_runtime(store, "agent/retained", "old");
+        refresh_agent_roster(store, false).unwrap();
+        let old_cut = store.index().unwrap();
+        roster_resilience_runtime(store, "agent/retained", "new");
+        let query = ClientListQuery { fresh: true, ..ClientListQuery::default() };
+        // Idle is not in flight: a pending request alone cannot promise a publication.
+        let (Extension(snapshot), _) = tokio::time::timeout(Duration::from_millis(200),
+            client_agents(State(state.clone()), Extension(new_client_snapshot(&state)), Query(query.clone())))
+            .await.expect("an idle refresher must answer from the last publication").unwrap();
+        assert_eq!(snapshot.store_index, old_cut);
+        let reader = Arc::clone(store);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, proceed) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || reader.answer_agent_roster_requests(|| {
+            started.send(()).unwrap();
+            proceed.recv().unwrap();
+            refresh_agent_roster(&reader, false)
+        }));
+        ready.await.unwrap();
+        let read = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)), Query(query));
+        tokio::pin!(read);
+        assert!(tokio::time::timeout(Duration::from_millis(30), &mut read).await.is_err(),
+            "a healthy in-flight refresh must be awaited, not answered with old cards");
+        release.send(()).unwrap();
+        let (Extension(snapshot), Json(page)) = tokio::time::timeout(Duration::from_millis(200), read)
+            .await.expect("successful publication must wake the fresh reader").unwrap();
+        worker.await.unwrap().unwrap();
+        assert_eq!(snapshot.store_index, store.index().unwrap());
+        assert!(snapshot.store_index > old_cut);
+        assert_eq!(page.items[0]["runtime_id"], "new");
+    }
+
 
     async fn assert_agent_roster_survives_other_mode_publications(history: bool) {
         let root = tempfile::tempdir().unwrap();

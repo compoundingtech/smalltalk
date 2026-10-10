@@ -3399,6 +3399,65 @@ impl Store {
         self.cached_agent_resources_for(index, history, None, build)
     }
 
+    pub(crate) fn begin_agent_roster_fault_retries(&self, history: bool) {
+        let mut retries = self.smalltalk.agent_roster_fault_retries.lock().expect("fault retries poisoned");
+        let mode = usize::from(history);
+        let mut pending = std::mem::take(&mut retries.pending[mode]);
+        retries.due[mode].append(&mut pending);
+    }
+
+    pub(crate) fn agent_roster_fault_retries(&self, history: bool) -> BTreeSet<String> {
+        self.smalltalk.agent_roster_fault_retries.lock().expect("fault retries poisoned")
+            .due[usize::from(history)].clone()
+    }
+
+    fn agent_roster_faults_pending(&self, history: bool) -> bool {
+        let retries = self.smalltalk.agent_roster_fault_retries.lock().expect("fault retries poisoned");
+        let mode = usize::from(history);
+        !retries.due[mode].is_empty() || !retries.pending[mode].is_empty()
+    }
+
+    pub(crate) fn record_agent_roster_fault_read(
+        &self, history: bool, subjects: &[String], deadline: bool,
+        selected: Option<&BTreeSet<String>>,
+    ) {
+        let mut retries = self.smalltalk.agent_roster_fault_retries.lock().expect("fault retries poisoned");
+        let mode = usize::from(history);
+        let answered = |subject: &String| selected.is_none_or(|selected| selected.contains(subject));
+        // Even a deadline answers this attempt: retry only on the next refresh, otherwise
+        // a chunked roster would refold the same degraded cards forever and never publish.
+        retries.due[mode].retain(|subject| !answered(subject));
+        if deadline {
+            retries.pending[mode].extend(subjects.iter().cloned());
+        } else {
+            retries.pending[mode].retain(|subject| !answered(subject));
+        }
+    }
+
+    /// Only a healthy attempt already in flight can satisfy a fresh read's bounded wait.
+    pub(crate) fn agent_roster_refresh_can_answer(&self) -> bool {
+        self.smalltalk.agent_roster_attempt.load(std::sync::atomic::Ordering::Acquire) == 1
+    }
+
+    pub(crate) fn previous_agent_faults(
+        &self, index: u64, history: bool, subjects: &[String],
+    ) -> BTreeMap<String, Value> {
+        let subjects = subjects.iter().map(String::as_str).collect::<HashSet<_>>();
+        let cache = self.smalltalk.agent_resources_cache.lock().expect("agent resources cache poisoned");
+        let mut faults = BTreeMap::new();
+        for entry in cache.iter().rev().filter(|entry| entry.index <= index && entry.history == history) {
+            for card in entry.items.iter() {
+                if let Some(id) = card["id"].as_str()
+                    && subjects.contains(id)
+                    && !faults.contains_key(id) {
+                    faults.insert(id.to_owned(), card["fault"].clone());
+                }
+            }
+            if faults.len() == subjects.len() { break; }
+        }
+        faults
+    }
+
     /// An agents WS window inherits the queue deadline from its selected or complete projection.
     pub(crate) fn agent_roster_valid_until(&self, index: u64) -> Option<u128> {
         self.smalltalk.agent_resources_cache.lock()
@@ -3433,9 +3492,12 @@ impl Store {
         // one, still completes in one bounded fold.
         let (changed, membership) = match &previous {
             None => (0, true),
-            Some(previous) if previous.index == index => (0, false),
+            Some(previous) if previous.index == index => (self.agent_roster_fault_retries(history).len(), false),
             Some(previous) => match self.agent_resources_delta(previous.index, index, &previous.items)? {
-                Ok(delta) => (delta.subjects.len(), delta.membership),
+                Ok(mut delta) => {
+                    delta.subjects.extend(self.agent_roster_fault_retries(history));
+                    (delta.subjects.len(), delta.membership)
+                }
                 Err(reason) => return Ok(Some(reason)),
             },
         };
@@ -3474,6 +3536,7 @@ impl Store {
     /// Whether the newest complete roster already is the one at `index`: same graph cut,
     /// same local activity, and no queue deadline passed since. A refresh would fold nothing.
     pub(crate) fn agent_roster_current(&self, index: u64, history: bool) -> Result<bool> {
+        if self.agent_roster_faults_pending(history) { return Ok(false); }
         let local = roster_local_frontier(&self.readers.get(), index)?;
         let now = now_ms();
         Ok(self.smalltalk.agent_resources_cache.lock()
@@ -3493,7 +3556,8 @@ impl Store {
         index: u64,
         history: bool,
     ) -> Result<bool> {
-        if self.smalltalk.agent_roster_refresh.get().is_none() {
+        if self.smalltalk.agent_roster_refresh.get().is_none()
+            || self.agent_roster_faults_pending(history) {
             return Ok(false);
         }
         let Some((cut, local, valid_until, items)) = self.smalltalk.agent_resources_cache.lock()
@@ -3569,9 +3633,20 @@ impl Store {
 
     /// Run one refresh, answering the requests made before it began only if it publishes.
     pub(crate) fn answer_agent_roster_requests<T>(&self, refresh: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.smalltalk.agent_roster_attempt.fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+        struct Attempt<'a>(&'a SmalltalkRuntime, bool);
+        impl Drop for Attempt<'_> {
+            fn drop(&mut self) {
+                self.0.agent_roster_attempt.store(if self.1 { 0 } else { 2 }, std::sync::atomic::Ordering::Release);
+                // Failure (including an unwind) must also wake readers waiting for publication.
+                self.0.agent_roster_published.send_modify(|_| {});
+            }
+        }
+        let mut attempt = Attempt(&self.smalltalk, false);
         let requested = &self.smalltalk.agent_roster_requested_at;
         let pending = requested.swap(0, std::sync::atomic::Ordering::AcqRel);
         let result = refresh();
+        attempt.1 = result.is_ok();
         if result.is_err() && pending != 0 {
             // Still unanswered: keep the oldest request time unless a newer request is waiting.
             let _ = requested.compare_exchange(0, pending, std::sync::atomic::Ordering::AcqRel,
@@ -3785,11 +3860,13 @@ impl Store {
         let select = |items: &[Value]| items.iter().filter(|item| {
             selected.is_none_or(|names| names.contains(item["id"].as_str().unwrap_or_default()))
         }).cloned().collect::<Vec<_>>();
+        let fault_retries = self.agent_roster_fault_retries(history);
         let cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
-        if let Some(entry) = cache.iter().filter(valid).find(|entry| {
-            agent_resources_entry_hits(entry, now, index, local, history, selected)
-        }) {
+        if let Some(entry) = cache.iter().rev().filter(valid)
+            .find(|entry| entry.index == index && entry.local == local && entry.history == history)
+            && agent_resources_entry_hits(entry, now, index, local, history, selected)
+            && selected.map_or(fault_retries.is_empty(), |names| names.is_disjoint(&fault_retries)) {
             let items = Arc::clone(&entry.items);
             drop(cache);
             return crate::performance::task("roster/cache-hit", || Ok(select(&items)));
@@ -3811,6 +3888,7 @@ impl Store {
         match previous {
             Some((previous, delta)) => {
                 let mut changed = delta.subjects;
+                changed.extend(fault_retries.iter().cloned());
                 if delta.membership {
                     let connection = self.readers.get();
                     let names = connection.prepare_cached(RANGE_SUBJECTS)?
@@ -3945,12 +4023,17 @@ impl Store {
             .expect("agent resources cache poisoned");
         // All endpoint callers hold admission. Direct internal readers may still race; never
         // replace a complete published projection with a partial one.
-        let published = cache.iter().filter(valid).find(|entry| {
-            agent_resources_entry_hits(entry, now, index, local, history, selected)
-        }).map(|entry| Arc::clone(&entry.items));
+        let published = cache.iter().rev().filter(valid)
+            .find(|entry| entry.index == index && entry.local == local && entry.history == history)
+            .filter(|entry| agent_resources_entry_hits(entry, now, index, local, history, selected)
+                && selected.map_or(fault_retries.is_empty(), |names| names.is_disjoint(&fault_retries)))
+            .map(|entry| Arc::clone(&entry.items));
         let complete = entry.covered.is_none();
         let items = if let Some(published) = published { published } else {
-            cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
+            // Fault retries can assemble partial chunks at the publication's exact cut.
+            // Keep that complete publication readable until the replacement is complete.
+            cache.retain(|old| old.index != index || old.local != local || old.history != history
+                || (!complete && old.covered.is_none()));
             let items = Arc::clone(&entry.items);
             cache.push_back(entry);
             if cache.len() > 8 {
@@ -3993,6 +4076,10 @@ impl Store {
         history: bool,
         selected: Option<&BTreeSet<String>>,
     ) -> Result<Option<(Arc<Vec<Value>>, u128)>> {
+        let fault_retries = self.agent_roster_fault_retries(history);
+        if selected.map_or(!fault_retries.is_empty(), |names| !names.is_disjoint(&fault_retries)) {
+            return Ok(None);
+        }
         if index < current_index(&self.readers.get())? {
             return Ok(None);
         }
@@ -4002,8 +4089,9 @@ impl Store {
         })?;
         let cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
-        let hit = cache.iter()
-            .find(|entry| agent_resources_entry_hits(entry, now, index, local, history, selected))
+        let hit = cache.iter().rev()
+            .find(|entry| entry.index == index && entry.local == local && entry.history == history)
+            .filter(|entry| agent_resources_entry_hits(entry, now, index, local, history, selected))
             .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms));
         drop(cache);
         Ok(hit.map(|hit| crate::performance::task("roster/cache-hit", || hit)))

@@ -1672,13 +1672,23 @@ background refresher last published; no read folds the roster itself. Each page 
 that roster's own cut in its `snapshot` (`store_index`, `created_at`) and when it was folded
 (`published_at`). That cut can be older than the request, by about a second plus one fold.
 
-A first page answers at once. A client that must see what was written before its request
-passes `fresh=true`: the daemon waits up to two seconds for a roster at least as new as the
-request before answering. `st agents ls` and `st agents tree` ask for it; Rust exposes
-`agents_list_fresh`. While no roster is published yet, a read answers a retryable 503 (the
-stream sends `resync`) and the refresher is asked for one. A continuation reads the roster
-published at its first page's cut; once that roster is gone it answers `page-cursor-expired`.
-A stream rereads when a newer roster is published.
+A first page answers at once. A client that prefers to see what was written before its request
+passes `fresh=true`. The daemon waits up to two seconds when a healthy refresh is in flight.
+If the last attempt failed, no attempt is in flight, or a waiting attempt fails, it returns
+the newest publication at once and asks for a refresh. Its original `store_index` and
+`published_at` show the age of those rows. `st agents ls` and `st agents tree` ask for this
+best-effort fresh read; Rust exposes `agents_list_fresh`.
+
+A read returns a retryable 503 (the stream sends `resync`) only before a usable roster of
+the requested mode has been published, or after a full projection reset clears it. Current
+and history rosters remain separate: a history read never substitutes current-only membership.
+A continuation reads the roster published at its first page's cut; once that roster is gone
+it answers `page-cursor-expired`. A stream rereads on a new publication.
+
+A card-faults read that reaches its deadline does not stop publication. Other card fields
+are current; each affected card keeps its previous `fault`, including a known null value.
+A card with no previous value reports `"fault status unknown"` in that same field. The next
+refresh retries those faults even if no claim changed.
 
 ## Exact terminal lookup
 

@@ -6,9 +6,21 @@ use crate::model::{LaunchSpec, MemberKind, MemberSpec};
 #[cfg(test)]
 thread_local! {
     static AFTER_FAULT_ACQUISITION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static CARD_FAULT_DEADLINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Runs once, after a promotion's reader pre-check found something that may promote and
     /// before the writer is borrowed, so a test can change the lease in that gap.
     static AFTER_PROMOTION_PRECHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+impl Store {
+    pub(crate) fn expire_next_card_fault_read_for_test() {
+        Self::expire_card_fault_reads_for_test(1);
+    }
+
+    pub(crate) fn expire_card_fault_reads_for_test(count: usize) {
+        CARD_FAULT_DEADLINES.with(|remaining| remaining.set(count));
+    }
 }
 
 fn lease(
@@ -1501,6 +1513,12 @@ impl Store {
         // One captured statement, rather than up to three round trips per actor. This
         // local query bound also applies to non-HTTP captures and never extends a parent.
         let duration = std::time::Duration::from_millis(25);
+        #[cfg(test)]
+        let duration = CARD_FAULT_DEADLINES.with(|remaining| {
+            let count = remaining.get();
+            remaining.set(count.saturating_sub(1));
+            if count == 0 { duration } else { std::time::Duration::ZERO }
+        });
         let budget = smallclaims::read_budget::current().map_or_else(
             || smallclaims::read_budget::ReadBudget::new("mailbox/card-faults", duration),
             |parent| parent.child(duration),
