@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "fractal-web: type-check .tsx and the st3-sdk tests in the app lane, restore folder tree row/notice/highlight styles, run render tests under jsdom",
+  "replay": {"status": "none", "detail": "Web UI and test configuration only; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "No client protocol or deployed runtime compatibility change."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No deployed installation action required; identity and state are unchanged."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

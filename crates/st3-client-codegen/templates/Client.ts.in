@@ -17,7 +17,7 @@ export type TraceContext = { traceparent: string; tracestate?: string };
 export type ClientOptions = {
     baseUrl: string;
     credential?: () => string | undefined | Promise<string | undefined>;
-    /** Read the active span's W3C context once per request or stream open. */
+    /** Read the active span's W3C context once per request, stream open, or collection subscribe. */
     traceContext?: () => TraceContext | undefined;
     fetchImpl?: typeof fetch;
     /** The app's name and build, sent as `x-st3-client` ("smalltalk-ios 1.0 (42)"). st lists it as
@@ -139,7 +139,8 @@ export class St3Client {
     private readonly traceContext?: ClientOptions['traceContext'];
     private readonly client?: string;
     private readonly fetchImpl: typeof fetch;
-    private discovered?: EnvelopeOf<Capabilities>;
+    /** Shared with every `withTraceContext` view so they discover once. */
+    private discoveryCache: { value?: EnvelopeOf<Capabilities> } = {};
 
     constructor(options: ClientOptions) {
         this.baseUrl = options.baseUrl.replace(/\/+$/, '');
@@ -151,12 +152,40 @@ export class St3Client {
 
     async capabilities(): Promise<EnvelopeOf<Capabilities>> {
         const response = await this.request<Capabilities>('GET', '/v1/client/capabilities');
-        this.discovered = response;
+        this.discoveryCache.value = response;
         return response;
     }
 
     async discover(): Promise<EnvelopeOf<Capabilities>> {
-        return this.discovered ?? this.capabilities();
+        return this.discoveryCache.value ?? this.capabilities();
+    }
+
+    /**
+     * This client with every request and stream carrying `traceContext` instead, so a caller can name
+     * the span that owns one call; credentials, transport, and discovery stay shared.
+     */
+    withTraceContext(traceContext: () => TraceContext | undefined): St3Client {
+        const view = new St3Client({
+            baseUrl: this.baseUrl,
+            fetchImpl: this.fetchImpl,
+            traceContext,
+            ...(this.credential === undefined ? {} : { credential: this.credential }),
+            ...(this.client === undefined ? {} : { client: this.client }),
+        });
+        view.discoveryCache = this.discoveryCache;
+        return view;
+    }
+
+    /** The callback's context when its `traceparent` is lowercase W3C version 00 with non-zero ids; otherwise none. */
+    private currentTraceContext(): TraceContext | undefined {
+        const context = this.traceContext?.();
+        if (!context) return undefined;
+        const parent = context.traceparent;
+        if (parent.length !== 55 || !/^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/.test(parent)
+            || parent.slice(0, 2) === 'ff'
+            || parent.slice(3, 35) === '00000000000000000000000000000000'
+            || parent.slice(36, 52) === '0000000000000000') return undefined;
+        return context.tracestate === undefined ? { traceparent: parent } : { traceparent: parent, tracestate: context.tracestate };
     }
 
     private applyTraceContext(headers: Record<string, string>): void {
@@ -360,7 +389,10 @@ export class St3Client {
         };
         const send = (command: Record<string, unknown>) => {
             if (ended) return;
-            if (open) sendNow(command); else waiting.push(command);
+            // A subscribe carries the context active when it is issued, not when a queued command flushes.
+            const trace = command.kind === 'subscribe' ? this.currentTraceContext() : undefined;
+            const traced = trace === undefined ? command : { ...command, trace };
+            if (open) sendNow(traced); else waiting.push(traced);
         };
         socket.onopen = () => { open = true; if (options.onOpen) notify(options.onOpen); for (const command of waiting.splice(0)) { if (ended) break; sendNow(command); } };
         socket.onmessage = event => {

@@ -91,7 +91,8 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
 /// the store unnoticed.
 const NOT_MEASURED: &[(&str, &str)] = &[
     ("POST /v1/client/observations", "requires a current paired session; bounded diagnostic memory and blocking JSONL, no Store mutation; real paired transport/unchanged-index controls in api/client_observations.rs"),
-    // A Claude permission hook's poll: one indexed newest-claim read and one operation lookup.
+    // A Claude permission hook's or Codex driver's approval poll: one indexed newest-claim read
+    // and one operation lookup.
     (
         "GET /v1/harness-prompts/state",
         "one newest harness.observed read by its subject index and one answer read by its operation index",

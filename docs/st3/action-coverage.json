@@ -81,9 +81,12 @@
       "action": "prompt.respond",
       "tests": [
         "crates/st3/src/store.rs::a_claude_permission_prompt_is_answered_once_by_its_person_while_it_waits",
-        "crates/st3/src/driver_hook.rs::a_permission_hook_returns_the_persons_answer_and_nothing_else"
+        "crates/st3/src/driver_hook.rs::a_permission_hook_returns_the_persons_answer_and_nothing_else",
+        "crates/st3/src/store.rs::a_codex_permission_prompt_is_answered_and_records_its_driver",
+        "crates/st-drivers/src/codex_app_server/tests.rs::an_approval_answered_in_st_is_sent_once_and_only_for_this_thread",
+        "crates/st-drivers/src/codex_app_server/tests.rs::a_persons_answer_takes_each_approval_methods_own_decision_words"
       ],
-      "behavior": "store and hook tests: only the seat's person answers, only the prompt still waiting (stale or terminal-only prompts refused), once; the answered alert disappears; the waiting hook returns the answer, stops when the prompt is gone and says nothing when time runs out"
+      "behavior": "store, hook and Codex driver tests: only the seat's person answers, only the prompt still waiting (stale or terminal-only prompts refused), once; the answered alert disappears; the waiting hook returns the answer, stops when the prompt is gone and says nothing when time runs out; the Codex driver sends the answer once in the request method's decision words, only for its own thread, and forgets a request resolved in the TUI or left behind"
     },
     {
       "action": "lane.approve",

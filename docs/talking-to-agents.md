@@ -14,6 +14,21 @@ st devices --as person/ada pair --full-control 'Garden phone'
 
 Enter the returned pairing ID and code in the app with your paired-only gateway URL. Use [gateway setup](st3/client-v0/README.md#tailnet-carrier) and [the phone connection guide](../apps/ios/README.md#connect); never forward the privileged daemon socket. `--full-control` lets this trusted device send messages and use the work controls. An offline app keeps its last view; reconnect before sending an action.
 
+## In the web conversation
+
+Tool rows show a short description rather than raw commands or infrastructure paths.
+Protocol events are hidden by default; the conversation menu can show payload-free
+event notices for inspection. Process and agent senders use readable captions.
+
+The pinned **Todos · phase completed/total** disclosure reads the accepted harness
+snapshot, independently of transcript loading. It remains above the composer while
+the conversation reconnects. A missing snapshot is not an empty task list, and stale
+or truncated snapshots keep their freshness and full-source progress labels.
+
+If a conversation cannot be found or access is not granted, ask the gateway owner
+to grant access to the surface. Your saved work is unchanged.
+
+
 ## From the CLI
 
 Capture the message ID so you can check it or keep the same thread:

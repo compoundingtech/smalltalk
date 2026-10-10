@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Close browser collection sockets synchronously on pagehide and resubscribe retained back/forward-cache pages",
+  "replay": { "status": "none", "detail": "No event replay behavior changes." },
+  "schema": { "status": "none", "detail": "No durable schema or migration changes." },
+  "rules": { "status": "none", "detail": "No daemon or fleet rules change." },
+  "compatibility": { "status": "none", "detail": "One pagehide handler synchronously closes sockets, unmounts React registry consumers, then disposes the source. Custom SDK sockets receive 1001; native browser adapters use a legal no-argument close because browser JavaScript cannot send reserved code 1001. Persisted pagehide retains its scope and React root; persisted pageshow reconnects and resubscribes existing interests without lifecycle timers." },
+  "downtime": { "status": "none", "detail": "Page-local sockets are closed during navigation; retained pages reconnect on restoration." },
+  "manual": { "status": "none", "detail": "No manual action required. Socket probe and creation spans retain trace propagation on reconnect." },
+  "recovery": { "status": "none", "detail": "Reloading the previous frontend restores its page lifecycle behavior; no persistent state requires recovery." }
+}

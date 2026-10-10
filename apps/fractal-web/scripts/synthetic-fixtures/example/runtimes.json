@@ -1,0 +1,65 @@
+[
+  {
+    "kind": "runtime",
+    "id": "runtime/synthetic-138/1",
+    "revision": "rev/synthetic-138-1",
+    "updated_at": "2032-01-19T00:00:00.000Z",
+    "owner_id": "agent/synthetic-138/1",
+    "owner_host_id": "host/synthetic-138/1",
+    "runtime_id": "synthetic-process-138-1",
+    "terminal_id": "terminal/synthetic-138/1",
+    "incarnation_id": "incarnation/synthetic-138/1",
+    "state": "running",
+    "runtime_kind": "agent",
+    "desired_revision": "rev/synthetic-138-1",
+    "owner_run_id": "mission-run/synthetic-138/1",
+    "terminal_sequence": 0,
+    "terminal_access": {
+      "read": "granted",
+      "input": "ungranted",
+      "resize": "granted"
+    }
+  },
+  {
+    "kind": "runtime",
+    "id": "runtime/synthetic-138/2",
+    "revision": "rev/synthetic-138-2",
+    "updated_at": "2032-01-19T00:00:00.000Z",
+    "owner_id": "agent/synthetic-138/2",
+    "owner_host_id": "host/synthetic-138/1",
+    "runtime_id": "synthetic-process-138-2",
+    "terminal_id": "terminal/synthetic-138/2",
+    "incarnation_id": "incarnation/synthetic-138/2",
+    "state": "running",
+    "runtime_kind": "agent",
+    "desired_revision": "rev/synthetic-138-2",
+    "owner_run_id": "mission-run/synthetic-138/2",
+    "terminal_sequence": 0,
+    "terminal_access": {
+      "read": "granted",
+      "input": "ungranted",
+      "resize": "granted"
+    }
+  },
+  {
+    "kind": "runtime",
+    "id": "runtime/synthetic-138/3",
+    "revision": "rev/synthetic-138-3",
+    "updated_at": "2032-01-19T00:00:00.000Z",
+    "owner_id": "agent/synthetic-138/3",
+    "owner_host_id": "host/synthetic-138/1",
+    "runtime_id": "synthetic-process-138-3",
+    "terminal_id": "terminal/synthetic-138/3",
+    "incarnation_id": "incarnation/synthetic-138/3",
+    "state": "running",
+    "runtime_kind": "agent",
+    "desired_revision": "rev/synthetic-138-3",
+    "owner_run_id": "mission-run/synthetic-138/3",
+    "terminal_sequence": 0,
+    "terminal_access": {
+      "read": "granted",
+      "input": "ungranted",
+      "resize": "granted"
+    }
+  }
+]

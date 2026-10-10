@@ -40,39 +40,51 @@ const traceCases = [
 ];
 
 for (const [name, callback, expected] of traceCases) {
-    test(`trace context: ${name} on HTTP and every WebSocket open`, async () => {
+    test(`trace context: ${name} on HTTP, every WebSocket open, and collection subscribes`, async () => {
         let reads = 0;
         const headers = [];
+        const sent = [];
         const client = new St3Client({
             baseUrl: 'https://example.test',
             ...(callback === undefined ? {} : { traceContext: () => { reads++; return callback(); } }),
             fetchImpl: async (_url, init) => { headers.push(init.headers); return response(envelope(capabilities)); },
         });
+        const sockets = [];
         const socket = (_url, _protocols, fields) => {
             headers.push(fields);
-            return { onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+            const opened = { onopen: null, onmessage: null, onclose: null, onerror: null, send: data => sent.push(JSON.parse(data)), close() {} };
+            sockets.push(opened);
+            return opened;
         };
         await client.capabilities();
         const terminal = await client.terminalStream('terminal/test', { streamCapability: 'proof', onScreen() {}, socket });
         const conversation = await client.conversationStream('session/test', { onChange() {}, socket });
         const collection = await client.collectionStream({ onFrame() {}, socket });
+        collection.subscribe('agents', 'agents', 100);
+        collection.unsubscribe('agents');
+        sockets[2].onopen();
         terminal.close();
         conversation.close();
         collection.close();
         assert.equal(headers.length, 4);
-        assert.equal(reads, callback === undefined ? 0 : 4);
+        assert.equal(reads, callback === undefined ? 0 : 5);
         for (const fields of headers) {
             assert.equal(fields.traceparent, expected?.traceparent);
             assert.equal(fields.tracestate, expected?.tracestate);
             assert.equal(Object.hasOwn(fields, 'traceparent'), expected !== undefined);
             assert.equal(Object.hasOwn(fields, 'tracestate'), expected?.tracestate !== undefined);
         }
+        assert.deepEqual(sent, [
+            { kind: 'subscribe', id: 'agents', collection: 'agents', limit: 100, ...(expected === undefined ? {} : { trace: expected }) },
+            { kind: 'unsubscribe', id: 'agents' },
+        ]);
     });
 }
 
-test('trace context is read afresh for each HTTP request', async () => {
+test('trace context is read when each request starts and when each subscribe is issued', async () => {
     let active;
     const headers = [];
+    const sent = [];
     const client = new St3Client({ baseUrl: 'https://example.test', traceContext: () => active,
         fetchImpl: async (_url, init) => { headers.push(init.headers); return response(envelope(capabilities)); } });
     await client.capabilities();
@@ -81,6 +93,36 @@ test('trace context is read afresh for each HTTP request', async () => {
     active = undefined;
     await client.capabilities();
     assert.deepEqual(headers.map(fields => fields.traceparent), [undefined, validTraceparent, undefined]);
+    const socket = { onopen: null, onmessage: null, onclose: null, onerror: null, send: data => sent.push(JSON.parse(data)), close() {} };
+    const stream = await client.collectionStream({ onFrame() {}, socket: () => socket });
+    active = { traceparent: validTraceparent };
+    stream.subscribeConversation('queued', 'session/test');
+    active = undefined;
+    socket.onopen();
+    stream.subscribeConversation('live', 'session/test');
+    assert.deepEqual(sent.map(command => command.trace), [{ traceparent: validTraceparent }, undefined]);
+    stream.close();
+});
+
+test('a traced view carries its own context and shares discovery, credentials, and transport', async () => {
+    const calls = [];
+    const own = '00-0123456789abcdef0123456789abcdef-fedcba9876543210-01';
+    const client = new St3Client({ baseUrl: 'https://example.test', credential: () => 'secret', client: 'web',
+        traceContext: () => ({ traceparent: validTraceparent }),
+        fetchImpl: async (url, init) => {
+            calls.push({ url, headers: init.headers });
+            return response(url.endsWith('/capabilities') ? envelope(capabilities) : envelope({ kind: 'action-result' }));
+        } });
+    const view = client.withTraceContext(() => ({ traceparent: own, tracestate: 'wf=1' }));
+    await view.capabilities();
+    await client.discover();
+    await view.discover();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].headers.traceparent, own);
+    assert.equal(calls[0].headers.tracestate, 'wf=1');
+    assert.equal(calls[0].headers.Authorization, 'Bearer secret');
+    await client.capabilities();
+    assert.equal(calls[1].headers.traceparent, validTraceparent);
 });
 
 test('discovers capabilities, bounds pages, and encodes opaque cursors', async () => {

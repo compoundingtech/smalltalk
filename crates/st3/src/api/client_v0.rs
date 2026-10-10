@@ -5329,11 +5329,34 @@ fn managed_transcript(
             ),
         }
     };
+    // A seat that started moments ago has not had time to bind a transcript, whichever piece is
+    // missing yet: that is starting up, not a fault, and a person watching a new agent is told so
+    // calmly instead of "could not be loaded".
+    let transcript = match transcript {
+        Err(missing) if !missing.not_yet && started_recently(incarnation) => {
+            Err(Missing::not_yet(missing.reason))
+        }
+        other => other,
+    };
     Ok(Some(ManagedTranscript {
         driver,
         anchor,
         transcript,
     }))
+}
+
+/// How long after a seat's incarnation starts a missing transcript binding is still startup.
+const TRANSCRIPT_STARTUP_GRACE_MS: i64 = 120_000;
+
+/// Whether `incarnation` (`PID:START`, START an RFC 3339 time) started within the startup grace.
+fn started_recently(incarnation: &str) -> bool {
+    incarnation
+        .split_once(':')
+        .and_then(|(_, started)| chrono::DateTime::parse_from_rfc3339(started).ok())
+        .is_some_and(|started| {
+            let age = chrono::Utc::now().timestamp_millis() - started.timestamp_millis();
+            (0..TRANSCRIPT_STARTUP_GRACE_MS).contains(&age)
+        })
 }
 
 /// The timeline entry that says a managed seat's native transcript is not shown, and why.
@@ -18356,6 +18379,86 @@ mission "example/zero-run" state="ready" {
             stale.reason.contains("does not name a driver process") && !stale.not_yet,
             "{stale:?}"
         );
+    }
+
+    #[test]
+    fn a_seat_that_started_moments_ago_is_starting_not_failed() {
+        // Nathan, 2026-10-10: a new agent's conversation said it could not be loaded for a
+        // while. Whatever binding piece is missing, a seat in its first minutes is starting.
+        let age = |seconds: i64| {
+            let started = chrono::Utc::now() - chrono::Duration::seconds(seconds);
+            format!("1234:{}", started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        };
+        assert!(super::started_recently(&age(5)));
+        assert!(!super::started_recently(&age(600)));
+        assert!(!super::started_recently("native-pty:current"));
+        assert!(!super::started_recently("no-colon"));
+        // A start time in the future is not "recent": the clock is wrong, not the seat young.
+        assert!(!super::started_recently(&age(-60)));
+
+        for (seconds, not_yet) in [(5, true), (600, false)] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let mut state = test_state_named(root.path(), "managed-claude-young-test");
+            state.native_session_home = Some(home);
+            let owner = "agent/managed-claude-young";
+            let incarnation = age(seconds);
+            let append = |kind: &str, fields: BTreeMap<String, Value>| {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: owner.into(),
+                        kind: kind.into(),
+                        actor: Some(owner.into()),
+                        fields,
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            };
+            append(
+                "runtime.observed",
+                BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("runtime_id".into(), json!("managed-claude-pty")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("terminal".into(), json!(true)),
+                ]),
+            );
+            append(
+                "harness.observed",
+                BTreeMap::from([
+                    ("state".into(), json!("working")),
+                    ("driver".into(), json!("claude")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("evidence_incarnation".into(), json!("4194303-1000-0")),
+                ]),
+            );
+            let session = ClientSession::local(Some("person/alex")).unwrap();
+            let items = timeline_value(
+                &state,
+                &new_client_snapshot(&state),
+                &session,
+                &super::managed_session_id(owner, &incarnation),
+                &ClientListQuery::default(),
+            )
+            .unwrap()
+            .0["items"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let notice = items
+                .iter()
+                .find(|item| item["body"]["code"] == "transcript-not-bound")
+                .expect("the timeline says why the transcript is missing");
+            assert_eq!(
+                notice["body"]["details"]["not_yet"] == true,
+                not_yet,
+                "{seconds}s old: {notice:#}"
+            );
+        }
     }
 
     #[test]

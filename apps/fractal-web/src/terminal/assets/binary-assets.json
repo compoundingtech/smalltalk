@@ -1,0 +1,38 @@
+[
+  {
+    "path": "apps/fractal-web/src/terminal/assets/JetBrainsMono-Regular.woff2",
+    "sha256": "a9cb1cd82332b23a47e3a1239d25d13c86d16c4220695e34b243effa999f45f2",
+    "origin": "https://github.com/JetBrains/JetBrainsMono/tree/v2.304",
+    "license": "OFL-1.1"
+  },
+  {
+    "path": "apps/fractal-web/src/terminal/assets/JetBrainsMono-Bold.woff2",
+    "sha256": "c503cc5ec5f8b2c7666b7ecda1adf44bd45f2e6579b2eba0fc292150416588a2",
+    "origin": "https://github.com/JetBrains/JetBrainsMono/tree/v2.304",
+    "license": "OFL-1.1"
+  },
+  {
+    "path": "apps/fractal-web/src/terminal/assets/JetBrainsMono-Italic.woff2",
+    "sha256": "cb6a1b246318ed3885d7dffa14a2609297fe80e9b8e500bea33b52fa312a36a4",
+    "origin": "https://github.com/JetBrains/JetBrainsMono/tree/v2.304",
+    "license": "OFL-1.1"
+  },
+  {
+    "path": "apps/fractal-web/src/terminal/assets/JetBrainsMono-BoldItalic.woff2",
+    "sha256": "3a013466c0eee979fb9d42c2d7a8887cd3645dc8b897cfc5b71781cf982efc5a",
+    "origin": "https://github.com/JetBrains/JetBrainsMono/tree/v2.304",
+    "license": "OFL-1.1"
+  },
+  {
+    "path": "apps/fractal-web/src/terminal/assets/JetBrainsMonoNerdFontMono-Regular.ttf",
+    "sha256": "f2a5ea6cfab397445ffab00c0370927b66d61e560a05db5db271b42006381c1a",
+    "origin": "https://github.com/ryanoasis/nerd-fonts/releases/tag/v3.5.1",
+    "license": "OFL-1.1"
+  },
+  {
+    "path": "apps/fractal-web/src/terminal/assets/ghostty-key-encoder.generated.wasm",
+    "sha256": "e7ddb75d97d435605ea32907544b34d18ebd421b5e885079f87c9c656e9c73c0",
+    "origin": "https://github.com/ghostty-org/ghostty/tree/a887df42c56f6de86c0fe6da9c4eeca37931e083",
+    "license": "MIT"
+  }
+]
