@@ -384,7 +384,7 @@ export const AppendedItems: Story = { render: args => <AppendedItemsStory scheme
   try {
     for (const [index, label] of ['tool', 'reasoning', 'answer'].entries()) {
       await userEvent.click(canvas.getByRole('button', { name: `Append ${label}` }))
-      await waitFor(() => expect(index === 0 ? work.querySelector('[data-tool-status="running"]') : index === 1 ? within(work).queryAllByTestId('thinking-entry').length === 2 : within(turn).queryByText('New answer content follows the retained rows.')).toBeTruthy())
+      await waitFor(() => expect(index === 0 ? work.querySelector('[data-tool-status="running"]') : index === 1 ? within(work).queryAllByTestId('thinking-entry').length === 1 && within(work).queryByText('New reasoning follows the observed tool call.') : within(turn).queryByText('New answer content follows the retained rows.')).toBeTruthy())
       recordRemovals(observer.takeRecords())
       await expect(removed).toHaveLength(0)
       await expect(fallbacks).toHaveLength(0)
