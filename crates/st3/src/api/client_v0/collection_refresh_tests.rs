@@ -786,7 +786,7 @@ async fn a_revoked_grant_ends_a_waiting_work_window_through_the_real_read() {
     tokio::time::advance(ATTENTION_CLOCK_INTERVAL).await;
     let revoked = fixture.frame().await;
     assert_eq!((revoked["kind"].as_str(), revoked["retryable"].as_bool()), (Some("error"), Some(false)), "{revoked}");
-    // Gone: a later publication reads and sends nothing.
+    // Gone: a later publication neither reads it nor sends it anything.
     super::super::published_lists::refresh_work_once(&state.store);
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("work", 3)]));
