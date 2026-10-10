@@ -23,6 +23,7 @@ import { openSubagentConversation } from '../conversationNavigation';
 import { useStore } from '../store';
 import { fonts, theme } from '../theme';
 import { Button, Field, LINE, Markdown, T } from '../ui';
+import { AlertsStrip } from './Alerts';
 
 // Drawn by stui's rules (fixtures/clients/conversation-style.json), so both apps look alike.
 const RULES: ConversationRules = rules;
@@ -317,6 +318,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     <Banners />
     {agent ? <AgentStrip agent={agent} onMission={(id, missionTitle) => navigation.navigate('Mission', { id, title: missionTitle })} /> : session ? <View style={styles.strip}><T dim numberOfLines={1}>{session.driver ?? 'harness'} · {session.state} · {session.id}</T></View> : null}
     {header ? <View style={styles.strip}><T dim>{header}</T></View> : null}
+    {agent ? <AlertsStrip agentId={agent.id} entries={timeline.entries} /> : null}
     {issue ? <View style={styles.strip}><T color={theme.waiting}>{staleLine(issue, loaded, lastFrame, now)}</T></View> : null}
     {findOpen ? <View style={[styles.strip, { flexDirection: 'row', alignItems: 'center', gap: 8 }]}>
       <Field value={find} onChangeText={setFind} placeholder="Find in this conversation" autoFocus autoCapitalize="none" autoCorrect={false} spellCheck={false} returnKeyType="search" style={{ flex: 1 }} />

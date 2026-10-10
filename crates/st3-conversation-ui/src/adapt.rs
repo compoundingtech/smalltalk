@@ -466,6 +466,12 @@ fn conversation_with_output_mode(
                         "delivery failing · retrying".into()
                     })
                 }
+                // A seat that has said nothing since it started has no transcript yet, which is
+                // not a fault, and not proof of an idle harness: one calm line, replaced by the
+                // conversation once the harness writes it.
+                "transcript-not-bound" if not_yet(error) => {
+                    Body::Event("starting · transcript unavailable until the harness writes its first line".into())
+                }
                 "transcript-not-bound" => {
                     Body::Event(format!(
                         "transcript unavailable: {}",

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Clean-room fractal-web React UI kit and synthetic Storybook stories",
+  "replay": {"status": "none", "detail": "UI development components only; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "No client protocol or deployed runtime compatibility change."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No deployed installation action required; identity and state are unchanged."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

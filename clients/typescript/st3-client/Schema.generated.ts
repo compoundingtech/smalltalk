@@ -1644,6 +1644,8 @@ export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   /** Observed not-before time: earliest work eligibility, not a promise of wake dispatch. */
   "next_wake_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Observed not-before time: earliest work eligibility, not a promise of wake dispatch." }),
   "path": Schema.String,
+  /** Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress. */
+  "progress_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." }),
   "since": Timestamp,
   "state": WorkState,
   "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -1662,7 +1664,8 @@ export type MustActEncoded = typeof MustAct.Encoded
 export const MissionRunSummary = /*#__PURE__*/ (() => Schema.Struct({
   "after": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),
   "blocker": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE),
-  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "id": StepRunId, "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
+  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "id": StepRunId, /** Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress. */
+"progress_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." }), "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
   "deadline": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "generation_id": optionalKey(RunGenerationId),
   "id": MissionRunId,
@@ -1924,6 +1927,8 @@ export const Work = /*#__PURE__*/ (() => Schema.Struct({
   "path": Schema.String,
   /** Responses to the asks this attempt made, or a person ask's own response. */
   "person_answers": optionalKey(Schema.Array(PersonAnswerRecord)).annotate({ description: "Responses to the asks this attempt made, or a person ask's own response." }),
+  /** Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress. */
+  "progress_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." }),
   "readiness_epoch": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "revision": Revision,
   "state": WorkState,

@@ -134,6 +134,8 @@ pub(crate) use mission_eligibility::MISSING_AGENT_CONDITION;
 mod revision_seats;
 pub(crate) mod delegation;
 mod limits;
+mod database_size;
+pub use database_size::DatabaseSize;
 mod person_work;
 pub(crate) mod work_summaries_ivm;
 mod subagents;
@@ -3516,6 +3518,11 @@ impl Store {
             Ok(delta) => delta.subjects.is_empty() && !delta.queues && !delta.membership,
             Err(_) => false,
         })
+    }
+
+    /// Note that an agents list read asked for the roster now, so a forget refolds it at once.
+    pub(crate) fn note_agent_roster_read(&self) {
+        self.smalltalk.agent_roster_read_at.store(now_ms() as u64, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether a refresher keeps the roster published, so readers must never fold it.
@@ -14585,6 +14592,11 @@ impl Store {
         launch_lineage_tx(&connection, subject)
     }
 
+    /// Presentation-only lineage of a recorded launch, even when it is no longer desired.
+    pub(crate) fn launch_lineage_from(&self, token: &str) -> Result<Vec<String>> {
+        launch_lineage_from_tx(&self.readers.get(), token.to_owned())
+    }
+
     /// Only seats whose durable resume requests name this host need transfer reconciliation.
     pub(crate) fn cross_host_resume_targets(&self, host: &str) -> Result<BTreeSet<String>> {
         smallclaims::touched::note_read(|| "kind:runtime.action.requested".to_owned());
@@ -21202,8 +21214,11 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
     let Some(row) = current_desired_row(connection, subject)? else {
         return Ok(Vec::new());
     };
-    let mut lineage = vec![row.claim_id.clone()];
-    let mut current = row.claim_id;
+    launch_lineage_from_tx(connection, row.claim_id)
+}
+
+fn launch_lineage_from_tx(connection: &Connection, mut current: String) -> Result<Vec<String>> {
+    let mut lineage = vec![current.clone()];
     while let Some(claim) = claim_by_id_tx(connection, &current)? {
         // A claim that merges concurrent revisions has one predecessor per fork; follow the
         // first one that is still the same launch.
@@ -21214,7 +21229,7 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
             }
             if let Some(previous) = claim_by_id_tx(connection, predecessor)?
                 && previous.kind == "intent.desired"
-                && previous.subject == subject
+                && previous.subject == claim.subject
                 && presentation_only_change(&previous.body, &claim.body)
             {
                 next = Some(previous.id);
@@ -41305,7 +41320,7 @@ version 2
         let mut legacy_digest = Sha256::new();
         legacy_digest.update(b"st3-checkpoint-rules-v1\0");
         legacy_digest.update(5_u32.to_be_bytes());
-        legacy_digest.update(checkpoint_rules::RULES_DESCRIPTION.as_bytes());
+        legacy_digest.update(checkpoint_rules::rules_description().as_bytes());
         let legacy_digest = hex::encode(legacy_digest.finalize());
         assert_ne!(legacy_digest, rules_digest());
         let sealed = controller.checkpoint_sealed_identities(cut, None).unwrap();
@@ -55268,6 +55283,114 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             "harness.observed",
             json!({"state":"working", "driver":"claude", "incarnation_id":"one",
                 "blocked_on":"human", "ask":"question"}),
+        );
+        assert!(prompt().unwrap().answers.is_empty());
+        assert_eq!(
+            store
+                .answer_native_prompt(seat, &question.id, "allow", "person/avery")
+                .unwrap_err()
+                .code,
+            "stale-fence"
+        );
+    }
+
+    /// A Codex approval prompt is answered the same way. The answer names the Codex driver, whose
+    /// control connection reads it and answers the app-server; a Codex question stays terminal-only.
+    #[test]
+    fn a_codex_permission_prompt_is_answered_and_records_its_driver() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &preview.subject_tokens, "answer-seat", Some("person/avery"))
+            .unwrap();
+        let seat = "agent/node.worker";
+        let append = |kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: seat.into(),
+                    kind: kind.into(),
+                    actor: Some(seat.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let prompt = || {
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .into_iter()
+                .find(|item| item.kind == "harness-prompt")
+        };
+        append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}));
+        // The driver waits on the observation its approval wrote, named by the record's sequences.
+        let asked = append(
+            "harness.observed",
+            json!({"state":"working", "driver":"codex", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"waitingOnApproval",
+                "ownership_sequence":1, "transition_sequence":3}),
+        );
+        assert_eq!(
+            prompt().unwrap().answers,
+            vec!["allow".to_owned(), "deny".to_owned()]
+        );
+        assert!(prompt().unwrap().detail.starts_with("Codex asks for approval;"));
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Open
+        );
+        let answer = store
+            .answer_native_prompt(seat, &asked.id, "allow", "person/avery")
+            .unwrap();
+        assert_eq!(answer.body["fields"]["driver"], "codex");
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Answered {
+                answer: "allow".into()
+            }
+        );
+        assert!(prompt().is_none(), "an answered prompt is no longer an alert");
+        // The next approval is its own: the earlier answer never answers it.
+        append(
+            "harness.observed",
+            json!({"state":"working", "driver":"codex", "incarnation_id":"one",
+                "blocked_on":null, "ask":null, "ownership_sequence":1, "transition_sequence":4}),
+        );
+        append(
+            "harness.observed",
+            json!({"state":"working", "driver":"codex", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"waitingOnApproval",
+                "ownership_sequence":1, "transition_sequence":5}),
+        );
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Gone
+        );
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 5).unwrap(),
+            NativePromptState::Open
+        );
+        let question = append(
+            "harness.observed",
+            json!({"state":"working", "driver":"codex", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"question", "reason":"waitingOnUserInput",
+                "ownership_sequence":1, "transition_sequence":6}),
         );
         assert!(prompt().unwrap().answers.is_empty());
         assert_eq!(

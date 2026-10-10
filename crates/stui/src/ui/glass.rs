@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 /// The palette's sections, in order; a digit key opens the palette at one.
 const SECTIONS: [&str; 7] = [
-    "needs you",
+    "alerts",
     "agents",
     "missions",
     "fleet",
@@ -831,7 +831,7 @@ impl Ui {
                 section: 0,
                 glyph: ("◆", theme::PERSON),
                 label: "Now".into(),
-                detail: "what needs you".into(),
+                detail: "alerts and updates".into(),
                 search: "now home".into(),
                 action: Action::Home,
             },
@@ -1671,7 +1671,7 @@ impl Ui {
             glasses.sidebar.focused = false;
         }
         if sidebar.section == 0 {
-            // What needs you opens where it is answered: Home, at that item.
+            // An alert opens where it is answered: Home, at that item.
             self.open_home();
             self.selected[0] = sidebar.selected[0];
         } else if sidebar.section == 4 {
@@ -1972,36 +1972,36 @@ impl Ui {
             Hit::Connection,
         );
         spans.push(Span::styled(link_text, bar(theme::fg(color))));
-        // Now opens over the glass from its count, "need you" (Nathan, 2026-10-04: one way in,
-        // named as `st now` is).
-        let need = self
+        // Now opens over the glass from its count of alerts (Nathan, 2026-10-04: one way in,
+        // named as `st now` is). No alert prints nothing at all (Nathan, 2026-10-10).
+        let alerts = self
             .world
             .attention
             .items()
             .iter()
-            .filter(|item| !self.snoozed.contains(&item.id) && !self.closed.contains(&item.id))
+            .filter(|item| {
+                item.is_alert() && !self.snoozed.contains(&item.id) && !self.closed.contains(&item.id)
+            })
             .count();
-        spans.push(Span::styled(" · ", bar(theme::dim())));
-        // Each count opens the palette at what it counts.
-        let mut x = area.x + Line::from(spans.clone()).width() as u16;
-        let need_text = if need > 0 {
-            format!("◆ {need} need you")
-        } else {
-            "nothing needs you".to_owned()
-        };
-        self.hit(
-            Rect {
-                x,
-                width: text::width(&need_text) as u16,
-                ..area
-            },
-            Hit::Home,
-        );
-        spans.push(if need > 0 {
-            Span::styled(need_text, bar(theme::strong(theme::PERSON)))
-        } else {
-            Span::styled(need_text, bar(theme::dim()))
-        });
+        let mut x;
+        if alerts > 0 {
+            spans.push(Span::styled(" · ", bar(theme::dim())));
+            // Each count opens the palette at what it counts.
+            x = area.x + Line::from(spans.clone()).width() as u16;
+            let alerts_text = format!(
+                "◆ {alerts} alert{}",
+                if alerts == 1 { "" } else { "s" }
+            );
+            self.hit(
+                Rect {
+                    x,
+                    width: text::width(&alerts_text) as u16,
+                    ..area
+                },
+                Hit::Home,
+            );
+            spans.push(Span::styled(alerts_text, bar(theme::strong(theme::PERSON))));
+        }
         let working = self
             .world
             .agents
@@ -3986,7 +3986,7 @@ mod tests {
         let shown = screen(&ui);
         let first = shown.lines().next().unwrap();
         assert!(
-            first.contains("need you") && first.contains("working") && first.contains("main"),
+            first.contains("alerts") && first.contains("working") && first.contains("main"),
             "{first}"
         );
         assert!(!first.contains("⌂") && first.contains("active"), "{first}");
@@ -3994,7 +3994,77 @@ mod tests {
         assert!(shown.contains("New terminal") && !shown.contains("New agent"), "{shown}");
         assert!(shown.contains("ctrl+k open"));
         let plain = screen(&Ui::new(demo::world()));
-        assert!(!plain.contains("ctrl+k") && !plain.lines().next().unwrap().contains("need you"));
+        assert!(!plain.contains("ctrl+k") && !plain.lines().next().unwrap().contains("alert"));
+    }
+
+    fn alert_prompt(id: &str, agent: &str) -> Attention {
+        Attention {
+            id: id.into(),
+            tier: Tier::Stopped,
+            title: format!("{agent} is waiting for a permission"),
+            waiting: None,
+            age: "1m".into(),
+            mission: None,
+            agent: Some(agent.into()),
+            kind: AttentionKind::Prompt {
+                seat: "builder".into(),
+                seat_id: agent.into(),
+                text: "Claude asks to use Bash".into(),
+                answers: vec!["allow".into(), "deny".into()],
+                episode: "episode-1".into(),
+            },
+            actions: vec!["prompt.respond".into()],
+            related: vec![],
+            raised_by: None,
+            blocked: None,
+            conversations: vec![agent.into()],
+        }
+    }
+
+    #[test]
+    fn the_top_bar_counts_alerts_and_prints_nothing_at_zero() {
+        let mut ui = glass();
+        ui.world.attention = Load::Ready(vec![]);
+        let none = screen(&ui);
+        let first = none.lines().next().unwrap();
+        assert!(!first.contains("alert") && !first.contains("need"), "{first}");
+        // An update asks nothing: it is not an alert.
+        let mut update = alert_prompt("attention/update", "agent/example/atlas/builder");
+        update.kind = AttentionKind::Update {
+            from: "builder".into(),
+            body: "done".into(),
+            about: String::new(),
+            subjects: vec![],
+        };
+        ui.world.attention = Load::Ready(vec![update.clone()]);
+        let first = screen(&ui).lines().next().unwrap().to_owned();
+        assert!(!first.contains("alert"), "{first}");
+        ui.world.attention = Load::Ready(vec![update, alert_prompt("attention/one", "agent/example/atlas/builder")]);
+        let first = screen(&ui).lines().next().unwrap().to_owned();
+        assert!(first.contains("◆ 1 alert ") && !first.contains("alerts"), "{first}");
+        ui.world.attention = Load::Ready(vec![
+            alert_prompt("attention/one", "agent/example/atlas/builder"),
+            alert_prompt("attention/two", "agent/example/docs/writer"),
+        ]);
+        let first = screen(&ui).lines().next().unwrap().to_owned();
+        assert!(first.contains("◆ 2 alerts"), "{first}");
+    }
+
+    #[test]
+    fn an_alert_shows_in_its_agents_conversation_and_clears_with_it() {
+        let mut ui = glass();
+        ui.world.attention = Load::Ready(vec![alert_prompt("attention/one", "agent/example/atlas/builder")]);
+        ui.open_in_glass(Pane::Agent(Some("agent/example/atlas/builder".into())), Open::Tab);
+        let shown = screen(&ui);
+        assert!(shown.contains("1 alert") && shown.contains("deny") && shown.contains("open in Now"), "{shown}");
+        // Another agent's conversation shows none of it.
+        ui.open_in_glass(Pane::Agent(Some("agent/example/docs/writer".into())), Open::Tab);
+        let other = screen(&ui);
+        assert!(!other.contains("open in Now"), "{other}");
+        // It clears itself when st stops listing it.
+        ui.open_in_glass(Pane::Agent(Some("agent/example/atlas/builder".into())), Open::Tab);
+        ui.world.attention = Load::Ready(vec![]);
+        assert!(!screen(&ui).contains("open in Now"));
     }
 
     #[test]
@@ -4048,7 +4118,7 @@ mod tests {
         assert_eq!(tabs(&ui).2[0], [ATLAS, WEEKLY, "machine:machine/harbor"]);
         ctrl(&mut ui, 'w');
 
-        // Now opens over the glass from "need you", with its keys; Esc puts the tab back in charge.
+        // Now opens over the glass from "alerts", with its keys; Esc puts the tab back in charge.
         ui.open_home();
         assert!(screen(&ui).contains("Now · esc closes"));
         assert_eq!(ui.tab, 0);
@@ -5341,7 +5411,7 @@ mod tests {
         assert_eq!(section(&ui), Some(2));
         press(&mut ui, KeyCode::Char('3'), KeyModifiers::CONTROL);
         assert_eq!(section(&ui), None, "the same again shows every section");
-        // "need you" in the top bar opens Home; the other counts open the palette there.
+        // "alerts" in the top bar opens Home; the other counts open the palette there.
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         screen(&ui);
         let hit_at = |ui: &Ui, wanted: Hit| {

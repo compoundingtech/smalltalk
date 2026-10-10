@@ -962,6 +962,8 @@ pub struct MissionStep {
     #[serde(default)]
     pub last_progress: Option<String>,
     #[serde(default)]
+    pub progress_at: Option<String>,
+    #[serde(default)]
     pub blocked_reason: Option<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
@@ -1029,6 +1031,8 @@ pub struct Work {
     pub title: Option<String>,
     pub assigned_to: Option<String>,
     pub last_progress: Option<String>,
+    #[serde(default)]
+    pub progress_at: Option<String>,
     pub state: String,
     pub gate_kind: Option<String>,
     pub attempt: u32,

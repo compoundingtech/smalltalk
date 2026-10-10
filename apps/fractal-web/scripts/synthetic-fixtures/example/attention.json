@@ -1,0 +1,49 @@
+[
+  {
+    "kind": "attention",
+    "id": "attention/synthetic-138/1",
+    "revision": "rev/synthetic-138-1",
+    "updated_at": "2032-01-19T00:00:00.000Z",
+    "state": "open",
+    "attention_kind": "agent-request",
+    "source_id": "agent/synthetic-138/2",
+    "targets": [
+      "person/operator"
+    ],
+    "requester_id": "agent/synthetic-138/2",
+    "mission_id": "mission/synthetic-138/2",
+    "mission_run_id": "mission-run/synthetic-138/2",
+    "person_id": "person/operator",
+    "actions": [
+      "work.done"
+    ],
+    "priority": "normal",
+    "title": "Choose a sample size",
+    "detail": "Select the small or large synthetic sample.",
+    "requested_at": "2032-01-18T23:59:30.000Z",
+    "preview": null,
+    "preview_token": null
+  },
+  {
+    "kind": "attention",
+    "id": "attention/synthetic-138/2",
+    "revision": "rev/synthetic-138-2",
+    "updated_at": "2032-01-19T00:00:00.000Z",
+    "state": "open",
+    "attention_kind": "unread-message",
+    "source_id": "person/operator",
+    "targets": [
+      "agent/synthetic-138/1"
+    ],
+    "person_id": "person/operator",
+    "actions": [
+      "message.read"
+    ],
+    "priority": "normal",
+    "title": "Sample ready",
+    "detail": "The synthetic sample is ready to inspect.",
+    "requested_at": "2032-01-18T23:59:30.000Z",
+    "preview": null,
+    "preview_token": null
+  }
+]

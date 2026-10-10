@@ -26,6 +26,8 @@ export type FeedHandlers = {
   onWindowStopped?: (name: FeedWindow) => void;
   /** Development measurement hook; never carries transcript content or a target. */
   onConversationFrame?: (rows: number, replace: boolean) => void;
+  /** How long a conversation or a terminal took from being followed to its first frame; carries no content or target. */
+  onTiming?: (target: 'ios-conversation-open' | 'ios-terminal-open', ms: number) => void;
 };
 
 /** The person's glasses, all of them, after each frame that changed them. */
@@ -160,7 +162,13 @@ export class Feed {
   /** Follow one terminal; a second call replaces the first. */
   followTerminal(terminalId: string, handlers: TerminalFollowHandlers): Follow {
     this.terminal?.close();
-    const follow = new TerminalFollow(this.client, terminalId, handlers, this.newActionId, this.retryDelaysMs, () => this.stream, () => { if (this.terminal === follow) this.terminal = undefined; });
+    const began = Date.now();
+    let timed = false;
+    const timedHandlers: TerminalFollowHandlers = { ...handlers, onScreen: screen => {
+      if (!timed) { timed = true; this.handlers.onTiming?.('ios-terminal-open', Date.now() - began); }
+      handlers.onScreen(screen);
+    } };
+    const follow = new TerminalFollow(this.client, terminalId, timedHandlers, this.newActionId, this.retryDelaysMs, () => this.stream, () => { if (this.terminal === follow) this.terminal = undefined; });
     this.terminal = follow;
     if (this.stream) void follow.attach();
     return { close: () => follow.close() };
@@ -169,7 +177,13 @@ export class Feed {
   /** Follow the conversation of an agent or a session; a second call replaces the first. */
   followConversation(target: string, handlers: ConversationHandlers): Follow {
     clearTimeout(this.conversation?.timer);
-    const follow: NonNullable<Feed['conversation']> = { target, handlers, failures: 0 };
+    const began = Date.now();
+    let timed = false;
+    const timedHandlers: ConversationHandlers = { ...handlers, onEntries: frame => {
+      if (!timed) { timed = true; this.handlers.onTiming?.('ios-conversation-open', Date.now() - began); }
+      handlers.onEntries(frame);
+    } };
+    const follow: NonNullable<Feed['conversation']> = { target, handlers: timedHandlers, failures: 0 };
     this.conversation = follow;
     this.stream?.subscribeConversation(CONVERSATION, target);
     return { close: () => { if (this.conversation !== follow) return; clearTimeout(follow.timer); this.conversation = undefined; this.stream?.unsubscribe(CONVERSATION); } };

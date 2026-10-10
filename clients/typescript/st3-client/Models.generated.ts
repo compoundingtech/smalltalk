@@ -1106,6 +1106,7 @@ export type MissionRunSummary = {
   assignee?: (ActorRef | null);
   claimant?: (ActorRef | null);
   id: StepRunId;
+  progress_at?: (Timestamp | null);
   since: Timestamp;
   state: WorkState;
   title: string | null;
@@ -1146,6 +1147,7 @@ export type MissionStep = {
   loop_round?: number | null;
   next_wake_at?: (Timestamp | null);
   path: string;
+  progress_at?: (Timestamp | null);
   since: Timestamp;
   state: WorkState;
   title?: string | null;
@@ -2336,6 +2338,7 @@ export type Work = ResourceHeader & {
   mission_run_id: Id;
   path: string;
   person_answers?: Array<PersonAnswerRecord>;
+  progress_at?: (Timestamp | null);
   readiness_epoch: number;
   state: WorkState;
   timeout_ms?: number | null;

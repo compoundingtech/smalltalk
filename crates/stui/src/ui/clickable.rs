@@ -39,6 +39,8 @@ impl Ui {
         let label = text::sanitize(&text::truncate(&self.target_label(buf, rect), 48));
         let mut left = match hit {
             Hit::Answer(_) => "choose answer; Enter sends".into(),
+            Hit::Alert(_, AlertTap::Answer(_)) => "answer this alert".into(),
+            Hit::Alert(_, AlertTap::Open) => "open this alert in Now".into(),
             Hit::Voice => "start voice input".into(),
             Hit::NewTerminal => "new terminal".into(),
             Hit::SidebarRow(_) => "open item in tab".into(),
