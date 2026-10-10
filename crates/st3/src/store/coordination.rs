@@ -157,6 +157,7 @@ mod tests {
                 })
                 .unwrap();
         }
+        let digest = graph_digest(&store.readers.get()).unwrap();
         store
             .connection
             .batched(|tx| {
@@ -183,6 +184,7 @@ mod tests {
         assert_eq!(complete["agent_to_agent"], 19);
         assert_eq!(complete["fyi"], 19);
         assert_eq!(complete["complete"], true);
+        assert_eq!(graph_digest(&store.readers.get()).unwrap(), digest);
     }
 
     #[test]

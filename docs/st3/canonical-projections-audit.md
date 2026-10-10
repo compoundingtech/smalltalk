@@ -281,3 +281,9 @@ The fix step must extend this foundation with non-empty fixtures for currently e
 1. Shared canonical helper + exhaustive local exceptions + behavioral coverage for shared winner selection independent of local arrival. Retain deterministic ancestry/operation selection and local cursor semantics.
 2. One incremental digest per logical shared table/source covering all shared columns, with insert/update/delete maintenance in the same transaction, stable serialization/PK order, full-rebuild validation and migration. Cheap cache invalidation alone is not incremental hashing. Physical indexes, receipt metadata, local clocks and live overlays stay outside. Extend replication status, heal diagnostics and doctor with named mismatches, and keep format/version compatibility explicit.
 3. Expand shuffle/restart/checkpoint CI coverage to every source and derived attention view. The audit commit intentionally contains the failing regression; it is not a green merge candidate. Only the completed fix PR with st/ci green on its own head may join the smalltalk merge train.
+
+Coordination cost metadata is also local: `coordination_sends` holds only a message subject,
+send time, and three integer category flags; `local_coordination_backfill` holds its local
+arrival cursor and completion marker. Writers derive them from sent claims in bounded batches.
+They are outside the shared logical rows and checkpoint digests, contain no message body, and
+are not replicated. Count readers query the metadata without advancing the backfill.
