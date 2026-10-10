@@ -1053,7 +1053,7 @@ impl Store {
         Ok(vec![AttentionItemView {
             episode: format!("{}:{writer}", checkpoint_name(first_waiting)), priority: "normal".into(), kind: "fault".into(),
             review_mode: None, subject: checkpoint.clone(), person: "person/operator".into(), requester_id: None,
-            launch_id: None, variant_id: None, message_id: None, conversation: None, title: format!("Checkpoints are waiting for {}", waiting.join(", ")),
+            launch_id: None, variant_id: None, message_id: None, answers: Vec::new(), conversation: None, title: format!("Checkpoints are waiting for {}", waiting.join(", ")),
             detail: "Bring the waiting machines back, upgrade them, or excuse a machine that stays away.".into(),
             mission: None, mission_run: None, step: None, targets: vec![checkpoint.clone()], requested_at_unix_ms: since,
             actions: vec![attention_action("inspect checkpoint", &["st", "replication", "checkpoint", "status"])],

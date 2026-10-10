@@ -2040,6 +2040,7 @@ const ACTIONS: &[&str] = &[
     "session.import",
     "work.ask",
     "custom.reply",
+    "prompt.respond",
     "work.done",
     "work.cancel-ask",
     "work.claim",
@@ -2076,6 +2077,7 @@ const ACTIONS: &[&str] = &[
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
     "custom.reply",
+    "prompt.respond",
     "arrangement.edit",
     "review.approve",
     "review.reject",
@@ -8960,7 +8962,7 @@ fn action_scope(action: &str) -> Option<&'static str> {
     ) {
         return Some("control.runtimes");
     }
-    if matches!(action, "work.done" | "custom.reply") {
+    if matches!(action, "work.done" | "custom.reply" | "prompt.respond") {
         return Some("control.attention");
     }
     Some(match action.split_once('.')?.0 {
@@ -9708,6 +9710,20 @@ async fn dispatch_action(
             "attention-migrated",
             "attention is a view; complete or remedy its source",
         ))),
+        // A person's answer to a native harness prompt, which the prompt's hook delivers.
+        "prompt.respond" => {
+            let answered = state
+                .store
+                .answer_native_prompt(
+                    &parameter_string(p, "target_id")?,
+                    &parameter_string(p, "episode")?,
+                    &parameter_string(p, "answer")?,
+                    authority_actor,
+                )
+                .map_err(ApiError::bad)?;
+            signal_changed(state);
+            Ok(vec![answered.subject])
+        }
         "custom.reply" => {
             let result = state
                 .store
