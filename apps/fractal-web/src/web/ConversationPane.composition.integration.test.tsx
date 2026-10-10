@@ -170,6 +170,45 @@ const mount = async (ux?: UxTelemetry) => {
 const text = () => container.textContent ?? ''
 
 describe('ConversationPane composition activation', () => {
+  it('keeps an overflowing visible suffix stable instead of growing it at idle, and finds older rows on demand', async () => {
+    const rows: ConversationItem[] = Array.from({ length: 30 }, (_, index) => ({
+      _tag: 'Text', id: `long-${index}`, role: 'assistant', text: `History row ${index}`, attachments: [], streaming: false, at: at(index),
+    }))
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: rows, hasOlder: false, observation: { empty: false } } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    const height = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(function (this: HTMLElement) {
+      return this.dataset.testid === 'transcript-scroll' ? 1000 : 0
+    })
+    const client = vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(700)
+    const bounds = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 700, this.dataset.testid === 'transcript-turn' ? 500 : 700)
+    })
+    const idle = vi.fn((_task: () => void) => 1)
+    vi.stubGlobal('requestIdleCallback', idle)
+    vi.stubGlobal('cancelIdleCallback', () => {})
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => setTimeout(() => callback(0), 0))
+    try {
+      await mount()
+      await act(async () => {
+        const { promise, resolve } = Promise.withResolvers<void>()
+        setTimeout(resolve, 25)
+        await promise
+      })
+      expect(text()).not.toContain('History row 0')
+      expect(text()).toContain('History row 29')
+      const before = container.querySelectorAll('[data-testid="transcript-message"]').length
+      await act(async () => { idle.mock.calls[0]?.[0]() })
+      expect(container.querySelectorAll('[data-testid="transcript-message"]')).toHaveLength(before)
+      expect(idle).not.toHaveBeenCalled()
+      const lane = container.querySelector<HTMLElement>('[data-testid="transcript-scroll"]')!
+      expect(lane.dataset.followState).toBe('attached')
+      await act(async () => { lane.dispatchEvent(new Event('scroll')) })
+      expect(container.querySelectorAll('[data-testid="transcript-message"]')).toHaveLength(before)
+      await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true })) })
+      expect(text()).toContain('History row 0')
+    } finally { height.mockRestore(); client.mockRestore(); bounds.mockRestore() }
+  })
+
   it('insets the composer dock so its focus outline stays inside the viewport', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
     await mount()

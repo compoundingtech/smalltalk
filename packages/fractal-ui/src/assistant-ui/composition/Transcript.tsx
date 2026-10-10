@@ -209,14 +209,6 @@ const windowTurns = (turns: readonly TranscriptTurn[], start: number): readonly 
     return [{ ...turn, prompt: index === turns.length - 1 ? turn.prompt : undefined, items, work: { ...turn.work, calls: turn.work.calls.filter(call => ids.has(call.id)) } }]
   })
 }
-const whenIdle = (task: () => void): (() => void) => {
-  if (typeof requestIdleCallback === 'function') {
-    const handle = requestIdleCallback(task, { timeout: 250 })
-    return () => cancelIdleCallback(handle)
-  }
-  const handle = setTimeout(task, 16)
-  return () => clearTimeout(handle)
-}
 /** Older engines and non-layout DOMs lack checkVisibility; retained hidden ancestors still must not backfill. */
 const hasVisibleBox = (element: HTMLElement): boolean => {
   if (typeof element.checkVisibility === 'function') return element.checkVisibility()
@@ -293,8 +285,8 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
   const viewport = React.useRef<EmbraceScrollViewportHandle>(null)
   const [proximity] = React.useState(() => new TurnProximity())
   React.useLayoutEffect(() => proximity.attach(scrollerOf(timeline.current)), [proximity, committed.length === 0])
-  // Each commit mounts a bounded source-row suffix, including oversized single turns. Idle backfill
-  // and history-top reveal use the same budget; only explicit browser find mounts the complete history.
+  // Mount a bounded suffix, filling the visible lane before paint. Older rows are
+  // demanded by history-top navigation or browser find, not idle-time visible growth.
   const [mounted, setMounted] = React.useState<MountedTurns>({ _tag: 'NewestPage' })
   const source = React.useMemo(() => committed.flatMap(turn => turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]), [committed])
   const start = mountedStart(mounted, source)
@@ -318,27 +310,14 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     else viewport.current.preserveLayout(update)
   }, [])
   const backfilling = start > 0
-  React.useEffect(() => {
-    if (start === 0) return
-    // Each chunk waits for a painted frame, then for idle time. A retained pane under `content-visibility: hidden`
-    // has no geometry to keep; it backfills once shown.
-    let cancel = () => {}
-    const frame = requestAnimationFrame(() => {
-      cancel = whenIdle(function step() {
-        if (timeline.current === null) return
-        if (!hasVisibleBox(timeline.current)) cancel = whenIdle(step)
-        else mountOlder(false)
-      })
-    })
-    return () => {
-      cancelAnimationFrame(frame)
-      cancel()
-    }
-  }, [start, mountOlder])
+  React.useLayoutEffect(() => {
+    const scroller = scrollerOf(timeline.current)
+    if (start > 0 && scroller instanceof HTMLElement && hasVisibleBox(scroller) && scroller.clientHeight > 0 && scroller.scrollHeight <= scroller.clientHeight) setMounted({ _tag: 'From', id: source[Math.max(0, start - backfillChunkRows)]!.id })
+  }, [start, source, visibleTurns])
   React.useEffect(() => {
     const scroller = scrollerOf(timeline.current)
     if (!backfilling || scroller == null) return
-    const nearTop = () => { if (scroller.scrollTop < scroller.clientHeight) mountOlder(false) }
+    const nearTop = () => { if (scroller instanceof HTMLElement && scroller.dataset.followState === 'detached' && scroller.scrollTop < scroller.clientHeight) mountOlder(false) }
     const find = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 'f') mountOlder(true) }
     const view = scroller.ownerDocument.defaultView
     scroller.addEventListener('scroll', nearTop, { passive: true })
@@ -383,6 +362,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
       {running !== undefined && <><div role="progressbar" aria-label="Run in progress" aria-valuetext="Running" data-testid="run-progress" {...stylex.props(styles.runningProgress)}><span {...stylex.props(styles.runningSegment)} /></div><span data-testid="run-elapsed">Running{Number.isFinite(started) && started <= now ? ` · ${formatWorkDuration(now - started) || '<1s'}` : ''}</span></>}
     </header>
     <ErrorOverlayHost lane><EmbraceScrollViewport ref={viewport} items={rows} anchorHistory={anchorHistory} stateKey={viewportKey} scrollToBottomKey={scrollToBottomKey} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
+      {start > 0 && <div {...stylex.props(styles.historyBoundary)}><Button data-testid="transcript-reveal-earlier" onPress={() => mountOlder(true)} {...stylex.props(styles.historyLoad)}>Show earlier messages</Button></div>}
       {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
       {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(visibleTurns, 0, gridOrigin - turnStart).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
     </EmbraceScrollViewport>{failure?.tone === 'error' && <ErrorOverlay id={`sync-${failure.text}`} title={failure.text} detail="History stays on screen." onRetry={onRetrySync} />}</ErrorOverlayHost>

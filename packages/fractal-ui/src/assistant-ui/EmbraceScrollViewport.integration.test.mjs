@@ -486,6 +486,17 @@ const mountTranscriptRows = async (singleTurn = true, withPrompt = false) => {
   return { lane, messages, geometry }
 }
 
+test('idle backfill does not expand a turn already visible in the lane', async () => {
+  const { messages } = await mountTranscriptRows()
+  await flush()
+  await act(async () => {
+    const pending = [...idleTasks.values()]
+    idleTasks.clear()
+    pending.forEach(callback => callback())
+  })
+  assert.equal(messages().length, 6)
+})
+
 for (const singleTurn of [true, false]) test(`initial 2000-row transcript mounts at most six source rows (${singleTurn ? 'one oversized turn' : '1000 two-row turns'})`, async () => {
   const { messages } = await mountTranscriptRows(singleTurn)
   assert.equal(messages().length, 6)
@@ -520,7 +531,7 @@ test('initial source window retains a whole adjacent reasoning run when its edge
   assert.equal(thoughtsShown.length, 11, 'the source window must not truncate an adjacent reasoning run')
   for (let index = 1; index <= 11; index++) assert.ok(thoughtsShown[index - 1].includes(`Thought ${index}`))
 })
-test('history-top reveal stays bounded and preserves an existing row before idle backfill', async () => {
+test('history-top reveal stays bounded and preserves an existing row', async () => {
   const { lane, messages, geometry } = await mountTranscriptRows()
   await flush()
   await act(async () => {
@@ -546,6 +557,16 @@ test('browser find exposes all source rows including an oversized turn', async (
   assert.equal(messages().length, 2000)
   assert.equal(messages()[0].dataset.itemId, 'row/0')
 })
+test('Show earlier messages exposes all loaded history for keyboard and screen-reader access', async () => {
+  const { lane, messages } = await mountTranscriptRows()
+  const reveal = lane.querySelector('[data-testid="transcript-reveal-earlier"]')
+  assert.equal(reveal.textContent, 'Show earlier messages')
+  await act(async () => reveal.click())
+  assert.equal(messages().length, 2000)
+  assert.equal(messages()[0].dataset.itemId, 'row/0')
+  assert.equal(lane.querySelector('[data-testid="transcript-reveal-earlier"]'), null)
+})
+
 
 test('work-log backfill renders only newly mounted call output', async () => {
   const calls = Array.from({ length: 3 }, (_, index) => ({ id: `call/${index}`, kind: 'read', title: 'Read', status: 'success', startedAt: '2032-01-18T12:00:00Z', detail: `Output ${index}` }))
@@ -582,34 +603,6 @@ for (const kind of ['tool', 'reasoning']) test(`bounded backfill within a turn a
   assert.equal(row.getBoundingClientRect().top, before)
   assert.equal(lane.scrollTop, 1020)
   Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => null })
-})
-
-test('idle backfill without checkVisibility waits for a retained hidden ancestor', async () => {
-  const descriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'checkVisibility')
-  delete HTMLElement.prototype.checkVisibility
-  try {
-    const { messages } = await mountTranscriptRows()
-    assert.equal(messages().length, 6)
-    container.style.contentVisibility = 'hidden'
-    await flush()
-    await act(async () => {
-      const pending = [...idleTasks.values()]
-      idleTasks.clear()
-      pending.forEach(callback => callback())
-    })
-    assert.equal(messages().length, 6)
-    container.style.contentVisibility = 'visible'
-    await act(async () => {
-      const pending = [...idleTasks.values()]
-      idleTasks.clear()
-      pending.forEach(callback => callback())
-    })
-    assert.equal(messages().length, 10)
-  } finally {
-    container.style.contentVisibility = ''
-    if (descriptor === undefined) delete HTMLElement.prototype.checkVisibility
-    else Object.defineProperty(HTMLElement.prototype, 'checkVisibility', descriptor)
-  }
 })
 
 for (const kind of ['message', 'work summary']) test(`row-gap backfill anchors the nested ${kind}, not its unmoving turn wrapper`, async () => {
