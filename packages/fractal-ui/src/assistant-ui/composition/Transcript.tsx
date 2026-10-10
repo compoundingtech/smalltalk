@@ -99,6 +99,58 @@ const strandedText = (item: ConversationItem): string | undefined => {
     default: return undefined
   }
 }
+/**
+ * Marks turns and turn groups more than a viewport away from the scroller's visible area as `data-distant`; only those
+ * skip rendering (`content-visibility: auto`). Turns near the reader render uncontained, so their painting and focus
+ * rings match a transcript without containment. A box's first report follows its first layout, so
+ * `contain-intrinsic-size: auto` has its real height before it is ever skipped. Reports from a hidden scroller (no root
+ * bounds) are ignored.
+ */
+class TurnProximity {
+  private observer: IntersectionObserver | undefined
+  private readonly boxes = new Set<Element>()
+  readonly attach = (root: Element | null | undefined) => {
+    if (root == null || typeof IntersectionObserver === 'undefined') return
+    const observer = new IntersectionObserver(entries => {
+      for (const entry of entries) if (entry.rootBounds !== null && entry.rootBounds.height > 0) entry.target.toggleAttribute('data-distant', !entry.isIntersecting)
+    }, { root, rootMargin: '100% 0px' })
+    this.observer = observer
+    for (const box of this.boxes) observer.observe(box)
+    return () => {
+      observer.disconnect()
+      if (this.observer === observer) this.observer = undefined
+    }
+  }
+  readonly observe = (box: HTMLElement | null) => {
+    if (box === null) return
+    this.boxes.add(box)
+    this.observer?.observe(box)
+    return () => {
+      this.boxes.delete(box)
+      this.observer?.unobserve(box)
+      box.removeAttribute('data-distant')
+    }
+  }
+}
+/** EmbraceScrollViewport renders scroller > content > children. */
+const scrollerOf = (timeline: Element | null) => timeline?.parentElement?.parentElement
+const TurnProximityRef = React.createContext<TurnProximity['observe'] | undefined>(undefined)
+const turnGroupSize = 16
+/**
+ * Turns in fixed groups of 16 by position in the transcript, so group keys stay put as turns are added. A distant
+ * full group skips as one box: revealing a pane styles the groups, not every turn. A partial group (the newest one
+ * while turns arrive) is not observed, so it never skips as a whole; once full it renders a frame at its full height
+ * before its first report can mark it distant.
+ */
+const turnGroups = (turns: readonly TranscriptTurn[]) => {
+  const groups: { readonly key: number; readonly turns: readonly TranscriptTurn[] }[] = []
+  for (let first = 0; first < turns.length; first += turnGroupSize) groups.push({ key: first / turnGroupSize, turns: turns.slice(first, first + turnGroupSize) })
+  return groups
+}
+function TurnGroup({ full, children }: { readonly full: boolean; readonly children: React.ReactNode }) {
+  const observe = React.useContext(TurnProximityRef)
+  return <div ref={full ? observe : undefined} {...stylex.props(styles.timeline, styles.turnSkip)}>{children}</div>
+}
 /** Fallback for an item the runtime never adopted: visible in place, never silently dropped. */
 function StrandedItem({ item }: { readonly item: ConversationItem }) {
   const text = strandedText(item)
@@ -133,7 +185,7 @@ const contentVersion = (item: ConversationItem): string => {
 const PreparedTurn = React.memo(function PreparedTurn({ turn, stranded, onOpenTool, onRetryRun, landmarkContext }: { turn: TranscriptTurn; stranded?: ReadonlySet<string>; onOpenTool: TranscriptProps['onOpenTool']; onRetryRun?: () => void; landmarkContext?: string }) {
   const detail = React.useCallback((call: WorkLogCall) => <ToolDetailPreview call={call} onOpen={onOpenTool} />, [onOpenTool])
   const reasoning = turn.items.filter(item => item._tag === 'Reasoning')
-  return <section data-testid="transcript-turn" data-item-id={turn.id} {...stylex.props(styles.turn)}>
+  return <section ref={React.useContext(TurnProximityRef)} data-testid="transcript-turn" data-item-id={turn.id} {...stylex.props(styles.turn, styles.turnSkip)}>
     {turn.prompt !== undefined && (stranded?.has(turn.prompt.id) ? <StrandedItem item={turn.prompt} /> : <ThreadPrimitive.Unstable_MessageById messageId={turn.prompt.id} components={messageComponents} />)}
     {(turn.work.calls.length > 0 || reasoning.length > 0) && <WorkLogV1 turn={turn.work} ariaLabel={`Work log ${turn.id}${landmarkContext ? `, ${landmarkContext}` : ''}`} listStyle={styles.workList} renderCallDetail={detail} previewCallDetail={!turn.work.running} interactiveCalls={onOpenTool !== undefined} hideLiveRow onRetry={onRetryRun} onOpenOutput={onOpenTool} expandedBody={reasoning.map(item => <ThinkingEntry key={item.id} text={item.text} streaming={item.streaming} />)} />}
     {turn.items.filter(item => item._tag !== 'ToolCall' && item._tag !== 'Reasoning').map(item => stranded?.has(item.id) ? <StrandedItem key={item.id} item={item} /> : <SenderCaption.Provider key={item.id} value={turn.senderCaptions?.[item.id]}><ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} /></SenderCaption.Provider>)}
@@ -189,6 +241,9 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
   React.useEffect(() => {
     if (strandedIds !== '' && process.env.NODE_ENV !== 'production') console.warn(`Transcript: the runtime never adopted ${strandedIds}; showing a fallback row.`)
   }, [strandedIds])
+  const timeline = React.useRef<HTMLDivElement>(null)
+  const [proximity] = React.useState(() => new TurnProximity())
+  React.useLayoutEffect(() => proximity.attach(scrollerOf(timeline.current)), [proximity, committed.length === 0])
   const imageOptions = React.useMemo(() => ({ resolveImage, onLoadImage }), [resolveImage, onLoadImage])
   // New rows or changed content are news; send state, tool status and timing are metadata.
   const rows = React.useMemo(() => committed.map(turn => ({ id: turn.id, version: (turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]).map(contentVersion).join(' ') })), [committed])
@@ -212,7 +267,7 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     </header>
     <ErrorOverlayHost lane><EmbraceScrollViewport items={rows} stateKey={viewportKey} scrollToBottomKey={scrollToBottomKey} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
       {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
-      {committed.length === 0 ? empty : <div {...stylex.props(styles.timeline)}>{committed.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</div>}
+      {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(committed).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
     </EmbraceScrollViewport>{failure?.tone === 'error' && <ErrorOverlay id={`sync-${failure.text}`} title={failure.text} detail="History stays on screen." onRetry={onRetrySync} />}</ErrorOverlayHost>
   </ThreadPrimitive.Root></RetrySend.Provider></MarkdownImagePolicy.Provider>
 }
@@ -225,6 +280,9 @@ const styles = stylex.create({
   // The shared reading column keeps rows and a reading-column composer on the same bounds.
   content: { paddingBlock: s.lg }, timeline: { display: 'flex', flexDirection: 'column', gap: s.xl, minWidth: 0 }, turn: { display: 'flex', flexDirection: 'column', gap: s.md, minWidth: 0 },
   workList: { maxHeight: 'none', overflowY: 'visible', overscrollBehavior: 'auto' },
+  // Turns and full turn groups far from the reader skip style, layout and paint; `auto` keeps each box's last rendered
+  // height as its placeholder, recorded while the box renders.
+  turnSkip: { contentVisibility: { default: 'visible', ':is([data-distant])': 'auto' }, containIntrinsicSize: `auto ${g.estimatedMessageHeight}` },
   user: { display: 'flex', flexDirection: 'column', minWidth: 0, color: ink.fg, fontSize: t.bodySize, lineHeight: t.bodyLeading, borderLeftWidth: g.focusRing, borderLeftStyle: 'solid', borderLeftColor: accent.primary, paddingLeft: s.lg, paddingBlock: s.xs }, userText: { minWidth: 0, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' },
   answer: { display: 'flex', flexDirection: 'column', gap: s.xs2, paddingBlock: s.xs2, color: ink.fgSoft, flexShrink: 0 }, sender: { margin: 0, fontSize: t.metaSize, lineHeight: t.metaLeading, fontWeight: t.weightMedium, color: ink.fgMuted },
   semantic: { display: 'flex', minWidth: 0, paddingBlock: s.xs2, color: ink.fgMuted, fontSize: t.metaSize, lineHeight: t.metaLeading },
