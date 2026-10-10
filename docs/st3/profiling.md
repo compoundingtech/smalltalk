@@ -12,6 +12,19 @@ An action row has a static route such as `/v1/work/renew/{*subject}`, `method: "
 route totals, so do not add counts across scopes. The seven action buckets are independent of the
 256 general-route limit.
 
+`GET /v1/client/agents` also gets `scope: "agents-read"` rows, `method: "GET"`, with `read` set to
+`first-page`, `fresh` or `continuation` (any page with a `cursor`). A `fresh=true` first page waits
+by design, up to two seconds, until the roster refresher publishes a roster at or after the
+read's own cut. The other two answer at once from a published roster. Count the fresh row against
+its own target rather than leaving it out: the route total still includes it.
+
+`scope: "agents-roster"` rows (also under route `/v1/client/agents`) time where that wait goes,
+each in its own last-512 sample, `duration_scope: "roster-stage"`. Stage `refresh` is one refresher
+fold and `refresh-admission` its wait for roster admission (`population: "refresher-folds"`).
+Stage `fresh-wait` is a fresh read's wait for a publication at its cut (2 s at most), and
+`fresh-page` the page it then builds (`population: "fresh-reads"`). Stages are not requests: they
+add no route or path rows.
+
 Each row's `count` is its completed-response count since this process started, including error
 responses. Percentiles use its last at most 512 completions (`recent_count`), in whole milliseconds.
 Renew and claim have separate counts and percentile samples. `duration_scope: "response-envelope"`
@@ -19,6 +32,39 @@ includes handler queueing, request work, durable admission and envelope serializ
 subtract writer wait or report only a hierarchy component. This is server completion time, not
 network delivery time. Abandoned and still-running requests have no sample. Existing long-poll
 route durations include deliberate waiting.
+
+## Targets and live windows
+
+[`slo/targets.toml`](../../slo/targets.toml) holds the daemon's targets: reads a person waits on,
+writes and acks, terminal attach to first screen, one SQL statement, any transaction or hold of
+the writer, and daemon CPU. Every daemon builds the file in. CI's daemon_load reads the same file.
+A target describes what we aim for and gates nothing by itself.
+
+The request-latency read adds `targets` and `paths` to `routes`. Each target and each path keeps
+rolling 1-minute, 5-minute and 1-hour windows with `count`, `p50_ms`, `p99_ms`, `max_ms`,
+`over_target` and `over_target_share`. A path is `METHOD /route`, or `stream COLLECTION` for the
+time from a subscription on the client collections socket to its first snapshot, conversation
+page or terminal screen. A read the daemon relayed from another machine's owner counts toward
+the target's `remote_windows` and its remote target. A request that asks to wait (`wait_ms` above
+zero, or `wait=true`) is a long poll: it is kept under `METHOD /route (long poll)` and counts
+toward no target. An agents list asked to be fresh (`fresh=true`, which `st agents ls` and
+`st agents tree` always send) waits for one roster refresh by design but is still a wait a person
+sits through, so it is the path `GET /v1/client/agents (fresh)` with its own `person-read-fresh`
+target and counts toward no other: a first page is held to the 100 ms of `person-read`, a fresh
+list to 300 ms. The `sql-statement`, `transaction` (`read`, `write`, `writer_hold`) and `cpu`
+rows cover the store's statements, its read and write transactions, each hold of its single
+writer, and the process's CPU in cores.
+
+The windows live in memory. Each is a ring of slots (12 of 5 seconds, 10 of 30 seconds, 12 of 5
+minutes). Each slot is a sparse histogram with 16 buckets per doubling, so a percentile is
+within a sixteenth of its sample and never above the window's exact maximum. The share over target
+is counted exactly as each sample finishes. Nothing samples on a thread of its own. A window ages
+out when it is next written or read, and a restart empties it.
+
+`st doctor` prints a `slo/NAME` line for each target and a line for each of the ten paths furthest
+over their target in the last five minutes. A p99 target is missed in a window when more than 1%
+of its samples are over. A max target is missed when any one sample is over. A miss is `info`,
+not `warn`, so `st doctor --strict` does not fail on a target.
 
 For a deployed latency receipt, retain the process/source identity and before/after count delta.
 A low-volume tail can include requests from before the measurement window, and a restart resets
@@ -124,6 +170,37 @@ client request records provide that detail. Profiling remains off unless `ST3_PR
 Capability admission seeks the attachment's indexed hash and its subject-head fence in one
 SQLite snapshot instead of decoding a bounded page of the whole fleet graph. Single-use CAS,
 session, person, and mode binding, expiry, and owner/incarnation checks remain unchanged.
+
+## Checkpoint scratch memory
+
+Checkpoint capture filters envelope cuts in SQLite and sorts only claim identities and canonical
+keys, then decodes retained bodies in bounded pages. Each metadata, body, protection and tombstone
+page has its own read snapshot and checks the persistent capture invalidation epoch. Mutations
+that affect the registered below-cut envelope prefix, canonical ordering, its protection references
+or below-cut tombstones restart capture; three invalidated attempts fail closed with a clear error.
+The seal rowid is fixed once per capture. A short atomic writer statement advances the monotonic
+frontier and accepted-time cut only when their persisted bounds need to grow; retries and repeated
+captures within covered bounds do not rewrite them. Admission of newer above-cut envelopes,
+identical duplicate re-offers and projection writes referring only to newer history do not
+invalidate capture. Delayed admission into the captured prefix and repairs that protect captured
+claims still invalidate it. The WAL is released between pages rather than pinned across sorting
+and the full body pass. The default and maximum capture page sizes are 64 envelopes/records.
+The compact metadata pass strictly decodes claim acceptance timestamps before envelope exclusion;
+malformed, negative or overflowing values return an error rather than silently counting as early.
+Capture mutation guards seek batch and record membership through their existing indexes, then
+look up the exact envelope identity. They do not scan the retained envelope frontier for each
+deleted claim during trim. Guard trigger version 3 replaces the earlier envelope-side OR
+predicate atomically while preserving the cut/frontier and invalidation rules.
+Mission-run and planning replay retain the canonical list of IDs and load one claim body at a
+time. Base replay uses a temporary ID order and bounded body pages. Both close their ordering
+or body statements before projection savepoints.
+
+Proof copies use a disk rollback journal and temporary storage, with a fixed 2 MiB SQLite cache
+target. The scratch directory needs space for the database copy and its rollback journal.
+This does not change the sealed set, canonical ordering, proof digests, or reader-equivalence
+checks. Large retained sealed sets still consume memory; reader page-cache settings do not
+bound decoded claim bodies or allocator retention. Compare live allocations and SQLite's
+allocator counters with RSS before attributing an RSS plateau to retained read connections.
 
 ## Read connections and SQLite allocation
 

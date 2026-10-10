@@ -165,6 +165,22 @@ pub fn machine_version() -> String {
     machine(&build_identity())
 }
 
+/// Source commit for public build receipts, using the same stamp as `--version`.
+/// Full hashes are preferred; older stamps retain their short revision.
+pub fn build_commit() -> &'static str {
+    static COMMIT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let raw = NIX_STAMP
+            .filter(|raw| matches!(parse_stamp(raw), Some(BuildStamp::Nix { .. })))
+            .or(LOCAL_STAMP);
+        let identity = build_identity();
+        raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|stamp| stamp.get("fullRev")?.as_str().map(str::to_owned))
+            .filter(|commit| !commit.is_empty())
+            .unwrap_or(identity.rev)
+    });
+    COMMIT.as_str()
+}
+
 /// Human-facing version for `--version`: the machineVersion plus source-kind and
 /// a relative commit time when known. Returns `&'static str` (clap's `version`
 /// needs `'static`); computed once, at the first CLI build (i.e. `--version`).

@@ -45,6 +45,14 @@ run-detail endpoint. The detail uses the same enriched `Store::mission_run` read
 runs keep lightweight effective-step summaries. Headers and enrichment share one reader
 snapshot; mission lists retain their lightweight summary reads.
 
+Mission `run_details[].steps[]` and `run_details[].current_steps[]` expose nullable
+`assignee` and `claimant` actor references (`agent/...`, `daemon/...`, or `person/...`),
+not agent-only IDs. A person-ask mission therefore retains its assigned person in both
+step views. `steps[].wake.assignee` uses the same actor-reference contract, including a
+ready person's unavailable, zero-attempt wake observation. `requester` and `outcome.actor`
+also use `ActorRef`. Clients must preserve these mission rows and handle the actor family
+instead of assuming every assignee or claimant is an agent.
+
 `loop_round` and `loop_max_rounds` belong to the loop attached to that exact step in the current
 generation; they are null for a non-loop step. `loop_reason` is the observed loop-state reason.
 `next_wake_at` is the observed not-before time (earliest work eligibility), not a delivery promise
@@ -58,6 +66,22 @@ Loop and wake enrichment is detail-only and bounded to open runs plus the latest
 null timing fields on lists or older finished runs are not proof of no loop or wake.
 Clients can render `round N/M · wakes in …` without reading claim envelopes.
 
+### Agent lifecycle metadata
+
+An agent roster row has an optional `lifecycle` field. The declaration currently accepts
+`"standing"`, `"owner"`, or `"bounded"`. It reports the selected agent declaration's optional KDL
+`lifecycle` child, not observed activity, runtime state, restart policy, or inferred ownership.
+Declaration replacements are reflected in subsequent roster reads and collection updates,
+including removal of the field when the replacement omits the child.
+
+When the declaration has no lifecycle, the server omits the field rather than supplying null
+or a default. A client treats an absent field as unknown, including when reading an older
+server; it must not infer `"standing"`, `"owner"`, or `"bounded"` from other fields.
+Like the other forward-compatible response enums, the wire schema accepts future strings.
+Generated clients decode an unfamiliar value as `Unknown` without dropping the roster row;
+this differs from an absent field, which means no lifecycle was declared.
+See [agent declarations](../kdl-lifecycle.md#definitions-do-not-start-work).
+
 ### Agent activity and human blocking
 
 An agent's `harness_state` describes activity independently of its optional `blocked_on`, `ask`,
@@ -66,6 +90,9 @@ activity makes the canonical agent `state: "waiting"`; clients present that comb
 a person. It takes precedence over working or idle, not over a terminal runtime, an ended/failed or
 indeterminate harness, a reconcile fault, or an observation fenced out by the current incarnation.
 `ask` names the structured question, permission, or review, not text inferred from the terminal.
+The optional `activity` is a status that is neither work nor a wait on a person, never an alert:
+`compacting` while the harness compacts its conversation (reason `compaction`; Claude Code, Codex
+and omp report both edges, pi only the end, so pi never shows it).
 
 The omp extension correlates an ask with its tool-call ID. Unrelated results leave it blocked; the
 matching answer emits a new unblocked activity frame. The pi-family channel retains all three axes
@@ -219,7 +246,7 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 
 | Resource | List and detail routes | Deterministic list order |
 |---|---|---|
-| Attention | `/attention`, `/attention/{id}` | priority descending, requested time ascending, ID |
+| Attention (alerts) | `/attention`, `/attention/{id}`; also `/alerts`, `/alerts/{id}` | priority descending, requested time ascending, ID |
 | Messages | `/messages`, `/messages/{id}` | sent time descending, ID |
 | Launches | `/launches`, `/launches/{id}` | updated time descending, ID |
 | Launch variants | `/launches/{id}/variants`, `/launches/{id}/variants/{variant_id}` | ordinal, ID |
@@ -565,6 +592,36 @@ Every attention resource carries its concrete `person_id`, original `source_id`,
 `attention_kind`, optional mission/run/step context, and currently meaningful typed actions. A
 client can therefore render a mixed inbox, navigate to the source, and act without recovering
 identity or graph context from prose.
+
+`alert` says whether the item is an alert: it blocks or waits on the person. Asks, human
+gates, launch and revision approvals, agent and custom requests, harness prompts and logins, and
+a broken gate the person published are alerts; an update, which asks nothing, is not. `conversation_id` names the agent whose
+conversation the item belongs to: the agent that asked, the agent whose work a gate reviews
+(else its run's requester), the launch's planner, the revision's proposer, or the seat itself.
+It is absent when no agent is behind the item. `conversation_ids` lists every conversation the item
+shows in, starting with `conversation_id`: a harness login alert is one alert per login directory
+and host, naming every seat that shares it, since one sign-in answers them all. Daemons that
+predate alerts omit these fields.
+
+A `harness-prompt` alert is a native prompt a seat's harness shows in its terminal and waits on:
+a permission, a question or a review. Its `source_id` and `conversation_id` are the seat, its
+`episode` is the harness observation that opened the prompt, and its detail carries the prompt
+text the harness reported. It clears when the harness reports the prompt gone, however it was
+answered, when Claude's terminal shows it was refused (Claude reports no event for that), or
+when the seat's runtime incarnation changes. It offers no typed action yet: its action attaches
+to the seat's terminal to answer there.
+
+A Claude permission prompt can also be answered from a client: its alert lists `answers`
+(`allow`, `deny`) under `action_parameters["prompt.respond"]` with its `target_id` and
+`episode`, and offers the typed action `prompt.respond`. The alert names only the tool; the call
+it would make (its command, path or other input) is conversation content, read from the seat's
+conversation, where Claude records the pending call before it asks. A client shows that pending
+call in full beside the answers and offers `allow` only when it can show it. Only the seat's
+person answers, only the prompt still waiting, and only once; the answer is recorded as a
+replicated `harness.diagnostic` (`native-prompt-answered`), and the prompt's hook on the seat's
+host, which waits while Claude shows its own dialog, returns it to Claude. An answer in the
+terminal still wins at once. A question prompt, and prompts of other harnesses, are answered in
+the terminal.
 
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
 generation, step, or agent), its current `state` and, when known, the `since`
@@ -1266,7 +1323,8 @@ The client-facing carrier remains a forwarder to `st3-client.sock`, never `st3.s
 Errors have `error_version: st3.client.error.v0`, a stable kebab-case code, safe message,
 `retryable`, structured details, and optional `retry_after_ms`. Required v0 codes are `not-found`,
 `forbidden`, `unsupported-capability`, `validation-failed`, `idempotency-conflict`, `stale-fence`,
-`cursor-gap`, `page-cursor-expired`, `rate-limited`, `runtime-not-local`,
+`cursor-gap`, `page-cursor-expired`, `projection-detail-too-large`,
+`projection-detail-invalid-source`, `rate-limited`, `runtime-not-local`,
 `runtime-authority-indeterminate`, `remote-unavailable`, `terminal-unavailable`, `terminal-ended`,
 and `internal`.
 

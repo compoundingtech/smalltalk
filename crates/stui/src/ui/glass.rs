@@ -4430,10 +4430,20 @@ mod tests {
                 .iter()
                 .any(|effect| matches!(effect, Effect::CloseTerminal))
         );
-        // Closing an attached terminal's tab lets it go too.
+        // Middle-closing an attached terminal's tab uses the same detach action.
         ctrl(&mut ui, ']');
         ui.effects.clear();
-        ui.close_tab();
+        screen(&ui);
+        let tab = ui.frame.borrow().hits.iter()
+            .find(|(_, hit)| matches!(hit, Hit::GlassTab(0, 0))).unwrap().0;
+        for kind in [MouseEventKind::Down(MouseButton::Middle), MouseEventKind::Up(MouseButton::Middle)] {
+            ui.mouse(crossterm::event::MouseEvent {
+                kind,
+                column: tab.x,
+                row: tab.y,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
         assert!(ui.terminal.is_none());
         assert!(
             ui.effects

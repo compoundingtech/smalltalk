@@ -19,7 +19,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@smalltalk/st3-client": "file:../st3-client"
+    "@smalltalk/st3-client": "workspace:*"
   },
   "devDependencies": {
     "typescript": "6.0.3"

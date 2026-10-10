@@ -62,16 +62,18 @@ st conversations send agent/garden/worker --from person/ada \
 
 Attachments are fetched by the member that reads or delivers the message. Ordinary workspace files do not replicate; put longer text in a graph document or a repository and send its reference. See [message examples](../examples/st3/SEND-A-MESSAGE-PROPERLY.md).
 
-## Home shows what needs you
+## Home shows your alerts
 
-Home is your attention inbox: approvals, decisions, feedback requests, failures that need action, and information addressed to you. An agent working normally does not need a Home card. Follow progress under **Missions** and talk under **Agents**; clearing a card does not erase its history.
+An alert is anything that blocks or waits on you: an ask, a human gate, a launch or revision approval, or a harness prompt. Each alert belongs to the conversation of the agent behind it, and it clears itself when it is answered anywhere or its origin ends. Home lists your alerts, then information addressed to you (updates), which asks nothing and is not counted as an alert. An agent working normally does not need a Home card. Follow progress under **Missions** and talk under **Agents**; clearing a card does not erase its history.
 
 The CLI shows the same person-facing work:
 
 ```sh
 st now
-st attention ls --as person/ada
+st alerts ls --as person/ada
 ```
+
+`st attention` is the older name of `st alerts` and still works.
 
 ## Ask for a human answer
 
@@ -124,10 +126,10 @@ st work ask --for person/ada --title 'Read the garden README' \
   --idempotency-key garden-readme-feedback --as "$ST_AGENT"
 ```
 
-Ada answers in Home, or uses the exact person-step ID from the attention inbox:
+Ada answers in Home, or uses the exact person-step ID from her alerts:
 
 ```sh
-st attention ls --as person/ada
+st alerts ls --as person/ada
 printf 'Person step-run ID to answer: '
 read -r person_step
 st work show "$person_step"

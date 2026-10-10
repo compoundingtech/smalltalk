@@ -6,6 +6,12 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
+import shutil
+import stat
+import tempfile
+import time
+import zipfile
 import subprocess
 
 FILES = ('workspace.tar.zst', 'st2.tar.zst', 'sekrets-st3', 'production-build.json')
@@ -46,11 +52,116 @@ def verify(manifest, current, directory, producer_attempt):
             raise ValueError(f'test archive digest mismatch: {name}')
 
 
+def artifact_metadata(document, artifact_id, environment):
+    """The successful producer artifact ID, run and attempt remain authoritative."""
+    attempt = environment['CI_TEST_ARCHIVE_PRODUCER_ATTEMPT']
+    current_attempt = environment['GITHUB_RUN_ATTEMPT']
+    if not attempt.isdecimal() or not 1 <= int(attempt) <= int(current_attempt):
+        raise ValueError('invalid successful producer attempt')
+    # PR artifact metadata names the author head, while GITHUB_SHA is the tested merge.
+    # The producer-output manifest hash and consume() bind that effective source.
+    run = document.get('workflow_run', {})
+    if (document.get('id') != int(artifact_id) or document.get('expired') is not False
+            or document.get('name') != 'linux-test-archives-' + attempt
+            or str(run.get('id')) != environment['GITHUB_RUN_ID']):
+        raise ValueError('download artifact source/run/producer identity mismatch')
+    size = document.get('size_in_bytes')
+    expected = document.get('digest', '')
+    if type(size) is not int or size <= 0 or not re.fullmatch(r'sha256:[a-f0-9]{64}', expected):
+        raise ValueError('artifact size and SHA256 are required')
+    return size, expected.removeprefix('sha256:')
+
+
+def extract_verified_zip(archive, destination, expected_size, expected_hash, manifest_hash):
+    # Wait for the complete ZIP and its authenticated digest before extracting any input.
+    if archive.stat().st_size != expected_size or digest(archive) != expected_hash:
+        raise ValueError('downloaded artifact ZIP size/digest mismatch')
+    with zipfile.ZipFile(archive) as zipped:
+        entries = zipped.infolist()
+        expected_names = set(FILES) | {'manifest.json'}
+        if len(entries) != len(expected_names) or {e.filename for e in entries} != expected_names:
+            raise ValueError('downloaded artifact ZIP must contain exactly the five producer files')
+        for entry in entries:
+            mode = entry.external_attr >> 16
+            if entry.is_dir() or stat.S_IFMT(mode) not in (0, stat.S_IFREG) or entry.flag_bits & 1:
+                raise ValueError('invalid archive member type')
+        if zipped.getinfo('manifest.json').file_size > 65536:
+            raise ValueError('producer manifest is too large')
+        manifest_bytes = zipped.read('manifest.json')  # Also checks this member's ZIP CRC.
+        if hashlib.sha256(manifest_bytes).hexdigest() != manifest_hash:
+            raise ValueError('downloaded manifest differs from successful producer output')
+        manifest = json.loads(manifest_bytes)
+        if set(manifest.get('files', {})) != set(FILES):
+            raise ValueError('both selected archive groups are required')
+        destination.mkdir(mode=0o700, exist_ok=False)
+        for entry in entries:
+            target = destination / entry.filename
+            with zipped.open(entry) as source, target.open('xb') as stream:
+                shutil.copyfileobj(source, stream, length=1024 * 1024)
+            # Copy waits for each member's EOF/CRC; the producer manifest binds its bytes.
+            expected = manifest_hash if entry.filename == 'manifest.json' else manifest['files'][entry.filename]
+            if digest(target) != expected:
+                raise ValueError('downloaded producer file digest mismatch: ' + entry.filename)
+
+
+def download(directory):
+    environment = os.environ
+    artifact_id = environment['CI_TEST_ARCHIVE_ARTIFACT_ID']
+    repository = environment['GITHUB_REPOSITORY']
+    manifest_hash = environment['CI_TEST_ARCHIVE_MANIFEST_SHA256']
+    if not artifact_id.isdecimal() or int(artifact_id) <= 0:
+        raise ValueError('one successful producer artifact ID is required')
+    if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repository):
+        raise ValueError('invalid repository')
+    if not re.fullmatch(r'[a-f0-9]{64}', manifest_hash):
+        raise ValueError('successful producer manifest hash is required')
+    if directory.exists() or directory.is_symlink():
+        raise ValueError('archive download destination must be fresh')
+    endpoint = f'repos/{repository}/actions/artifacts/{artifact_id}'
+    # gh receives the read-only job token in GH_TOKEN, never in argv or diagnostics.
+    metadata = subprocess.run(['gh', 'api', endpoint], capture_output=True, timeout=60)
+    if metadata.returncode < 0 or metadata.returncode >= 128:
+        raise SystemExit(metadata.returncode if metadata.returncode >= 0 else 128 - metadata.returncode)
+    if metadata.returncode:
+        raise RuntimeError(f'artifact metadata request failed (exit {metadata.returncode})')
+    size, expected_hash = artifact_metadata(json.loads(metadata.stdout), artifact_id, environment)
+    for attempt in (1, 2):
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory(prefix='ci-test-transfer-', dir=directory.parent) as scratch:
+            scratch = Path(scratch)
+            archive = scratch / 'artifact.zip'
+            try:
+                with archive.open('xb') as stream:
+                    result = subprocess.run(['gh', 'api', endpoint + '/zip'], stdout=stream,
+                                            stderr=subprocess.DEVNULL, timeout=600)
+                if result.returncode < 0 or result.returncode >= 128:
+                    raise SystemExit(result.returncode if result.returncode >= 0 else 128 - result.returncode)
+                if result.returncode:
+                    raise RuntimeError(f'artifact ZIP request failed (exit {result.returncode})')
+                verified = scratch / 'verified'
+                extract_verified_zip(archive, verified, size, expected_hash, manifest_hash)
+                if directory.exists() or directory.is_symlink():
+                    raise ValueError('archive destination appeared during transfer')
+                verified.rename(directory)
+                print(f'Artifact {artifact_id}: complete ZIP {size} bytes SHA256 {expected_hash}; '
+                      f'all producer files verified, transfer attempt {attempt}, '
+                      f'{time.monotonic() - started:.1f}s', flush=True)
+                return
+            except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, subprocess.TimeoutExpired) as error:
+                print(f'::warning::Artifact {artifact_id} transfer attempt {attempt} failed '
+                      f'({type(error).__name__}: {error}); private partial input discarded; no tests started.', flush=True)
+                if attempt == 2:
+                    raise RuntimeError('exact producer artifact transfer failed after two bounded attempts') from None
+    raise AssertionError('unreachable')
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('build', 'consume'))
+    parser.add_argument('action', choices=('build', 'download', 'consume'))
     args = parser.parse_args()
     directory = Path(os.environ['RUNNER_TEMP']) / 'ci-test-archives'
+    if args.action == 'download':
+        download(directory)
+        return
     current = identity()
     if current['source'] != os.environ['GITHUB_SHA']:
         raise ValueError('checkout must match the workflow tested SHA')

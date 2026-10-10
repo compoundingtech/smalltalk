@@ -42,6 +42,18 @@ fn lease_ms() -> u64 {
         .map_or(SUBAGENT_LEASE_MS, |cap| cap.min(SUBAGENT_LEASE_MS))
 }
 
+/// How long a subagent its harness reports while it runs may go unreported.
+/// `ST3_SUBAGENT_SILENCE_MS` can only shorten it, as `ST3_SUBAGENT_LEASE_MS` does the lease.
+fn silence_ms() -> u64 {
+    std::env::var("ST3_SUBAGENT_SILENCE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|cap| *cap > 0)
+        .map_or(ledger::SILENT_GRACE_MS, |cap| {
+            cap.min(ledger::SILENT_GRACE_MS)
+        })
+}
+
 /// What this driver has recorded, kept beside the ledger so a driver replaced in place carries on.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Published {
@@ -66,6 +78,7 @@ pub struct Publisher {
     /// The incarnation stamped on the harness timeline, which a subagent's usage joins.
     timeline_incarnation: Option<String>,
     lease_ms: u64,
+    silence_ms: u64,
     published: Published,
 }
 
@@ -123,6 +136,7 @@ impl Publisher {
             codex_home: st_drivers::codex_app_server::codex_home(),
             timeline_incarnation: None,
             lease_ms: lease_ms(),
+            silence_ms: silence_ms(),
             published,
         }
     }
@@ -159,6 +173,7 @@ impl Publisher {
         let now = ledger::now_ms();
         let current = ledger::update(&self.agent_dir, |ledger| {
             ledger.end_unlisted(now);
+            ledger.end_silent(now, self.silence_ms);
             ledger.clone()
         })?;
         let before = self.published.clone();

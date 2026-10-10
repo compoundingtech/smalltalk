@@ -22,6 +22,8 @@ fn authored_pull_request_lookup_indexes_existing_schema_seventeen_on_open() {
         json!({"url":"url", "repository":"repo", "number":42}),
         "1",
     );
+    // Exercise the legacy-version open path, rather than reopening the current schema.
+    connection.execute_batch("PRAGMA user_version=17").unwrap();
     drop(connection);
     drop(store);
     let store = Store::open(&path, "node").unwrap();
@@ -30,7 +32,7 @@ fn authored_pull_request_lookup_indexes_existing_schema_seventeen_on_open() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
             .unwrap(),
-        17
+        st3_schema::STORAGE_VERSION
     );
     assert_eq!(
         connection

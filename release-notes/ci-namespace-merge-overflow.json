@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Allow capacity-based Namespace merge overflow and report daily executed job minutes.",
+  "replay": {
+    "status": "none",
+    "detail": "CI routing/reporting only; no runtime, database or protocol change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI routing/reporting only; no runtime, database or protocol change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI routing/reporting only; no runtime, database or protocol change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI routing/reporting only; no runtime, database or protocol change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI routing/reporting only; no runtime, database or protocol change."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "CI-speed controls capacity variables. Leave CI_MERGE_CI1 unset/off for automatic whole-group overflow, optionally use an existing verified Namespace merge profile, and apply build concurrency3 after checking live runner waits. Daily Namespace usage summary/artifact at06:05UTC records previous-day execution minutes, not invoice dollars. Live grouping strategy is preserved."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Revert routing or use the existing forced-local switch and lower build count; no stored data or service rollback."
+  }
+}

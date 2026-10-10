@@ -160,8 +160,73 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
     None
 }
 
+/// Whether Claude's own input box is on screen: a full-width rule, the `❯` prompt line and
+/// another rule. Claude replaces the box with its dialog while a permission, question or plan
+/// prompt is up, and shows it again once the prompt is answered or dismissed (measured on Claude
+/// Code 2.1.296: Esc or "No" ends the turn without any hook event). The box is also on screen
+/// while Claude works, so it says a prompt is gone only after the prompt's dialog was seen.
+pub fn claude_input_ready(screen: &str) -> bool {
+    let rule = |line: &str| line.chars().count() >= 20 && line.chars().all(|c| c == '─');
+    // A dialog's selected choice (`❯ 1. Yes`) is not the input prompt.
+    let prompt = |line: &str| {
+        line.strip_prefix('❯').is_some_and(|rest| {
+            let rest = rest.trim_start();
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            digits == 0 || !rest[digits..].starts_with('.')
+        })
+    };
+    let lines = screen
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    lines
+        .windows(3)
+        .any(|window| rule(window[0]) && prompt(window[1]) && rule(window[2]))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_input_box_is_back_after_a_refusal_and_absent_in_every_dialog() {
+        let screen = |name: &str| -> &'static str {
+            match name {
+                "claude-permission-dialog.txt" => include_str!("../tests/fixtures/blocking-screens/claude-permission-dialog.txt"),
+                "claude-edit-dialog.txt" => include_str!("../tests/fixtures/blocking-screens/claude-edit-dialog.txt"),
+                "claude-ask-question.txt" => include_str!("../tests/fixtures/blocking-screens/claude-ask-question.txt"),
+                "claude-plan-dialog.txt" => include_str!("../tests/fixtures/blocking-screens/claude-plan-dialog.txt"),
+                "claude-trust.txt" => include_str!("../tests/fixtures/blocking-screens/claude-trust.txt"),
+                "claude-permission-refused.txt" => include_str!("../tests/fixtures/blocking-screens/claude-permission-refused.txt"),
+                "claude-edit-refused.txt" => include_str!("../tests/fixtures/blocking-screens/claude-edit-refused.txt"),
+                "claude-working.txt" => include_str!("../tests/fixtures/blocking-screens/claude-working.txt"),
+                _ => unreachable!("{name}"),
+            }
+        };
+        for dialog in [
+            "claude-permission-dialog.txt",
+            "claude-edit-dialog.txt",
+            "claude-ask-question.txt",
+            "claude-plan-dialog.txt",
+            "claude-trust.txt",
+        ] {
+            assert!(!super::claude_input_ready(screen(dialog)), "{dialog}");
+        }
+        // The box is back after a refusal, and also while Claude works: only a dialog seen
+        // first makes its return mean the prompt is gone.
+        for input in [
+            "claude-permission-refused.txt",
+            "claude-edit-refused.txt",
+            "claude-working.txt",
+        ] {
+            assert!(super::claude_input_ready(screen(input)), "{input}");
+        }
+        assert!(!super::claude_input_ready(""));
+        // A dialog's selected choice between two rules is not the input prompt.
+        assert!(!super::claude_input_ready(
+            "────────────────────────────────────────\n❯ 1. Yes\n────────────────────────────────────────\n"
+        ));
+    }
+
     #[test]
     fn plain_followup_tool_lines_are_not_login_diagnostics() {
         for text in [

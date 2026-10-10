@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "Unchanged harness-state evidence is re-stamped every five minutes again (was twenty seconds), so a quiet seat can read stale until its next state change or refresh.",
+  "commits": ["69cabc9cbe6fe249fa0edf22dee7b6004f58c9f0"],
+  "replay": {"status": "none", "detail": "No history is folded or rebuilt; only the cadence at which a live writer re-stamps unchanged evidence changes, and a state change still publishes immediately."},
+  "schema": {"status": "none", "detail": "No database schema, claim kind or persisted-format change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and fleet coordination are unchanged."},
+  "compatibility": {"status": "changed", "detail": "HARNESS_STATE_REFRESH and the provider-session refresh go from 20 s to 5 min. st3 presents a harness observation older than 90 s as stale (observation 'stale', harness_state 'indeterminate', a running seat shown as waiting), so a quiet idle seat can show stale or indeterminate between refreshes, and after a daemon restart until its next state change. The merge's updated restart test asserts exactly that and that fresh evidence recovers without restarting the seat. How long a healthy quiet seat reads stale in steady state was not measured."},
+  "downtime": {"status": "none", "detail": "No restart, migration or interruption is required; the new cadence applies as each seat's wrapper is next launched with the new build."},
+  "manual": {"status": "none", "detail": "No operator action."},
+  "recovery": {"status": "none", "detail": "Rolling back restores the 20 s refresh; the evidence format is unchanged in both directions, so mixed builds read each other's records."}
+}

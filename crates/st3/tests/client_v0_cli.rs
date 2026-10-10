@@ -2344,6 +2344,7 @@ mission "cli/child" state="ready" {
     assert_eq!(now["value"]["filters"]["person"], "person/alex");
 
     for arguments in [
+        vec!["alerts", "ls", "--as", "person/alex"],
         vec!["attention", "ls", "--as", "person/alex"],
         vec!["agents", "ls"],
         vec!["agents", "tree"],
@@ -2517,14 +2518,14 @@ mission "cli/child" state="ready" {
     assert_eq!(history["value"]["items"][0]["state"], "revoked");
 
     for (arguments, heading) in [
-        (vec!["now", "--as", "person/alex"], "NEEDS YOU"),
+        // Nothing waits on alex: now says nothing about alerts, not even a zero.
+        (vec!["now", "--as", "person/alex"], "Work: st work ls"),
         (vec!["machines"], "MACHINES"),
         (vec!["activity", "--limit", "10"], "ACTIVITY"),
         (vec!["devices", "--as", "person/alex", "--all"], "DEVICES"),
-        (
-            vec!["attention", "ls", "--as", "person/alex"],
-            "HUMAN ATTENTION",
-        ),
+        (vec!["alerts", "ls", "--as", "person/alex"], "ALERTS FOR"),
+        // The older name still works.
+        (vec!["attention", "ls", "--as", "person/alex"], "ALERTS FOR"),
         (vec!["agents", "ls"], "AGENTS"),
         (vec!["agents", "tree"], "AGENT TREE"),
         (vec!["work", "ls"], "WORK"),

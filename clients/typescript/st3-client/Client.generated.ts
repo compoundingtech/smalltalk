@@ -13,9 +13,12 @@ export type PageOptions = { cursor?: string; limit?: number };
 export type TerminalListOptions = PageOptions & { history?: boolean; owner?: string; state?: string };
 export type ListOptions = PageOptions & { history?: boolean; owner_run?: string; actor?: string; status?: string; native_only?: boolean };
 export type EventOptions = { after?: string; limit?: number; wait_ms?: number };
+export type TraceContext = { traceparent: string; tracestate?: string };
 export type ClientOptions = {
     baseUrl: string;
     credential?: () => string | undefined | Promise<string | undefined>;
+    /** Read the active span's W3C context once per request or stream open. */
+    traceContext?: () => TraceContext | undefined;
     fetchImpl?: typeof fetch;
     /** The app's name and build, sent as `x-st3-client` ("smalltalk-ios 1.0 (42)"). st lists it as
      * reported (clients.list); it is never identity or authority. */
@@ -60,6 +63,10 @@ export type CollectionStreamOptions = {
     /** Called once when the socket ends: without an error after a normal close. Open a new
      * socket and subscribe again; its snapshots are authoritative. */
     onEnd?: (error?: Error) => void;
+    /** Called when the WebSocket reports open, before queued commands are flushed. Observer errors are isolated. */
+    onOpen?: () => void;
+    /** Called after a collection command is passed to socket.send, including queued commands. Observer errors are isolated. */
+    onCommandSent?: (command: { readonly kind: 'subscribe' | 'unsubscribe'; readonly id: string }) => void;
     socket?: CollectionSocketFactory;
 };
 export type CollectionStream = {
@@ -129,6 +136,7 @@ function bounded(value: number | undefined, maximum: number, name: string): void
 export class St3Client {
     private readonly baseUrl: string;
     private readonly credential?: ClientOptions['credential'];
+    private readonly traceContext?: ClientOptions['traceContext'];
     private readonly client?: string;
     private readonly fetchImpl: typeof fetch;
     private discovered?: EnvelopeOf<Capabilities>;
@@ -136,6 +144,7 @@ export class St3Client {
     constructor(options: ClientOptions) {
         this.baseUrl = options.baseUrl.replace(/\/+$/, '');
         this.credential = options.credential;
+        this.traceContext = options.traceContext;
         this.client = options.client;
         this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
     }
@@ -150,6 +159,18 @@ export class St3Client {
         return this.discovered ?? this.capabilities();
     }
 
+    private applyTraceContext(headers: Record<string, string>): void {
+        const context = this.traceContext?.();
+        if (!context) return;
+        const parent = context.traceparent;
+        if (parent.length !== 55 || !/^[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/.test(parent)
+            || parent.slice(0, 2) === 'ff'
+            || parent.slice(3, 35) === '00000000000000000000000000000000'
+            || parent.slice(36, 52) === '0000000000000000') return;
+        headers.traceparent = parent;
+        if (context.tracestate !== undefined) headers.tracestate = context.tracestate;
+    }
+
     private async request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, idempotencyKey?: string, raw?: { contentType: string }): Promise<EnvelopeOf<T>> {
         const credential = await this.credential?.();
         const headers: Record<string, string> = { Accept: 'application/json', 'x-st3-features': 'custom-subjects.v1, conversation-blocks.v1' };
@@ -157,6 +178,7 @@ export class St3Client {
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
         if (body !== undefined) headers['Content-Type'] = raw?.contentType ?? 'application/json';
+        this.applyTraceContext(headers);
         const response = await this.fetchImpl(this.baseUrl + path, {
             method, headers, ...(body === undefined ? {} : { body: raw ? (body as BodyInit) : JSON.stringify(body) }),
         });
@@ -255,6 +277,7 @@ export class St3Client {
         const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1, conversation-blocks.v1' };
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
+        this.applyTraceContext(headers);
         const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [TERMINAL_SUBPROTOCOL, `st3.cap.${options.streamCapability}`], headers);
         let ended = false;
         const stop = () => { ended = true; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
@@ -282,6 +305,7 @@ export class St3Client {
         const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1, conversation-blocks.v1' };
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
+        this.applyTraceContext(headers);
         const socket = (options.socket ?? defaultTerminalSocket)(url.toString(), [CONVERSATION_SUBPROTOCOL], headers);
         let ended = false;
         const end = (error?: Error) => { if (ended) return; ended = true; socket.onmessage = null; socket.onclose = null; socket.onerror = null; options.onEnd?.(error); };
@@ -307,17 +331,33 @@ export class St3Client {
         const headers: Record<string, string> = { 'x-st3-features': 'custom-subjects.v1, conversation-blocks.v1' };
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
+        this.applyTraceContext(headers);
         const socket = (options.socket ?? (defaultTerminalSocket as unknown as CollectionSocketFactory))(url.toString(), [COLLECTIONS_SUBPROTOCOL], headers);
         let ended = false, open = false;
-        const waiting: string[] = [];
+        const waiting: Record<string, unknown>[] = [];
         const stop = () => { ended = true; socket.onopen = null; socket.onmessage = null; socket.onclose = null; socket.onerror = null; };
         const end = (error?: Error) => { if (ended) return; stop(); options.onEnd?.(error); };
+        const notify = (callback: () => void) => {
+            try { callback(); } catch (error) {
+                end(error as Error);
+                socket.close(1000);
+            }
+        };
+        const sendNow = (command: Record<string, unknown>) => {
+            if (ended) return;
+            socket.send(JSON.stringify(command));
+            const kind = command.kind;
+            const id = command.id;
+            const onCommandSent = options.onCommandSent;
+            if ((kind === 'subscribe' || kind === 'unsubscribe') && typeof id === 'string' && onCommandSent) {
+                notify(() => onCommandSent({ kind, id }));
+            }
+        };
         const send = (command: Record<string, unknown>) => {
             if (ended) return;
-            const text = JSON.stringify(command);
-            if (open) socket.send(text); else waiting.push(text);
+            if (open) sendNow(command); else waiting.push(command);
         };
-        socket.onopen = () => { open = true; for (const text of waiting.splice(0)) socket.send(text); };
+        socket.onopen = () => { open = true; if (options.onOpen) notify(options.onOpen); for (const command of waiting.splice(0)) { if (ended) break; sendNow(command); } };
         socket.onmessage = event => {
             let frame: CollectionFrame;
             try { frame = JSON.parse(String(event.data)) as CollectionFrame; } catch { end(new Error('A collections message is not JSON')); socket.close(1000); return; }
@@ -439,6 +479,7 @@ export class St3Client {
     async missionRevise(input: Omit<ActionOf<'mission.revise'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.revise' } as ActionOf<'mission.revise'>); }
     async missionStart(input: Omit<ActionOf<'mission.start'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'mission.start' } as ActionOf<'mission.start'>); }
     async pairingRevoke(input: Omit<ActionOf<'pairing.revoke'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'pairing.revoke' } as ActionOf<'pairing.revoke'>); }
+    async promptRespond(input: Omit<ActionOf<'prompt.respond'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'prompt.respond' } as ActionOf<'prompt.respond'>); }
     async reviewApprove(input: Omit<ActionOf<'review.approve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'review.approve' } as ActionOf<'review.approve'>); }
     async reviewReject(input: Omit<ActionOf<'review.reject'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'review.reject' } as ActionOf<'review.reject'>); }
     async reviewRequestChanges(input: Omit<ActionOf<'review.request-changes'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'review.request-changes' } as ActionOf<'review.request-changes'>); }

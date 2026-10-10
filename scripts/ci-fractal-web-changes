@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Decide whether a Workspace CI event must run the fractal-web execution lane.
+
+Pull requests diff the immutable base and head SHAs from their merge base; merge groups diff the
+queued group's base and head. Both commits are fetched explicitly. Renames are split into a
+deletion and an addition, so both paths are matched. Any missing or malformed SHA, failed fetch or
+failed diff exits nonzero: it never means "no web changes". Manual runs always execute.
+"""
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+# Directory patterns end in `/**`; `*` stays within one path component.
+PATTERNS = (
+    "apps/fractal-web/**",
+    "packages/fractal-ui/**",
+    # Export graph consumed by the app/SDK and Buck's client typecheck inputs.
+    "clients/typescript/st3-client/index.ts",
+    "clients/typescript/st3-client/Models.generated.ts",
+    "clients/typescript/st3-client/Client.generated.ts",
+    "clients/typescript/st3-client/Schema.generated.ts",
+    "clients/typescript/st3-client/errors.ts",
+    "clients/typescript/st3-client/package.json",
+    "clients/typescript/st3-client/tsconfig.json",
+    "clients/typescript/st3-client/tsconfig.schema.json",
+    "clients/typescript/st3-client/types.test.ts",
+    "clients/typescript/st3-client/BUCK*",
+    "clients/typescript/st3-views/**",
+    "clients/typescript/st3-scenarios/**",
+    # Views tests and scenario lanes read committed client/scenario fixtures.
+    "fixtures/**",
+    "package.json*",
+    "pnpm-workspace.yaml*",
+    "pnpm-lock.yaml",
+    "pnpm-install-contract.json*",
+    ".npmrc",
+    "tsconfig*.json*",
+    ".buckroot*",
+    ".buckconfig*",
+    "BUCK*",
+    "buck2/**",
+    "genie/**",
+    "nix/web/**",
+    "nix/fractal-web*.nix",
+    "scripts/ci-fractal-web*",
+    "scripts/ci-typescript-client*",
+    ".github/workflows/fleet.yml*",
+    ".github/workflows/workspace-ci.ts",
+    ".github/workflows/main-upkeep.yml*",
+    ".github/workflows/cache-audit.ts",
+    ".github/repo-settings.json*",
+)
+SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def pattern_regex(pattern):
+    parts = re.split(r"(\*\*|\*)", pattern)
+    body = "".join(".*" if part == "**" else "[^/]*" if part == "*" else re.escape(part) for part in parts)
+    # DOTALL: Git paths may legally contain newlines, and `**` must still cover them.
+    return re.compile(body + r"\Z", re.DOTALL)
+
+
+MATCHERS = tuple(pattern_regex(pattern) for pattern in PATTERNS)
+
+
+def relevant_paths(paths):
+    return [path for path in paths if any(matcher.match(path) for matcher in MATCHERS)]
+
+
+def git(directory, *args):
+    return subprocess.run(["git", "-C", directory, *args], check=True, capture_output=True, text=True, timeout=45).stdout
+
+
+def changed_paths(remote, event, base, head):
+    for name, value in (("base", base), ("head", head)):
+        if not SHA.fullmatch(value):
+            raise ValueError(f"{event} {name} SHA is missing or malformed: {value!r}")
+    with tempfile.TemporaryDirectory() as directory:
+        git(directory, "init", "--quiet")
+        # Commit history without blobs: enough for the merge base and a name-only tree diff.
+        git(directory, "fetch", "--quiet", "--no-tags", "--filter=blob:none", remote, base, head)
+        start = git(directory, "merge-base", base, head).strip() if event == "pull_request" else base
+        if not SHA.fullmatch(start):
+            raise ValueError(f"no merge base for {base} and {head}")
+        output = git(directory, "diff", "--name-only", "--no-renames", "-z", start, head)
+    return [path for path in output.split("\0") if path]
+
+
+def main():
+    event = os.environ.get("EVENT", "")
+    summary = []
+    if event == "workflow_dispatch":
+        relevant, summary = True, ["Manual run: web execution is forced."]
+    elif event in ("pull_request", "merge_group"):
+        paths = changed_paths(os.environ["REMOTE"], event, os.environ.get("BASE_SHA", ""), os.environ.get("HEAD_SHA", ""))
+        matched = relevant_paths(paths)
+        relevant = bool(matched)
+        summary = [f"{len(paths)} changed path(s), {len(matched)} web-relevant."] + [f"- `{path}`" for path in matched[:50]]
+    else:
+        raise ValueError(f"unsupported event {event!r}")
+    with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+        output.write(f"relevant={'true' if relevant else 'false'}\n")
+    with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as step_summary:
+        step_summary.write("\n".join([f"fractal-web execution: **{'required' if relevant else 'not required'}**", *summary]) + "\n")
+    print(f"relevant={'true' if relevant else 'false'}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as error:  # Fail closed on every detector error.
+        detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) else str(error)
+        print(f"::error::fractal-web change detection failed: {detail}", file=sys.stderr)
+        sys.exit(1)

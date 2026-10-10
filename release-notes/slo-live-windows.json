@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Show every SLO target's live 1-minute, 5-minute and 1-hour windows on the request-latency read and in st doctor, from slo/targets.toml",
+  "replay": {
+    "status": "none",
+    "detail": "No claim, projection or replay change; the windows are process memory only and are never written to the graph."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index or migration change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "GET /v1/client/request-latency keeps its routes array and adds targets and paths. st doctor adds slo/ lines; a missed target is info, never warn or fail, so doctor --strict and its exit status are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Normal restart on deploy; the windows start empty after each restart."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Nothing to configure; the targets file is built into the daemon."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swapping back to an older build drops only the in-memory windows and the added fields."
+  }
+}

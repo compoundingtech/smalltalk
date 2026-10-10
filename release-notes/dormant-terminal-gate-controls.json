@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add dormant test-registered terminal-gate operator controls.",
+  "replay": {
+    "status": "none",
+    "detail": "Test-only operator, decoder and private fixture schema; no production registration, bridge, Doctor wiring or public contract change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Test-only operator, decoder and private fixture schema; no production registration, bridge, Doctor wiring or public contract change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Test-only operator, decoder and private fixture schema; no production registration, bridge, Doctor wiring or public contract change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test-only operator, decoder and private fixture schema; no production registration, bridge, Doctor wiring or public contract change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Test-only operator, decoder and private fixture schema; no production registration, bridge, Doctor wiring or public contract change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Test-only operator, decoder and private fixture schema; no production registration, bridge, Doctor wiring or public contract change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Test-only operator, decoder and private fixture schema; no production registration, bridge, Doctor wiring or public contract change."
+  }
+}

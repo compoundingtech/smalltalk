@@ -29,6 +29,9 @@ pub struct SmalltalkRuntime {
     pub(crate) message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
     pub(crate) agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
     pub(crate) agent_resources_cache: Mutex<VecDeque<AgentResourcesEntry>>,
+    /// Each agent's usage fold at the newest cut a read reached, so a card refold reads only
+    /// the usage claims after it rather than the agent's whole usage history.
+    pub(crate) usage_folds: Mutex<UsageFolds>,
     /// Ordering and queue metadata for lazy HTTP pages, shared at the same graph cuts.
     pub(crate) agent_page_refs_cache: Mutex<VecDeque<AgentResourcesEntry>>,
     /// Acquire before opening a SQLite snapshot, never while pinning a WAL read mark.
@@ -43,11 +46,16 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_roster_overdue_warned: std::sync::atomic::AtomicBool,
     /// Whether a reader asked for the history roster since the refresher last folded it.
     pub(crate) agent_roster_history_wanted: std::sync::atomic::AtomicBool,
+    /// Wakes a pausing refresher for a reader that waits for a fresh roster, so that read
+    /// waits for one fold rather than the rest of the minimum pause.
+    pub(crate) agent_roster_fresh_wanted: tokio::sync::Notify,
     /// Rosters assembled in chunks because no short fold could complete them, by why.
     pub(crate) agent_roster_chunked: Mutex<BTreeMap<String, u64>>,
     /// Counts complete current roster publications, same graph index or not, so collection
     /// streams that read an earlier one reread the newer.
     pub(crate) agent_roster_published: tokio::sync::watch::Sender<u64>,
+    /// Every other collection's published view revisions, for the same rereads.
+    pub(crate) published_views: published_views::PublishedViews,
     #[cfg(test)]
     pub(crate) agent_resources_builds: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -169,6 +177,7 @@ impl Runtime for SmalltalkRuntime {
 
     fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(&RUNTIME_ID_INDEX)?;
         connection.execute_batch(arrangements::SCHEMA)?;
         usage_period::create_schema(connection)?;
         migrate_local_usage_seen(connection)?;
@@ -355,7 +364,9 @@ impl Runtime for SmalltalkRuntime {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        *self.usage_folds.lock().unwrap_or_else(PoisonError::into_inner) = UsageFolds::default();
         self.agent_roster_published.send_modify(|revision| *revision += 1);
+        self.published_views.invalidate();
         self.agent_page_refs_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

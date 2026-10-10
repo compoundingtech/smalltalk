@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Let daemon_load subscribers wait through a retryable resync, as the collection contract allows",
+  "replay": {"status": "none", "detail": "No claim replay or stored history changes."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."},
+  "compatibility": {"status": "none", "detail": "Only the load test changes. A held window that receives a retryable resync, such as a published view still being prepared, keeps waiting. Its first snapshot is still timed from its subscribe, and the report counts resyncs per collection. A resync that is not retryable still fails the subscriber."},
+  "downtime": {"status": "none", "detail": "No service interruption."},
+  "manual": {"status": "none", "detail": "No action is required."},
+  "recovery": {"status": "none", "detail": "Nothing to recover; the daemon is unchanged."}
+}

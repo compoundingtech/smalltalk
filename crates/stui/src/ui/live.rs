@@ -7,6 +7,7 @@
 //! data in place: it never empties a list or a conversation while the fresh copy is on its way.
 
 use super::adapt::{self, Extras};
+use super::direct;
 use super::glass::GlassWrite;
 use super::view::{Load, MissionPreview};
 use super::{AgentControl, Effect, Guard, Ui};
@@ -221,6 +222,7 @@ enum Fetched {
     /// st started an agent asked for here.
     /// st started a shell asked for here.
     TerminalStarted(String),
+    MachinesFailed(String),
     /// A direct stream to an agent's (or a shell's) PTY session.
     Native {
         agent: String,
@@ -372,6 +374,8 @@ pub fn run(context: Context) -> Result<()> {
     // The runtimes of the agent whose terminal view is open, to follow it again after a pause.
     let mut terminal_runtimes: Option<Vec<String>> = None;
     let mut terminal_runtimes_by_agent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // The fleet host that owns each opened terminal, so a dropped stream attaches again directly.
+    let mut terminal_owners: BTreeMap<String, String> = BTreeMap::new();
     // Attaching a dropped terminal again: whether a try is out, and how many failed.
     let mut reattaching = false;
     // When a terminal was asked for, while it connects: the wait is shown, and a long one named.
@@ -393,6 +397,12 @@ pub fn run(context: Context) -> Result<()> {
     let mut clients_read: Option<Instant> = None;
     let mut clients_reading = false;
     let mut usage_reading = false;
+    // The machine list has no stream of its own, and a cached copy can be days old. It is read
+    // again when a connection goes live and whenever st's live summary counts a different number
+    // of machines, never on a timer.
+    let mut machines_stale = true;
+    let mut machines_reading = false;
+    let mut summary_machines: Option<u64> = None;
     // The palette's conversation search: what st was last asked, and what is typed since when.
     let mut said_asked: Option<String> = None;
     let mut said_typed: Option<(String, Instant)> = None;
@@ -428,6 +438,7 @@ pub fn run(context: Context) -> Result<()> {
                 feed::Update::GlassesVersion(version) => super::set_glasses_version(version),
                 feed::Update::Connected(member) => {
                     client = member;
+                    machines_stale = true;
                     extras.live = false;
                     attached = None;
                     shown_tab = usize::MAX;
@@ -464,6 +475,11 @@ pub fn run(context: Context) -> Result<()> {
                             Resource::Summary(summary) => Some(summary.clone()),
                             _ => None,
                         });
+                        let counted = extras.summary.as_ref().map(machines_counted);
+                        if counted != summary_machines {
+                            summary_machines = counted;
+                            machines_stale = true;
+                        }
                         changed = true;
                         continue;
                     }
@@ -682,7 +698,15 @@ pub fn run(context: Context) -> Result<()> {
                         }
                     }
                 }
-                Fetched::Machines(machines) => model.machines = machines,
+                Fetched::Machines(machines) => {
+                    machines_reading = false;
+                    model.machines = machines;
+                }
+                Fetched::MachinesFailed(why) => {
+                    // Asked again when the connection or st's count changes, not at once.
+                    machines_reading = false;
+                    ui.flash(format!("Could not load machines: {why}"));
+                }
                 Fetched::Older {
                     target,
                     session_id,
@@ -742,10 +766,14 @@ pub fn run(context: Context) -> Result<()> {
                         ));
                     }
                     let (rows, columns) = ui.terminal_size.get();
+                    let route = direct.route.clone();
                     if let Some(view) = ui
                         .terminal_view_mut(&agent)
                         .filter(|view| view.native.is_none())
                     {
+                        // The route stays in the header, so the person can always see it.
+                        view.name = format!("{} · {route}", view.name);
+                        view.title = view.name.clone();
                         view.native = Some(super::pty::NativeTerminal::spawn(
                             direct.stream,
                             &direct.name,
@@ -755,6 +783,7 @@ pub fn run(context: Context) -> Result<()> {
                         ));
                         view.stale = None;
                     }
+                    ui.flash(format!("Attached · {route}"));
                 }
                 Fetched::Reattached { agent, outcome } => {
                     reattaching = false;
@@ -849,6 +878,19 @@ pub fn run(context: Context) -> Result<()> {
                     }
                 });
             }
+        }
+        // The machines shown follow the live connection and st's own count of them.
+        if machines_stale && extras.live && !machines_reading {
+            machines_stale = false;
+            machines_reading = true;
+            let client = client.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                let _ = tx.send(match model::read_machines(&client).await {
+                    Ok(collection) => Fetched::Machines(collection),
+                    Err(error) => Fetched::MachinesFailed(error.to_string()),
+                });
+            });
         }
         // Ctrl+K asks st's conversation search once what is typed has been still for a moment;
         // an answer to an earlier query is dropped where it lands (Ui::said_choices).
@@ -1099,9 +1141,14 @@ pub fn run(context: Context) -> Result<()> {
                             agent.clone()
                         }
                     });
+                    let owner = terminal_owner(&model, &agent, found, &runtime_ids);
                     attached = None;
                     terminal_runtimes = Some(runtime_ids.clone());
                     terminal_runtimes_by_agent.insert(agent.clone(), runtime_ids.clone());
+                    match &owner {
+                        Some(owner) => terminal_owners.insert(agent.clone(), owner.clone()),
+                        None => terminal_owners.remove(&agent),
+                    };
                     attach_started = Some(Instant::now());
                     let _ = commands.send(Command::Unfollow);
                     {
@@ -1109,9 +1156,14 @@ pub fn run(context: Context) -> Result<()> {
                         let tx = fetched_tx.clone();
                         let agent = agent.clone();
                         runtime.spawn(async move {
-                            let attached =
-                                attach_known_then_direct(&client, &agent, known, &runtime_ids)
-                                    .await;
+                            let attached = attach_known_then_direct(
+                                &client,
+                                &agent,
+                                known,
+                                &runtime_ids,
+                                owner.as_deref(),
+                            )
+                            .await;
                             let _ = tx.send(match attached {
                                 Ok(direct) => Fetched::Native { agent, direct },
                                 Err(reason) => Fetched::NativeFailed {
@@ -1311,7 +1363,7 @@ pub fn run(context: Context) -> Result<()> {
                             // st saying no, or never reaching it.
                             let unconfirmed = error
                                 .downcast_ref::<ClientError>()
-                                .is_some_and(|error| matches!(error, ClientError::Transport(_)));
+                                .is_some_and(ClientError::outcome_unknown);
                             (plain(error), unconfirmed)
                         }),
                     ));
@@ -1452,8 +1504,16 @@ pub fn run(context: Context) -> Result<()> {
                 .get(&agent)
                 .cloned()
                 .unwrap_or_default();
+            let owner = terminal_owners.get(&agent).cloned();
             runtime.spawn(async move {
-                let outcome = attach_direct(&client, &agent, &runtime_ids, Some(&expected)).await;
+                let outcome = attach_direct(
+                    &client,
+                    &agent,
+                    &runtime_ids,
+                    Some(&expected),
+                    owner.as_deref(),
+                )
+                .await;
                 let _ = tx.send(Fetched::Reattached { agent, outcome });
             });
         }
@@ -1809,6 +1869,8 @@ fn not_applied(error: &anyhow::Error, effect: &Effect) -> bool {
         .chain()
         .filter_map(|cause| cause.downcast_ref::<ClientError>())
         .any(|error| match error {
+            // st said it queued nothing, so a fresh try with a fresh fence is safe.
+            _ if error.applied() == Some("none") => true,
             ClientError::Api(st3_client::ErrorCode::StaleFence, ..) => !attention,
             ClientError::Api(st3_client::ErrorCode::RateLimited, ..)
             | ClientError::Unreachable(_) => true,
@@ -2341,6 +2403,66 @@ async fn send_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_send_st_may_have_taken_is_unconfirmed_and_one_it_never_queued_is_tried_afresh() {
+        let answer = |applied: &str, code: st3_client::ErrorCode| -> anyhow::Error {
+            let envelope = st3_client::ErrorEnvelope {
+                api_version: "st3.client.v0".into(),
+                error_version: "st3.client.error.v0".into(),
+                request_id: "request/test".into(),
+                code: code.clone(),
+                message: "the database has not confirmed the send".into(),
+                retryable: false,
+                retry_after_ms: None,
+                details: std::collections::BTreeMap::from([(
+                    "applied".to_owned(),
+                    serde_json::json!(applied),
+                )]),
+            };
+            ClientError::Api(code, envelope.message.clone(), Box::new(envelope)).into()
+        };
+        let send = Effect::Send {
+            agent: "agent/x".into(),
+            text: "hello".into(),
+            in_reply_to: None,
+            tags: Vec::new(),
+            images: Vec::new(),
+        };
+        // `applied: "unknown"` (a code this build does not know decodes as Unknown): the exact
+        // request may have been taken. It is not retried here, and it is shown as unconfirmed.
+        let unknown = answer("unknown", st3_client::ErrorCode::Unknown);
+        assert!(!not_applied(&unknown, &send));
+        assert!(unknown.downcast_ref::<ClientError>().unwrap().outcome_unknown());
+        assert_eq!(
+            super::plain(&unknown),
+            "st may have taken it and has not confirmed it yet; sending it again is safe"
+        );
+        // `applied: "none"` with a full queue (rate limited): nothing was queued, so try again.
+        assert!(not_applied(&answer("none", st3_client::ErrorCode::RateLimited), &send));
+        assert!(!answer("none", st3_client::ErrorCode::RateLimited)
+            .downcast_ref::<ClientError>()
+            .unwrap()
+            .outcome_unknown());
+    }
+
+    #[test]
+    fn a_different_machine_count_in_the_live_summary_means_the_machine_list_is_out_of_date() {
+        let summary = |connected: u64, indirect: u64, offline: u64| -> st3_client::Summary {
+            serde_json::from_value(serde_json::json!({
+                "kind": "summary", "id": "summary/current", "revision": "r",
+                "updated_at": "2026-10-09T17:00:00Z",
+                "person_id": "person/ada", "needs_you": 0, "working_agents": 0, "active_missions": 0,
+                "machines": {"connected": connected, "indirect": indirect, "offline": offline},
+            }))
+            .unwrap()
+        };
+        // Four machines counted, whatever their reach; a machine list cached before the fifth joined
+        // (or before hetz2 did) holds fewer, and the next summary frame says so.
+        assert_eq!(machines_counted(&summary(3, 0, 1)), 4);
+        assert_eq!(machines_counted(&summary(2, 1, 1)), 4);
+        assert_ne!(machines_counted(&summary(3, 0, 0)), machines_counted(&summary(3, 0, 1)));
+    }
+
     #[test]
     fn a_slow_page_stops_the_first_screen_reading_on() {
         assert!(!super::slow_page(Duration::from_millis(400)));
@@ -3249,11 +3371,19 @@ mod tests {
     }
 }
 
+/// How many machines st's live summary counts. A different number than last time means the
+/// machine list stui holds, possibly a cached one days old, is out of date.
+fn machines_counted(summary: &st3_client::Summary) -> u64 {
+    summary.machines.connected + summary.machines.indirect + summary.machines.offline
+}
+
 /// A direct stream to a terminal's PTY session, and what it is.
 struct Direct {
     name: String,
     incarnation: String,
     stream: std::os::unix::net::UnixStream,
+    /// How it was reached, for the person: `local PTY`, `Fabric to HOST`, or `via the daemon (…)`.
+    route: String,
 }
 
 /// A direct stream to `subject`'s PTY session: st's raw terminal stream, fenced to the
@@ -3278,14 +3408,16 @@ async fn attach_known_then_direct(
     agent: &str,
     known: Option<(String, String, String)>,
     runtime_ids: &[String],
+    owner: Option<&str>,
 ) -> Result<Direct, String> {
     if let Some((name, terminal, incarnation)) = known
         && !agent.starts_with("terminal/")
-        && let Ok(direct) = attach_terminal(client, name, &terminal, incarnation).await
+        && let Ok(direct) =
+            attach_terminal(client, agent, name, &terminal, incarnation, owner, None).await
     {
         return Ok(direct);
     }
-    attach_direct(client, agent, runtime_ids, None).await
+    attach_direct(client, agent, runtime_ids, None, owner).await
 }
 
 async fn attach_direct(
@@ -3293,6 +3425,7 @@ async fn attach_direct(
     subject: &str,
     runtime_ids: &[String],
     expected: Option<&str>,
+    owner: Option<&str>,
 ) -> Result<Direct, String> {
     let mut found = Vec::new();
     if subject.starts_with("terminal/") {
@@ -3312,6 +3445,7 @@ async fn attach_direct(
             subject.trim_start_matches("terminal/").replace('/', "."),
             subject.to_owned(),
             screen.value.runtime_incarnation,
+            owner.map(str::to_owned),
         ));
     } else {
         for id in runtime_ids {
@@ -3324,17 +3458,33 @@ async fn attach_direct(
             if let (Some(terminal), Some(incarnation)) =
                 (runtime.terminal_id, runtime.incarnation_id)
             {
-                found.push((runtime.runtime_id, terminal, incarnation));
+                found.push((
+                    runtime.runtime_id,
+                    terminal,
+                    incarnation,
+                    Some(runtime.owner_host_id).filter(|host| !host.is_empty()),
+                ));
             }
         }
     }
     let mut reason = "the agent has no terminal right now".to_owned();
-    for (name, terminal, incarnation) in found {
+    for (name, terminal, incarnation, runtime_owner) in found {
         if expected.is_some_and(|expected| expected != incarnation) {
-            reason = "the terminal restarted; Ctrl+] attaches the new one".into();
+            reason = direct::RESTARTED.into();
             continue;
         }
-        match attach_terminal(client, name, &terminal, incarnation).await {
+        let owner = owner.map(str::to_owned).or(runtime_owner);
+        match attach_terminal(
+            client,
+            subject,
+            name,
+            &terminal,
+            incarnation,
+            owner.as_deref(),
+            expected,
+        )
+        .await
+        {
             Ok(direct) => return Ok(direct),
             Err(error) => reason = error,
         }
@@ -3342,13 +3492,45 @@ async fn attach_direct(
     Err(reason)
 }
 
-/// A raw attachment to one terminal's PTY session at one incarnation, and its stream.
+/// One terminal's PTY session at one incarnation, and its stream: the local socket for a terminal
+/// on this host, Fabric for one another fleet host owns. The paired-device gateway carries the
+/// bytes only for a device with no daemon of its own.
 async fn attach_terminal(
     client: &Client,
+    subject: &str,
     name: String,
     terminal: &str,
     incarnation: String,
+    owner: Option<&str>,
+    expected: Option<&str>,
 ) -> Result<Direct, String> {
+    let opened = direct::open(
+        client,
+        &direct::Terminal {
+            subject,
+            name: &name,
+            incarnation: &incarnation,
+            owner,
+            expected,
+        },
+    )
+    .await?;
+    let route = match opened {
+        direct::Opened::Stream {
+            stream,
+            name,
+            incarnation,
+            route,
+        } => {
+            return Ok(Direct {
+                name,
+                incarnation,
+                stream,
+                route,
+            });
+        }
+        direct::Opened::UseGateway { route } => route,
+    };
     let attachment = client
         .raw_terminal_attachment(terminal, &incarnation, st3_client::RawTerminalMode::Attach)
         .await
@@ -3363,6 +3545,31 @@ async fn attach_terminal(
             name,
             incarnation,
             stream,
+            route,
         })
         .map_err(|error| error.to_string())
+}
+
+/// The fleet host that owns `agent`'s terminal, as st already says it: the agent's host, or else
+/// the host of the runtime that holds the terminal.
+fn terminal_owner(
+    model: &Model,
+    agent: &str,
+    found: Option<&st3_client::Agent>,
+    runtime_ids: &[String],
+) -> Option<String> {
+    found
+        .and_then(|agent| agent.host_id.clone())
+        .filter(|host| !host.is_empty())
+        .or_else(|| {
+            model.runtimes.items.iter().find_map(|item| match item {
+                Resource::Runtime(runtime)
+                    if runtime.terminal_id.as_deref() == Some(agent)
+                        || runtime_ids.contains(&runtime.header.id) =>
+                {
+                    Some(runtime.owner_host_id.clone()).filter(|host| !host.is_empty())
+                }
+                _ => None,
+            })
+        })
 }

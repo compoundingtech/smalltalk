@@ -59,12 +59,22 @@ class Node:
         self.binary = binary
         for sub in ("bin", "home", "run", "state"):
             (root / sub).mkdir(parents=True, exist_ok=True)
-        pty = shutil.which("pty")
-        if not pty:
-            raise SystemExit("pty must be on PATH")
-        (root / "bin/pty").symlink_to(pty)
+        # The Nix sandbox has no /usr/bin/env and only /bin/sh: the daemon's login shell runs
+        # `env -0` and the stand-in runs hooks with `bash -c`, so resolve both here, before PATH is
+        # narrowed to this directory plus /usr/bin:/bin. The revision eval's seats run `sleep`.
+        for tool in ("pty", "env", "bash", "sleep"):
+            executable = shutil.which(tool)
+            if not executable:
+                raise SystemExit(f"{tool} must be on PATH")
+            (root / "bin" / tool).symlink_to(executable)
+        python = shutil.which("python3")
+        if not python:
+            raise SystemExit("python3 must be on PATH")
+        # An absolute interpreter, because the stand-in's own #!/usr/bin/env shebang cannot run there.
+        # The stand-in is copied under the node, away from the repository path it would otherwise show.
+        shutil.copy2(HERE / "claude", root / "bin/claude.py")
         stub = root / "bin/claude"
-        shutil.copy2(HERE / "claude", stub)
+        stub.write_text(f'#!/bin/sh\nexec "{python}" "{root / "bin/claude.py"}" "$@"\n')
         stub.chmod(0o755)
         self.path = f"{root / 'bin'}:/usr/bin:/bin"
         self.endpoint = root / "run/st.sock"

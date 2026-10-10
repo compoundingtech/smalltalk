@@ -50,6 +50,8 @@ pub mod mission;
 pub mod model;
 /// A driver relaunches its harness on the native session a suspended seat resumes.
 pub mod native_resume;
+/// Durable seat-scoped first native launch outcomes.
+pub mod native_seed;
 pub mod node_identity;
 // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
 pub mod omp_ask_resume;
@@ -64,6 +66,7 @@ pub use smallclaims::{performance, profile};
 pub mod projection;
 pub mod provenance;
 pub mod reconcile;
+mod relay_trace;
 pub mod rules;
 /// Observes git and gh calls without changing their command behavior.
 pub mod recorder;
@@ -84,6 +87,7 @@ pub mod sekrets;
 pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
+pub mod slo;
 pub mod startup;
 pub mod store;
 pub mod subagents;

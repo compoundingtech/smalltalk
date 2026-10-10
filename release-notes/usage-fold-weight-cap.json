@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Kept usage folds are bounded by their weight in incarnations and rollup series rather than by agent count, and a single fold too heavy to keep is folded afresh on each read",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digests change."},
+  "compatibility": {"status": "none", "detail": "Usage summaries are unchanged; only which in-memory folds are kept differs."},
+  "downtime": {"status": "none", "detail": "No startup work."},
+  "manual": {"status": "none", "detail": "No operator steps."},
+  "recovery": {"status": "none", "detail": "In-memory only; a restart or rollback folds afresh without changing durable state."}
+}

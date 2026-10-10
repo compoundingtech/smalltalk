@@ -427,6 +427,13 @@ fn list_item(line: &str) -> Option<(String, &str)> {
     None
 }
 
+/// The narrowest a column is squeezed to before the table is shown as stacked records instead.
+const MIN_COLUMN: usize = 6;
+
+/// A markdown table. It is a grid when it fits; when a cell is long or the pane is narrow the
+/// columns are narrowed and their cells wrap inside them, so it is still a table. Only when even
+/// the narrowest columns cannot fit is each row shown as a record, one `heading: value` per cell.
+/// Cells are read as inline markdown: bold, code and links keep their look and stay clickable.
 fn table(rows: &[&str], width: usize, base: Style, theme: &Theme) -> Vec<Line<'static>> {
     let cells = rows
         .iter()
@@ -434,41 +441,79 @@ fn table(rows: &[&str], width: usize, base: Style, theme: &Theme) -> Vec<Line<'s
         .map(|row| {
             row.trim_matches('|')
                 .split('|')
-                .map(|cell| cell.trim().replace("**", "").replace('`', ""))
+                .map(|cell| cell.trim().to_owned())
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
     let columns = cells.iter().map(Vec::len).max().unwrap_or(0);
-    let mut widths = vec![0; columns];
-    for row in &cells {
-        for (column, cell) in row.iter().enumerate() {
-            widths[column] = widths[column].max(self::width(cell));
-        }
-    }
-    let total = widths.iter().sum::<usize>() + columns.saturating_sub(1) * 3;
-    if total > width {
-        // Too wide to draw as a grid: fall back to "key: value" lines.
-        return cells
-            .iter()
-            .flat_map(|row| wrap(&[run(row.join(" · "), base)], width, &[], &[], None))
-            .collect();
-    }
-    let mut lines = Vec::new();
-    for (index, row) in cells.iter().enumerate() {
-        let mut spans = Vec::new();
-        for (column, w) in widths.iter().enumerate() {
-            if column > 0 {
-                spans.push(Span::styled(" │ ", theme::fg(theme.surface2)));
-            }
-            let cell = row.get(column).map(String::as_str).unwrap_or("");
+    let runs = cells
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
             let style = if index == 0 {
                 base.add_modifier(Modifier::BOLD)
             } else {
                 base
             };
-            spans.push(Span::styled(format!("{cell:<w$}", w = *w), style));
+            (0..columns)
+                .map(|column| inline(row.get(column).map(String::as_str).unwrap_or(""), style, theme))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let natural = (0..columns)
+        .map(|column| {
+            runs.iter()
+                .map(|row| row[column].iter().map(|run| width_of(&run.text)).sum::<usize>())
+                .max()
+                .unwrap_or(0)
+        })
+        .collect::<Vec<_>>();
+    let budget = width.saturating_sub(columns.saturating_sub(1) * 3);
+    let Some(widths) = fit_columns(&natural, budget) else {
+        return records(&cells, &runs, width, base, theme);
+    };
+    let mut lines = Vec::new();
+    for (index, row) in runs.iter().enumerate() {
+        let wrapped = row
+            .iter()
+            .zip(&widths)
+            .map(|(cell, w)| {
+                if cell.is_empty() {
+                    vec![Line::default()]
+                } else {
+                    wrap(cell, *w, &[], &[], None)
+                }
+            })
+            .collect::<Vec<_>>();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        for line_index in 0..height {
+            let mut spans = Vec::new();
+            for (column, w) in widths.iter().enumerate() {
+                if column > 0 {
+                    spans.push(Span::styled(" │ ", theme::fg(theme.surface2)));
+                }
+                let mut used = 0;
+                if let Some(line) = wrapped[column].get(line_index) {
+                    used = line.width();
+                    spans.extend(line.spans.iter().cloned());
+                }
+                // The last column's trailing spaces would only be copied; the others hold the grid.
+                if column + 1 < widths.len() {
+                    spans.push(Span::styled(" ".repeat(w.saturating_sub(used)), base));
+                }
+            }
+            // Nothing after the last column but what is in it: no trailing spaces to copy.
+            while let Some(last) = spans.last_mut() {
+                let kept = last.content.trim_end().len();
+                if kept == 0 {
+                    spans.pop();
+                } else {
+                    last.content = last.content[..kept].to_owned().into();
+                    break;
+                }
+            }
+            lines.push(Line::from(spans));
         }
-        lines.push(Line::from(spans));
         if index == 0 {
             let rule = widths
                 .iter()
@@ -477,6 +522,69 @@ fn table(rows: &[&str], width: usize, base: Style, theme: &Theme) -> Vec<Line<'s
                 .join("─┼─");
             lines.push(Line::from(Span::styled(rule, theme::fg(theme.surface2))));
         }
+    }
+    lines
+}
+
+/// Column widths that fit `budget`: each column's natural width when they all fit, else the
+/// widest columns give up space first, down to `MIN_COLUMN`. `None` when even that is too wide.
+fn fit_columns(natural: &[usize], budget: usize) -> Option<Vec<usize>> {
+    if natural.iter().sum::<usize>() <= budget {
+        return Some(natural.to_vec());
+    }
+    let mut widths = natural
+        .iter()
+        .map(|natural| (*natural).min(MIN_COLUMN))
+        .collect::<Vec<_>>();
+    let mut spare = budget.checked_sub(widths.iter().sum::<usize>())?;
+    while spare > 0 {
+        // The column that still wants the most gets the next cell of width.
+        let Some((column, _)) = natural
+            .iter()
+            .zip(&widths)
+            .enumerate()
+            .map(|(column, (natural, width))| (column, natural - width))
+            .filter(|(_, wants)| *wants > 0)
+            .max_by_key(|(column, wants)| (*wants, std::cmp::Reverse(*column)))
+        else {
+            break;
+        };
+        widths[column] += 1;
+        spare -= 1;
+    }
+    Some(widths)
+}
+
+/// A table too narrow for any grid: each row as a record, the heading before each value.
+fn records(
+    cells: &[Vec<String>],
+    runs: &[Vec<Vec<Run>>],
+    width: usize,
+    base: Style,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(headings) = cells.first() else {
+        return lines;
+    };
+    for (row, row_runs) in runs.iter().enumerate().skip(1) {
+        if row > 1 {
+            lines.push(Line::default());
+        }
+        for (column, cell) in row_runs.iter().enumerate() {
+            let heading = headings.get(column).map(String::as_str).unwrap_or("");
+            let first = [run(format!("{heading}: "), theme.dim())];
+            lines.extend(wrap(cell, width, &first, &[run("  ", base)], None));
+        }
+    }
+    if runs.len() == 1 {
+        lines.extend(wrap(
+            &[run(headings.join(" · "), base.add_modifier(Modifier::BOLD))],
+            width,
+            &[],
+            &[],
+            None,
+        ));
     }
     lines
 }
@@ -574,6 +682,72 @@ mod tests {
         assert_eq!(text[0], "Head");
         assert_eq!(text[2], "• a b");
         assert!(text.iter().any(|line| line.starts_with("k │ v")));
+    }
+
+    /// The "Factory / Now / Target" table from a real conversation: long cells and links.
+    const FACTORY: &str = "| Factory | Now | Target |\n|---|---|---|\n\
+        | Merges an hour while PRs wait | 2.8 | 4 |\n\
+        | Merges this hour | 2: [#2076](https://example.com/pull/2076), [#2090](https://example.com/pull/2090) | — |\n\
+        | Merge queue | 12 deep; each group carries one PR and takes 30–60 min | — |\n\
+        | Missions stalled | 9 | 0 |";
+
+    fn rendered(input: &str, width: usize) -> Vec<String> {
+        markdown(input, width, Style::default(), &crate::tests::theme())
+            .iter()
+            .map(plain)
+            .collect()
+    }
+
+    #[test]
+    fn a_table_with_long_cells_is_still_a_grid_that_fits_the_pane() {
+        for width in [60, 80, 100, 140] {
+            let text = rendered(FACTORY, width);
+            assert!(
+                text.iter().all(|line| self::width(line) <= width),
+                "{width}: {text:#?}"
+            );
+            // Still a table: a header, a rule and a separator on every row.
+            assert!(text[0].contains(" │ ") && text[0].starts_with("Factory"), "{width}: {text:#?}");
+            assert!(text[1].contains("─┼─"), "{width}: {text:#?}");
+            assert!(text[2..].iter().all(|line| line.contains(" │ ") || line.starts_with(' ')), "{width}: {text:#?}");
+            // Links read as their text; the address is not printed into the cell.
+            let all = text.join("\n");
+            assert!(all.contains("#2076") && all.contains("#2090"), "{width}: {text:#?}");
+            assert!(!all.contains("]("), "{width}: {text:#?}");
+            assert!(!all.contains("example.com"), "{width}: {text:#?}");
+            // Nothing is lost to the wrapping.
+            for word in ["Merges", "queue", "stalled", "30–60", "deep;"] {
+                assert!(all.contains(word), "{width}: missing {word}: {text:#?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_table_that_fits_is_unchanged_and_wide_ones_do_not_pad_their_last_column() {
+        let text = rendered("| k | value |\n|---|---|\n| x | y |", 40);
+        assert_eq!(text, ["k │ value", "──┼──────", "x │ y"]);
+        let wide = rendered(FACTORY, 60);
+        assert!(wide.iter().all(|line| !line.ends_with(' ')), "{wide:#?}");
+    }
+
+    #[test]
+    fn a_table_too_narrow_for_any_grid_is_stacked_as_records() {
+        let text = rendered(FACTORY, 14);
+        assert!(text.iter().all(|line| self::width(line) <= 14), "{text:#?}");
+        assert!(text.iter().any(|line| line.starts_with("Now: ")), "{text:#?}");
+        assert!(text.iter().any(|line| line.starts_with("Target: ")), "{text:#?}");
+        assert!(text.contains(&String::new()), "records are told apart by a blank line: {text:#?}");
+        assert!(!text.iter().any(|line| line.contains("─┼─")), "{text:#?}");
+    }
+
+    #[test]
+    fn column_widths_give_up_space_widest_first_and_never_below_the_minimum() {
+        assert_eq!(fit_columns(&[4, 5], 20), Some(vec![4, 5]));
+        let squeezed = fit_columns(&[4, 60, 30], 50).unwrap();
+        assert_eq!(squeezed.iter().sum::<usize>(), 50);
+        assert_eq!(squeezed[0], 4, "a short column keeps its width");
+        assert!(squeezed[1] > squeezed[2], "{squeezed:?}");
+        assert_eq!(fit_columns(&[40, 40, 40], 12), None);
     }
 
     #[test]

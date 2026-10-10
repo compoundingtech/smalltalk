@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Record/check licenses for every registry package in the frozen pnpm v9 lock.
+
+Installed manifests are authoritative. Hoisted installs can nest duplicate versions; scan
+all package-level node_modules, not just the root. For packages omitted by the installer
+(e.g. optional platform binaries), read package.json from the exact npm archive after
+verifying its lockfile integrity. Never use mutable registry license metadata or UNKNOWN.
+The lock-only mode needs only Python's standard library, no install or network.
+"""
+
+import argparse
+import base64
+import hashlib
+import io
+import json
+from pathlib import Path
+import re
+import sys
+import tarfile
+from urllib.parse import quote
+from urllib.request import urlopen
+
+ROOT = Path(__file__).resolve().parent.parent
+INVENTORY = Path("buck2/dependencies/licenses.json")
+PROVENANCE = {
+    "generated": "Do not edit; run nix develop .#web -c python3 scripts/ci-fractal-web-licenses",
+    "source": "pnpm-lock.yaml packages; installed package.json license (legacy licenses fallback); missing manifests from lock-integrity-verified npm archives",
+    "schemaVersion": 1,
+}
+
+
+def lock_packages(text):
+    # This is deliberately a fail-closed reader of pnpm's registry-only v9 projection,
+    # not a general YAML parser. Unsupported lock formats/resolutions require updating it.
+    if not re.search(r"^lockfileVersion: ['\"]?9\.0['\"]?$", text, re.M):
+        raise ValueError("expected pnpm lockfileVersion 9.0")
+    sections = re.split(r"^packages:\s*$", text, flags=re.M)
+    if len(sections) != 2:
+        raise ValueError("expected exactly one packages section")
+    section = re.split(r"^\S", sections[1], maxsplit=1, flags=re.M)[0]
+    packages = {}
+    current = None
+    for line in section.splitlines():
+        if not line.strip():
+            continue
+        if re.match(r"^  \S", line):
+            match = re.fullmatch(r"  (?:'([^']+)'|\"([^\"]+)\"|([^'\"\s][^:]*)):", line)
+            if not match:
+                raise ValueError(f"unsupported package key: {line}")
+            key = next(value for value in match.groups() if value is not None)
+            name, separator, version = key.rpartition("@")
+            if not separator or not re.fullmatch(r"(?:@[a-z0-9._-]+/)?[a-z0-9._-]+", name) or not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+-]+)?", version):
+                raise ValueError(f"unsupported registry package: {key}")
+            current = (name, version)
+            if current in packages:
+                raise ValueError(f"duplicate lock package: {key}")
+            packages[current] = None
+        elif line.startswith("    resolution:"):
+            match = re.fullmatch(r"    resolution: \{integrity: (sha512-[A-Za-z0-9+/]+={0,2})\}", line)
+            if current is None or not match or packages[current] is not None:
+                raise ValueError(f"unsupported registry resolution: {line}")
+            packages[current] = match[1]
+        elif not line.startswith("    ") or current is None:
+            raise ValueError(f"unsupported packages line: {line}")
+    if not packages or any(value is None for value in packages.values()):
+        raise ValueError("every lock package must have a sha512 registry resolution")
+    return packages
+
+
+def manifest_license(manifest):
+    value = manifest.get("license") or manifest.get("licenses")
+    if isinstance(value, list):
+        licenses = [license_string(item) for item in value]
+        if not licenses:
+            raise ValueError("empty legacy licenses")
+        return licenses[0] if len(licenses) == 1 else "(" + " OR ".join(licenses) + ")"
+    return license_string(value)
+
+
+def license_string(value):
+    if isinstance(value, dict):
+        value = value.get("type")
+    if not isinstance(value, str) or not value.strip() or value.strip().upper() == "UNKNOWN":
+        raise ValueError("missing or unsupported package license")
+    return value
+
+
+def installed_manifests(directory, keys):
+    found = {}
+    visited = set()
+
+    def package(path):
+        manifest = path / "package.json"
+        if manifest.is_file():
+            data = json.loads(manifest.read_text())
+            key = (data.get("name"), data.get("version"))
+            if key in keys:
+                license = manifest_license(data)
+                if key in found and found[key] != license:
+                    raise ValueError(f"conflicting installed licenses for {key}: {manifest}")
+                found[key] = license
+        nested = path / "node_modules"
+        if nested.is_dir():
+            scan(nested)
+
+    def scan(base):
+        identity = base.resolve()
+        if identity in visited:
+            return
+        visited.add(identity)
+        for path in sorted(base.iterdir()):
+            if path.name.startswith(".") or not path.is_dir():
+                continue
+            if path.name.startswith("@"):
+                for child in sorted(path.iterdir()):
+                    if child.is_dir():
+                        package(child)
+            else:
+                package(path)
+
+    if not directory.is_dir():
+        raise ValueError("node_modules is missing; run pnpm install --frozen-lockfile first")
+    scan(directory)
+    if not found:
+        raise ValueError("no lock packages installed; run pnpm install --frozen-lockfile first")
+    return found
+
+
+def archive_manifest(data, integrity, key):
+    expected = base64.b64decode(integrity.removeprefix("sha512-"), validate=True)
+    if hashlib.sha512(data).digest() != expected:
+        raise ValueError(f"archive integrity mismatch: {key}")
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        member = archive.getmember("package/package.json")
+        if not member.isfile():
+            raise ValueError(f"archive manifest is not a regular file: {key}")
+        manifest = json.load(archive.extractfile(member))
+    if (manifest.get("name"), manifest.get("version")) != key:
+        raise ValueError(f"archive manifest identity mismatch: {key}")
+    return manifest
+
+
+def collect_licenses(root, packages):
+    licenses = installed_manifests(root / "node_modules", packages)
+    for key in sorted(packages.keys() - licenses.keys()):
+        name, version = key
+        print(f"Not installed: {name}@{version}; resolving lock-integrity-verified archive", file=sys.stderr)
+        url = f"https://registry.npmjs.org/{quote(name, safe='@/')}/-/{name.rsplit('/', 1)[-1]}-{version}.tgz"
+        with urlopen(url, timeout=60) as response:
+            manifest = archive_manifest(response.read(), packages[key], key)
+        licenses[key] = manifest_license(manifest)
+    return [{"name": name, "version": version, "license": licenses[name, version]} for name, version in sorted(packages)]
+
+
+def check_package_set(inventory, packages):
+    entries = inventory.get("packages")
+    if not isinstance(entries, list):
+        raise ValueError("inventory packages must be an array")
+    keys = []
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"name", "version", "license"}:
+            raise ValueError("inventory entries must contain name, version and license")
+        if not isinstance(entry["name"], str) or not isinstance(entry["version"], str):
+            raise ValueError("inventory package identity must be strings")
+        license_string(entry["license"])
+        keys.append((entry["name"], entry["version"]))
+    if keys != sorted(set(keys)):
+        raise ValueError("inventory packages must be sorted and unique")
+    missing, extra = packages.keys() - set(keys), set(keys) - packages.keys()
+    if missing or extra:
+        raise ValueError(f"inventory package drift: missing={sorted(missing)}, extra={sorted(extra)}")
+
+
+def render(value):
+    return json.dumps(value, indent=2, ensure_ascii=False) + "\n"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--check", action="store_true", help="compare all recorded licenses with installed/verified archive manifests")
+    modes.add_argument("--check-lockfile", action="store_true", help="check package-set/provenance drift without node_modules or network")
+    args = parser.parse_args()
+    text = (ROOT / "pnpm-lock.yaml").read_text()
+    packages = lock_packages(text)
+    metadata = {**PROVENANCE, "lockfileSha256": hashlib.sha256(text.encode()).hexdigest()}
+    path = ROOT / INVENTORY
+    if args.check or args.check_lockfile:
+        recorded = json.loads(path.read_text())
+        check_package_set(recorded, packages)
+        if {key: value for key, value in recorded.items() if key != "packages"} != metadata:
+            raise ValueError("inventory provenance drift; regenerate dependency licenses")
+        if args.check_lockfile:
+            print(f"Dependency license lockfile check passed: {len(packages)} packages")
+            return 0
+    expected = render({**metadata, "packages": collect_licenses(ROOT, packages)})
+    if args.check:
+        if path.read_text() != expected:
+            raise ValueError("dependency licenses differ from manifests; regenerate inventory")
+        print(f"Dependency license manifest check passed: {len(packages)} packages")
+    elif not path.exists() or path.read_text() != expected:
+        if path.exists():
+            path.chmod(0o644)
+        path.write_text(expected)
+        print(f"Recorded dependency licenses: {len(packages)} packages")
+    # Git does not retain read-only permissions; generation/full checks restore them.
+    path.chmod(0o444)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (ValueError, OSError, KeyError, tarfile.TarError) as error:
+        print(f"Dependency license check failed: {error}", file=sys.stderr)
+        raise SystemExit(1)

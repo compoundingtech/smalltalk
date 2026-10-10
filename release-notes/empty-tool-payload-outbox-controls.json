@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Correct empty-tool outbox controls to use serialized camelCase fields",
+  "replay": {
+    "status": "none",
+    "detail": "Test assertion correction only; no additional runtime impact."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Test assertion correction only; no additional runtime impact."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Test assertion correction only; no additional runtime impact."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test assertion correction only; no additional runtime impact."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Test assertion correction only; no additional runtime impact."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Test assertion correction only; no additional runtime impact."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Test assertion correction only; no additional runtime impact."
+  }
+}

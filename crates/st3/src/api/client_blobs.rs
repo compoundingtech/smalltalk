@@ -623,11 +623,11 @@ agent "example/bridge" {
                 None,
             )
         };
-        let stolen = send("person/ada", "person/robin", "stolen", format!("blob/{hash}"));
+        let stolen = send("person/ada", "agent/robin", "stolen", format!("blob/{hash}"));
         assert_eq!(stolen.unwrap_err().code, "blob-not-found");
-        let missing = send("person/alex", "person/robin", "missing", format!("blob/{}", "0".repeat(64)));
+        let missing = send("person/alex", "agent/robin", "missing", format!("blob/{}", "0".repeat(64)));
         assert_eq!(missing.unwrap_err().code, "blob-not-found");
-        let sent = send("person/alex", "person/robin", "with-image", format!("blob/{hash}"))
+        let sent = send("person/alex", "agent/robin", "with-image", format!("blob/{hash}"))
             .unwrap()
             .0;
         assert_eq!(sent.attachments.len(), 1);
@@ -661,7 +661,7 @@ agent "example/bridge" {
             MessageSendRequest {
                 idempotency_key: "many".into(),
                 from: "person/alex".into(),
-                to: "person/robin".into(),
+                to: "agent/robin".into(),
                 content: "x".into(),
                 title: None,
                 in_reply_to: None,
@@ -680,13 +680,41 @@ agent "example/bridge" {
 
         // The sender and the recipient read it through the message; a bystander does not.
         let path = format!("/v1/client/blobs/{hash}?message={}", sent.subject);
-        let (status, headers, bytes) = call(&app, "GET", &path, "person/robin", None, vec![]).await;
+        let (status, headers, bytes) = call(&app, "GET", &path, "agent/robin", None, vec![]).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers["content-type"], "image/png");
         assert_eq!(bytes, image);
         let (status, _, bytes) = call(&app, "GET", &path, "person/alex", None, vec![]).await;
         assert_eq!((status, bytes), (StatusCode::OK, image.clone()));
-        let (status, _, body) = call(&app, "GET", &path, "person/blair", None, vec![]).await;
+        // Anyone may read a message that has an agent on it; only the two people of a message
+        // between people read its blobs. An API send to a person is refused, so a pair that
+        // predates the refusal is written to the graph directly.
+        let (status, _, bytes) = call(&app, "GET", &path, "person/blair", None, vec![]).await;
+        assert_eq!((status, bytes), (StatusCode::OK, image.clone()));
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/between-people".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/alex".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), json!("person/alex")),
+                    ("to".into(), json!("person/robin")),
+                    ("content".into(), json!("x")),
+                    ("status".into(), json!("sent")),
+                    ("attachments".into(), serde_json::to_value(&sent.attachments).unwrap()),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("between-people".into()),
+            })
+            .unwrap();
+        let people_path = format!("/v1/client/blobs/{hash}?message=message/between-people");
+        for reader in ["person/robin", "person/alex"] {
+            let (status, _, bytes) = call(&app, "GET", &people_path, reader, None, vec![]).await;
+            assert_eq!((status, bytes), (StatusCode::OK, image.clone()), "{reader}");
+        }
+        let (status, _, body) = call(&app, "GET", &people_path, "person/blair", None, vec![]).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{}", json_of(&body));
         let bare = format!("/v1/client/blobs/{hash}");
         let (status, _, _) = call(&app, "GET", &bare, "person/blair", None, vec![]).await;
@@ -707,7 +735,7 @@ agent "example/bridge" {
         let mut collected = Vec::new();
         loop {
             let chunk_path = format!("{bare}/chunk?message={}&offset={}", sent.subject, collected.len());
-            let (status, _, body) = call(&app, "GET", &chunk_path, "person/robin", None, vec![]).await;
+            let (status, _, body) = call(&app, "GET", &chunk_path, "agent/robin", None, vec![]).await;
             assert_eq!(status, StatusCode::OK);
             let chunk = &json_of(&body)["value"];
             assert_eq!(chunk["size"], image.len());
@@ -724,7 +752,7 @@ agent "example/bridge" {
 
         // After the retention window the bytes are gone and the message is not.
         assert_eq!(BlobDir::under(root.path()).sweep(Duration::ZERO), 1);
-        let (status, _, body) = call(&app, "GET", &path, "person/robin", None, vec![]).await;
+        let (status, _, body) = call(&app, "GET", &path, "agent/robin", None, vec![]).await;
         assert_eq!(status, StatusCode::GONE, "{}", json_of(&body));
         assert_eq!(json_of(&body)["code"], "blob-expired");
         assert_eq!(

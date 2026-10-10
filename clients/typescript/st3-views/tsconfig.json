@@ -9,9 +9,13 @@
     "lib": [
       "es2022",
       "dom"
-    ]
+    ],
+    "types": []
   },
   "include": [
     "*.ts"
+  ],
+  "exclude": [
+    "*.genie.ts"
   ]
 }

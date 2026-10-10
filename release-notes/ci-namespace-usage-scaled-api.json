@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Size daily Namespace metadata reporting for the observed workflow volume.",
+  "replay": {
+    "status": "none",
+    "detail": "CI reporting splits saturated time queries and reuses the existing runner-read token with a 4000-request cap and explicit rate-limit evidence. No runtime/database/resource-policy changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI reporting splits saturated time queries and reuses the existing runner-read token with a 4000-request cap and explicit rate-limit evidence. No runtime/database/resource-policy changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI reporting splits saturated time queries and reuses the existing runner-read token with a 4000-request cap and explicit rate-limit evidence. No runtime/database/resource-policy changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI reporting splits saturated time queries and reuses the existing runner-read token with a 4000-request cap and explicit rate-limit evidence. No runtime/database/resource-policy changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI reporting splits saturated time queries and reuses the existing runner-read token with a 4000-request cap and explicit rate-limit evidence. No runtime/database/resource-policy changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "CI reporting splits saturated time queries and reuses the existing runner-read token with a 4000-request cap and explicit rate-limit evidence. No runtime/database/resource-policy changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI reporting splits saturated time queries and reuses the existing runner-read token with a 4000-request cap and explicit rate-limit evidence. No runtime/database/resource-policy changes."
+  }
+}

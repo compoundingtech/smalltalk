@@ -523,8 +523,9 @@ fs.rmSync(delayedHelloPath, { force: true });
 
 // omp loads this extension into every in-process subagent, as a second instance sharing the
 // process-wide stash (compoundingtech/smalltalk#852). A subagent's lifecycle must leave the seat's
-// channel alone: no channel of its own, no frames from its turns, and its shutdown does not close
-// the seat's channel. Mail that arrives afterwards still reaches the top-level session.
+// channel alone: no channel of its own, and its shutdown does not close the seat's channel. Mail
+// that arrives afterwards still reaches the top-level session. st's asset reports the subagent's
+// runs on the seat's channel and nothing else of it; the legacy asset sends no frame at all.
 const subHandlers = new Map();
 const subHandedOver = [];
 mod.default({
@@ -544,11 +545,62 @@ await subHandlers.get("session_start")({}, subCtx);
 await subHandlers.get("agent_start")({}, subCtx);
 await subHandlers.get("tool_call")({ toolName: "bash", toolCallId: "sub-call", input: {} }, subCtx);
 await subHandlers.get("message_end")(messageEvent, subCtx);
+await subHandlers.get("turn_end")(messageEvent, subCtx);
+await subHandlers.get("agent_end")({ ...successfulEnd, willContinue: true }, subCtx);
 await subHandlers.get("agent_end")(successfulEnd, subCtx);
 await subHandlers.get("session_shutdown")({}, subCtx);
+// A second run fails; a third is cut short when its session shuts down first.
+await subHandlers.get("agent_start")({}, subCtx);
+await subHandlers.get("agent_end")({ messages: [{ role: "assistant", stopReason: "error" }] }, subCtx);
+await subHandlers.get("agent_start")({}, subCtx);
+await subHandlers.get("session_shutdown")({}, subCtx);
+// A subagent omp does not name reports nothing.
+await subHandlers.get("agent_start")({}, { ...subCtx, agent: { kind: "sub", depth: 1 } });
 await pause(300);
 assert.strictEqual(fs.readFileSync(pidPath, "utf8"), pidsBeforeSubagent, "a subagent opens no channel");
-assert.deepStrictEqual(readFrames().slice(framesBeforeSubagent), [], "a subagent's events reach no channel");
+const run = (event, outcome) => ({ type: "subagent", id: "0-Review", name: "task", event,
+  ...(outcome ? { outcome } : {}) });
+assert.deepStrictEqual(
+  readFrames().slice(framesBeforeSubagent),
+  process.argv[2]?.includes("st-omp-channel")
+    ? [run("start"), run("progress"), run("end", "completed"), run("start"), run("end", "failed"),
+      run("start"), run("end", "interrupted")]
+    : [],
+  "a subagent's events reach the channel only as its runs",
+);
+// While its runs last, st's asset reports each minute every subagent omp says is busy, as in a long
+// tool call. A subagent whose session went idle without its end reports nothing, so st ends it once
+// it has been quiet long enough.
+const heartbeats = [];
+const realSetInterval = globalThis.setInterval;
+globalThis.setInterval = (callback, ms) => {
+  heartbeats.push({ callback, ms });
+  return realSetInterval(() => {}, 2 ** 30);
+};
+const busyCtx = { ...subCtx, isIdle: () => false };
+const quietCtx = { ...subCtx, isIdle: () => true, agent: { ...subCtx.agent, id: "1-Quiet" } };
+const framesBeforeHeartbeat = readFrames().length;
+await subHandlers.get("agent_start")({}, busyCtx);
+await subHandlers.get("agent_start")({}, quietCtx);
+globalThis.setInterval = realSetInterval;
+assert.deepStrictEqual(
+  heartbeats.map(({ ms }) => ms),
+  process.argv[2]?.includes("st-omp-channel") ? [60_000] : [],
+  "one heartbeat serves every running subagent",
+);
+heartbeats[0]?.callback();
+await subHandlers.get("agent_end")(successfulEnd, busyCtx);
+await subHandlers.get("session_shutdown")({}, quietCtx);
+await pause(300);
+const quiet = (event, outcome) => ({ ...run(event, outcome), id: "1-Quiet" });
+assert.deepStrictEqual(
+  readFrames().slice(framesBeforeHeartbeat).filter((frame) => frame.type === "subagent"),
+  process.argv[2]?.includes("st-omp-channel")
+    ? [run("start"), quiet("start"), run("progress"), run("end", "completed"),
+      quiet("end", "interrupted")]
+    : [],
+  "a heartbeat reports only the subagents whose sessions are busy",
+);
 // Still mid-turn from the subagent's point of view; the seat's session is idle, so mail goes now.
 fs.appendFileSync(outboxPath, JSON.stringify({
   type: "message",

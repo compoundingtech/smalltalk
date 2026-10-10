@@ -1,0 +1,150 @@
+{
+  "format": "st3.scenario.rebase-vectors.v1",
+  "vectors": [
+    {
+      "anchor": "2030-01-01T12:00:00.000Z",
+      "expected": {
+        "_tag": "ok",
+        "value": {
+          "micro_a": "2030-01-02T11:59:01.750Z",
+          "micro_b": "2030-01-02T11:59:01.750Z",
+          "milli": "2030-01-02T11:59:01.750Z",
+          "offset": "2030-01-02T12:00:01.500Z",
+          "second": "2030-01-02T11:59:01.500Z"
+        }
+      },
+      "input": {
+        "micro_a": "2030-01-01T11:59:00.250999Z",
+        "micro_b": "2030-01-01T11:59:00.250001Z",
+        "milli": "2030-01-01T11:59:00.250Z",
+        "offset": "2030-01-01T13:00:00+01:00",
+        "second": "2030-01-01T11:59:00Z"
+      },
+      "name": "second, millisecond and microsecond inputs; a now with nonzero milliseconds",
+      "now": 1893585601500,
+      "times": [
+        {
+          "codec": "timestamp",
+          "pointer": "/second"
+        },
+        {
+          "codec": "timestamp",
+          "pointer": "/milli"
+        },
+        {
+          "codec": "timestamp",
+          "pointer": "/micro_a"
+        },
+        {
+          "codec": "timestamp",
+          "pointer": "/micro_b"
+        },
+        {
+          "codec": "timestamp",
+          "pointer": "/offset"
+        }
+      ]
+    },
+    {
+      "anchor": "2030-01-01T12:00:00.000Z",
+      "expected": {
+        "_tag": "ok",
+        "value": {
+          "id": "message/scenario-2030-01-01T11:59:00.000Z",
+          "list": [
+            {
+              "a/b": "2030-01-01T10:00:00.000Z"
+            }
+          ],
+          "observed_at_unix_ms": 1893495540000,
+          "text": "2030-01-01T11:59:00.000Z",
+          "timeout_ms": 60000
+        }
+      },
+      "input": {
+        "id": "message/scenario-2030-01-01T11:59:00.000Z",
+        "list": [
+          {
+            "a/b": "2030-01-01T11:00:00.000Z"
+          }
+        ],
+        "observed_at_unix_ms": 1893499140000,
+        "text": "2030-01-01T11:59:00.000Z",
+        "timeout_ms": 60000
+      },
+      "name": "epoch-ms integers move; durations, content and ids equal to a timestamp do not",
+      "now": 1893495600000,
+      "times": [
+        {
+          "codec": "epoch-ms",
+          "pointer": "/observed_at_unix_ms"
+        },
+        {
+          "codec": "timestamp",
+          "pointer": "/list/0/a~1b"
+        }
+      ]
+    },
+    {
+      "anchor": "2030-01-01T12:00:00.000Z",
+      "expected": {
+        "_tag": "ok",
+        "value": {
+          "at": "2030-01-01T11:00:00.000Z"
+        }
+      },
+      "input": {
+        "at": "2030-01-01T11:00:00.000Z"
+      },
+      "name": "now equal to the anchor leaves values unchanged",
+      "now": 1893499200000,
+      "times": [
+        {
+          "codec": "timestamp",
+          "pointer": "/at"
+        }
+      ]
+    },
+    {
+      "anchor": "2030-01-01T12:00:00.000Z",
+      "expected": {
+        "_tag": "range-error",
+        "pointer": "/late"
+      },
+      "input": {
+        "late": "9999-12-31T00:00:00.000Z",
+        "ok": "2030-01-01T11:00:00.000Z"
+      },
+      "name": "a shift past 9999-12-31 is rejected naming the pointer",
+      "now": 1893672000000,
+      "times": [
+        {
+          "codec": "timestamp",
+          "pointer": "/ok"
+        },
+        {
+          "codec": "timestamp",
+          "pointer": "/late"
+        }
+      ]
+    },
+    {
+      "anchor": "2030-01-01T12:00:00.000Z",
+      "expected": {
+        "_tag": "range-error",
+        "pointer": "/early"
+      },
+      "input": {
+        "early": "0001-01-01T00:00:00.000Z"
+      },
+      "name": "a shift before 0001-01-01 is rejected naming the pointer",
+      "now": 1893499199999,
+      "times": [
+        {
+          "codec": "timestamp",
+          "pointer": "/early"
+        }
+      ]
+    }
+  ]
+}

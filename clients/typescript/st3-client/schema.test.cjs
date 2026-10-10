@@ -4,6 +4,29 @@ const assert = require('node:assert/strict');
 // Node 24 loads the generated TypeScript directly, without a transpilation copy.
 const modules = Promise.all([import('effect'), import('./Schema.generated.ts')]);
 
+test('person-ask mission rows retain actor references through the generated decoder', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const wire = require('../../../docs/st3/client-v0/fixtures/person-ask-mission.json');
+    const decode = Rich.decodeUnknownSync(Rich.Mission, 'strict');
+    const roundTrip = Schema.encodeSync(Rich.Mission)(decode(wire));
+    assert.equal(roundTrip.run_details[0].current_steps[0].assignee, 'person/avery');
+    assert.equal(roundTrip.run_details[0].steps[0].assignee, 'person/avery');
+    assert.equal(roundTrip.run_details[0].steps[0].wake.assignee, 'person/avery');
+    assert.equal(roundTrip.run_details[0].steps[0].claimant, null);
+    for (const actor of ['agent/asker', 'daemon/reconciler', 'person/avery']) {
+        const row = structuredClone(wire);
+        row.run_details[0].current_steps[0].assignee = actor;
+        row.run_details[0].current_steps[0].claimant = actor;
+        row.run_details[0].steps[0].assignee = actor;
+        row.run_details[0].steps[0].claimant = actor;
+        row.run_details[0].steps[0].wake.assignee = actor;
+        assert.equal(Schema.encodeSync(Rich.Mission)(decode(row)).run_details[0].steps[0].claimant, actor);
+    }
+    const invalid = structuredClone(wire);
+    invalid.run_details[0].steps[0].assignee = 'mission/not-an-actor';
+    assert.throws(() => decode(invalid));
+});
+
 test('timestamp codecs reject normalized invalid calendar dates and preserve instants', async () => {
     const [{ DateTime, Schema }, Rich] = await modules;
     const decode = Rich.decodeUnknownSync(Rich.Timestamp);
@@ -25,6 +48,55 @@ test('unknown cases round-trip tolerantly and reject in both strict decoding API
     assert.deepEqual(Effect.runSync(Rich.decodeUnknownEffect(Rich.ErrorCode)('future-error')), future);
     assert.throws(() => Effect.runSync(Rich.decodeUnknownEffect(Rich.ErrorCode, 'strict')('future-error')));
     assert.throws(() => Schema.encodeSync(Rich.ErrorCode)({ _tag: 'Unknown', raw: 'not-found' }));
+});
+
+test('optional agent lifecycle preserves known values and absence while future values keep roster rows', async () => {
+    const [{ Effect, Schema }, Rich] = await modules;
+    const wire = {
+        id: 'agent/example/worker', kind: 'agent', name: 'Worker',
+        reachability: 'local', revision: '1', runtime_ids: [], state: 'waiting',
+        updated_at: '2024-02-29T00:00:00.000Z',
+    };
+    for (const mode of ['tolerant', 'strict']) {
+        const decode = Rich.decodeUnknownSync(Rich.Agent, mode);
+        const absent = decode(wire);
+        assert.equal(Object.hasOwn(absent, 'lifecycle'), false);
+        assert.equal(Object.hasOwn(Schema.encodeSync(Rich.Agent)(absent), 'lifecycle'), false);
+        for (const lifecycle of ['standing', 'owner', 'bounded']) {
+            const decoded = decode({ ...wire, lifecycle });
+            assert.equal(decoded.lifecycle, lifecycle);
+            assert.equal(Schema.encodeSync(Rich.Agent)(decoded).lifecycle, lifecycle);
+            assert.equal(Effect.runSync(Rich.decodeUnknownEffect(Rich.Agent, mode)({ ...wire, lifecycle })).lifecycle, lifecycle);
+        }
+    }
+
+    const future = { ...wire, lifecycle: 'future-kind' };
+    const unknown = { _tag: 'Unknown', raw: 'future-kind' };
+    const decoded = Rich.decodeUnknownSync(Rich.Agent)(future);
+    assert.deepEqual(decoded.lifecycle, unknown);
+    assert.equal(Schema.encodeSync(Rich.Agent)(decoded).lifecycle, 'future-kind');
+    assert.deepEqual(Effect.runSync(Rich.decodeUnknownEffect(Rich.Agent)(future)).lifecycle, unknown);
+    assert.throws(() => Rich.decodeUnknownSync(Rich.Agent, 'strict')(future));
+    assert.throws(() => Effect.runSync(Rich.decodeUnknownEffect(Rich.Agent, 'strict')(future)));
+    assert.throws(() => Schema.encodeSync(Rich.Agent)({ ...decoded, lifecycle: { _tag: 'Unknown', raw: 'standing' } }));
+
+    const roster = {
+        kind: 'page', collection: 'agents', filters: {},
+        items: [wire, future], page: { limit: 50, has_more: false },
+    };
+    const page = Rich.decodeUnknownSync(Rich.Page)(roster);
+    assert.equal(page.items.length, 2);
+    assert.equal(Object.hasOwn(page.items[0], 'lifecycle'), false);
+    assert.equal(page.items[1].id, wire.id);
+    assert.equal(page.items[1].name, wire.name);
+    assert.equal(page.items[1].state, wire.state);
+    assert.deepEqual(page.items[1].lifecycle, unknown);
+    const encoded = Schema.encodeSync(Rich.Page)(page);
+    assert.equal(encoded.items.length, 2);
+    assert.equal(Object.hasOwn(encoded.items[0], 'lifecycle'), false);
+    assert.equal(encoded.items[1].lifecycle, 'future-kind');
+    assert.throws(() => Rich.decodeUnknownSync(Rich.Page, 'strict')(roster));
+    assert.throws(() => Effect.runSync(Rich.decodeUnknownEffect(Rich.Page, 'strict')(roster)));
 });
 
 test('recursive Glass layouts enforce child bounds and strict nested keys', async () => {

@@ -754,6 +754,29 @@ impl Store {
     pub fn custom_subject(&self, subject: &str) -> Result<Option<Value>> {
         source(&self.readers.get(), subject)
     }
+    /// Which of these subjects are registered custom sources, in one read.
+    pub fn registered_custom_subjects(&self, subjects: &[String]) -> Result<BTreeSet<String>> {
+        if subjects.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, body FROM custom_sources
+             WHERE subject IN (SELECT value FROM json_each(?1))",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(subjects)?], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut registered = BTreeSet::new();
+        for row in rows {
+            let (subject, body) = row?;
+            // `custom_subject` reports a source whose body does not parse as unregistered.
+            if serde_json::from_str::<Value>(&body).is_ok() {
+                registered.insert(subject);
+            }
+        }
+        Ok(registered)
+    }
     pub fn custom_subjects(
         &self,
         kind: Option<&str>,
@@ -865,7 +888,10 @@ pub(super) fn attention_item(body: &Value, at: u128) -> Result<AttentionItemView
         requester_id: body["owner"].as_str().map(str::to_owned),
         launch_id: None,
         variant_id: None,
-        message_id: None,
+        message_id: None, answers: Vec::new(),
+        conversation: body["owner"]
+            .as_str()
+            .and_then(super::attention_snapshot::agent),
         title: a["title"].as_str().unwrap_or_default().into(),
         detail: a["detail"].as_str().unwrap_or_default().into(),
         request: None,
