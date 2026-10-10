@@ -676,7 +676,8 @@ const renderTreeElement = (element: React.ReactElement): React.ReactElement => e
 
 /** The live host owns roster presentation and arrangement edits; RAC owns hierarchy and focus. */
 const BoundAgentFolders = (props: AgentFoldersProps) => {
-  const layout = React.useMemo(() => new ListLayout({ estimatedRowSize: 48, padding: 4 }), [])
+  // The live roster already supplies its 8px inset; avoid a second inset on nested titles.
+  const layout = React.useMemo(() => new ListLayout({ estimatedRowSize: 48, padding: 0 }), [])
   const treeRef = React.useRef<HTMLDivElement>(null)
   const expanded = new Set<Key>()
   const foldersById = new Map<string, SidebarNode>()
@@ -723,7 +724,7 @@ const BoundAgentFolders = (props: AgentFoldersProps) => {
     <TreeItem key={node.id} id={node.id} textValue={node.label} hasChildItems={node._tag !== 'Agent'} onAction={node._tag === 'Agent' ? () => props.onSelect?.(node.id) : undefined} data-wf-agent-ref={node._tag === 'Agent' ? node.subject : undefined} className={treeItemClassName}>
       <TreeItemContent>
         {({ level, isExpanded }) => (
-          <div data-sidebar-content="" style={{ marginInlineStart: (level - 1) * 16, position: 'relative' }}>
+          <div data-sidebar-content="" style={{ marginInlineStart: (level - 1) * 8, position: 'relative' }}>
             <AriaButton slot="drag" aria-label={`Move ${node.label}`} {...stylex.props(styles.drag)} />
             {node._tag === 'Agent' ? props.renderAgent?.(node) : (
               <div {...stylex.props(styles.folder)}>

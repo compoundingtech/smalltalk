@@ -51,10 +51,10 @@ const mount = async () => {
   return { host, row, toggles, dispose: async () => { await React.act(async () => root.unmount()); host.remove() } }
 }
 describe('bound live folder tree', () => {
-  it('derives levels and 16px offsets from RAC hierarchy, including folder members and Unfiled', async () => {
+  it('derives levels and compact 8px offsets from RAC hierarchy, including folder members and Unfiled', async () => {
     const view = await mount()
     try {
-      for (const [label, level, offset] of [['Alpha', 1, 0], ['Beta', 2, 16], ['Gamma', 3, 32], ['One', 2, 16], ['Two', 2, 16]] as const) {
+      for (const [label, level, offset] of [['Alpha', 1, 0], ['Beta', 2, 8], ['Gamma', 3, 16], ['One', 2, 8], ['Two', 2, 8]] as const) {
         const row = view.row(label)
         expect(row, label).toBeDefined()
         expect(row.getAttribute('aria-level'), label).toBe(String(level))

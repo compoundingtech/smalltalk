@@ -244,7 +244,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                       </div> : null}
                       <AgentFolders {...sidebarFolders} selectedId={current} onSelect={select} renderAgent={node => {
                         const row = agentsByRef.get(node.id)
-                        return row === undefined ? null : <SidebarAgentRow inTree item={sidebarRow({ agent: row, stale, now })} now={now} variant="SR-2" layout="SR2-A" glyph="SG-1" extraSignals={[]} query={search} active={current === row.ref} onOpen={() => select(row.ref)} />
+                        return row === undefined ? null : <SidebarAgentRow inTree timePlacement="subtitle" item={sidebarRow({ agent: row, stale, now })} now={now} variant="SR-2" layout="SR2-A" glyph="SG-1" extraSignals={[]} query={search} active={current === row.ref} onOpen={() => select(row.ref)} />
                       }} />
                     </nav>
                     {fleet._tag !== 'Observed' ? (
