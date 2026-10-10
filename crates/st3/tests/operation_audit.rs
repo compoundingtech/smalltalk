@@ -670,3 +670,33 @@ fn drift_repaired_during_the_audit_is_gone_from_the_next_pass() {
         assert!(old_drift(&store).is_empty());
     }
 }
+
+#[test]
+fn a_cancelled_parent_budget_cannot_turn_an_empty_audit_into_a_clean_report() {
+    let store = Store::open_memory(NODE).unwrap();
+    // Cover the ordinary idle-reader path without opening a new pool connection.
+    assert!(store.operation_projection_drift().unwrap().is_empty());
+    let budget = smallclaims::read_budget::ReadBudget::new("/operation-audit", Duration::from_secs(1));
+    budget.cancel();
+    let mut snapshots = 0;
+    let result = smallclaims::read_budget::with(Some(budget), || {
+        store.operation_projection_drift_with_observer(&mut |_| snapshots += 1)
+    });
+    assert!(result.is_err());
+    assert_eq!(snapshots, 0, "a cancelled unit must not begin a snapshot");
+}
+
+#[test]
+fn cancellation_between_units_stops_an_empty_audit() {
+    let store = Store::open_memory(NODE).unwrap();
+    let budget = smallclaims::read_budget::ReadBudget::new("/operation-audit", Duration::from_secs(1));
+    let mut snapshots = 0;
+    let result = smallclaims::read_budget::with(Some(budget.clone()), || {
+        store.operation_projection_drift_with_observer(&mut |_| {
+            snapshots += 1;
+            budget.cancel();
+        })
+    });
+    assert!(result.is_err());
+    assert_eq!(snapshots, 1, "cancellation must stop the next unit before its snapshot");
+}

@@ -23,6 +23,9 @@ fn page(
 ) -> Result<usize> {
     connection.busy_timeout(Duration::from_millis(40))?;
     for attempt in 0..3 {
+        // Cheap empty/index seeks may not reach a VM progress callback. Preserve the
+        // caller's cancellation before replacing the pool's one-step cancelled handler.
+        smallclaims::read_budget::check()?;
         let started = Instant::now();
         connection.progress_handler(1000, Some(move || {
             started.elapsed() >= Duration::from_millis(40) || smallclaims::read_budget::check().is_err()
@@ -61,6 +64,7 @@ fn page(
 
 impl Store {
     pub(super) fn operation_audit(&self, observer: &mut dyn FnMut(Duration)) -> Result<Vec<String>> {
+        smallclaims::read_budget::check()?;
         let connection = self.readers.get();
         let mut claim_cut = 0_i64;
         let mut checkpoint_cut = 0_i64;
