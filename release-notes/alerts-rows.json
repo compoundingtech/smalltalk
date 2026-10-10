@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Attention rows say whether they are alerts and name the agent conversations they belong to; the summary's needs_you becomes the alert count (everything waiting on the person except updates) and gains alerts; a harness login is one alert per person, host and login directory; alerts names the attention collection and routes",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill or stored data change. Both fields are derived on read from existing claims and run headers."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database change. The published client schema gains optional Attention.alert, Attention.conversation_id and Summary.alerts; the contract digest changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Additive optional fields (Attention.alert, conversation_id, conversation_ids; Summary.alerts) and an alerts capability; older stui and iOS builds ignore them. The alerts collection and /v1/client/alerts routes serve the attention rows; attention names keep working. The summary's needs_you now counts alerts: unread updates no longer count, and harness logins and broken gates the person published now do. Seats that share a login directory on a host now share one harness-login item (its targets name every seat) instead of one item each, so an older client shows one card for them. Older daemons omit the new fields."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; no data conversion or extra startup work."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swap back freely: nothing is stored; an older daemon counts needs_you as before."
+  }
+}

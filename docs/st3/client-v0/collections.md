@@ -18,7 +18,7 @@ Send one JSON command per subscription:
 {"kind":"subscribe","id":"missions-tab","collection":"missions","limit":50}
 ```
 
-Collections are `missions`, `attention`, `agents`, `work`, `glasses`, and `arrangements`,
+Collections are `missions`, `attention` (also subscribable as `alerts`, the name a person reads; frames name it `attention`), `agents`, `work`, `glasses`, and `arrangements`,
 plus `terminal` and `conversation` (below). The optional `actor` filter applies to work,
 `person` to attention, and `status` to agents. For `arrangements`, `person: "person/NAME"`
 is required: agents explicitly select a fleet person's collection, never an inferred
@@ -154,14 +154,16 @@ A daemon that advertises the `summary` capability version 1 accepts
 `{"kind":"subscribe","id":"top-bar","collection":"summary","limit":1}`.
 A person session uses its own authority; an agent may select `person` using the
 same access rules as attention. This is one row, `summary/current`, with
-`kind: "summary"`, `person_id`, `needs_you`, `working_agents`, `active_missions`,
+`kind: "summary"`, `person_id`, `alerts`, `needs_you`, `working_agents`, `active_missions`,
 and `machines: {connected, indirect, offline}`. Normal snapshot/changes/order
 frames apply, with `has_more: false`. There is no new HTTP list or get route.
 
 These are complete current source counts, independent of any list's page size.
-`needs_you` counts open Home items (human gates, launch/revision approvals,
-person requests and updates, agent requests, custom requests and harness
-prompts), excluding messages and faults. Local snoozes and closed rows remain
+`alerts` counts open alerts: items that block or wait on the person (human
+gates, launch/revision approvals, person asks, agent and custom requests, harness
+prompts and logins, and broken gates the person published). Updates, messages and
+agents' faults are not alerts. `needs_you` carries the same count for older clients; a daemon that
+predates alerts omits `alerts` and also counted unread updates in `needs_you`. Local snoozes and closed rows remain
 client-owned. `working_agents` uses running/working presentation, excluding
 faults and stale delivery. `active_missions` uses the shared mission words
 working, queued, decision, stalled, unstaffed and unclaimed, excluding system

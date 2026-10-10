@@ -312,6 +312,15 @@ pub struct Attention {
     pub attention_kind: String,
     pub source_id: String,
     pub person_id: String,
+    /// Whether this item blocks or waits on its person's answer; absent on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert: Option<bool>,
+    /// The agent whose conversation this item belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// Every agent conversation this item shows in, starting with `conversation_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conversation_ids: Vec<String>,
     pub requester_id: Option<String>,
     pub launch_id: Option<String>,
     pub variant_id: Option<String>,
@@ -909,6 +918,7 @@ pub struct MissionRunSummary {
     pub status: String,
     pub phase: String,
     pub progress: Value,
+    /// Step assignees and claimants are nullable ActorRef strings, not agent-only IDs.
     pub current_steps: Vec<Value>,
     pub must_act: String,
     pub state_since: String,
@@ -940,8 +950,10 @@ pub struct MissionStep {
     pub title: Option<String>,
     pub state: String,
     pub attempt: u32,
+    /// An ActorRef: agent, daemon, or person.
     #[serde(default)]
     pub assignee: Option<String>,
+    /// An ActorRef: agent, daemon, or person.
     #[serde(default)]
     pub claimant: Option<String>,
     #[serde(default)]
@@ -975,6 +987,7 @@ pub struct MissionStep {
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MissionWake {
+    /// An ActorRef: agent, daemon, or person.
     pub assignee: String,
     pub assignee_state: String,
     pub incarnation_id: String,
@@ -1609,7 +1622,11 @@ pub struct Summary {
     #[serde(flatten)]
     pub header: ResourceHeader,
     pub person_id: Option<String>,
+    /// The alert count; an older daemon also counted unread updates.
     pub needs_you: u64,
+    /// Open alerts; absent on daemons that predate alerts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alerts: Option<u64>,
     pub working_agents: u64,
     pub active_missions: u64,
     pub machines: SummaryMachines,

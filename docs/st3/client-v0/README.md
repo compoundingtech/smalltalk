@@ -45,6 +45,14 @@ run-detail endpoint. The detail uses the same enriched `Store::mission_run` read
 runs keep lightweight effective-step summaries. Headers and enrichment share one reader
 snapshot; mission lists retain their lightweight summary reads.
 
+Mission `run_details[].steps[]` and `run_details[].current_steps[]` expose nullable
+`assignee` and `claimant` actor references (`agent/...`, `daemon/...`, or `person/...`),
+not agent-only IDs. A person-ask mission therefore retains its assigned person in both
+step views. `steps[].wake.assignee` uses the same actor-reference contract, including a
+ready person's unavailable, zero-attempt wake observation. `requester` and `outcome.actor`
+also use `ActorRef`. Clients must preserve these mission rows and handle the actor family
+instead of assuming every assignee or claimant is an agent.
+
 `loop_round` and `loop_max_rounds` belong to the loop attached to that exact step in the current
 generation; they are null for a non-loop step. `loop_reason` is the observed loop-state reason.
 `next_wake_at` is the observed not-before time (earliest work eligibility), not a delivery promise
@@ -235,7 +243,7 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 
 | Resource | List and detail routes | Deterministic list order |
 |---|---|---|
-| Attention | `/attention`, `/attention/{id}` | priority descending, requested time ascending, ID |
+| Attention (alerts) | `/attention`, `/attention/{id}`; also `/alerts`, `/alerts/{id}` | priority descending, requested time ascending, ID |
 | Messages | `/messages`, `/messages/{id}` | sent time descending, ID |
 | Launches | `/launches`, `/launches/{id}` | updated time descending, ID |
 | Launch variants | `/launches/{id}/variants`, `/launches/{id}/variants/{variant_id}` | ordinal, ID |
@@ -581,6 +589,16 @@ Every attention resource carries its concrete `person_id`, original `source_id`,
 `attention_kind`, optional mission/run/step context, and currently meaningful typed actions. A
 client can therefore render a mixed inbox, navigate to the source, and act without recovering
 identity or graph context from prose.
+
+`alert` says whether the item is an alert: it blocks or waits on the person. Asks, human
+gates, launch and revision approvals, agent and custom requests, harness prompts and logins, and
+a broken gate the person published are alerts; an update, which asks nothing, is not. `conversation_id` names the agent whose
+conversation the item belongs to: the agent that asked, the agent whose work a gate reviews
+(else its run's requester), the launch's planner, the revision's proposer, or the seat itself.
+It is absent when no agent is behind the item. `conversation_ids` lists every conversation the item
+shows in, starting with `conversation_id`: a harness login alert is one alert per login directory
+and host, naming every seat that shares it, since one sign-in answers them all. Daemons that
+predate alerts omit these fields.
 
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
 generation, step, or agent), its current `state` and, when known, the `since`

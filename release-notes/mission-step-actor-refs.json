@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Preserve person-ask missions in validating clients by accepting actor references in step ownership fields",
+  "replay": {"status": "none", "detail": "No replay or backfill; existing mission projections already emit actor references."},
+  "schema": {"status": "none", "detail": "No storage schema change. The public client-v0 schema widens mission step assignee and claimant, current-step assignee and claimant, and wake assignee from AgentId to ActorRef."},
+  "rules": {"status": "none", "detail": "Assignment, claiming, authorization, and person-response rules are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Widened public ownership types accept agent, daemon, and person references while retaining existing nullability. Clients that pattern-match on agent IDs must also handle person and daemon references rather than dropping the mission row. Regenerated Rust, Swift, and TypeScript clients retain these values."},
+  "downtime": {"status": "none", "detail": "No downtime or data migration required."},
+  "manual": {"status": "none", "detail": "No operator action required."},
+  "recovery": {"status": "none", "detail": "No recovery procedure changes."}
+}

@@ -3,17 +3,6 @@
 use super::*;
 use st3_ui_model::missions::{Display, Word};
 
-pub(super) fn home_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "human-gate"
-            | "launch-approval"
-            | "revision-approval"
-            | "person-step"
-            | "agent-request"
-            | "harness-prompt"
-    ) || kind.starts_with("custom.")
-}
 pub(super) fn working(agent: &Value) -> bool {
     agent["state"] == "running"
         && agent["harness_state"] == "working"
@@ -46,10 +35,8 @@ pub(super) fn native(
         .map_err(|e| anyhow::anyhow!(e.message))?;
     let store = &state.store;
     let attention = store.attention_snapshot(person.as_deref(), now)?;
-    let needs = attention
-        .iter()
-        .filter(|item| home_kind(&item.kind))
-        .count();
+    // What needs the person is what waits on their answer: an update asks nothing.
+    let alerts = attention.iter().filter(|item| item.is_alert()).count();
     let gates = attention
         .iter()
         .filter(|item| item.kind == "human-gate")
@@ -134,7 +121,7 @@ pub(super) fn native(
     let working = agents.iter().filter(|agent| working(agent)).count();
     let machines = machine_summary_resources(state, snapshot, session)?;
     let machine_counts = machine_counts(&machines, &agents, &client_host_id(&state.node), now);
-    let mut value = json!({"person_id":person,"needs_you":needs,"working_agents":working,"active_missions":active,"machines":machine_counts});
+    let mut value = json!({"person_id":person,"alerts":alerts,"needs_you":alerts,"working_agents":working,"active_missions":active,"machines":machine_counts});
     value["revision"] = json!(smallclaims::hash::canonical_hash(&value)?);
     value["id"] = json!("summary/current");
     value["kind"] = json!("summary");

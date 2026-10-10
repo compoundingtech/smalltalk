@@ -12,6 +12,9 @@ const MESSAGE_CHANGES: &str = "SELECT DISTINCT changed.subject FROM claims chang
                           AND json_extract(child.value,'$.name')='to'
                           AND json_extract(child.value,'$.arguments[0]') IN (?2,?3)))";
 
+/// A live stream's canonical order keys, by message subject.
+type MailboxOrder = BTreeMap<String, canonical::ClaimKey>;
+
 pub(crate) struct MailboxChanges {
     pub mark: MailboxWatermark,
     pub seat: bool,
@@ -96,8 +99,54 @@ impl Store {
         })
     }
 
-    pub(crate) fn order_mailbox_messages(&self, messages: &mut [MessageView]) -> Result<()> {
-        sort_messages_canonically(&self.readers.get(), messages)
+    /// `sort_messages_canonically`, reading keys only for subjects missing from `keys`, all in
+    /// one statement. A key is the subject's first send or declaration, so it changes only
+    /// with a claim on that subject: callers remove each changed subject before ordering.
+    /// Keeps only the current mailbox's keys.
+    pub(crate) fn order_mailbox_messages(
+        &self,
+        messages: &mut [MessageView],
+        keys: &mut MailboxOrder,
+    ) -> Result<()> {
+        let mut current = MailboxOrder::new();
+        let mut missing = Vec::new();
+        for message in messages.iter() {
+            match keys.remove(&message.subject) {
+                Some(key) => {
+                    current.insert(message.subject.clone(), key);
+                }
+                None => missing.push(&message.subject),
+            }
+        }
+        if !missing.is_empty() {
+            static QUERY: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+                let position = canonical::position_sql("claims");
+                format!("SELECT claims.subject, claims.accepted_at_unix_ms, batches.origin,
+                    batches.replica_sequence, claims.batch_id, {position}, claims.id
+                    FROM claims JOIN batches ON batches.id=claims.batch_id
+                    WHERE claims.subject IN (SELECT value FROM json_each(?1))
+                      AND claims.kind IN ('message.sent','intent.desired')")
+            });
+            let connection = self.readers.get();
+            let mut statement = connection.prepare_cached(&QUERY)?;
+            let mut rows = statement.query([serde_json::to_string(&missing)?])?;
+            // ClaimKey order is the canonical order, so a subject's least key is its first claim.
+            while let Some(row) = rows.next()? {
+                let subject: String = row.get(0)?;
+                let time: String = row.get(1)?;
+                let key = (time.parse()?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?);
+                let entry = current.entry(subject).or_insert_with(|| key.clone());
+                if key < *entry {
+                    *entry = key;
+                }
+            }
+        }
+        if let Some(message) = messages.iter().find(|message| !current.contains_key(&message.subject)) {
+            anyhow::bail!("mailbox message {} has no send or declaration claim", message.subject);
+        }
+        messages.sort_by(|left, right| current[&left.subject].cmp(&current[&right.subject]));
+        *keys = current;
+        Ok(())
     }
 }
 

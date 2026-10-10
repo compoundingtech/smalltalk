@@ -1761,6 +1761,10 @@ pub struct AttentionItemView {
     pub variant_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+    /// The agent whose conversation this item belongs to: the agent that asked, whose work a
+    /// gate reviews, that planned a launch or proposed a revision, or the seat itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
     pub title: String,
     pub detail: String,
     /// The structured request a person-step ask carries.
@@ -1777,6 +1781,42 @@ pub struct AttentionItemView {
     pub requested_at_unix_ms: u128,
     #[serde(default)]
     pub actions: Vec<AttentionActionView>,
+}
+
+impl AttentionItemView {
+    /// Whether this item is an update: information its person asked for, which asks nothing.
+    pub fn is_update(&self) -> bool {
+        self.request
+            .as_ref()
+            .is_some_and(|request| request["type"] == "update")
+    }
+
+    /// Whether this item is an alert: it blocks or waits on an answer from its person.
+    pub fn is_alert(&self) -> bool {
+        attention_is_alert(&self.kind, self.is_update())
+    }
+
+    /// Every agent conversation this item shows in: its own, and for a login, every seat that
+    /// shares it, since one sign-in answers them all.
+    pub fn conversations(&self) -> Vec<String> {
+        let mut conversations = self.conversation.iter().cloned().collect::<Vec<_>>();
+        if self.kind == "harness-login" {
+            for seat in &self.targets {
+                if seat.starts_with("agent/") && !conversations.contains(seat) {
+                    conversations.push(seat.clone());
+                }
+            }
+        }
+        conversations
+    }
+}
+
+/// Whether an item of `kind` is an alert: it blocks or waits on its person. Asks, human gates,
+/// launch and revision approvals, agents' requests, harness prompts and logins, and a gate the
+/// person published that is broken all are. An update asks nothing, and a message stays in its
+/// conversation.
+pub fn attention_is_alert(kind: &str, update: bool) -> bool {
+    !update && kind != "unread-message"
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

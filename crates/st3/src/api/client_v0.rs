@@ -45,7 +45,7 @@ pub(super) async fn request_latency(
 struct CollectionSubscribe {
     kind: String,
     id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "collection_name")]
     collection: String,
     limit: Option<usize>,
     person: Option<String>,
@@ -60,6 +60,13 @@ struct CollectionSubscribe {
     capability: Option<String>,
     /// A conversation subscription names an agent or a session.
     conversation: Option<String>,
+}
+
+/// A collection's name, with `alerts` read as `attention`: the same rows under the name a person
+/// reads. Clients that predate alerts keep subscribing to `attention`.
+fn collection_name<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    Ok(if name == "alerts" { "attention".into() } else { name })
 }
 
 struct CollectionSubscription {
@@ -2176,6 +2183,9 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         })
         .collect::<Vec<_>>();
     capabilities.push(json!({"id":"summary", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
+    // Attention rows say whether each is an alert and name its agent conversation; `alerts` names
+    // the attention collection and routes, and the summary counts alerts.
+    capabilities.push(json!({"id":"alerts", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
@@ -12007,6 +12017,65 @@ mission "queue-parity" state="ready" {
         assert_eq!(page.items, changes["upserts"].as_array().unwrap().clone());
         socket.close(None).await.unwrap();
         server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fresh_agent_roster_read_cuts_the_refresh_pause_short_and_plain_reads_do_not() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/fresh-pause";
+        let append = |fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "harness.observed".into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            state.store.index().unwrap()
+        };
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"fresh-pause", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        let list = |fresh: bool| client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery { fresh, ..ClientListQuery::default() }));
+        let publishes = |cut: u64| {
+            let store = state.store.clone();
+            move |_: &u64| store.published_agent_roster(store.index().unwrap(), false)
+                .is_some_and(|(published, _, _)| published >= cut)
+        };
+
+        // A plain read asks for a refresh; once it publishes, the refresher pauses a second.
+        let working = append(json!({"state":"working", "driver":"codex", "incarnation_id":"one"}));
+        let _ = list(false).await;
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(publishes(working)))
+            .await.expect("the refresher publishes the asked-for cut").unwrap();
+
+        // Unchanged: plain reads during the pause answer from the publication and do not cut it
+        // short, however many ask.
+        let idle = append(json!({"state":"idle", "driver":"codex", "incarnation_id":"one"}));
+        for _ in 0..3 {
+            let (Extension(snapshot), Json(page)) = list(false).await.unwrap();
+            assert!(snapshot.store_index < idle, "a plain read answers from the publication");
+            assert_eq!(page.items[0]["harness_state"], "working");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), published.wait_for(publishes(idle)))
+                .await.is_err(),
+            "plain reads must not shorten the refresher's minimum pause",
+        );
+
+        // Changed: a fresh read waits for one fold, not the rest of the pause (about 750 ms here).
+        let started = std::time::Instant::now();
+        let (Extension(snapshot), Json(page)) = list(true).await.unwrap();
+        let waited = started.elapsed();
+        assert!(snapshot.store_index >= idle, "a fresh read shows what was written before it");
+        assert_eq!(page.items[0]["harness_state"], "idle");
+        assert!(waited < Duration::from_millis(500), "a fresh read waited {waited:?} for the pause");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
