@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "summary": "stui, the phone and the Rust and TypeScript clients read a send answered with details.applied: unknown as unconfirmed (repeat the identical request) and applied: none as safe to try afresh, with a plain sentence",
+  "replay": { "status": "none", "detail": "No replay, backfill, stored data or transcript change." },
+  "schema": { "status": "none", "detail": "Published schema, operations and contract digest are unchanged. The clients read the existing free-form details object of an error." },
+  "rules": { "status": "none", "detail": "No claim, checkpoint, retention or authority rule change." },
+  "compatibility": {
+    "status": "changed",
+    "detail": "An error whose details say applied: unknown is shown as 'st may have taken it and has not confirmed it yet; sending it again is safe', is kept as unconfirmed in stui, and is repeated once unchanged on the phone; applied: none lets either client try again with a fresh request. A daemon that sends neither is read as before. An error code a client does not know already decodes as unknown."
+  },
+  "downtime": { "status": "none", "detail": "Ordinary rolling deployment; no data conversion or extra startup work." },
+  "manual": { "status": "none", "detail": "No manual action is required." },
+  "recovery": { "status": "none", "detail": "No recovery, durable payload or initialization changes." }
+}

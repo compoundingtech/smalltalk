@@ -1907,10 +1907,18 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
             } else {
                 Ask::Permission
             };
+            // The tool the prompt asks to use. Its input is conversation content: a client reads
+            // the pending call from the seat's conversation, never from this replicated record.
+            let reason = payload
+                .get("tool_name")
+                .and_then(serde_json::Value::as_str)
+                .filter(|tool| !tool.is_empty())
+                .unwrap_or("permissionRequest")
+                .to_owned();
             Some(
                 Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
                     .with_ask(ask)
-                    .with_reason("permissionRequest"),
+                    .with_reason(reason),
             )
         }
         _ => None,
@@ -2354,6 +2362,17 @@ mod tests {
             fs::read_to_string(&seed).unwrap()
         );
         assert_eq!(status::read_state(&presence), status::State::Available);
+    }
+
+    #[test]
+    fn a_permission_prompt_names_its_tool_and_keeps_its_input_out() {
+        let observed = observe_hook_event(
+            "PermissionRequest",
+            &serde_json::json!({"tool_name":"Bash","tool_input":{"command":"rm -r build"}}),
+        )
+        .unwrap();
+        assert_eq!(observed.blocked_on, BlockedOn::Human);
+        assert_eq!(observed.reason.as_deref(), Some("Bash"));
     }
 
     #[test]

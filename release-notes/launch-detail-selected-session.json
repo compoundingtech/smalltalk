@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Launch details select one session before rendering instead of rendering the launch collection.",
+  "replay": {
+    "status": "none",
+    "detail": "No initialization or replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Uses existing session, candidate, preview, subject and desired primary-key indexes; no database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, authority or retention rules change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Preserves native-ID precedence, public-ID fallback, historical visibility and all launch fields. Item and envelope now use one pinned read. Detail explicitly requires read.projections for GET and HEAD; GET admission already required it. Preview declarations use selected keys with the same candidate-intent overlay. Collections, cursors, error codes and payload admission limits are unchanged. Selected-session history, variants and document payload costs remain; no bounded whole-request bytes or history-work claim."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary deployment only."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual migration or backfill."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Read-only change; source data and writer behavior are preserved."
+  }
+}

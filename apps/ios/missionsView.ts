@@ -9,7 +9,7 @@ export const WORDS = ['decision', 'stalled', 'unstaffed', 'unclaimed', 'queued',
 export type Word = typeof WORDS[number];
 
 export function wordName(word: Word): string {
-  return word === 'decision' ? 'needs you' : word;
+  return word === 'decision' ? 'alert' : word;
 }
 
 export function wordStyle(word: Word, spinner = '⠿'): { glyph: string; color: string } {

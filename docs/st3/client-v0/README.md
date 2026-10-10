@@ -66,6 +66,22 @@ Loop and wake enrichment is detail-only and bounded to open runs plus the latest
 null timing fields on lists or older finished runs are not proof of no loop or wake.
 Clients can render `round N/M · wakes in …` without reading claim envelopes.
 
+### Claim progress timestamp
+
+Work resources (`work ls` and `work show`) and enriched mission detail step rows expose
+optional nullable `progress_at`: the RFC3339 time of the latest nonempty `work.progress`
+summary in the current attempt. It belongs to the claim's progress summary, not harness
+activity. Lease renewal, incoming mail and nudge receipts do not move it; retry attempts
+start without an earlier attempt's progress. No progress summary means null on enriched
+surfaces. Older servers may omit it. When the current attempt has no progress summary, consumers can
+use the existing Work `execution_started_at_unix_ms` (execution start) as the age origin;
+if both are absent the age is unknown. This fallback adds no field or history read.
+
+Lightweight mission list cards also return null but do not hydrate progress summaries:
+that null does **not** prove no progress. Use the enriched work collection or mission
+detail for progress coverage. This field alone does not classify current idle holding
+or protective waits; it introduces no watcher, ask, gate, retry, mail or subagent predicate.
+
 ### Agent lifecycle metadata
 
 An agent roster row has an optional `lifecycle` field. The declaration currently accepts
@@ -610,6 +626,22 @@ text the harness reported. It clears when the harness reports the prompt gone, h
 answered, when Claude's terminal shows it was refused (Claude reports no event for that), or
 when the seat's runtime incarnation changes. It offers no typed action yet: its action attaches
 to the seat's terminal to answer there.
+
+A Claude permission prompt or a Codex approval request can also be answered from a client: its
+alert lists `answers` (`allow`, `deny`) under `action_parameters["prompt.respond"]` with its
+`target_id` and `episode`, and offers the typed action `prompt.respond`. The alert names only
+Claude's tool (a Codex alert names none); the call it would make (its command, path or other
+input) is conversation content, read from the seat's conversation, where the harness records the
+pending call before it asks. A client shows that pending call in full beside the answers and
+offers `allow` only when it can show it. Only the seat's person answers, only the prompt still
+waiting, and only once; the answer is recorded as a replicated `harness.diagnostic`
+(`native-prompt-answered`, naming the seat's driver). On the seat's host, Claude's prompt hook,
+which waits while Claude shows its own dialog, returns it to Claude; the Codex driver's control
+connection to the app-server sends it as the request's response (`accept`/`decline` for a
+command or file change; the requested permissions, or none, for a permissions request), which
+closes the TUI's prompt. Each waits on the exact observation its prompt wrote, so an answer to an
+earlier prompt never answers a later one. An answer in the terminal still wins at once. A
+question prompt, and prompts of other harnesses, are answered in the terminal.
 
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
 generation, step, or agent), its current `state` and, when known, the `since`

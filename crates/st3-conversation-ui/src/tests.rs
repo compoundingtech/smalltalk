@@ -761,7 +761,7 @@ fn exposed_timeline_variants_media_and_unknown_payloads_are_visible() {
         "future-secret",
         "attachment/safe",
         "image/png",
-        "transcript unavailable",
+        "transcript unavailable until the harness writes its first line",
         "Earlier history is not shown: st reads only the newest part",
     ] {
         assert!(display.contains(visible), "missing {visible}: {display}");
@@ -946,6 +946,25 @@ fn pending_binding_preserves_authorized_activity_without_claiming_an_empty_harne
     assert!(!availability.contains("nothing"));
 }
 
+#[test]
+fn a_seat_still_starting_reads_as_one_calm_line_not_an_error() {
+    // Nathan, 2026-10-10: a new agent's conversation read "transcript unavailable: transcript not
+    // bound: ..." for a while. It is startup: one quiet line, no technical reason, no claim that
+    // the harness is idle.
+    let notice = serde_json::from_value(serde_json::json!({
+        "id":"notice","sequence":4,"revision":1,"timestamp":"2026-10-05T10:00:01Z",
+        "role":"system","final":true,"type":"error",
+        "body":{"code":"transcript-not-bound","message":"transcript not bound: the SessionStart hook did not bind this incarnation",
+            "retryable":true,"details":{"not_yet":true}}
+    }))
+    .unwrap();
+    let rendered = adapt::conversation(&[notice], &Default::default());
+    let [entry] = &rendered[..] else { panic!("{rendered:?}") };
+    let Body::Event(line) = &entry.body else { panic!("{entry:?}") };
+    assert_eq!(line, "starting · transcript unavailable until the harness writes its first line");
+    assert!(!line.contains("not bound") && !line.contains("SessionStart") && !line.contains("nothing"));
+}
+
 fn review_entry(kind: &str, role: &str, body: serde_json::Value) -> st3_client::TimelineEntry {
     serde_json::from_value(serde_json::json!({
         "id":kind,"sequence":1,"revision":1,"timestamp":"2026-10-05T10:00:00Z",
@@ -1042,7 +1061,6 @@ fn review_unknown_type_and_diagnostics_are_bounded_on_unicode_boundaries() {
     assert!(matches!(&rendered[0].body, Body::Event(line)
         if line.contains('…') && line.matches('界').count() == 64));
     for (code, details) in [
-        ("transcript-not-bound", serde_json::json!({"not_yet":true})),
         ("transcript-not-bound", serde_json::json!({})),
         ("other", serde_json::json!({"severity":"warning"})),
         ("other", serde_json::json!({})),
@@ -1298,7 +1316,7 @@ fn routine_records_and_delivery_echoes_do_not_reach_the_conversation() {
         "status: failed",
         "the harness reported an error",
         "content withheld: credential",
-        "transcript unavailable",
+        "transcript unavailable until the harness writes its first line",
         "Run the clone command, then create a branch and work there.",
         "background task completed",
     ] {

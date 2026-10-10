@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Guard diagnostic CLI inventory execution with independent build provenance and tighten source parsing errors.",
+  "replay": {"status": "none", "detail": "No store replay or startup path change; the diagnostic remains explicitly invoked tooling."},
+  "schema": {"status": "none", "detail": "No database schema, index, trigger, or version change."},
+  "rules": {"status": "none", "detail": "No checkpoint rule or digest change."},
+  "compatibility": {"status": "none", "detail": "No client, peer, wire, or runtime CLI contract change. The diagnostic now refuses to launch a manifest binary without independent build attestation."},
+  "downtime": {"status": "none", "detail": "No daemon or deployment path change; the diagnostic is not a required CI gate."},
+  "manual": {"status": "none", "detail": "No installation action. Diagnostic users must supply a separately attested CLI build before its optional inventory execution can qualify."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

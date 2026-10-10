@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "fractal-ui kit: gated workbench and composer, single-commit transcript pane mount, and blue addition tint in place of green palette defaults",
+  "replay": {"status": "none", "detail": "UI development components only; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "changed", "detail": "No client protocol or deployed runtime compatibility change; workbench layouts and composer drafts are browser-local story/host state. Package entry change: @smalltalk/fractal-ui/assistant-ui/shell no longer re-exports DiffPanel, because its source highlighting loads the Markdown grammar graph and the shell entry stays runtime-free. Hosts import DiffPanel from @smalltalk/fractal-ui/assistant-ui instead."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No deployed installation action required; identity and state are unchanged."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

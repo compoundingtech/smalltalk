@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Generate a st3 TypeScript client compatible with exactOptionalPropertyTypes and enforce strict consumer compiler flags in its type checks.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or wire schema changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No API or transport behavior change. The optional client identity is assigned only when defined, preserving omitted identity behavior and supporting exactOptionalPropertyTypes. Raw client type checks also enforce verbatimModuleSyntax alongside erasableSyntaxOnly."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover."
+  }
+}

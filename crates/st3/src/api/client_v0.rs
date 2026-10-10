@@ -20,6 +20,8 @@ mod stream_start_tests;
 #[cfg(test)]
 pub(super) mod observer_subscription_detail_tests;
 #[cfg(test)]
+mod launch_detail_tests;
+#[cfg(test)]
 mod agents_window_tests;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
@@ -113,6 +115,29 @@ const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
 const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 const COLLECTION_PING_INTERVAL: Duration = Duration::from_secs(8);
 const COLLECTION_SEND_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Schedule the windows a publication made stale. A window still waiting for its first snapshot,
+/// usually because the view was not ready when it subscribed, reads at once: the publication is
+/// what it waited for, and pacing would add up to a reread interval to its first frame. Held
+/// windows are paced together as usual. Returns whether nothing is due yet.
+fn publication_rereads<'a>(
+    stale: impl Iterator<Item = (&'a String, &'a CollectionSubscription)>,
+    reread_due: &mut BTreeSet<String>,
+    refresh: &mut Vec<String>,
+    last_reread: tokio::time::Instant,
+) -> bool {
+    for (id, subscription) in stale {
+        if subscription.delivered {
+            reread_due.insert(id.clone());
+        } else {
+            refresh.push(id.clone());
+        }
+    }
+    if !reread_due.is_empty() && last_reread.elapsed() >= COLLECTION_REREAD_INTERVAL {
+        refresh.extend(reread_due.iter().cloned());
+    }
+    refresh.is_empty()
+}
 
 /// Whether a collection's rows change as time passes without a claim: attention grace periods,
 /// mission and work-queue leases, and the summary counts made of them.
@@ -419,6 +444,7 @@ async fn collection_items_with_windows(
                 let mut published = None;
                 let mut published_at = None;
                 let cached_agents = if collection == "agents" {
+                    store.note_agent_roster_read();
                     match store.agent_resources_published_at(index, false, None)? {
                         Some((cards, at)) => {
                             published_at = Some(at);
@@ -1517,6 +1543,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 reread_due.extend(others);
                 if reread_due.is_empty() && !roster_wanted || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
                 if std::mem::take(&mut roster_wanted) {
+                    state.store.note_agent_roster_read();
                     state.store.request_agent_roster_refresh();
                     last_reread = tokio::time::Instant::now();
                 }
@@ -1526,21 +1553,17 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 if result.is_err() { return; }
                 // A window read before this roster was published rereads it.
                 let published = *roster.borrow_and_update();
-                reread_due.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
-                    && s.request.collection == "agents" && s.roster_revision < published)
-                    .map(|(id, _)| id.clone()));
-                if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(reread_due.iter().cloned());
+                let stale = subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && s.request.collection == "agents" && s.roster_revision < published);
+                if publication_rereads(stale, &mut reread_due, &mut refresh, last_reread) { continue; }
             }
             result = views.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 // The same for every other published view.
                 let published = *views.borrow_and_update();
-                reread_due.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
-                    && s.view_revision < crate::store::published_views::revision(&published, &s.request.collection))
-                    .map(|(id, _)| id.clone()));
-                if reread_due.is_empty() || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
-                refresh.extend(reread_due.iter().cloned());
+                let stale = subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                    && s.view_revision < crate::store::published_views::revision(&published, &s.request.collection));
+                if publication_rereads(stale, &mut reread_due, &mut refresh, last_reread) { continue; }
             }
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && (!reread_due.is_empty() || roster_wanted || subscriptions.values().any(|s| s.ivm.is_some() && s.dirty && s.reading.is_none())) => {
                 if std::mem::take(&mut roster_wanted) { state.store.request_agent_roster_refresh(); }
@@ -2021,6 +2044,7 @@ const ACTIONS: &[&str] = &[
     "session.import",
     "work.ask",
     "custom.reply",
+    "prompt.respond",
     "work.done",
     "work.cancel-ask",
     "work.claim",
@@ -2057,6 +2081,7 @@ const ACTIONS: &[&str] = &[
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
     "custom.reply",
+    "prompt.respond",
     "arrangement.edit",
     "review.approve",
     "review.reject",
@@ -2562,11 +2587,12 @@ fn mission_list_cards_at(
                 "id":step.subject,"path":step.step,"title":step.title,"state":client_work_state(&step.status),
                 "attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,
                 "agentless":step.agentless,"since":client_timestamp(step.updated_at_unix_ms),
+                "progress_at": null,
                 "blocked_reason":step.blocked_reason.as_deref().or_else(|| scheduler_fault.as_deref().filter(|_| step.status=="pending")),"blockers":step.blockers,
                 "goals":step.goals,"constraints":step.constraints
             })).collect::<Vec<_>>();
             let current=shown.iter().filter(|s| matches!(s["state"].as_str(),Some("ready"|"claimed"|"verifying"|"blocked")))
-                .map(|s| json!({"id":s["id"],"title":s["title"],"assignee":s["assignee"],"claimant":s["claimant"],"state":s["state"],"since":s["since"]})).collect::<Vec<_>>();
+                .map(|s| json!({"id":s["id"],"title":s["title"],"assignee":s["assignee"],"claimant":s["claimant"],"state":s["state"],"since":s["since"],"progress_at":s["progress_at"]})).collect::<Vec<_>>();
             Ok::<Value,anyhow::Error>(json!({
                 "id":run["id"],"generation_id":run["generation_id"],"requester":run["requester"],
                 "status":run["status"],"phase":run["phase"],"progress":{"done":done,"total":total},
@@ -2799,6 +2825,7 @@ fn mission_resources_filtered(
                                 "claimant": step.claimant,
                                 "state": client_work_state(&step.status),
                                 "since": client_timestamp(step.updated_at_unix_ms),
+                                "progress_at": step.progress_at_unix_ms.map(client_timestamp),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -2891,6 +2918,7 @@ fn mission_resources_filtered(
                                     "agentless": step.agentless,
                                     "since": client_timestamp(step.updated_at_unix_ms),
                                     "last_progress": step.progress_summary,
+                                    "progress_at": step.progress_at_unix_ms.map(client_timestamp),
                                     "blocked_reason": step.blocked_reason.as_deref().or_else(|| run.scheduler_fault.as_deref().filter(|_| step.status == "pending")),
                                     "blockers": step.blockers,
                                     "goals": step.goals,
@@ -5308,11 +5336,34 @@ fn managed_transcript(
             ),
         }
     };
+    // A seat that started moments ago has not had time to bind a transcript, whichever piece is
+    // missing yet: that is starting up, not a fault, and a person watching a new agent is told so
+    // calmly instead of "could not be loaded".
+    let transcript = match transcript {
+        Err(missing) if !missing.not_yet && started_recently(incarnation) => {
+            Err(Missing::not_yet(missing.reason))
+        }
+        other => other,
+    };
     Ok(Some(ManagedTranscript {
         driver,
         anchor,
         transcript,
     }))
+}
+
+/// How long after a seat's incarnation starts a missing transcript binding is still startup.
+const TRANSCRIPT_STARTUP_GRACE_MS: i64 = 120_000;
+
+/// Whether `incarnation` (`PID:START`, START an RFC 3339 time) started within the startup grace.
+fn started_recently(incarnation: &str) -> bool {
+    incarnation
+        .split_once(':')
+        .and_then(|(_, started)| chrono::DateTime::parse_from_rfc3339(started).ok())
+        .is_some_and(|started| {
+            let age = chrono::Utc::now().timestamp_millis() - started.timestamp_millis();
+            (0..TRANSCRIPT_STARTUP_GRACE_MS).contains(&age)
+        })
 }
 
 /// The timeline entry that says a managed seat's native transcript is not shown, and why.
@@ -8941,7 +8992,7 @@ fn action_scope(action: &str) -> Option<&'static str> {
     ) {
         return Some("control.runtimes");
     }
-    if matches!(action, "work.done" | "custom.reply") {
+    if matches!(action, "work.done" | "custom.reply" | "prompt.respond") {
         return Some("control.attention");
     }
     Some(match action.split_once('.')?.0 {
@@ -9689,6 +9740,20 @@ async fn dispatch_action(
             "attention-migrated",
             "attention is a view; complete or remedy its source",
         ))),
+        // A person's answer to a native harness prompt, which the prompt's hook delivers.
+        "prompt.respond" => {
+            let answered = state
+                .store
+                .answer_native_prompt(
+                    &parameter_string(p, "target_id")?,
+                    &parameter_string(p, "episode")?,
+                    &parameter_string(p, "answer")?,
+                    authority_actor,
+                )
+                .map_err(ApiError::bad)?;
+            signal_changed(state);
+            Ok(vec![answered.subject])
+        }
         "custom.reply" => {
             let result = state
                 .store
@@ -12189,8 +12254,105 @@ mission "queue-parity" state="ready" {
             .filter(|row| row["scope"] == "agents-roster")
             .filter_map(|row| row["stage"].as_str().map(str::to_owned))
             .collect::<BTreeSet<_>>();
-        for stage in ["fresh-wait", "fresh-page", "refresh"] {
+        for stage in ["fresh-wait", "fresh-page"] {
             assert!(stages.contains(stage), "{stage} recorded: {stages:?}");
+        }
+        assert!(stages.contains("refresh") || stages.contains("refresh-cold"),
+            "a warm or cold refresher fold is recorded: {stages:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forgotten_agent_roster_is_refolded_before_any_read_asks() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_claim(&ClaimInput {
+            subject: "agent/forgotten".into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"forgotten", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        let complete = {
+            let store = state.store.clone();
+            move |_: &u64| store.published_agent_roster(store.index().unwrap(), false).is_some()
+        };
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(complete.clone()))
+            .await.expect("the refresher publishes the roster as it starts").unwrap();
+        let plain = || client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default()));
+
+        // A chunked replication projection, a trim or a repair forgets every kept reduction,
+        // the published roster with them. Where no agents list was read lately, the roster
+        // folds again only when a read asks: a catch-up that forgets per chunk refolds nothing.
+        state.store.forget_current_views();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), published.wait_for(complete.clone()))
+                .await.is_err(),
+            "a forget on a node nobody reads must not refold the roster",
+        );
+        assert!(plain().await.is_err(), "the first read after that finds no roster yet");
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(complete.clone()))
+            .await.expect("the read's request republishes the roster").unwrap();
+
+        // Once agents are being read, the refresher folds it again on its own: no read asks,
+        // so none finds the roster missing and waits for a fold from the log.
+        let cold_folds = || crate::api::request_latency_snapshot().into_iter()
+            .find(|row| row["scope"] == "agents-roster" && row["stage"] == "refresh-cold")
+            .map_or(0, |row| row["count"].as_u64().unwrap());
+        let before = cold_folds();
+        state.store.forget_current_views();
+        assert!(state.store.published_agent_roster(state.store.index().unwrap(), false).is_none());
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(complete))
+            .await.expect("the refresher republishes a forgotten roster unasked").unwrap();
+        assert!(cold_folds() > before, "the refold from the log lands in the refresh-cold row");
+        let (Extension(_), Json(page)) = plain().await.expect("a plain read after the refold finds a roster");
+        assert_eq!(page.items[0]["id"], "agent/forgotten");
+    }
+
+    /// What agents reads cost after every kept reduction was forgotten, on a disposable copy of
+    /// a real store (`ST_ROSTER_BACKLOG_STORE`, opened in place): a fresh and a plain first page
+    /// `ST_ROSTER_FORGET_DELAY_MS` after each forget, as a reader arriving then would see them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "agents reads after a forget on a store copy; set ST_ROSTER_BACKLOG_STORE and run with --ignored --nocapture"]
+    async fn agent_reads_after_a_forget_timing_on_a_store_copy() {
+        let Some(database) = std::env::var_os("ST_ROSTER_BACKLOG_STORE").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let delay = Duration::from_millis(std::env::var("ST_ROSTER_FORGET_DELAY_MS").ok()
+            .map_or(3000, |ms| ms.parse().unwrap()));
+        let root = tempfile::tempdir().unwrap();
+        let state = AppState {
+            store: Arc::new(Store::open(&database, "bench-host").unwrap()),
+            ..test_state(root.path())
+        };
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        let complete = {
+            let store = state.store.clone();
+            move |_: &u64| store.published_agent_roster(u64::MAX, false).is_some()
+        };
+        tokio::time::timeout(Duration::from_secs(600), published.wait_for(complete))
+            .await.expect("the refresher publishes the roster as it starts").unwrap();
+        let read = |fresh: bool| {
+            let state = state.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let answer = client_agents(State(state.clone()), Extension(new_client_snapshot(&state)),
+                    Query(ClientListQuery { fresh, limit: Some(50), ..ClientListQuery::default() })).await;
+                (started.elapsed().as_secs_f64() * 1000.0, answer.is_ok())
+            }
+        };
+        // Agents are being read, as on a node people watch.
+        let _ = read(false).await;
+        for round in 0..5 {
+            state.store.forget_current_views();
+            tokio::time::sleep(delay).await;
+            let (fresh_ms, fresh_ok) = read(true).await;
+            let (plain_ms, plain_ok) = read(false).await;
+            println!("forget round {round}: {delay:?} later fresh {fresh_ms:.1} ms ok={fresh_ok}; \
+                plain {plain_ms:.1} ms ok={plain_ok}");
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     }
 
@@ -15991,6 +16153,44 @@ mission "example/steps" state="ready" {
             .collect::<BTreeMap<_, _>>();
         assert_eq!(progress[runs[0].as_str()], "Half built.");
         assert_eq!(progress[runs[1].as_str()], Value::Null);
+        let progressed = claimed
+            .steps
+            .iter()
+            .find(|step| step.step == "build")
+            .unwrap();
+        let expected_at = progressed.progress_at_unix_ms.map(client_timestamp);
+        assert!(expected_at.is_some());
+        let projected = details.iter().find(|run| run["id"] == runs[0]).unwrap();
+        let build = projected["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["path"] == "build")
+            .unwrap();
+        assert_eq!(build["progress_at"], json!(expected_at));
+        assert_eq!(projected["current_steps"][0]["progress_at"], json!(expected_at));
+        let no_progress = details.iter().find(|run| run["id"] == runs[1]).unwrap();
+        assert!(no_progress["steps"].as_array().unwrap().iter().all(|step| step["progress_at"].is_null()));
+        // Renewing the operational lease does not prove the claimant made progress.
+        state.store.work_action(&progressed.subject, "renew", &crate::model::WorkRequest {
+            actor: progressed.claimant.clone(),
+            incarnation: Some("builder-1".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: "progress-timestamp-renew".into(),
+        }).unwrap();
+        let index = state.store.index().unwrap();
+        let work = super::client_work_resources(&state.store, None, false, client_now_ms(), index).unwrap();
+        let item = work.iter().find(|step| step["id"] == progressed.subject).unwrap();
+        assert_eq!(item["progress_at"], json!(expected_at));
+        let item_detail = super::client_work_item(&state.store, &progressed.subject, None, client_now_ms(), index)
+            .unwrap()
+            .unwrap();
+        assert_eq!(item_detail["progress_at"], json!(expected_at));
+        let cards = mission_list_cards(&state.store, &["mission/example/steps".into()]).unwrap();
+        assert!(cards[0]["run_details"].as_array().unwrap().iter().all(|run|
+            run["steps"].as_array().unwrap().iter().all(|step| step.get("progress_at") == Some(&Value::Null))));
         let tree_runs = tree["runs"]
             .as_array()
             .unwrap()
@@ -18355,6 +18555,86 @@ mission "example/zero-run" state="ready" {
             stale.reason.contains("does not name a driver process") && !stale.not_yet,
             "{stale:?}"
         );
+    }
+
+    #[test]
+    fn a_seat_that_started_moments_ago_is_starting_not_failed() {
+        // Nathan, 2026-10-10: a new agent's conversation said it could not be loaded for a
+        // while. Whatever binding piece is missing, a seat in its first minutes is starting.
+        let age = |seconds: i64| {
+            let started = chrono::Utc::now() - chrono::Duration::seconds(seconds);
+            format!("1234:{}", started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        };
+        assert!(super::started_recently(&age(5)));
+        assert!(!super::started_recently(&age(600)));
+        assert!(!super::started_recently("native-pty:current"));
+        assert!(!super::started_recently("no-colon"));
+        // A start time in the future is not "recent": the clock is wrong, not the seat young.
+        assert!(!super::started_recently(&age(-60)));
+
+        for (seconds, not_yet) in [(5, true), (600, false)] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let mut state = test_state_named(root.path(), "managed-claude-young-test");
+            state.native_session_home = Some(home);
+            let owner = "agent/managed-claude-young";
+            let incarnation = age(seconds);
+            let append = |kind: &str, fields: BTreeMap<String, Value>| {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: owner.into(),
+                        kind: kind.into(),
+                        actor: Some(owner.into()),
+                        fields,
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            };
+            append(
+                "runtime.observed",
+                BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("runtime_id".into(), json!("managed-claude-pty")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("terminal".into(), json!(true)),
+                ]),
+            );
+            append(
+                "harness.observed",
+                BTreeMap::from([
+                    ("state".into(), json!("working")),
+                    ("driver".into(), json!("claude")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("evidence_incarnation".into(), json!("4194303-1000-0")),
+                ]),
+            );
+            let session = ClientSession::local(Some("person/alex")).unwrap();
+            let items = timeline_value(
+                &state,
+                &new_client_snapshot(&state),
+                &session,
+                &super::managed_session_id(owner, &incarnation),
+                &ClientListQuery::default(),
+            )
+            .unwrap()
+            .0["items"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let notice = items
+                .iter()
+                .find(|item| item["body"]["code"] == "transcript-not-bound")
+                .expect("the timeline says why the transcript is missing");
+            assert_eq!(
+                notice["body"]["details"]["not_yet"] == true,
+                not_yet,
+                "{seconds}s old: {notice:#}"
+            );
+        }
     }
 
     #[test]

@@ -9,8 +9,19 @@ use super::theme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+/// What a button on an alert does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AlertTap {
+    /// Send one of its typed answers: `allow`, `deny`, or a structured answer's id.
+    Answer(String),
+    /// Open the alert's whole card in Now, where every kind is answered.
+    Open,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hit {
+    /// A button on an alert shown in its agent's conversation.
+    Alert(String, AlertTap),
     /// One of a structured request's named answers, by its place: chosen, then Enter sends it.
     Answer(usize),
     /// Speak into the focused message box instead of typing (voice mode).

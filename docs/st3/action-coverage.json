@@ -75,6 +75,17 @@
       "behavior": "stale source/card fences and wrong actor refused; client and CLI answers survive restart; exact replay writes no duplicate answer"
     },
     {
+      "action": "prompt.respond",
+      "tests": [
+        "crates/st3/src/store.rs::a_claude_permission_prompt_is_answered_once_by_its_person_while_it_waits",
+        "crates/st3/src/driver_hook.rs::a_permission_hook_returns_the_persons_answer_and_nothing_else",
+        "crates/st3/src/store.rs::a_codex_permission_prompt_is_answered_and_records_its_driver",
+        "crates/st-drivers/src/codex_app_server/tests.rs::an_approval_answered_in_st_is_sent_once_and_only_for_this_thread",
+        "crates/st-drivers/src/codex_app_server/tests.rs::a_persons_answer_takes_each_approval_methods_own_decision_words"
+      ],
+      "behavior": "store, hook and Codex driver tests: only the seat's person answers, only the prompt still waiting (stale or terminal-only prompts refused), once; the answered alert disappears; the waiting hook returns the answer, stops when the prompt is gone and says nothing when time runs out; the Codex driver sends the answer once in the request method's decision words, only for its own thread, and forgets a request resolved in the TUI or left behind"
+    },
+    {
       "action": "lane.approve",
       "tests": [
         "crates/st3/tests/action_coverage.rs::lane_actions_survive_stale_fences_and_restarts"
@@ -1333,6 +1344,7 @@
       "command": "st missions show",
       "description": "Explain one mission run, its goals, state, work, and usage",
       "tests": [
+        "crates/st3/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -2066,6 +2078,7 @@
       "command": "st work ls",
       "description": "List current actionable work; use --as to filter one agent or --all for history",
       "tests": [
+        "crates/st3/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -2162,6 +2175,7 @@
       "command": "st work show",
       "description": "Explain one work item, its owner, readiness, lease, and evidence",
       "tests": [
+        "crates/st3/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"

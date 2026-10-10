@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web adds the app-side browser-local composer draft port and a revision-checked kit handle adapter. Drafts use one versioned prefix, schema decoding, newer-timestamp checks, cross-tab storage events, a 100-record cap and a 64 KiB UTF-8 text cap per record with oldest-first eviction. Session edits are never overwritten by external restores. Only user-caused text changes persist: optimistic submission clears and kit restores do not clear saved drafts. Completed message actions clear the submitted draft only if no newer draft replaced it; refusals keep the stored text. The existing outbox remains memory-only with transcript failure and exact-key retry, so reloading after refusal restores the saved text rather than losing it. This layer supplies the storage and adapter seams, not the final composer mounting integration; activation requires the matching kit handle and cause-tagged change contract.",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only draft state; no runtime replay change. Read positions are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change. Browser-local draft records have version, text and updatedAt fields; corrupt or foreign records are ignored. Empty clearing records prevent stale text resurrection while retained within the bounded store."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No server wire change. The replaceable app port supports later person-scoped storage. The composer integration must provide getDraft and revision-checked restoreDraft plus user, submit-reset, restore and send-failed-restore change causes. localStorage ordering checks are synchronous, not a cross-process transaction; active subscriptions retain successful local writes for stale-event repair. Outbox retries lack the original composer revision and therefore never acknowledge a current draft, even with equal text; saved text is retained rather than risking deletion of an unrelated edit."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; this change does not deploy the app."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change. Denied or full browser storage keeps current edits in memory but cannot guarantee reload recovery. Browser-local draft eviction intentionally discards the oldest records."
+  }
+}

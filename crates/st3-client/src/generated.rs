@@ -962,6 +962,8 @@ pub struct MissionStep {
     #[serde(default)]
     pub last_progress: Option<String>,
     #[serde(default)]
+    pub progress_at: Option<String>,
+    #[serde(default)]
     pub blocked_reason: Option<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
@@ -1029,6 +1031,8 @@ pub struct Work {
     pub title: Option<String>,
     pub assigned_to: Option<String>,
     pub last_progress: Option<String>,
+    #[serde(default)]
+    pub progress_at: Option<String>,
     pub state: String,
     pub gate_kind: Option<String>,
     pub attempt: u32,
@@ -2225,6 +2229,8 @@ pub struct Fence {
 pub enum ActionType {
     #[serde(rename = "custom.reply")]
     CustomReply,
+    #[serde(rename = "prompt.respond")]
+    PromptRespond,
     #[serde(rename = "arrangement.edit")]
     ArrangementEdit,
     #[serde(rename = "attention.resolve")]
@@ -2752,6 +2758,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::PairingRevoke,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn prompt_respond(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PromptRespondParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::PromptRespond,
             idempotency_key,
             fence,
             &parameters,
@@ -3833,6 +3853,15 @@ pub struct AgentRepository {
     pub path: String,
     pub workspaces: Vec<String>,
     pub agent_ids: Vec<String>,
+}
+
+/// A person's answer to a native harness prompt alert.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptRespondParameters {
+    pub target_id: String,
+    pub episode: String,
+    pub answer: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

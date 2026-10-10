@@ -19,6 +19,7 @@ pub struct Targets {
     pub statement: Statement,
     pub transaction: Transaction,
     pub cpu: Cpu,
+    pub database: Database,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,6 +53,16 @@ pub struct Transaction {
 pub struct Cpu {
     pub about: String,
     pub max_cores: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Database {
+    pub about: String,
+    /// The pages in use, not counting free pages SQLite reuses before the file grows.
+    pub max_live_gb: f64,
+    /// Net daily growth of the pages in use: what is written less what checkpoints free.
+    pub max_growth_mb_per_day: f64,
 }
 
 impl Latency {
@@ -108,6 +119,12 @@ pub fn parse(text: &str) -> Result<Targets> {
     ensure!(
         targets.cpu.max_cores.is_finite() && targets.cpu.max_cores > 0.0,
         "the CPU target is not a positive number of cores"
+    );
+    ensure!(
+        [targets.database.max_live_gb, targets.database.max_growth_mb_per_day]
+            .iter()
+            .all(|value| value.is_finite() && *value > 0.0),
+        "the database targets are not positive sizes"
     );
     Ok(targets)
 }
@@ -211,7 +228,21 @@ pub fn verdict(windows: &Value, p99: bool) -> Verdict {
     Verdict { met, message }
 }
 
-/// The store's windows and the CPU's, with their targets.
+/// This member's newest store size, which the daemon measures hourly.
+static DATABASE: std::sync::Mutex<Option<crate::store::DatabaseSize>> = std::sync::Mutex::new(None);
+
+/// Remember the newest store size for its readers.
+pub fn note_database_size(size: &crate::store::DatabaseSize) {
+    *DATABASE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(size.clone());
+}
+
+/// The newest store size the daemon measured: the one sample every reader of the store's size
+/// and growth uses, the database target and disk-filling conditions alike.
+pub fn database_size() -> Option<crate::store::DatabaseSize> {
+    DATABASE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+/// The store's windows and the CPU's, and the store's size, with their targets.
 pub fn store_report(cpu: Value) -> Vec<Value> {
     let targets = targets();
     let series = |work| smallclaims::windows::store_series(work).snapshot(std::time::Instant::now());
@@ -236,6 +267,13 @@ pub fn store_report(cpu: Value) -> Vec<Value> {
             "about": targets.cpu.about,
             "max_cores": targets.cpu.max_cores,
             "windows": cpu,
+        }),
+        json!({
+            "name": "database",
+            "about": targets.database.about,
+            "max_live_gb": targets.database.max_live_gb,
+            "max_growth_mb_per_day": targets.database.max_growth_mb_per_day,
+            "size": database_size().map_or(Value::Null, |size| json!(size)),
         }),
     ]
 }
@@ -287,6 +325,7 @@ pub fn doctor_lines(report: &Value) -> Vec<(String, &'static str, String)> {
                     ),
                 ));
             }
+            "database" => lines.push(database_line(target)),
             _ => {
                 let own = verdict(&target["windows"], true);
                 lines.push((
@@ -330,6 +369,35 @@ pub fn doctor_lines(report: &Value) -> Vec<(String, &'static str, String)> {
     lines
 }
 
+/// `st doctor`'s line for the store's size: met when the pages in use and their daily growth are
+/// both within target. Growth needs an hour of samples; until then only the size is judged.
+fn database_line(target: &Value) -> (String, &'static str, String) {
+    const GB: f64 = 1e9;
+    const MB: f64 = 1e6;
+    let max_live = target["max_live_gb"].as_f64().unwrap_or_default();
+    let max_growth = target["max_growth_mb_per_day"].as_f64().unwrap_or_default();
+    let size = &target["size"];
+    let Some(live) = size["live_bytes"].as_f64() else {
+        return ("slo/database".into(), "info", "not measured yet".into());
+    };
+    let file = size["file_bytes"].as_f64().unwrap_or_default();
+    let growth = size["growth_bytes_per_day"].as_f64();
+    let met = live / GB <= max_live && growth.is_none_or(|growth| growth / MB <= max_growth);
+    let growth = growth.map_or("growth not known yet".to_owned(), |growth| {
+        let span = size["growth_span_ms"].as_f64().unwrap_or_default() / 3_600_000.0;
+        format!("growth {:+.0} MB a day over {span:.0} h", growth / MB)
+    });
+    (
+        "slo/database".into(),
+        if met { "pass" } else { "info" },
+        format!(
+            "live ≤ {max_live} GB, growth ≤ {max_growth} MB a day: live {:.2} GB of a {:.2} GB file, {growth}",
+            live / GB,
+            file / GB
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,6 +436,7 @@ mod tests {
         assert_eq!((targets.statement.p99_ms, targets.statement.max_ms), (10, 100));
         assert_eq!(targets.transaction.max_ms, 100);
         assert_eq!(targets.cpu.max_cores, 2.0);
+        assert_eq!((targets.database.max_live_gb, targets.database.max_growth_mb_per_day), (8.0, 300.0));
         assert!(targets.for_path("GET /v1/health").is_none());
     }
 
@@ -390,10 +459,35 @@ mod tests {
     }
 
     #[test]
+    fn the_database_line_judges_size_and_daily_growth() {
+        let target = |size: Value| {
+            json!({"name": "database", "max_live_gb": 8.0, "max_growth_mb_per_day": 300.0, "size": size})
+        };
+        assert_eq!(database_line(&target(Value::Null)).1, "info");
+        let (name, status, message) = database_line(&target(json!({
+            "live_bytes": 6e9, "file_bytes": 14e9, "growth_bytes_per_day": null
+        })));
+        assert_eq!((name.as_str(), status), ("slo/database", "pass"));
+        assert!(message.contains("live 6.00 GB of a 14.00 GB file, growth not known yet"), "{message}");
+        let line = database_line(&target(json!({
+            "live_bytes": 6e9, "file_bytes": 14e9, "growth_bytes_per_day": 450e6, "growth_span_ms": 86_400_000
+        })));
+        assert_eq!(line.1, "info");
+        assert!(line.2.contains("growth +450 MB a day over 24 h"), "{}", line.2);
+        assert_eq!(database_line(&target(json!({"live_bytes": 9e9, "file_bytes": 9e9}))).1, "info");
+        let shrinking = database_line(&target(json!({
+            "live_bytes": 6e9, "file_bytes": 14e9, "growth_bytes_per_day": -2e9, "growth_span_ms": 86_400_000
+        })));
+        assert_eq!(shrinking.1, "pass");
+    }
+
+    #[test]
     fn a_broken_targets_file_is_refused_not_defaulted() {
         let without_cpu = SOURCE.split("[cpu]").next().unwrap();
         assert!(parse(without_cpu).is_err());
         assert!(parse(&SOURCE.replace("max_cores = 2.0", "max_cores = -1.0")).is_err());
+        assert!(parse(SOURCE.split("[database]").next().unwrap()).is_err());
+        assert!(parse(&SOURCE.replace("max_live_gb = 8.0", "max_live_gb = 0.0")).is_err());
         assert!(parse(&SOURCE.replace("p99_ms = 10\n", "p99_ms = 10\ntypo = 1\n")).is_err());
         let twice = format!(
             "{SOURCE}\n[[latency]]\nname = \"again\"\nabout = \"\"\np99_ms = 1\npaths = [\"GET /v1/client/now\"]\n"

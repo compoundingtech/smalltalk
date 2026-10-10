@@ -84,6 +84,7 @@
   "actions": {
     "arrangement.edit": { "capability": "control.arrangements", "parameters": "ArrangementEditParameters", "max_response_bytes": 1048576 },
     "custom.reply": {"capability": "control.attention", "parameters": "CustomReplyParameters"},
+    "prompt.respond": {"capability": "control.attention", "parameters": "PromptRespondParameters"},
     "review.approve": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.reject": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.request-changes": { "capability": "control.attention", "parameters": "TargetParameters" },

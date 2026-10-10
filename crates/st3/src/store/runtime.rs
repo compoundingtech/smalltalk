@@ -46,6 +46,8 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_roster_attempt: std::sync::atomic::AtomicU8,
     /// Fault retries due in this fold, and deadlines deferred to the next refresh.
     pub(crate) agent_roster_fault_retries: Mutex<AgentRosterFaultRetries>,
+    /// When an agents list read last asked for the roster, in Unix ms; 0 before the first.
+    pub(crate) agent_roster_read_at: std::sync::atomic::AtomicU64,
     /// Whether the current overdue refresh request was already reported.
     pub(crate) agent_roster_overdue_warned: std::sync::atomic::AtomicBool,
     /// Whether a reader asked for the history roster since the refresher last folded it.
@@ -381,6 +383,20 @@ impl Runtime for SmalltalkRuntime {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        // Nothing is published now, and a refold from the log takes seconds on a large store.
+        // Where agents lists are being read, start it here rather than when the next read finds
+        // no roster and waits for it. A node nobody reads keeps folding only on demand, so a
+        // long catch-up or trim that forgets once per chunk does not refold it once per chunk.
+        let read_at = self.agent_roster_read_at.load(std::sync::atomic::Ordering::Acquire);
+        let read_lately = read_at != 0
+            && (now_ms() as u64).saturating_sub(read_at) < AGENT_ROSTER_READ_LATELY.as_millis() as u64;
+        if let Some(wake) = self.agent_roster_refresh.get().filter(|_| read_lately) {
+            let _ = self.agent_roster_requested_at.compare_exchange(
+                0, now_ms() as u64, std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            wake.notify_one();
+        }
     }
 
     fn digest_tables(&self) -> &'static [(&'static str, &'static [&'static str])] {
@@ -416,6 +432,10 @@ impl Runtime for SmalltalkRuntime {
         checkpoint_rules::subject_answers(connection, subject, cut)
     }
 
+    fn checkpoint_global_answers(&self, transaction: &Transaction<'_>) -> Result<Option<Value>> {
+        checkpoint_rules::global_answers(transaction).map(Some)
+    }
+
     fn checkpoint_subject_answers_with_sources(
         &self,
         connection: &Connection,
@@ -428,6 +448,10 @@ impl Runtime for SmalltalkRuntime {
 
 /// The version of smalltalk's shared projection layout, beside the claim vocabulary. Nodes whose
 /// layouts differ keep exchanging claim authority but do not compare projection maps.
+/// How recently an agents list read must have asked for the roster for a forget to refold it
+/// at once rather than on the next read.
+const AGENT_ROSTER_READ_LATELY: std::time::Duration = std::time::Duration::from_secs(300);
+
 const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.arrangements.v2";
 
 /// The replication `schema_digest`: the claim vocabulary digest and the shared projection layout.

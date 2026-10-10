@@ -179,7 +179,7 @@ export const ActionCommon = /*#__PURE__*/ (() => Schema.Struct({
   "id": Id,
   "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")),
   "parameters": Schema.Record(Schema.String, Schema.Unknown),
-  "type": Schema.Literals(["arrangement.edit","custom.reply","attention.resolve","review.approve","review.reject","review.request-changes","message.send","message.read","message.close","launch.create","launch.revise","launch.preview","launch.approve","launch.cancel","mission.start","mission.revise","mission.approve-revision","mission.cancel-revision","mission.cancel","session.import","work.ask","work.done","work.cancel-ask","work.claim","work.renew","work.progress","work.complete","work.fail","work.release","work.retry","work.publish-mission","agent.create","agent.stop","agent.start","agent.suspend","agent.resume","terminal.create","terminal.end","agent.queue-move","lane.join","lane.leave","lane.move","lane.mark","lane.approve","runtime.stop","runtime.restart","runtime.reset","runtime.context-clear","runtime.signal","terminal.input","terminal.resize","terminal.attach","terminal.detach","pairing.revoke"])
+  "type": Schema.Literals(["arrangement.edit","custom.reply","prompt.respond","attention.resolve","review.approve","review.reject","review.request-changes","message.send","message.read","message.close","launch.create","launch.revise","launch.preview","launch.approve","launch.cancel","mission.start","mission.revise","mission.approve-revision","mission.cancel-revision","mission.cancel","session.import","work.ask","work.done","work.cancel-ask","work.claim","work.renew","work.progress","work.complete","work.fail","work.release","work.retry","work.publish-mission","agent.create","agent.stop","agent.start","agent.suspend","agent.resume","terminal.create","terminal.end","agent.queue-move","lane.join","lane.leave","lane.move","lane.mark","lane.approve","runtime.stop","runtime.restart","runtime.reset","runtime.context-clear","runtime.signal","terminal.input","terminal.resize","terminal.attach","terminal.detach","pairing.revoke"])
 }).annotate({ identifier: "ActionCommon" }))()
 export type ActionCommon = typeof ActionCommon.Type
 export type ActionCommonEncoded = typeof ActionCommon.Encoded
@@ -379,6 +379,15 @@ export const PersonStepParameters = /*#__PURE__*/ (() => Schema.Struct({
 export type PersonStepParameters = typeof PersonStepParameters.Type
 export type PersonStepParametersEncoded = typeof PersonStepParameters.Encoded
 
+/** A person's answer to a native harness prompt alert: its seat, the episode on the alert's action_parameters, and one of its answers (allow or deny). */
+export const PromptRespondParameters = /*#__PURE__*/ (() => Schema.Struct({
+  "answer": Schema.Literals(["allow","deny"]),
+  "episode": Schema.String,
+  "target_id": Id
+}).annotate({ identifier: "PromptRespondParameters", description: "A person's answer to a native harness prompt alert: its seat, the episode on the alert's action_parameters, and one of its answers (allow or deny)." }))()
+export type PromptRespondParameters = typeof PromptRespondParameters.Type
+export type PromptRespondParametersEncoded = typeof PromptRespondParameters.Encoded
+
 export const TargetParameters = /*#__PURE__*/ (() => Schema.Struct({
   "evidence": optionalKey(Schema.Array(Id)),
   "reason": optionalKey(Schema.String),
@@ -399,6 +408,7 @@ export type TerminalCreateParametersEncoded = typeof TerminalCreateParameters.En
 export const ActionRequest = /*#__PURE__*/ (() => Schema.Union([
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": ArrangementEditParameters, "type": Schema.Literal("arrangement.edit") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": CustomReplyParameters, "type": Schema.Literal("custom.reply") }),
+  Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": PromptRespondParameters, "type": Schema.Literal("prompt.respond") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": AgentCreateParameters, "type": Schema.Literal("agent.create") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), /** The snapshot and exact mutable identities the user acted on; echoed byte-identically in actions. */
 "fence": Schema.Struct({ "attempt": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "mission_generation": optionalKey(RunGenerationId), "preview_token": optionalKey(Schema.String.check(Schema.isPattern(new RegExp("^lpv0:[0-9a-f]{64}$", "u"))).pipe(Schema.brand("st3/PreviewToken"))), "readiness_epoch": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))), "runtime_desired_revision": Schema.String, "runtime_incarnation": optionalKey(Schema.String), "snapshot_id": SnapshotId, "step_definition": optionalKey(Revision), "subject_revisions": Schema.Record(Schema.String, Revision).check(Schema.makeFilter((o: object) => Object.keys(o).every(Schema.is(Schema.String.check(Schema.isPattern(new RegExp("^[a-z][a-z0-9-]*/", "u"))))), { expected: "property names matching the schema" })), "terminal_sequence": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))) }).annotate({ description: "The snapshot and exact mutable identities the user acted on; echoed byte-identically in actions." }), "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": AgentStopParameters, "type": Schema.Literal("agent.stop") }),
@@ -1064,7 +1074,7 @@ export type PersonUpdateEncoded = typeof PersonUpdate.Encoded
 
 export const Attention = /*#__PURE__*/ (() => Schema.Struct({
   "action_parameters": optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
-  "actions": Schema.Array(Schema.Literals(["custom.reply","work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"])),
+  "actions": Schema.Array(Schema.Literals(["custom.reply","prompt.respond","work.done","review.approve","review.reject","review.request-changes","launch.approve","launch.cancel","mission.approve-revision","mission.cancel-revision","message.read"])),
   /** Whether this item is an alert: it blocks or waits on its person (an ask, a human gate, a launch or revision approval, an agent or custom request, a harness prompt or login, or a broken gate the person published). An update is not one. Absent on daemons that predate alerts. */
   "alert": optionalKey(Schema.Boolean).annotate({ description: "Whether this item is an alert: it blocks or waits on its person (an ask, a human gate, a launch or revision approval, an agent or custom request, a harness prompt or login, or a broken gate the person published). An update is not one. Absent on daemons that predate alerts." }),
   "attention_kind": Schema.Union([Schema.Literals(["human-gate","launch-approval","revision-approval","unread-message","person-step","agent-request","fault","harness-login","harness-prompt"]), Schema.String.check(Schema.isPattern(new RegExp("^custom\\.[a-zA-Z0-9_.-]+$", "u")))]),
@@ -1601,6 +1611,8 @@ export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   /** Observed not-before time: earliest work eligibility, not a promise of wake dispatch. */
   "next_wake_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Observed not-before time: earliest work eligibility, not a promise of wake dispatch." }),
   "path": Schema.String,
+  /** Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress. */
+  "progress_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." }),
   "since": Timestamp,
   "state": WorkState,
   "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -1619,7 +1631,8 @@ export type MustActEncoded = typeof MustAct.Encoded
 export const MissionRunSummary = /*#__PURE__*/ (() => Schema.Struct({
   "after": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),
   "blocker": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE),
-  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "id": StepRunId, "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
+  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "id": StepRunId, /** Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress. */
+"progress_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." }), "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
   "deadline": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "generation_id": optionalKey(RunGenerationId),
   "id": MissionRunId,
@@ -1881,6 +1894,8 @@ export const Work = /*#__PURE__*/ (() => Schema.Struct({
   "path": Schema.String,
   /** Responses to the asks this attempt made, or a person ask's own response. */
   "person_answers": optionalKey(Schema.Array(PersonAnswerRecord)).annotate({ description: "Responses to the asks this attempt made, or a person ask's own response." }),
+  /** Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress. */
+  "progress_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." }),
   "readiness_epoch": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "revision": Revision,
   "state": WorkState,

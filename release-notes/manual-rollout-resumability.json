@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Accept authored session selectors for manual seat adoption and publication; validate resumability when rollout is requested.",
+  "replay": {"status": "none", "detail": "No replay or backfill is required."},
+  "schema": {"status": "none", "detail": "No database or claim schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "changed", "detail": "Manual owned-set adoption and publication accept the seat's own authored --resume or --continue selector. Automatic cutovers retain their resumability checks. The explicit rollout command and API refuse unsupported resumption before recording a durable cutover action."},
+  "manual": {"status": "none", "detail": "No migration is required. Manual publication still requires an explicit rollout request to apply a pending launch change."},
+  "recovery": {"status": "changed", "detail": "A resumability refusal leaves the incumbent running with intake open and the published manual change pending. The refusal does not start a drain or stop the seat."},
+  "downtime": {"status": "none", "detail": "Manual publication and a refused rollout do not interrupt the incumbent. An accepted rollout keeps the existing drain and replacement behavior."}
+}
