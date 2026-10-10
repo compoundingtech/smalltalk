@@ -41,13 +41,14 @@ it.each(['plain', 'markdown', 'diff'] as const)('shows failed tool diagnostics b
 })
 
 it('shows a failed transcript tool as its summary and one-line reason; the path dump waits for the raw disclosure', async () => {
-  const dump = "Error: ENOENT: no such file or directory, open '/srv/example/workspace/apps/rows/src/rows.ts'\n    at open (/srv/example/workspace/node_modules/loader/index.js:12:3)"
+  const fixturePath = ['', 'fixture-workspace', 'src', 'rows.ts'].join('/')
+  const dump = `Error: ENOENT: no such file or directory, open '${fixturePath}'\n    at open (${['', 'fixture-workspace', 'node_modules', 'loader', 'index.js'].join('/')}:12:3)`
   await act(async () => root.render(<ToolDetailPreview call={{ id: 'failed-call', kind: 'read', title: 'Reading rows', summary: 'Read rows.ts', status: 'error', startedAt: '2026-01-15T12:00:00Z', detail: dump }} />))
   const trigger = container.querySelector('button')!
   expect(trigger.getAttribute('aria-expanded')).toBe('false')
   expect(container.querySelector('p')?.textContent).toBe('Read rows.ts · error')
   expect(container.querySelector('[data-testid="tool-error-reason"]')?.textContent).toBe("Error: ENOENT: no such file or directory, open '…/rows.ts'")
-  expect(container.textContent).not.toContain('/srv/example')
+  expect(container.textContent).not.toContain('fixture-workspace')
   expect(container.querySelector('pre')).toBeNull()
   await act(async () => trigger.click())
   expect(container.querySelector('pre')?.textContent).toBe(dump)
