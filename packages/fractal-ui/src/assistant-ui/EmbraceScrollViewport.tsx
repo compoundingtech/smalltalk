@@ -5,7 +5,7 @@ import { returnAffordanceFocus } from './embrace-virtual/AffordancePosition'
 import { FollowAffordance } from './embrace-virtual/FollowAffordance'
 import { FollowAnimation } from './embrace-virtual/FollowAnimation'
 
-const rowSelector = '[data-item-id], [data-embrace-entry-id]'
+const rowSelector = '[data-item-id], [data-embrace-entry-id], [data-tool-status], [data-testid="thinking-entry"], [data-work-log-summary]'
 const navigationKeys: Readonly<Record<string, true>> = { PageUp: true, PageDown: true, Home: true, End: true, ArrowUp: true, ArrowDown: true, ' ': true }
 const readerScrollWindowMs = 250
 
@@ -20,7 +20,16 @@ function pressScrollOwner(lane: HTMLElement): HTMLElement {
 }
 
 /** Scroll state a conversation keeps while it stays on a surface. */
-export interface ViewportState { readonly top: number; readonly following: boolean; readonly unread: boolean }
+export interface ViewportState {
+  readonly top: number
+  readonly following: boolean
+  readonly unread: boolean
+  /** The reader's line by row identity: `top` alone drifts when a remount backfills rows above it. */
+  readonly anchor?: { readonly id: string; readonly offset: number }
+}
+
+const keyedRowSelector = '[data-item-id], [data-embrace-entry-id]'
+const rowKey = (row: HTMLElement): string | undefined => row.dataset.itemId ?? row.dataset.embraceEntryId
 
 /** Per-surface memory, one entry per conversation. Owners drop closed keys and dispose on unmount. */
 export class ViewportStore {
@@ -56,6 +65,8 @@ class ViewportController {
   private restored: ViewportState | undefined
   /** A restored line whose content is settling; the first reader scroll clears it. */
   private pendingTop: number | undefined
+  /** The restored line's row, applied once that row is mounted; reader input clears it with `pendingTop`. */
+  private pendingAnchor: ViewportState['anchor']
   /** Pointers down somewhere on the page; the dock keeps its layout until all are released. */
   private readonly pressed = new Set<number>()
   private readonly readerPointers = new Set<number>()
@@ -66,6 +77,7 @@ class ViewportController {
   constructor(saved?: ViewportState) {
     if (saved !== undefined && !saved.following) {
       this.restored = saved
+      this.pendingAnchor = saved.anchor
       this.unread = saved.unread
     }
   }
@@ -84,7 +96,32 @@ class ViewportController {
     this.jumpButton.hidden = this.following || element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.followAffordanceBand
   }
 
-  readonly released = (): ViewportState => ({ top: this.lastTop, following: this.following, unread: this.unread })
+  readonly released = (): ViewportState => {
+    const state = { top: this.lastTop, following: this.following, unread: this.unread }
+    const element = this.element
+    if (this.following || element === null) return state
+    // A restore that has not found its row yet keeps the row it is still looking for.
+    if (this.pendingAnchor !== undefined) return { ...state, anchor: this.pendingAnchor }
+    this.capture()
+    const row = this.anchor?.element.isConnected ? this.anchor.element.closest<HTMLElement>(keyedRowSelector) : null
+    const id = row === null || !element.contains(row) ? undefined : rowKey(row)
+    return id === undefined ? state : { ...state, anchor: { id, offset: row!.getBoundingClientRect().top - element.getBoundingClientRect().top } }
+  }
+
+  /** Restores the saved row at its saved offset; false while that row is not mounted. */
+  private restoreAnchor(): boolean {
+    const element = this.element
+    const saved = this.pendingAnchor
+    if (element === null || saved === undefined) return false
+    let row: HTMLElement | undefined
+    for (const candidate of element.querySelectorAll<HTMLElement>(keyedRowSelector)) if (rowKey(candidate) === saved.id) { row = candidate; break }
+    if (row === undefined) return false
+    this.writeTop(element.scrollTop + row.getBoundingClientRect().top - element.getBoundingClientRect().top - saved.offset)
+    this.anchor = { element: row, offset: saved.offset }
+    this.pendingAnchor = undefined
+    this.pendingTop = undefined
+    return true
+  }
 
   /** Swaps a reused viewport to another conversation without carrying its unread mark across. */
   readonly resume = (saved?: ViewportState) => {
@@ -96,6 +133,7 @@ class ViewportController {
     if (saved !== undefined && !saved.following) {
       this.following = false
       this.anchor = undefined
+      this.pendingAnchor = saved.anchor
       this.pendingTop = saved.top
       this.writeTop(saved.top)
       this.scheduleCapture()
@@ -103,6 +141,7 @@ class ViewportController {
     } else {
       this.following = true
       this.anchor = undefined
+      this.pendingAnchor = undefined
       if (this.element !== null) this.writeTop(this.element.scrollHeight)
       this.schedule()
     }
@@ -114,11 +153,13 @@ class ViewportController {
     const viewport = element.getBoundingClientRect()
     const top = viewport.top
     const hit = element.ownerDocument.elementFromPoint(viewport.left + viewport.width / 2, top + geometryNumbers.scrollEndTolerance)?.closest<HTMLElement>(rowSelector)
-    if (hit !== undefined && hit !== null && element.contains(hit)) {
+    if (hit !== undefined && hit !== null && element.contains(hit) && hit.dataset.testid !== 'transcript-turn') {
       this.anchor = { element: hit, offset: hit.getBoundingClientRect().top - top }
       return
     }
     for (const row of element.querySelectorAll<HTMLElement>(rowSelector)) {
+      // A prefix can grow inside a turn without moving its wrapper. Gaps/padding must resolve to a leaf row.
+      if (row.dataset.testid === 'transcript-turn') continue
       const bounds = row.getBoundingClientRect()
       if (bounds.bottom > top) {
         this.anchor = { element: row, offset: bounds.top - top }
@@ -168,7 +209,8 @@ class ViewportController {
     if (this.preservePress()) return
     if (this.following) {
       if (!this.followAnimation.active) this.writeTop(element.scrollHeight)
-    } else if (this.pendingTop !== undefined) {
+    } else if (this.restoreAnchor()) this.scheduleCapture()
+    else if (this.pendingTop !== undefined) {
       this.writeTop(this.pendingTop)
       if (Math.abs(element.scrollTop - Math.max(0, Math.min(this.pendingTop, element.scrollHeight - element.clientHeight))) < geometryNumbers.scrollEndTolerance) {
         this.pendingTop = undefined
@@ -199,6 +241,7 @@ class ViewportController {
     this.unread = false
     this.anchor = undefined
     this.pendingTop = undefined
+    this.pendingAnchor = undefined
     this.dock()
     if (this.element !== null) this.followAnimation.start(this.element)
   }
@@ -210,6 +253,7 @@ class ViewportController {
     this.readerInputAt = -Infinity
     this.readerGesture = false
     this.pendingTop = undefined
+    this.pendingAnchor = undefined
     this.pressedAnchor = undefined
     this.anchor = undefined
     this.dock()
@@ -259,6 +303,7 @@ class ViewportController {
       if (event.type === 'wheel' || event.type === 'touchmove' || event.type === 'keydown') this.pressedAnchor = undefined
       this.programmaticTop = undefined
       this.pendingTop = undefined
+      this.pendingAnchor = undefined
     }
     const focus = () => {
       // Native focus can scroll before focusin, but its scroll event arrives later.
@@ -269,6 +314,7 @@ class ViewportController {
         this.followAnimation.cancel()
         this.following = false
         this.pendingTop = undefined
+        this.pendingAnchor = undefined
         this.programmaticTop = undefined
         this.pressedAnchor = undefined
         this.lastTop = element.scrollTop
@@ -283,6 +329,7 @@ class ViewportController {
         this.unread = false
         this.anchor = undefined
         this.pendingTop = undefined
+        this.pendingAnchor = undefined
         this.programmaticTop = undefined
         this.lastTop = element.scrollTop
         this.dock()
