@@ -17,6 +17,7 @@ st3-terminal-direct = { path = "../st3-terminal-direct" }
 st3-feed = { path = "../st3-feed" }
 st3-conversation-ui = { path = "../st3-conversation-ui", features = ["ratatui"] }
 st3-ui-model = { path = "../st3-ui-model" }
+st-surface = { path = "../st-surface", features = ["ratatui"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 uuid = { version = "1", features = ["v7"] }
 signal-hook = "0.3"

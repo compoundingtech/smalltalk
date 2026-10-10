@@ -2230,6 +2230,19 @@ fn machine_line(machine: &Machine) -> String {
     parts.join(" · ")
 }
 
+/// stui's theme for the metric cards stui and Fractal share.
+fn metrics_palette() -> st_surface::terminal::Palette {
+    st_surface::terminal::Palette {
+        name: theme::bold(),
+        label: theme::dim(),
+        separator: theme::dim(),
+        normal: theme::soft(),
+        busy: theme::strong(theme::YELLOW),
+        stale: theme::dim(),
+        unknown: theme::dim(),
+    }
+}
+
 pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'static str) -> Doc {
     let mut doc = Doc::new();
     let Some(machine) = id.and_then(|id| {
@@ -2248,8 +2261,10 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
         span(machine.name.clone(), theme::bold()),
         span(format!("  {}", machine_line(machine)), theme::dim()),
     ]));
-    if let Some(load) = &machine.load {
-        doc.line(Line::from(span(format!("   {load}"), theme::soft())));
+    if !machine.metrics.is_empty() {
+        let mut line = vec![span("   ", theme::soft())];
+        line.extend(st_surface::terminal::spans(&machine.metrics, &metrics_palette()));
+        doc.line(Line::from(line));
     }
     doc.blank();
     let mut links = Doc::new();

@@ -4293,6 +4293,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "st-surface"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "st3-client",
+]
+
+[[package]]
 name = "st-wire"
 version = "0.1.0"
 dependencies = [
@@ -4670,6 +4681,7 @@ dependencies = [
  "sha2",
  "signal-hook 0.3.18",
  "smallclaims",
+ "st-surface",
  "st3",
  "st3-client",
  "st3-conversation-ui",

@@ -1096,7 +1096,7 @@ fn machines() -> Vec<Machine> {
             reach: Reach::Here,
             platform: s("macOS · arm64"),
             seen: s("now"),
-            load: Some(s("2 agents")),
+            metrics: metrics("lark", "2 running", ("0.84 / 10 cpu", st_surface::Tone::Normal)),
             links: vec![
                 (s("harbor"), true, s("direct · 18ms")),
                 (s("wren"), false, s("last seen 2d ago")),
@@ -1108,7 +1108,7 @@ fn machines() -> Vec<Machine> {
             reach: Reach::Direct,
             platform: s("linux · x86_64"),
             seen: s("4s ago"),
-            load: Some(s("6 agents · 41% cpu")),
+            metrics: metrics("harbor", "6 running", ("17.20 / 16 cpu", st_surface::Tone::Busy)),
             links: vec![
                 (s("lark"), true, s("direct · 18ms")),
                 (s("wren"), false, s("last seen 2d ago")),
@@ -1120,10 +1120,20 @@ fn machines() -> Vec<Machine> {
             reach: Reach::Offline,
             platform: s("linux · arm64"),
             seen: s("2d ago"),
-            load: None,
+            metrics: metrics("wren", "0 running", ("not reported", st_surface::Tone::Unknown)),
             links: vec![],
             you_are_here: false,
         },
+    ]
+}
+
+/// The cards st-surface makes for a machine, as demo data.
+fn metrics(name: &str, agents: &str, (load, tone): (&str, st_surface::Tone)) -> Vec<st_surface::Card> {
+    use st_surface::{Card, CardKind};
+    let subject = format!("machine/{name}");
+    vec![
+        Card { id: format!("{subject}#agents-running"), kind: CardKind::AgentsRunning, subject: subject.clone(), label: s("agents"), value: s(agents), tone: st_surface::Tone::Normal },
+        Card { id: format!("{subject}#load-1m"), kind: CardKind::HostLoad, subject, label: s("load 1m"), value: s(load), tone },
     ]
 }
 

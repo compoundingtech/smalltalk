@@ -162,7 +162,8 @@
             { "$ref": "#/$defs/StatusHistory" },
             { "$ref": "#/$defs/AgentQueue" },
             { "$ref": "#/$defs/UsagePeriod" },
-            { "$ref": "#/$defs/MailBacklog" }
+            { "$ref": "#/$defs/MailBacklog" },
+            { "$ref": "#/$defs/HostFacts" }
           ]
         }
       }
@@ -625,6 +626,37 @@
         "threshold_ms": { "type": "integer", "minimum": 1 },
         "cleanup_command": { "type": "string" }
       }
+    },
+    "HostFacts": {
+      "description": "What the answering member's own host reports now. Sampled on read, never stored in the graph.",
+      "type": "object", "additionalProperties": false,
+      "required": ["host_id", "observed_at", "load"],
+      "properties": {
+        "host_id": { "$ref": "#/$defs/Id" },
+        "observed_at": { "$ref": "#/$defs/Timestamp" },
+        "load": { "$ref": "#/$defs/HostLoad" }
+      }
+    },
+    "HostLoad": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["state", "one_minute", "cpus"],
+          "properties": {
+            "state": { "const": "reported" },
+            "one_minute": { "type": "number", "minimum": 0 },
+            "cpus": { "type": "integer", "minimum": 1 }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["state", "reason"],
+          "properties": {
+            "state": { "const": "unknown" },
+            "reason": { "type": "string" }
+          }
+        }
+      ]
     },
     "UsagePeriod": {
       "type": "object", "additionalProperties": false,

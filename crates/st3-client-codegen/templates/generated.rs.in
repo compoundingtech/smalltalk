@@ -419,6 +419,20 @@ pub struct MailBacklog {
     pub threshold_ms: u64,
     pub cleanup_command: String,
 }
+/// What the answering member's own host reports now; sampled on read, never stored in the graph.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct HostFacts {
+    pub host_id: String,
+    pub observed_at: String,
+    pub load: HostLoad,
+}
+/// The host's one-minute load average and the CPUs it is shared by, or why it is unknown.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum HostLoad {
+    Reported { one_minute: f64, cpus: u32 },
+    Unknown { reason: String },
+}
 /// Token spend over a period, one row per agent, mission run, step, model, account and host.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct UsagePeriod {

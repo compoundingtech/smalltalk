@@ -2298,6 +2298,22 @@ export const EventPage = /*#__PURE__*/ (() => Schema.Struct({
 export type EventPage = typeof EventPage.Type
 export type EventPageEncoded = typeof EventPage.Encoded
 
+export const HostLoad = /*#__PURE__*/ (() => Schema.Union([
+  Schema.Struct({ "cpus": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)), "one_minute": Schema.Number.check(Schema.isGreaterThanOrEqualTo(0)), "state": Schema.Literal("reported") }),
+  Schema.Struct({ "reason": Schema.String, "state": Schema.Literal("unknown") })
+], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("state")).annotate({ identifier: "HostLoad" }))()
+export type HostLoad = typeof HostLoad.Type
+export type HostLoadEncoded = typeof HostLoad.Encoded
+
+/** What the answering member's own host reports now. Sampled on read, never stored in the graph. */
+export const HostFacts = /*#__PURE__*/ (() => Schema.Struct({
+  "host_id": Id,
+  "load": HostLoad,
+  "observed_at": Timestamp
+}).annotate({ identifier: "HostFacts", description: "What the answering member's own host reports now. Sampled on read, never stored in the graph." }))()
+export type HostFacts = typeof HostFacts.Type
+export type HostFactsEncoded = typeof HostFacts.Encoded
+
 export const MailBacklog = /*#__PURE__*/ (() => Schema.Struct({
   "cleanup_command": Schema.String,
   "count": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -2507,7 +2523,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
+  "value": Schema.Union([Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog, HostFacts], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded

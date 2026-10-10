@@ -1,0 +1,408 @@
+[
+  {
+    "name": "local machine with a fresh sample",
+    "now_ms": 1791626401000,
+    "machines": [
+      {
+        "id": "machine/dev3",
+        "kind": "machine",
+        "revision": "machine:dev3",
+        "updated_at": "2026-10-10T09:59:00.000Z",
+        "host_id": "host/dev3",
+        "name": "dev3",
+        "state": "local",
+        "fleet_id": "fleet/example",
+        "capacity": {
+          "state": "unknown",
+          "reason": "no capacity observation"
+        },
+        "occupancy": {
+          "running_runtimes": 5
+        },
+        "projects": [],
+        "work": [],
+        "transports": [],
+        "runtime_ids": []
+      }
+    ],
+    "facts": {
+      "host_id": "host/dev3",
+      "observed_at": "2026-10-10T10:00:00.000Z",
+      "load": {
+        "state": "reported",
+        "one_minute": 0.42,
+        "cpus": 8
+      }
+    },
+    "cards": [
+      {
+        "id": "machine/dev3#agents-running",
+        "kind": "agents_running",
+        "subject": "machine/dev3",
+        "label": "agents",
+        "value": "5 running",
+        "tone": "normal"
+      },
+      {
+        "id": "machine/dev3#load-1m",
+        "kind": "host_load",
+        "subject": "machine/dev3",
+        "label": "load 1m",
+        "value": "0.42 / 8 cpu",
+        "tone": "normal"
+      }
+    ]
+  },
+  {
+    "name": "load at or above the cpu count is busy",
+    "now_ms": 1791626401000,
+    "machines": [
+      {
+        "id": "machine/dev3",
+        "kind": "machine",
+        "revision": "machine:dev3",
+        "updated_at": "2026-10-10T09:59:00.000Z",
+        "host_id": "host/dev3",
+        "name": "dev3",
+        "state": "local",
+        "fleet_id": "fleet/example",
+        "capacity": {
+          "state": "unknown",
+          "reason": "no capacity observation"
+        },
+        "occupancy": {
+          "running_runtimes": 12
+        },
+        "projects": [],
+        "work": [],
+        "transports": [],
+        "runtime_ids": []
+      }
+    ],
+    "facts": {
+      "host_id": "host/dev3",
+      "observed_at": "2026-10-10T10:00:00.000Z",
+      "load": {
+        "state": "reported",
+        "one_minute": 9.1,
+        "cpus": 8
+      }
+    },
+    "cards": [
+      {
+        "id": "machine/dev3#agents-running",
+        "kind": "agents_running",
+        "subject": "machine/dev3",
+        "label": "agents",
+        "value": "12 running",
+        "tone": "normal"
+      },
+      {
+        "id": "machine/dev3#load-1m",
+        "kind": "host_load",
+        "subject": "machine/dev3",
+        "label": "load 1m",
+        "value": "9.10 / 8 cpu",
+        "tone": "busy"
+      }
+    ]
+  },
+  {
+    "name": "a sample older than three polls is stale",
+    "now_ms": 1791626406001,
+    "machines": [
+      {
+        "id": "machine/dev3",
+        "kind": "machine",
+        "revision": "machine:dev3",
+        "updated_at": "2026-10-10T09:59:00.000Z",
+        "host_id": "host/dev3",
+        "name": "dev3",
+        "state": "local",
+        "fleet_id": "fleet/example",
+        "capacity": {
+          "state": "unknown",
+          "reason": "no capacity observation"
+        },
+        "occupancy": {
+          "running_runtimes": 5
+        },
+        "projects": [],
+        "work": [],
+        "transports": [],
+        "runtime_ids": []
+      }
+    ],
+    "facts": {
+      "host_id": "host/dev3",
+      "observed_at": "2026-10-10T10:00:00.000Z",
+      "load": {
+        "state": "reported",
+        "one_minute": 0.42,
+        "cpus": 8
+      }
+    },
+    "cards": [
+      {
+        "id": "machine/dev3#agents-running",
+        "kind": "agents_running",
+        "subject": "machine/dev3",
+        "label": "agents",
+        "value": "5 running",
+        "tone": "normal"
+      },
+      {
+        "id": "machine/dev3#load-1m",
+        "kind": "host_load",
+        "subject": "machine/dev3",
+        "label": "load 1m",
+        "value": "0.42 / 8 cpu",
+        "tone": "stale"
+      }
+    ]
+  },
+  {
+    "name": "a sample from a skewed clock is current",
+    "now_ms": 1791626395000,
+    "machines": [
+      {
+        "id": "machine/dev3",
+        "kind": "machine",
+        "revision": "machine:dev3",
+        "updated_at": "2026-10-10T09:59:00.000Z",
+        "host_id": "host/dev3",
+        "name": "dev3",
+        "state": "local",
+        "fleet_id": "fleet/example",
+        "capacity": {
+          "state": "unknown",
+          "reason": "no capacity observation"
+        },
+        "occupancy": {
+          "running_runtimes": 5
+        },
+        "projects": [],
+        "work": [],
+        "transports": [],
+        "runtime_ids": []
+      }
+    ],
+    "facts": {
+      "host_id": "host/dev3",
+      "observed_at": "2026-10-10T10:00:00.000Z",
+      "load": {
+        "state": "reported",
+        "one_minute": 0.42,
+        "cpus": 8
+      }
+    },
+    "cards": [
+      {
+        "id": "machine/dev3#agents-running",
+        "kind": "agents_running",
+        "subject": "machine/dev3",
+        "label": "agents",
+        "value": "5 running",
+        "tone": "normal"
+      },
+      {
+        "id": "machine/dev3#load-1m",
+        "kind": "host_load",
+        "subject": "machine/dev3",
+        "label": "load 1m",
+        "value": "0.42 / 8 cpu",
+        "tone": "normal"
+      }
+    ]
+  },
+  {
+    "name": "another machine's load is not reported and an unreachable one is stale",
+    "now_ms": 1791626401000,
+    "machines": [
+      {
+        "id": "machine/dev3",
+        "kind": "machine",
+        "revision": "machine:dev3",
+        "updated_at": "2026-10-10T09:59:00.000Z",
+        "host_id": "host/dev3",
+        "name": "dev3",
+        "state": "local",
+        "fleet_id": "fleet/example",
+        "capacity": {
+          "state": "unknown",
+          "reason": "no capacity observation"
+        },
+        "occupancy": {
+          "running_runtimes": 5
+        },
+        "projects": [],
+        "work": [],
+        "transports": [],
+        "runtime_ids": []
+      },
+      {
+        "id": "machine/mbp",
+        "kind": "machine",
+        "revision": "machine:mbp",
+        "updated_at": "2026-10-10T09:59:00.000Z",
+        "host_id": "host/mbp",
+        "name": "mbp",
+        "state": "unreachable",
+        "fleet_id": "fleet/example",
+        "capacity": {
+          "state": "unknown",
+          "reason": "no capacity observation"
+        },
+        "occupancy": {
+          "running_runtimes": 2
+        },
+        "projects": [],
+        "work": [],
+        "transports": [],
+        "runtime_ids": []
+      }
+    ],
+    "facts": {
+      "host_id": "host/dev3",
+      "observed_at": "2026-10-10T10:00:00.000Z",
+      "load": {
+        "state": "reported",
+        "one_minute": 0.42,
+        "cpus": 8
+      }
+    },
+    "cards": [
+      {
+        "id": "machine/dev3#agents-running",
+        "kind": "agents_running",
+        "subject": "machine/dev3",
+        "label": "agents",
+        "value": "5 running",
+        "tone": "normal"
+      },
+      {
+        "id": "machine/dev3#load-1m",
+        "kind": "host_load",
+        "subject": "machine/dev3",
+        "label": "load 1m",
+        "value": "0.42 / 8 cpu",
+        "tone": "normal"
+      },
+      {
+        "id": "machine/mbp#agents-running",
+        "kind": "agents_running",
+        "subject": "machine/mbp",
+        "label": "agents",
+        "value": "2 running",
+        "tone": "stale"
+      },
+      {
+        "id": "machine/mbp#load-1m",
+        "kind": "host_load",
+        "subject": "machine/mbp",
+        "label": "load 1m",
+        "value": "not reported",
+        "tone": "unknown"
+      }
+    ]
+  },
+  {
+    "name": "a host that cannot read its load says why",
+    "now_ms": 1791626401000,
+    "machines": [
+      {
+        "id": "machine/dev3",
+        "kind": "machine",
+        "revision": "machine:dev3",
+        "updated_at": "2026-10-10T09:59:00.000Z",
+        "host_id": "host/dev3",
+        "name": "dev3",
+        "state": "local",
+        "fleet_id": "fleet/example",
+        "capacity": {
+          "state": "unknown",
+          "reason": "no capacity observation"
+        },
+        "occupancy": {
+          "running_runtimes": 0
+        },
+        "projects": [],
+        "work": [],
+        "transports": [],
+        "runtime_ids": []
+      }
+    ],
+    "facts": {
+      "host_id": "host/dev3",
+      "observed_at": "2026-10-10T10:00:00.000Z",
+      "load": {
+        "state": "unknown",
+        "reason": "/proc/loadavg: No such file or directory (os error 2)"
+      }
+    },
+    "cards": [
+      {
+        "id": "machine/dev3#agents-running",
+        "kind": "agents_running",
+        "subject": "machine/dev3",
+        "label": "agents",
+        "value": "0 running",
+        "tone": "normal"
+      },
+      {
+        "id": "machine/dev3#load-1m",
+        "kind": "host_load",
+        "subject": "machine/dev3",
+        "label": "load 1m",
+        "value": "/proc/loadavg: No such file or directory (os error 2)",
+        "tone": "unknown"
+      }
+    ]
+  },
+  {
+    "name": "a failed facts read leaves load unreported",
+    "now_ms": 1791626401000,
+    "machines": [
+      {
+        "id": "machine/dev3",
+        "kind": "machine",
+        "revision": "machine:dev3",
+        "updated_at": "2026-10-10T09:59:00.000Z",
+        "host_id": "host/dev3",
+        "name": "dev3",
+        "state": "local",
+        "fleet_id": "fleet/example",
+        "capacity": {
+          "state": "unknown",
+          "reason": "no capacity observation"
+        },
+        "occupancy": {
+          "running_runtimes": 5
+        },
+        "projects": [],
+        "work": [],
+        "transports": [],
+        "runtime_ids": []
+      }
+    ],
+    "facts": null,
+    "cards": [
+      {
+        "id": "machine/dev3#agents-running",
+        "kind": "agents_running",
+        "subject": "machine/dev3",
+        "label": "agents",
+        "value": "5 running",
+        "tone": "normal"
+      },
+      {
+        "id": "machine/dev3#load-1m",
+        "kind": "host_load",
+        "subject": "machine/dev3",
+        "label": "load 1m",
+        "value": "not reported",
+        "tone": "unknown"
+      }
+    ]
+  }
+]

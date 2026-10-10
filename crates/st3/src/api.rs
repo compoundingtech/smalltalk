@@ -71,6 +71,7 @@ pub(crate) mod agent_harness;
 mod delivery_probes;
 mod github_watch;
 mod harness_events;
+mod host_facts;
 mod mailbox;
 mod mail_backlog;
 mod read_deadline;
@@ -513,6 +514,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/documents/content", get(client_v0::document_get))
         .route("/v1/client/usage", get(client_v0::usage_period))
         .route("/v1/client/mail-backlog", get(mail_backlog::get))
+        .route("/v1/client/host-facts", get(host_facts::read))
         .route("/v1/client/clients", get(client_v0::clients_list))
         .route(
             "/v1/client/subject-definition",

@@ -789,6 +789,8 @@ const HEARD_RECENTLY: chrono::Duration = chrono::Duration::minutes(5);
 
 fn machines(model: &Model) -> Vec<Machine> {
     let gateway = gateway(model).unwrap_or_default();
+    let facts = model.host_facts.as_ref().and_then(|facts| facts.as_ref().ok());
+    let now_ms = chrono::Utc::now().timestamp_millis();
     model
         .machines()
         .map(|machine| {
@@ -822,10 +824,7 @@ fn machines(model: &Model) -> Vec<Machine> {
                 seen: heard
                     .map(|at| crate::age_label(&at.to_rfc3339(), &now()))
                     .unwrap_or_else(|| "never".into()),
-                load: Some(match machine.occupancy.running_runtimes {
-                    1 => "1 running runtime".to_owned(),
-                    count => format!("{count} running runtimes"),
-                }),
+                metrics: st_surface::metrics::cards(std::slice::from_ref(machine), facts, now_ms),
                 links: machine
                     .transports
                     .iter()

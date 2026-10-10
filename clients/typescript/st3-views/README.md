@@ -20,7 +20,10 @@ const name = clientName('smalltalk-ide', version, build);
 
 The root exports all functions and types. Subpaths named after the source modules
 (`conversationView`, `conversationSimple`, `sessionView`, `homeView`, `requestView`,
-`deviceSigning`, `clientName`, `time`) expose the same APIs individually.
+`deviceSigning`, `clientName`, `time`, `metricCards`) expose the same APIs individually.
+
+`metricCards` turns `machines.list` and `host-facts.read` into the cards stui and Fractal draw
+through `crates/st-surface`; both check `fixtures/clients/metric-cards.json`.
 
 Conversation parsing, simplified tool bundles, live-window/history joining, session
 discovery, Home filtering/grouping, requests and structured answers live here. Home

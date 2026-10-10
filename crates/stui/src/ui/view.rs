@@ -409,7 +409,8 @@ pub struct Machine {
     pub platform: String,
     /// When anything was last heard from it: "4s ago", or "never".
     pub seen: String,
-    pub load: Option<String>,
+    /// The shared metric cards for this machine (crates/st-surface): agents running, then load.
+    pub metrics: Vec<st_surface::Card>,
     pub links: Vec<(String, bool, String)>,
     pub you_are_here: bool,
 }

@@ -83,6 +83,10 @@ pub struct Model {
     /// The build this member's daemon reports, read with its clients.
     #[serde(skip)]
     pub member_build: Option<String>,
+    /// What this member's own host reports (`host-facts.read`), read while the fleet shows, or
+    /// why not. Sampled, never cached: an old sample on disk would read as a current one.
+    #[serde(skip)]
+    pub host_facts: Option<std::result::Result<st3_client::HostFacts, String>>,
 }
 
 impl Model {

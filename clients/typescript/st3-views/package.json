@@ -12,7 +12,8 @@
     "./requestView": "./requestView.ts",
     "./deviceSigning": "./deviceSigning.ts",
     "./clientName": "./clientName.ts",
-    "./time": "./time.ts"
+    "./time": "./time.ts",
+    "./metricCards": "./metricCards.ts"
   },
   "scripts": {
     "test": "node --experimental-transform-types --test tests/*.test.mjs",

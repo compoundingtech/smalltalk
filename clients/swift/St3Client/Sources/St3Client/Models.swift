@@ -170,6 +170,25 @@ public struct DocumentContent: Codable, Sendable { public let reference: String;
 public struct ClientConnections: Codable, Sendable { public let kind, member: String; public let items: [ClientConnection] }
 public struct ClientConnection: Codable, Sendable { public let actor, person, member, via, since, lastSeen: String; public let client, deviceID, deviceName: String?; public let connected: Bool; public let streams: UInt64; public let follows: [String]?; enum CodingKeys: String, CodingKey { case actor, person, member, via, since, client, connected, streams, follows, lastSeen = "last_seen", deviceID = "device_id", deviceName = "device_name" } }
 public struct MailBacklog: Codable, Sendable { public let count, thresholdMS: UInt64; public let cleanupCommand: String; enum CodingKeys: String, CodingKey { case count, thresholdMS = "threshold_ms", cleanupCommand = "cleanup_command" } }
+public struct HostFacts: Codable, Sendable { public let hostID, observedAt: String; public let load: HostLoad; enum CodingKeys: String, CodingKey { case hostID = "host_id", observedAt = "observed_at", load } }
+public enum HostLoad: Codable, Sendable {
+    case reported(oneMinute: Double, cpus: UInt32), unknown(reason: String)
+    enum CodingKeys: String, CodingKey { case state, oneMinute = "one_minute", cpus, reason }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        switch try values.decode(String.self, forKey: .state) {
+        case "reported": self = .reported(oneMinute: try values.decode(Double.self, forKey: .oneMinute), cpus: try values.decode(UInt32.self, forKey: .cpus))
+        default: self = .unknown(reason: try values.decode(String.self, forKey: .reason))
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .reported(let oneMinute, let cpus): try values.encode("reported", forKey: .state); try values.encode(oneMinute, forKey: .oneMinute); try values.encode(cpus, forKey: .cpus)
+        case .unknown(let reason): try values.encode("unknown", forKey: .state); try values.encode(reason, forKey: .reason)
+        }
+    }
+}
 public struct UsagePeriod: Codable, Sendable { public let sinceMS, untilMS: UInt64; public let rows: [UsageRow]; public let limits: [UsageLimit]?; public let agentMessages: AgentMessageEstimate?; enum CodingKeys: String, CodingKey { case rows, limits, sinceMS = "since_ms", untilMS = "until_ms", agentMessages = "agent_messages" } }
 public struct AgentMessageEstimate: Codable, Sendable { public let calibration: String?; public let source, method: String; public let fallbackLowMicrousd, fallbackHighMicrousd: UInt64; public let days: [AgentMessageDay]; enum CodingKeys: String, CodingKey { case calibration, source, method, days, fallbackLowMicrousd = "fallback_low_microusd", fallbackHighMicrousd = "fallback_high_microusd" } }
 public struct AgentMessageDay: Codable, Sendable { public let dayStartMS, sinceMS, untilMS, messages, calibratedMessages, lowMicrousd, highMicrousd, usageCostMicrousd, unpricedTokens: UInt64; public let lowPercent, highPercent: Double?; enum CodingKeys: String, CodingKey { case messages, dayStartMS = "day_start_ms", sinceMS = "since_ms", untilMS = "until_ms", calibratedMessages = "calibrated_messages", lowMicrousd = "low_microusd", highMicrousd = "high_microusd", usageCostMicrousd = "usage_cost_microusd", unpricedTokens = "unpriced_tokens", lowPercent = "low_percent", highPercent = "high_percent" } }

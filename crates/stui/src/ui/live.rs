@@ -168,6 +168,9 @@ struct Following {
 const USAGE_EVERY: Duration = Duration::from_secs(60);
 /// How often the connected clients are read again while the fleet shows.
 const CLIENTS_EVERY: Duration = Duration::from_secs(10);
+/// How often this member's host facts are read again while the fleet shows.
+const HOST_FACTS_EVERY: Duration =
+    Duration::from_millis(st_surface::metrics::POLL_INTERVAL_MS);
 /// How long the missions window stays followed after a mission list or card leaves the screen.
 const MISSIONS_GRACE: Duration = Duration::from_secs(30);
 
@@ -211,6 +214,8 @@ enum Fetched {
         Result<st3_client::ClientConnections, String>,
         Option<String>,
     ),
+    /// This member's own host facts, or why they could not be read.
+    HostFacts(Result<st3_client::HostFacts, String>),
     /// st's conversation search for the palette's query, or why st could not say.
     Said(String, Result<st3_client::ConversationSearch, String>),
     Devices(Collection),
@@ -390,6 +395,8 @@ pub fn run(context: Context) -> Result<()> {
     // When the connected clients were last read, while the fleet shows, and whether a read is out.
     let mut clients_read: Option<Instant> = None;
     let mut clients_reading = false;
+    let mut host_facts_read: Option<Instant> = None;
+    let mut host_facts_reading = false;
     let mut usage_reading = false;
     // The machine list has no stream of its own, and a cached copy can be days old. It is read
     // again when a connection goes live and whenever st's live summary counts a different number
@@ -714,6 +721,10 @@ pub fn run(context: Context) -> Result<()> {
                         model.member_build = member_build;
                     }
                 }
+                Fetched::HostFacts(outcome) => {
+                    host_facts_reading = false;
+                    model.host_facts = Some(outcome);
+                }
                 Fetched::Usage(hours, outcome) => {
                     usage_reading = false;
                     if hours == ui.usage_hours {
@@ -922,8 +933,30 @@ pub fn run(context: Context) -> Result<()> {
                     let _ = tx.send(Fetched::Clients(outcome, member_build));
                 });
             }
+            let due = host_facts_read.is_none_or(|at| at.elapsed() >= HOST_FACTS_EVERY);
+            if due && !host_facts_reading {
+                host_facts_read = Some(Instant::now());
+                host_facts_reading = true;
+                let client = client.clone();
+                let tx = fetched_tx.clone();
+                runtime.spawn(async move {
+                    let outcome = client
+                        .host_facts_read()
+                        .await
+                        .map(|envelope| envelope.value)
+                        .map_err(|error| match &error {
+                            ClientError::Api(st3_client::ErrorCode::NotFound, ..) => {
+                                "this st does not report host facts yet: its daemon needs an update"
+                                    .to_owned()
+                            }
+                            _ => error.plain(),
+                        });
+                    let _ = tx.send(Fetched::HostFacts(outcome));
+                });
+            }
         } else {
             clients_read = None;
+            host_facts_read = None;
         }
         // Usage has no stream: it is read while something shows it, again each minute, and at
         // once over a new period.

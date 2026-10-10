@@ -1,0 +1,19 @@
+[package]
+name = "st-surface"
+version = "0.1.0"
+edition = "2024"
+description = "Renderer-independent cards over st client resources, shared by stui, Fractal and the web kit"
+license = "MIT"
+
+[features]
+# The terminal rendering stui and Fractal share; the web kit draws the same cards with React.
+ratatui = ["dep:ratatui"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+ratatui = { workspace = true, optional = true }
+serde = { version = "1", features = ["derive"] }
+st3-client = { path = "../st3-client" }
+
+[dev-dependencies]
+serde_json = "1"
