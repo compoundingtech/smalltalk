@@ -1,7 +1,8 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
-import { Button } from 'react-aria-components'
-import { surfaceVars, textVars, borderVars, radiusVars, spaceVars, typeVars, geometryNumbers } from './composition-tokens.stylex'
+import { geometryNumbers } from './composition-tokens.stylex'
+import { returnAffordanceFocus } from './embrace-virtual/AffordancePosition'
+import { FollowAffordance } from './embrace-virtual/FollowAffordance'
 
 const rowSelector = '[data-item-id], [data-embrace-entry-id]'
 const navigationKeys: Readonly<Record<string, true>> = { PageUp: true, PageDown: true, Home: true, End: true, ArrowUp: true, ArrowDown: true, ' ': true }
@@ -70,9 +71,13 @@ class ViewportController {
     this.dock()
   }
 
-  /** Shows the jump only for unread rows, and never reflows the lane under an active press. */
+  /** The pill offers the end whenever the reader is away from it; an active press keeps its layout until release. */
   private dock() {
-    if (this.jumpButton !== null && this.pressed.size === 0) this.jumpButton.hidden = !this.unread
+    const element = this.element
+    if (element === null) return
+    element.dataset.followState = this.following ? 'attached' : 'detached'
+    if (this.jumpButton === null || this.pressed.size > 0) return
+    this.jumpButton.hidden = this.following || element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.scrollEndTolerance
   }
 
   readonly released = (): ViewportState => ({ top: this.lastTop, following: this.following, unread: this.unread })
@@ -148,28 +153,35 @@ class ViewportController {
     return true
   }
 
+  /** One layout pass: the pressed row, then the end or the reader's anchor. */
+  private settle() {
+    const element = this.element
+    if (element === null) return
+    // The pressed row takes precedence over the reader's history anchor.
+    if (this.preservePress()) return
+    if (this.following) this.writeTop(element.scrollHeight)
+    else if (this.pendingTop !== undefined) {
+      this.writeTop(this.pendingTop)
+      if (Math.abs(element.scrollTop - Math.max(0, Math.min(this.pendingTop, element.scrollHeight - element.clientHeight))) < geometryNumbers.scrollEndTolerance) {
+        this.pendingTop = undefined
+        this.scheduleCapture()
+      }
+    } else if (this.captureFrame === undefined && this.anchor?.element.isConnected) {
+      this.writeTop(element.scrollTop + this.anchor.element.getBoundingClientRect().top - element.getBoundingClientRect().top - this.anchor.offset)
+    }
+    if (!this.following) this.dock()
+  }
+
   readonly schedule = () => {
     if (this.frame !== undefined) return
     this.frame = requestAnimationFrame(() => {
       this.frame = undefined
-      const element = this.element
-      if (element === null) return
-      // The pressed row takes precedence over the reader's history anchor.
-      if (this.preservePress()) return
-      if (this.following) this.writeTop(element.scrollHeight)
-      else if (this.pendingTop !== undefined) {
-        this.writeTop(this.pendingTop)
-        if (Math.abs(element.scrollTop - Math.max(0, Math.min(this.pendingTop, element.scrollHeight - element.clientHeight))) < geometryNumbers.scrollEndTolerance) {
-          this.pendingTop = undefined
-          this.scheduleCapture()
-        }
-      } else if (this.captureFrame === undefined && this.anchor?.element.isConnected) {
-        this.writeTop(element.scrollTop + this.anchor.element.getBoundingClientRect().top - element.getBoundingClientRect().top - this.anchor.offset)
-      }
+      this.settle()
     })
   }
 
   readonly jump = () => {
+    if (this.jumpButton !== null) returnAffordanceFocus(this.jumpButton, this.element)
     this.readerInputAt = -Infinity
     this.readerGesture = false
     this.following = true
@@ -189,6 +201,7 @@ class ViewportController {
     this.anchor = undefined
     this.writeTop(top)
     if (this.element !== null) this.lastTop = this.element.scrollTop
+    this.dock()
     this.scheduleCapture()
   }
 
@@ -226,6 +239,7 @@ class ViewportController {
       }
       if (event.type === 'wheel' || event.type === 'touchmove' || event.type === 'keydown') this.pressedAnchor = undefined
       this.following = false
+      this.dock()
       this.programmaticTop = undefined
       this.pendingTop = undefined
       this.scheduleCapture()
@@ -257,6 +271,7 @@ class ViewportController {
         if (this.following) this.schedule()
         else {
           this.lastTop = element.scrollTop
+          this.dock()
           this.scheduleCapture()
         }
         return
@@ -264,6 +279,7 @@ class ViewportController {
       this.pressedAnchor = undefined
       this.lastTop = element.scrollTop
       this.following = false
+      this.dock()
       this.scheduleCapture()
     }
     const scrollend = () => {
@@ -303,12 +319,11 @@ class ViewportController {
       this.dock()
     }
     const hidden = () => { if (page.visibilityState === 'hidden') abandon() }
+    // Resize delivery has already laid out the new geometry: settle before paint and drop the pending frame.
     const observer = new ResizeObserver(() => {
-      if (!this.preservePress() && this.following) {
-        if (this.frame !== undefined) cancelAnimationFrame(this.frame)
-        this.frame = undefined
-        this.writeTop(element.scrollHeight)
-      } else this.schedule()
+      if (this.frame !== undefined) cancelAnimationFrame(this.frame)
+      this.frame = undefined
+      this.settle()
     })
     observer.observe(element)
     if (element.firstElementChild !== null) observer.observe(element.firstElementChild)
@@ -422,12 +437,10 @@ export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({
   }, [controller, store])
   return <div {...stylex.props(styles.frame)}>
     <div {...props} style={{ ...props.style, overflowAnchor: 'none' }} ref={controller.attach}><div {...contentProps}>{children}</div></div>
-    <Button ref={controller.attachJump} onPress={controller.jump} hidden {...stylex.props(styles.jump)}>New messages ↓</Button>
+    <FollowAffordance buttonRef={controller.attachJump} onPress={controller.jump} />
   </div>
 })
 
 const styles = stylex.create({
-  frame: { display: 'flex', flexDirection: 'column', flex: '1 1 0', minHeight: 0, minWidth: 0 },
-  // A visible jump control gets its own dock, never covering a reader's current line.
-  jump: { flexShrink: 0, marginInline: 'auto', marginBlock: spaceVars.md, paddingBlock: spaceVars.xs, paddingInline: spaceVars.md, borderRadius: radiusVars.full, borderWidth: spaceVars.hairline, borderStyle: 'solid', borderColor: borderVars.borderStrong, backgroundColor: surfaceVars.raised, color: textVars.fg, fontSize: typeVars.metaSize, cursor: 'pointer' },
+  frame: { position: 'relative', display: 'flex', flexDirection: 'column', flex: '1 1 0', minHeight: 0, minWidth: 0 },
 })

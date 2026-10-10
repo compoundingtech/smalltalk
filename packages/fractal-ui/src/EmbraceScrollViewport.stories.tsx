@@ -35,14 +35,14 @@ export const FollowingAndAnchored: Story = { play: async ({ canvasElement }) => 
   await userEvent.click(canvas.getByRole('button', { name: 'Append message' }))
   await frame()
   await expect(Math.abs(anchor.getBoundingClientRect().top - viewport.getBoundingClientRect().top - offset)).toBeLessThanOrEqual(1)
-  await expect(canvas.getByRole('button', { name: 'New messages ↓' })).toBeVisible()
+  await expect(canvas.getByRole('button', { name: 'Scroll to end' })).toBeVisible()
   await userEvent.click(canvas.getByRole('button', { name: 'Change width' }))
   await frame()
   await expect(Math.abs(anchor.getBoundingClientRect().top - viewport.getBoundingClientRect().top - offset)).toBeLessThanOrEqual(1)
-  await userEvent.click(canvas.getByRole('button', { name: 'New messages ↓' }))
+  await userEvent.click(canvas.getByRole('button', { name: 'Scroll to end' }))
   await frame()
   await expect(viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop).toBeLessThanOrEqual(1)
-  await expect(canvas.queryByRole('button', { name: 'New messages ↓' })).toBeNull()
+  await expect(canvas.queryByRole('button', { name: 'Scroll to end' })).toBeNull()
 } }
 export const FollowingAndAnchoredLight: Story = { ...FollowingAndAnchored, args: { scheme: 'light' } }
 export const AllStates: Story = { render: args => <ScrollStory {...args} /> }
