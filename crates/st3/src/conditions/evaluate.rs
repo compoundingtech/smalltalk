@@ -12,15 +12,67 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::probe::{self, ProcessSampler};
-use super::{ConditionDecl, Metric, Scope, Tracker, Transition, Window, transition_text};
+use super::{ConditionDecl, Metric, Scope, Tracker, Transition, Window};
 use crate::disk::DiskSpace;
 use crate::store::{ConditionRecord, Store};
+
+/// One background evaluator per daemon. Kernel reads and store work run on the blocking
+/// pool; request handlers only read already recorded state.
+pub fn spawn(
+    store: std::sync::Arc<Store>,
+    host: String,
+    database: PathBuf,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+    events: tokio::sync::watch::Sender<u64>,
+) {
+    tokio::spawn(async move {
+        let probe = HostProbe::new(database, Box::new(crate::api::request_latency_windows));
+        let mut evaluator = Evaluator::new(host, Box::new(probe));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(super::EVALUATE_EVERY_MS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let tick_store = store.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let result = evaluator.tick(&tick_store, now);
+                (evaluator, result)
+            })
+            .await;
+            match task {
+                Ok((next, result)) => {
+                    evaluator = next;
+                    match result {
+                        Ok(report) => {
+                            if report.recorded > 0 || !report.messages.is_empty() {
+                                notify.notify_one();
+                                events.send_modify(|index| *index = index.wrapping_add(1));
+                            }
+                            for error in report.errors {
+                                tracing::warn!(%error, "condition evaluation");
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "condition evaluation"),
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "condition evaluator stopped");
+                    break;
+                }
+            }
+        }
+    });
+}
 
 /// How long a spend reading is reused: it reads a day of usage rollups.
 const COST_EVERY_MS: u128 = 5 * 60_000;
 
 /// Where values come from. The daemon reads the host; tests supply their own.
-pub trait Probe: Send {
+pub(crate) trait Probe: Send {
     /// Free space on each local filesystem, by mount point.
     fn filesystems(&mut self) -> BTreeMap<String, DiskSpace>;
     fn filesystem_of(&mut self, path: &str) -> Option<DiskSpace>;
@@ -32,7 +84,7 @@ pub trait Probe: Send {
 }
 
 /// The daemon's own host.
-pub struct HostProbe {
+pub(crate) struct HostProbe {
     database: PathBuf,
     processes: ProcessSampler,
     slo: Box<dyn Fn() -> Value + Send>,
@@ -74,18 +126,6 @@ impl Probe for HostProbe {
     }
 }
 
-/// A transition its owner has not been told of yet.
-struct Wake {
-    subject: String,
-    instance: String,
-    transition: Transition,
-    breach_since: u128,
-    title: String,
-    body: String,
-    /// The state claim that recorded the transition, once written.
-    evidence: Option<String>,
-}
-
 /// What one tick did, for the log and for tests.
 #[derive(Debug, Default, PartialEq)]
 pub struct TickReport {
@@ -96,14 +136,13 @@ pub struct TickReport {
     pub errors: Vec<String>,
 }
 
-pub struct Evaluator {
+pub(crate) struct Evaluator {
     host: String,
     probe: Box<dyn Probe>,
     trackers: BTreeMap<(String, String), Tracker>,
     restored: bool,
     /// Transitions whose state claim is not written yet.
     unrecorded: BTreeMap<(String, String), Transition>,
-    wakes: Vec<Wake>,
     cost: Option<(u128, f64)>,
 }
 
@@ -126,7 +165,6 @@ impl Evaluator {
             trackers: BTreeMap::new(),
             restored: false,
             unrecorded: BTreeMap::new(),
-            wakes: Vec::new(),
             cost: None,
         }
     }
@@ -134,7 +172,11 @@ impl Evaluator {
     pub fn tick(&mut self, store: &Store, now: u128) -> Result<TickReport> {
         let mut report = TickReport::default();
         // Bring the heads up to date first: they are what readers and a restart read.
-        while store.fold_condition_heads()? > 0 {}
+        for _ in 0..4 {
+            if store.fold_condition_heads()? < 500 {
+                break;
+            }
+        }
         if !self.restored {
             self.trackers = store.condition_trackers(&self.host)?;
             self.restored = true;
@@ -165,6 +207,9 @@ impl Evaluator {
         let mut live = BTreeSet::new();
         for decl in &decls {
             for (instance, value) in self.values(store, decl, &mut readings, now) {
+                if !value.is_finite() {
+                    continue;
+                }
                 let key = (decl.subject(), instance.clone());
                 live.insert(key.clone());
                 report.evaluated += 1;
@@ -174,19 +219,6 @@ impl Evaluator {
                         .transitions
                         .push((key.0.clone(), instance.clone(), transition));
                     self.unrecorded.insert(key.clone(), transition);
-                    if decl.owner.starts_with("agent/") {
-                        let (title, body) =
-                            transition_text(decl, transition, &self.host, &instance, tracker, now);
-                        self.wakes.push(Wake {
-                            subject: key.0.clone(),
-                            instance: instance.clone(),
-                            transition,
-                            breach_since: tracker.breach_since.unwrap_or(now),
-                            title,
-                            body,
-                            evidence: None,
-                        });
-                    }
                 }
                 let transition = self.unrecorded.get(&key).copied();
                 if !tracker.should_record(transition, now) {
@@ -200,19 +232,10 @@ impl Evaluator {
                     transition,
                     now,
                 }) {
-                    Ok(claim) => {
+                    Ok(_) => {
                         tracker.mark_recorded(now);
                         report.recorded += 1;
-                        if let Some(transition) = self.unrecorded.remove(&key) {
-                            for wake in self.wakes.iter_mut().filter(|wake| {
-                                wake.subject == key.0
-                                    && wake.instance == key.1
-                                    && wake.transition == transition
-                                    && wake.evidence.is_none()
-                            }) {
-                                wake.evidence = Some(claim.id.clone());
-                            }
-                        }
+                        self.unrecorded.remove(&key);
                     }
                     Err(error) => report
                         .errors
@@ -222,38 +245,27 @@ impl Evaluator {
         }
         // Instances of conditions that no longer apply here stop being tracked. One whose value
         // could not be read this tick keeps its state for the next.
-        let declared = decls.iter().map(ConditionDecl::subject).collect::<BTreeSet<_>>();
+        let declared = decls
+            .iter()
+            .map(ConditionDecl::subject)
+            .collect::<BTreeSet<_>>();
         self.trackers
             .retain(|key, _| declared.contains(&key.0) || live.contains(key));
-        let by_subject = decls
-            .iter()
-            .map(|decl| (decl.subject(), decl))
-            .collect::<BTreeMap<_, _>>();
-        let mut unsent = Vec::new();
-        for wake in self.wakes.drain(..) {
-            let Some(decl) = by_subject.get(&wake.subject) else {
-                continue;
-            };
-            match store.send_condition_message(
-                decl,
-                &wake.instance,
-                wake.transition,
-                wake.breach_since,
-                &wake.title,
-                &wake.body,
-                wake.evidence.as_deref(),
-            ) {
-                Ok(Some(message)) => report.messages.push(message),
-                Ok(None) => {}
-                Err(error) => {
-                    report
-                        .errors
-                        .push(format!("{} {}: {error:#}", wake.subject, wake.instance));
-                    unsent.push(wake);
-                }
+        for (key, tracker) in &mut self.trackers {
+            if !live.contains(key) {
+                tracker.interrupt_hold(now);
             }
         }
-        self.wakes = unsent;
+        // Fold freshly written claims before draining the durable notification queue.
+        for _ in 0..4 {
+            if store.fold_condition_heads()? < 500 {
+                break;
+            }
+        }
+        match store.flush_condition_notifications() {
+            Ok(messages) => report.messages.extend(messages),
+            Err(error) => report.errors.push(format!("notifications: {error:#}")),
+        }
         Ok(report)
     }
 
@@ -316,9 +328,7 @@ impl Evaluator {
                 .map(|value| vec![(host, value)])
                 .unwrap_or_default(),
             Metric::DaemonCpuCores | Metric::SloBurnRate | Metric::SloP99Ms => {
-                let windows = readings
-                    .slo
-                    .get_or_insert_with(|| self.probe.slo_windows());
+                let windows = readings.slo.get_or_insert_with(|| self.probe.slo_windows());
                 slo_value(windows, decl)
                     .map(|value| vec![(host, value)])
                     .unwrap_or_default()
@@ -439,7 +449,11 @@ mod tests {
         fn memory_available_percent(&mut self) -> Option<f64> {
             None
         }
-        fn processes(&mut self, names: &[&str], _now: u128) -> BTreeMap<String, probe::ProcessReading> {
+        fn processes(
+            &mut self,
+            names: &[&str],
+            _now: u128,
+        ) -> BTreeMap<String, probe::ProcessReading> {
             let cpu = *self.cpu.lock().unwrap();
             names
                 .iter()
@@ -507,7 +521,12 @@ condition "fleet/elsewhere" {
             )
             .unwrap();
         store
-            .apply_as(&intent, &plan.subject_tokens, "conditions", Some("person/ada"))
+            .apply_as(
+                &intent,
+                &plan.subject_tokens,
+                "conditions",
+                Some("person/ada"),
+            )
             .unwrap();
         (directory, store)
     }
@@ -518,10 +537,10 @@ condition "fleet/elsewhere" {
     fn owners_are_woken_once_on_entering_breach_and_once_on_recovery() {
         let (_directory, store) = store();
         let fake = Fake::default();
-        fake.free.lock().unwrap().extend([
-            ("/".to_owned(), (50, 100)),
-            ("/data".to_owned(), (10, 100)),
-        ]);
+        fake.free
+            .lock()
+            .unwrap()
+            .extend([("/".to_owned(), (50, 100)), ("/data".to_owned(), (10, 100))]);
         *fake.cpu.lock().unwrap() = Some(0.2);
         let mut evaluator = Evaluator::new("alder", Box::new(fake.clone()));
         let start = 1_760_000_000_000u128;
@@ -549,16 +568,27 @@ condition "fleet/elsewhere" {
             )]
         );
         assert_eq!(messages.len(), 1);
-        let message = store.claims_for(&messages[0], Some("message.sent")).unwrap();
-        assert_eq!(message[0].fields["to"], "agent/ops");
+        let message = store
+            .claims_for(&messages[0], Some("message.sent"))
+            .unwrap();
+        assert_eq!(message[0].body["fields"]["to"], "agent/ops");
         assert_eq!(
-            message[0].fields["title"],
+            message[0].body["fields"]["title"],
             "Condition breached: fleet/disk on alder:/data"
         );
-        let content = message[0].fields["content"].as_str().unwrap();
-        assert!(content.contains("disk.free-percent is 10%, below its threshold of 15%"), "{content}");
-        assert!(content.contains("Series: st conditions show fleet/disk"), "{content}");
-        assert!(!message[0].evidence.is_empty(), "the message cites its state claim");
+        let content = message[0].body["fields"]["content"].as_str().unwrap();
+        assert!(
+            content.contains("disk.free-percent is 10%, below its threshold of 15%"),
+            "{content}"
+        );
+        assert!(
+            content.contains("Series: st conditions show fleet/disk"),
+            "{content}"
+        );
+        assert!(
+            !message[0].body["evidence"].as_array().unwrap().is_empty(),
+            "the message cites its state claim"
+        );
 
         // A restarted evaluator continues from the graph and does not announce it again.
         let mut evaluator = Evaluator::new("alder", Box::new(fake.clone()));
@@ -580,17 +610,24 @@ condition "fleet/elsewhere" {
         run(&mut evaluator, 1230, 1320);
         assert_eq!(transitions.len(), 3);
         assert_eq!(messages.len(), 2);
-        let alerts = store.attention_snapshot(Some("person/ada"), start + 1320 * S).unwrap();
+        let alerts = store
+            .attention_snapshot(Some("person/ada"), start + 1320 * S)
+            .unwrap();
         let alert = alerts.iter().find(|item| item.kind == "condition").unwrap();
-        assert_eq!(alert.title, "Condition breached: fleet/collector-cpu on alder");
+        assert_eq!(
+            alert.title,
+            "Condition breached: fleet/collector-cpu on alder"
+        );
         *fake.cpu.lock().unwrap() = Some(0.5);
         run(&mut evaluator, 1350, 1440);
         assert_eq!(transitions.len(), 4);
-        assert!(store
-            .attention_snapshot(Some("person/ada"), start + 1440 * S)
-            .unwrap()
-            .iter()
-            .all(|item| item.kind != "condition"));
+        assert!(
+            store
+                .attention_snapshot(Some("person/ada"), start + 1440 * S)
+                .unwrap()
+                .iter()
+                .all(|item| item.kind != "condition")
+        );
 
         let conditions = store.conditions().unwrap();
         let disk = conditions
@@ -609,6 +646,46 @@ condition "fleet/elsewhere" {
             .find(|c| c.subject == "condition/fleet/elsewhere")
             .unwrap();
         assert!(elsewhere.instances.is_empty());
+    }
+
+    #[test]
+    fn a_missing_reading_interrupts_entry_and_recovery_holds() {
+        let (_directory, store) = store();
+        let fake = Fake::default();
+        fake.free.lock().unwrap().insert("/".into(), (10, 100));
+        let mut evaluator = Evaluator::new("alder", Box::new(fake.clone()));
+        let start = 1_760_000_000_000u128;
+        evaluator.tick(&store, start).unwrap();
+        fake.free.lock().unwrap().clear();
+        evaluator.tick(&store, start + 30_000).unwrap();
+        fake.free.lock().unwrap().insert("/".into(), (10, 100));
+        assert!(
+            evaluator
+                .tick(&store, start + 120_000)
+                .unwrap()
+                .transitions
+                .is_empty()
+        );
+        assert_eq!(
+            evaluator.tick(&store, start + 240_000).unwrap().transitions[0].2,
+            Transition::Enter
+        );
+        fake.free.lock().unwrap().insert("/".into(), (20, 100));
+        evaluator.tick(&store, start + 270_000).unwrap();
+        fake.free.lock().unwrap().clear();
+        evaluator.tick(&store, start + 300_000).unwrap();
+        fake.free.lock().unwrap().insert("/".into(), (20, 100));
+        assert!(
+            evaluator
+                .tick(&store, start + 330_000)
+                .unwrap()
+                .transitions
+                .is_empty()
+        );
+        assert_eq!(
+            evaluator.tick(&store, start + 390_000).unwrap().transitions[0].2,
+            Transition::Recover
+        );
     }
 
     #[test]
@@ -633,7 +710,10 @@ condition "fleet/elsewhere" {
         let mut steady = 0;
         fake.free.lock().unwrap().insert("/".into(), (50, 100));
         for tick in 120..240u128 {
-            steady += evaluator.tick(&store, start + tick * 30 * S).unwrap().recorded;
+            steady += evaluator
+                .tick(&store, start + tick * 30 * S)
+                .unwrap()
+                .recorded;
         }
         assert_eq!(steady, 1, "a steady value writes once, when it changed");
     }
@@ -672,14 +752,35 @@ condition "fleet/elsewhere" {
         };
         let burn = slo_value(&report, &decl("slo.burn-rate", Some("person-read"), None)).unwrap();
         assert!((burn - 3.0).abs() < 1e-9, "{burn}");
-        assert_eq!(slo_value(&report, &decl("slo.p99-ms", Some("person-read"), None)), Some(140.0));
-        assert_eq!(slo_value(&report, &decl("slo.p99-ms", Some("write-ack"), None)), None);
-        assert_eq!(slo_value(&report, &decl("slo.burn-rate", Some("write-ack"), None)), Some(0.0));
         assert_eq!(
-            slo_value(&report, &decl("slo.p99-ms", Some("GET /v1/client/now"), Some("5m"))),
+            slo_value(&report, &decl("slo.p99-ms", Some("person-read"), None)),
+            Some(140.0)
+        );
+        assert_eq!(
+            slo_value(&report, &decl("slo.p99-ms", Some("write-ack"), None)),
+            None
+        );
+        assert_eq!(
+            slo_value(&report, &decl("slo.burn-rate", Some("write-ack"), None)),
+            Some(0.0)
+        );
+        assert_eq!(
+            slo_value(
+                &report,
+                &decl("slo.p99-ms", Some("GET /v1/client/now"), Some("5m"))
+            ),
             Some(80.0)
         );
-        assert_eq!(slo_value(&report, &decl("slo.burn-rate", Some("GET /v1/unknown"), None)), None);
-        assert_eq!(slo_value(&report, &decl("daemon.cpu-cores", None, None)), Some(0.4));
+        assert_eq!(
+            slo_value(
+                &report,
+                &decl("slo.burn-rate", Some("GET /v1/unknown"), None)
+            ),
+            None
+        );
+        assert_eq!(
+            slo_value(&report, &decl("daemon.cpu-cores", None, None)),
+            Some(0.4)
+        );
     }
 }

@@ -375,8 +375,9 @@ pub fn parse_condition(subject: &str, desired: &Value) -> Result<ConditionDecl, 
         )
     })?;
     let scope_name = one_string(desired, "scope")?.ok_or("a condition needs a `scope`")?;
-    let scope = Scope::parse(&scope_name)
-        .ok_or_else(|| format!("unknown scope `{scope_name}`; use host, process, member or route"))?;
+    let scope = Scope::parse(&scope_name).ok_or_else(|| {
+        format!("unknown scope `{scope_name}`; use host, process, member or route")
+    })?;
     if scope != metric_scope {
         return Err(format!(
             "metric `{metric_name}` is measured per {}, not per {scope_name}",
@@ -430,12 +431,17 @@ pub fn parse_condition(subject: &str, desired: &Value) -> Result<ConditionDecl, 
         Some(value) => Window::parse(&value)
             .ok_or_else(|| format!("window `{value}` is not one of 1m, 5m or 1h"))?,
     };
-    let (comparison, threshold) = match (one_number(desired, "above")?, one_number(desired, "below")?) {
-        (Some(value), None) => (Comparison::Above, value),
-        (None, Some(value)) => (Comparison::Below, value),
-        (None, None) => return Err("a condition needs a threshold: `above N` or `below N`".into()),
-        (Some(_), Some(_)) => return Err("a condition takes `above` or `below`, not both".into()),
-    };
+    let (comparison, threshold) =
+        match (one_number(desired, "above")?, one_number(desired, "below")?) {
+            (Some(value), None) => (Comparison::Above, value),
+            (None, Some(value)) => (Comparison::Below, value),
+            (None, None) => {
+                return Err("a condition needs a threshold: `above N` or `below N`".into());
+            }
+            (Some(_), Some(_)) => {
+                return Err("a condition takes `above` or `below`, not both".into());
+            }
+        };
     let recover_at = one_number(desired, "recover")?.unwrap_or(threshold);
     match comparison {
         Comparison::Above if recover_at > threshold => {
@@ -450,8 +456,9 @@ pub fn parse_condition(subject: &str, desired: &Value) -> Result<ConditionDecl, 
         }
         _ => {}
     }
-    let hold_ms = duration(desired, "for")?
-        .ok_or("a condition needs `for`: how long the threshold must be crossed, such as \"10m\"")?;
+    let hold_ms = duration(desired, "for")?.ok_or(
+        "a condition needs `for`: how long the threshold must be crossed, such as \"10m\"",
+    )?;
     let recover_hold_ms = duration(desired, "recover-for")?.unwrap_or(hold_ms);
     let owner = one_string(desired, "owner")?.ok_or("a condition needs an `owner`")?;
     let owner_name = owner
@@ -515,9 +522,7 @@ impl ConditionDecl {
     /// Where the owner can see the series of one instance.
     pub fn series_link(&self, host: &str, instance: &str) -> String {
         match &self.link {
-            Some(link) => link
-                .replace("{host}", host)
-                .replace("{instance}", instance),
+            Some(link) => link.replace("{host}", host).replace("{instance}", instance),
             None => format!("st conditions show {}", self.name),
         }
     }
@@ -659,6 +664,18 @@ impl Tracker {
         }
     }
 
+    /// A missing sample cannot prove that a threshold held continuously.
+    pub fn interrupt_hold(&mut self, now: u128) {
+        match self.phase {
+            Phase::Pending => {
+                self.breach_since = None;
+                self.set(Phase::Clear, now);
+            }
+            Phase::Recovering => self.set(Phase::Breach, now),
+            _ => {}
+        }
+    }
+
     /// Fold one sample in. Returns the transition it caused, if any.
     pub fn observe(&mut self, decl: &ConditionDecl, value: f64, now: u128) -> Option<Transition> {
         if self.values.len() == RING {
@@ -750,7 +767,11 @@ pub fn transition_text(
     tracker: &Tracker,
     now: u128,
 ) -> (String, String) {
-    let value = tracker.values.back().map(|(_, value)| *value).unwrap_or(f64::NAN);
+    let value = tracker
+        .values
+        .back()
+        .map(|(_, value)| *value)
+        .unwrap_or(f64::NAN);
     let since = tracker.breach_since.unwrap_or(now);
     let place = if instance == host {
         host.to_owned()
@@ -815,6 +836,57 @@ pub fn breach_subject(condition: &str) -> String {
     }
 }
 
+/// Summarize each declared condition using only published state.
+pub fn doctor_lines(
+    conditions: &[crate::store::ConditionView],
+) -> Vec<(String, &'static str, String)> {
+    conditions
+        .iter()
+        .map(|condition| {
+            let status = if condition.invalid.is_some()
+                || condition.instances.is_empty()
+                || condition
+                    .instances
+                    .iter()
+                    .any(|instance| instance.phase != "clear")
+            {
+                "warn"
+            } else {
+                "pass"
+            };
+            let states = condition
+                .instances
+                .iter()
+                .map(|instance| {
+                    format!(
+                        "{} {} (value {})",
+                        instance.instance,
+                        instance.phase,
+                        instance
+                            .value
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "unknown".into())
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let detail = condition.invalid.clone().unwrap_or_else(|| {
+                format!(
+                    "{}; owner {}; {}",
+                    condition.rule.as_deref().unwrap_or("unknown rule"),
+                    condition.owner.as_deref().unwrap_or("unknown"),
+                    if states.is_empty() {
+                        "awaiting a sample"
+                    } else {
+                        &states
+                    }
+                )
+            });
+            (condition.subject.clone(), status, detail)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,7 +928,10 @@ mod tests {
             decl.describe_rule(),
             "disk.free-percent below 15% (recovers at 18%) for 10m"
         );
-        assert_eq!(decl.series_link("alder", "alder:/"), "st conditions show fleet/disk");
+        assert_eq!(
+            decl.series_link("alder", "alder:/"),
+            "st conditions show fleet/disk"
+        );
     }
 
     #[test]
@@ -880,7 +955,9 @@ mod tests {
             children[index] = child;
             parse(children).unwrap_err()
         };
-        assert!(replace(0, json!({"name": "metric", "arguments": ["cpu"]})).contains("unknown metric"));
+        assert!(
+            replace(0, json!({"name": "metric", "arguments": ["cpu"]})).contains("unknown metric")
+        );
         assert!(
             replace(1, json!({"name": "scope", "arguments": ["host"]}))
                 .contains("measured per process")
@@ -890,16 +967,15 @@ mod tests {
                 .contains("needs a `process`")
         );
         assert!(
-            replace(2, json!({"name": "process", "arguments": ["a-process-name-too-long"]}))
-                .contains("15 characters")
+            replace(
+                2,
+                json!({"name": "process", "arguments": ["a-process-name-too-long"]})
+            )
+            .contains("15 characters")
         );
+        assert!(replace(4, json!({"name": "recover", "arguments": [2]})).contains("needs `for`"));
         assert!(
-            replace(4, json!({"name": "recover", "arguments": [2]}))
-                .contains("needs `for`")
-        );
-        assert!(
-            replace(5, json!({"name": "owner", "arguments": ["ada"]}))
-                .contains("not an agent")
+            replace(5, json!({"name": "owner", "arguments": ["ada"]})).contains("not an agent")
         );
         let mut both = base();
         both.push(json!({"name": "below", "arguments": [1]}));
@@ -924,7 +1000,10 @@ mod tests {
         assert_eq!(tracker.phase, Phase::Pending);
         assert_eq!(tracker.observe(&decl, 13.0, 6 * MIN), None);
         // Ten minutes after the first crossing, not after the latest sample.
-        assert_eq!(tracker.observe(&decl, 12.0, 11 * MIN), Some(Transition::Enter));
+        assert_eq!(
+            tracker.observe(&decl, 12.0, 11 * MIN),
+            Some(Transition::Enter)
+        );
         assert_eq!(tracker.phase, Phase::Breach);
         assert_eq!(tracker.breach_since, Some(MIN));
         for minute in 12..40 {
@@ -944,7 +1023,10 @@ mod tests {
         // The next crossing starts its hold over.
         tracker.observe(&decl, 14.0, 10 * MIN);
         assert_eq!(tracker.observe(&decl, 14.0, 19 * MIN), None);
-        assert_eq!(tracker.observe(&decl, 14.0, 20 * MIN), Some(Transition::Enter));
+        assert_eq!(
+            tracker.observe(&decl, 14.0, 20 * MIN),
+            Some(Transition::Enter)
+        );
     }
 
     #[test]
@@ -952,14 +1034,20 @@ mod tests {
         let decl = disk();
         let mut tracker = Tracker::default();
         tracker.observe(&decl, 10.0, 0);
-        assert_eq!(tracker.observe(&decl, 10.0, 10 * MIN), Some(Transition::Enter));
+        assert_eq!(
+            tracker.observe(&decl, 10.0, 10 * MIN),
+            Some(Transition::Enter)
+        );
         // Above the threshold but under the recovery line is still breach.
         assert_eq!(tracker.observe(&decl, 16.0, 11 * MIN), None);
         assert_eq!(tracker.phase, Phase::Breach);
         assert_eq!(tracker.observe(&decl, 19.0, 12 * MIN), None);
         assert_eq!(tracker.phase, Phase::Recovering);
         assert_eq!(tracker.observe(&decl, 19.0, 16 * MIN), None);
-        assert_eq!(tracker.observe(&decl, 20.0, 17 * MIN), Some(Transition::Recover));
+        assert_eq!(
+            tracker.observe(&decl, 20.0, 17 * MIN),
+            Some(Transition::Recover)
+        );
         assert_eq!(tracker.phase, Phase::Clear);
         assert_eq!(tracker.observe(&decl, 30.0, 30 * MIN), None);
     }
@@ -975,7 +1063,10 @@ mod tests {
             let value = if tick % 2 == 0 { 14.0 } else { 16.0 };
             transitions.extend(tracker.observe(&decl, value, tick * 30_000));
         }
-        assert!(transitions.is_empty(), "no hold of ten minutes: {transitions:?}");
+        assert!(
+            transitions.is_empty(),
+            "no hold of ten minutes: {transitions:?}"
+        );
         // Held under the threshold, it enters once; flapping between 14 and 17 afterwards stays in
         // breach; only a held climb past 18 recovers, once.
         for tick in 60..90u128 {
@@ -1034,7 +1125,10 @@ mod tests {
         let decl = disk();
         let mut tracker = Tracker::default();
         tracker.observe(&decl, 40.0, 0);
-        assert!(tracker.should_record(None, 0), "the first sample is written");
+        assert!(
+            tracker.should_record(None, 0),
+            "the first sample is written"
+        );
         tracker.mark_recorded(0);
         tracker.observe(&decl, 39.0, MIN);
         assert!(!tracker.should_record(None, MIN), "changed, but too soon");
@@ -1072,8 +1166,14 @@ mod tests {
         assert_eq!(title, "Condition breached: fleet/disk on alder:/srv");
         assert!(body.starts_with("disk.free-percent is 12.3%, below its threshold of 15%, since 2025-10-09 08:53 UTC (10m ago)."), "{body}");
         assert!(body.contains("Recent values: 14.2%, 12.3%"), "{body}");
-        assert!(body.contains("Series: https://observe.example/d?host=alder"), "{body}");
-        assert!(body.contains("Source: condition/fleet/disk (alder:/srv)"), "{body}");
+        assert!(
+            body.contains("Series: https://observe.example/d?host=alder"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Source: condition/fleet/disk (alder:/srv)"),
+            "{body}"
+        );
     }
 
     #[test]
@@ -1082,7 +1182,10 @@ mod tests {
         assert_eq!(round(0.012345), 0.0123);
         assert_eq!(round(123_456.0), 123_000.0);
         assert_eq!(round(0.0), 0.0);
-        assert_eq!(Metric::DbGrowthBytesPerDay.describe(3.5 * 1024.0 * 1024.0), "3.5 MiB");
+        assert_eq!(
+            Metric::DbGrowthBytesPerDay.describe(3.5 * 1024.0 * 1024.0),
+            "3.5 MiB"
+        );
         assert_eq!(duration_text(90 * 60_000), "1h30m");
     }
 }

@@ -5767,6 +5767,23 @@ agent "dotfiles/steward" {
     }
 
     #[test]
+    fn condition_declarations_are_root_only_and_validated_on_publication() {
+        let condition = r#"condition "fleet/disk" {
+  metric "disk.free-percent"
+  scope "host"
+  below 15
+  for "10m"
+  owner "agent/ops"
+}"#;
+        let source = format!("version 2\n{condition}\n");
+        let intent = parse_intent(&source, "alder").unwrap();
+        assert!(intent.subjects.contains_key("condition/fleet/disk"));
+        assert!(parse_intent(&source.replace("disk.free-percent", "unknown"), "alder").is_err());
+        assert!(parse_intent(&source.replace("scope \"host\"", "scope \"route\""), "alder").is_err());
+        assert!(parse_intent(&format!("version 2\nmission \"sample\" {{\n{condition}\n}}\n"), "alder").is_err());
+    }
+
+    #[test]
     fn account_declarations_are_root_only_and_strict() {
         let source = r#"
 version 2

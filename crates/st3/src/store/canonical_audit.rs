@@ -70,6 +70,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_limit_stops",
         "local_seat_accounts",
         "local_condition_heads",
+        "local_condition_notifications",
         "local_condition_claim_bytes",
         "account_limit_readings",
         "account_limit_seats",

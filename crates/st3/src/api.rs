@@ -752,6 +752,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/events", get(events))
         .route("/v1/events/page", get(events_page))
         .route("/v1/doctor", get(doctor))
+        .route("/v1/conditions", get(list_conditions))
         .route("/v1/repair", get(operational_repair_plan))
         .route("/v1/repair/apply", post(apply_operational_repair))
         .route("/v1/backup", get(backup_export))
@@ -1250,7 +1251,7 @@ fn request_latency_snapshot() -> Vec<Value> {
 }
 
 /// Every target's live windows, and every path's: see `slo/targets.toml`.
-fn request_latency_windows() -> Value {
+pub fn request_latency_windows() -> Value {
     request_latency().lock().unwrap().windows(Instant::now())
 }
 
@@ -7009,6 +7010,11 @@ fn doctor_report_with_operation_drift(
             status: "fail".into(),
             message: error.to_string(),
         }),
+    }
+    for (name, status, message) in crate::conditions::doctor_lines(
+        &state.store.conditions().map_err(ApiError::internal)?,
+    ) {
+        checks.push(DoctorCheck { name, status: status.into(), message });
     }
     match state.store.claim_verdict_counts() {
         Ok(counts) => checks.push(claim_signatures_check(&counts)),
@@ -13360,6 +13366,10 @@ async fn outcome_history(
     .await
     .map(Json)
 }
+async fn list_conditions(State(state): State<AppState>) -> Result<Json<Vec<crate::store::ConditionView>>, ApiError> {
+    blocking_store(move || state.store.conditions()).await.map(Json)
+}
+
 async fn performance_report() -> Json<Value> {
     Json(crate::performance::snapshot())
 }
@@ -17020,6 +17030,40 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
             native_session_home: None,
             planner_default: PlannerSpec::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn conditions_api_and_doctor_read_recorded_state_without_evaluating() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"version 2
+condition "fleet/disk" {
+  metric "disk.free-percent"
+  scope "host"
+  below 15
+  for "0s"
+  owner "person/ada"
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let plan = state.store.mission(&intent, IntentInput { kdl: source.into(), source_name: None }).unwrap();
+        state.store.apply_as(&intent, &plan.subject_tokens, "conditions", Some("person/ada")).unwrap();
+        let decl = state.store.declared_conditions().unwrap().remove(0).decl.unwrap();
+        let mut tracker = crate::conditions::Tracker::default();
+        let transition = tracker.observe(&decl, 10.0, 1_000);
+        state.store.record_condition_state(&crate::store::ConditionRecord {
+            decl: &decl, host: "node", instance: "node:/", tracker: &tracker, transition, now: 1_000,
+        }).unwrap();
+        state.store.fold_condition_heads().unwrap();
+        let before = state.store.index().unwrap();
+        let (status, values) = get_request(router(state.clone()), "/v1/conditions").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(values[0]["subject"], "condition/fleet/disk");
+        assert_eq!(values[0]["instances"][0]["phase"], "breach");
+        let report = doctor_report(&state).unwrap().0;
+        assert!(report.checks.iter().any(|check| check.name == "condition/fleet/disk"
+            && check.status == "warn" && check.message.contains("breach")));
+        assert_eq!(state.store.index().unwrap(), before);
     }
 
     #[test]

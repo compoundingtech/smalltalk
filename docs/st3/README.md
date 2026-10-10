@@ -50,6 +50,7 @@ Use these documents for implementation details:
   stopping a seat ends every process the seat started, and what a host without systemd misses.
 - [Subagents](subagents.md) explains how st records the subagents a seat's harness runs as claims
   on the seat, with a lease, and ends them when their harness, session or seat goes away.
+- [Declared conditions](conditions.md) describes daemon evaluation, thresholds, owner notifications and inspection.
 - [Model accounts](accounts.md) explains how a person declares several Claude and Codex accounts, how a
   seat binds one or a pool, and how a pooled seat at its limit restarts on another account.
 - [Sekrets](sekrets.md) explains the opt-in gateway that runs any CLI with a credential no seat

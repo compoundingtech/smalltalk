@@ -3024,6 +3024,8 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("incarnation", string()),
         ],
         "condition.state" => &[
+            ("notification_title", string()),
+            ("notification_body", string()),
             ("instance", required_string()),
             ("host", required_string()),
             (

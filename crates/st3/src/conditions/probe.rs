@@ -39,7 +39,7 @@ pub fn mount_points(mountinfo: &str) -> Vec<String> {
 
 /// The kernel writes a space in a path as `\040`, and likewise tab, newline and backslash.
 fn unescape(path: &str) -> String {
-    let mut output = String::with_capacity(path.len());
+    let mut output = Vec::with_capacity(path.len());
     let bytes = path.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
@@ -48,22 +48,25 @@ fn unescape(path: &str) -> String {
             && bytes[index + 1..index + 4].iter().all(u8::is_ascii_digit)
             && let Ok(code) = u8::from_str_radix(&path[index + 1..index + 4], 8)
         {
-            output.push(code as char);
+            output.push(code);
             index += 4;
             continue;
         }
-        output.push(bytes[index] as char);
+        output.push(bytes[index]);
         index += 1;
     }
-    output
+    String::from_utf8(output).unwrap_or_else(|_| path.to_owned())
 }
 
 /// Free space on each local filesystem, keyed by its first mount point. A host without a mount
 /// table reads `/` alone.
-pub fn filesystems() -> BTreeMap<String, DiskSpace> {
+pub(crate) fn filesystems() -> BTreeMap<String, DiskSpace> {
+    #[cfg(not(target_os = "macos"))]
     let mounts = std::fs::read_to_string("/proc/self/mountinfo")
         .map(|text| mount_points(&text))
         .unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    let mounts = apple_mount_points();
     let mounts = if mounts.is_empty() {
         vec!["/".to_owned()]
     } else {
@@ -71,7 +74,7 @@ pub fn filesystems() -> BTreeMap<String, DiskSpace> {
     };
     let mut seen = std::collections::BTreeSet::new();
     let mut output = BTreeMap::new();
-    for mount in mounts {
+    for mount in mounts.into_iter().take(256) {
         if let Ok(space) = disk_space(Path::new(&mount))
             && space.total > 0
             && seen.insert(space.filesystem)
@@ -82,12 +85,49 @@ pub fn filesystems() -> BTreeMap<String, DiskSpace> {
     output
 }
 
-/// Free space on the filesystem holding `path`.
-pub fn filesystem_of(path: &str) -> Option<DiskSpace> {
-    disk_space(Path::new(path)).ok().filter(|space| space.total > 0)
+/// Caller-owned mount table: unlike getmntinfo, getfsstat does not return shared static storage.
+#[cfg(target_os = "macos")]
+fn apple_mount_points() -> Vec<String> {
+    let mut mounts = Vec::<libc::statfs>::with_capacity(256);
+    let bytes = mounts.capacity() * std::mem::size_of::<libc::statfs>();
+    // SAFETY: the allocation can hold 256 statfs records. MNT_NOWAIT uses cached kernel facts.
+    let count =
+        unsafe { libc::getfsstat(mounts.as_mut_ptr(), bytes as libc::c_int, libc::MNT_NOWAIT) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    // SAFETY: getfsstat initialized the returned records, bounded by the supplied buffer.
+    unsafe {
+        mounts.set_len((count as usize).min(mounts.capacity()));
+    }
+    mounts
+        .iter()
+        .filter_map(|mount| {
+            // SAFETY: the kernel's fixed-size filesystem and mount names are NUL-terminated.
+            let kind = unsafe { std::ffi::CStr::from_ptr(mount.f_fstypename.as_ptr()) }
+                .to_str()
+                .ok()?;
+            if !LOCAL_FILESYSTEMS.contains(&kind) {
+                return None;
+            }
+            Some(
+                unsafe { std::ffi::CStr::from_ptr(mount.f_mntonname.as_ptr()) }
+                    .to_str()
+                    .ok()?
+                    .to_owned(),
+            )
+        })
+        .collect()
 }
 
-pub fn free_percent(space: &DiskSpace) -> f64 {
+/// Free space on the filesystem holding `path`.
+pub(crate) fn filesystem_of(path: &str) -> Option<DiskSpace> {
+    disk_space(Path::new(path))
+        .ok()
+        .filter(|space| space.total > 0)
+}
+
+pub(crate) fn free_percent(space: &DiskSpace) -> f64 {
     space.available as f64 * 100.0 / space.total as f64
 }
 
@@ -175,7 +215,7 @@ impl ProcessSampler {
     pub fn sample(&mut self, names: &[&str], now: u128) -> BTreeMap<String, ProcessReading> {
         let mut found: HashMap<&str, HashMap<(u32, u64), ProcessStat>> = HashMap::new();
         if let Ok(entries) = std::fs::read_dir(&self.root) {
-            for entry in entries.flatten() {
+            for entry in entries.flatten().take(16_384) {
                 let Some(pid) = entry
                     .file_name()
                     .to_str()
@@ -280,7 +320,8 @@ mod tests {
 
     #[test]
     fn memory_is_available_over_total() {
-        let meminfo = "MemTotal:       16000000 kB\nMemFree:  100 kB\nMemAvailable:    4000000 kB\n";
+        let meminfo =
+            "MemTotal:       16000000 kB\nMemFree:  100 kB\nMemAvailable:    4000000 kB\n";
         assert_eq!(memory_available_percent(meminfo), Some(25.0));
         assert_eq!(memory_available_percent("MemTotal: 1 kB\n"), None);
     }
@@ -308,7 +349,9 @@ mod tests {
             std::fs::write(directory.join("comm"), format!("{comm}\n")).unwrap();
             std::fs::write(
                 directory.join("stat"),
-                format!("{pid} ({comm}) S 1 1 1 0 -1 0 0 0 0 0 {ticks} 0 0 0 20 0 1 0 {start} 1000 10 0"),
+                format!(
+                    "{pid} ({comm}) S 1 1 1 0 -1 0 0 0 0 0 {ticks} 0 0 0 20 0 1 0 {start} 1000 10 0"
+                ),
             )
             .unwrap();
         };

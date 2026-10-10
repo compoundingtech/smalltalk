@@ -9,9 +9,7 @@
 //! `db.growth-bytes-per-day`. Neither replicates: the claims are the authority.
 
 use super::*;
-use crate::conditions::{
-    ConditionDecl, Phase, Recorded, Tracker, Transition, parse_condition,
-};
+use crate::conditions::{ConditionDecl, Phase, Recorded, Tracker, Transition, parse_condition};
 
 pub(super) const SCHEMA: &str = r#"
 CREATE INDEX IF NOT EXISTS desired_condition_index ON desired(subject) WHERE kind='condition';
@@ -21,6 +19,9 @@ CREATE TABLE IF NOT EXISTS local_condition_heads (
     store_index INTEGER NOT NULL,
     PRIMARY KEY (subject, instance)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS local_condition_notifications (
+    store_index INTEGER PRIMARY KEY
+);
 CREATE TABLE IF NOT EXISTS local_condition_claim_bytes (
     hour_unix_ms INTEGER PRIMARY KEY,
     claims INTEGER NOT NULL,
@@ -145,7 +146,7 @@ impl Store {
             let connection = self.readers.get();
             let cursor = meta_integer(&connection, HEADS_CURSOR)?.unwrap_or(0);
             let mut statement = connection.prepare_cached(
-                "SELECT store_index, subject, json_extract(body, '$.fields.instance')
+                "SELECT store_index, subject, json_extract(body, '$.fields.instance'), body
                    FROM claims
                   WHERE kind='condition.state' AND store_index > ?1
                   ORDER BY store_index LIMIT ?2",
@@ -156,6 +157,7 @@ impl Store {
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -165,15 +167,27 @@ impl Store {
             return Ok(0);
         };
         let count = rows.len();
+        let host = self.origin().to_owned();
+        let heads_upsert = canonical_sql(
+            "INSERT INTO local_condition_heads(subject, instance, store_index)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(subject, instance) DO UPDATE SET store_index=(
+                 SELECT claims.store_index FROM claims
+                  WHERE claims.store_index IN (local_condition_heads.store_index, excluded.store_index)
+                  ORDER BY CANONICAL_DESC(claims) LIMIT 1)");
         self.connection
             .batched(move |transaction| {
-                for (index, subject, instance) in &rows {
+                for (index, subject, instance, body) in &rows {
                     let Some(instance) = instance else { continue };
+                    if let Ok(body) = serde_json::from_str::<Value>(body) {
+                        let fields = &body["fields"];
+                        if fields["host"] == host && fields["transition"].is_string()
+                            && fields["owner"].as_str().is_some_and(|owner| owner.starts_with("agent/")) {
+                            transaction.execute("INSERT OR IGNORE INTO local_condition_notifications(store_index) VALUES (?1)", [index])?;
+                        }
+                    }
                     transaction.execute(
-                        "INSERT INTO local_condition_heads(subject, instance, store_index)
-                         VALUES (?1, ?2, ?3)
-                         ON CONFLICT(subject, instance) DO UPDATE
-                           SET store_index=max(store_index, excluded.store_index)",
+                        &heads_upsert,
                         params![subject, instance, index],
                     )?;
                 }
@@ -306,7 +320,10 @@ impl Store {
                 "phase".to_owned(),
                 Value::String(tracker.phase.as_str().into()),
             ),
-            ("metric".to_owned(), Value::String(decl.metric.as_str().into())),
+            (
+                "metric".to_owned(),
+                Value::String(decl.metric.as_str().into()),
+            ),
             (
                 "comparison".to_owned(),
                 Value::String(decl.comparison.as_str().into()),
@@ -350,6 +367,18 @@ impl Store {
                 Value::String(transition.as_str().into()),
             );
         }
+        if let Some(transition) = transition {
+            let (title, body) = crate::conditions::transition_text(
+                decl,
+                *transition,
+                host,
+                instance,
+                tracker,
+                *now,
+            );
+            fields.insert("notification_title".into(), title.into());
+            fields.insert("notification_body".into(), body.into());
+        }
         let claim = self.append_claim(&ClaimInput {
             subject: decl.subject(),
             kind: "condition.state".into(),
@@ -378,12 +407,35 @@ impl Store {
         body: &str,
         evidence: Option<&str>,
     ) -> Result<Option<String>> {
-        if !decl.owner.starts_with("agent/") {
+        self.send_condition_notification(
+            &decl.subject(),
+            &decl.owner,
+            instance,
+            transition,
+            breach_since,
+            title,
+            body,
+            evidence,
+        )
+    }
+
+    fn send_condition_notification(
+        &self,
+        condition: &str,
+        owner: &str,
+        instance: &str,
+        transition: Transition,
+        breach_since: u128,
+        title: &str,
+        body: &str,
+        evidence: Option<&str>,
+    ) -> Result<Option<String>> {
+        if !owner.starts_with("agent/") {
             return Ok(None);
         }
         let key = format!(
             "condition:{}:{instance}:{}:{breach_since}",
-            decl.subject(),
+            condition,
             transition.as_str()
         );
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
@@ -397,7 +449,7 @@ impl Store {
             actor: Some("daemon/runtime".into()),
             fields: BTreeMap::from([
                 ("from".into(), Value::String("daemon/runtime".into())),
-                ("to".into(), Value::String(decl.owner.clone())),
+                ("to".into(), Value::String(owner.to_owned())),
                 ("content".into(), Value::String(body.into())),
                 ("status".into(), Value::String("sent".into())),
                 ("title".into(), Value::String(title.into())),
@@ -405,7 +457,7 @@ impl Store {
                 (
                     "tags".into(),
                     json!([
-                        format!("st3-condition:{}", decl.subject()),
+                        format!("st3-condition:{}", condition),
                         format!("st3-condition-transition:{}", transition.as_str()),
                     ]),
                 ),
@@ -415,6 +467,61 @@ impl Store {
             idempotency_key: Some(key),
         })?;
         Ok(Some(subject))
+    }
+
+    /// Replay recorded transitions after a restart. Sending and queue removal may be interrupted;
+    /// the deterministic message key prevents a second wake when that happens.
+    pub fn flush_condition_notifications(&self) -> Result<Vec<String>> {
+        let rows = {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare_cached(
+                "SELECT c.store_index, c.id, c.subject, c.body FROM local_condition_notifications n
+                 JOIN claims c ON c.store_index=n.store_index ORDER BY c.store_index LIMIT 100",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut messages = Vec::new();
+        for (index, claim, subject, body) in rows {
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = &body["fields"];
+            let transition = match fields["transition"].as_str() {
+                Some("enter") => Transition::Enter,
+                Some("recover") => Transition::Recover,
+                _ => continue,
+            };
+            if let Some(message) = self.send_condition_notification(
+                &subject,
+                fields["owner"].as_str().unwrap_or(""),
+                fields["instance"].as_str().unwrap_or(""),
+                transition,
+                u128::from(fields["breach_since"].as_u64().unwrap_or(0)),
+                fields["notification_title"]
+                    .as_str()
+                    .unwrap_or("Condition changed"),
+                fields["notification_body"].as_str().unwrap_or(""),
+                Some(&claim),
+            )? {
+                messages.push(message);
+            }
+            self.connection
+                .batched(move |transaction| {
+                    transaction.execute(
+                        "DELETE FROM local_condition_notifications WHERE store_index=?1",
+                        [index],
+                    )
+                })
+                .map_err(|error| anyhow::anyhow!("{error}"))??;
+        }
+        Ok(messages)
     }
 
     /// A breach owned by a person is an alert on their home while it lasts. It is derived from
@@ -634,7 +741,12 @@ condition "fleet/collector-cpu" {
             .unwrap();
         assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
         store
-            .apply_as(&intent, &plan.subject_tokens, "conditions", Some("person/ada"))
+            .apply_as(
+                &intent,
+                &plan.subject_tokens,
+                "conditions",
+                Some("person/ada"),
+            )
             .unwrap();
         (directory, store)
     }
@@ -650,7 +762,14 @@ condition "fleet/collector-cpu" {
             .unwrap()
     }
 
-    fn record(store: &Store, decl: &ConditionDecl, instance: &str, tracker: &Tracker, transition: Option<Transition>, now: u128) -> ClaimRecord {
+    fn record(
+        store: &Store,
+        decl: &ConditionDecl,
+        instance: &str,
+        tracker: &Tracker,
+        transition: Option<Transition>,
+        now: u128,
+    ) -> ClaimRecord {
         store
             .record_condition_state(&ConditionRecord {
                 decl,
@@ -664,11 +783,93 @@ condition "fleet/collector-cpu" {
     }
 
     #[test]
+    fn transitions_survive_a_restart_and_retry_without_duplicate_wakes() {
+        let (directory, store) = store();
+        let disk = decl(&store, "condition/fleet/disk");
+        let mut tracker = Tracker::default();
+        tracker.observe(&disk, 10.0, 1_000);
+        let enter = tracker.observe(&disk, 10.0, 601_000).unwrap();
+        let claim = record(&store, &disk, "alder:/", &tracker, Some(enter), 601_000);
+        // The state write committed but the evaluator has not folded or sent anything.
+        drop(store);
+        let store = Store::open(&directory.path().join("claims.sqlite3"), "alder").unwrap();
+        store.fold_condition_heads().unwrap();
+        let messages = store.flush_condition_notifications().unwrap();
+        assert_eq!(messages.len(), 1);
+        let sent = store
+            .latest_claim(&messages[0], Some("message.sent"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.body["fields"]["to"], "agent/ops");
+        assert_eq!(sent.body["evidence"], json!([claim.id]));
+        // Simulate interruption after sending and before removing the durable queue entry.
+        let index = store
+            .latest_claim(&disk.subject(), Some("condition.state"))
+            .unwrap()
+            .unwrap()
+            .store_index;
+        store
+            .connection
+            .batched(move |tx| {
+                tx.execute(
+                    "INSERT INTO local_condition_notifications(store_index) VALUES (?1)",
+                    [index],
+                )
+            })
+            .unwrap()
+            .unwrap();
+        store.flush_condition_notifications().unwrap();
+        assert_eq!(
+            store
+                .claims_for(&messages[0], Some("message.sent"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(store.flush_condition_notifications().unwrap().is_empty());
+    }
+
+    #[test]
+    fn doctor_reads_each_condition_without_writing() {
+        let (_directory, store) = store();
+        let before = store.index().unwrap();
+        let lines = crate::conditions::doctor_lines(&store.conditions().unwrap());
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines
+                .iter()
+                .all(|(_, status, message)| *status == "warn"
+                    && message.contains("awaiting a sample"))
+        );
+        let disk = decl(&store, "condition/fleet/disk");
+        let mut tracker = Tracker::default();
+        tracker.observe(&disk, 10.0, 1_000);
+        let enter = tracker.observe(&disk, 10.0, 601_000).unwrap();
+        assert_eq!(store.index().unwrap(), before);
+        record(&store, &disk, "alder:/", &tracker, Some(enter), 601_000);
+        store.fold_condition_heads().unwrap();
+        let before = store.index().unwrap();
+        let lines = crate::conditions::doctor_lines(&store.conditions().unwrap());
+        assert!(
+            lines
+                .iter()
+                .any(|(name, status, message)| name == "condition/fleet/disk"
+                    && *status == "warn"
+                    && message.contains("breach")
+                    && message.contains("10"))
+        );
+        assert_eq!(store.index().unwrap(), before);
+    }
+
+    #[test]
     fn a_declared_condition_reads_back_with_no_state_until_one_is_recorded() {
         let (_directory, store) = store();
         let conditions = store.conditions().unwrap();
         assert_eq!(
-            conditions.iter().map(|c| c.subject.as_str()).collect::<Vec<_>>(),
+            conditions
+                .iter()
+                .map(|c| c.subject.as_str())
+                .collect::<Vec<_>>(),
             ["condition/fleet/collector-cpu", "condition/fleet/disk"]
         );
         assert!(conditions.iter().all(|c| c.instances.is_empty()));
@@ -676,7 +877,10 @@ condition "fleet/collector-cpu" {
             conditions[1].rule.as_deref(),
             Some("disk.free-percent below 15% (recovers at 18%) for 10m")
         );
-        assert_eq!(conditions[0].hosts.as_deref(), Some(&["alder".to_owned()][..]));
+        assert_eq!(
+            conditions[0].hosts.as_deref(),
+            Some(&["alder".to_owned()][..])
+        );
     }
 
     #[test]
@@ -690,13 +894,24 @@ condition "fleet/collector-cpu" {
         data.observe(&disk, 10.0, 1_000);
         record(&store, &disk, "alder:/data", &data, None, 1_000);
         data.observe(&disk, 9.0, 700_000);
-        let entered = record(&store, &disk, "alder:/data", &data, Some(Transition::Enter), 700_000);
+        let entered = record(
+            &store,
+            &disk,
+            "alder:/data",
+            &data,
+            Some(Transition::Enter),
+            700_000,
+        );
         assert_eq!(store.fold_condition_heads().unwrap(), 3);
         assert_eq!(store.fold_condition_heads().unwrap(), 0);
 
         let before = store.index().unwrap();
         let conditions = store.conditions().unwrap();
-        assert_eq!(store.index().unwrap(), before, "a condition read must not write");
+        assert_eq!(
+            store.index().unwrap(),
+            before,
+            "a condition read must not write"
+        );
         let instances = &conditions[1].instances;
         assert_eq!(instances.len(), 2);
         assert_eq!(instances[0].instance, "alder:/");
@@ -722,17 +937,33 @@ condition "fleet/collector-cpu" {
         let disk = decl(&store, "condition/fleet/disk");
         let message = |transition, since| {
             store
-                .send_condition_message(&disk, "alder:/", transition, since, "Condition breached: fleet/disk on alder:/", "body", None)
+                .send_condition_message(
+                    &disk,
+                    "alder:/",
+                    transition,
+                    since,
+                    "Condition breached: fleet/disk on alder:/",
+                    "body",
+                    None,
+                )
                 .unwrap()
                 .unwrap()
         };
         let first = message(Transition::Enter, 5);
-        assert_eq!(message(Transition::Enter, 5), first, "a retry sends nothing new");
+        assert_eq!(
+            message(Transition::Enter, 5),
+            first,
+            "a retry sends nothing new"
+        );
         let sent = store.claims_for(&first, Some("message.sent")).unwrap();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].fields["to"], "agent/ops");
+        assert_eq!(sent[0].body["fields"]["to"], "agent/ops");
         assert_ne!(message(Transition::Recover, 5), first);
-        assert_ne!(message(Transition::Enter, 6), first, "a later breach is a new message");
+        assert_ne!(
+            message(Transition::Enter, 6),
+            first,
+            "a later breach is a new message"
+        );
 
         // A person's condition never messages anyone; it shows as an alert on their home.
         let cpu = decl(&store, "condition/fleet/collector-cpu");
@@ -746,22 +977,49 @@ condition "fleet/collector-cpu" {
         tracker.observe(&cpu, 3.0, 1_000);
         tracker.observe(&cpu, 3.0, 301_000);
         assert_eq!(tracker.phase, Phase::Breach);
-        record(&store, &cpu, "alder", &tracker, Some(Transition::Enter), 301_000);
+        record(
+            &store,
+            &cpu,
+            "alder",
+            &tracker,
+            Some(Transition::Enter),
+            301_000,
+        );
         store.fold_condition_heads().unwrap();
         let items = store.condition_attention_items(Some("person/ada")).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "condition");
         assert_eq!(items[0].person, "person/ada");
-        assert_eq!(items[0].title, "Condition breached: fleet/collector-cpu on alder");
+        assert_eq!(
+            items[0].title,
+            "Condition breached: fleet/collector-cpu on alder"
+        );
         assert!(items[0].is_alert());
-        assert!(store.condition_attention_items(Some("person/bo")).unwrap().is_empty());
-        let snapshot = store.attention_snapshot(Some("person/ada"), now_ms()).unwrap();
-        assert!(snapshot.iter().any(|item| item.kind == "condition"), "{snapshot:?}");
+        assert!(
+            store
+                .condition_attention_items(Some("person/avery"))
+                .unwrap()
+                .is_empty()
+        );
+        let snapshot = store
+            .attention_snapshot(Some("person/ada"), now_ms())
+            .unwrap();
+        assert!(
+            snapshot.iter().any(|item| item.kind == "condition"),
+            "{snapshot:?}"
+        );
 
         tracker.observe(&cpu, 0.5, 302_000);
         tracker.observe(&cpu, 0.5, 602_000);
         assert_eq!(tracker.phase, Phase::Clear);
-        record(&store, &cpu, "alder", &tracker, Some(Transition::Recover), 602_000);
+        record(
+            &store,
+            &cpu,
+            "alder",
+            &tracker,
+            Some(Transition::Recover),
+            602_000,
+        );
         store.fold_condition_heads().unwrap();
         assert!(store.condition_attention_items(None).unwrap().is_empty());
     }
