@@ -155,6 +155,13 @@ fn limits() -> PublicationLimits {
 
 impl Slice {
     fn create(path: &Path) -> Result<Self> {
+        Self::create_with_inventory(path, 0)
+    }
+
+    // Explicit fixture setup only: added tables exist before capturing this lifetime.
+    // Existing tests retain exactly the old schema and setup path with zero additions.
+    fn create_with_inventory(path: &Path, unrelated_tables: usize) -> Result<Self> {
+        ensure!(unrelated_tables <= 128, "invalid growth fixture inventory");
         let store = Store::open(path, "slice-fixture", Arc::new(Plain))?;
         let installer = installer()?;
         let fingerprint = format!("fixture.claim-images.v1:{}", uuid::Uuid::now_v7());
@@ -240,6 +247,11 @@ impl Slice {
                 },
                 0,
             )?;
+            for n in 0..unrelated_tables {
+                tx.execute_batch(&format!(
+                    "CREATE TABLE main.metadata_growth_{n}(k INTEGER PRIMARY KEY,payload TEXT)"
+                ))?;
+            }
             let cookie = schema(&tx)?;
             tx.commit()?;
             (job, cookie)
@@ -1453,5 +1465,98 @@ fn full_page_accounting_includes_metadata_and_physical_reader_writer_return() ->
 fn full_page_accounting_includes_metadata_and_physical_reader_writer_return() {
     panic!(
         "required page-work accounting is unavailable: build this target with --features test-support and require the named control with a positive statement count; missing instrumentation is not a passed or omitted prerequisite"
+    );
+}
+
+// Characterization, not an expanded-inventory work-bound acceptance test. The
+// original strict full-page control above remains the prerequisite with its
+// unchanged assertions. A printed over-ceiling row is adverse evidence even if
+// this measurement's output/correctness assertions pass.
+#[cfg(feature = "test-support")]
+#[test]
+fn canonical_metadata_inventory_growth_reports_actual_page_work() -> Result<()> {
+    use smallclaims::sqlite::work::SqliteWorkScope;
+
+    let mut expected_page_shape = [None, None];
+    for additions in [0, 1, 8, 32, 128] {
+        let root = tempfile::tempdir()?;
+        let slice = Slice::create_with_inventory(&root.path().join("claims.db"), additions)?;
+        // Diagnostic copy on the real traced reader, charged and reported separately.
+        // These are bytes this probe copies, NOT the production helper's copy bytes
+        // or SQLite internal scan/allocation bytes. It does not mint schema proof.
+        let diagnostic_scope = SqliteWorkScope::start();
+        let (inventory_rows, diagnostic_copy_bytes) = slice.read(|db| {
+            let mut statement = db.prepare(
+                "SELECT name,COALESCE(sql,'') FROM main.sqlite_schema
+                 WHERE type='table' ORDER BY name LIMIT 257",
+            )?;
+            let mut rows = statement.query([])?;
+            let mut count = 0usize;
+            let mut bytes = 0usize;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(0)?;
+                let declaration: String = row.get(1)?;
+                count += 1;
+                bytes += name.len() + declaration.len();
+            }
+            ensure!(
+                count <= 256,
+                "growth fixture exceeds canonical inventory bound"
+            );
+            Ok((count, bytes))
+        })?;
+        let diagnostic_work = diagnostic_scope.finish(); // includes reader return
+        eprintln!(
+            "metadata growth diagnostic additions={additions} inventory_rows={inventory_rows} \
+             diagnostic_copy_bytes={diagnostic_copy_bytes} probe_work={diagnostic_work:?}"
+        );
+        assert!(diagnostic_work.statements > 0);
+        assert!(diagnostic_copy_bytes > 0);
+
+        for (ordinal, expected_shape) in expected_page_shape.iter_mut().enumerate() {
+            // Fixed count, subject width and native body across inventory sizes.
+            for n in 0..PAGE_ROWS {
+                append(&slice, &format!("note/growth-{ordinal}-{n:02}"))?;
+            }
+            let whole_scope = SqliteWorkScope::start();
+            let capture_scope = SqliteWorkScope::start();
+            let page = slice.capture()?;
+            let capture_work = capture_scope.finish(); // includes physical reader return
+            let shape = (page.images.len(), page.bytes);
+            let page = page.reduce()?;
+            let publication_scope = SqliteWorkScope::start();
+            slice.publish(&page)?;
+            let publication_work = publication_scope.finish(); // physical writer return
+            let whole_work = whole_scope.finish(); // before all verification queries
+            eprintln!(
+                "canonical metadata growth additions={additions} inventory_rows={inventory_rows} \
+                 ordinal={ordinal} page_rows={} copied_input_bytes={} \
+                 capture={capture_work:?} publication={publication_work:?} whole={whole_work:?} \
+                 within_original_statement_ceiling={}",
+                shape.0,
+                shape.1,
+                whole_work.statements <= 128
+            );
+            assert_eq!(shape.0, PAGE_ROWS);
+            if let Some(expected) = expected_shape {
+                assert_eq!(shape, *expected, "inventory must not change input shape");
+            } else {
+                *expected_shape = Some(shape);
+            }
+            assert!(capture_work.statements > 0);
+            assert!(publication_work.statements > 0);
+            assert_eq!(whole_work - capture_work, publication_work);
+            assert_eq!(whole_work.autoindex_rows, 0);
+            assert_eq!(slice.ready_rows()?.len(), (ordinal + 1) * PAGE_ROWS);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "test-support"))]
+#[test]
+fn canonical_metadata_inventory_growth_reports_actual_page_work() {
+    panic!(
+        "required growth measurement is unavailable: build with test-support and require this exact name with positive traced statement counts; missing instrumentation is not evidence"
     );
 }
