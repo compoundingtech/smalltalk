@@ -10,9 +10,10 @@
     pty.url = "github:compoundingtech/pty/1ae8c187301034d2b343b6ec638f2b74c009f92e";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared CI generators and the `otelite` collector used by release-integration.
-    # Re-pin to effect-utils main once the Rust helpers and repo-settings PRs merge.
+    # Also the source of fractal-web's @overeng/devbar, meters and stylex-tokens file: deps
+    # (via the repos/effect-utils link). Pinned to the devbar branch of effect-utils#1727.
     effect-utils.url =
-      "github:overengineeringstudio/effect-utils/3089f7e1faa82d7a4cb4de0e8d485164f837708b";
+      "github:overengineeringstudio/effect-utils/81a6527895a45d70dca7c0d1ca3a72ae76feaeb5";
     # The messaging fixture must not invoke Nix or fetch a historical build in the sandbox.
     messaging-baseline.url = "github:compoundingtech/smalltalk/678103d3e8ae873a158bb2cb951d3ffefdf698c4";
   };

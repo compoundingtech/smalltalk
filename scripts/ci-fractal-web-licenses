@@ -48,6 +48,10 @@ def lock_packages(text):
             if not match:
                 raise ValueError(f"unsupported package key: {line}")
             key = next(value for value in match.groups() if value is not None)
+            # First-party sources linked from the pinned effect-utils checkout, not registry packages.
+            if re.fullmatch(r"@overeng/[a-z0-9-]+@file:repos/effect-utils/packages/@overeng/[a-z0-9-]+", key):
+                current = "directory"
+                continue
             name, separator, version = key.rpartition("@")
             if not separator or not re.fullmatch(r"(?:@[a-z0-9._-]+/)?[a-z0-9._-]+", name) or not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.+-]+)?", version):
                 raise ValueError(f"unsupported registry package: {key}")
@@ -55,6 +59,9 @@ def lock_packages(text):
             if current in packages:
                 raise ValueError(f"duplicate lock package: {key}")
             packages[current] = None
+        elif current == "directory":
+            if line.startswith("    resolution:") and not re.fullmatch(r"    resolution: \{directory: repos/effect-utils/packages/@overeng/[a-z0-9-]+, type: directory\}", line):
+                raise ValueError(f"unsupported directory resolution: {line}")
         elif line.startswith("    resolution:"):
             match = re.fullmatch(r"    resolution: \{integrity: (sha512-[A-Za-z0-9+/]+={0,2})\}", line)
             if current is None or not match or packages[current] is not None:

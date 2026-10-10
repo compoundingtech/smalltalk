@@ -13,4 +13,12 @@ export default pnpmWorkspaceYaml.root({
   extraMembers: workspaceMembers,
   ...pnpmPolicy,
   nodeLinker: 'hoisted',
+  // @overeng/devbar is private and depends on stylex-tokens via `workspace:^`; point that edge
+  // at the same file: source fractal-web uses.
+  overrides: { '@overeng/stylex-tokens': 'file:repos/effect-utils/packages/@overeng/stylex-tokens' },
+  // Until effect-utils#1727 widens the meters `effect` peer to include 4.0.0-rc.118.
+  peerDependencyRules: {
+    ...pnpmPolicy.peerDependencyRules,
+    allowedVersions: { ...pnpmPolicy.peerDependencyRules?.allowedVersions, '@overeng/meters>effect': '4.0.0-rc.118' },
+  },
 })

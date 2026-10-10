@@ -10,22 +10,17 @@ packages:
   - clients/typescript/st3-views
   - packages/fractal-ui
 
+overrides:
+  "@overeng/stylex-tokens": "file:repos/effect-utils/packages/@overeng/stylex-tokens"
+
 peerDependencyRules:
   allowedVersions:
     typescript: ">=6.0.0"
     vitest: ">=4.0.0"
     unplugin: ">=3.0.0"
+    "@overeng/meters>effect": 4.0.0-rc.118
 
-minimumReleaseAgeExclude:
-  - "@types/node"
-  - effect
-  - "@effect/ai-openai-compat"
-  - "@effect/ai-typesafe"
-  - "@effect/platform-node"
-  - "@effect/vitest"
-  - "@effect/opentelemetry"
-  - "@effect/atom-react"
-  - "@effect/platform-node-shared"
+minimumReleaseAgeExclude: ["@types/node"]
 
 supportedArchitectures:
   os: [linux, darwin]
