@@ -82,6 +82,60 @@ fn refuse_authored(argv: &[String], flags: &[&str]) -> Result<(), Refusal> {
     }
 }
 
+/// The normalized authored selector, independent of unrelated launch arguments.
+pub fn selection_scope(member: &crate::model::MemberSpec) -> Option<String> {
+    let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+        return None;
+    };
+    let provider = argv.iter().position(|arg| arg == "--")
+        .map_or(argv.as_slice(), |index| &argv[index + 1..]);
+    selector_scope(member.driver.as_deref()?, provider)
+}
+
+pub fn selector_scope(driver: &str, argv: &[String]) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+    let flags: &[&str] = match driver {
+        "claude" => &["-c", "--continue", "-r", "--resume", "--session-id", "--fork-session", "--from-pr", "--teleport"],
+        "pi" | "omp" => &["-c", "--continue", "-r", "--resume", "--session", "--session-id", "--fork", "--no-session"],
+        "opencode" => &["-c", "--continue", "-s", "--session", "--fork"],
+        "codex" => &["resume", "fork"],
+        _ => return None,
+    };
+    let mut selected = Vec::new();
+    let mut args = argv.iter().skip(1).take_while(|arg| arg.as_str() != "--").peekable();
+    while let Some(arg) = args.next() {
+        let (flag, inline) = arg.split_once('=').map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+        if flags.contains(&flag) {
+            let canonical = match flag {
+                "-r" => "--resume",
+                "-s" => "--session",
+                "-c" if driver != "codex" => "--continue",
+                _ => flag,
+            };
+            let takes_value = matches!(canonical, "--resume" | "--session" | "--session-id" | "--from-pr" | "--teleport" | "resume" | "fork");
+            let value = inline.or_else(|| takes_value.then(|| args.peek().filter(|value| !value.starts_with('-')).map(|value| value.as_str())).flatten());
+            selected.push((canonical.to_owned(), value.map(str::to_owned)));
+            if inline.is_none() && value.is_some() {
+                args.next();
+            }
+        }
+    }
+    (!selected.is_empty()).then(|| hex::encode(Sha256::digest(serde_json::to_vec(&selected).expect("selector strings serialize"))))
+}
+
+#[cfg(test)]
+#[test]
+fn authored_selector_scope_ignores_unrelated_launch_edits() {
+    let argv = |values: &[&str]| values.iter().map(|value| (*value).to_owned()).collect::<Vec<_>>();
+    let original = selector_scope("omp", &argv(&["omp", "--resume", "/transcript", "--model", "one"]));
+    assert!(original.is_some());
+    assert_eq!(original, selector_scope("omp", &argv(&["omp", "--model", "two", "--resume=/transcript"])));
+    assert_ne!(original, selector_scope("omp", &argv(&["omp", "--resume", "/other"])));
+    assert!(selector_scope("omp", &argv(&["omp", "--", "--resume", "/transcript"])).is_none());
+    assert_eq!(selector_scope("omp", &argv(&["omp", "--continue", "one"])), selector_scope("omp", &argv(&["omp", "-c", "two"])));
+    assert!(selector_scope("codex", &argv(&["codex", "fork", "thread"])).is_some());
+}
+
 /// Refuse authored session selectors before a rollout can stop the incumbent.
 pub fn rollout_support(member: &crate::model::MemberSpec) -> Result<(), Refusal> {
     if !member.terminal {

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Avoid redaction notices for absent or null tool payloads",
+  "replay": {"status": "none", "detail": "Existing timeline entries are retained; no replay or cleanup is introduced."},
+  "schema": {"status": "none", "detail": "No database, event spool or timeline schema changes."},
+  "rules": {"status": "none", "detail": "No checkpoint or replication rules change."},
+  "compatibility": {"status": "changed", "detail": "New tool-call and tool-result entries with absent or JSON-null payloads no longer add a separate sensitive-content redaction notice unless other fields are omitted. Their existing redacted placeholder, digest and serialized byte count remain unchanged. Non-null payloads and omitted fields still produce privacy notices."},
+  "downtime": {"status": "none", "detail": "No additional service interruption is introduced."},
+  "manual": {"status": "none", "detail": "No configuration change or cleanup of retained notices is required."},
+  "recovery": {"status": "none", "detail": "Older binaries can read the unchanged entry schema; swapping binaries does not remove retained entries."}
+}

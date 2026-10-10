@@ -27,6 +27,8 @@ mod card_fold;
 mod card_fold_tests;
 #[cfg(test)]
 mod roster_controls;
+#[cfg(test)]
+mod agents_window_deadline_tests;
 pub(crate) mod step_labels;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -141,6 +143,10 @@ mod checkpoint_agreement_tests;
 #[cfg(test)]
 mod checkpoint_tests;
 #[cfg(test)]
+mod checkpoint_capture_epoch_tests;
+#[cfg(test)]
+mod checkpoint_replication_capture_tests;
+#[cfg(test)]
 mod convergence;
 #[cfg(test)]
 mod document_index_tests;
@@ -157,6 +163,8 @@ mod runtime;
 pub(crate) mod published_views;
 #[cfg(test)]
 mod tombstones_tests;
+#[cfg(test)]
+mod work_renew_tests;
 pub use runtime::SmalltalkRuntime;
 #[cfg(test)]
 pub(crate) use smallclaims::sqlite::STATEMENTS_RUN;
@@ -1665,6 +1673,7 @@ fn migrate_schema(connection: &Connection) -> Result<()> {
         || version == 15
         || version == 16
         || version == 17
+        || version == 18
     {
         return Ok(());
     }
@@ -3087,11 +3096,11 @@ impl Store {
         self.cached_agent_resources_for(index, history, None, build)
     }
 
-    /// The complete agents WS window inherits the queue deadline from its shared projection.
+    /// An agents WS window inherits the queue deadline from its selected or complete projection.
     pub(crate) fn agent_roster_valid_until(&self, index: u64) -> Option<u128> {
         self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned").iter().rev()
-            .find(|entry| entry.index == index && !entry.history && entry.covered.is_none())
+            .find(|entry| entry.index == index && !entry.history)
             .and_then(|entry| entry.valid_until_unix_ms)
     }
 
@@ -3171,6 +3180,41 @@ impl Store {
                 && entry.valid_until_unix_ms.is_none_or(|expiry| now < expiry)))
     }
 
+    /// Whether the newest complete roster published at or before `index` already shows every
+    /// card as it would at `index`: no claim since its cut changes a card's inputs (the same
+    /// delta the incremental fold trusts), no agent timeline row arrived, and no queue deadline
+    /// passed. A read that must see what was written before it need not wait for a refresh
+    /// that would fold nothing. One range read over the claims since the cut; it never folds.
+    pub(crate) fn published_agent_roster_unchanged_through(
+        &self,
+        index: u64,
+        history: bool,
+    ) -> Result<bool> {
+        if self.smalltalk.agent_roster_refresh.get().is_none() {
+            return Ok(false);
+        }
+        let Some((cut, local, valid_until, items)) = self.smalltalk.agent_resources_cache.lock()
+            .expect("agent resources cache poisoned").iter()
+            .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
+            .max_by_key(|entry| (entry.index, entry.local))
+            .map(|entry| (entry.index, entry.local, entry.valid_until_unix_ms, Arc::clone(&entry.items)))
+        else {
+            return Ok(false);
+        };
+        if valid_until.is_some_and(|expiry| now_ms() >= expiry)
+            || roster_local_frontier(&self.readers.get(), index)? != local
+        {
+            return Ok(false);
+        }
+        if cut == index {
+            return Ok(true);
+        }
+        Ok(match self.agent_resources_delta(cut, index, &items)? {
+            Ok(delta) => delta.subjects.is_empty() && !delta.queues && !delta.membership,
+            Err(_) => false,
+        })
+    }
+
     /// Whether a refresher keeps the roster published, so readers must never fold it.
     pub(crate) fn agent_roster_refresher_running(&self) -> bool {
         self.smalltalk.agent_roster_refresh.get().is_some()
@@ -3192,6 +3236,27 @@ impl Store {
     pub(crate) fn request_agent_roster_history(&self) {
         self.smalltalk.agent_roster_history_wanted.store(true, std::sync::atomic::Ordering::Release);
         self.request_agent_roster_refresh();
+    }
+
+    /// Ask the refresher, if one runs, for a roster at the newest cut on behalf of a reader that
+    /// waits for it: a refresher pausing between refreshes stops pausing once it has paused as
+    /// long as its last refresh took, and at least a tenth of a second.
+    pub(crate) fn request_fresh_agent_roster(&self, history: bool) {
+        if self.smalltalk.agent_roster_refresh.get().is_none() {
+            return;
+        }
+        self.smalltalk.agent_roster_fresh_wanted.notify_one();
+        if history {
+            self.request_agent_roster_history();
+        } else {
+            self.request_agent_roster_refresh();
+        }
+    }
+
+    /// Resolves once a reader waits for a fresh roster, including one that asked before this
+    /// was called and was not yet answered by a refresh's pause.
+    pub(crate) async fn fresh_agent_roster_wanted(&self) {
+        self.smalltalk.agent_roster_fresh_wanted.notified().await;
     }
 
     /// Whether a reader asked for the history roster since the last time this was taken.
@@ -3585,7 +3650,16 @@ impl Store {
             cache.retain(|entry| entry.index != index || entry.local != local || entry.history != history);
             let items = Arc::clone(&entry.items);
             cache.push_back(entry);
-            if cache.len() > 8 { cache.pop_front(); }
+            if cache.len() > 8 {
+                // Keep the newest complete publication of each mode, even while the other
+                // mode republishes or this one is still assembling partial chunks.
+                let oldest = cache.iter().position(|entry| entry.covered.is_some()
+                    || cache.iter().any(|newer| newer.history == entry.history
+                        && newer.covered.is_none()
+                        && (newer.index, newer.local) > (entry.index, entry.local)))
+                    .expect("only two complete roster publications can be protected");
+                cache.remove(oldest);
+            }
             items
         };
         drop(cache);
@@ -8267,8 +8341,11 @@ impl Store {
             })?;
         let now = now_ms();
         // One work action in a savepoint of the writer's next batch, answered once that batch commits.
-        self.connection
+        let committed = self
+            .connection
             .batched(|transaction| -> Result<StepRunView, St3Error> {
+                #[cfg(test)]
+                let _writer_work = WorkActionWriterProbe::start(&request.idempotency_key);
                 if let Some(response) = smallclaims::store::idempotency::cached_response(transaction, &request.idempotency_key)?
                 {
                     if let Some(input) = handoff {
@@ -8559,11 +8636,9 @@ impl Store {
                     && request.evidence.is_empty();
                 let last_replicated_expiry = if quiet_renewal {
                     transaction
+                        .prepare_cached(&last_replicated_lease_query())
+                        .map_err(internal)?
                         .query_row(
-                            &canonical_sql("SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
-                             FROM claims WHERE subject=?1
-                               AND kind IN ('work.claimed','work.renewed','work.progress')
-                             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                             [&subject],
                             |row| row.get::<_, Option<u64>>(0),
                         )
@@ -8660,7 +8735,12 @@ impl Store {
                     "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                             lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
                      FROM step_runs WHERE subject=?1", [&subject], step_run_from_row).map_err(internal)?;
-                enrich_step_queue(transaction, &mut view).map_err(internal)?;
+                // A renewal only moves the lease. Its view's timing, summaries and wake fold the
+                // step's whole claim history, which would hold the writer longer the older the
+                // step grows, so a renewal's view is filled from a reader after COMMIT.
+                if action != "renew" {
+                    enrich_step_queue(transaction, &mut view).map_err(internal)?;
+                }
                 transaction
                     .execute(
                         "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
@@ -8675,7 +8755,19 @@ impl Store {
                 }
                 Ok(view)
             })
-            .map_err(|error| St3Error::new("internal", error))?
+            .map_err(|error| St3Error::new("internal", error))?;
+        let mut view = committed?;
+        if action == "renew" {
+            // An exact retry of a renewal also replays a view cached without these fields.
+            self.enrich_work_response(&mut view)
+                .map_err(|error| St3Error::new("store-read-failed", format!("{error:#}")))?;
+        }
+        Ok(view)
+    }
+
+    /// Fill a committed work acknowledgement's queue, timing, summaries and wake from a reader.
+    pub(crate) fn enrich_work_response(&self, view: &mut StepRunView) -> Result<()> {
+        enrich_step_queue(&self.readers.get(), view).map_err(Into::into)
     }
 
     pub fn set_step_state(
@@ -11973,6 +12065,45 @@ impl Store {
         Ok(value)
     }
 
+    /// `projection_time_at` for several cuts in one statement: each distinct cut is one indexed
+    /// seek of `claims` by `store_index`, so the statement count does not grow with the cuts.
+    pub fn projection_times_at(&self, store_indexes: &[u64]) -> Result<HashMap<u64, u128>> {
+        let mut times = HashMap::with_capacity(store_indexes.len());
+        let mut cuts = store_indexes
+            .iter()
+            .copied()
+            .filter(|store_index| *store_index != 0)
+            .collect::<Vec<_>>();
+        cuts.sort_unstable();
+        cuts.dedup();
+        if let Some(zero) = store_indexes.iter().find(|store_index| **store_index == 0) {
+            times.insert(*zero, 0);
+        }
+        if cuts.is_empty() {
+            return Ok(times);
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT cut.value,
+                    (SELECT accepted_at_unix_ms FROM claims
+                     WHERE store_index <= cut.value ORDER BY store_index DESC LIMIT 1)
+             FROM json_each(?1) AS cut",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(&cuts)?], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        for row in rows {
+            let (cut, value) = row?;
+            times.insert(
+                cut,
+                value
+                    .and_then(|value| value.parse::<u128>().ok())
+                    .unwrap_or_default(),
+            );
+        }
+        Ok(times)
+    }
+
     pub fn events_after_filtered(
         &self,
         after: u64,
@@ -13848,7 +13979,29 @@ impl Store {
     fn mission_run_attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
         let mut items = Vec::new();
         let reviews = self.pending_human_reviews(person)?;
-        items.extend(reviews.into_iter().map(attention_item_from_review));
+        {
+            let connection = self.readers.get();
+            for review in reviews {
+                // The gate's owner is the step whose work it reviews, a loop whose step runs
+                // it, or its run.
+                let step = if review.owner.starts_with("step-run/") {
+                    Some(review.owner.clone())
+                } else if review.owner.starts_with("loop-run/") {
+                    loop_step_tx(&connection, &review.owner)?.map(|step| step.subject)
+                } else {
+                    None
+                };
+                let conversation = attention_snapshot::conversation_agent(
+                    &connection,
+                    step.as_deref(),
+                    Some(&review.mission_run),
+                )?;
+                items.push(AttentionItemView {
+                    conversation,
+                    ..attention_item_from_review(review)
+                });
+            }
+        }
 
         {
             let connection = self.readers.get();
@@ -14053,7 +14206,7 @@ impl Store {
                     ),
                     launch_id: None,
                     variant_id: None,
-                    message_id: None,
+                    message_id: None, conversation: None,
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -16915,11 +17068,20 @@ impl Store {
 
     /// A login is work only the seat's person can do. Project it from the current canonical
     /// condition, rather than raising an agent-owned fault or a legacy attention request.
+    /// One alert per login that needs a person: seats that share a login directory on a host
+    /// fail together and one sign-in fixes them all, so they share an alert that names each seat
+    /// and shows in each one's conversation. It clears when the login works again.
     fn harness_login_attention_items(
         &self,
         person: Option<&str>,
     ) -> Result<Vec<AttentionItemView>> {
-        let mut items = Vec::new();
+        struct Seat {
+            subject: String,
+            driver: String,
+            episode: String,
+            requested_at: u128,
+        }
+        let mut logins: BTreeMap<(String, String, String), Vec<Seat>> = BTreeMap::new();
         for desired in self.desired_harness_login_candidates()? {
             if !person_work::declaration_live(&self.readers.get(), &desired.subject)? {
                 continue;
@@ -16940,13 +17102,37 @@ impl Store {
                 .member
                 .as_ref()
                 .and_then(|m| m.driver.as_deref())
-                .unwrap_or("harness");
+                .unwrap_or("harness")
+                .to_owned();
             let host = desired
                 .member
                 .as_ref()
-                .map(|m| m.host.as_str())
-                .unwrap_or("unknown");
-            let login = match driver {
+                .map(|m| m.host.clone())
+                .unwrap_or_else(|| "unknown".into());
+            let login = self.seat_login(&desired, &host, &driver)?;
+            let (fence, episode) =
+                self.harness_login_episode_key(&desired.subject, &harness.incarnation_id)?;
+            let requested_at = fence.as_ref().map_or(harness.observed_at_unix_ms, |claim| {
+                claim.accepted_at_unix_ms
+            });
+            logins.entry((owner, host, login)).or_default().push(Seat {
+                subject: desired.subject,
+                driver,
+                episode,
+                requested_at,
+            });
+        }
+        let mut items = Vec::new();
+        for ((owner, host, login), mut seats) in logins {
+            // The seat that failed first stands for the login: its terminal is where to sign in,
+            // and its episode is the alert's. If it recovers before the others, the next seat
+            // stands for the login and the alert's ID changes with it: a login episode of its
+            // own would have to be written, and a read never writes.
+            seats.sort_by(|left, right| {
+                (left.requested_at, &left.subject).cmp(&(right.requested_at, &right.subject))
+            });
+            let first = &seats[0];
+            let how = match first.driver.as_str() {
                 "claude" | "pi" | "omp" => "run /login",
                 "codex" => {
                     "complete the sign-in prompt or run codex login in a shell using this seat's account configuration"
@@ -16956,24 +17142,62 @@ impl Store {
                 }
                 _ => "use this harness's login command",
             };
-            let (fence, key) =
-                self.harness_login_episode_key(&desired.subject, &harness.incarnation_id)?;
-            let requested_at = fence.as_ref().map_or(harness.observed_at_unix_ms, |claim| {
-                claim.accepted_at_unix_ms
-            });
+            let names = seats
+                .iter()
+                .map(|seat| seat.subject.as_str())
+                .collect::<Vec<_>>();
+            let (title, detail) = if let [seat] = names.as_slice() {
+                (
+                    format!("{seat} on {host} needs you to log in"),
+                    format!("{seat} on {host} needs you to log in: attach (Ctrl+] in stui) and {how}. A successful authenticated turn clears this alert automatically."),
+                )
+            } else {
+                (
+                    format!("{} seats on {host} need you to log in to {login}", names.len()),
+                    format!("{} on {host} share the login {login}, which needs you to sign in again: attach to {} (Ctrl+] in stui) and {how}. One sign-in fixes every seat; each clears when its next authenticated turn succeeds.", names.join(", "), first.subject),
+                )
+            };
             items.push(AttentionItemView {
-                episode: key, priority: "high".into(), kind: "harness-login".into(), review_mode: None,
-                subject: desired.subject.clone(), person: owner, requester_id: None, launch_id: None,
-                variant_id: None, message_id: None,
-                title: format!("{} on {host} needs you to log in", desired.subject),
-                detail: format!("{} on {host} needs you to log in: attach (Ctrl+] in stui) and {login}. A successful authenticated turn clears this item automatically.", desired.subject),
+                episode: first.episode.clone(), priority: "high".into(), kind: "harness-login".into(), review_mode: None,
+                subject: first.subject.clone(), person: owner, requester_id: None, launch_id: None,
+                variant_id: None, message_id: None, conversation: Some(first.subject.clone()),
+                title, detail,
                 request: None, mission: None, mission_run: None, step: None,
-                targets: vec![desired.subject.clone()], requested_at_unix_ms: requested_at,
+                targets: names.iter().map(|name| (*name).to_owned()).collect(),
+                requested_at_unix_ms: first.requested_at,
                 actions: vec![crate::model::AttentionActionView { label: "Attach to log in".into(),
-                    argv: vec!["st".into(), "terminals".into(), "attach".into(), desired.subject] }],
+                    argv: vec!["st".into(), "terminals".into(), "attach".into(), first.subject.clone()] }],
             });
         }
         Ok(items)
+    }
+
+    /// The login directory a seat's harness runs with on `host`: its account's, or the pool
+    /// account this node placed it on, else the harness's own default login on that host. Only
+    /// the seat's own node knows which pool account it chose, so a pooled seat on another node
+    /// stands alone rather than being merged with seats that may use another login.
+    fn seat_login(&self, desired: &DesiredSubject, host: &str, driver: &str) -> Result<String> {
+        let account = match crate::accounts::harness_binding(&desired.desired).map(|b| b.binding) {
+            Some(crate::accounts::Binding::Account(name)) => name,
+            Some(crate::accounts::Binding::Pool(_)) if host == self.origin => {
+                match self.seat_account_choice(&desired.subject)? {
+                    Some(name) => name,
+                    None => return Ok(format!("the login of {}", desired.subject)),
+                }
+            }
+            Some(crate::accounts::Binding::Pool(_)) => {
+                return Ok(format!("the login of {}", desired.subject));
+            }
+            None => return Ok(format!("the default {driver} login")),
+        };
+        // One declaration read by its key, not a scan of every declared subject.
+        Ok(self
+            .desired_subject_with_writer(&format!("account/{account}"))?
+            .and_then(|(declared, _)| {
+                crate::accounts::parse_account(&declared.subject, &declared.desired)
+            })
+            .and_then(|declared| declared.login_for(host).map(str::to_owned))
+            .unwrap_or(account))
     }
 
     pub(crate) fn harness_login_episode_key(
@@ -20964,16 +21188,18 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute("DELETE FROM planning_candidates", [])?;
     transaction.execute("DELETE FROM planning_sessions", [])?;
     let mut statement = transaction.prepare(
-        &canonical_sql("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+        &canonical_sql("SELECT id
          FROM claims WHERE kind >= 'planning-session.' AND kind < 'planning-session/'
          ORDER BY CANONICAL_ASC(claims)"),
     )?;
-    let claims = statement
-        .query_map([], claim_from_row)?
+    let claim_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     clear_quarantined_claims_tx(transaction, "projection:planning")?;
-    for claim in claims {
+    for id in claim_ids {
+        let claim = claim_by_id_tx(transaction, &id)?
+            .context("a planning claim disappeared during replay")?;
         // A claim admission accepted but this projection cannot read, such as one from a faulty
         // or older producer, is quarantined alone instead of failing the whole graph.
         project_claim_isolated_tx(transaction, "projection:planning", &claim, || {
@@ -21650,6 +21876,32 @@ fn cache_local_apply_receipt_tx(
         mark_replay_safe_receipt_tx(transaction, key).map_err(internal)?;
     }
     Ok(response)
+}
+
+/// The lease expiry of a step's newest replicated `work.claimed`, `work.renewed` or
+/// `work.progress` claim. Each kind's newest accepted time is one seek of the subject-kind
+/// index; only the claims accepted in those milliseconds are put in canonical order, so the read
+/// stays the same size however many reports and renewals the step has.
+fn last_replicated_lease_query() -> String {
+    let newest = |kind: &str| {
+        format!(
+            "SELECT '{kind}', (SELECT accepted_at_unix_ms FROM claims INDEXED BY claims_subject_kind_accepted_index
+                 WHERE subject=?1 AND kind='{kind}'
+                 ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC LIMIT 1)"
+        )
+    };
+    canonical_sql(&format!(
+        "WITH newest(kind, accepted) AS ({} UNION ALL {} UNION ALL {})
+         SELECT json_extract(claims.body, '$.fields.claim_expires_at_unix_ms')
+         FROM newest CROSS JOIN claims INDEXED BY claims_subject_kind_accepted_index
+           ON claims.subject=?1 AND claims.kind=newest.kind
+          AND length(claims.accepted_at_unix_ms)=length(newest.accepted)
+          AND claims.accepted_at_unix_ms=newest.accepted
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+        newest("work.claimed"),
+        newest("work.renewed"),
+        newest("work.progress"),
+    ))
 }
 
 fn mark_replay_safe_receipt_tx(transaction: &Transaction<'_>, key: &str) -> Result<()> {
@@ -24085,7 +24337,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
         requester_id: None,
         launch_id: None,
         variant_id: None,
-        message_id: None,
+        message_id: None, conversation: None,
         title: review
             .title
             .clone()
@@ -24152,6 +24404,7 @@ fn attention_item_from_planning(
             session.id, candidate.variant
         )),
         message_id: None,
+        conversation: attention_snapshot::agent(&session.planner),
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
         mission: Some(format!("mission/{}", session.mission)),
@@ -24210,6 +24463,7 @@ fn attention_item_from_revision(
         launch_id: None,
         variant_id: None,
         message_id: None,
+        conversation: attention_snapshot::agent(&proposal.actor),
         title: format!("Approve a revision of {}", run.mission),
         detail: proposal.reason.clone(),
         mission: Some(run.mission.clone()),
@@ -24269,7 +24523,7 @@ fn attention_item_from_failure(request: AttentionRequestView) -> AttentionItemVi
         requester_id: Some(request.actor),
         launch_id: None,
         variant_id: None,
-        message_id: None,
+        message_id: None, conversation: None,
         title: request.title,
         detail: request.reason,
         mission: None,
@@ -26600,6 +26854,41 @@ thread_local! {
     pub(crate) static STEPS_ENRICHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// The SQLite work each work action did inside its writer job, by idempotency key, so a test
+/// can see what one action holds the single writer for.
+#[cfg(test)]
+pub(crate) static WORK_ACTION_WRITER_WORK: Mutex<
+    BTreeMap<String, smallclaims::sqlite::work::SqliteWork>,
+> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+struct WorkActionWriterProbe {
+    key: String,
+    scope: Option<smallclaims::sqlite::work::SqliteWorkScope>,
+}
+
+#[cfg(test)]
+impl WorkActionWriterProbe {
+    fn start(key: &str) -> Self {
+        Self {
+            key: key.to_owned(),
+            scope: Some(smallclaims::sqlite::work::SqliteWorkScope::start()),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for WorkActionWriterProbe {
+    fn drop(&mut self) {
+        if let Some(scope) = self.scope.take() {
+            WORK_ACTION_WRITER_WORK
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(std::mem::take(&mut self.key), scope.finish());
+        }
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn streamed_digest_matches_materialized_rows() {
@@ -28740,6 +29029,7 @@ fn project_replicated_base_claims_with_progress(
         )
         .map_err(internal)?;
     clear_quarantined_claims_tx(transaction, "projection:base")?;
+
     progress(ReplayProgress {
         phase: "full-replay/base-claims",
         processed: Some(0),
@@ -28981,20 +29271,22 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
         };
         let mut statement = transaction
             .prepare(&canonical_sql(&format!(
-                "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
-                        claims.origin, claims.actor, claims.body, claims.predecessors,
-                        claims.accepted_at_unix_ms
+                "SELECT claims.id
                  FROM claims JOIN batches ON batches.id=claims.batch_id WHERE {filter}
                  ORDER BY CANONICAL_ASC(claims)"
             )))
             .map_err(internal)?;
-        let claims = statement
-            .query_map([], claim_from_row)
+        let claim_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
             .map_err(internal)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal)?;
         drop(statement);
-        for claim in claims {
+        for id in claim_ids {
+            let claim = claim_by_id_tx(transaction, &id)
+                .map_err(internal)?
+                .context("a mission run claim disappeared during replay")
+                .map_err(internal)?;
             project_claim_isolated_tx(transaction, "projection:runs", &claim, || match pass {
                 0 => project_mission_run_created(transaction, &claim),
                 1 => project_mission_run_update(transaction, &claim),
@@ -33342,6 +33634,45 @@ mod tests {
         other.join().unwrap();
         assert_eq!(completed.unwrap().unwrap()[0]["id"], "agent/cached");
         assert_eq!(resumed, published.unwrap());
+    }
+
+    #[test]
+    fn projection_times_at_names_every_cut_like_the_single_lookup() {
+        let store = roster_cache_store();
+        let (_, newest) = store.event_bounds().unwrap();
+        assert!(newest > 1, "the fixture needs several claims");
+        // Heterogeneous, repeated, unordered, empty-store and past-the-frontier cuts.
+        let mut cuts = vec![0, newest + 7, 1, newest, 1, newest / 2, 0, newest];
+        cuts.extend(1..=newest);
+        let batched = store.projection_times_at(&cuts).unwrap();
+        for cut in &cuts {
+            assert_eq!(batched[cut], store.projection_time_at(*cut).unwrap(), "cut {cut}");
+        }
+        assert_eq!(batched.len(), (0..=newest + 7).filter(|c| cuts.contains(c)).count());
+        assert!(store.projection_times_at(&[]).unwrap().is_empty());
+        // Acceptance times are per claim, not one shared value, once the clock moves.
+        assert!(batched[&newest] >= batched[&1]);
+    }
+
+    #[test]
+    fn projection_times_at_seeks_the_claim_index_once_per_cut() {
+        let store = roster_cache_store();
+        let connection = store.readers.get();
+        let plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT cut.value,
+                        (SELECT accepted_at_unix_ms FROM claims
+                         WHERE store_index <= cut.value ORDER BY store_index DESC LIMIT 1)
+                 FROM json_each(?1) AS cut",
+            )
+            .unwrap()
+            .query_map(["[1,2]"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("SEARCH claims USING INTEGER PRIMARY KEY"), "{plan}");
+        assert!(!plan.contains("SCAN claims"), "{plan}");
     }
 
     fn roster_cache_store() -> Store {
@@ -44641,7 +44972,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            17
+            st3_schema::STORAGE_VERSION
         );
         assert_eq!(
             connection
@@ -44715,7 +45046,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            17
+            st3_schema::STORAGE_VERSION
         );
     }
 
@@ -44748,7 +45079,7 @@ version 2
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
         assert_eq!(planner_column, 1);
     }
 
@@ -46813,9 +47144,19 @@ version 2
                 child_step,
             ))
             .unwrap();
+        // This repair touches run-state projections and appends new history, not any
+        // captured body, canonical key or protection reference.
+        store.checkpoint_sealed_set(now_ms() + 1_000).unwrap();
         let before_dry_run = store.index().unwrap();
+        let capture_epoch =
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap();
         let repair = store.operational_repair_plan().unwrap();
         assert_eq!(store.index().unwrap(), before_dry_run);
+        assert_eq!(
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap(),
+            capture_epoch,
+            "planning a repair must not invalidate checkpoint capture"
+        );
         assert_eq!(repair.status, "changes");
         assert!(repair.items.iter().any(|item| {
             item.class == "terminal-descendants"
@@ -46826,9 +47167,21 @@ version 2
         let applied = store.apply_operational_repair(&repair.token).unwrap();
         assert!(applied.applied >= 1);
         assert!(!applied.already_applied);
+        let repaired_epoch =
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap();
+        assert_eq!(
+            repaired_epoch,
+            capture_epoch,
+            "unrelated operational-state repair must not invalidate captured history"
+        );
         let duplicate = store.apply_operational_repair(&repair.token).unwrap();
         assert_eq!(duplicate.applied, 0);
         assert!(duplicate.already_applied);
+        assert_eq!(
+            smallclaims::store::checkpoint_capture_epoch(&store.readers.get()).unwrap(),
+            repaired_epoch,
+            "an already-applied repair must not invalidate checkpoint capture"
+        );
         assert_eq!(store.operational_repair_plan().unwrap().status, "clean");
         let history = store.work(None, true).unwrap();
         let nested = history
@@ -54381,13 +54734,18 @@ message "human-attention" {
             "harness.observed",
             json!({"state":"idle", "incarnation_id":"current", "provider_auth":null}),
         );
+        // These seats share the harness's default login on one host, so one alert names them all.
         let login_subjects = || {
-            store
+            let logins = store
                 .attention_items(Some("person/avery"))
                 .unwrap()
                 .into_iter()
                 .filter(|item| item.kind == "harness-login")
-                .map(|item| item.subject)
+                .collect::<Vec<_>>();
+            assert!(logins.len() <= 1, "{logins:?}");
+            logins
+                .into_iter()
+                .flat_map(|item| item.targets)
                 .collect::<BTreeSet<_>>()
         };
         let (items, reads) = smallclaims::touched::record(login_subjects);
@@ -54433,6 +54791,73 @@ message "human-attention" {
         assert_eq!(
             login_subjects(),
             BTreeSet::from(["agent/node.healthy".into()])
+        );
+    }
+
+    #[test]
+    fn one_login_alert_per_login_directory_names_every_seat_that_shares_it() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = workspace.path().display().to_string();
+        let source = format!(
+            r#"version 2
+account "avery/one" {{ provider "anthropic"; owner "person/avery"; plan "max"; login "/logins/one"; }}
+account "avery/two" {{ provider "anthropic"; owner "person/avery"; plan "max"; login "/logins/two"; }}
+agent "first" {{ workspace {workspace:?}; harness "claude" {{ account "avery/one"; }} }}
+agent "second" {{ workspace {workspace:?}; harness "claude" {{ account "avery/one"; }} }}
+agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two"; }} }}
+"#
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &preview.subject_tokens, "logins", Some("person/avery"))
+            .unwrap();
+        for name in ["first", "second", "third"] {
+            for (kind, fields) in [
+                ("runtime.observed", json!({"status":"running", "incarnation_id":"current"})),
+                ("harness.diagnostic", json!({"code":"provider-auth-expired", "incarnation_id":"current", "driver":"claude"})),
+            ] {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: format!("agent/node.{name}"),
+                        kind: kind.into(),
+                        actor: Some(format!("agent/node.{name}")),
+                        fields: serde_json::from_value(fields).unwrap(),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            }
+        }
+        let logins = store
+            .attention_items(Some("person/avery"))
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.kind == "harness-login")
+            .map(|item| (item.targets.clone(), (item.is_alert(), item.conversations())))
+            .collect::<BTreeMap<_, _>>();
+        let seats = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| format!("agent/node.{name}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            logins,
+            BTreeMap::from([
+                (seats(&["first", "second"]), (true, seats(&["first", "second"]))),
+                (seats(&["third"]), (true, seats(&["third"]))),
+            ])
         );
     }
 

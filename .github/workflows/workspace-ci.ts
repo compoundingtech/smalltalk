@@ -7,7 +7,8 @@ import {
 } from '../../repos/effect-utils/genie/external.ts'
 
 // Profiles require controls inline; namespace-features labels apply only to shape labels.
-// Namespace serves queued merge-group jobs before PR, optional and manual jobs.
+// Generic workflows retain merge-first ordering. Required Workspace PR checks use
+// the first class too, through namespaceLabels below, rather than sharing benchmarks.
 // This orders waiting jobs; it does not preempt active jobs or reserve a runner.
 const linuxJobPriority = "${{ github.event_name == 'merge_group' && 1 || 2 }}"
 export const linuxRunnerProfile = `namespace-profile-linux-x86-64;job.priority=${linuxJobPriority}`
@@ -169,13 +170,15 @@ const mergeCi1Labels = `github.event_name == 'merge_group' && (vars.CI_MERGE_CI1
 const pickedOr = (namespaceLabels: string, output = 'ci1') =>
   `\${{ fromJSON(${mergeCi1Labels} || (github.event_name != 'merge_group' && needs.${pickRunnerJobId}.outputs.${output}) || ${namespaceLabels}) }}`
 
-// Keep run affinity within each event class. Merge groups take the first Namespace
-// queue class; optional/manual and PR work retain the same second class.
+// Required PR and merge checks share the first class. PR checks are prerequisites
+// for the merge queue: serving every new merge ahead of them can starve that input.
+// Optional/manual work retains linuxJobPriority and the second class.
+const workspaceJobPriority = "(github.event_name == 'merge_group' || github.event_name == 'pull_request') && 1 || 2"
 // Set this repository variable only after a runner administrator has provisioned
 // the profile with the existing image/cache and left it capacity outside the PR pool.
-// An unset variable retains the existing shapes with merge-first queue ordering.
+// An unset variable retains the existing shapes and Workspace priority policy.
 const namespaceLabels = (labels: readonly string[]) =>
-  `github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('${JSON.stringify(labels).replaceAll('${{ github.run_id }}', '{0}').replaceAll(linuxJobPriority, '{1}')}', github.run_id, github.event_name == 'merge_group' && 1 || 2)`
+  `github.event_name == 'merge_group' && vars.CI_MERGE_NAMESPACE_PROFILE && format('["namespace-profile-{0};job.priority=1;github.run-id={1}"]', vars.CI_MERGE_NAMESPACE_PROFILE, github.run_id) || format('${JSON.stringify(labels).replaceAll('${{ github.run_id }}', '{0}').replaceAll(linuxJobPriority, '{1}')}', github.run_id, ${workspaceJobPriority})`
 /** `runs-on` for a stage job: picked ci1, else the shared Namespace queue class. */
 export const linuxStageRunsOn = pickedOr(
   namespaceLabels(linuxStageRunner),
@@ -311,16 +314,28 @@ export const testArchiveConsumerSetup = [
     env: { PRODUCER_RESULT: "${{ needs.linux-test-build.result }}" },
     run: '[ "$PRODUCER_RESULT" = success ] || { echo "::error::shared test producer failed or was skipped"; exit 1; }' },
   ...commonSetupSteps.filter((step: any) => step.id !== 'cargo-cache'
-    && step !== buildSnapshotRestore && step !== buildSnapshotPrepare),
+    && step !== buildSnapshotRestore && step !== buildSnapshotPrepare)
+    // The producer already restores the protected-main linux-tests Nix cache.
+    // Reuse that tool/fixture cache here instead of cold, per-consumer entries.
+    // Nix still resolves the pinned recipes; compiled test archives remain bound
+    // separately to this exact successful producer, source, attempt and hashes.
+    .map((step: any) => {
+      if (step.id !== 'nix-cache') return step
+      const key = step.with.key.replace('${{ github.job }}', 'linux-tests')
+      if (!key.includes('nix5-linux-tests-')) throw new Error('shared fixture cache key must name linux-tests')
+      return { ...step, with: { ...step.with, key,
+        'restore-keys': step.with['restore-keys'].replaceAll('${{ github.job }}', 'linux-tests') } }
+    }),
   ...testBuildSteps.slice(0, 2),
   {
     name: 'Download this run attempt’s successful test build',
-    uses: 'actions/download-artifact@v4',
-    with: {
-      'artifact-ids': '${{ needs.linux-test-build.outputs.artifact-id }}',
-      'merge-multiple': true,
-      path: '${{ runner.temp }}/ci-test-archives',
+    env: {
+      GH_TOKEN: '${{ github.token }}',
+      CI_TEST_ARCHIVE_ARTIFACT_ID: '${{ needs.linux-test-build.outputs.artifact-id }}',
+      CI_TEST_ARCHIVE_MANIFEST_SHA256: '${{ needs.linux-test-build.outputs.manifest-sha256 }}',
+      CI_TEST_ARCHIVE_PRODUCER_ATTEMPT: '${{ needs.linux-test-build.outputs.producer-attempt }}',
     },
+    run: 'python3 scripts/ci-test-archive download',
   },
   { ...nixDevelopStep({ name: 'Verify source, hashes and extract test archives',
     command: ['python3', 'scripts/ci-test-archive', 'consume'] }),
@@ -338,6 +353,7 @@ export const linuxStageJob = ({
   name,
   stage,
   setup,
+  cacheSaveSetup = setup,
   description,
   env = {},
   extraLogs = '',
@@ -350,6 +366,7 @@ export const linuxStageJob = ({
   name: string
   stage: string
   setup: readonly unknown[]
+  cacheSaveSetup?: readonly unknown[]
   description?: string
   env?: Record<string, string>
   extraLogs?: string
@@ -379,7 +396,7 @@ export const linuxStageJob = ({
       if: `success() && env.CI_LOCAL_CACHES != '1' && ${optionalQueueCacheSave}`,
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
-    ...saveMainDependencyCaches(setup),
+    ...saveMainDependencyCaches(cacheSaveSetup),
     ...buildSnapshotSave,
     {
       name: 'Retain stage logs and timings',

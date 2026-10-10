@@ -2825,6 +2825,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "identity",
         "name",
         "description",
+        "lifecycle",
         "host",
         "workspace",
         "checkout",
@@ -2868,6 +2869,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "identity",
         "name",
         "description",
+        "lifecycle",
         "host",
         "workspace",
         "checkout",
@@ -2889,6 +2891,17 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "agent-authority",
     ] {
         unique_child(document, child)?;
+    }
+    if let Some(lifecycle) = unique_child(document, "lifecycle")? {
+        ensure_no_properties(lifecycle)?;
+        ensure_no_children(lifecycle)?;
+        let value = one_string(lifecycle)?;
+        if crate::model::AgentLifecycle::parse(&value).is_none() {
+            return Err(St3Error::new(
+                "invalid-agent-lifecycle",
+                format!("agent lifecycle `{value}` must be standing, owner, or bounded"),
+            ));
+        }
     }
     if let Some(flag) = unique_child(document, "handles-faults")? {
         ensure_bare(flag)?;
@@ -5927,6 +5940,41 @@ version 2
                 .is_err(),
                 "{invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn agent_lifecycle_is_optional_and_closed() {
+        for value in ["standing", "owner", "bounded"] {
+            let intent = parse_intent(
+                &format!("version 2\nagent \"example/purpose\" {{ lifecycle \"{value}\"; command \"true\" }}"),
+                "node",
+            ).unwrap();
+            let desired = &intent.subjects["agent/example/purpose"].desired;
+            assert_eq!(
+                crate::model::declared_agent_lifecycle(Some(desired)),
+                crate::model::AgentLifecycle::parse(value),
+            );
+        }
+        let intent = parse_intent(
+            "version 2\nagent \"example/purpose\" { command \"true\" }", "node",
+        ).unwrap();
+        assert_eq!(crate::model::declared_agent_lifecycle(
+            Some(&intent.subjects["agent/example/purpose"].desired),
+        ), None);
+        let invalid = parse_intent(
+            "version 2\nagent \"example/purpose\" { lifecycle \"unknown\"; command \"true\" }",
+            "node",
+        ).unwrap_err();
+        assert_eq!(invalid.code, "invalid-agent-lifecycle");
+        for invalid in [
+            "lifecycle #true", "lifecycle", "lifecycle \"owner\" extra=\"bounded\"",
+            "lifecycle \"standing\" {}", "lifecycle \"owner\"; lifecycle \"bounded\"",
+        ] {
+            assert!(parse_intent(
+                &format!("version 2\nagent \"example/purpose\" {{ {invalid}; command \"true\" }}"),
+                "node",
+            ).is_err(), "{invalid}");
         }
     }
 

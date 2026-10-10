@@ -16,6 +16,8 @@ mod summary;
 
 #[cfg(test)]
 mod stream_start_tests;
+#[cfg(test)]
+mod agents_window_tests;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -40,7 +42,7 @@ pub(super) async fn request_latency(
 struct CollectionSubscribe {
     kind: String,
     id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "collection_name")]
     collection: String,
     limit: Option<usize>,
     person: Option<String>,
@@ -55,6 +57,13 @@ struct CollectionSubscribe {
     capability: Option<String>,
     /// A conversation subscription names an agent or a session.
     conversation: Option<String>,
+}
+
+/// A collection's name, with `alerts` read as `attention`: the same rows under the name a person
+/// reads. Clients that predate alerts keep subscribing to `attention`.
+fn collection_name<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    Ok(if name == "alerts" { "attention".into() } else { name })
 }
 
 struct CollectionSubscription {
@@ -431,6 +440,11 @@ async fn collection_items_with_windows(
                                 return Ok(Err(super::agent_roster_not_ready()));
                             }
                             None if admitted => None,
+                            // A selected projection is sufficient for a warm unfiltered
+                            // window. Do not discard its FIFO reader grant merely because
+                            // no complete roster has been folded.
+                            None if status.is_none()
+                                && client_agent_window_is_cached(&store, index, limit)? => None,
                             None => return Ok(Ok(None)),
                         },
                     }
@@ -475,15 +489,15 @@ async fn collection_items_with_windows(
                             client_attention_resources_at(&store, person.as_deref(), false, now)?
                         }
                         "agents" => {
-                            // Unfiltered windows keep one row past the limit for `has_more`.
+                            // Published cards already exist; a cold unfiltered window folds
+                            // only its visible cards and gets has_more from shallow membership.
                             let keep = if status.is_none() { limit + 1 } else { usize::MAX };
                             match &cached_agents {
                                 Some(cards) => cards.iter().take(keep).cloned().collect(),
-                                None => {
-                                    let mut cards = client_agent_resources_cached(&store, false, index)?;
-                                    cards.truncate(keep);
-                                    cards
+                                None if status.is_none() => {
+                                    return client_agent_window_cards(&store, index, limit);
                                 }
+                                None => client_agent_resources_cached(&store, false, index)?,
                             }
                         }
                         "work" => client_work_resources(
@@ -531,7 +545,7 @@ async fn collection_items_with_windows(
                     if let Some(status) = &status {
                         items.retain(|item| item["state"].as_str() == Some(status.as_str()));
                     }
-                    has_more = items.len() > limit;
+                    has_more |= items.len() > limit;
                     items.truncate(limit);
                 }
                 Ok(Ok(Some((snapshot, items, has_more))))
@@ -555,6 +569,27 @@ async fn collection_items_with_windows(
         items.truncate(end);
     }
     Ok((snapshot, items, has_more))
+}
+
+/// Membership and display order come from the existing shallow page refs. The next
+/// reference proves `has_more` without folding an invisible card.
+fn client_agent_window_cards(store: &Store, index: u64, limit: usize) -> anyhow::Result<(Vec<Value>, bool)> {
+    let refs = client_agent_page_refs(store, false, index)?;
+    let has_more = refs.len() > limit;
+    let selected = refs.iter().take(limit)
+        .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    Ok((client_agent_cards_selected(store, false, index, &selected, true)?, has_more))
+}
+
+fn client_agent_window_is_cached(store: &Store, index: u64, limit: usize) -> anyhow::Result<bool> {
+    let Some(refs) = store.agent_page_refs_cached_at(index, false) else {
+        return Ok(false);
+    };
+    let selected = refs.iter().take(limit)
+        .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
+        .collect::<BTreeSet<_>>();
+    Ok(store.agent_resources_cached_at(index, false, Some(&selected))?.is_some())
 }
 
 fn collection_window_label(collection: &str) -> &'static str {
@@ -2184,6 +2219,9 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         })
         .collect::<Vec<_>>();
     capabilities.push(json!({"id":"summary", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
+    // Attention rows say whether each is an alert and name its agent conversation; `alerts` names
+    // the attention collection and routes, and the summary counts alerts.
+    capabilities.push(json!({"id":"alerts", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
@@ -6714,15 +6752,48 @@ fn client_session_id(owner: &str, incarnation: &str) -> String {
     format!("session/{}", &digest[..24])
 }
 
+/// What a page of events needs from the store to attribute its subjects, read once per page
+/// instead of once per event.
+#[derive(Default)]
+struct EventPageLookups {
+    missions: BTreeMap<String, String>,
+    custom_sources: BTreeSet<String>,
+}
+
+impl EventPageLookups {
+    fn read<'a>(state: &AppState, records: impl IntoIterator<Item = &'a EventRecord>) -> Self {
+        let (mut runs, mut customs) = (BTreeSet::new(), BTreeSet::new());
+        for record in records {
+            if record.subject.starts_with("custom/") {
+                customs.insert(record.subject.clone());
+            } else if record.subject.starts_with("mission-run/") {
+                runs.insert(record.subject.clone());
+            }
+        }
+        Self {
+            missions: state
+                .store
+                .run_missions(&runs.into_iter().collect::<Vec<_>>())
+                .unwrap_or_default(),
+            custom_sources: state
+                .store
+                .registered_custom_subjects(&customs.into_iter().collect::<Vec<_>>())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[cfg(test)]
 fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec<String>, Value) {
-    if record.subject.starts_with("custom/")
-        && state
-            .store
-            .custom_subject(&record.subject)
-            .ok()
-            .flatten()
-            .is_some()
-    {
+    safe_event_projection_with(state, record, &EventPageLookups::read(state, [record]))
+}
+
+fn safe_event_projection_with(
+    state: &AppState,
+    record: &EventRecord,
+    lookups: &EventPageLookups,
+) -> (String, Vec<String>, Value) {
+    if record.subject.starts_with("custom/") && lookups.custom_sources.contains(&record.subject) {
         return (
             "attention.changed".into(),
             vec![record.subject.clone()],
@@ -6785,9 +6856,9 @@ fn safe_event_projection(state: &AppState, record: &EventRecord) -> (String, Vec
     {
         resource_ids.push(record.subject.clone());
     } else if record.subject.starts_with("mission-run/")
-        && let Ok(Some(mission)) = state.store.mission_for_run(&record.subject)
+        && let Some(mission) = lookups.missions.get(&record.subject)
     {
-        resource_ids.push(mission);
+        resource_ids.push(mission.clone());
     } else if record.subject.starts_with("planning-session/") {
         resource_ids.push(format!(
             "launch/{}",
@@ -6890,6 +6961,13 @@ pub(super) async fn events(
     // The projection enrichment reads the store (mission attribution, snapshot ids), so it
     // takes one admitted query scope; the wait above held no reader.
     let items = super::read_deadline::query(&state.store, "/v1/client/events", || {
+        // Every event is named by its own cut; read all of the page's cuts in one statement.
+        let cuts = records
+            .iter()
+            .map(|(record, _)| record.store_index)
+            .collect::<Vec<_>>();
+        let times = state.store.projection_times_at(&cuts).unwrap_or_default();
+        let lookups = EventPageLookups::read(&state, records.iter().map(|(record, _)| record));
         Ok(records
             .into_iter()
             .map(|(record, local)| {
@@ -6907,8 +6985,12 @@ pub(super) async fn events(
                         local: None,
                     },
                 };
-                let event_snapshot = client_snapshot_at(&state, record.store_index);
-                let (event_type, resource_ids, body) = safe_event_projection(&state, &record);
+                let event_snapshot = client_snapshot_with_time(
+                    &state,
+                    record.store_index,
+                    times.get(&record.store_index).copied().unwrap_or_default(),
+                );
+                let (event_type, resource_ids, body) = safe_event_projection_with(&state, &record, &lookups);
                 json!({
                     "id": format!("projection-event/{}/{}", state.node, position.label()),
                     "epoch": state.node,
@@ -11211,6 +11293,59 @@ mission "queue-parity" state="ready" {
     }
 
     #[tokio::test]
+    async fn agent_lifecycle_declaration_updates_live_roster_rows() {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let writer = state.clone();
+        let apply = |lifecycle: Option<&str>, key: &str| {
+            let field = lifecycle.map(|value| format!("lifecycle \"{value}\";")).unwrap_or_default();
+            let source = format!("version 2\nagent \"example/purpose\" {{ {field} command \"true\" }}");
+            let intent = crate::graph::parse_intent(&source, "node").unwrap();
+            let planned = writer.store.mission(&intent, IntentInput {
+                kdl: source, source_name: None,
+            }).unwrap();
+            writer.store.apply(&intent, &planned.subject_tokens, key).unwrap();
+            signal_changed(&writer);
+        };
+        apply(Some("standing"), "lifecycle-initial");
+        let app = axum::Router::new().route("/stream", axum::routing::get(
+            move |upgrade: WebSocketUpgrade| {
+                let state = state.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| collection_stream_socket_with_reader(
+                        socket, state, ClientSession::local(None).unwrap(), None,
+                        |state, session, request, permit| async move {
+                            collection_items(&state, &session, &request, permit).await
+                        },
+                    ))
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}/stream")).await.unwrap();
+        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({"kind":"subscribe","id":"lifecycle","collection":"agents","limit":2}).to_string().into(),
+        )).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+        let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(frame["kind"], "snapshot");
+        assert_eq!(frame["items"][0]["lifecycle"], "standing");
+        for (lifecycle, key) in [(Some("owner"), "lifecycle-owner"), (Some("bounded"), "lifecycle-bounded"), (None, "lifecycle-removed")] {
+            apply(lifecycle, key);
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next()).await.unwrap().unwrap().unwrap();
+            let frame: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+            assert_eq!(frame["kind"], "changes", "{frame}");
+            assert_eq!(frame["upserts"][0]["id"], "agent/example/purpose");
+            assert_eq!(frame["upserts"][0].get("lifecycle"), lifecycle.map(|value| json!(value)).as_ref());
+        }
+        socket.close(None).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn agent_roster_warm_ws_read_bypasses_a_cold_builder_admission() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
@@ -11796,6 +11931,65 @@ mission "queue-parity" state="ready" {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fresh_agent_roster_read_cuts_the_refresh_pause_short_and_plain_reads_do_not() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/fresh-pause";
+        let append = |fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: "harness.observed".into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+            state.store.index().unwrap()
+        };
+        state.store.append_claim(&ClaimInput {
+            subject: subject.into(), kind: "runtime.observed".into(), actor: None,
+            fields: serde_json::from_value(json!({"status":"running",
+                "runtime_id":"fresh-pause", "incarnation_id":"one"})).unwrap(),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        let list = |fresh: bool| client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Query(ClientListQuery { fresh, ..ClientListQuery::default() }));
+        let publishes = |cut: u64| {
+            let store = state.store.clone();
+            move |_: &u64| store.published_agent_roster(store.index().unwrap(), false)
+                .is_some_and(|(published, _, _)| published >= cut)
+        };
+
+        // A plain read asks for a refresh; once it publishes, the refresher pauses a second.
+        let working = append(json!({"state":"working", "driver":"codex", "incarnation_id":"one"}));
+        let _ = list(false).await;
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(publishes(working)))
+            .await.expect("the refresher publishes the asked-for cut").unwrap();
+
+        // Unchanged: plain reads during the pause answer from the publication and do not cut it
+        // short, however many ask.
+        let idle = append(json!({"state":"idle", "driver":"codex", "incarnation_id":"one"}));
+        for _ in 0..3 {
+            let (Extension(snapshot), Json(page)) = list(false).await.unwrap();
+            assert!(snapshot.store_index < idle, "a plain read answers from the publication");
+            assert_eq!(page.items[0]["harness_state"], "working");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), published.wait_for(publishes(idle)))
+                .await.is_err(),
+            "plain reads must not shorten the refresher's minimum pause",
+        );
+
+        // Changed: a fresh read waits for one fold, not the rest of the pause (about 750 ms here).
+        let started = std::time::Instant::now();
+        let (Extension(snapshot), Json(page)) = list(true).await.unwrap();
+        let waited = started.elapsed();
+        assert!(snapshot.store_index >= idle, "a fresh read shows what was written before it");
+        assert_eq!(page.items[0]["harness_state"], "idle");
+        assert!(waited < Duration::from_millis(500), "a fresh read waited {waited:?} for the pause");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn agent_roster_pages_ask_for_a_refresh_after_local_activity_alone() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
@@ -11840,6 +12034,61 @@ mission "queue-parity" state="ready" {
         let (snapshot, Json(after)) = page().await.unwrap();
         assert_eq!(snapshot.0.store_index, index);
         assert!(!after.items[0]["last_activity_at"].is_null(), "{:?}", after.items[0]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fresh_agent_roster_waits_only_for_claims_that_change_a_card() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let subject = "agent/fresh-roster";
+        let append = |subject: &str, kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        append(subject, "runtime.observed", json!({"status":"running",
+            "runtime_id":"fresh-roster", "incarnation_id":"one"}));
+        let mut published = state.store.subscribe_agent_roster();
+        crate::api::start_agent_roster(&state);
+        tokio::time::timeout(Duration::from_secs(5), published.wait_for(|revision| *revision > 0))
+            .await.unwrap().unwrap();
+        let revision = *published.borrow_and_update();
+        let (_, Json(before)) = client_agents(State(state.clone()),
+            Extension(new_client_snapshot(&state)), Query(ClientListQuery::default())).await.unwrap();
+        let fresh = || async {
+            let started = std::time::Instant::now();
+            let (snapshot, Json(page)) = client_agents(State(state.clone()),
+                Extension(new_client_snapshot(&state)),
+                Query(ClientListQuery { fresh: true, ..ClientListQuery::default() })).await.unwrap();
+            (started.elapsed(), snapshot.0.store_index, page)
+        };
+
+        // Claims on subjects no card reads move the graph past the published cut. The paced
+        // refresher would publish the same cards, so a fresh read does not wait for it.
+        let cut = state.store.index().unwrap();
+        for marker in 0..3 {
+            append(&format!("custom/test/fresh-{marker}"), "custom.test.marker", json!({}));
+        }
+        assert!(state.store.index().unwrap() > cut);
+        assert!(state.store.published_agent_roster_unchanged_through(
+            state.store.index().unwrap(), false).unwrap());
+        let (waited, index, page) = fresh().await;
+        assert!(waited < Duration::from_millis(500), "waited {waited:?} for an unchanged roster");
+        assert_eq!(index, cut, "the unchanged roster is served under its own cut");
+        assert_eq!(page.items, before.items);
+
+        // A claim about the agent changes its card: the fresh read still waits for a roster
+        // at or after it, and shows it.
+        append(subject, "harness.observed", json!({"state":"working",
+            "driver":"codex", "incarnation_id":"one"}));
+        let written = state.store.index().unwrap();
+        assert!(!state.store.published_agent_roster_unchanged_through(written, false).unwrap());
+        let (_, index, page) = fresh().await;
+        assert_eq!(index, written);
+        assert_ne!(page.items, before.items, "the fresh read shows the claim it waited for");
+        assert!(*published.borrow_and_update() > revision);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -14802,7 +15051,7 @@ subscription "watch/source" {
                 snapshot_id: snapshot.id.clone(),
                 ..Default::default()
             },
-            parameters: json!({"to":"person/blair","content":"Send once despite unrelated activity."}),
+            parameters: json!({"to":"agent/blair","content":"Send once despite unrelated activity."}),
         };
         state
             .store
@@ -15941,6 +16190,109 @@ mission "example/zero-run" state="ready" {
         .0;
         assert_eq!(page["oldest_cursor"], expected);
         assert!(!serde_json::to_string(&page).unwrap().contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn event_pages_keep_each_events_own_cut_and_read_in_constant_statements() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "cut-node");
+        let session = ClientSession::local(None).unwrap();
+        let accepted = std::cell::RefCell::new(Vec::new());
+        let append = |count: usize| {
+            for _ in 0..count {
+                let key = format!("cut-{}", accepted.borrow().len());
+                accepted.borrow_mut().push(
+                    state
+                        .store
+                        .append_claim(&ClaimInput {
+                            subject: format!("message/{key}"),
+                            kind: "message.sent".into(),
+                            actor: Some("person/alex".into()),
+                            fields: BTreeMap::from([
+                                ("from".into(), Value::String("person/alex".into())),
+                                ("to".into(), Value::String("agent/worker".into())),
+                                ("content".into(), Value::String("safe".into())),
+                                ("status".into(), Value::String("sent".into())),
+                            ]),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(key),
+                        })
+                        .unwrap(),
+                );
+                // Acceptance times are milliseconds; keep neighbouring cuts distinct.
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let page = |after: Option<String>, limit: usize| {
+            let (state, session) = (state.clone(), session.clone());
+            async move {
+                let scope = smallclaims::sqlite::work::SqliteWorkScope::start();
+                let page = events(
+                    State(state),
+                    Extension(session),
+                    Query(EventsQuery { after, limit: Some(limit), wait_ms: None }),
+                )
+                .await
+                .unwrap()
+                .0;
+                (page, scope.finish().statements)
+            }
+        };
+        append(100);
+
+        // Each event keeps its own cut: its timestamp and snapshot id are the single lookup's.
+        let (tail, _) = page(None, 100).await;
+        let items = tail["items"].as_array().unwrap();
+        assert_eq!(items.len(), 100);
+        for item in items {
+            let sequence = item["sequence"].as_u64().unwrap();
+            let single = client_snapshot_at(&state, sequence);
+            assert_eq!(item["timestamp"], single.created_at, "sequence {sequence}");
+            assert_eq!(item["snapshot_id"], single.id, "sequence {sequence}");
+        }
+        let times = items.iter().map(|item| item["timestamp"].as_str().unwrap().to_owned()).collect::<BTreeSet<_>>();
+        assert!(times.len() > 1, "events must not share one page time");
+
+        // Statements stay flat as the page grows, and as unrelated history grows.
+        let mut counts = Vec::new();
+        for size in [10, 50, 100] {
+            counts.push(page(None, size).await.1);
+        }
+        eprintln!("events statements: 10/50/100 items {counts:?}");
+        assert!(counts.windows(2).all(|pair| pair[0] == pair[1]), "grew with page size: {counts:?}");
+        append(200);
+        let mut grown = Vec::new();
+        for size in [10, 50, 100] {
+            grown.push(page(None, size).await.1);
+        }
+        eprintln!("events statements after +200 claims of history: {grown:?}");
+        assert_eq!(counts, grown, "statements must not grow with history");
+
+        // Walking forward in pages, with an append during the walk, yields each event once, in
+        // order, with the same cuts.
+        let first = accepted.borrow()[0].store_index.saturating_sub(1);
+        let mut cursor = Some(format!("event-cursor/cut-node/{first}"));
+        let mut sequences = Vec::new();
+        let mut appended = false;
+        loop {
+            let (walked, _) = page(cursor.clone(), 7).await;
+            for item in walked["items"].as_array().unwrap() {
+                let sequence = item["sequence"].as_u64().unwrap();
+                assert_eq!(item["timestamp"], client_snapshot_at(&state, sequence).created_at);
+                sequences.push(sequence);
+            }
+            cursor = Some(walked["resume_cursor"].as_str().unwrap().to_owned());
+            if !appended {
+                appended = true;
+                append(3);
+            }
+            if !walked["has_more"].as_bool().unwrap() {
+                break;
+            }
+        }
+        let expected = accepted.borrow().iter().map(|claim| claim.store_index).collect::<Vec<_>>();
+        assert_eq!(sequences, expected);
     }
 
     #[tokio::test]

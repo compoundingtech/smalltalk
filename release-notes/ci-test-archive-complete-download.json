@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Complete and verify the exact producer artifact ZIP before publishing archive-consumer inputs; discard partial transfers and retry the same immutable artifact at most once.",
+  "replay": {
+    "status": "none",
+    "detail": "CI transport only; source/run/attempt/tool/file verification and production behavior are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI transport only; source/run/attempt/tool/file verification and production behavior are unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI transport only; source/run/attempt/tool/file verification and production behavior are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI transport only; source/run/attempt/tool/file verification and production behavior are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI transport only; source/run/attempt/tool/file verification and production behavior are unchanged."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "CI transport only; source/run/attempt/tool/file verification and production behavior are unchanged."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI transport only; source/run/attempt/tool/file verification and production behavior are unchanged."
+  }
+}

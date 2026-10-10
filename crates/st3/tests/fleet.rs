@@ -767,7 +767,18 @@ agent "move/worker" {
         a.stop();
         b.st_ok(&["agents", "start", SUBJECT, "--host", "cobalt", "--source-offline", "--as", PERSON]);
     } else {
-        b.st_ok(&["agents", "start", SUBJECT, "--host", "cobalt", "--as", PERSON]);
+        let start = ["agents", "start", SUBJECT, "--host", "cobalt", "--as", PERSON];
+        let output = b.st(&start);
+        if !output.status.success() {
+            panic!(
+                "st3 {} on cobalt failed:\n{}{}\n{}\n{}",
+                start.join(" "),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                desired_dump(&[&a, &b], SUBJECT).await,
+                b.logs()
+            );
+        }
     }
     wait_until("cobalt's running observation reaches both replicas", 30, || async {
         let replicas = if mode == SeatMove::SourceOffline { vec![&b] } else { vec![&a, &b] };
@@ -851,6 +862,37 @@ agent "move/worker" {
             String::from_utf8_lossy(&output.stdout)
         );
     }
+}
+
+/// What each node holds for a subject's declaration, so a start that stops on conflicting
+/// declarations says which unreferenced `intent.desired` heads it found and where they came from.
+async fn desired_dump(nodes: &[&Node], subject: &str) -> String {
+    let mut dump = String::new();
+    for node in nodes {
+        let status = node.st(&["--json", "subject", "show", subject]);
+        let status: Value = serde_json::from_slice(&status.stdout).unwrap_or(Value::Null);
+        let row = &status["status"]["subjects"][0];
+        dump.push_str(&format!(
+            "--- {} {subject}: desired_token {} conflicts {}\n",
+            node.name, row["desired_token"], row["conflicts"]
+        ));
+        for claim in node.claims().await {
+            if claim["subject"] != subject || claim["kind"] != "intent.desired" {
+                continue;
+            }
+            let body = claim["body"].to_string();
+            dump.push_str(&format!(
+                "intent.desired id {} store_index {} origin {} actor {} predecessors {} body {}\n",
+                claim["id"],
+                claim["store_index"],
+                claim["origin"],
+                claim["actor"],
+                claim["predecessors"],
+                body.chars().take(400).collect::<String>()
+            ));
+        }
+    }
+    dump
 }
 
 fn authority_digest(node: &Node) -> String {

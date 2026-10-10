@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Require one selected outbound-only timing test with one passing result and no ignored or measured tests",
+  "replay": {"status": "none", "detail": "CI result validation only; no claim replay or rebuild."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No authority or claim rule change."},
+  "compatibility": {"status": "none", "detail": "The optional timing job fails closed on missing, duplicate, ignored or measured harness selections. Rust test and production bytes are unchanged."},
+  "downtime": {"status": "none", "detail": "No production runtime change."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "No production retry, cancellation or recovery change."}
+}

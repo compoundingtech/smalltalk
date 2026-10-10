@@ -185,17 +185,37 @@ fn forwarded_deadline(operation: &crate::peer::ClientReadOperation) -> Option<Du
 }
 
 fn timeout_response(state: &AppState, path: &str) -> Response {
-    let error = json!({"code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}});
-    let request_id = super::new_request_id();
-    let value = if path.starts_with("/v1/client/") {
-        super::client_error_envelope(StatusCode::GATEWAY_TIMEOUT, &error, &request_id)
-    } else {
-        json!({"api_version":"st3.v1", "request_id":request_id,
+    construct_timeout_response(|| {
+        let error = json!({"code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}});
+        let request_id = super::new_request_id();
+        if let Some(trace) = crate::relay_trace::current() {
+            trace.response(&request_id);
+        }
+        let value = if path.starts_with("/v1/client/") {
+            super::client_error_envelope(StatusCode::GATEWAY_TIMEOUT, &error, &request_id)
+        } else {
+            json!({"api_version":"st3.v1", "request_id":request_id,
             "snapshot_host":state.node,
             "store_index":state.store.index().unwrap_or_default(),
             "code":"read-deadline", "message":"the read exceeded its server deadline", "details":{}})
-    };
-    (StatusCode::GATEWAY_TIMEOUT, Json(value)).into_response()
+        };
+        (StatusCode::GATEWAY_TIMEOUT, Json(value)).into_response()
+    })
+}
+
+/// The deadline has fired, but the response does not exist until construction returns.
+/// Keep the existing construction (including its Store read) inside this interval. A
+/// panic during construction is a panic terminal, never a prematurely completed timeout.
+fn construct_timeout_response(construct: impl FnOnce() -> Response) -> Response {
+    use crate::relay_trace::{Outcome, Phase};
+    let trace = crate::relay_trace::current();
+    let _root = trace.as_ref().map(crate::relay_trace::Trace::guard);
+    crate::relay_trace::span(Phase::Deadline).finish(Outcome::TimedOut);
+    let response = crate::relay_trace::work(Phase::TimeoutEnvelope, construct);
+    if let Some(trace) = trace {
+        trace.finish(Outcome::TimedOut);
+    }
+    response
 }
 
 #[track_caller]
@@ -211,11 +231,58 @@ fn body_timeout_response(state: &AppState) -> Response {
 
 pub(super) async fn envelope(
     state: (AppState, ClientTransportBoundary),
-    mut request: Request<Body>,
+    request: Request<Body>,
     next: Next,
 ) -> Response {
     let started = std::time::Instant::now();
+    let caller = request
+        .extensions()
+        .get::<crate::profile::Caller>()
+        .map(|caller| caller.0.as_ref())
+        .unwrap_or("");
+    let trace = crate::relay_trace::gateway(
+        request
+            .uri()
+            .path_and_query()
+            .map_or("", |path| path.as_str()),
+        request
+            .headers()
+            .get(super::client_v0::LOCAL_PERSON_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        caller,
+        request.method() == Method::GET && matches!(state.1, ClientTransportBoundary::Unix),
+        request.extensions().get::<crate::relay_trace::Connection>(),
+    );
+    let _root = trace.as_ref().map(crate::relay_trace::Trace::guard);
+    let response = crate::relay_trace::scope(trace.clone(), async {
+        let mut span = crate::relay_trace::span(crate::relay_trace::Phase::Request);
+        let response = envelope_inner(state, request, next, started).await;
+        span.finish(if response.status().is_success() {
+            crate::relay_trace::Outcome::Completed
+        } else {
+            crate::relay_trace::Outcome::Failed
+        });
+        response
+    })
+    .await;
+    if let Some(trace) = trace {
+        trace.finish(if response.status().is_success() {
+            crate::relay_trace::Outcome::Completed
+        } else {
+            crate::relay_trace::Outcome::Failed
+        });
+    }
+    response
+}
+
+async fn envelope_inner(
+    state: (AppState, ClientTransportBoundary),
+    mut request: Request<Body>,
+    next: Next,
+    started: std::time::Instant,
+) -> Response {
     let mut duration = deadline(&request);
+    let mut forwarding_trace = None;
     if request.method() == Method::POST
         && request.uri().path() == crate::peer::CLIENT_READ_FORWARD_PATH
     {
@@ -240,9 +307,50 @@ pub(super) async fn envelope(
         };
         if let Ok(forwarded) = serde_json::from_slice::<crate::peer::ClientReadRequest>(&bytes) {
             duration = forwarded_deadline(&forwarded.request);
+            if matches!(
+                &forwarded.request,
+                crate::peer::ClientReadOperation::Timeline { .. }
+            ) {
+                let caller = parts
+                    .extensions
+                    .get::<crate::profile::Caller>()
+                    .map(|caller| caller.0.as_ref())
+                    .unwrap_or("");
+                forwarding_trace = crate::relay_trace::forwarded(
+                    &bytes,
+                    caller,
+                    matches!(state.1, ClientTransportBoundary::Unix),
+                    parts.extensions.get::<crate::relay_trace::Connection>(),
+                );
+            }
         }
         request = Request::from_parts(parts, Body::from(bytes));
     }
+    if let Some(trace) = forwarding_trace {
+        let _root = trace.guard();
+        let response = crate::relay_trace::scope(
+            Some(trace.clone()),
+            envelope_work(state, request, next, started, duration),
+        )
+        .await;
+        trace.finish(if response.status().is_success() {
+            crate::relay_trace::Outcome::Completed
+        } else {
+            crate::relay_trace::Outcome::Failed
+        });
+        response
+    } else {
+        envelope_work(state, request, next, started, duration).await
+    }
+}
+
+async fn envelope_work(
+    state: (AppState, ClientTransportBoundary),
+    request: Request<Body>,
+    next: Next,
+    started: std::time::Instant,
+    duration: Option<Duration>,
+) -> Response {
     let Some(duration) = duration.map(|limit| limit.saturating_sub(started.elapsed())) else {
         return super::response_envelope_unbounded(axum::extract::State(state), request, next)
             .await;
@@ -328,18 +436,29 @@ where
     };
     let mut future = std::pin::pin!(future);
     let mut admission = std::pin::pin!(store.readers.admit_read(admission_budget.clone()));
+    let mut diagnostic_admission = None;
     std::future::poll_fn(|cx| {
         if smallclaims::sqlite::thread_holds_reader() {
             if store.readers.has_request_reader() {
                 return future.as_mut().poll(cx);
             }
-            return store.readers.request_read(|| future.as_mut().poll(cx))
+            return store
+                .readers
+                .request_read(|| future.as_mut().poll(cx))
                 .unwrap_or_else(|error| Poll::Ready(ApiError::internal(error).into_response()));
         }
+        let admission_span = diagnostic_admission.get_or_insert_with(|| {
+            crate::relay_trace::span(crate::relay_trace::Phase::HandlerReaderAdmission)
+        });
         let admitted = match admission.as_mut().poll(cx) {
             Poll::Pending => return Poll::Pending,
-            Poll::Ready(Ok(permit)) => permit,
+            Poll::Ready(Ok(permit)) => {
+                admission_span.finish(crate::relay_trace::Outcome::Completed);
+                diagnostic_admission = None;
+                permit
+            }
             Poll::Ready(Err(error)) => {
+                admission_span.finish(crate::relay_trace::Outcome::Failed);
                 return Poll::Ready(ApiError::internal(error).into_response());
             }
         };
@@ -418,14 +537,19 @@ where
         }
     });
     let worker_budget = budget.clone();
+    let diagnostic = crate::relay_trace::current();
+    let diagnostic_admission = diagnostic.clone();
+    let diagnostic_dispatch = diagnostic.clone();
     let store = STORE.with(|slot| slot.borrow().clone());
     let multithread = matches!(
         tokio::runtime::Handle::current().runtime_flavor(),
         tokio::runtime::RuntimeFlavor::MultiThread
     );
-    let reentrant = store.as_ref().is_some_and(|store| store.readers.has_request_reader());
-    let cross_pool = query && store.is_some() && !reentrant
-        && smallclaims::sqlite::thread_holds_reader();
+    let reentrant = store
+        .as_ref()
+        .is_some_and(|store| store.readers.has_request_reader());
+    let cross_pool =
+        query && store.is_some() && !reentrant && smallclaims::sqlite::thread_holds_reader();
     // Handlers never own a whole-request reader: `handler` admits per poll, and their
     // nested queries take query admission themselves. Only explicit query work admits here.
     let loan = budget.is_some() && query;
@@ -443,31 +567,47 @@ where
     let cancel = Cancel(budget.clone());
     let profile = query.then(crate::profile::current).flatten();
     let queued = profile.as_ref().map(|op| op.wall_span("blocking/queue"));
-    let run = move |permit: Option<smallclaims::sqlite::ReadPermit>| {
+    let run = move |permit: Option<smallclaims::sqlite::ReadPermit>,
+                    mut diagnostic_queue: Option<crate::relay_trace::Span>| {
+        if let Some(span) = &mut diagnostic_queue {
+            span.finish(crate::relay_trace::Outcome::Completed);
+        }
         drop(queued);
         let _work = profile.as_ref().map(|op| op.wall_span("blocking/work"));
-        with_store(store.clone(), || {
-            read_budget::with(worker_budget.clone(), || {
-                if let Some(budget) = &worker_budget {
-                    budget.check().map_err(WorkError::Deadline)?;
-                }
-                let result = match (&store, permit) {
-                    (Some(store), Some(permit)) => store
-                        .readers
-                        .request_read_with_permit(permit, work)
-                        .map_err(|error| WorkError::Store(smallclaims::error::typed(error)))?,
-                    (Some(store), None) if loan => store
-                        .readers
-                        .request_read(work)
-                        .map_err(|error| WorkError::Store(smallclaims::error::typed(error)))?,
-                    _ => work(),
-                };
-                if let Some(budget) = &worker_budget {
-                    budget.check().map_err(WorkError::Deadline)?;
-                }
-                Ok(result)
+        crate::relay_trace::blocking(diagnostic, || {
+            crate::relay_trace::result(crate::relay_trace::Phase::BlockingWork, || {
+                with_store(store.clone(), || {
+                    read_budget::with(worker_budget.clone(), || {
+                        if let Some(budget) = &worker_budget {
+                            budget.check().map_err(WorkError::Deadline)?;
+                        }
+                        let result = match (&store, permit) {
+                            (Some(store), Some(permit)) => store
+                                .readers
+                                .request_read_with_permit(permit, work)
+                                .map_err(|error| {
+                                    WorkError::Store(smallclaims::error::typed(error))
+                                })?,
+                            (Some(store), None) if loan => {
+                                store.readers.request_read(work).map_err(|error| {
+                                    WorkError::Store(smallclaims::error::typed(error))
+                                })?
+                            }
+                            _ => work(),
+                        };
+                        if let Some(budget) = &worker_budget {
+                            budget.check().map_err(WorkError::Deadline)?;
+                        }
+                        Ok(result)
+                    })
+                })
             })
         })
+    };
+    let start_queue = move || {
+        diagnostic_dispatch
+            .as_ref()
+            .map(|trace| trace.span(crate::relay_trace::Phase::BlockingQueue))
     };
     enum Task<T> {
         Inline(Result<T, WorkError>),
@@ -486,10 +626,10 @@ where
         Task::Inline(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if multithread {
-                    tokio::task::block_in_place(|| run(None))
+                    tokio::task::block_in_place(|| run(None, start_queue()))
                 } else {
                     // A different pool cannot queue while a synchronous outer loan is held.
-                    run(None)
+                    run(None, start_queue())
                 }
             }))
             .unwrap_or(Err(WorkError::Panic)),
@@ -499,17 +639,32 @@ where
         // work. Admission itself is asynchronous and happens before opening a connection or
         // entering the blocking callback's snapshot, writer, cache or roster locks.
         Task::Spawned(tokio::spawn(async move {
-            let permit = store
+            let mut admission_span = diagnostic_admission
+                .as_ref()
+                .map(|trace| trace.span(crate::relay_trace::Phase::ReaderAdmission));
+            let admitted = store
                 .readers
                 .admit_read(admission_budget)
                 .await
-                .map_err(admission_error)?;
-            tokio::task::spawn_blocking(move || run(Some(permit)))
+                .map_err(admission_error);
+            if let Some(span) = &mut admission_span {
+                span.finish(match &admitted {
+                    Ok(_) => crate::relay_trace::Outcome::Completed,
+                    Err(WorkError::Deadline(_)) => crate::relay_trace::Outcome::TimedOut,
+                    Err(_) => crate::relay_trace::Outcome::Failed,
+                });
+            }
+            let permit = admitted?;
+            let diagnostic_queue = start_queue();
+            tokio::task::spawn_blocking(move || run(Some(permit), diagnostic_queue))
                 .await
                 .map_err(WorkError::Join)?
         }))
     } else {
-        Task::Spawned(tokio::task::spawn_blocking(move || run(None)))
+        let diagnostic_queue = start_queue();
+        Task::Spawned(tokio::task::spawn_blocking(move || {
+            run(None, diagnostic_queue)
+        }))
     };
     async move {
         let _cancel = cancel;
@@ -581,6 +736,97 @@ mod tests {
 
     fn bounded_state(root: &std::path::Path, limit: usize) -> AppState {
         smallclaims::sqlite::with_read_limit_for_test(limit, || super::super::tests::state(root))
+    }
+
+    #[test]
+    fn selected_reader_admission_precedes_blocking_dispatch_without_holding_a_reader() {
+        use crate::relay_trace::{self, Outcome};
+        for handler_case in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let state = bounded_state(root.path(), 1);
+            let store = state.store.clone();
+            let capture = relay_trace::tests::Capture::default();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            tracing::dispatcher::with_default(&capture.dispatch(), || {
+                let trace = relay_trace::tests::trace();
+                with_store(Some(store.clone()), || {
+                    read_budget::with(Some(ReadBudget::new("/phase-control", ORDINARY)), || {
+                        runtime.block_on(relay_trace::scope(Some(trace.clone()), async {
+                            // Occupy only the permit, not a connection/snapshot or a worker.
+                            let held = store.readers.admit_read(None).await.unwrap();
+                            let reading = store.clone();
+                            let mut work = Box::pin(async move {
+                                if handler_case {
+                                    let response = handler(async {
+                                        assert!(reading.readers.has_request_reader());
+                                        StatusCode::OK.into_response()
+                                    })
+                                    .await;
+                                    u64::from(response.status().as_u16())
+                                } else {
+                                    spawn_blocking(move || {
+                                        assert!(reading.readers.has_request_reader());
+                                        reading
+                                            .readers
+                                            .get()
+                                            .query_row("SELECT 42", [], |row| row.get::<_, u64>(0))
+                                            .unwrap()
+                                    })
+                                    .await
+                                    .unwrap()
+                                }
+                            });
+                            assert!(futures_util::poll!(work.as_mut()).is_pending());
+                            let phase = if handler_case {
+                                "HandlerReaderAdmission"
+                            } else {
+                                "ReaderAdmission"
+                            };
+                            let observed = tokio::time::timeout(Duration::from_secs(5), async {
+                                loop {
+                                    if capture.events().iter().any(|e| e["phase"] == phase) {
+                                        break;
+                                    }
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await;
+                            let waiting = capture.events();
+                            // Always release before assertions/joins, including a missed event.
+                            drop(held);
+                            let answer = work.await;
+                            observed.expect("the selected admission was not observed");
+                            assert_eq!(answer, if handler_case { 200 } else { 42 });
+                            assert!(
+                                !waiting
+                                    .iter()
+                                    .any(|e| { e["phase"] == phase && e["state"] == "completed" })
+                            );
+                            assert!(!waiting.iter().any(|e| e["phase"] == "BlockingQueue"));
+                            let events = capture.events();
+                            let admitted = events
+                                .iter()
+                                .position(|e| e["phase"] == phase && e["state"] == "completed")
+                                .unwrap();
+                            if !handler_case {
+                                let dispatched = events
+                                    .iter()
+                                    .position(|e| {
+                                        e["phase"] == "BlockingQueue" && e["state"] == "started"
+                                    })
+                                    .unwrap();
+                                assert!(admitted < dispatched);
+                            }
+                        }));
+                    })
+                });
+                trace.finish(Outcome::Completed);
+            });
+            assert_eq!(store.readers.usage().open, store.readers.usage().idle);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -952,6 +1198,117 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_pending_ordinary_handler_holds_no_reader_and_keeps_nested_workers_on_a_current_thread_runtime() {
         ordinary_pending_holds_no_reader(true).await;
+    }
+
+    #[test]
+    fn timeout_terminal_waits_for_response_construction_and_survives_late_child_completion() {
+        use crate::relay_trace::{self, Outcome, Phase};
+        let capture = relay_trace::tests::Capture::default();
+        let dispatch = capture.dispatch();
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let request_id = uuid::Uuid::nil().to_string();
+        let expected_id = request_id.clone();
+        let worker = std::thread::spawn(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let trace = relay_trace::tests::trace();
+                let mut child = trace.span(Phase::BlockingWork);
+                relay_trace::blocking(Some(trace.clone()), || {
+                    let response = construct_timeout_response(|| {
+                        trace.response(&request_id);
+                        entered.send(()).unwrap();
+                        // Control an unfinished construction without a Store or a timed sleep.
+                        released.recv().unwrap();
+                        (
+                            StatusCode::GATEWAY_TIMEOUT,
+                            [("x-test-response-id", request_id)],
+                            "unchanged response body",
+                        )
+                            .into_response()
+                    });
+                    child.finish(Outcome::Completed);
+                    trace.finish(Outcome::Completed);
+                    response
+                })
+            })
+        });
+        waiting.recv().unwrap();
+        let during_construction = capture.events();
+        // Release and join before assertions so a failing control cannot strand a worker.
+        release.send(()).unwrap();
+        let response = worker.join().unwrap();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(response.headers()["x-test-response-id"], expected_id);
+        assert!(
+            during_construction
+                .iter()
+                .any(|e| { e["phase"] == "Deadline" && e["state"] == "timed-out" })
+        );
+        assert!(
+            during_construction
+                .iter()
+                .any(|e| e["phase"] == "ResponseBinding")
+        );
+        assert!(
+            during_construction
+                .iter()
+                .any(|e| e["phase"] == "TimeoutEnvelope")
+        );
+        assert!(!during_construction.iter().any(|e| e["phase"] == "Terminal"));
+
+        let events = capture.events();
+        let binding = events
+            .iter()
+            .position(|e| e["phase"] == "ResponseBinding")
+            .unwrap();
+        let construction = events
+            .iter()
+            .position(|e| e["phase"] == "TimeoutEnvelope" && e["state"] == "completed")
+            .unwrap();
+        let terminal = events
+            .iter()
+            .position(|e| e["phase"] == "Terminal")
+            .unwrap();
+        assert!(binding < construction && construction < terminal);
+        assert_eq!(events[terminal]["state"], "TimedOut");
+        assert_eq!(
+            events.iter().filter(|e| e["phase"] == "Terminal").count(),
+            1
+        );
+        assert!(events[terminal + 1..].iter().any(|e| {
+            e["phase"] == "BlockingWork"
+                && e["state"] == "completed"
+                && e["after_terminal"] == "true"
+        }));
+    }
+
+    #[test]
+    fn aborted_timeout_construction_records_panic_instead_of_timeout_completion() {
+        use crate::relay_trace;
+        let capture = relay_trace::tests::Capture::default();
+        tracing::dispatcher::with_default(&capture.dispatch(), || {
+            let trace = relay_trace::tests::trace();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                relay_trace::blocking(Some(trace), || {
+                    construct_timeout_response(|| panic!("private construction failure"))
+                })
+            }));
+            assert!(result.is_err());
+            assert!(relay_trace::current().is_none());
+        });
+        let events = capture.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| { e["phase"] == "TimeoutEnvelope" && e["state"] == "panicked" })
+        );
+        assert_eq!(events.last().unwrap()["phase"], "Terminal");
+        assert_eq!(events.last().unwrap()["state"], "Panicked");
+        assert_eq!(
+            events.iter().filter(|e| e["phase"] == "Terminal").count(),
+            1
+        );
+        assert!(!format!("{events:?}").contains("private construction failure"));
     }
 
     #[test]
