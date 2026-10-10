@@ -407,3 +407,6 @@ impl Operator for TerminalGates {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod native_source;

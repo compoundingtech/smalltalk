@@ -75,3 +75,8 @@ success-output = "immediate"
 [[profile.ci.overrides]]
 filter = 'package(=smallclaims) and binary(=ivm_admitted_applied_slice) and test(/^canonical_metadata_inventory_growth_reports_actual_page_work$/)'
 success-output = "immediate"
+
+# Expose private native-source work tuples without changing selection or budgets.
+[[profile.ci.overrides]]
+filter = 'package(=st3) and test(/^store::terminal_gate_evidence::native_source::tests::native_gate_unrelated_and_noop_work_at_zero_1024_and_100000_rows$/)'
+success-output = "immediate"

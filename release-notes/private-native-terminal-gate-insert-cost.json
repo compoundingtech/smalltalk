@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Measure one unrelated claim insert in each private native terminal fixture size.",
+  "replay": {
+    "status": "none",
+    "detail": "Test-only per-insert and idle-finish work controls plus fixture documentation. No production trigger, schema, dependency, Runtime or Doctor contract change; no measured performance result is claimed before hosted execution."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Test-only per-insert and idle-finish work controls plus fixture documentation. No production trigger, schema, dependency, Runtime or Doctor contract change; no measured performance result is claimed before hosted execution."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Test-only per-insert and idle-finish work controls plus fixture documentation. No production trigger, schema, dependency, Runtime or Doctor contract change; no measured performance result is claimed before hosted execution."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test-only per-insert and idle-finish work controls plus fixture documentation. No production trigger, schema, dependency, Runtime or Doctor contract change; no measured performance result is claimed before hosted execution."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Test-only per-insert and idle-finish work controls plus fixture documentation. No production trigger, schema, dependency, Runtime or Doctor contract change; no measured performance result is claimed before hosted execution."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Test-only per-insert and idle-finish work controls plus fixture documentation. No production trigger, schema, dependency, Runtime or Doctor contract change; no measured performance result is claimed before hosted execution."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Test-only per-insert and idle-finish work controls plus fixture documentation. No production trigger, schema, dependency, Runtime or Doctor contract change; no measured performance result is claimed before hosted execution."
+  }
+}
