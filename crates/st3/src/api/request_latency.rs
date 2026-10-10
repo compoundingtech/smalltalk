@@ -161,6 +161,34 @@ impl Sample {
     }
 }
 
+/// Where an agents roster read's time goes: the refresher's fold and its wait for roster
+/// admission, and a fresh read's wait for a publication at its cut and the page it then builds.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum RosterStage {
+    Refresh,
+    RefreshAdmission,
+    FreshWait,
+    FreshPage,
+}
+
+impl RosterStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Refresh => "refresh",
+            Self::RefreshAdmission => "refresh-admission",
+            Self::FreshWait => "fresh-wait",
+            Self::FreshPage => "fresh-page",
+        }
+    }
+
+    fn population(self) -> &'static str {
+        match self {
+            Self::Refresh | Self::RefreshAdmission => "refresher-folds",
+            Self::FreshWait | Self::FreshPage => "fresh-reads",
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Meter {
     routes: BTreeMap<String, Sample>,
@@ -168,6 +196,7 @@ pub(super) struct Meter {
     // complete denominator even if the route table has already filled.
     work_actions: BTreeMap<WorkAction, Sample>,
     agents_reads: BTreeMap<AgentsRead, Sample>,
+    roster_stages: BTreeMap<RosterStage, Sample>,
     /// Windows by path: `GET /route`, `stream COLLECTION`, or a long poll's route.
     paths: BTreeMap<String, smallclaims::windows::Series>,
     /// Windows by target position in `slo/targets.toml`: served here, then from another machine.
@@ -225,6 +254,11 @@ impl Meter {
         if let Some(read) = AgentsRead::classify(method, route, query) {
             self.agents_reads.entry(read).or_default().record(elapsed);
         }
+    }
+
+    /// Count one roster stage's duration.
+    pub(super) fn record_roster_stage(&mut self, stage: RosterStage, elapsed: Duration) {
+        self.roster_stages.entry(stage).or_default().record(elapsed);
     }
 
     /// Count one sample in its path's windows and its target's.
@@ -312,6 +346,13 @@ impl Meter {
                 let mut row = sample.snapshot(AGENTS, "agents-read");
                 row["method"] = json!("GET");
                 row["read"] = json!(read.name());
+                row
+            }))
+            .chain(self.roster_stages.iter().map(|(stage, sample)| {
+                let mut row = sample.snapshot(AGENTS, "agents-roster");
+                row["stage"] = json!(stage.name());
+                row["duration_scope"] = json!("roster-stage");
+                row["population"] = json!(stage.population());
                 row
             }))
             .collect()
@@ -480,6 +521,29 @@ mod tests {
         let fresh = Timed::resolve("GET /v1/client/agents", false, true);
         assert!(fresh.target.is_none());
         assert_eq!(fresh.key, "GET /v1/client/agents (long poll)");
+    }
+
+    #[test]
+    fn roster_stages_report_their_own_samples_beside_the_route() {
+        let mut meter = Meter::default();
+        for (stage, ms) in [
+            (RosterStage::Refresh, 40), (RosterStage::Refresh, 60), (RosterStage::RefreshAdmission, 2),
+            (RosterStage::FreshWait, 90), (RosterStage::FreshPage, 4),
+        ] {
+            meter.record_roster_stage(stage, Duration::from_millis(ms));
+        }
+        let stage = |name: &str| meter.snapshot().into_iter()
+            .find(|row| row["scope"] == "agents-roster" && row["stage"] == name).unwrap();
+        assert_eq!(stage("refresh")["count"], 2);
+        assert_eq!(stage("refresh")["max_ms"], 60);
+        assert_eq!(stage("refresh")["population"], "refresher-folds");
+        assert_eq!(stage("refresh-admission")["p99_ms"], 2);
+        assert_eq!(stage("fresh-wait")["p99_ms"], 90);
+        assert_eq!(stage("fresh-wait")["population"], "fresh-reads");
+        assert_eq!(stage("fresh-page")["duration_scope"], "roster-stage");
+        assert_eq!(stage("fresh-page")["route"], AGENTS);
+        // Stages are not requests: no route row appears for them.
+        assert!(meter.snapshot().iter().all(|row| row["scope"] != "route"));
     }
 
     #[test]

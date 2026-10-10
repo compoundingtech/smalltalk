@@ -1092,6 +1092,9 @@ pub struct Agent {
     pub ask: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
+    /// The seat's status that is neither work nor a wait: `compacting`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
     pub host_id: Option<String>,
     pub last_activity_at: Option<String>,
     pub silent_since: Option<String>,

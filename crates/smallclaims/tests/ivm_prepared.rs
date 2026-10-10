@@ -909,3 +909,62 @@ async fn native_worker_preserves_notice_during_owned_page_and_propagates_failure
             .contains("native preparation failed")
     );
 }
+
+#[test]
+fn canonical_image_keeps_unrelated_shapes_and_complete_inbound_refusal() {
+    let (mut db, i, job) = fixture();
+    ready(&mut db, &i, &job);
+    // Only requested outputs need namespace/PK/column/trigger eligibility. This
+    // unrelated generated shape and trigger must not become new API refusals.
+    db.execute_batch(
+        "CREATE TABLE main.unrelated_shape(\"bad-name\" TEXT,
+           computed TEXT GENERATED ALWAYS AS (\"bad-name\") VIRTUAL);
+         CREATE TRIGGER main.unrelated_trigger AFTER INSERT ON main.unrelated_shape
+           BEGIN UPDATE unrelated_shape SET \"bad-name\"='unrelated'; END;",
+    )
+    .unwrap();
+    for grouped in [false, true] {
+        let mut page = i
+            .prepare_live(&db, "cards", PublicationLimits::default())
+            .unwrap();
+        if grouped {
+            page.capture_tables(&db, &["cards", "coverage"]).unwrap();
+        } else {
+            page.capture_table(&db, "cards").unwrap();
+            page.capture_table(&db, "coverage").unwrap();
+        }
+        page.upsert(
+            "cards",
+            vec![Sql::Text("amber".into()), Sql::Text("body".into())],
+        )
+        .unwrap();
+        page.upsert("coverage", vec![Sql::Integer(1)]).unwrap();
+    }
+    db.execute_batch(
+        "CREATE TABLE main.unrelated_inbound(namespace TEXT,k TEXT,
+           FOREIGN KEY(namespace,k) REFERENCES CaRdS(namespace,k));",
+    )
+    .unwrap();
+    let mut page = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    page.capture_table(&db, "coverage").unwrap();
+    let error = page
+        .capture_tables(&db, &["coverage", "cards"])
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("prepared output foreign keys unsupported"));
+    // Failed image construction cannot lose existing metadata or accept a sibling.
+    page.upsert("coverage", vec![Sql::Integer(1)]).unwrap();
+    assert!(
+        page.upsert(
+            "cards",
+            vec![Sql::Text("amber".into()), Sql::Text("body".into())]
+        )
+        .is_err()
+    );
+    let mut single = i
+        .prepare_live(&db, "cards", PublicationLimits::default())
+        .unwrap();
+    let error = single.capture_table(&db, "cards").unwrap_err();
+    assert!(format!("{error:#}").contains("prepared output foreign keys unsupported"));
+}
