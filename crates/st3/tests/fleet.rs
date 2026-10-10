@@ -4058,6 +4058,8 @@ async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart
     node.restart().await;
     let output = node.command(&["--json", "gh", "own", "https://github.com/fixture/app/pull/12#pullrequestreview-802", "--as", "agent/example/watch"]).env("ST_AGENT", "agent/example/watch").output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // Store::open also initializes projections, so inspect without the daemon's writer.
+    node.stop();
     let store = st3::store::Store::open(&node.state_dir().join("claims.sqlite3"), "fixture-watch").unwrap();
     for (kind, id) in [("comment", 801), ("review", 802)] {
         let subject = st3::github_watch::github_post_subject("fixture/app", kind, id);
@@ -4066,6 +4068,7 @@ async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart
     }
     assert_eq!(store.github_post_agent("fixture/app", "comment", 902).unwrap(), None);
     drop(store);
+    node.start().await;
     {
         let bodies = posts.lock().unwrap();
         assert_eq!(bodies.len(), 2);
