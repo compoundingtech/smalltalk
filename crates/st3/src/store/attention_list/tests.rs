@@ -471,7 +471,7 @@ fn every_seat_a_login_item_covers_counts_as_holding_it() {
             "targets":["agent/alder.unrelated"]}),
     ];
     assert_eq!(
-        login_seats(&rows),
+        item_seats(&rows),
         BTreeSet::from(["agent/alder.first".to_owned(), "agent/alder.second".to_owned()])
     );
 }
@@ -540,4 +540,60 @@ fn a_claim_from_any_seat_a_shared_login_item_covers_folds() {
         AttentionDelta::Refold("work.progress".into())
     );
     assert_eq!(delta(&without_at(&published, observed)), AttentionDelta::Unchanged(None));
+}
+
+#[test]
+fn a_prompt_blocked_on_a_person_and_its_clearing_fold() {
+    let (store, _, _) = fixture();
+    store.start_attention_list_refresher().unwrap();
+    let published = refresh_and_check(&store);
+    let delta = |publication: &AttentionPublication| {
+        store
+            .read_snapshot(|index| store.attention_list_delta(publication, index, now_ms()))
+            .unwrap()
+    };
+    let at = |publication: &AttentionPublication, cut: u64, rows: Vec<Value>| AttentionPublication {
+        cut,
+        projection: publication.projection.clone(),
+        evaluated_at_unix_ms: publication.evaluated_at_unix_ms,
+        due_at_unix_ms: None,
+        future_after: None,
+        published_at_unix_ms: now_ms(),
+        rows: Arc::new(rows),
+    };
+    // A seat blocked on a person is a new prompt: its observation folds.
+    store
+        .append_claim(&input(
+            "agent/alder.asker",
+            "harness.observed",
+            Some("agent/alder.asker"),
+            json!({"state":"blocked","blocked_on":"human","incarnation_id":"one","driver":"claude"}),
+        ))
+        .unwrap();
+    assert_eq!(
+        delta(&at(&published, published.cut, (*published.rows).clone())),
+        AttentionDelta::Refold("harness.observed".into())
+    );
+    // Once its prompt is published, the observation that clears it folds too; without a
+    // prompt the same ordinary observation does not.
+    let blocked = store.index().unwrap();
+    store
+        .append_claim(&input(
+            "agent/alder.asker",
+            "harness.observed",
+            Some("agent/alder.asker"),
+            json!({"state":"working","incarnation_id":"one","driver":"claude"}),
+        ))
+        .unwrap();
+    let mut prompted = (*published.rows).clone();
+    prompted.push(json!({"attention_kind":"harness-prompt","source_id":"agent/alder.asker",
+        "targets":["agent/alder.asker"]}));
+    assert_eq!(
+        delta(&at(&published, blocked, prompted)),
+        AttentionDelta::Refold("harness.observed".into())
+    );
+    assert_eq!(
+        delta(&at(&published, blocked, (*published.rows).clone())),
+        AttentionDelta::Unchanged(None)
+    );
 }
