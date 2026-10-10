@@ -133,6 +133,36 @@ export const QuickOpenAction: Story = { name: 'Row hover · quick Open', render:
   await expect(target.querySelector('[aria-current="page"]')).not.toBeNull()
 } }
 export const AllStates: Story = { render: () => <main {...stylex.props(styles.root)}><CardPair row={knownRow} /><CardPair row={unreportedRow} /><CohortList /></main> }
+function NameRows() {
+  return <div data-frame-rows {...stylex.props(styles.list)}>
+    <div data-testid="name-default"><SidebarAgentRow item={knownRow} now={storyNow} onOpen={() => undefined} /></div>
+    <div data-testid="name-compact"><SidebarAgentRow item={knownRow} variant="SR-1" now={storyNow} onOpen={() => undefined} /></div>
+    <div data-testid="name-uncounted"><SidebarAgentRow item={uncountedRow} variant="SR-1" now={storyNow} onOpen={() => undefined} /></div>
+  </div>
+}
+const reportedName = 'Sample session (Working, needs your attention, 2 unread)'
+const startsReported = (name: string) => name.startsWith(`${reportedName} `)
+/** Default SR2-A and compact SR-1 both use SG-1, whose glyph and badges sit outside the row button; the button name still carries them. */
+export const AccessibleName: Story = { name: 'Row name · status and badges', render: () => <main {...stylex.props(styles.root)}><NameRows /></main>, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const defaultRow = canvas.getByTestId('name-default')
+  const compact = canvas.getByTestId('name-compact')
+  await expect(within(defaultRow).getByRole('button', { name: startsReported })).toBeEnabled()
+  await expect(within(compact).getByRole('button', { name: reportedName })).toBeEnabled()
+  // Unreported attention and unread are omitted, not named as unknown.
+  await expect(within(canvas.getByTestId('name-uncounted')).getByRole('button', { name: 'Uncounted session (Working)' })).toBeEnabled()
+  await expect(canvas.queryAllByRole('button', { name: /unknown|not reported/i })).toHaveLength(0)
+  // Control: without the name facts (the glyph-only shape) the same role queries fail.
+  const facts = [...canvasElement.querySelectorAll<HTMLElement>('[data-row-name-facts]')]
+  await expect(facts).toHaveLength(3)
+  for (const fact of facts) fact.hidden = true
+  await expect(within(defaultRow).queryByRole('button', { name: startsReported })).toBeNull()
+  await expect(within(compact).queryByRole('button', { name: reportedName })).toBeNull()
+  await expect(within(compact).getByRole('button', { name: 'Sample session' })).toBeEnabled()
+  for (const fact of facts) fact.hidden = false
+  await expect(within(compact).getByRole('button', { name: reportedName })).toBeEnabled()
+} }
+export const AccessibleNameLight: Story = { ...AccessibleName, name: 'Row name · status and badges (light)', render: () => <main {...stylex.props(styles.root, lightTheme)}><NameRows /></main> }
 
 const styles = stylex.create({
   root: { height: '100vh', minHeight: 0, overflowY: 'auto', boxSizing: 'border-box', padding: s.lg, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading, display: 'flex', flexDirection: 'column', gap: s.xl },
