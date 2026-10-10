@@ -2,8 +2,8 @@ import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import { flushSync } from 'react-dom'
 import type { Meta, StoryObj } from '@storybook/react-vite'
-import { expect, fn, userEvent, waitFor, within } from 'storybook/test'
-import { Transcript, type TranscriptHistory, type TranscriptTurn } from './assistant-ui/composition/Transcript'
+import { expect, fn, userEvent, within } from 'storybook/test'
+import { Transcript, type TranscriptHistory, type TranscriptProps, type TranscriptTurn } from './assistant-ui/composition/Transcript'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
 import type { ConversationItem, TextItem } from './assistant-ui/embrace-data/model'
 import { workLogTurnFromItems } from './assistant-ui/taste/work-log'
@@ -91,14 +91,18 @@ declare global {
   interface Window { __transcriptBench?: TranscriptBenchApi }
 }
 
-function TranscriptPane({ turns, history }: { turns: readonly TranscriptTurn[]; history?: TranscriptHistory }) {
+function TranscriptPane({ turns, history, onOpenTool }: { turns: readonly TranscriptTurn[]; history?: TranscriptHistory; onOpenTool?: TranscriptProps['onOpenTool'] }) {
   const messages = React.useMemo(() => turns.flatMap(turn => turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]), [turns])
   const options = React.useMemo(() => ({ messages, isRunning: false, onNew: async () => {} }), [messages])
-  return <EmbraceRuntimeProvider options={options}><Transcript title="Row checks" turns={turns} sync={sync} now={now} observedAt={now - 8000} history={history} /></EmbraceRuntimeProvider>
+  return <EmbraceRuntimeProvider options={options}><Transcript title="Row checks" turns={turns} sync={sync} now={now} observedAt={now - 8000} history={history} onOpenTool={onOpenTool} /></EmbraceRuntimeProvider>
 }
 
-function TranscriptBench({ turns: count, scheme, history }: { turns: number; scheme: Scheme; history?: TranscriptHistory }) {
-  const turns = benchTurns(count)
+function TranscriptBench({ turns: count, scheme, history, earlier = 0, onOpenTool }: { turns: number; scheme: Scheme; history?: TranscriptHistory; earlier?: number; onOpenTool?: TranscriptProps['onOpenTool'] }) {
+  // `earlier` older turns stay behind the history boundary until "Load earlier messages" prepends them.
+  const series = benchTurns(count + earlier)
+  const [loaded, setLoaded] = React.useState(false)
+  const turns = React.useMemo(() => loaded ? series : series.slice(earlier), [series, loaded, earlier])
+  const shownHistory: TranscriptHistory | undefined = earlier > 0 && !loaded ? { _tag: 'HasOlder', onLoadEarlier: () => setLoaded(true) } : history
   const [mounted, setMounted] = React.useState(true)
   const attach = React.useCallback((pane: HTMLDivElement | null) => {
     if (pane === null) return
@@ -125,7 +129,7 @@ function TranscriptBench({ turns: count, scheme, history }: { turns: number; sch
     return () => { sampling++; if (window.__transcriptBench === api) delete window.__transcriptBench }
   }, [count])
   return <main data-testid="transcript-bench" data-turns={count} data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
-    <div ref={attach} data-testid="bench-pane" {...stylex.props(styles.pane)}>{mounted ? <TranscriptPane turns={turns} history={history} /> : null}</div>
+    <div ref={attach} data-testid="bench-pane" {...stylex.props(styles.pane)}>{mounted ? <TranscriptPane turns={turns} history={shownHistory} onOpenTool={onOpenTool} /> : null}</div>
   </main>
 }
 
@@ -225,6 +229,30 @@ export const TopMountsOlderTurns: Story = { args: { history: { _tag: 'HasOlder',
   await expect(canvasElement.querySelector('[data-testid="transcript-turn"]')).toHaveAttribute('data-item-id', 'bench/0')
   await userEvent.click(within(boundary).getByRole('button', { name: 'Load earlier messages' }))
   await expect(loadEarlier).toHaveBeenCalledTimes(1)
+} }
+/** Backfill and prepended history keep every mounted turn: its DOM node, an open disclosure and focus survive both. */
+export const BackfillKeepsTurnState: Story = { args: { earlier: 40, onOpenTool: fn() }, play: async ({ canvasElement }) => {
+  await expect(await reopen(canvasElement)).toBeLessThan(200)
+  const turn = [...canvasElement.querySelectorAll('[data-testid="transcript-turn"]')].at(-1)!
+  const disclosure = turn.querySelector<HTMLElement>('button[aria-expanded="false"]')!
+  await userEvent.click(disclosure)
+  disclosure.focus()
+  await expect(disclosure).toHaveAttribute('aria-expanded', 'true')
+  await expect(disclosure).toHaveFocus()
+  while (turnCount(canvasElement) < 200) await frame()
+  await expect(turn.isConnected).toBe(true)
+  await expect(disclosure.isConnected).toBe(true)
+  await expect(disclosure).toHaveAttribute('aria-expanded', 'true')
+  await expect(disclosure).toHaveFocus()
+  // A virtual click presses the boundary button without moving focus off the disclosure.
+  within(await within(canvasElement).findByTestId('history-boundary')).getByRole('button', { name: 'Load earlier messages' }).click()
+  // Prepended turns backfill above the reader like the first older turns did.
+  while (turnCount(canvasElement) < 240) await frame()
+  await expect(canvasElement.querySelector('[data-testid="transcript-turn"]')).toHaveAttribute('data-item-id', 'bench/0')
+  await expect(turn.isConnected).toBe(true)
+  await expect(disclosure.isConnected).toBe(true)
+  await expect(disclosure).toHaveAttribute('aria-expanded', 'true')
+  await expect(disclosure).toHaveFocus()
 } }
 
 const styles = stylex.create({
