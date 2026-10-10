@@ -42669,9 +42669,10 @@ version 2
                 .statuses.contains_key(&step),
             "the final incremental chunk must invalidate the preceding prefix reduction"
         );
-        let rows = |table: &str, columns: usize| {
+        let rows = |table: &str| {
             let connection = worker.readers.get();
             let mut statement = connection.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let columns = statement.column_count();
             let mut rows = statement
                 .query_map([], |row| {
                     (0..columns)
@@ -42685,16 +42686,16 @@ version 2
             rows.sort_by_cached_key(|row| format!("{row:?}"));
             rows
         };
-        let current = rows("current_claims", 10);
-        let registers = rows("latest_values", 10);
+        let current = rows("current_claims");
+        let registers = rows("latest_values");
         assert!(!registers.is_empty(), "include register-backed current claims");
         let status = serde_json::to_value(
             worker.status_at(Some(&step), None, Some(admitted)).unwrap(),
         )
         .unwrap();
         worker.replay_replication_graph().unwrap();
-        assert_eq!(current, rows("current_claims", 10));
-        assert_eq!(registers, rows("latest_values", 10));
+        assert_eq!(current, rows("current_claims"));
+        assert_eq!(registers, rows("latest_values"));
         assert_eq!(
             status,
             serde_json::to_value(
