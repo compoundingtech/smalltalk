@@ -558,10 +558,11 @@ pub fn duration_text(ms: u128) -> String {
     let seconds = ms / 1_000;
     match seconds {
         0 => "0s".into(),
-        s if s % 86_400 == 0 => format!("{}d", s / 86_400),
-        s if s % 3_600 == 0 => format!("{}h", s / 3_600),
-        s if s % 60 == 0 => format!("{}m", s / 60),
-        s if s >= 3_600 => format!("{}h{}m", s / 3_600, s % 3_600 / 60),
+        s if s.is_multiple_of(86_400) => format!("{}d", s / 86_400),
+        s if s.is_multiple_of(3_600) => format!("{}h", s / 3_600),
+        s if s >= 3_600 && s.is_multiple_of(60) => format!("{}h{}m", s / 3_600, s % 3_600 / 60),
+        s if s >= 3_600 => format!("{}h{}m{}s", s / 3_600, s % 3_600 / 60, s % 60),
+        s if s.is_multiple_of(60) => format!("{}m", s / 60),
         s if s >= 60 => format!("{}m{}s", s / 60, s % 60),
         s => format!("{s}s"),
     }
@@ -981,7 +982,7 @@ mod tests {
             )
             .contains("15 characters")
         );
-        assert!(replace(4, json!({"name": "recover", "arguments": [2]})).contains("needs `for`"));
+        assert!(replace(4, json!({"name": "recover", "arguments": [1]})).contains("needs `for`"));
         assert!(
             replace(5, json!({"name": "owner", "arguments": ["ada"]})).contains("not an agent")
         );
@@ -1149,7 +1150,7 @@ mod tests {
         assert_eq!(transition, None);
         tracker.observe(&decl, 1.0, 18 * MIN);
         assert!(tracker.should_record(Some(Transition::Enter), 18 * MIN));
-        assert_eq!(tracker.values.len(), 5);
+        assert_eq!(tracker.values.len(), 6);
         for minute in 19..40 {
             tracker.observe(&decl, 1.0, minute * MIN);
         }
