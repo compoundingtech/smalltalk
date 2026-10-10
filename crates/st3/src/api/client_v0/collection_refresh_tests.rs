@@ -619,8 +619,8 @@ async fn a_held_view_that_is_not_ready_resyncs_once_and_waits_for_its_next_chang
         assert_eq!((first["kind"].as_str(), first["retryable"].as_bool()), (Some("resync"), Some(true)), "{first}");
         // Neither a commit nor the reread interval reads it again meanwhile. A paired session's
         // clock does, to recheck its grant, and sends nothing.
-        fixture.claim("daemon/fixture", "daemon.diagnostic",
-            json!({"code":"fixture", "severity":"error", "reason":"unrelated"}));
+        // A commit the work collection reads, not one it ignores.
+        fixture.claim("agent/fixture-seat", "runtime.observed", json!({"status":"running", "incarnation_id":"one"}));
         tokio::time::advance(ATTENTION_CLOCK_INTERVAL + COLLECTION_REREAD_INTERVAL).await;
         fixture.quiet().await;
         let clock_reads = usize::from(paired);
@@ -634,8 +634,8 @@ async fn a_held_view_that_is_not_ready_resyncs_once_and_waits_for_its_next_chang
         gate.store(NOT_READY, SeqCst);
         state.store.hold_collection_view("work");
         assert_eq!(fixture.frame().await["kind"], "resync");
-        fixture.claim("daemon/fixture", "daemon.diagnostic",
-            json!({"code":"fixture", "severity":"error", "reason":"unrelated again"}));
+        // A commit the work collection reads, not one it ignores.
+        fixture.claim("agent/fixture-seat", "runtime.observed", json!({"status":"running", "incarnation_id":"two"}));
         tokio::time::advance(ATTENTION_CLOCK_INTERVAL + COLLECTION_REREAD_INTERVAL).await;
         fixture.quiet().await;
         assert_eq!(fixture.counts()["work"], reads + 1 + clock_reads, "{}", session.transport);
@@ -705,8 +705,8 @@ async fn a_real_work_window_waits_for_the_published_list_and_ends_with_its_refre
     assert_eq!(first["kind"], "resync", "held before start: {first}");
     assert_eq!(state.store.direct_work_reads(), direct);
     list.start();
-    fixture.claim("daemon/fixture", "daemon.diagnostic",
-        json!({"code":"fixture", "severity":"error", "reason":"unrelated"}));
+    // A commit the work collection reads, not one it ignores.
+    fixture.claim("agent/fixture-seat", "runtime.observed", json!({"status":"running", "incarnation_id":"three"}));
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("work", 1)]));
     // The first publication delivers its rows.
@@ -728,8 +728,8 @@ async fn a_real_work_window_waits_for_the_published_list_and_ends_with_its_refre
     let ended = fixture.frame().await;
     assert_eq!((ended["kind"].as_str(), ended["retryable"].as_bool()), (Some("error"), Some(false)), "{ended}");
     assert!(ended["message"].as_str().unwrap().contains("work-list-ended"), "{ended}");
-    fixture.claim("daemon/fixture", "daemon.diagnostic",
-        json!({"code":"fixture", "severity":"error", "reason":"after the end"}));
+    // A commit the work collection reads, not one it ignores.
+    fixture.claim("agent/fixture-seat", "runtime.observed", json!({"status":"running", "incarnation_id":"four"}));
     state.store.publish_collection_view("work");
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("work", 5)]), "read once for the end, then removed");

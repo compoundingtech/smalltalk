@@ -179,8 +179,8 @@ struct ClientListQuery {
     state: Option<String>,
     #[serde(default)]
     native_only: bool,
-    /// Agents only: wait briefly for a roster at least as new as this request, rather than
-    /// answering at once from the newest published one.
+    /// Agents and current work: wait briefly for a roster, or a work list, at least as new as this
+    /// request, rather than answering at once from the newest published one.
     #[serde(default)]
     fresh: bool,
 }
@@ -4377,11 +4377,25 @@ struct PublishedWorkPage {
     /// The publication's identity: its list, generation and number. A continuation is served
     /// only while that list is still the store's and in that generation.
     id: crate::store::published_list::PublicationId,
-    publication: Arc<crate::store::published_list::Publication<crate::store::work_list::WorkRows>>,
-    indexes: Option<Arc<Vec<u32>>>,
     /// What the first page issued, which a cursor, being the client's to edit, must repeat.
     contract: PublishedWorkContract,
+    /// Only the rows the page lists, in order: the actor's, or every row for a fleet page,
+    /// sharing the publication's rendered values. Not the publication, its memo or its seats.
+    rows: Arc<Vec<Arc<Value>>>,
     expires_at_unix_ms: u128,
+}
+
+/// Drop the entries that expired, and this list's entries of a generation a forget replaced.
+/// Another store's entries are left to their own list. Lazy: run at each cache access.
+fn purge_published_work_pages(
+    pages: &mut VecDeque<PublishedWorkPage>,
+    list: &crate::store::published_list::PublishedList<crate::store::work_list::WorkRows>,
+) {
+    let now = client_now_ms();
+    let (instance, generation) = (list.instance(), list.generation());
+    pages.retain(|page| {
+        page.expires_at_unix_ms > now && (page.id.list != instance || page.id.generation == generation)
+    });
 }
 
 /// A published work page's issued limit, snapshot and filters.
@@ -4415,6 +4429,18 @@ static PUBLISHED_WORK_PAGES: OnceLock<Mutex<VecDeque<PublishedWorkPage>>> = Once
 
 fn published_work_pages() -> &'static Mutex<VecDeque<PublishedWorkPage>> {
     PUBLISHED_WORK_PAGES.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// How many published work page entries a list's publications hold, for tests: the cache is
+/// shared by every store in the process.
+#[cfg(test)]
+fn published_work_pages_of(list: u64) -> usize {
+    published_work_pages()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|page| page.id.list == list)
+        .count()
 }
 
 /// The first `items_digest` segment of a cursor that continues a published work page.
@@ -4496,7 +4522,7 @@ async fn wait_for_work_list(
     let wanted = store.index().map_err(ApiError::internal)?;
     let mut changes = list.subscribe();
     let deadline = tokio::time::Instant::now() + WORK_LIST_FRESH_WAIT;
-    list.request_refresh();
+    list.request_fresh();
     loop {
         drop(changes.borrow_and_update());
         let newest = match list.current() {
@@ -4537,24 +4563,36 @@ fn client_work_published_page(
         return Err(published_lists::work_list_not_ready());
     }
     let snapshot = roster_snapshot(state, publication.cut, publication.published_at_unix_ms);
-    let expires_at_unix_ms = client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS);
     let digest = published_work_digest(state, id, query.actor.as_deref());
+    let mut expires_at_unix_ms = 0;
     let next_cursor = if has_more {
+        let mut cursor = published_work_cursor(&snapshot, query, items.len(), limit, digest, 0);
+        let contract = PublishedWorkContract::of(&cursor);
         let mut pages = published_work_pages().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = client_now_ms();
-        pages.retain(|page| page.expires_at_unix_ms > now);
-        while pages.len() >= CLIENT_PAGE_CACHE_CAPACITY {
-            pages.pop_front();
-        }
-        let cursor = published_work_cursor(&snapshot, query, items.len(), limit, digest.clone(), expires_at_unix_ms);
-        pages.push_back(PublishedWorkPage {
-            digest,
-            id,
-            publication: Arc::clone(publication),
-            indexes: indexes.clone(),
-            contract: PublishedWorkContract::of(&cursor),
-            expires_at_unix_ms,
-        });
+        purge_published_work_pages(&mut pages, list);
+        // The same page asked again reuses its entry and its original expiry: polling the same
+        // first page neither adds an entry nor evicts another's.
+        expires_at_unix_ms = match pages
+            .iter()
+            .find(|page| page.digest == cursor.items_digest && page.contract == contract)
+        {
+            Some(page) => page.expires_at_unix_ms,
+            None => {
+                while pages.len() >= CLIENT_PAGE_CACHE_CAPACITY {
+                    pages.pop_front();
+                }
+                let expires_at_unix_ms = client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS);
+                pages.push_back(PublishedWorkPage {
+                    digest: cursor.items_digest.clone(),
+                    id,
+                    contract,
+                    rows: Arc::new(publication.rows.selected_rows(indexes.as_deref().map(Vec::as_slice))),
+                    expires_at_unix_ms,
+                });
+                expires_at_unix_ms
+            }
+        };
+        cursor.expires_at_unix_ms = expires_at_unix_ms;
         Some(encode_client_cursor(&cursor)?)
     } else {
         None
@@ -4635,32 +4673,37 @@ fn client_work_published_continuation(
     if client_now_ms() > cursor.expires_at_unix_ms {
         return Err(client_page_expired("the page cursor expired"));
     }
-    let (publication, indexes, id) = {
-        let mut pages = published_work_pages().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = client_now_ms();
-        pages.retain(|page| page.expires_at_unix_ms > now);
-        let page = pages
-            .iter()
-            .find(|page| page.digest == cursor.items_digest && page.expires_at_unix_ms == cursor.expires_at_unix_ms)
-            .ok_or_else(|| client_page_expired("the page snapshot is no longer available; restart pagination"))?;
-        // The cursor is the client's to edit: it must repeat the limit, snapshot and filters
-        // its first page issued, so it can never ask for more than one bounded page.
-        if page.contract != PublishedWorkContract::of(&cursor)
-            || !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&cursor.limit)
-        {
-            return Err(client_page_expired("the page cursor does not match the page it continues"));
-        }
-        (Arc::clone(&page.publication), page.indexes.clone(), page.id)
-    };
     // Served only from the store's own list, in the generation its rows were folded in.
     let list = state.store.published_work_list();
+    let (rows, id) = {
+        let mut pages = published_work_pages().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        purge_published_work_pages(&mut pages, list);
+        // The cursor is the client's to edit: it must repeat the limit, snapshot and filters
+        // its first page issued, so it can never ask for more than one bounded page, and two
+        // pages with one digest and expiry but different contracts never answer for each other.
+        let contract = PublishedWorkContract::of(&cursor);
+        if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&cursor.limit) {
+            return Err(client_page_expired("the page cursor does not match the page it continues"));
+        }
+        let page = pages
+            .iter()
+            .find(|page| {
+                page.digest == cursor.items_digest
+                    && page.expires_at_unix_ms == cursor.expires_at_unix_ms
+                    && page.contract == contract
+            })
+            .ok_or_else(|| client_page_expired("the page snapshot is no longer available; restart pagination"))?;
+        (Arc::clone(&page.rows), page.id)
+    };
     let current = |list: &crate::store::published_list::PublishedList<crate::store::work_list::WorkRows>| {
         list.instance() == id.list && list.generation() == id.generation
     };
     if !current(list) {
         return Err(client_page_expired("the work list was refolded since this page was read; restart pagination"));
     }
-    let (items, has_more) = publication.rows.page_of(indexes.as_deref().map(Vec::as_slice), cursor.offset, cursor.limit);
+    let end = cursor.offset.saturating_add(cursor.limit).min(rows.len());
+    let items = rows[cursor.offset.min(end)..end].iter().map(|row| (**row).clone()).collect::<Vec<_>>();
+    let has_more = end < rows.len();
     // The final fence: a forget while the page was sliced replaced the rows it holds.
     if !current(list) {
         return Err(client_page_expired("the work list was refolded since this page was read; restart pagination"));

@@ -33,6 +33,9 @@ pub(crate) struct PublishedList<R> {
     instance: u64,
     newest: Mutex<Option<Arc<Publication<R>>>>,
     wake: Arc<tokio::sync::Notify>,
+    /// A fresh read's request for the next fold now, which cuts the refresher's pause short.
+    /// Commits only `wake` it, so they keep the pause.
+    fresh: Arc<tokio::sync::Notify>,
     /// Whether a refresher was started; there is at most one.
     started: AtomicBool,
     /// Whether the started refresher's task has ended. Nothing publishes again until the daemon
@@ -63,6 +66,7 @@ impl<R> Default for PublishedList<R> {
             instance: LISTS.fetch_add(1, Ordering::Relaxed) + 1,
             newest: Mutex::new(None),
             wake: Arc::default(),
+            fresh: Arc::default(),
             started: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             serving: AtomicBool::new(false),
@@ -161,6 +165,18 @@ impl<R> PublishedList<R> {
     /// Ask the refresher to fold now rather than wait for its next commit or deadline.
     pub(crate) fn request_refresh(&self) {
         self.wake.notify_one();
+    }
+
+    /// Ask the refresher, for a reader waiting on it, to fold as soon as its current fold ends,
+    /// without its pause. One request serves every reader waiting then.
+    pub(crate) fn request_fresh(&self) {
+        self.fresh.notify_one();
+        self.wake.notify_one();
+    }
+
+    /// What a fresh read's request notifies: see [`Self::request_fresh`].
+    pub(crate) fn fresh_requests(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.fresh)
     }
 
     /// The newest publication, while the refresher keeps the list served. Its rows carry their

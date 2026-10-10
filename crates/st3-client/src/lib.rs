@@ -1285,7 +1285,13 @@ impl Client {
         let deadline = started + self.outage_wait;
         let mut pause = Duration::from_millis(100);
         loop {
-            let attempt = self.request_once::<Envelope<Page>>(Method::GET, &path, None, None, "application/json");
+            let attempt = self.request_once::<Envelope<Page>>(
+                Method::GET,
+                &path,
+                None,
+                None,
+                "application/json",
+            );
             let outcome = if self.outage_wait.is_zero() {
                 attempt.await
             } else {
@@ -1305,7 +1311,10 @@ impl Client {
                 Err(ClientError::Api(_, _, envelope)) => {
                     envelope.retryable
                         && matches!(
-                            envelope.details.get("reason").and_then(serde_json::Value::as_str),
+                            envelope
+                                .details
+                                .get("reason")
+                                .and_then(serde_json::Value::as_str),
                             Some("work-list-not-ready" | "work-list-not-fresh")
                         )
                 }
@@ -4104,7 +4113,9 @@ mod tests {
         tokio::spawn(async move {
             let mut lines = Vec::new();
             for (delay, status, body) in answers {
-                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
                 let mut request = Vec::new();
                 let mut chunk = [0_u8; 1024];
                 while !request.windows(4).any(|window| window == b"\r\n\r\n") {
@@ -4114,7 +4125,13 @@ mod tests {
                     }
                     request.extend_from_slice(&chunk[..read]);
                 }
-                lines.push(String::from_utf8_lossy(&request).lines().next().unwrap_or_default().to_owned());
+                lines.push(
+                    String::from_utf8_lossy(&request)
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .to_owned(),
+                );
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 let response = format!(
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",

@@ -30663,7 +30663,22 @@ fn seat_run_orders_tx(
 /// When each seat `?1` (every seat when null) joined each open run it has a step in, and the
 /// run's status. It reads from the open runs to their steps, in that order: from the steps,
 /// SQLite reads every step any seat was ever assigned before it finds the open runs among them.
-fn seat_queue_joins_query() -> String {
+/// Every seat's queue moves (`?2` null), or one seat's, that no repair replaced, in graph order.
+pub(crate) fn seat_queue_moves_query() -> String {
+    canonical_sql(
+        "SELECT claims.id, claims.subject, claims.actor, claims.body, claims.accepted_at_unix_ms
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.kind=?1 AND (?2 IS NULL OR claims.subject=?2)
+           AND NOT EXISTS (
+               SELECT 1 FROM replica_records
+               WHERE replica_records.claim_id=claims.id
+                 AND replica_records.state='repaired'
+           )
+         ORDER BY CANONICAL_ASC(claims)",
+    )
+}
+
+pub(crate) fn seat_queue_joins_query() -> String {
     format!(
         "SELECT step_runs.assignee, step_runs.run_id,
                 MIN(CAST(step_runs.created_at_unix_ms AS INTEGER)), mission_runs.status
@@ -30752,17 +30767,7 @@ fn seat_queue_inputs_tx(
     agent: Option<&str>,
 ) -> Result<BTreeMap<String, SeatQueueInputs>> {
     let mut seats = BTreeMap::<String, SeatQueueInputs>::new();
-    let mut statement = connection.prepare(&canonical_sql(
-        "SELECT claims.id, claims.subject, claims.actor, claims.body, claims.accepted_at_unix_ms
-         FROM claims JOIN batches ON batches.id=claims.batch_id
-         WHERE claims.kind=?1 AND (?2 IS NULL OR claims.subject=?2)
-           AND NOT EXISTS (
-               SELECT 1 FROM replica_records
-               WHERE replica_records.claim_id=claims.id
-                 AND replica_records.state='repaired'
-           )
-         ORDER BY CANONICAL_ASC(claims)",
-    ))?;
+    let mut statement = connection.prepare(&seat_queue_moves_query())?;
     let rows = statement.query_map(params![seat_queue::MOVED_CLAIM, agent], |row| {
         Ok((
             row.get::<_, String>(0)?,

@@ -73,6 +73,9 @@ pub(crate) struct SeatQueue {
     pub(crate) order: Vec<String>,
     pub(crate) runs: BTreeSet<String>,
 }
+/// Whether a replica record was repaired by a claim after `?1` through `?2`, by the kind index.
+pub(crate) const REPAIRED_SINCE: &str = "SELECT 1 FROM claims
+ WHERE kind='record.repaired' AND store_index>?1 AND store_index<=?2 LIMIT 1";
 /// The earliest claim about step `?1` accepted after `?2`, by the subject index.
 pub(crate) const NEXT_CLAIM_AFTER: &str = "SELECT MIN(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
  WHERE subject=?1 AND CAST(accepted_at_unix_ms AS INTEGER)>?2";
@@ -88,9 +91,6 @@ pub(crate) struct WorkChanges {
     pub(crate) moved_seats: BTreeSet<String>,
     /// The runs those claims name or reach, as run keys: a seat that read one rereads it.
     pub(crate) runs: BTreeSet<String>,
-    /// Whether a replica record was repaired: that can drop a seat's move with no claim about
-    /// the seat, so the list folds from nothing.
-    pub(crate) repaired: bool,
 }
 
 /// How many actors' orders one publication keeps. Each holds at most one `u32` per row, so a
@@ -117,6 +117,10 @@ pub(crate) struct ActorOrders {
     pub(crate) hits: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) overflow: std::sync::atomic::AtomicUsize,
+    /// Seats a fold reread and found unchanged, so copied nothing, for tests. Kept here, on a
+    /// field every clone resets, so each publication counts its own fold's.
+    #[cfg(test)]
+    pub(crate) unchanged_seats: std::sync::atomic::AtomicUsize,
 }
 
 type OrderCell = Arc<std::sync::OnceLock<Arc<Vec<u32>>>>;
@@ -329,6 +333,21 @@ impl WorkRows {
     /// emptied buckets dropped. A seat stays registered while it has an order or any run. Says
     /// whether its order changed.
     pub(crate) fn set_seat_queue(&mut self, seat: &str, queue: Option<SeatQueue>) -> bool {
+        // Unchanged, order and every run it read: nothing to copy or relink.
+        let registered_order = self.seat_orders.get(seat).map(|order| order.as_slice());
+        let registered_runs = self.seat_runs.get(seat).map(|runs| &**runs);
+        let unchanged = match &queue {
+            Some(queue) if !queue.runs.is_empty() || !queue.order.is_empty() => {
+                registered_runs == Some(&queue.runs)
+                    && registered_order.unwrap_or_default() == queue.order.as_slice()
+            }
+            _ => registered_runs.is_none() && registered_order.is_none(),
+        };
+        if unchanged {
+            #[cfg(test)]
+            self.actors.unchanged_seats.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
         let seat_runs = Arc::make_mut(&mut self.seat_runs);
         let run_seats = Arc::make_mut(&mut self.run_seats);
         if let Some(runs) = seat_runs.remove(seat) {
@@ -385,13 +404,14 @@ impl WorkRows {
             .map(|(index, step)| (index as u32, &self.rows[step].view))
             .filter(|(_, view)| visible_to(view, viewer))
             .collect::<Vec<_>>();
-        let seat = viewer_seat(viewer);
-        let queue = self.seat_orders.get(&seat).map_or(&[][..], |order| order.as_slice());
+        // The direct read hands `select` its own seat string (the actor if it names a kind, else
+        // `agent/ACTOR`, which is `viewer`) and looks the queue up by the normalized seat.
+        let queue = self.seat_orders.get(&viewer_seat(viewer)).map_or(&[][..], |order| order.as_slice());
         let steps = shown
             .iter()
             .map(|(_, view)| crate::seat_queue::SeatStep::from(&***view))
             .collect::<Vec<_>>();
-        let ready = crate::seat_queue::select(&seat, &steps, queue)
+        let ready = crate::seat_queue::select(viewer, &steps, queue)
             .ready
             .into_iter()
             .map(str::to_owned)
@@ -408,6 +428,18 @@ impl WorkRows {
                 .then_with(|| left.subject.cmp(&right.subject))
         });
         shown.into_iter().map(|(index, _)| index).collect()
+    }
+
+    /// The rendered rows at `indexes`, or every row, in order, sharing this publication's values:
+    /// what a page cursor keeps of it.
+    pub(crate) fn selected_rows(&self, indexes: Option<&[u32]>) -> Vec<Arc<Value>> {
+        match indexes {
+            Some(indexes) => indexes
+                .iter()
+                .map(|&index| Arc::clone(&self.rows[&self.order[index as usize]].value))
+                .collect(),
+            None => self.order.iter().map(|step| Arc::clone(&self.rows[step].value)).collect(),
+        }
     }
 
     /// The rendered rows at `indexes[offset..]`, at most `limit` of them, and whether more
@@ -442,7 +474,6 @@ impl Store {
         let mut steps = BTreeSet::new();
         let mut reorder = false;
         let mut moved_seats = BTreeSet::new();
-        let mut repaired = false;
         let mut runs = BTreeSet::new();
         let mut requesters = BTreeSet::new();
         let mut every_ask = false;
@@ -458,7 +489,6 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         for (subject, kind, origin) in claims {
-            repaired |= kind == "record.repaired";
             if let Some(run) = subject.strip_prefix("mission-run/") {
                 runs.insert(run.to_owned());
                 // A run's state ends the steps of the runs under it, and decides whether asks
@@ -528,7 +558,7 @@ impl Store {
             }
         }
         let runs = runs.iter().map(|run| run_key(run)).collect();
-        Ok(WorkChanges { steps, reorder, moved_seats, runs, repaired })
+        Ok(WorkChanges { steps, reorder, moved_seats, runs })
     }
 
     /// The steps whose worker lease ended after `after` and by `through`: their rows show them
@@ -621,18 +651,24 @@ impl Store {
     }
 
     /// Each of `seats`' queue order and the runs it read, in the caller's snapshot, from the same
-    /// read [`Store::seat_run_order`] makes. A seat with no queued run and no move is left out.
+    /// inputs [`Store::seat_run_order`] reads. A seat with no queued run and no move is left
+    /// out. One read of every seat's inputs serves them all: per seat, the moves query scans
+    /// every move claim by kind and the joins every open run anyway.
     pub(crate) fn seat_queues_of(&self, seats: &BTreeSet<String>) -> Result<HashMap<String, SeatQueue>> {
         #[cfg(test)]
         {
             self.smalltalk.seat_order_reads.fetch_add(seats.len(), std::sync::atomic::Ordering::Relaxed);
             *self.smalltalk.last_seats_read.lock().unwrap() = seats.clone();
         }
+        if seats.is_empty() {
+            return Ok(HashMap::new());
+        }
         smallclaims::touched::note_read(|| format!("kind:{}", seat_queue::MOVED_CLAIM));
         let connection = self.readers.get();
+        let mut every = seat_queue_inputs_tx(&connection, None)?;
         let mut queues = HashMap::new();
         for seat in seats {
-            let Some(inputs) = seat_queue_inputs_tx(&connection, Some(seat.as_str()))?.remove(seat) else {
+            let Some(inputs) = every.remove(seat) else {
                 continue;
             };
             let order = inputs.live_order();
@@ -644,6 +680,34 @@ impl Store {
             queues.insert(seat.clone(), SeatQueue { order, runs });
         }
         Ok(queues)
+    }
+
+    /// Whether a replica record was repaired by a claim after `after` through `through`, read in
+    /// the caller's snapshot. A repair applied with its claim, as `apply` does, drops a seat's
+    /// move with no claim about the seat and no forget; the other routes forget when the record
+    /// flips. Only claims newer than `after` count, so one repair folds the list from nothing
+    /// once, however far a lagging frontier makes a fold read back.
+    pub(crate) fn repaired_since(&self, after: u64, through: u64) -> Result<bool> {
+        let connection = self.readers.get();
+        Ok(connection
+            .prepare_cached(REPAIRED_SINCE)?
+            .query_row(params![after, through], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Set how far replicated claims are projected, as a replication pass would, for tests.
+    #[cfg(test)]
+    pub(crate) fn set_projection_frontier_for_test(&self, index: u64) {
+        let connection = self.connection.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
+                 VALUES ('graph', 'healthy', ?1, '0')
+                 ON CONFLICT(aggregate) DO UPDATE SET last_good_store_index=excluded.last_good_store_index",
+                [index],
+            )
+            .unwrap();
     }
 
     /// Count `count` runs a warm fold looked up in its reverse index, for tests.
@@ -719,6 +783,8 @@ mod tests {
             ("work leases", WORK_LEASES.to_owned()),
             ("next claim", NEXT_CLAIM_AFTER.to_owned()),
             ("step assignees", STEP_ASSIGNEES.to_owned()),
+            ("repaired since", REPAIRED_SINCE.to_owned()),
+            ("seat queue moves", seat_queue_moves_query()),
             ("selected work", selected_work_at_snapshot_query(false)),
             ("selected mission keys", super::super::mission_list::mission_keys_sql(true)),
         ] {
@@ -749,8 +815,9 @@ mod tests {
         let orders = ActorOrders::default();
         let orders = &orders;
         let (started, building) = std::sync::mpsc::channel();
-        let (release, held) = std::sync::mpsc::channel::<()>();
         std::thread::scope(|scope| {
+            // Owned in the scope: a failing assertion drops it, which unblocks every worker.
+            let (release, held) = std::sync::mpsc::channel::<()>();
             let first = scope.spawn(move || {
                 orders.get_or_build("agent/a", move || {
                     started.send(()).unwrap();
@@ -758,7 +825,7 @@ mod tests {
                     vec![3, 1, 2]
                 })
             });
-            building.recv().unwrap();
+            building.recv_timeout(WAIT).expect("a worker started");
             // Churn every other slot while a's build is under way: a stays kept.
             for n in 0..ACTOR_ORDERS {
                 orders.get_or_build(&format!("agent/other-{n}"), || vec![n as u32]);
@@ -776,9 +843,12 @@ mod tests {
         assert_eq!(orders.overflow.load(Relaxed), 0);
     }
 
+    /// How long a test waits on another thread before failing instead of hanging.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
     /// Wait until `count` reads hold `actor`'s registered cell: proof each one registered.
     fn wait_for_readers(orders: &ActorOrders, actor: &str, count: usize) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + WAIT;
         while orders.readers(actor) != Some(count) {
             assert!(std::time::Instant::now() < deadline, "{actor} never had {count} readers");
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -788,9 +858,10 @@ mod tests {
     /// Block every kept slot's build, run `then` while they are all mid-build, then release them.
     fn while_saturated(orders: &ActorOrders, then: impl FnOnce()) {
         let (started, building) = std::sync::mpsc::channel();
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        let held = std::sync::Arc::new(std::sync::Mutex::new(held));
         std::thread::scope(|scope| {
+            // Owned in the scope: a failing assertion drops it, which unblocks every worker.
+            let (release, held) = std::sync::mpsc::channel::<()>();
+            let held = std::sync::Arc::new(std::sync::Mutex::new(held));
             let builders = (0..ACTOR_ORDERS)
                 .map(|n| {
                     let (started, held) = (started.clone(), std::sync::Arc::clone(&held));
@@ -804,7 +875,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             for _ in 0..ACTOR_ORDERS {
-                building.recv().unwrap();
+                building.recv_timeout(WAIT).expect("a worker started");
             }
             assert_eq!(orders.kept(), (ACTOR_ORDERS, ACTOR_ORDERS, 0), "every kept slot mid-build");
             then();
@@ -823,8 +894,9 @@ mod tests {
         let orders = ActorOrders::default();
         while_saturated(&orders, || {
             let (started, building) = std::sync::mpsc::channel();
-            let (release, held) = std::sync::mpsc::channel::<()>();
             std::thread::scope(|scope| {
+                // Owned in the scope: a failing assertion drops it, which unblocks every worker.
+                let (release, held) = std::sync::mpsc::channel::<()>();
                 let first = scope.spawn(|| {
                     orders.get_or_build("agent/late", move || {
                         started.send(()).unwrap();
@@ -832,7 +904,7 @@ mod tests {
                         vec![7]
                     })
                 });
-                building.recv().unwrap();
+                building.recv_timeout(WAIT).expect("a worker started");
                 assert_eq!(orders.kept().2, 1, "one overflow cell, registered");
                 // A second read of the same actor shares that cell: one build.
                 let second = scope.spawn(|| orders.get_or_build("agent/late", || panic!("a second build of agent/late")));
@@ -866,8 +938,9 @@ mod tests {
         assert_eq!(orders.get_or_build("agent/a", || vec![1]), (std::sync::Arc::new(vec![1]), true));
         // With another read waiting on its cell, that read builds it once, in the same cell.
         let (started, building) = std::sync::mpsc::channel();
-        let (release, held) = std::sync::mpsc::channel::<()>();
         std::thread::scope(|scope| {
+            // Owned in the scope: a failing assertion drops it, which unblocks every worker.
+            let (release, held) = std::sync::mpsc::channel::<()>();
             let failing = scope.spawn(|| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     orders.get_or_build("agent/b", move || {
@@ -877,7 +950,7 @@ mod tests {
                     })
                 }))
             });
-            building.recv().unwrap();
+            building.recv_timeout(WAIT).expect("a worker started");
             let waiting = scope.spawn(|| orders.get_or_build("agent/b", || vec![2]));
             // The waiting read holds the same cell before the first build fails.
             wait_for_readers(&orders, "agent/b", 2);
@@ -893,8 +966,9 @@ mod tests {
     /// second has registered, so both hold the same cell.
     fn two_failing_reads(orders: &ActorOrders, actor: &str) {
         let (started, building) = std::sync::mpsc::channel();
-        let (release, held) = std::sync::mpsc::channel::<()>();
         std::thread::scope(|scope| {
+            // Owned in the scope: a failing assertion drops it, which unblocks every worker.
+            let (release, held) = std::sync::mpsc::channel::<()>();
             let first = scope.spawn(|| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     orders.get_or_build(actor, move || {
@@ -904,7 +978,7 @@ mod tests {
                     })
                 }))
             });
-            building.recv().unwrap();
+            building.recv_timeout(WAIT).expect("a worker started");
             let second = scope.spawn(|| {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     orders.get_or_build(actor, || panic!("the second build failed too"))
@@ -932,6 +1006,27 @@ mod tests {
             assert_eq!(full.readers("agent/late"), None);
             assert_eq!(full.kept(), (ACTOR_ORDERS, ACTOR_ORDERS, 0), "no overflow cell left registered");
         });
+    }
+
+    #[test]
+    fn the_seat_queue_joins_walk_open_runs_by_index_and_scan_no_table() {
+        // One read per fold that reads any seat: it walks the open runs, by their partial index.
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.readers.get();
+        let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {}", seat_queue_joins_query())).unwrap();
+        let parameters = statement.parameter_count();
+        let plan = statement
+            .query_map(rusqlite::params_from_iter(std::iter::repeat_n("[]", parameters)), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        for line in &plan {
+            if line.starts_with("SCAN ") && !line.starts_with("SCAN CONSTANT") {
+                assert!(line.contains("USING "), "a bare table scan:\n{}", plan.join("\n"));
+            }
+        }
     }
 
     #[test]

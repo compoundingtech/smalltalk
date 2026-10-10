@@ -1703,8 +1703,8 @@ after a replay, trim or heal until its fold from nothing publishes), a work wind
 retryable `resync`, then waits for the list's next publication; neither commits, the reread
 interval nor a repeat of that answer sends it anything more. A paired session's clock still
 rechecks its grant meanwhile, and an expired or revoked grant ends the window. If the work
-list's refresher stops for good, a work window receives one `error` frame that names
-`work-list-ended` and ends; the daemon must restart.
+list's refresher stops for good, a work window receives one `error` frame and ends: its `code` is
+`internal`, and its `message` names `work-list-ended`. The daemon must restart.
 
 `GET /v1/client/work` (the current list, not `history=true`) answers the same way. A first
 page is a slice of the newest publication, under that publication's snapshot. A continuation
@@ -1715,9 +1715,12 @@ no current publication, a first page answers HTTP 503, retryable, with
 retryable, with `details.reason: "work-list-ended"`. With `fresh=true`, the daemon waits up to
 two seconds for a publication at or after the store index when the request arrived; if none
 comes, it answers HTTP 503, retryable, with `details.reason: "work-list-not-fresh"` and the
-`wanted_cut` and `newest_cut`, and never older rows as fresh. `st work ls` asks for a fresh first
-page and asks again on a not-ready or not-fresh answer within `--daemon-wait`, measured once
-across every attempt. HTTP pages of `/v1/client/missions` are unchanged.
+`wanted_cut` and `newest_cut`, and never older rows as fresh. On the wire these answers carry
+`code: "internal"`; `details.reason` tells them apart. `st work ls` asks for a fresh first page and
+asks again on a not-ready or not-fresh answer within `--daemon-wait`, measured once across every
+attempt. A client that does not retry, such as the TypeScript and Swift `workList` or a feed's
+model, gets that retryable 503 until the work list's first fold after the daemon starts, and again
+after each replay, trim or heal and each withdrawal until the next publication. HTTP pages of `/v1/client/missions` are unchanged.
 
 A daemon started with `ST3_PUBLISHED_LISTS=off` folds each window and page on read instead.
 

@@ -37,7 +37,7 @@
     { "id": "launch-approvals.list", "method": "GET", "path": "/v1/client/launches/{id}/approvals", "response": "Page" },
     { "id": "missions.list", "method": "GET", "path": "/v1/client/missions", "response": "Page" },
     { "id": "missions.get", "method": "GET", "path": "/v1/client/missions/{id}", "response": "Resource" },
-    { "id": "work.list", "method": "GET", "path": "/v1/client/work", "response": "Page" },
+    { "id": "work.list", "method": "GET", "path": "/v1/client/work", "response": "Page", "query": { "fresh": "optional true: wait up to two seconds for a current work list published at least as new as the request" } },
     { "id": "work.get", "method": "GET", "path": "/v1/client/work/{id}", "response": "Resource" },
     { "id": "resources.list", "method": "GET", "path": "/v1/client/resources", "response": "ResourcesPage" },
     { "id": "agents.list", "method": "GET", "path": "/v1/client/agents", "response": "Page", "query": { "fresh": "optional true: wait up to two seconds for a roster at least as new as the request" } },

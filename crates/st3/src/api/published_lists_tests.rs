@@ -948,7 +948,7 @@ fn seat_mission(store: &Store, name: &str, seat: &str) {
             r#"version 2
 mission "{name}" state="ready" {{
   goal "Tend one seat."
-  concurrent-runs max=32
+  concurrent-runs max=64
   step "plant" {{ assigned-to "{seat}" }}
 }}"#
         ),
@@ -1050,11 +1050,19 @@ fn an_incremental_fold_reads_only_the_seats_it_can_reorder() {
     mission(&store, "garden/unrelated");
     refresh_work_once(&store);
     assert_eq!(store.seat_order_reads(), cold, "an unrelated commit rereads no seat");
-    // One seat's step changes: that seat alone.
+    // One seat's step changes: that seat alone, and its queue is unchanged, so the seat maps
+    // are shared with the previous publication, not copied.
+    let before = store.published_work().unwrap();
     let (plant, seat) = step(&runs[&3], "plant");
     act(&store, &plant, &seat, "claim", "claim-seat-3");
     refresh_work_once(&store);
     assert_eq!(store.seat_order_reads(), cold + 1, "only seat 3");
+    let after = store.published_work().unwrap();
+    assert!(after.cut > before.cut);
+    assert!(Arc::ptr_eq(&before.rows.seat_orders, &after.rows.seat_orders), "an unchanged queue copies no order map");
+    assert!(Arc::ptr_eq(&before.rows.seat_runs, &after.rows.seat_runs));
+    assert!(Arc::ptr_eq(&before.rows.run_seats, &after.rows.run_seats));
+    assert_eq!(after.rows.actors.unchanged_seats.load(std::sync::atomic::Ordering::Relaxed), 1);
     // One seat's queue moves: that seat alone.
     store
         .move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
@@ -1069,6 +1077,9 @@ fn an_incremental_fold_reads_only_the_seats_it_can_reorder() {
         .unwrap();
     refresh_work_once(&store);
     assert_eq!(store.seat_order_reads(), cold + 2, "only seat 5");
+    let moved = store.published_work().unwrap();
+    assert!(!Arc::ptr_eq(&after.rows.seat_orders, &moved.rows.seat_orders), "a changed queue copies the map");
+    assert_ne!(after.rows.seat_orders.get("agent/garden/seat-5"), moved.rows.seat_orders.get("agent/garden/seat-5"));
     // And the list is still the direct read for each actor.
     fold_work_checked(&store);
 }
@@ -1127,6 +1138,24 @@ async fn an_edited_or_foreign_published_work_cursor_expires() {
     fold_work_checked(&other.store);
     assert_eq!(other.store.published_work_list().generation(), store.published_work_list().generation());
     expired(continue_with(&other, cursor.clone(), None).await, "another store's list");
+    // Each other issued filter edited.
+    let fields: [(&str, &dyn Fn(&mut ClientPageCursor)); 3] = [
+        ("person", &|cursor| cursor.person = Some("person/someone-else".into())),
+        ("status", &|cursor| cursor.status = Some("ready".into())),
+        ("native_only", &|cursor| cursor.native_only = !cursor.native_only),
+    ];
+    for (field, change) in fields {
+        let edited = edit(&cursor, change);
+        let decoded = decode_client_cursor(&edited).unwrap();
+        let query = ClientListQuery {
+            cursor: Some(edited),
+            person: decoded.person,
+            status: decoded.status,
+            native_only: decoded.native_only,
+            ..Default::default()
+        };
+        expired(work_page(&state, query).await, field);
+    }
     // 5. The snapshot edited: its id, or its index alone.
     let edited = edit(&cursor, &|cursor| cursor.snapshot.id.push('x'));
     expired(continue_with(&state, edited, None).await, "snapshot id");
@@ -1214,82 +1243,39 @@ fn a_seat_rereads_when_a_run_its_move_only_anchors_on_changes() {
     let store = Store::open_memory("cedar").unwrap();
     let (ash, birch) = ("agent/garden/ash", "agent/garden/birch");
     agents(&store, &["garden/ash", "garden/birch"]);
-    let proposed = |seat: &str, goal: &str, key: &str| {
-        let source = format!(
-            r#"version 2
-mission "garden/proposed" state="ready" revisions="human-only" revision-reviewer="person/reviewer" {{
-  goal "Grow by proposal."
-  agent "owner" {{ workspace "."; command "true" }}
-  step "plant" {{ assigned-to {seat:?}; goal {goal:?} }}
-}}"#
-        );
-        let intent = crate::graph::parse_intent(&source, store.origin()).unwrap();
-        let preview = store
-            .mission(&intent, crate::model::IntentInput { kdl: source.clone(), source_name: None })
-            .unwrap();
-        store.apply_as(&intent, &preview.subject_tokens, key, Some("person/operator")).unwrap();
-        intent.missions["garden/proposed"].clone()
-    };
-    proposed(ash, "Plant in beds.", "publish-proposed-beds");
     seat_mission(&store, "garden/tend-ash", ash);
-    let r1 = start(&store, "garden/proposed", "proposed-1");
-    ready_run(&store, "garden/tend-ash", "tend-ash-1");
-    let r3 = ready_run(&store, "garden/tend-ash", "tend-ash-2");
-    // Ash claims R1's step, its first queued run, and anchors a move on R1.
-    let (plant, seat) = step(&r1, "plant");
-    store.set_step_state(&plant, "ready", None).unwrap();
-    act(&store, &plant, &seat, "claim", "claim-r1");
+    let r1 = ready_run(&store, "garden/tend-ash", "tend-ash-1");
+    let r3 = ready_run(&store, "garden/tend-ash", "tend-ash-3");
+    // Ash anchors a move on R1, then hands R1's step to birch in place: ash keeps no step in
+    // R1, so R1 is in ash's queue's runs only through that move.
     move_run(&store, ash, &r3.id, "after", Some(&r1.id), "r3-after-r1");
-    // A revision moves R1's step to birch; ash keeps only its old-generation, draining step.
-    let rows = proposed(birch, "Plant in rows.", "publish-proposed-rows");
-    let proposal = store
-        .create_revision_proposal(&r1.id, &rows, &format!("agent/{}/owner", r1.id), "move to birch", "proposal-birch")
-        .unwrap();
-    store
-        .approve_revision_proposal(&proposal.id, "person/reviewer", proposal.preview_hash.as_deref().unwrap(), "approve-birch")
-        .unwrap();
+    let (plant, seat) = step(&r1, "plant");
+    act(&store, &plant, &seat, "claim", "claim-r1");
+    handoff(&store, &plant, &seat, birch, "handoff-r1").unwrap();
     store.published_work_list().start();
     let (base, _) = fold_work_checked(&store);
     let r1_key = crate::store::work_list::run_key(&r1.id);
     assert!(base.rows.seat_runs[ash].contains(&r1_key), "ash's move names R1");
-    assert!(
-        base.rows.seat_orders.get(ash).is_none_or(|order| !order.contains(&r1_key)),
-        "R1 is open but not live for ash at the base"
-    );
+    assert!(base.rows.seat_orders.get(ash).is_none_or(|order| !order.contains(&r1_key)), "R1 is not live for ash");
+    // No row-derived trigger: R1's row names no ash, as assignee, holder or offer.
+    let names_ash = |rows: &WorkRows| {
+        rows.rows.get(&plant).is_some_and(|row| {
+            row.view.assigned_to.as_deref() == Some(ash)
+                || row.view.claimant.as_deref() == Some(ash)
+                || row.view.available_to.iter().any(|offered| offered == ash)
+        })
+    };
+    assert!(!names_ash(&base.rows), "R1's row at the base names ash");
     let (rebuilds, lookups) = (claims_rebuilds(&store), store.seat_lookups());
-    // In the window, ash hands its old-generation step to birch: a named input of ash's queue.
-    match handoff(&store, &plant, &seat, birch, "handoff-old-generation") {
-        Ok(_) => {
-            refresh_work_once(&store);
-            // Said, so a pass is read as the named-run path having run.
-            eprintln!(
-                "anchor control: handoff accepted; cut {}, lookups {} -> {}, seats read {:?}",
-                store.index().unwrap(),
-                lookups,
-                store.seat_lookups(),
-                store.last_seats_read()
-            );
-            assert_eq!(claims_rebuilds(&store), rebuilds, "a warm fold");
-            assert!(store.seat_lookups() > lookups);
-            assert!(store.last_seats_read().contains(ash), "ash was read again through R1");
-            fold_work_checked(&store);
-        }
-        // `Store::work_action_with_handoff` follows a revision's carried claim to its successor
-        // step; with no successor carrying it, a step of a superseded generation is refused as
-        // `stale-run-generation`. That proves only that this local route refuses this case; it
-        // does not exercise the index's coverage of named runs (the source argument and the
-        // shared oracle do), nor the replicated `handoff_to` projection, which does not check the
-        // generation. Any other error is a mistake in this fixture, not that refusal.
-        Err(error) => {
-            // Said, so a pass is not read as the named-run path having run.
-            eprintln!(
-                "anchor control: local handoff refused ({}); cut {}, lookups {lookups}; the named-run path did not run",
-                error.code,
-                store.index().unwrap()
-            );
-            assert_eq!(error.code, "stale-run-generation", "{error:?}");
-        }
-    }
+    // In the window, a claim on R1's step by neither ash nor its holder.
+    store.set_step_state(&plant, "blocked", Some("waiting for frost to pass")).unwrap();
+    refresh_work_once(&store);
+    let after = store.published_work().unwrap();
+    assert!(!names_ash(&after.rows), "R1's row after names ash");
+    assert_eq!(claims_rebuilds(&store), rebuilds, "a warm fold");
+    assert!(store.seat_lookups() > lookups, "R1 was looked up");
+    assert!(store.last_seats_read().contains(ash), "ash was read again, through R1 alone");
+    fold_work_checked(&store);
 }
 
 #[test]
@@ -1318,4 +1304,124 @@ fn an_operator_repair_that_drops_a_move_folds_the_list_from_nothing() {
     assert_eq!(claims_rebuilds(&store), rebuilds + 1, "the repair folded the list from nothing");
     let (after, _) = fold_work_checked(&store);
     assert_eq!(after.rows.seat_orders[ash].first(), Some(&crate::store::work_list::run_key(&r1.id)), "the repaired move no longer counts");
+}
+
+#[test]
+fn one_repair_folds_the_list_from_nothing_once_while_a_lagging_frontier_advances() {
+    let _clock = Clock::at(start_time());
+    let store = Store::open_memory("cedar").unwrap();
+    let ash = "agent/garden/ash";
+    seat_mission(&store, "garden/tend-ash", ash);
+    ready_run(&store, "garden/tend-ash", "tend-ash-1");
+    let r2 = ready_run(&store, "garden/tend-ash", "tend-ash-2");
+    let moved = move_run(&store, ash, &r2.id, "top", None, "r2-first");
+    let record = format!("record/{}", "cd".repeat(32));
+    store.record_replica_for_test(&record, &moved.id, "invalid");
+    // Replication has projected only the first claim: the frontier lags far behind.
+    store.set_projection_frontier_for_test(1);
+    store.published_work_list().start();
+    refresh_work_once(&store);
+    let rebuilds = claims_rebuilds(&store);
+    // The operator repairs the move through apply, above the lagging frontier.
+    publish(
+        &store,
+        &format!("version 2\nrepair \"{record}\" {{\n  replacement \"{}\"\n  reason \"replaced by the operator\"\n}}\n", moved.id),
+        "repair-move",
+    );
+    let repaired_at = store.index().unwrap();
+    refresh_work_once(&store);
+    assert_eq!(claims_rebuilds(&store), rebuilds + 1, "the repair folds the list from nothing");
+    // The frontier advances three times, still below the repair: each fold reads the repair's
+    // claim again, and none folds from nothing again.
+    for (n, frontier) in [2_u64, 3, 4].into_iter().enumerate() {
+        assert!(frontier < repaired_at);
+        mission(&store, &format!("garden/later-{n}"));
+        store.set_projection_frontier_for_test(frontier);
+        refresh_work_once(&store);
+        let published = store.published_work().unwrap();
+        assert_eq!(published.cut, store.index().unwrap(), "fold {n} reached the current cut");
+        assert_eq!(published.rows.frontier, frontier, "fold {n} saw the advanced frontier");
+        assert_eq!(claims_rebuilds(&store), rebuilds + 1, "fold {n} stayed warm");
+    }
+    fold_work_checked(&store);
+}
+
+#[tokio::test]
+async fn the_published_work_page_cache_reuses_a_page_evicts_by_contract_and_purges_on_forget() {
+    let root = tempfile::tempdir().unwrap();
+    let state = app_state(root.path());
+    let store = &state.store;
+    // More rows than any page below asks for, so every page has a next one and an entry.
+    seat_mission(store, "garden/tend", "agent/garden/ash");
+    for n in 0..40 {
+        ready_run(store, "garden/tend", &format!("tend-{n}"));
+    }
+    let list = store.published_work_list();
+    list.start();
+    fold_work_checked(store);
+    let instance = list.instance();
+    // The same first page, asked again: the same cursor and expiry, and no new entry.
+    let first = work_page(&state, work_query(None, 1)).await.unwrap();
+    let held = published_work_pages_of(instance);
+    let again = work_page(&state, work_query(None, 1)).await.unwrap();
+    assert_eq!(again.page.next_cursor, first.page.next_cursor);
+    assert_eq!(again.page.cursor_expires_at, first.page.cursor_expires_at, "the original expiry, not extended");
+    assert_eq!(published_work_pages_of(instance), held, "a repeated page adds nothing");
+    // A withdrawal leaves its continuation valid: same generation, rows at their own cut.
+    list.withdraw();
+    let next = work_page(&state, ClientListQuery { cursor: first.page.next_cursor.clone(), ..work_query(None, 1) })
+        .await
+        .unwrap();
+    assert_eq!(next.items.len(), 1);
+    assert!(list.serve_again(list.generation()));
+    // Distinct contracts (limits) fill the cache: the oldest is evicted, and its cursor expires.
+    let oldest = first.page.next_cursor.clone().unwrap();
+    for limit in 2..=33 {
+        work_page(&state, work_query(None, limit)).await.unwrap();
+    }
+    let evicted = work_page(&state, ClientListQuery { cursor: Some(oldest), ..work_query(None, 1) }).await.unwrap_err();
+    assert_eq!((evicted.status, evicted.code.as_str()), (StatusCode::GONE, "page-cursor-expired"));
+    // A forget purges this list's entries at the next access, and its cursors expire.
+    let live = work_page(&state, work_query(None, 3)).await.unwrap().page.next_cursor.unwrap();
+    assert!(published_work_pages_of(instance) > 0);
+    list.forget();
+    let forgotten = work_page(&state, ClientListQuery { cursor: Some(live), ..work_query(None, 3) }).await.unwrap_err();
+    assert_eq!(forgotten.code, "page-cursor-expired");
+    assert_eq!(published_work_pages_of(instance), 0, "the replaced generation's entries are gone");
+}
+
+/// Wait, bounded in the test's own time, until the refresher has published the current cut.
+async fn wait_published(store: &Store) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !store.published_work().is_some_and(|published| published.cut == store.index().unwrap()) {
+        assert!(tokio::time::Instant::now() < deadline, "the refresher never published the current cut");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fresh_read_cuts_the_refresher_pause_short_and_commits_keep_it() {
+    let root = tempfile::tempdir().unwrap();
+    let state = app_state(root.path());
+    let store = &state.store;
+    seat_mission(store, "garden/tend", "agent/garden/ash");
+    ready_run(store, "garden/tend", "tend-1");
+    start_published_work(&state);
+    wait_published(store).await;
+    // A commit just after a fold waits out the pause before the next fold.
+    let committed = tokio::time::Instant::now();
+    ready_run(store, "garden/tend", "tend-2");
+    wait_published(store).await;
+    assert!(committed.elapsed() >= REFRESH_PAUSE - Duration::from_millis(100), "{:?}", committed.elapsed());
+    // A fresh read just after a fold asks for the next one at once.
+    ready_run(store, "garden/tend", "tend-3");
+    let asked = tokio::time::Instant::now();
+    let page = work_page(&state, ClientListQuery { fresh: true, ..work_query(None, 200) }).await.unwrap();
+    assert_eq!(page.items.len(), 3);
+    assert!(asked.elapsed() < REFRESH_PAUSE / 2, "{:?}", asked.elapsed());
+    // Two fresh reads at once: one request serves both.
+    ready_run(store, "garden/tend", "tend-4");
+    let fresh = ClientListQuery { fresh: true, ..work_query(None, 200) };
+    let (first, second) = tokio::join!(work_page(&state, fresh.clone()), work_page(&state, fresh));
+    assert_eq!((first.unwrap().items.len(), second.unwrap().items.len()), (4, 4));
 }

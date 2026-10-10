@@ -54,10 +54,16 @@ struct Withdraw<R: 'static> {
 
 impl<R> Drop for Withdraw<R> {
     fn drop(&mut self) {
-        eprintln!(
-            "st3: ERROR the {} list's refresher stopped; it is not published again until the daemon restarts",
-            self.name
-        );
+        // Dropped while unwinding: the task panicked. Otherwise it was cancelled, as the daemon's
+        // runtime shutting down cancels it.
+        if std::thread::panicking() {
+            eprintln!(
+                "st3: ERROR the {} list's refresher panicked; it is not published again until the daemon restarts",
+                self.name
+            );
+        } else {
+            eprintln!("st3: the {} list's refresher stopped", self.name);
+        }
         (self.list)(&self.store).end();
         withdraw(&self.store, self.list, self.name);
     }
@@ -198,8 +204,12 @@ fn spawn<R: Send + Sync + 'static>(
         // Should this task ever stop, the list ends: a governed list's readers refuse, and an
         // ungoverned list's windows fold on read and follow commits again.
         let _withdraw = Withdraw { store: Arc::clone(&store), list, name };
+        let fresh = list(&store).fresh_requests();
         let mut failures = 0;
         loop {
+            // A fresh request from before this fold is served by it: drop it, so it cannot cut
+            // the next pause short. One made during the fold stays, and cuts that pause.
+            let _ = futures_util::FutureExt::now_or_never(fresh.notified());
             let started = tokio::time::Instant::now();
             let reader = store.clone();
             let folded = tokio::task::spawn_blocking(move || {
@@ -262,7 +272,8 @@ fn spawn<R: Send + Sync + 'static>(
                     withdraw(&store, list, name);
                 }
             }
-            tokio::time::sleep(started.elapsed().max(REFRESH_PAUSE)).await;
+            // The pause keeps commits paced; a fresh read waiting on the list cuts it short.
+            let _ = tokio::time::timeout(started.elapsed().max(REFRESH_PAUSE), fresh.notified()).await;
             let deadline = list(&store).newest().and_then(|newest| newest.valid_until_unix_ms);
             let mut wait = deadline.map(|deadline| {
                 Duration::from_millis(deadline.saturating_sub(now_ms()).min(u64::MAX as u128) as u64)
@@ -703,12 +714,14 @@ fn work_since(store: &Store, base: &Publication<WorkRows>) -> anyhow::Result<Adv
             return Ok(Advance::Rebuild);
         };
         let time = store.projection_time_at(cut)?.max(rows.time_unix_ms);
-        let changes = store.work_list_changes(from, cut, &rows.seats)?;
-        // A repaired replica record can drop a seat's move, or change other projections, with no
-        // claim a warm fold maps: fold from nothing.
-        if changes.repaired {
+        // A replica record repaired since the base's own cut can drop a seat's move, or change
+        // other projections, with no claim a warm fold maps: fold from nothing. Only repairs newer
+        // than the base's cut, not the whole window a lagging frontier reads back, so one repair
+        // folds from nothing once.
+        if store.repaired_since(base.cut, cut)? {
             return Ok(Advance::Rebuild);
         }
+        let changes = store.work_list_changes(from, cut, &rows.seats)?;
         let mut steps = changes.steps;
         // Leases that ended by the new time show their steps ready again.
         steps.extend(store.steps_with_leases_ended(rows.time_unix_ms, time)?);
