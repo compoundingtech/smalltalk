@@ -1420,7 +1420,8 @@ fn native_prompt_answer(connection: &Connection, observation: &str) -> Result<Op
     Ok(connection
         .prepare_cached(
             "SELECT json_extract(body, '$.fields.status') FROM claims INDEXED BY claims_operation_index
-             WHERE json_extract(body, '$._operation.id')=?1 LIMIT 1",
+             WHERE json_extract(body, '$._operation.id') IS NOT NULL
+               AND json_extract(body, '$._operation.id')=?1 LIMIT 1",
         )?
         .query_row([operation], |row| row.get::<_, Option<String>>(0))
         .optional()?
@@ -1485,7 +1486,8 @@ impl Store {
         let refused: bool = connection
             .prepare_cached(
                 "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_operation_index
-                   WHERE json_extract(body, '$._operation.id')=?1)",
+                   WHERE json_extract(body, '$._operation.id') IS NOT NULL
+                     AND json_extract(body, '$._operation.id')=?1)",
             )?
             .query_row([native_prompt_gone_operation(&claim)], |row| row.get(0))?;
         if refused {
