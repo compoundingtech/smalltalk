@@ -299,7 +299,10 @@ impl Store {
                     return Ok(None);
                 }
                 // Its own rows no longer give the drop it verified, so it adopts the manifest
-                // from a peer like a node that did not take part.
+                // from a peer like a node that did not take part. Tombstones a trim interrupted
+                // while recording go first: nothing reads them until the trim finishes, and
+                // they must not outlive the plan they came from.
+                self.forget_recording_tombstones(&checkpoint)?;
                 self.set_checkpoint_state(&checkpoint, cut, "plan-changed")?;
                 self.checkpoint_diagnostic(
                     "checkpoint-trim-plan-changed",
@@ -495,6 +498,57 @@ impl Store {
         };
         self.replica_rows_changed();
         Ok(forgotten)
+    }
+
+    /// Delete the tombstones of `checkpoint` while it is `recording`, in chunks of
+    /// `TRIM_CHUNK_BUDGET`, and return how many. Each chunk checks the state again, so a
+    /// checkpoint whose trim went on records nothing lost. Nothing has been deleted for them yet,
+    /// and sealed sets never read them, so forgetting them changes no inventory or plan.
+    pub fn forget_recording_tombstones(&self, checkpoint: &str) -> Result<usize> {
+        self.runtime.checkpoint_preflight()?;
+        let mut forgotten = 0;
+        loop {
+            let mut connection = self.connection.write();
+            let transaction = connection.transaction()?;
+            let recording: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM checkpoints WHERE id=?1 AND state='recording')",
+                [checkpoint],
+                |row| row.get(0),
+            )?;
+            if !recording {
+                return Ok(forgotten);
+            }
+            let started = std::time::Instant::now();
+            let mut deleted = 0;
+            // A trim records after every earlier checkpoint's tombstones, so a recording
+            // checkpoint's tombstones are the newest rows of each table: walk down from the
+            // newest by rowid, with no scan for the checkpoint's name.
+            'tables: for table in ["checkpoint_envelopes", "checkpoint_claims"] {
+                while started.elapsed() < TRIM_CHUNK_BUDGET {
+                    let newest = transaction
+                        .prepare_cached(&format!(
+                            "SELECT rowid, checkpoint FROM {table} ORDER BY rowid DESC LIMIT 1"
+                        ))?
+                        .query_row([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+                        .optional()?;
+                    match newest {
+                        Some((rowid, name)) if name == checkpoint => {
+                            transaction
+                                .execute(&format!("DELETE FROM {table} WHERE rowid=?1"), [rowid])?;
+                            deleted += 1;
+                        }
+                        _ => continue 'tables,
+                    }
+                }
+                break;
+            }
+            transaction.commit()?;
+            drop(connection);
+            forgotten += deleted;
+            if deleted == 0 {
+                return Ok(forgotten);
+            }
+        }
     }
 
     pub fn set_checkpoint_state(
