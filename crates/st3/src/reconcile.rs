@@ -12022,7 +12022,17 @@ impl<R: RuntimeControl> Reconciler<R> {
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
             let item = format!("schedule-work:{}", schedule.subject);
             active.insert(item.clone());
-            let context = self.incremental.observe_context(&item, schedule);
+            let context = {
+                // Retry state can change without an append record. Fingerprint its current
+                // request/deadline alongside the declaration, releasing this lock before
+                // evaluation. Unchanged retries still rely on their recorded due time.
+                let retries = self
+                    .schedule_workspace_retries
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                self.incremental
+                    .observe_context(&item, &(schedule, retries.get(&schedule.subject)))
+            };
             self.reconcile_selected_intake(
                 "schedule-work",
                 &item,
@@ -23910,6 +23920,15 @@ schedule "{name}" {{
 
     #[tokio::test]
     async fn scheduled_work_waits_for_an_available_workspace() {
+        scheduled_work_workspace_recovery(false).await;
+    }
+
+    #[tokio::test]
+    async fn scheduled_work_workspace_retry_changes_select_skipped_items() {
+        scheduled_work_workspace_recovery(true).await;
+    }
+
+    async fn scheduled_work_workspace_recovery(skip_unneeded: bool) {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let revision = scheduled_mission_revision(&store);
         let root = tempfile::tempdir().unwrap();
@@ -23930,7 +23949,8 @@ schedule "{name}" {{
             Arc::new(FakeRuntime::default()),
             "node".into(),
             Arc::new(Notify::new()),
-        );
+        )
+        .skipping_unneeded(skip_unneeded);
         reconciler.reconcile_once().unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         reconciler.reconcile_once().unwrap();

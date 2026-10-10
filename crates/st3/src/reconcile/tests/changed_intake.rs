@@ -180,7 +180,7 @@ subscription "watch" { observer "observer/repo-1"; to "agent/target"; on "issues
     );
     // A reader-side deletion fixture at unchanged append frontiers, matching the raw desired
     // sensor obligation. No admission/replication proof is inferred from this mutation.
-    let frontier = store.changes_since(u64::MAX, i64::MAX).unwrap();
+    let frontier = store.changes_since(0, 0).unwrap();
     store
         .connection
         .write()
@@ -413,7 +413,7 @@ fn local_observer_and_schedule_arm_clock_dependencies_before_cached_timer_return
     let due = START + 86_400_000;
     let at = chrono::DateTime::from_timestamp_millis(due as i64)
         .unwrap()
-        .to_rfc3339();
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     apply_source(
         &store,
         &format!(
@@ -513,7 +513,7 @@ impl ResourceProvider for PendingProvider {
                 anyhow::bail!("fixture connection reset");
             }
             Ok(crate::resource::ProviderObservation {
-                facts: serde_json::json!({"issues":[]}),
+                facts: serde_json::json!({"repository_id":7,"issues":[]}),
                 cursor: Some("completed".into()),
                 next_check_unix_ms: now_ms() + 60_000,
             })
@@ -599,8 +599,8 @@ async fn an_elapsed_observer_deadline_is_consumed_while_the_real_provider_is_pen
         .unwrap();
     assert!(reconciler.armed_observers.lock().unwrap().is_empty());
     assert_eq!(
-        store.latest_actual_value("resource/repo").unwrap().unwrap()["facts"]["issues"],
-        serde_json::json!([])
+        store.latest_actual_value("resource/repo").unwrap().unwrap()["facts"]["repository_id"],
+        serde_json::json!(7)
     );
     let next = due + 60_000;
     assert_eq!(
@@ -642,7 +642,7 @@ async fn an_elapsed_schedule_deadline_is_consumed_until_its_real_timer_notifies(
     let due = START + 10;
     let anchor = chrono::DateTime::from_timestamp_millis(due as i64)
         .unwrap()
-        .to_rfc3339();
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     apply_source(
         &store,
         &format!(
