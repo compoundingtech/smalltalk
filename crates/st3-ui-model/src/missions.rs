@@ -105,6 +105,7 @@ pub struct StepMetadata {
     pub last_progress: Option<String>,
     /// How long ago st nudged the step's holder for idling while holding it with nothing set to
     /// wake it, as an age label such as `40m`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nudged: Option<String>,
 }
 
