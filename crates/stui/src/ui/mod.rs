@@ -6402,6 +6402,38 @@ mod tests {
     }
 
     #[test]
+    fn content_controls_emit_load_effects_once_and_release_on_collapse_or_hide() {
+        let (mut ui, conversation) = expand_all_viewport_fixture();
+        ui.click(Hit::ToggleTool("one".into()));
+        let [Effect::LoadContent(output)] = ui.effects.as_slice() else {
+            panic!("expanding referenced output must request its content");
+        };
+        let output = output.clone();
+        assert_eq!(output.reference, "one");
+        assert_eq!(output.conversation, "session/expand-all");
+        assert!(ui.content.is_loading(&output));
+        ui.click(Hit::ContentOutput(output.clone()));
+        assert_eq!(ui.effects.len(), 1, "an in-flight read is not duplicated");
+        ui.click(Hit::ToggleTool("one".into()));
+        assert!(!ui.content.is_loading(&output));
+        ui.effects.clear();
+        ui.click(Hit::ContentOutput(output.clone()));
+        assert_eq!(ui.effects, vec![Effect::LoadContent(output)]);
+        assert!(ui.conversation_state.expanded.contains("one"));
+        ui.effects.clear();
+
+        let image = ui.content.tool_images(&conversation, "image").pop().unwrap();
+        ui.click(Hit::ContentImage(image.clone()));
+        assert_eq!(ui.effects, vec![Effect::LoadContent(image.clone())]);
+        assert!(ui.content.is_loading(&image));
+        assert!(ui.conversation_state.expanded.contains("image"));
+        ui.effects.clear();
+        ui.click(Hit::ContentImage(image.clone()));
+        assert!(ui.effects.is_empty(), "hiding an image does not fetch it");
+        assert!(!ui.content.is_loading(&image));
+    }
+
+    #[test]
     fn expand_all_loads_visible_clipped_blocks_sequentially_and_collapse_releases() {
         let (mut ui, conversation) = expand_all_viewport_fixture();
         let mut reads = content::Reads::default();
