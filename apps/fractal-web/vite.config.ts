@@ -10,6 +10,16 @@ export default defineConfig({
   plugins: [
     fractalContentSecurityPolicy(),
     {
+      // The root is src/web, so Vite watches other app and kit modules file by file; such a watch
+      // can be lost when a write replaces the file (git, formatters, atomic saves). Directory watches
+      // keep HMR following those writes.
+      name: 'fractal:workspace-watch',
+      apply: 'serve',
+      configureServer(server) {
+        server.watcher.add([new URL('./src', import.meta.url).pathname, new URL('../../packages/fractal-ui/src', import.meta.url).pathname])
+      },
+    },
+    {
       name: 'fractal-build-identity',
       resolveId(id) {
         if (id === 'virtual:build-identity') return '\0fractal-build-identity'
@@ -32,7 +42,15 @@ export default defineConfig({
     react(),
     webfractalGateway(),
   ],
-  server: { strictPort: true, host: '127.0.0.1', allowedHosts: (process.env.WF_ALLOWED_HOSTS ?? '127.0.0.1,localhost').split(',') },
+  server: {
+    strictPort: true,
+    host: '127.0.0.1',
+    allowedHosts: (process.env.WF_ALLOWED_HOSTS ?? '127.0.0.1,localhost').split(','),
+    // Browser diagnostics stay in DevTools. Vite forwards them by default under AI agents, and
+    // before 8.0.14 (vitejs/vite#22407) a send failing after an HMR disconnect re-enters the
+    // forwarder as an unhandled rejection, looping without bound. See hmr-disconnect-proof.mjs.
+    forwardConsole: false,
+  },
   resolve: { dedupe: ['effect', 'react', 'react-dom'] },
   build: {
     outDir: '../../dist/web',

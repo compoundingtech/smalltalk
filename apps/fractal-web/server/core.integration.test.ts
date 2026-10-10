@@ -10,7 +10,7 @@ import { join } from 'node:path'
 import type { Duplex } from 'node:stream'
 import { brotliCompressSync } from 'node:zlib'
 import { Option, Tracer } from 'effect'
-import { createFractalWebServer } from './core.mts'
+import { createFractalWebMiddleware, createFractalWebServer } from './core.mts'
 import type { FractalWebServer } from './core.mts'
 import { cleanHeaders, clientRoute } from './gateway.mts'
 import { traceparent } from './tracing.mts'
@@ -408,5 +408,34 @@ it('retains upgrade error coverage through rejected socket shutdown', async () =
   client.resetAndDestroy()
   await closed
   expect(socket.listenerCount('error')).toBe(0)
+  expect(setup.received).toHaveLength(0)
+})
+
+it('leaves a non-gateway WebSocket upgrade to its middleware host without admission', async () => {
+  const setup = await fixture()
+  const server = createServer()
+  let admissions = 0
+  const boundary = createFractalWebMiddleware({
+    server,
+    admit: () => { admissions++; return false },
+    tracer: Tracer.make({ span: options => new Tracer.NativeSpan(options) }),
+    gateway: { socketPath: join(setup.root, 'gateway.sock'), host: 'paired-gateway', authorization: gatewayAuthorization, timeoutMs: 1000 },
+  })
+  cleanups.push(async () => { await boundary.close(); await new Promise<void>(resolve => server.close(() => resolve())) })
+  server.on('upgrade', (_request, socket) => {
+    socket.on('error', () => undefined)
+    socket.end('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n')
+  })
+  await listen(server)
+  const address = server.address()
+  if (address === null || typeof address === 'string') throw new TypeError('Expected TCP listener')
+  const client = connect(address.port, '127.0.0.1')
+  client.on('error', () => undefined)
+  cleanups.push(async () => { client.destroy() })
+  const reply = once(client, 'data')
+  client.write('GET /hmr HTTP/1.1\r\nHost: fixture\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n')
+  expect(String((await reply)[0])).toContain('101 Switching Protocols')
+  await new Promise<void>(resolve => setImmediate(resolve))
+  expect(admissions).toBe(0)
   expect(setup.received).toHaveLength(0)
 })
