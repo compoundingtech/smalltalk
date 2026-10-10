@@ -18,6 +18,13 @@ by design, up to two seconds, until the roster refresher publishes a roster at o
 read's own cut. The other two answer at once from a published roster. Count the fresh row against
 its own target rather than leaving it out: the route total still includes it.
 
+`scope: "agents-roster"` rows (also under route `/v1/client/agents`) time where that wait goes,
+each in its own last-512 sample, `duration_scope: "roster-stage"`. Stage `refresh` is one refresher
+fold and `refresh-admission` its wait for roster admission (`population: "refresher-folds"`).
+Stage `fresh-wait` is a fresh read's wait for a publication at its cut (2 s at most), and
+`fresh-page` the page it then builds (`population: "fresh-reads"`). Stages are not requests: they
+add no route or path rows.
+
 Each row's `count` is its completed-response count since this process started, including error
 responses. Percentiles use its last at most 512 completions (`recent_count`), in whole milliseconds.
 Renew and claim have separate counts and percentile samples. `duration_scope: "response-envelope"`

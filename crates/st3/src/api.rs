@@ -1239,6 +1239,12 @@ fn request_latency() -> &'static Mutex<request_latency::Meter> {
     REQUEST_LATENCY.get_or_init(|| Mutex::new(request_latency::Meter::default()))
 }
 
+/// Count one agents roster stage's duration beside the request rows.
+fn record_roster_stage(stage: request_latency::RosterStage, elapsed: Duration) {
+    // A poisoned diagnostic lock must not stop the refresher that records into it.
+    request_latency().lock().unwrap_or_else(std::sync::PoisonError::into_inner).record_roster_stage(stage, elapsed);
+}
+
 fn request_latency_snapshot() -> Vec<Value> {
     request_latency().lock().unwrap().snapshot()
 }
@@ -4518,12 +4524,20 @@ async fn client_agents_published(
         return blocking_store(move || Ok(client_agents_published_continuation(&reader, snapshot, &query)))
             .await?;
     }
-    if query.fresh {
+    let fresh = query.fresh;
+    if fresh {
+        let waited = Instant::now();
         wait_for_agent_roster(&state.store, query.history).await;
+        record_roster_stage(request_latency::RosterStage::FreshWait, waited.elapsed());
     }
     let reader = state.clone();
     let history = query.history;
-    match blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await?? {
+    let built = Instant::now();
+    let page = blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await;
+    if fresh {
+        record_roster_stage(request_latency::RosterStage::FreshPage, built.elapsed());
+    }
+    match page?? {
         Some(page) => Ok(page),
         None => {
             if history {
@@ -5671,8 +5685,11 @@ pub fn start_agent_roster(state: &AppState) {
         loop {
             let started = tokio::time::Instant::now();
             let mut admission = store.admit_agent_resources().await;
-            let reader = store.clone();
             let first = std::mem::take(&mut head);
+            if !first {
+                record_roster_stage(request_latency::RosterStage::RefreshAdmission, started.elapsed());
+            }
+            let reader = store.clone();
             if first {
                 // Warm without admission: nothing is published, and no reader folds.
                 drop(admission);
@@ -5693,13 +5710,16 @@ pub fn start_agent_roster(state: &AppState) {
                 crate::performance::task("roster/refresh", || if first {
                     reader.read_snapshot(|index| client_agent_roster_head(&reader, index))
                 } else {
-                    reader.answer_agent_roster_requests(|| {
+                    let folded = Instant::now();
+                    let refreshed = reader.answer_agent_roster_requests(|| {
                         refresh_agent_roster(&reader, false)?;
                         if reader.take_agent_roster_history_request() {
                             refresh_agent_roster(&reader, true)?;
                         }
                         Ok(())
-                    })
+                    });
+                    record_roster_stage(request_latency::RosterStage::Refresh, folded.elapsed());
+                    refreshed
                 })
             })
             .await;
