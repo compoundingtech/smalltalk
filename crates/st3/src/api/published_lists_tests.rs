@@ -1519,3 +1519,35 @@ async fn a_fresh_read_the_newest_publication_covers_asks_for_no_fold() {
     tokio::time::sleep(REFRESH_PAUSE * 2).await;
     assert_eq!(list.folds(), folds, "a covered fresh read asks for no fold");
 }
+
+#[test]
+fn a_warm_fold_probes_only_the_named_runs_of_the_seats_it_reads() {
+    let _clock = Clock::at(start_time());
+    let store = Store::open_memory("cedar").unwrap();
+    let (a, b) = ("agent/garden/seat-a", "agent/garden/seat-b");
+    seat_mission(&store, "garden/tend-a", a);
+    seat_mission(&store, "garden/tend-b", b);
+    let ra = ready_run(&store, "garden/tend-a", "ra");
+    let rb1 = ready_run(&store, "garden/tend-b", "rb1");
+    let rb2 = ready_run(&store, "garden/tend-b", "rb2");
+    let rb3 = ready_run(&store, "garden/tend-b", "rb3");
+    // B's move anchors on a run that then ends: named history only B's read probes.
+    move_run(&store, b, &rb3.id, "before", Some(&rb1.id), "rb3-before-rb1");
+    store.set_mission_run_state(&rb1.id, "cancelled", "terminal", Some("no longer needed")).unwrap();
+    store.published_work_list().start();
+    fold_work_checked(&store);
+    // A's step changes: A has no named run, and B's are not probed for it.
+    let probes = crate::store::named_run_probes();
+    let (plant, seat) = step(&ra, "plant");
+    act(&store, &plant, &seat, "claim", "claim-ra");
+    refresh_work_once(&store);
+    assert_eq!(store.last_seats_read(), BTreeSet::from([a.to_owned()]));
+    assert_eq!(crate::store::named_run_probes(), probes, "no other seat's named runs probed");
+    // B's step changes: B's read probes its named run.
+    let probes = crate::store::named_run_probes();
+    store.set_step_state(&step(&rb2, "plant").0, "blocked", Some("waiting for rain")).unwrap();
+    refresh_work_once(&store);
+    assert!(store.last_seats_read().contains(b));
+    assert!(crate::store::named_run_probes() > probes, "B's named run probed");
+    fold_work_checked(&store);
+}

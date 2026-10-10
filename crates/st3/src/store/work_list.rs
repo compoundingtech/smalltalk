@@ -665,7 +665,8 @@ impl Store {
         }
         smallclaims::touched::note_read(|| format!("kind:{}", seat_queue::MOVED_CLAIM));
         let connection = self.readers.get();
-        let mut every = seat_queue_inputs_tx(&connection, None)?;
+        // Every move and join in one pass, but only these seats' named runs probed.
+        let mut every = seat_queue_inputs_of_tx(&connection, None, Some(seats))?;
         let mut queues = HashMap::new();
         for seat in seats {
             let Some(inputs) = every.remove(seat) else {

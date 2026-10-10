@@ -30766,6 +30766,28 @@ fn seat_queue_inputs_tx(
     connection: &Connection,
     agent: Option<&str>,
 ) -> Result<BTreeMap<String, SeatQueueInputs>> {
+    seat_queue_inputs_of_tx(connection, agent, None)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Named-run probes `seat_queue_inputs_of_tx` made on this thread, for tests.
+    static NAMED_RUN_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many named-run probes this thread's seat-queue reads have made, for tests.
+#[cfg(test)]
+pub(crate) fn named_run_probes() -> usize {
+    NAMED_RUN_PROBES.with(std::cell::Cell::get)
+}
+
+/// [`seat_queue_inputs_tx`], keeping only `seats` when given: every move and join is still read
+/// in one pass, but only those seats' named runs are probed, one query each.
+pub(crate) fn seat_queue_inputs_of_tx(
+    connection: &Connection,
+    agent: Option<&str>,
+    only: Option<&BTreeSet<String>>,
+) -> Result<BTreeMap<String, SeatQueueInputs>> {
     let mut seats = BTreeMap::<String, SeatQueueInputs>::new();
     let mut statement = connection.prepare(&seat_queue_moves_query())?;
     let rows = statement.query_map(params![seat_queue::MOVED_CLAIM, agent], |row| {
@@ -30841,6 +30863,9 @@ fn seat_queue_inputs_tx(
          FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
          WHERE step_runs.assignee=?1 AND step_runs.run_id=?2 AND step_runs.agentless=0",
     )?;
+    if let Some(only) = only {
+        seats.retain(|seat, _| only.contains(seat));
+    }
     for (seat, inputs) in &mut seats {
         let named = inputs
             .moves
@@ -30855,6 +30880,8 @@ fn seat_queue_inputs_tx(
             let Some(run_id) = run.strip_prefix("mission-run/") else {
                 continue;
             };
+            #[cfg(test)]
+            NAMED_RUN_PROBES.with(|probes| probes.set(probes.get() + 1));
             let joined = statement
                 .query_row(params![seat, run_id], |row| {
                     Ok((
