@@ -11,6 +11,25 @@ use crate::model::MessageView;
 
 /// The sender chose the silent message kind.
 pub const SILENT_TAG: &str = "st3-silent";
+/// Read compatibility for unshipped FYI previews; new unsigned sends store only st3-silent.
+pub const LEGACY_FYI_TAG: &str = "st3-fyi";
+
+pub fn is_silent_tag(tag: &str) -> bool {
+    matches!(tag, SILENT_TAG | LEGACY_FYI_TAG)
+}
+
+pub fn is_remaining_tag(tag: &str) -> bool {
+    tag.starts_with(REMAINING_PREFIX) || tag.starts_with("st3-fyi-remaining:")
+}
+
+pub fn view_tag(tag: &str) -> String {
+    if tag == LEGACY_FYI_TAG {
+        SILENT_TAG.into()
+    } else {
+        tag.into()
+    }
+}
+
 pub const BATCH_LIMIT: usize = 8;
 /// Delivery-only metadata, never stored in a message claim.
 pub const REMAINING_PREFIX: &str = "st3-silent-remaining:";
@@ -41,15 +60,16 @@ pub fn always_wakes(from: &str, tags: &[String]) -> bool {
 
 /// Whether a stored message is held: it wakes nobody until something else wakes its recipient.
 pub fn is_held(message: &MessageView) -> bool {
-    message.tags.iter().any(|tag| tag == SILENT_TAG) && !always_wakes(&message.from, &message.tags)
+    message.tags.iter().any(|tag| is_silent_tag(tag)) && !always_wakes(&message.from, &message.tags)
 }
 
 /// Normalize the accepted delivery tags once, without reading a recipient declaration.
 pub fn stored_tags(from: &str, requested: &[String]) -> Vec<String> {
     let mut tags = Vec::with_capacity(requested.len());
     for tag in requested {
-        if !tag.starts_with(REMAINING_PREFIX) && !tags.contains(tag) {
-            tags.push(tag.clone());
+        let tag = view_tag(tag);
+        if !is_remaining_tag(&tag) && !tags.contains(&tag) {
+            tags.push(tag);
         }
     }
     if always_wakes(from, &tags) {
@@ -319,6 +339,18 @@ mod tests {
                 &[SILENT_TAG]
             )));
         }
+    }
+
+    #[test]
+    fn old_daemon_receipt_tags_do_not_confirm_silent_delivery() {
+        let held = message("message/x", "agent/example/writer", "sent", &[SILENT_TAG]);
+        let mut raw = serde_json::to_value(&held).unwrap();
+        let old: crate::model::MessageSendReceipt = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(old.kind, None);
+        assert!(old.message.tags.contains(&SILENT_TAG.into()));
+        raw["kind"] = serde_json::json!("silent");
+        let new: crate::model::MessageSendReceipt = serde_json::from_value(raw).unwrap();
+        assert_eq!(new.kind.as_deref(), Some("silent"));
     }
 
     #[test]

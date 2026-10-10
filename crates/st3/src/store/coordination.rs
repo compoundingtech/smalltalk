@@ -10,8 +10,6 @@ CREATE TABLE IF NOT EXISTS coordination_sends (
     to_person INTEGER NOT NULL,
     held INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS coordination_sends_time
-ON coordination_sends(sent_ms, agent_to_agent, silent, to_person);
 CREATE TABLE IF NOT EXISTS local_coordination_backfill (
     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
     cursor INTEGER NOT NULL,
@@ -29,6 +27,11 @@ pub(super) fn create_schema(connection: &Connection) -> Result<()> {
             .query_map([], |row| row.get(1))?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     };
+    let existing = columns("coordination_sends")?;
+    if existing.iter().any(|name| name == "fyi") && !existing.iter().any(|name| name == "silent") {
+        // SQLite rewrites the covering index too; canonical message claims stay immutable.
+        connection.execute_batch("ALTER TABLE coordination_sends RENAME COLUMN fyi TO silent;")?;
+    }
     if !columns("coordination_sends")?
         .iter()
         .any(|name| name == "held")
@@ -45,7 +48,8 @@ pub(super) fn create_schema(connection: &Connection) -> Result<()> {
         connection.execute_batch("ALTER TABLE local_coordination_backfill ADD COLUMN progress_ms INTEGER NOT NULL DEFAULT 0;")?;
     }
     connection.execute_batch(
-        "CREATE INDEX IF NOT EXISTS coordination_sends_held ON coordination_sends(held,sent_ms);
+        "CREATE INDEX IF NOT EXISTS coordination_sends_time ON coordination_sends(sent_ms,agent_to_agent,silent,to_person);
+         CREATE INDEX IF NOT EXISTS coordination_sends_held ON coordination_sends(held,sent_ms);
          CREATE TRIGGER IF NOT EXISTS coordination_offer AFTER INSERT ON claims
          WHEN NEW.kind IN ('message.staged','message.delivered','message.read','message.closed')
          BEGIN
@@ -108,7 +112,7 @@ pub(super) fn sync(
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let tagged_held = tags.iter().any(|tag| tag == crate::silent::SILENT_TAG)
+    let tagged_held = tags.iter().any(|tag| crate::silent::is_silent_tag(tag))
         && !crate::silent::always_wakes(from, &tags);
     let silent = agent_to_agent && tagged_held;
     let held = tagged_held
@@ -232,6 +236,68 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn previous_fyi_preview_reopens_forward_and_preserves_unoffered_silent_mail() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("graph.db");
+        let store = Store::open(&path, "node").unwrap();
+        let send = |subject: &str, tag: &str| ClaimInput {
+            subject: subject.into(),
+            kind: "message.sent".into(),
+            actor: Some("agent/example/writer".into()),
+            fields: BTreeMap::from([
+                ("status".into(), json!("sent")),
+                ("from".into(), json!("agent/example/writer")),
+                ("to".into(), json!("agent/example/reader")),
+                ("content".into(), json!("held")),
+                ("tags".into(), json!([tag])),
+            ]),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: None,
+        };
+        store
+            .append_claim(&send("message/preview", crate::silent::LEGACY_FYI_TAG))
+            .unwrap();
+        store
+            .connection
+            .batched(|tx| {
+                tx.execute_batch("ALTER TABLE coordination_sends RENAME COLUMN silent TO fyi;")?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .unwrap()
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(&path, "node").unwrap();
+        let old = reopened.message("message/preview").unwrap().unwrap();
+        assert!(crate::silent::is_held(&old));
+        assert_eq!(old.tags, vec![crate::silent::SILENT_TAG]);
+        let mut unoffered = vec![old];
+        crate::silent::release(&mut unoffered);
+        assert!(unoffered.is_empty());
+        assert_eq!(
+            reopened
+                .claims_for("message/preview", Some("message.sent"))
+                .unwrap()[0]
+                .body["fields"]["tags"],
+            json!([crate::silent::LEGACY_FYI_TAG])
+        );
+        reopened
+            .append_claim(&send("message/new", crate::silent::SILENT_TAG))
+            .unwrap();
+        let counts = reopened.coordination_counts(0, u64::MAX / 2).unwrap();
+        assert_eq!(counts["silent"], 2);
+        assert_eq!(counts["agent_to_agent"], 2);
+        assert_eq!(counts["complete"], true);
+        assert_eq!(reopened.held_mail_before(u128::MAX).unwrap()[0].1, 2);
+        let plan = reopened.readers.get().prepare("EXPLAIN QUERY PLAN SELECT SUM(silent) FROM coordination_sends WHERE sent_ms>=0 AND sent_ms<=10000000000000").unwrap().query_map([], |row| row.get::<_,String>(3)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert!(
+            plan.iter()
+                .any(|row| row.contains("COVERING INDEX coordination_sends_time")),
+            "{plan:?}"
+        );
+    }
+
     #[test]
     fn malformed_historical_body_keeps_bootstrap_incomplete_without_blocking_open() {
         let root = tempfile::tempdir().unwrap();

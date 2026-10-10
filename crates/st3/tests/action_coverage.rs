@@ -2397,6 +2397,7 @@ async fn cli_silent_kinds_and_count_reads_survive_restart() {
     };
     let silent_args = send("copper-silent", "silent");
     let sent = cli_value(daemon.cli(PEER, &silent_args).await);
+    assert_eq!(sent["kind"], "silent");
     let held = sent["subject"].as_str().unwrap().to_owned();
     assert!(st3::silent::is_held(
         &daemon.store().message(&held).unwrap().unwrap()
@@ -2414,6 +2415,7 @@ async fn cli_silent_kinds_and_count_reads_survive_restart() {
     );
     assert_eq!(read["status"], "read");
     let question = cli_value(daemon.cli(PEER, &send("copper-question", "wake")).await);
+    assert_eq!(question["kind"], "wake");
     assert!(!st3::silent::is_held(
         &daemon
             .store()

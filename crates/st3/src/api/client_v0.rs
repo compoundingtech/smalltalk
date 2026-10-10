@@ -9055,7 +9055,7 @@ fn message_send_tags(parameters: &Value) -> Result<Vec<String>, ApiError> {
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
-    let marked_silent = tags.iter().any(|tag| tag == crate::silent::SILENT_TAG);
+    let marked_silent = tags.iter().any(|tag| crate::silent::is_silent_tag(tag));
     if kind == "wake" && marked_silent {
         return Err(validation(
             "wake messages cannot carry the silent delivery tag",

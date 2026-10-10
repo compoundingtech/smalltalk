@@ -16894,7 +16894,10 @@ async fn send_message(
             if let Some(previous) = hour.checked_sub(1) {
                 let previous = derived_message_key(&request, incarnation.as_deref(), previous);
                 match client.sent_message(&previous).await {
-                    Ok(Some(receipt)) => return Ok(Some(receipt)),
+                    Ok(Some(receipt)) => {
+                        warn_unconfirmed_silent(&request, &receipt);
+                        return Ok(Some(receipt));
+                    }
                     Ok(None) => {}
                     // A daemon from before the lookup has no such route. Its sends still repeat
                     // only within the hour.
@@ -16912,24 +16915,24 @@ async fn send_message(
     };
     match client.send_message(&request).await {
         Ok(receipt) => {
-            if request.from.starts_with("agent/")
-                && request
-                    .tags
-                    .iter()
-                    .any(|tag| tag == st3::silent::SILENT_TAG)
-                && !receipt
-                    .message
-                    .tags
-                    .iter()
-                    .any(|tag| tag == st3::silent::SILENT_TAG)
-            {
-                eprintln!(
-                    "st: daemon did not confirm silent holding; this message may wake its recipient. Upgrade the sender and recipient owner daemons."
-                );
-            }
+            warn_unconfirmed_silent(&request, &receipt);
             Ok(Some(receipt))
         }
         Err(error) => Err(message_send_error(error, &request.idempotency_key)),
+    }
+}
+
+fn warn_unconfirmed_silent(request: &MessageSendRequest, receipt: &MessageSendReceipt) {
+    if request.from.starts_with("agent/")
+        && request
+            .tags
+            .iter()
+            .any(|tag| tag == st3::silent::SILENT_TAG)
+        && receipt.kind.as_deref() != Some("silent")
+    {
+        eprintln!(
+            "st: daemon did not confirm silent holding; this message may wake its recipient. Upgrade the sender and recipient owner daemons."
+        );
     }
 }
 

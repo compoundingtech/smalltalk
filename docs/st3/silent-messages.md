@@ -34,7 +34,7 @@ tags remain allowed and do not bypass silence; daemon planning `launch` notices 
 
 The daemon decides once at acceptance, without a recipient-policy query or question-thread state.
 Readers classify the stored kind from tags and sender; delivery adds no per-message query.
-Retries preserve canonical accepted input and reject a changed kind.
+Retries preserve canonical accepted input and reject a changed kind. Unsigned admission deduplicates tags and discards delivery-only remaining-count tags on both wake and silent messages.
 
 A seat's mailbox stream keeps held mail admitted, but it leaves unoffered held mail out of the
 frame it sends until a message that wakes the seat is in it. At most the eight newest unoffered silent messages go out with that wake, in send order.
@@ -65,10 +65,10 @@ rolling day and publishes informational values; zero merges gives no ratio.
 
 Old daemons silently ignore the typed `kind` field and do not hold `st3-silent` tags, so a
 silent message may wake its recipient. Old CLIs reject `--kind`. The CLI warns when an agent's
-requested silent tag is absent from the receipt; SDK callers must inspect returned tags in a
+requested silent delivery is not confirmed by the raw receipt's `kind: silent` (old daemons may
+retain the tag without honoring it); SDK callers must upgrade all owners before relying on silent delivery in a
 mixed fleet. Upgrade all senders and owner daemons before relying on silent delivery.
-Downgrading below this build is unsupported; use forward recovery. Earlier FYI/silent preview
-binaries have incompatible local metadata and positional inserts and may fail sends or startup.
+Downgrading below this build is unsupported; use forward recovery. The startup writer migrates an earlier preview metadata column from `fyi` to `silent`; its covering index follows. Legacy held tags are read as silent without rewriting canonical claims, so preview-held mail stays unread and held. Earlier preview binaries remain incompatible with the new schema: recover forward, never downgrade.
 Pre-feature binaries lose no-wake guarantees. Rust struct literals must supply `kind: MessageKind`;
 deserialization and CLI defaults are wake. There is no seat declaration or restart change.
 
@@ -76,7 +76,7 @@ Bootstrap reports `cursor`, `ceiling`, `progress_ms` and `complete` from local m
 doctor warns if unfinished bootstrap makes no progress for 15 minutes. On reopening after
 an old binary ran, the writer reopens the uncovered send tail in bounded jobs. Corrupt source
 claims are not skipped: bootstrap fails closed and keeps counts incomplete so a collector
-cannot publish a plausible undercount. A failed startup bootstrap page rolls back and logs the error while allowing the daemon to start; later bootstrap remains incomplete. Repair the source using existing recovery procedures.
+cannot publish a plausible undercount. A failed startup bootstrap page rolls back and logs the error while allowing the daemon to start; later bootstrap remains incomplete. The background task already pauses 60 seconds after a failed page; successful incomplete pages pause 100 ms. Repair the source using existing recovery procedures.
 
 At eight subjects per job with a 100-millisecond pause, 100,000 historical sends need at
 least about 20.8 minutes and one million about 3.5 hours, plus writer contention. Until

@@ -13375,7 +13375,10 @@ impl Store {
     pub fn held_mail_before(&self, before_unix_ms: u128) -> Result<Vec<(String, u64, u128)>> {
         let mut seats = BTreeMap::<String, (u64, u128)>::new();
         for sent in unread_mail::sent_before(&self.readers.get(), before_unix_ms)? {
-            if sent.tags.iter().any(|tag| tag == crate::silent::SILENT_TAG)
+            if sent
+                .tags
+                .iter()
+                .any(|tag| crate::silent::is_silent_tag(tag))
                 && !crate::silent::always_wakes(&sent.from, &sent.tags)
             {
                 let seat = seats.entry(sent.to).or_insert((0, sent.sent_unix_ms));
@@ -22342,8 +22345,8 @@ fn message_view_tx(
                 values
                     .iter()
                     .filter_map(Value::as_str)
-                    .filter(|tag| !tag.starts_with(crate::silent::REMAINING_PREFIX))
-                    .map(str::to_owned)
+                    .filter(|tag| !crate::silent::is_remaining_tag(tag))
+                    .map(crate::silent::view_tag)
                     .collect()
             })
             .unwrap_or_else(|| {
@@ -22352,7 +22355,8 @@ fn message_view_tx(
                     .map(|value| {
                         canonical_child_strings(value, "tag")
                             .into_iter()
-                            .filter(|tag| !tag.starts_with(crate::silent::REMAINING_PREFIX))
+                            .filter(|tag| !crate::silent::is_remaining_tag(tag))
+                            .map(|tag| crate::silent::view_tag(&tag))
                             .collect()
                     })
                     .unwrap_or_default()

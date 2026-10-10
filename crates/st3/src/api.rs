@@ -3751,6 +3751,14 @@ async fn message_by_key(
             .map_err(ApiError::internal)?
             .ok_or_else(not_sent)?;
         Ok(Json(MessageSendReceipt {
+            kind: Some(
+                if crate::silent::is_held(&message) {
+                    "silent"
+                } else {
+                    "wake"
+                }
+                .into(),
+            ),
             message,
             idempotency_key: query.key.clone(),
             already_sent: true,
@@ -12437,7 +12445,7 @@ fn accept_message_receipt_with_upload_owner(
         && request
             .tags
             .iter()
-            .any(|tag| tag.starts_with(crate::silent::REMAINING_PREFIX))
+            .any(|tag| crate::silent::is_remaining_tag(tag))
     {
         return Err(ApiError::bad(St3Error::new(
             "reserved-message-tag",
@@ -12554,7 +12562,7 @@ fn accept_message_receipt_with_upload_owner(
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .filter(|tag| !tag.starts_with(crate::silent::REMAINING_PREFIX))
+        .filter(|tag| !crate::silent::is_remaining_tag(tag))
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let mut work_wake = is_work_wake(&tags);
@@ -12566,7 +12574,15 @@ fn accept_message_receipt_with_upload_owner(
         settle_answered_message(&state.store, reference, &from, &to, &subject, &record.id)?;
     }
     signal_message_changed(state, "message.sent", work_wake);
+    let kind = if tags.iter().any(|tag| crate::silent::is_silent_tag(tag))
+        && !crate::silent::always_wakes(&from, &tags)
+    {
+        "silent"
+    } else {
+        "wake"
+    };
     Ok(MessageSendReceipt {
+        kind: Some(kind.into()),
         message: MessageView {
             subject,
             from,
