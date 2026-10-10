@@ -418,7 +418,7 @@ impl Store {
         let claims = {
             let connection = self.readers.get();
             let mut statement = connection.prepare_cached(
-                "SELECT subject, kind, actor, CAST(accepted_at_unix_ms AS TEXT) FROM claims
+                "SELECT id, subject, kind, actor, CAST(accepted_at_unix_ms AS TEXT) FROM claims
                  WHERE store_index>?1 AND store_index<=?2 ORDER BY store_index LIMIT ?3",
             )?;
             statement
@@ -426,8 +426,9 @@ impl Store {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
@@ -435,7 +436,7 @@ impl Store {
         if claims.len() > DELTA_LIMIT {
             return Ok(Some("many".into()));
         }
-        for (subject, kind, actor, accepted) in claims {
+        for (id, subject, kind, actor, accepted) in claims {
             let accepted = accepted.parse::<u128>().unwrap_or(0);
             if accepted > now {
                 *due = Some(due.map_or(accepted, |due: u128| due.min(accepted)));
@@ -447,13 +448,16 @@ impl Store {
                 // Work by a seat counts as its activity in the login fold: it can only clear a
                 // login item the seat already has.
                 match actor.as_deref().filter(|actor| actor.starts_with("agent/")) {
-                    Some(seat) => seats.has_login_item(seat),
+                    Some(seat) => seats.has_seat_item(seat),
                     None => false,
                 }
             } else if kind.starts_with("harness.") {
-                seats.has_login_item(&subject) || seats.needs_login(&subject)?
+                seats.has_seat_item(&subject)
+                    || seats.needs_login(&subject)?
+                    // An observation blocked on a person is a harness prompt for its seat.
+                    || kind == "harness.observed" && blocked_on_human(&self.readers.get(), &id)?
             } else if SEAT_RUNTIME_KINDS.contains(&kind.as_str()) {
-                seats.has_login_item(&subject)
+                seats.has_seat_item(&subject)
                     || seats.needs_login(&subject)?
                     || seats.retiring(&subject)?
             } else {
@@ -467,12 +471,12 @@ impl Store {
     }
 }
 
-/// What one delta asks about seats, each answered once: whether the previous rows hold its
-/// login item, whether it needs a login now, and whether it is retiring.
+/// What one delta asks about seats, each answered once: whether the previous rows hold a login
+/// or prompt item for it, whether it needs a login now, and whether it is retiring.
 struct SeatChecks<'a> {
     store: &'a Store,
     previous: &'a AttentionPublication,
-    login_items: Option<BTreeSet<String>>,
+    seat_items: Option<BTreeSet<String>>,
     needs_login: HashMap<String, bool>,
     retiring: HashMap<String, bool>,
 }
@@ -482,19 +486,19 @@ impl<'a> SeatChecks<'a> {
         Self {
             store,
             previous,
-            login_items: None,
+            seat_items: None,
             needs_login: HashMap::new(),
             retiring: HashMap::new(),
         }
     }
 
-    /// Whether the previous rows hold a login item for `seat`: any claim about it can change
-    /// that item, its episode or its removal. A login item names its seat as its source and
-    /// lists every seat it covers in its targets, so a seat sharing another's login counts too.
-    fn has_login_item(&mut self, seat: &str) -> bool {
+    /// Whether the previous rows hold a login or prompt item for `seat`: any claim about it can
+    /// change that item, its episode or its removal. Such an item names its seat as its source
+    /// and lists every seat it covers in its targets, so a seat sharing another's login counts.
+    fn has_seat_item(&mut self, seat: &str) -> bool {
         let previous = self.previous;
-        self.login_items
-            .get_or_insert_with(|| login_seats(&previous.rows))
+        self.seat_items
+            .get_or_insert_with(|| item_seats(&previous.rows))
             .contains(seat)
     }
 
@@ -526,10 +530,13 @@ impl<'a> SeatChecks<'a> {
     }
 }
 
-/// Every seat a login item in `rows` covers: its source and its targets.
-fn login_seats(rows: &[Value]) -> BTreeSet<String> {
+/// Attention kinds made of a seat's harness and runtime claims.
+const SEAT_ITEM_KINDS: &[&str] = &["harness-login", "harness-prompt"];
+
+/// Every seat a login or prompt item in `rows` covers: its source and its targets.
+fn item_seats(rows: &[Value]) -> BTreeSet<String> {
     rows.iter()
-        .filter(|row| row["attention_kind"] == "harness-login")
+        .filter(|row| row["attention_kind"].as_str().is_some_and(|kind| SEAT_ITEM_KINDS.contains(&kind)))
         .flat_map(|row| {
             row["source_id"]
                 .as_str()
@@ -538,6 +545,19 @@ fn login_seats(rows: &[Value]) -> BTreeSet<String> {
                 .map(str::to_owned)
         })
         .collect()
+}
+
+/// Whether the harness observation `id` says its seat is blocked on a person.
+fn blocked_on_human(connection: &Connection, id: &str) -> Result<bool> {
+    Ok(connection
+        .prepare_cached(
+            "SELECT COALESCE(json_extract(body, '$.fields.blocked_on'), json_extract(body, '$.blocked_on'))='human'
+             FROM claims WHERE id=?1",
+        )?
+        .query_row([id], |row| row.get::<_, Option<bool>>(0))
+        .optional()?
+        .flatten()
+        .unwrap_or(false))
 }
 
 /// Whether `subject`'s current declaration is a stop: only then can a retiring seat's ask read
