@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Count a fresh agents list (st agents ls and tree) under its own person-read-fresh target instead of under none",
+  "replay": {"status": "none", "detail": "No claim, projection or replay change; the windows are process memory only."},
+  "schema": {"status": "none", "detail": "No table, index or migration change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests unchanged."},
+  "compatibility": {"status": "changed", "detail": "GET /v1/client/request-latency paths and st doctor change for fresh=true agents reads only: they move from 'GET /v1/client/agents (long poll)' to 'GET /v1/client/agents (fresh)' and a new person-read-fresh target (p99 300 ms) with its own slo/person-read-fresh doctor line, a miss being info. The 100 ms person-read target and every other target are unchanged."},
+  "downtime": {"status": "none", "detail": "Normal restart on deploy; the windows start empty after each restart."},
+  "manual": {"status": "none", "detail": "Nothing to configure."},
+  "recovery": {"status": "none", "detail": "Swapping back to an older build drops only the in-memory windows and the new target."}
+}

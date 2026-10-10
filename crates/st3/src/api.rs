@@ -1292,7 +1292,11 @@ struct Served {
 
 /// A client collections socket's subscription sent its first snapshot or screen.
 pub(crate) fn record_stream_latency(collection: &str, elapsed: Duration, remote: bool) {
-    let timed = request_latency::Timed::resolve(&format!("stream {collection}"), remote, false);
+    let timed = request_latency::Timed::resolve(
+        &format!("stream {collection}"),
+        remote,
+        request_latency::Wait::No,
+    );
     request_latency()
         .lock()
         .unwrap()
@@ -1310,11 +1314,16 @@ fn record_request_latency(
 ) {
     let elapsed = started.elapsed();
     crate::performance::record_request(route, Some(caller), elapsed);
-    // The key and the target lookup allocate and scan; do them before taking the lock. A designed
-    // wait (a long poll, a fresh agents read) counts toward no target.
-    let waits = served.long_poll || request_latency::waits_by_design(method, route, query);
-    let timed =
-        request_latency::Timed::resolve(&format!("{method} {route}"), served.remote, waits);
+    // The key and the target lookup allocate and scan; do them before taking the lock. A long
+    // poll counts toward no target; a fresh agents list toward its own.
+    let wait = if served.long_poll {
+        request_latency::Wait::LongPoll
+    } else if request_latency::is_fresh_agents_read(method, route, query) {
+        request_latency::Wait::Fresh
+    } else {
+        request_latency::Wait::No
+    };
+    let timed = request_latency::Timed::resolve(&format!("{method} {route}"), served.remote, wait);
     {
         let mut meter = request_latency().lock().unwrap();
         meter.record(method, route, path, query, elapsed);
