@@ -34133,13 +34133,14 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
     /// before the dialog is drawn and while Claude works.
     #[test]
     fn a_refused_claude_prompt_is_gone_only_after_its_dialog_was_seen() {
-        let fixture = |name: &str| {
-            std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("../st-drivers/tests/fixtures/blocking-screens")
-                    .join(name),
-            )
-            .unwrap()
+        let fixture = |name: &str| -> String {
+            match name {
+                "claude-working.txt" => include_str!("../../st-drivers/tests/fixtures/blocking-screens/claude-working.txt"),
+                "claude-permission-dialog.txt" => include_str!("../../st-drivers/tests/fixtures/blocking-screens/claude-permission-dialog.txt"),
+                "claude-permission-refused.txt" => include_str!("../../st-drivers/tests/fixtures/blocking-screens/claude-permission-refused.txt"),
+                _ => unreachable!("{name}"),
+            }
+            .into()
         };
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();

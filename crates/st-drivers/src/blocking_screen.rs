@@ -189,13 +189,18 @@ pub fn claude_input_ready(screen: &str) -> bool {
 mod tests {
     #[test]
     fn claude_input_box_is_back_after_a_refusal_and_absent_in_every_dialog() {
-        let screen = |name: &str| {
-            std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/blocking-screens")
-                    .join(name),
-            )
-            .unwrap()
+        let screen = |name: &str| -> &'static str {
+            match name {
+                "claude-permission-dialog.txt" => include_str!("../tests/fixtures/blocking-screens/claude-permission-dialog.txt"),
+                "claude-edit-dialog.txt" => include_str!("../tests/fixtures/blocking-screens/claude-edit-dialog.txt"),
+                "claude-ask-question.txt" => include_str!("../tests/fixtures/blocking-screens/claude-ask-question.txt"),
+                "claude-plan-dialog.txt" => include_str!("../tests/fixtures/blocking-screens/claude-plan-dialog.txt"),
+                "claude-trust.txt" => include_str!("../tests/fixtures/blocking-screens/claude-trust.txt"),
+                "claude-permission-refused.txt" => include_str!("../tests/fixtures/blocking-screens/claude-permission-refused.txt"),
+                "claude-edit-refused.txt" => include_str!("../tests/fixtures/blocking-screens/claude-edit-refused.txt"),
+                "claude-working.txt" => include_str!("../tests/fixtures/blocking-screens/claude-working.txt"),
+                _ => unreachable!("{name}"),
+            }
         };
         for dialog in [
             "claude-permission-dialog.txt",
@@ -204,7 +209,7 @@ mod tests {
             "claude-plan-dialog.txt",
             "claude-trust.txt",
         ] {
-            assert!(!super::claude_input_ready(&screen(dialog)), "{dialog}");
+            assert!(!super::claude_input_ready(screen(dialog)), "{dialog}");
         }
         // The box is back after a refusal, and also while Claude works: only a dialog seen
         // first makes its return mean the prompt is gone.
@@ -213,7 +218,7 @@ mod tests {
             "claude-edit-refused.txt",
             "claude-working.txt",
         ] {
-            assert!(super::claude_input_ready(&screen(input)), "{input}");
+            assert!(super::claude_input_ready(screen(input)), "{input}");
         }
         assert!(!super::claude_input_ready(""));
         // A dialog's selected choice between two rules is not the input prompt.
