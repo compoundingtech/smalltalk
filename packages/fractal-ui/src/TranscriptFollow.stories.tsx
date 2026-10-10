@@ -19,6 +19,7 @@ interface Drivers {
   readonly prepend: (count: number, preserve: boolean) => void
   /** The host acknowledges the pending row under a new key without changing its content. */
   readonly acknowledge: () => void
+  readonly navigate: (top: number) => void
 }
 let drivers: Drivers | undefined
 const drive = () => { if (drivers === undefined) throw new Error('Follow story not mounted'); return drivers }
@@ -46,6 +47,10 @@ function FollowStory({ scheme = 'dark', lane = 'kit' }: { scheme?: Scheme; lane?
         else change()
       },
       acknowledge: () => flushSync(() => setLatestKey('timeline-entry/ack')),
+      navigate: top => {
+        if (viewport.current === null) throw new Error('Explicit navigation needs the kit viewport')
+        viewport.current.scrollTo(top)
+      },
     }
     return () => { drivers = undefined }
   }, [])
@@ -53,6 +58,7 @@ function FollowStory({ scheme = 'dark', lane = 'kit' }: { scheme?: Scheme; lane?
     <p {...stylex.props(styles.text)}>{row.text}</p>
     {row.id === 'history-3' && expanded && <pre data-testid="expanded-above" {...stylex.props(styles.expanded)}>{'An expanded observation above the reading line.\n'.repeat(10)}</pre>}
     {row.id === latestKey && <Button>Reply action</Button>}
+    {row.id === 'history-0' && <Button excludeFromTabOrder>Earlier row action</Button>}
   </article>)
   return <main {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
     {lane === 'kit'
@@ -338,7 +344,12 @@ async function proveFocusKeepsFollowing(canvasElement: HTMLElement, navigation =
   if (document.activeElement instanceof HTMLElement) document.activeElement.blur()
   await userEvent.tab()
   await expect(document.activeElement).toBe(lane)
-  if (navigation) lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageUp', bubbles: true }))
+  if (navigation) {
+    lane.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageUp', bubbles: true }))
+    lane.scrollTop -= 80
+    lane.dispatchEvent(new Event('scroll'))
+    await settle()
+  }
   for (let chunk = 0; chunk < 4; chunk++) {
     const painted = await paintedAfter(() => drive().stream(), () => gap(lane))
     await expect(painted, 'focus alone must keep streaming at the end').toBeLessThanOrEqual(1)
@@ -379,6 +390,62 @@ export const KeyboardPillNotActivatedControl: Story = { play: async ({ canvasEle
   await expect(proveKeyboardPill(canvasElement, false)).rejects.toThrow()
 } }
 export const KeyboardPillNotActivatedControlLight: Story = { ...KeyboardPillNotActivatedControl, args: { scheme: 'light' } }
+
+/** Reviewed upstream input/no-op navigation fixups: only an actual move changes follow mode. */
+async function proveSignalsKeepFollowing(canvasElement: HTMLElement, actualMove = false) {
+  const { canvas, lane } = await ready(canvasElement)
+  for (const event of [
+    new WheelEvent('wheel', { deltaY: -80, bubbles: true }),
+    new Event('touchmove', { bubbles: true }),
+    new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }),
+    new PointerEvent('pointerdown', { pointerId: 99, bubbles: true }),
+  ]) {
+    lane.dispatchEvent(event)
+    if (actualMove) { lane.scrollTop -= 80; lane.dispatchEvent(new Event('scroll')); await settle() }
+    const painted = await paintedAfter(() => drive().stream(), () => gap(lane))
+    await expect(painted, 'input signals without movement must keep following').toBeLessThanOrEqual(1)
+    lane.dispatchEvent(new PointerEvent('pointerup', { pointerId: 99, bubbles: true }))
+    lane.dispatchEvent(new Event('scrollend'))
+    await expectAttached(canvasElement, lane)
+  }
+  drive().navigate(lane.scrollTop)
+  const noOp = await paintedAfter(() => drive().stream(), () => gap(lane))
+  await expect(noOp, 'no-op explicit navigation must keep following').toBeLessThanOrEqual(1)
+  await settle()
+  // This layout scroll was already delivered. Focus must not compare it to the stale repin target.
+  lane.scrollTop -= 47
+  lane.dispatchEvent(new Event('scroll'))
+  canvas.getByRole('button', { name: 'Reply action' }).focus({ preventScroll: true })
+  const pending = await paintedAfter(() => drive().stream(), () => gap(lane))
+  await expect(pending, 'focus without movement during a pending repin must keep following').toBeLessThanOrEqual(1)
+  await expectAttached(canvasElement, lane)
+}
+export const SignalsWithoutMovementKeepFollowing: Story = { play: async ({ canvasElement }) => { await proveSignalsKeepFollowing(canvasElement) } }
+export const SignalsWithoutMovementKeepFollowingLight: Story = { ...SignalsWithoutMovementKeepFollowing, args: { scheme: 'light' } }
+export const ActualReaderMovementControl: Story = { play: async ({ canvasElement }) => {
+  await expect(proveSignalsKeepFollowing(canvasElement, true)).rejects.toThrow(/input signals without movement/)
+} }
+export const ActualReaderMovementControlLight: Story = { ...ActualReaderMovementControl, args: { scheme: 'light' } }
+
+/** Native focus scrolling is real navigation, even while a layout repin is pending. */
+async function proveNativeFocusNavigation(canvasElement: HTMLElement, preventScroll = false) {
+  const { canvas, lane } = await ready(canvasElement)
+  lane.scrollTop -= 47
+  lane.dispatchEvent(new Event('scroll'))
+  canvas.getByRole('button', { name: 'Earlier row action' }).focus({ preventScroll })
+  await settle()
+  await expect(lane.dataset['followState'], 'native focus navigation must detach').toBe('detached')
+  const top = lane.scrollTop
+  await expect(gap(lane)).toBeGreaterThan(40)
+  const moved = await paintedAfter(() => drive().stream(), () => Math.abs(lane.scrollTop - top))
+  await expect(moved, 'streaming must preserve the native focus navigation target').toBeLessThanOrEqual(1)
+}
+export const NativeFocusNavigationKeepsTarget: Story = { play: async ({ canvasElement }) => { await proveNativeFocusNavigation(canvasElement) } }
+export const NativeFocusNavigationKeepsTargetLight: Story = { ...NativeFocusNavigationKeepsTarget, args: { scheme: 'light' } }
+export const FocusPreventScrollControl: Story = { play: async ({ canvasElement }) => {
+  await expect(proveNativeFocusNavigation(canvasElement, true)).rejects.toThrow(/native focus navigation must detach/)
+} }
+export const FocusPreventScrollControlLight: Story = { ...FocusPreventScrollControl, args: { scheme: 'light' } }
 
 export const AllStates: Story = { render: args => <FollowStory {...args} /> }
 

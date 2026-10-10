@@ -47,6 +47,8 @@ class ViewportController {
   private captureFrame: number | undefined
   private unread = false
   private lastTop = 0
+  /** Last delivered scroll or controller write, independent of a pending repin. */
+  private observedTop = 0
   private programmaticTop: number | undefined
   private readerInputAt = -Infinity
   private readerGesture = false
@@ -132,12 +134,14 @@ class ViewportController {
 
   private writeTop(top: number) {
     const element = this.element
-    if (element === null) return
+    if (element === null) return false
     const target = Math.max(0, Math.min(top, element.scrollHeight - element.clientHeight))
-    if (Math.abs(target - element.scrollTop) < geometryNumbers.scrollEndTolerance) return
+    if (Math.abs(target - element.scrollTop) < geometryNumbers.scrollEndTolerance) return false
     element.scrollTop = target
     this.programmaticTop = element.scrollTop
     this.lastTop = element.scrollTop
+    this.observedTop = element.scrollTop
+    return true
   }
 
   /** Pin the pressed row, not the first visible row: insertion above must not move its action. */
@@ -193,14 +197,13 @@ class ViewportController {
   }
 
   readonly scrollTo = (top: number) => {
+    if (!this.writeTop(top)) return
     this.following = false
     this.readerInputAt = -Infinity
     this.readerGesture = false
     this.pendingTop = undefined
     this.pressedAnchor = undefined
     this.anchor = undefined
-    this.writeTop(top)
-    if (this.element !== null) this.lastTop = this.element.scrollTop
     this.dock()
     this.scheduleCapture()
   }
@@ -231,6 +234,7 @@ class ViewportController {
   readonly attach = (element: HTMLDivElement | null) => {
     if (element === null) return
     this.element = element
+    this.observedTop = element.scrollTop
     const manual = (event: Event) => {
       if (event instanceof KeyboardEvent && (navigationKeys[event.key] !== true || (event.target instanceof HTMLElement && event.target.closest('input,textarea,[contenteditable="true"]')))) return
       if (event.type === 'wheel' || event.type === 'touchmove' || event.type === 'keydown') {
@@ -238,15 +242,26 @@ class ViewportController {
         this.readerGesture = true
       }
       if (event.type === 'wheel' || event.type === 'touchmove' || event.type === 'keydown') this.pressedAnchor = undefined
-      this.following = false
-      this.dock()
       this.programmaticTop = undefined
       this.pendingTop = undefined
-      this.scheduleCapture()
-      if (this.frame !== undefined) cancelAnimationFrame(this.frame)
-      this.frame = undefined
+    }
+    const focus = () => {
+      // Native focus can scroll before focusin, but its scroll event arrives later.
+      // Already-delivered layout scrolls must not count as focus movement.
+      const previousTop = this.observedTop
+      queueMicrotask(() => {
+        if (this.element !== element || Math.abs(element.scrollTop - previousTop) < geometryNumbers.scrollEndTolerance || element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.scrollEndTolerance) return
+        this.following = false
+        this.pendingTop = undefined
+        this.programmaticTop = undefined
+        this.pressedAnchor = undefined
+        this.lastTop = element.scrollTop
+        this.dock()
+        this.scheduleCapture()
+      })
     }
     const scroll = () => {
+      this.observedTop = element.scrollTop
       if (element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.scrollEndTolerance) {
         this.following = true
         this.unread = false
@@ -331,6 +346,7 @@ class ViewportController {
     element.addEventListener('touchmove', manual, { passive: true })
     element.addEventListener('keydown', manual)
     element.addEventListener('pointerdown', manual, { passive: true })
+    element.addEventListener('focusin', focus)
     element.addEventListener('scroll', scroll, { passive: true })
     element.addEventListener('scrollend', scrollend, { passive: true })
     page.addEventListener('pointerdown', press, true)
@@ -358,6 +374,7 @@ class ViewportController {
       element.removeEventListener('touchmove', manual)
       element.removeEventListener('keydown', manual)
       element.removeEventListener('pointerdown', manual)
+      element.removeEventListener('focusin', focus)
       element.removeEventListener('scroll', scroll)
       element.removeEventListener('scrollend', scrollend)
       page.removeEventListener('pointerdown', press, true)
