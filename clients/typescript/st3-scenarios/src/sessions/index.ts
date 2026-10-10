@@ -60,7 +60,7 @@ export const sessions: readonly Session[] = [
       { kind: 'user', t: 0, text: 'Draft a migration plan before changing the inventory format.' },
       { kind: 'status', t: 0, status: 'running' },
       { kind: 'tool', t: 11, end: 13, id: 'read-format', name: 'read', input: { path: 'docs/inventory-format.md' }, output: 'Version 1: quantity is a string. Version 2 will store an integer.' },
-      { kind: 'say', t: 34, text: 'Migration draft: validate quantities, preserve the original file, then write the version marker.', final: false },
+      { kind: 'say', t: 34, text: 'Migration draft: validate quantities, preserve the original file, then write the version marker.' },
       { kind: 'tool', t: 45, id: 'interrupted-write', name: 'write', input: { path: 'docs/migration-plan.md' } },
       { kind: 'status', t: 52, status: 'cancelled', detail: 'Interrupted by the operator. Draft and prior output are retained.' },
     ],
