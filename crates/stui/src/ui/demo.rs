@@ -512,6 +512,7 @@ fn agent(
     Agent {
         id: s(id),
         name: s(name),
+        lifecycle: None,
         harness,
         state,
         host: s(host),
@@ -639,6 +640,7 @@ fn agents() -> Vec<Agent> {
     list.push(Agent {
         id: s("session/unmanaged-1"),
         name: s("codex in ~/src/scratch"),
+        lifecycle: None,
         harness: Harness::Codex,
         state: AgentState::Unknown,
         host: s("lark"),

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "stui marks explicitly declared standing seats with a dim Nerd Font anchor after their name in both Agents sidebar views, retaining the marker when names are shortened.",
+  "replay": { "status": "none", "detail": "Presentation only; no replay or projection rebuild." },
+  "schema": { "status": "none", "detail": "Consumes the existing optional client-v0 lifecycle enum; no database or API schema changes." },
+  "rules": { "status": "none", "detail": "Only declared standing lifecycle renders a marker. Owner, bounded, and undeclared lifecycles remain unmarked." },
+  "compatibility": { "status": "none", "detail": "Older daemons omit lifecycle and render no marker. The anchor is U+F0031 and requires a Nerd Font for its intended appearance." },
+  "downtime": { "status": "none", "detail": "No daemon restart or service interruption is required." },
+  "manual": { "status": "none", "detail": "No declaration changes are required. A terminal Nerd Font displays the anchor." },
+  "recovery": { "status": "none", "detail": "No stored state transition or new recovery procedure." }
+}

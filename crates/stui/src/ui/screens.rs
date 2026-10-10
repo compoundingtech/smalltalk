@@ -1438,6 +1438,27 @@ fn subagent_lines(agent: &Agent, indent: &str, width: usize) -> Vec<Line<'static
         .collect()
 }
 
+/// Reserve the standing marker before the shell truncates the row against its right columns.
+/// The last span is the name; tree callers include their final folder indent before fitting it.
+fn mark_standing(
+    agent: &Agent,
+    first: &mut Vec<Span<'static>>,
+    right: &[Span<'static>],
+    width: usize,
+) {
+    if agent.lifecycle != Some(st3_client::AgentLifecycle::Standing) {
+        return;
+    }
+    const MARKER: &str = " \u{F0031}";
+    let prefix_width = first[..first.len() - 1].iter().map(Span::width).sum::<usize>();
+    let right_width = right.iter().map(Span::width).sum::<usize>();
+    let room = width.saturating_sub(prefix_width + right_width + 2 + text::width(MARKER));
+    if let Some(name) = first.last_mut() {
+        name.content = text::truncate(&name.content, room).into();
+    }
+    first.push(span(MARKER, theme::dim()));
+}
+
 pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listing {
     let mut items = Vec::new();
     let mut ids = Vec::new();
@@ -1465,19 +1486,22 @@ pub fn agents_list(world: &World, spinner: &'static str, width: usize) -> Listin
         }
         let (glyph, color) = agent_glyph(agent.state, spinner);
         let path = agent.id.strip_prefix("agent/").unwrap_or(&agent.id);
+        let mut first = vec![
+            span(format!(" {glyph} "), theme::strong(color)),
+            span(agent.name.clone(), theme::bold()),
+        ];
+        let right = vec![
+            span(
+                agent.harness.name(),
+                theme::fg(harness_color(agent.harness)),
+            ),
+            span(format!(" {:>4}", agent.activity), theme::dim()),
+        ];
+        mark_standing(agent, &mut first, &right, width);
         items.push(Item::Row {
             index: ids.len(),
-            first: vec![
-                span(format!(" {glyph} "), theme::strong(color)),
-                span(agent.name.clone(), theme::bold()),
-            ],
-            right: vec![
-                span(
-                    agent.harness.name(),
-                    theme::fg(harness_color(agent.harness)),
-                ),
-                span(format!(" {:>4}", agent.activity), theme::dim()),
-            ],
+            first,
+            right,
             // What its step last reported leads; the path says who it is when nothing was said.
             second: match &agent.details.progress {
                 Some(progress) => vec![span(
@@ -3044,12 +3068,14 @@ pub fn agents_tree(world: &World, spinner: &'static str, width: usize) -> Listin
         if let Item::Row {
             index,
             first,
+            right,
             children,
             ..
         } = item
             && let Some(agent) = agents.iter().find(|agent| agent.id == listing.ids[*index])
         {
             let indent = format!("{}  ", first.first().map_or("", |span| &*span.content));
+            mark_standing(agent, first, right, width);
             *children = subagent_lines(agent, &indent, width);
         }
     }
@@ -3237,6 +3263,85 @@ pub fn devices_card(world: &World, width: usize) -> Doc {
 #[cfg(test)]
 mod tree_tests {
     use super::*;
+
+    #[test]
+    fn only_standing_seats_have_a_dim_anchor_in_both_agent_views() {
+        use st3_client::AgentLifecycle::{Bounded, Owner, Standing};
+
+        for lifecycle in [Some(Standing), Some(Owner), Some(Bounded), None] {
+            let mut world = super::super::demo::world();
+            let mut agent = world.agents.items()[0].clone();
+            agent.lifecycle = lifecycle;
+            agent.state = AgentState::Idle;
+            world.agents = Load::Ready(vec![agent]);
+            for listing in [agents_list(&world, "⠋", 60), agents_tree(&world, "⠋", 60)] {
+                let first = listing
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Row { first, .. } => Some(first),
+                        _ => None,
+                    })
+                    .unwrap();
+                let shown = first
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                assert_eq!(
+                    shown.contains('\u{F0031}'),
+                    lifecycle == Some(Standing),
+                    "{shown}"
+                );
+                if lifecycle == Some(Standing) {
+                    assert!(shown.ends_with("Atlas Builder \u{F0031}"), "{shown}");
+                    assert_eq!(first.last().unwrap().style, theme::dim());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_agent_row_truncates_its_name_before_its_standing_marker() {
+        let mut world = super::super::demo::world();
+        let mut agent = world.agents.items()[0].clone();
+        agent.lifecycle = Some(st3_client::AgentLifecycle::Standing);
+        agent.name = "Atlas Builder 界界界".into();
+        world.agents = Load::Ready(vec![agent]);
+        for width in [20, 24, 28] {
+            for listing in [agents_list(&world, "⠋", width), agents_tree(&world, "⠋", width)] {
+                let (first, right) = listing
+                    .items
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Row { first, right, .. } => Some((first, right)),
+                        _ => None,
+                    })
+                    .unwrap();
+                let right_width = right.iter().map(Span::width).sum::<usize>();
+                // Exercise the shell's final truncation, not only the screen's name budget.
+                let fitted =
+                    super::super::truncate_spans(first, width.saturating_sub(right_width + 2));
+                let shown = fitted
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                assert!(shown.ends_with("… \u{F0031}"), "{width}: {shown}");
+                assert!(
+                    text::width(&shown) + right_width + 2 <= width,
+                    "{width}: {shown}"
+                );
+                let padding = " ".repeat(width.saturating_sub(text::width(&shown) + right_width + 1));
+                let row = format!(
+                    "{shown}{padding}{}",
+                    right
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                );
+                assert_eq!(text::width(&row), width - 1, "{row}");
+            }
+        }
+    }
 
     #[test]
     fn a_request_holding_a_json_report_shows_what_happened_and_folds_the_rest() {

@@ -6,6 +6,12 @@ Messages are durable conversation. Missions track work and its result; [human re
 
 Run `stui`, open **Agents**, and select `garden/worker`. Click the conversation composer, type, and press **Enter** to send. In v0.3.4, **c** opens the composer from the conversation. **Ctrl+K** finds an agent or mission; **Ctrl+H** opens Home, and **Ctrl+Q** quits. The conversation shows your Smalltalk messages alongside the harness's transcript and tool calls.
 
+In stui's Agents sidebar, a dim anchor after a seat's name marks an explicitly declared
+`lifecycle "standing"` seat, in both the list and tree views. The anchor uses the MDI anchor
+glyph (U+F0031), so use a Nerd Font in your terminal. Owner, bounded, and undeclared lifecycles
+have no marker; runtime activity and mission ownership never infer one. On a narrow sidebar,
+the name shortens before the anchor, leaving the harness and activity columns in place.
+
 On the phone, open **Agents**, select the worker, and use its composer. [Build and run the iOS app](ios-app.md) covers local installation first. A phone reads and acts through a paired member; it does not become a replica or run a seat. To begin pairing on your daemon machine:
 
 ```sh
