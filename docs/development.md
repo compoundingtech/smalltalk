@@ -166,6 +166,26 @@ remote site. With CSP enforced the route is never reached and `img-src` reports
 the violation. Browser sessions, listeners and temporary build files are closed
 and removed on exit. There is no production CSP-disable switch.
 
+## fractal-web dev-server console forwarding
+
+The app's Vite config sets `server.forwardConsole: false`; browser diagnostics stay in DevTools.
+Vite enables console forwarding by default when it detects an AI agent environment. Before
+Vite 8.0.14 the forwarder sends every unhandled rejection to the dev server and leaves its own
+failed send unhandled ([vitejs/vite#22407](https://github.com/vitejs/vite/issues/22407), fixed by
+[#22450](https://github.com/vitejs/vite/pull/22450)). Once the HMR socket drops, one rejection
+becomes an unbounded "send was called before connect" loop. The hoisted workspace Vite is 8.0.5.
+
+```sh
+CI=1 node apps/fractal-web/scripts/hmr-disconnect-proof.mjs
+VITE_MODULE="$PWD/node_modules/vite/dist/node/index.js" CI=1 node apps/fractal-web/scripts/hmr-disconnect-proof.mjs --without-fix
+```
+
+The proof serves a temporary StyleX fixture with the app config, saves it four times (rename and
+in place), refuses four compiled-stylesheet fetches with 410, closes the HMR socket and raises
+one console error and one rejection. It passes with zero send-before-connect errors. The
+negative control re-enables forwarding and must storm, so it needs an affected Vite.
+`PLAYWRIGHT_MODULE` and `CHROMIUM_PATH` select the browser, as in the terminal proofs.
+
 ## Fractal web transcript switch paint
 
 The conversation pane reports `ux.transcriptCommitted(ref)` only after its scoped DOM

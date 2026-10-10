@@ -42,7 +42,15 @@ export default defineConfig({
     react(),
     webfractalGateway(),
   ],
-  server: { strictPort: true, host: '127.0.0.1', allowedHosts: (process.env.WF_ALLOWED_HOSTS ?? '127.0.0.1,localhost').split(',') },
+  server: {
+    strictPort: true,
+    host: '127.0.0.1',
+    allowedHosts: (process.env.WF_ALLOWED_HOSTS ?? '127.0.0.1,localhost').split(','),
+    // Browser diagnostics stay in DevTools. Vite forwards them by default under AI agents, and
+    // before 8.0.14 (vitejs/vite#22407) a send failing after an HMR disconnect re-enters the
+    // forwarder as an unhandled rejection, looping without bound. See hmr-disconnect-proof.mjs.
+    forwardConsole: false,
+  },
   resolve: { dedupe: ['effect', 'react', 'react-dom'] },
   build: {
     outDir: '../../dist/web',
