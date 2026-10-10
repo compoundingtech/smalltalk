@@ -66,6 +66,22 @@ Loop and wake enrichment is detail-only and bounded to open runs plus the latest
 null timing fields on lists or older finished runs are not proof of no loop or wake.
 Clients can render `round N/M · wakes in …` without reading claim envelopes.
 
+### Claim progress timestamp
+
+Work resources (`work ls` and `work show`) and enriched mission detail step rows expose
+optional nullable `progress_at`: the RFC3339 time of the latest nonempty `work.progress`
+summary in the current attempt. It belongs to the claim's progress summary, not harness
+activity. Lease renewal, incoming mail and nudge receipts do not move it; retry attempts
+start without an earlier attempt's progress. No progress summary means null on enriched
+surfaces. Older servers may omit it. When the current attempt has no progress summary, consumers can
+use the existing Work `execution_started_at_unix_ms` (execution start) as the age origin;
+if both are absent the age is unknown. This fallback adds no field or history read.
+
+Lightweight mission list cards also return null but do not hydrate progress summaries:
+that null does **not** prove no progress. Use the enriched work collection or mission
+detail for progress coverage. This field alone does not classify current idle holding
+or protective waits; it introduces no watcher, ask, gate, retry, mail or subagent predicate.
+
 ### Agent lifecycle metadata
 
 An agent roster row has an optional `lifecycle` field. The declaration currently accepts
