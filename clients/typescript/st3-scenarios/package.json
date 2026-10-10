@@ -7,7 +7,8 @@
     ".": "./src/index.ts",
     "./replay": "./src/replay/index.ts",
     "./react": "./src/react/index.ts",
-    "./storybook": "./src/storybook/index.ts"
+    "./storybook": "./src/storybook/index.ts",
+    "./sessions": "./src/sessions/index.ts"
   },
   "scripts": {
     "emit": "node --experimental-transform-types --no-warnings scripts/emit.ts",

@@ -252,6 +252,9 @@ importers:
         specifier: 4.0.1
         version: 4.0.1(supports-color@8.1.1)
     devDependencies:
+      '@smalltalk/st3-scenarios':
+        specifier: workspace:*
+        version: link:../../clients/typescript/st3-scenarios
       '@storybook/addon-a11y':
         specifier: 10.6.1
         version: 10.6.1(storybook@10.6.1(@types/react@19.2.14)(react@19.2.3))
