@@ -13,6 +13,6 @@ export function composition({ repoRoot, appUrl, build, ci }) {
       [appRef.id]: { title: appRef.title, url: (!build && !ci && appUrl) || appRef.staticPath, type: 'server-lazy' },
     },
     // Embed the app under the landing so publication needs only the kit output directory.
-    staticDirs: build && appBuilt ? [{ from: output, to: '/apps/fractal-web/storybook-static' }] : [],
+    staticDirs: build && appBookExists && appBuilt ? [{ from: output, to: '/apps/fractal-web/storybook-static' }] : [],
   }
 }
