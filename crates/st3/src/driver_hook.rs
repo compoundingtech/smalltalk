@@ -352,6 +352,17 @@ fn answer_permission_from_st(env: &dyn HookEnv, identity: &str, agent_dir: &Path
     if payload.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") {
         return;
     }
+    // A subagent's prompt never moves the seat's state, so no alert names it: answer it in the
+    // terminal. The seat's own prompts come one at a time: Claude serializes tool execution
+    // around an open permission prompt, even for a parallel batch (see
+    // `claude_session::observe_hook_event`), so one waiting hook stands for one prompt.
+    if payload
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return;
+    }
     // This hook's own observation, as its state record names it: only an answer to that exact
     // prompt is this hook's, never one to an earlier prompt or a parallel hook's.
     let Some((ownership, transition)) = st_drivers::harness_state::read(
