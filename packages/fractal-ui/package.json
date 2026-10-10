@@ -8,6 +8,7 @@
     "./tokens.css": "./src/tokens.css",
     "./assistant-ui": "./src/assistant-ui/index.ts",
     "./assistant-ui/shell": "./src/assistant-ui/shell.ts",
+    "./assistant-ui/transcript-skeleton": "./src/assistant-ui/composition/TranscriptSkeleton.tsx",
     "./assistant-ui/resources": "./src/assistant-ui/resources/index.ts",
     "./assistant-ui/work-log": "./src/assistant-ui/taste/work-log.ts",
     "./assistant-ui/tool-attention": "./src/assistant-ui/embrace-tool-attention.ts",
@@ -22,7 +23,8 @@
     "test:palettes": "node --test src/legacy-palettes.test.mjs",
     "test:transcript": "node --test --test-force-exit src/assistant-ui/composition/Transcript.unit.test.mjs",
     "check:shell-imports": "node scripts/check-shell-imports.mjs",
-    "test:work-log": "node --test --test-force-exit src/assistant-ui/taste/work-log.unit.test.mjs"
+    "test:work-log": "node --test --test-force-exit src/assistant-ui/taste/work-log.unit.test.mjs",
+    "check:transcript-skeleton-imports": "node scripts/check-transcript-skeleton-imports.mjs"
   },
   "dependencies": {
     "react": "19.2.3",
