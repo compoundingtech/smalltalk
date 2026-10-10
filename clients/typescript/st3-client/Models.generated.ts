@@ -1167,6 +1167,47 @@ export type MissionWake = {
 
 export type MustAct = ("you" | "agent" | "system" | "blocked" | "nobody" | string);
 
+export type ObservationAccepted = {
+  accepted: true;
+};
+
+export type ObservationLatency = {
+  buckets: Array<[number, number]>;
+  carrier: "fabric" | "tailscale" | "lan";
+  count: number;
+  interval_end: string;
+  interval_start: string;
+  kind: "latency";
+  max_ms: number;
+  over_target: number;
+  path?: "direct" | "relay";
+  target: "ios-open-to-live" | "ios-connect" | "ios-message-ack" | "ios-conversation-open" | "ios-terminal-open" | "ios-recover";
+};
+
+export type ObservationLiveShare = {
+  carrier: "fabric" | "tailscale" | "lan";
+  foreground_ms: number;
+  interval_end: string;
+  interval_start: string;
+  kind: "live-share";
+  live_ms: number;
+  path?: "direct" | "relay";
+  target: "ios-live-share";
+};
+
+export type ObservationReport = {
+  report_id: string;
+  samples: Array<ObservationSample>;
+};
+
+export type ObservationResponse = {
+  api_version: "st3.client.v0";
+  request_id: RequestId;
+  value: ObservationAccepted;
+};
+
+export type ObservationSample = (ObservationLatency | ObservationLiveShare);
+
 export type Observer = ResourceHeader & {
   kind: "observer";
   owner_generation_id: string | null;

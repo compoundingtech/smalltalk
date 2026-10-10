@@ -2984,6 +2984,62 @@ export const HostRepositories = /*#__PURE__*/ (() => Schema.Struct({
 export type HostRepositories = typeof HostRepositories.Type
 export type HostRepositoriesEncoded = typeof HostRepositories.Encoded
 
+export const ObservationAccepted = /*#__PURE__*/ (() => Schema.Struct({
+  "accepted": Schema.Literal(true)
+}).annotate({ identifier: "ObservationAccepted" }))()
+export type ObservationAccepted = typeof ObservationAccepted.Type
+export type ObservationAcceptedEncoded = typeof ObservationAccepted.Encoded
+
+export const ObservationLatency = /*#__PURE__*/ (() => Schema.Struct({
+  "buckets": Schema.Array(Schema.Tuple([Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(3670015)), Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(1000000))])).check(Schema.isMinLength(1)).check(Schema.isMaxLength(64)),
+  "carrier": Schema.Literals(["fabric","tailscale","lan"]),
+  "count": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(1000000)),
+  "interval_end": Schema.String.check(Schema.isMaxLength(32)).check(Schema.isPattern(DATE_TIME, { expected: "an RFC 3339 date-time" })),
+  "interval_start": Schema.String.check(Schema.isMaxLength(32)).check(Schema.isPattern(DATE_TIME, { expected: "an RFC 3339 date-time" })),
+  "kind": Schema.Literal("latency"),
+  "max_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(3600000)),
+  "over_target": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(1000000)),
+  "path": optionalKey(Schema.Literals(["direct","relay"])),
+  "target": Schema.Literals(["ios-open-to-live","ios-connect","ios-message-ack","ios-conversation-open","ios-terminal-open","ios-recover"])
+}).annotate({ identifier: "ObservationLatency" }))()
+export type ObservationLatency = typeof ObservationLatency.Type
+export type ObservationLatencyEncoded = typeof ObservationLatency.Encoded
+
+export const ObservationLiveShare = /*#__PURE__*/ (() => Schema.Struct({
+  "carrier": Schema.Literals(["fabric","tailscale","lan"]),
+  "foreground_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(60000)),
+  "interval_end": Schema.String.check(Schema.isMaxLength(32)).check(Schema.isPattern(DATE_TIME, { expected: "an RFC 3339 date-time" })),
+  "interval_start": Schema.String.check(Schema.isMaxLength(32)).check(Schema.isPattern(DATE_TIME, { expected: "an RFC 3339 date-time" })),
+  "kind": Schema.Literal("live-share"),
+  "live_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(60000)),
+  "path": optionalKey(Schema.Literals(["direct","relay"])),
+  "target": Schema.Literal("ios-live-share")
+}).annotate({ identifier: "ObservationLiveShare" }))()
+export type ObservationLiveShare = typeof ObservationLiveShare.Type
+export type ObservationLiveShareEncoded = typeof ObservationLiveShare.Encoded
+
+export const ObservationSample = /*#__PURE__*/ (() => Schema.Union([
+  ObservationLatency,
+  ObservationLiveShare
+], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("kind")).annotate({ identifier: "ObservationSample" }))()
+export type ObservationSample = typeof ObservationSample.Type
+export type ObservationSampleEncoded = typeof ObservationSample.Encoded
+
+export const ObservationReport = /*#__PURE__*/ (() => Schema.Struct({
+  "report_id": Schema.String.check(Schema.isPattern(new RegExp("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "u"))).check(Schema.isMinLength(36)).check(Schema.isMaxLength(36)),
+  "samples": Schema.Array(ObservationSample).check(Schema.isMinLength(1)).check(Schema.isMaxLength(32))
+}).annotate({ identifier: "ObservationReport" }))()
+export type ObservationReport = typeof ObservationReport.Type
+export type ObservationReportEncoded = typeof ObservationReport.Encoded
+
+export const ObservationResponse = /*#__PURE__*/ (() => Schema.Struct({
+  "api_version": Schema.Literal("st3.client.v0"),
+  "request_id": RequestId,
+  "value": ObservationAccepted
+}).annotate({ identifier: "ObservationResponse" }))()
+export type ObservationResponse = typeof ObservationResponse.Type
+export type ObservationResponseEncoded = typeof ObservationResponse.Encoded
+
 /** Static unauthenticated pairing preflight; no envelope, presence update or graph information. */
 export const PairingAdvertisement = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),

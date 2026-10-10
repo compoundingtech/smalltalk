@@ -3129,3 +3129,32 @@ pub struct ConversationContentChunk {
     pub data: String,
     pub next_offset: Option<u64>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationReport {
+    pub report_id: String,
+    pub samples: Vec<ObservationSample>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum ObservationSample {
+    #[serde(rename = "latency")]
+    Latency {
+        target: String, carrier: String, #[serde(default,skip_serializing_if="Option::is_none")] path: Option<String>,
+        interval_start: String, interval_end: String,
+        count: u64, over_target: u64, max_ms: u64, buckets: Vec<(u64,u64)>,
+    },
+    #[serde(rename = "live-share")]
+    LiveShare {
+        target: String, carrier: String, #[serde(default,skip_serializing_if="Option::is_none")] path: Option<String>,
+        interval_start: String, interval_end: String, foreground_ms: u64, live_ms: u64,
+    },
+}
+
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObservationAccepted { pub accepted: bool }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObservationResponse {pub api_version: String, pub request_id: String, pub value: ObservationAccepted}

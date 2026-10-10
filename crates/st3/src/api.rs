@@ -80,6 +80,7 @@ mod mail_backlog;
 mod read_deadline;
 mod owned_sets;
 mod request_latency;
+mod client_observations;
 mod terminal_view;
 mod work_response;
 
@@ -514,6 +515,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/client/request-latency",
             get(client_v0::request_latency),
         )
+        .route("/v1/client/observations", post(client_observations::report)
+            .layer(DefaultBodyLimit::max(client_observations::MAX_BODY_BYTES)))
         .route("/v1/client/documents/content", get(client_v0::document_get))
         .route("/v1/client/usage", get(client_v0::usage_period))
         .route("/v1/client/mail-backlog", get(mail_backlog::get))
@@ -981,6 +984,7 @@ async fn response_envelope_unbounded(
         Some(caller.clone()),
     );
     let client_request = request.uri().path().starts_with("/v1/client/");
+    let observation_report = request_route == "/v1/client/observations";
     // These point readers admit snapshot metadata inside their pinned read before
     // formatting it. Authentication still runs here; their response extension
     // supplies the envelope snapshot. All other routes keep admission snapshots.
@@ -1035,7 +1039,7 @@ async fn response_envelope_unbounded(
                     client_v0::authenticate(&auth_state, &auth_request, transport)
                 });
             drop(authentication_span);
-            let snapshot = (!defer_detail_snapshot).then(|| {
+            let snapshot = (!defer_detail_snapshot && !observation_report).then(|| {
                 let snapshot_span = crate::profile::span("admission/snapshot");
                 let snapshot = crate::relay_trace::work(crate::relay_trace::Phase::Snapshot, || {
                     client_request_snapshot(&auth_state, cursor_snapshot.flatten())
@@ -1067,7 +1071,7 @@ async fn response_envelope_unbounded(
         // handler on a blocking thread so a busy projection or replication pass cannot
         // occupy an async worker needed to accept another call. Read workers are admitted
         // before taking store locks; nested work reuses the handler's reader.
-        (None, Ok(_)) if request_path == "/v1/health" => next.run(request).await,
+        (None, Ok(_)) if request_path == "/v1/health" || observation_report => next.run(request).await,
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
             let handler_profile = profile.clone();
@@ -1188,7 +1192,10 @@ async fn response_envelope_unbounded(
     if let Some(trace) = crate::relay_trace::current() {
         trace.response(&request_id);
     }
-    let envelope = if client_request && status.is_success() {
+    let envelope = if observation_report && status.is_success() {
+        // Local diagnostic acceptance, never a graph snapshot fence or action receipt.
+        json!({"api_version": CLIENT_API_VERSION, "request_id": request_id, "value": raw})
+    } else if client_request && status.is_success() {
         json!({
             "api_version": CLIENT_API_VERSION,
             "request_id": request_id,

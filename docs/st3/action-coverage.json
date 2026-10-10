@@ -1,5 +1,8 @@
 {
   "version": 1,
+  "client_commands": [
+    {"command":"observations.report","tests":["crates/st3/src/api/client_observations.rs::observation_paired_session_transport_reader_doctor_and_body_limits","crates/st3/src/api/client_observations.rs::observation_dedup_conflict_overlap_and_history_failure_have_no_partial_acceptance","crates/st3/src/api/client_observations.rs::observation_history_is_bounded_rotates_expires_and_survives_restart"],"behavior":"Paired-only local diagnostics; no graph mutation, snapshot fence, replicated ACK or durable receipt. Memory dedup/overlap survives identical retries only within bounded process retention; JSONL history persists independently."}
+  ],
   "typed_actions": [
     {
       "action": "agent.create",
