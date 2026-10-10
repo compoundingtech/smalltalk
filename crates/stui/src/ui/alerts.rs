@@ -87,20 +87,24 @@ impl Ui {
             .collect()
     }
 
-    /// The call a Claude permission prompt would let through: the newest tool call the
-    /// conversation shows as still running, as the seat's harness recorded it.
-    fn pending_call(&self, agent: &str) -> Option<String> {
+    /// The tool calls the conversation shows as unanswered, oldest first, as the seat's harness
+    /// recorded them. A permission prompt is for one of them, but `prompt.respond` names no
+    /// call: only when exactly one is unanswered is it certain which one an allow lets through.
+    fn unanswered_calls(&self, agent: &str) -> Vec<String> {
         let Some(Load::Ready(entries)) = self.world.conversations.get(agent) else {
-            return None;
+            return Vec::new();
         };
-        entries.iter().rev().find_map(|entry| match &entry.body {
-            Body::Tool {
-                title,
-                state: ToolState::Running,
-                ..
-            } => Some(title.clone()),
-            _ => None,
-        })
+        entries
+            .iter()
+            .filter_map(|entry| match &entry.body {
+                Body::Tool {
+                    title,
+                    state: ToolState::Running,
+                    ..
+                } => Some(title.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The band for `agent` at `width` columns: empty when nothing waits on the person there.
@@ -139,13 +143,39 @@ impl Ui {
                     text: prompt,
                     ..
                 } => {
-                    let call = if answers.is_empty() {
-                        None
+                    let calls = if answers.is_empty() {
+                        Vec::new()
                     } else {
-                        self.pending_call(seat_id)
+                        self.unanswered_calls(seat_id)
                     };
-                    match &call {
-                        Some(call) => {
+                    match calls.as_slice() {
+                        // Several calls are unanswered and the prompt names none: show them all
+                        // and offer only deny. Allowing the wrong one is not undoable.
+                        [_, _, ..] => {
+                            rows.push(BandRow::text(vec![Span::styled(
+                                format!(
+                                    "   {} calls are unanswered and st cannot tell which one Claude asks about; allow it in the terminal (Ctrl+]):",
+                                    calls.len()
+                                ),
+                                theme::soft(),
+                            )]));
+                            for call in calls.iter().take(CALL_LINES) {
+                                rows.push(BandRow::text(vec![
+                                    Span::styled("   · ", theme::dim()),
+                                    Span::styled(
+                                        text::truncate(first_line(call), width.saturating_sub(8)),
+                                        theme::text(),
+                                    ),
+                                ]));
+                            }
+                            if calls.len() > CALL_LINES {
+                                rows.push(BandRow::text(vec![Span::styled(
+                                    format!("   … and {} more", calls.len() - CALL_LINES),
+                                    theme::dim(),
+                                )]));
+                            }
+                        }
+                        [call] => {
                             let lines = text::wrap(
                                 &[text::run(call.clone(), theme::text())],
                                 width.saturating_sub(4),
@@ -171,7 +201,7 @@ impl Ui {
                                 ));
                             }
                         }
-                        None if answers.is_empty() => {
+                        [] if answers.is_empty() => {
                             // Another harness's prompt: it is answered where it is shown.
                             rows.extend(
                                 text::wrap(
@@ -189,7 +219,7 @@ impl Ui {
                                 .map(|line| BandRow { line, hits: Vec::new() }),
                             );
                         }
-                        None => rows.push(BandRow::text(vec![Span::styled(
+                        [] => rows.push(BandRow::text(vec![Span::styled(
                             "   the call it would make is not in the conversation yet: answer it in the terminal (Ctrl+]) or open it in Now",
                             theme::dim(),
                         )])),
@@ -467,6 +497,37 @@ mod tests {
         assert!(shown.contains("rm -rf build/cache"), "{shown}");
         let taps = taps(&rows);
         assert!(taps.contains(&Hit::Alert(
+            "attention/one".into(),
+            AlertTap::Answer("allow".into())
+        )));
+        assert!(taps.contains(&Hit::Alert(
+            "attention/one".into(),
+            AlertTap::Answer("deny".into())
+        )));
+    }
+
+    #[test]
+    fn with_several_calls_unanswered_every_one_is_listed_and_only_deny_is_offered() {
+        let mut ui = with_alerts(vec![prompt("attention/one", &["allow", "deny"])]);
+        ui.world.conversations.insert(
+            "agent/example/atlas".into(),
+            Load::Ready(vec![
+                running_call("Bash · rm -rf build/cache"),
+                Entry {
+                    id: "tool-2".into(),
+                    ..running_call("Write · notes.md")
+                },
+            ]),
+        );
+        let rows = ui.alert_band("agent/example/atlas", 80);
+        let shown = texts(&rows);
+        assert!(shown.contains("2 calls are unanswered"), "{shown}");
+        assert!(
+            shown.contains("rm -rf build/cache") && shown.contains("notes.md"),
+            "{shown}"
+        );
+        let taps = taps(&rows);
+        assert!(!taps.contains(&Hit::Alert(
             "attention/one".into(),
             AlertTap::Answer("allow".into())
         )));
