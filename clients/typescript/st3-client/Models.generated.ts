@@ -11,7 +11,7 @@ export type ActionCommon = {
   parameters: {
 
 };
-  type: "arrangement.edit" | "custom.reply" | "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
+  type: "arrangement.edit" | "custom.reply" | "prompt.respond" | "attention.resolve" | "review.approve" | "review.reject" | "review.request-changes" | "message.send" | "message.read" | "message.close" | "launch.create" | "launch.revise" | "launch.preview" | "launch.approve" | "launch.cancel" | "mission.start" | "mission.revise" | "mission.approve-revision" | "mission.cancel-revision" | "mission.cancel" | "session.import" | "work.ask" | "work.done" | "work.cancel-ask" | "work.claim" | "work.renew" | "work.progress" | "work.complete" | "work.fail" | "work.release" | "work.retry" | "work.publish-mission" | "agent.create" | "agent.stop" | "agent.start" | "agent.suspend" | "agent.resume" | "terminal.create" | "terminal.end" | "agent.queue-move" | "lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve" | "runtime.stop" | "runtime.restart" | "runtime.reset" | "runtime.context-clear" | "runtime.signal" | "terminal.input" | "terminal.resize" | "terminal.attach" | "terminal.detach" | "pairing.revoke";
 };
 
 export type ActionResult = {
@@ -401,7 +401,7 @@ export type Attention = ResourceHeader & {
   action_parameters?: {
 
 };
-  actions: Array<"custom.reply" | "work.done" | "review.approve" | "review.reject" | "review.request-changes" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
+  actions: Array<"custom.reply" | "prompt.respond" | "work.done" | "review.approve" | "review.reject" | "review.request-changes" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
   alert?: boolean;
   attention_kind: ("human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault" | "harness-login" | "harness-prompt" | string);
   because?: string;
@@ -1325,6 +1325,12 @@ export type ProjectionEvent = Omit<{
   type: "upsert" | "delete" | "timeline.delta" | "terminal.available" | "capabilities.changed";
 }, 'type' | 'body'> & ({ type: "timeline.delta"; body: TimelineDelta });
 
+export type PromptRespondParameters = {
+  answer: "allow" | "deny";
+  episode: string;
+  target_id: Id;
+};
+
 export type PublicationDefinition = {
   declaration: {
 
@@ -2153,6 +2159,7 @@ export type ActionRequest =
   workspace: string;
 }; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'pairing.revoke'; parameters: TargetParameters; fence: Fence }) |
+  (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'prompt.respond'; parameters: PromptRespondParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'review.approve'; parameters: TargetParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'review.reject'; parameters: TargetParameters; fence: Fence }) |
   (Omit<ActionCommon, 'type' | 'parameters' | 'fence'> & { type: 'review.request-changes'; parameters: TargetParameters; fence: Fence }) |

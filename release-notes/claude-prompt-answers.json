@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A Claude permission prompt can be answered (allow or deny) from its alert with the typed action prompt.respond; the seat's permission hook waits for the answer while Claude shows its own dialog",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or backfill."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database change. The client contract gains the prompt.respond action and PromptRespondParameters; the contract digest changes. Answers are harness.diagnostic claims with code native-prompt-answered, which the claim schema already admits."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim kind, field, checkpoint or authority rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Additive: harness-prompt alerts for Claude permission prompts carry answers and the prompt.respond action; older clients ignore them. The Claude PermissionRequest hook now waits up to ten minutes (hook timeout 660 s), polling its local daemon's new GET /v1/harness-prompts/state once a second; Claude keeps its dialog answerable in the terminal meanwhile (measured on Claude Code 2.1.296). Seats pick up the new hook set on their next start. A daemon older than this build answers the poll with an error, which the hook treats as no answer."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swap back freely: an older daemon offers no answers and its hook set does not wait."
+  }
+}

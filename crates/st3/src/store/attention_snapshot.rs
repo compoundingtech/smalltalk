@@ -108,7 +108,7 @@ impl Store {
                          AND json_extract(body, '$._operation.id')=?1)",
                 )?
                 .query_row([native_prompt_gone_operation(&claim)], |row| row.get(0))?;
-            if gone {
+            if gone || native_prompt_answer(&connection, &claim)?.is_some() {
                 continue;
             }
             // Only the running incarnation's prompt waits: a restarted seat's old prompt is gone.
@@ -149,6 +149,11 @@ impl Store {
                 launch_id: None,
                 variant_id: None,
                 message_id: None,
+                answers: if answerable(&harness) {
+                    vec!["allow".into(), "deny".into()]
+                } else {
+                    Vec::new()
+                },
                 conversation: Some(seat.clone()),
                 title: format!("{seat} is waiting for {what}"),
                 detail: format!(
@@ -543,7 +548,7 @@ impl Store {
                 requester_id: None,
                 launch_id: None,
                 variant_id: None,
-                message_id: None, conversation: None,
+                message_id: None, answers: Vec::new(), conversation: None,
                 title: format!("st cannot reconcile {source}"),
                 detail: format!(
                     "{scope}: {}. Inspect with `st subject {source}`.",
@@ -662,7 +667,7 @@ impl Store {
             requester_id: None,
             launch_id: None,
             variant_id: None,
-            message_id: None, conversation: None,
+            message_id: None, answers: Vec::new(), conversation: None,
             title,
             detail,
             mission: Some(run.mission.clone()),
@@ -723,7 +728,7 @@ impl Store {
             let diagnostic = self.last_driver_diagnostic(&source)?;
             items.push(AttentionItemView {
                 episode: decision.id.clone(), priority: "high".into(), kind: "fault".into(), review_mode: None,
-                subject: source.clone(), person: reviewer.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None, conversation: None,
+                subject: source.clone(), person: reviewer.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None, answers: Vec::new(), conversation: None,
                 title: if codex { "A Codex agent stopped after repeated failures" } else { "An agent stopped after repeated runtime failures" }.into(),
                 detail: format!("{source}: {}.{} Inspect the seat and revise its desired declaration before restarting.", decision.body["fields"]["reason"].as_str().unwrap_or("the runtime is parked"), diagnostic.map(|diagnostic| format!(" The driver's last diagnostic: {diagnostic}.")).unwrap_or_default()),
                 mission: None, mission_run: desired.owner_run, step: None, targets: vec![source.clone()], requested_at_unix_ms: decision.accepted_at_unix_ms,
@@ -801,7 +806,7 @@ impl Store {
             };
             items.push(AttentionItemView {
                 episode: token.clone(), priority: "high".into(), kind: "fault".into(), review_mode: None,
-                subject: source.clone(), person: REVIEWER.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None, conversation: None,
+                subject: source.clone(), person: REVIEWER.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None, answers: Vec::new(), conversation: None,
                 title: "An agent seat has not started".into(),
                 detail: format!("{source} has been declared to run on {host} for over {} minutes and no runtime has ever been observed for it, so it is still `desired`.{diagnostic} Check that the host is up and its daemon can start the seat.", SEAT_NOT_STARTED_MS / 60_000),
                 mission: None, mission_run: desired.owner_run, step: None, targets: vec![source.clone()], requested_at_unix_ms: due,
@@ -952,7 +957,7 @@ impl Store {
                 requester_id: None,
                 launch_id: None,
                 variant_id: None,
-                message_id: None, conversation: None,
+                message_id: None, answers: Vec::new(), conversation: None,
                 title: condition.title().into(),
                 detail: condition.reason(&source, &latest.origin),
                 mission: None,
@@ -1333,7 +1338,7 @@ pub(super) fn person_attention_item(
         requester_id: ask.and_then(|ask| ask.actor),
         launch_id: None,
         variant_id: None,
-        message_id: None,
+        message_id: None, answers: Vec::new(),
         title: view
             .title
             .unwrap_or_else(|| "A step needs your response".into()),
@@ -1396,4 +1401,148 @@ pub(crate) fn native_prompt_gone_key(observation: &str) -> String {
 
 fn native_prompt_gone_operation(observation: &str) -> String {
     smallclaims::store::operation_id_for_key(&native_prompt_gone_key(observation))
+}
+
+/// Whether st can answer the prompt `harness` reports from a client: a Claude permission prompt,
+/// whose hook waits for the answer. Other prompts are answered in the seat's terminal.
+fn answerable(harness: &Value) -> bool {
+    harness["blocked_on"] == "human" && harness["ask"] == "permission" && harness["driver"] == "claude"
+}
+
+/// The idempotency key of the person's answer to the native prompt `observation` opened.
+fn native_prompt_answer_key(observation: &str) -> String {
+    format!("native-prompt-answer:{observation}")
+}
+
+/// The answer recorded for the prompt `observation` opened, if any.
+fn native_prompt_answer(connection: &Connection, observation: &str) -> Result<Option<String>> {
+    let operation = smallclaims::store::operation_id_for_key(&native_prompt_answer_key(observation));
+    Ok(connection
+        .prepare_cached(
+            "SELECT json_extract(body, '$.fields.status') FROM claims INDEXED BY claims_operation_index
+             WHERE json_extract(body, '$._operation.id')=?1 LIMIT 1",
+        )?
+        .query_row([operation], |row| row.get::<_, Option<String>>(0))
+        .optional()?
+        .flatten())
+}
+
+/// What a waiting prompt hook needs to know: whether the seat's prompt is still open, answered
+/// (and how), or gone.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum NativePromptState {
+    /// Not yet published, or still waiting on a person.
+    Open,
+    Answered { answer: String },
+    /// Answered in the terminal, replaced or ended: nothing will arrive.
+    Gone,
+}
+
+impl Store {
+    /// The newest harness observation of `seat` and when it was accepted.
+    fn newest_harness_observation(&self, seat: &str) -> Result<Option<(String, u128, Value)>> {
+        let connection = self.readers.get();
+        let row = connection
+            .prepare_cached(&format!(
+                "{} LIMIT 1",
+                newest_claims_of_kind_query(
+                    "claims.id, claims.accepted_at_unix_ms, claims.body",
+                    "harness.observed"
+                )
+            ))?
+            .query_row(params![seat, i64::MAX], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .optional()?;
+        row.map(|(id, at, body)| -> Result<(String, u128, Value)> {
+            let body: Value = serde_json::from_str(&body)?;
+            Ok((id, at.parse()?, body.get("fields").cloned().unwrap_or(body)))
+        })
+        .transpose()
+    }
+
+    /// The prompt a hook that started at `since` waits on: the seat's newest observation, once it
+    /// is no older than the hook. Claude shows one prompt at a time, so it is the hook's own.
+    pub fn native_prompt_state(&self, seat: &str, since: u128) -> Result<NativePromptState> {
+        let Some((claim, at, harness)) = self.newest_harness_observation(seat)? else {
+            return Ok(NativePromptState::Open);
+        };
+        // The hook's own observation reaches the store after the hook starts; allow for the
+        // clock reading the hook took first.
+        if at.saturating_add(2_000) < since {
+            return Ok(NativePromptState::Open);
+        }
+        if !answerable(&harness) {
+            return Ok(NativePromptState::Gone);
+        }
+        let connection = self.readers.get();
+        // Refused in the terminal, which only the screen showed.
+        let refused: bool = connection
+            .prepare_cached(
+                "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_operation_index
+                   WHERE json_extract(body, '$._operation.id')=?1)",
+            )?
+            .query_row([native_prompt_gone_operation(&claim)], |row| row.get(0))?;
+        if refused {
+            return Ok(NativePromptState::Gone);
+        }
+        Ok(match native_prompt_answer(&connection, &claim)? {
+            Some(answer) => NativePromptState::Answered { answer },
+            None => NativePromptState::Open,
+        })
+    }
+
+    /// Record `actor`'s answer to the native prompt `episode` (the observation that opened it) of
+    /// `seat`. Only the seat's person answers, only the prompt still waiting, and only once.
+    pub fn answer_native_prompt(
+        &self,
+        seat: &str,
+        episode: &str,
+        answer: &str,
+        actor: &str,
+    ) -> std::result::Result<ClaimRecord, St3Error> {
+        let internal = |error: anyhow::Error| St3Error::new("internal", format!("{error:#}"));
+        if !matches!(answer, "allow" | "deny") {
+            return Err(St3Error::new("invalid-answer", "answer allow or deny"));
+        }
+        if self.agent_person(seat).map_err(internal)?.as_deref() != Some(actor) {
+            return Err(St3Error::new(
+                "forbidden",
+                "only the seat's person answers its prompts",
+            ));
+        }
+        let current = self.newest_harness_observation(seat).map_err(internal)?;
+        let Some((claim, _, harness)) = current.filter(|(claim, _, _)| claim == episode) else {
+            return Err(St3Error::new(
+                "stale-fence",
+                "that prompt is no longer waiting: it was answered or replaced",
+            ));
+        };
+        if !answerable(&harness) {
+            return Err(St3Error::new(
+                "stale-fence",
+                "that prompt can only be answered in the seat's terminal",
+            ));
+        }
+        let incarnation = harness["incarnation_id"].as_str().unwrap_or_default();
+        self.append_claim(&ClaimInput {
+            subject: seat.to_owned(),
+            kind: "harness.diagnostic".into(),
+            actor: Some(actor.to_owned()),
+            fields: BTreeMap::from([
+                ("code".into(), Value::String("native-prompt-answered".into())),
+                ("status".into(), Value::String(answer.into())),
+                ("driver".into(), Value::String("claude".into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ]),
+            evidence: vec![claim.clone()],
+            expected_subject: None,
+            idempotency_key: Some(native_prompt_answer_key(&claim)),
+        })
+    }
 }

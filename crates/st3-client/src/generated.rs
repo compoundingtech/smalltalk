@@ -2754,6 +2754,20 @@ impl ActionRequest {
             &parameters,
         )
     }
+    pub fn prompt_respond(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PromptRespondParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::PromptRespond,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
     pub fn review_approve(
         id: impl Into<String>,
         idempotency_key: impl Into<String>,
@@ -3830,6 +3844,15 @@ pub struct AgentRepository {
     pub path: String,
     pub workspaces: Vec<String>,
     pub agent_ids: Vec<String>,
+}
+
+/// A person's answer to a native harness prompt alert.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptRespondParameters {
+    pub target_id: String,
+    pub episode: String,
+    pub answer: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

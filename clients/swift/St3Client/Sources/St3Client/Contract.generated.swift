@@ -31,6 +31,7 @@ public enum ActionType: String, Codable, CaseIterable, Sendable {
     case missionRevise = "mission.revise"
     case missionStart = "mission.start"
     case pairingRevoke = "pairing.revoke"
+    case promptRespond = "prompt.respond"
     case reviewApprove = "review.approve"
     case reviewReject = "review.reject"
     case reviewRequestChanges = "review.request-changes"

@@ -3049,6 +3049,15 @@ pub struct AgentRepository {
     pub agent_ids: Vec<String>,
 }
 
+/// A person's answer to a native harness prompt alert.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptRespondParameters {
+    pub target_id: String,
+    pub episode: String,
+    pub answer: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CustomReplyParameters {

@@ -28,6 +28,28 @@ pub(super) async fn publish(
     finish_claim_publication(&state, &kind, record, changed, Some(transition)).await
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct PromptStateQuery {
+    agent: String,
+    since: u128,
+}
+
+/// Where a waiting prompt hook's prompt stands: open, answered by a person (and how), or gone.
+/// The hook asks its own host's daemon, which holds the person's answer once it replicates.
+pub(super) async fn prompt_state(
+    State(state): State<AppState>,
+    Query(query): Query<PromptStateQuery>,
+) -> Result<Json<crate::store::NativePromptState>, ApiError> {
+    let store = state.store.clone();
+    let prompt = blocking_action(move || {
+        store
+            .native_prompt_state(&query.agent, query.since)
+            .map_err(|error| St3Error::new("internal", format!("{error:#}")))
+    })
+    .await?;
+    Ok(Json(prompt))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
