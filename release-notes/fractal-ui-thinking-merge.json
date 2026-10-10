@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "fractal-ui merges adjacent reasoning entries into one Thinking disclosure",
+  "summary": "Each turn's work log uses one Thinking disclosure for all its reasoning entries, including thoughts separated by tool calls. Source order and individual Markdown bodies remain intact; bounded backfill retains the complete reasoning run.",
   "replay": {
     "status": "none",
     "detail": "No replay or rebuild."
