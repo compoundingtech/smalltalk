@@ -475,56 +475,53 @@ fn channel_loop(
                 // ages visibly through `ageMs` instead of looking refreshed. Every frame is handed
                 // to the guard, which decides bucket, compaction edge, or heartbeat.
                 let context = frame.as_ref().and_then(context_frame);
-                // A compaction is the seat's status from its start to its end.
-                let compaction = if frame.as_ref().is_some_and(|frame| {
-                    frame.get("type").and_then(Value::as_str) == Some("pre_compact")
-                }) {
-                    compacting = true;
-                    Some(harness_state::Activity::Active)
-                } else if compacting && context.as_ref().is_some_and(|(_, edge)| edge.is_some()) {
-                    compacting = false;
-                    Some(harness_state::Activity::Idle)
-                } else {
-                    None
-                };
-                if let Some(activity) = compaction {
-                    let mut observation = harness_state::Observation::new(
-                        activity,
-                        harness_state::BlockedOn::None,
-                        harness_state::InputBuffer::Unknown,
-                    );
-                    if activity == harness_state::Activity::Active {
-                        observation = observation.with_reason("compaction");
-                    }
-                    if let Err(error) = writer.observe_unless_ended(observation) {
-                        tracing::warn!("st {label} channel: recording compaction failed: {error}");
-                    }
-                }
+                let compaction_ended =
+                    compacting && context.as_ref().is_some_and(|(_, edge)| edge.is_some());
                 if let Some(context) = context
                     && let Some(context_writer) = context_writer.as_deref_mut()
                     && let Err(error) = write_context(context_writer, context)
                 {
                     tracing::warn!("st {label} channel: recording harness context failed: {error}");
                 }
-                if frame.as_ref().is_some_and(|frame| {
+                // A compaction is the seat's status from its start to its end. A start whose
+                // context recovery failed says so instead: that is what someone must act on.
+                let compaction = if frame.as_ref().is_some_and(|frame| {
                     frame.get("type").and_then(Value::as_str) == Some("pre_compact")
-                }) && let Err(error) = ensure_pre_compact_context(agent_dir)
-                {
-                    tracing::warn!(
-                        "st {label} channel: writing pre-compact context stub failed: {error}"
-                    );
-                    let actionable = harness_state::Observation::new(
-                        harness_state::Activity::Active,
+                }) {
+                    compacting = true;
+                    Some(match ensure_pre_compact_context(agent_dir) {
+                        Ok(_) => harness_state::Observation::new(
+                            harness_state::Activity::Active,
+                            harness_state::BlockedOn::None,
+                            harness_state::InputBuffer::Unknown,
+                        )
+                        .with_reason("compaction"),
+                        Err(error) => {
+                            tracing::warn!(
+                                "st {label} channel: writing pre-compact context stub failed: {error}"
+                            );
+                            harness_state::Observation::new(
+                                harness_state::Activity::Active,
+                                harness_state::BlockedOn::None,
+                                harness_state::InputBuffer::Unknown,
+                            )
+                            .with_reason(PRE_COMPACT_ERROR_REASON)
+                        }
+                    })
+                } else if compaction_ended {
+                    compacting = false;
+                    Some(harness_state::Observation::new(
+                        harness_state::Activity::Idle,
                         harness_state::BlockedOn::None,
                         harness_state::InputBuffer::Unknown,
-                    )
-                    .with_reason(PRE_COMPACT_ERROR_REASON);
-                    if let Err(state_error) = writer.observe_unless_ended(actionable) {
-                        tracing::warn!(
-                            "st {label} channel: recording pre-compact recovery failure failed: \
-                             {state_error}"
-                        );
-                    }
+                    ))
+                } else {
+                    None
+                };
+                if let Some(observation) = compaction
+                    && let Err(error) = writer.observe_unless_ended(observation)
+                {
+                    tracing::warn!("st {label} channel: recording compaction failed: {error}");
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -1360,6 +1357,13 @@ mod tests {
             authored,
             "the recovery edge must never replace authored state"
         );
+
+        // A successful recovery edge marks the seat compacting. Each run here is a new session,
+        // and a session never replaces another's record, so the next one starts on a fresh record.
+        let state_path = harness_state::harness_state_path(agent_dir);
+        let compacting: Value = serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(compacting["reason"], "compaction");
+        std::fs::remove_file(&state_path).unwrap();
 
         std::fs::remove_file(context_dir.join("now.md")).unwrap();
         std::fs::write(context_dir.join("now.md"), [0xff]).unwrap();
