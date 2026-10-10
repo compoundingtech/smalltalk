@@ -241,13 +241,9 @@ fn retain_live_mail(
             && sent.accepted_at_unix_ms >= since;
         if after_connection || recovered.contains(&message.subject) {
             live.push(message);
-        } else if sent.accepted_at_unix_ms
-            > since.saturating_sub(if crate::fyi::is_held(&message) {
-                // Held mail waits for a turn, not a delivery: it is still news for a day.
-                crate::fyi::HELD_TOO_LONG_MS
-            } else {
-                u128::from(super::mail_backlog::THRESHOLD_MS)
-            })
+        } else if (crate::fyi::is_held(&message)
+            || sent.accepted_at_unix_ms
+                > since.saturating_sub(u128::from(super::mail_backlog::THRESHOLD_MS)))
             && never_offered(store, &message)?
         {
             recovered.insert(message.subject.clone());
@@ -1497,6 +1493,59 @@ mod tests {
                 .map(|m| m.subject.as_str())
                 .collect::<Vec<_>>(),
             ["message/recent"]
+        );
+    }
+
+    #[test]
+    fn held_mail_older_than_a_day_survives_reconnect_until_the_next_wake() {
+        let store = Store::open_memory("node").unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "message/old-fyi".into(),
+                kind: "message.sent".into(),
+                actor: Some("agent/example/writer".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("agent/example/writer")),
+                    ("to".into(), json!("agent/example/reader")),
+                    ("content".into(), json!("A held update.")),
+                    ("tags".into(), json!([crate::fyi::FYI_TAG])),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let since = client_now_ms() + crate::fyi::HELD_TOO_LONG_MS + 1;
+        let mut messages = store.messages(Some("agent/example/reader"), false).unwrap();
+        let mut recovered = std::collections::BTreeSet::new();
+        retain_live_mail(
+            &store,
+            &mut messages,
+            since,
+            Some(store.index().unwrap()),
+            &mut recovered,
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 1);
+        let mut offered = messages.clone();
+        crate::fyi::release(&mut offered);
+        assert!(offered.is_empty(), "reconnect alone cannot wake the seat");
+        let mut waking = messages[0].clone();
+        waking.subject = "message/question".into();
+        waking.tags = vec![crate::fyi::QUESTION_TAG.into()];
+        messages.push(waking);
+        crate::fyi::release(&mut messages);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            store.message("message/old-fyi").unwrap().unwrap().status,
+            "sent"
+        );
+        assert!(
+            store
+                .claims_for("message/old-fyi", Some("message.read"))
+                .unwrap()
+                .is_empty()
         );
     }
 

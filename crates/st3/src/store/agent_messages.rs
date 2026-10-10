@@ -149,9 +149,13 @@ pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
+        if sent.is_none() {
+            coordination::sync(transaction, &subject, None)?;
+        }
         let desired = sent
             .map(|(at, body)| -> Result<_> {
                 let body: Value = serde_json::from_str(&body)?;
+                coordination::sync(transaction, &subject, Some((at, &body["fields"])))?;
                 Ok(eligible(&body["fields"])
                     .then(|| (at, body["fields"]["to"].as_str().unwrap().to_owned())))
             })
@@ -181,6 +185,7 @@ pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
             [&subject],
         )?;
     }
+    coordination::backfill(transaction)?;
     Ok(())
 }
 

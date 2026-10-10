@@ -61,11 +61,21 @@ A seat's mailbox stream keeps held mail admitted, but it leaves unoffered held m
 frame it sends until a message that wakes the seat is in it. Then they go out together, oldest
 first, at the start of that turn. Each harness shows a held message with
 `(FYI: held without waking you until this turn)`. Once offered, held mail follows the ordinary
-staged, delivered and read receipts. A seat that reconnects within a day of a held message still
-receives it with its next wake.
+staged, delivered and read receipts. A seat that reconnects still receives every unoffered held message with its next wake,
+regardless of its age.
 
 Held mail is never lost. Until it is read it is unread like any other message:
 `st conversations ls` lists it, and `st conversations read` reads it on demand. Held mail waiting
 for a turn does not count as late in the `message-delivery` check, does not keep a stopping seat
 running, and does not block a rollout drain. `st doctor`'s `held-mail` check lists each seat with
 FYI mail unread for over a day.
+
+## Coordination cost
+
+`st usage --hours 24 --messages-only --json` reads counts without message bodies or token
+usage: `agent_to_agent`, its held `fyi` subset, and `to_person`. Each message subject counts
+once, including messages already read. Daemon and person senders do not count. The covering
+metadata index is maintained by writers; historical bootstrap advances eight subjects per
+writer batch. `complete: false` means bootstrap is unfinished, so collectors publish no ratio.
+Reads never advance bootstrap. The factory SLO timer divides each count by merges in the
+rolling day and publishes informational values; zero merges gives no ratio.

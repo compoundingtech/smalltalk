@@ -163,6 +163,7 @@ pub(crate) mod mission_ivm;
 pub(crate) mod client_summary;
 mod unread_mail;
 mod agent_messages;
+mod coordination;
 pub mod agent_view;
 mod conversation_reads;
 mod usage_period;

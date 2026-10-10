@@ -718,9 +718,13 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/rules/set", post(set_rule))
         .route("/v1/documents/content", get(get_document))
         .route("/v1/diagnostics/harness", post(post_harness_diagnostic))
-        .route("/v1/delivery/hold", get(get_delivery_hold).post(post_delivery_hold))
+        .route(
+            "/v1/delivery/hold",
+            get(get_delivery_hold).post(post_delivery_hold),
+        )
         .route("/v1/claims", get(list_claims).post(post_claim))
         .route("/v1/usage", get(get_usage))
+        .route("/v1/usage/messages", get(get_coordination_counts))
         .route("/v1/claims/by-id/{id}", get(get_claim))
         .route("/v1/reviews", get(list_reviews))
         .route("/v1/reviews/{*subject}", post(post_review))
@@ -11480,6 +11484,23 @@ async fn finish_claim_publication(
 struct UsageQuery {
     since_ms: Option<u64>,
     until_ms: Option<u64>,
+}
+
+async fn get_coordination_counts(
+    State(state): State<AppState>,
+    Query(query): Query<UsageQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let until = query.until_ms.unwrap_or(client_now_ms() as u64);
+    let since = query.since_ms.unwrap_or(until.saturating_sub(86_400_000));
+    if since > until {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-usage-period",
+            "usage start must be before its end",
+        )));
+    }
+    Ok(Json(
+        blocking_store(move || state.store.coordination_counts(since, until)).await?,
+    ))
 }
 
 async fn get_usage(
