@@ -603,6 +603,14 @@ shows in, starting with `conversation_id`: a harness login alert is one alert pe
 and host, naming every seat that shares it, since one sign-in answers them all. Daemons that
 predate alerts omit these fields.
 
+A `harness-prompt` alert is a native prompt a seat's harness shows in its terminal and waits on:
+a permission, a question or a review. Its `source_id` and `conversation_id` are the seat, its
+`episode` is the harness observation that opened the prompt, and its detail carries the prompt
+text the harness reported. It clears when the harness reports the prompt gone, however it was
+answered, when Claude's terminal shows it was refused (Claude reports no event for that), or
+when the seat's runtime incarnation changes. It offers no typed action yet: its action attaches
+to the seat's terminal to answer there.
+
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
 generation, step, or agent), its current `state` and, when known, the `since`
 time it entered that state. Resource and document targets have none. The card describes the

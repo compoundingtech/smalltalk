@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Qualify the grouped metadata refusal error macro",
+  "replay": {
+    "status": "none",
+    "detail": "Compile correction to the already-authored grouped metadata error branch; no algorithm, persisted schema, publication, control, limit or activation change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Compile correction to the already-authored grouped metadata error branch; no algorithm, persisted schema, publication, control, limit or activation change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Compile correction to the already-authored grouped metadata error branch; no algorithm, persisted schema, publication, control, limit or activation change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Compile correction to the already-authored grouped metadata error branch; no algorithm, persisted schema, publication, control, limit or activation change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Compile correction to the already-authored grouped metadata error branch; no algorithm, persisted schema, publication, control, limit or activation change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Compile correction to the already-authored grouped metadata error branch; no algorithm, persisted schema, publication, control, limit or activation change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Compile correction to the already-authored grouped metadata error branch; no algorithm, persisted schema, publication, control, limit or activation change."
+  }
+}

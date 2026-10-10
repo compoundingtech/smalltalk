@@ -22,6 +22,8 @@ impl Daemon {
         for (name, source) in [
             ("pty", "#!/bin/sh\nprintf '[]\\n'\n"),
             ("gh", "#!/bin/sh\nexit 1\n"),
+            // Force the group-only teardown path even when the host has a user manager.
+            ("systemctl", "#!/bin/sh\nexit 1\n"),
         ] {
             let path = bin.join(name);
             std::fs::write(&path, source).unwrap();

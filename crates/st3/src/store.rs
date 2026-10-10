@@ -33,6 +33,7 @@ mod roster_controls;
 #[cfg(test)]
 mod agents_window_deadline_tests;
 pub(crate) mod step_labels;
+mod operation_audit;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(test)]
@@ -116,6 +117,7 @@ pub use smallclaims::store::{
 mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
+pub(crate) use attention_snapshot::native_prompt_gone_key;
 // Registration stays opt-in until the shared installer certifies every source family.
 #[cfg_attr(
     not(test),
@@ -247,8 +249,40 @@ pub(crate) struct CachedUsageFold {
     fold: UsageFold,
 }
 
-/// How many agents' usage folds a store keeps. Past it the cache starts over.
-const USAGE_FOLDS: usize = 4096;
+/// How much usage fold state a store keeps, counted in incarnations and rollup series. Past it
+/// the kept folds start over; a single fold heavier than a sixteenth of it is never kept.
+const USAGE_FOLD_WEIGHT: usize = 65_536;
+
+/// The usage folds a store keeps, by agent, and their total weight.
+#[derive(Default)]
+pub(crate) struct UsageFolds {
+    folds: HashMap<String, Arc<CachedUsageFold>>,
+    weight: usize,
+}
+
+impl UsageFolds {
+    fn get(&self, subject: &str) -> Option<&Arc<CachedUsageFold>> {
+        self.folds.get(subject)
+    }
+
+    /// Keep `cached` unless a newer fold is kept already or it is too heavy to keep.
+    fn keep(&mut self, subject: String, cached: CachedUsageFold) {
+        let weight = cached.fold.weight();
+        if weight > USAGE_FOLD_WEIGHT / 16
+            || self.folds.get(&subject).is_some_and(|kept| kept.through > cached.through)
+        {
+            return;
+        }
+        if let Some(previous) = self.folds.remove(&subject) {
+            self.weight -= previous.fold.weight();
+        }
+        if self.weight + weight > USAGE_FOLD_WEIGHT {
+            *self = Self::default();
+        }
+        self.weight += weight;
+        self.folds.insert(subject, Arc::new(cached));
+    }
+}
 
 /// Canonical order's first components: accepted time as stored, shorter first.
 fn accepted_order(accepted: &str) -> (usize, &str) {
@@ -400,6 +434,11 @@ impl UsageFold {
             _ => {}
         }
         Ok(())
+    }
+
+    /// The state this fold keeps: one per incarnation and one per rollup series.
+    fn weight(&self) -> usize {
+        1 + self.spend.values().map(|group| 1 + group.rollups.len()).sum::<usize>()
     }
 
     fn summary(&self) -> Option<UsageSummary> {
@@ -3995,14 +4034,25 @@ impl Store {
         // only the drifted rows: rebuilding the whole table held the only writer for a minute
         // and more on a populated store, stalling every write behind it.
         let drift = self.operation_projection_drift()?;
+        self.repair_operation_projection_drift_from_audit(&drift)
+    }
+
+    /// Repair only keys found by an earlier audit, re-deriving them from current claims.
+    /// A concurrent append cannot make an old finding overwrite the new canonical row.
+    /// At most 16 keys share a writer transaction; release the writer between batches.
+    /// This bounds the batch, not the work of one key with arbitrarily many source claims.
+    pub fn repair_operation_projection_drift_from_audit(&self, drift: &[String]) -> Result<bool> {
         if drift.is_empty() {
             return Ok(false);
         }
-        let mut connection = self.connection.write();
-        let transaction = connection.transaction()?;
-        repair_operations_tx(&transaction, &drift)?;
-        transaction.commit()?;
-        Ok(true)
+        let mut changed = 0;
+        for batch in drift.chunks(16) {
+            let mut connection = self.connection.write();
+            let transaction = connection.transaction()?;
+            changed += repair_operations_tx(&transaction, batch)?;
+            transaction.commit()?;
+        }
+        Ok(changed != 0)
     }
 
     /// Idempotency keys that two requests with different content used, which only members
@@ -4038,40 +4088,7 @@ impl Store {
     }
 
     pub fn operation_projection_drift(&self) -> Result<Vec<String>> {
-        let connection = self.readers.get();
-        // Replication and harness observations can append claims while doctor runs. Both
-        // sides of this comparison must see the same SQLite snapshot, or a healthy
-        // projection can appear to drift between the two reads.
-        let transaction = connection.unchecked_transaction()?;
-        let expected = expected_operations(&transaction)?;
-        let mut statement = transaction.prepare(
-            "SELECT id, request_digest, canonical_claim_id, state FROM operations ORDER BY id",
-        )?;
-        let actual = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    (
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ),
-                ))
-            })?
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        drop(statement);
-        transaction.commit()?;
-        let mut drift = Vec::new();
-        for id in expected
-            .keys()
-            .chain(actual.keys())
-            .collect::<BTreeSet<_>>()
-        {
-            if expected.get(id) != actual.get(id) {
-                drift.push((*id).clone());
-            }
-        }
-        Ok(drift)
+        self.operation_audit(&mut |_| {})
     }
 
     /// Rebuild only the planning tables. A planning claim written through the generic claim path
@@ -14391,6 +14408,7 @@ impl Store {
         let mut items = self.mission_run_attention_items(person)?;
         items.extend(self.person_attention_items(person, as_of)?);
         items.extend(self.harness_login_attention_items(person)?);
+        items.extend(self.harness_prompt_attention_items(person)?);
         items.extend(self.custom_attention_items(person)?);
         // A person who published a broken gate is the one to correct it.
         items.extend(
@@ -16243,13 +16261,7 @@ impl Store {
             .collect();
         let mut folds = self.smalltalk.usage_folds.lock().expect("usage folds poisoned");
         for (subject, cached) in folded {
-            if folds.get(&subject).is_some_and(|kept| kept.through > cached.through) {
-                continue;
-            }
-            if folds.len() >= USAGE_FOLDS && !folds.contains_key(&subject) {
-                folds.clear();
-            }
-            folds.insert(subject, Arc::new(cached));
+            folds.keep(subject, cached);
         }
         Ok(summaries)
     }
@@ -46504,7 +46516,7 @@ version 2
     }
 
     #[test]
-    fn operation_projection_drift_uses_one_snapshot_during_writes() {
+    fn operation_projection_drift_does_not_report_consistent_concurrent_writes() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&directory.path().join("state.sqlite3"), "node").unwrap());
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -55011,6 +55023,101 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
                 (seats(&["third"]), (true, seats(&["third"]))),
             ])
         );
+    }
+
+    /// A native prompt is an alert in its seat's conversation while the harness waits on it, and
+    /// clears when the harness reports it gone, when the terminal shows it was refused, or when
+    /// the seat restarts.
+    #[test]
+    fn a_native_prompt_is_an_alert_until_its_harness_or_terminal_says_it_is_gone() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &preview.subject_tokens, "prompt-seat", Some("person/avery"))
+            .unwrap();
+        let append = |kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "agent/node.worker".into(),
+                    kind: kind.into(),
+                    actor: Some("agent/node.worker".into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let prompts = || {
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.kind == "harness-prompt")
+                .collect::<Vec<_>>()
+        };
+        append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}));
+        assert!(prompts().is_empty());
+        let asked = append(
+            "harness.observed",
+            json!({"state":"working", "incarnation_id":"one", "blocked_on":"human",
+                "ask":"permission", "reason":"Deploy production?"}),
+        );
+        let shown = prompts();
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(shown[0].episode, asked.id);
+        assert!(shown[0].is_alert());
+        assert_eq!(shown[0].conversation.as_deref(), Some("agent/node.worker"));
+        assert!(shown[0].detail.starts_with("Deploy production?"));
+        // Answered in the terminal: the harness reports it is no longer blocked.
+        append(
+            "harness.observed",
+            json!({"state":"working", "incarnation_id":"one", "blocked_on":null, "ask":null}),
+        );
+        assert!(prompts().is_empty());
+        // Asked again, then refused in the terminal, which only the screen shows.
+        let again = append(
+            "harness.observed",
+            json!({"state":"working", "incarnation_id":"one", "blocked_on":"human", "ask":"question"}),
+        );
+        assert_eq!(prompts()[0].episode, again.id);
+        store
+            .append_claim(&ClaimInput {
+                subject: "agent/node.worker".into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some("agent/node.worker".into()),
+                fields: serde_json::from_value(
+                    json!({"code":"native-prompt-gone", "incarnation_id":"one"}),
+                )
+                .unwrap(),
+                evidence: vec![again.id.clone()],
+                expected_subject: None,
+                idempotency_key: Some(attention_snapshot::native_prompt_gone_key(&again.id)),
+            })
+            .unwrap();
+        assert!(prompts().is_empty());
+        // A prompt from an incarnation that is no longer running waits on nobody.
+        append(
+            "harness.observed",
+            json!({"state":"working", "incarnation_id":"one", "blocked_on":"human", "ask":"permission"}),
+        );
+        assert_eq!(prompts().len(), 1);
+        append("runtime.observed", json!({"status":"running", "incarnation_id":"two"}));
+        assert!(prompts().is_empty());
     }
 
     #[test]

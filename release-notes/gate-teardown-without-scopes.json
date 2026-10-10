@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep cancelled gate process groups scheduled for teardown when an adoption observation cannot be read.",
+  "replay": { "status": "none", "detail": "No projection or replay changes." },
+  "schema": { "status": "none", "detail": "No database or migration changes." },
+  "rules": { "status": "none", "detail": "No checkpoint or fleet rule changes." },
+  "compatibility": { "status": "changed", "detail": "An indeterminate runtime observation no longer records a stopped gate. Teardown retries the observation and retains SIGKILL escalation on systems without user scopes. Group signalling reports live members found immediately after SIGKILL." },
+  "downtime": { "status": "unknown", "detail": "Restart the daemon to use the fix. Interruption duration has not been measured." },
+  "manual": { "status": "none", "detail": "No configuration change is required." },
+  "recovery": { "status": "none", "detail": "No persistent state format changes. Rollback restores the previous teardown behavior." }
+}

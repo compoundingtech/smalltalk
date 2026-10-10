@@ -32,10 +32,10 @@ pub(super) async fn request_latency(
     Extension(session): Extension<ClientSession>,
 ) -> Result<Json<Value>, ApiError> {
     require_scope(&session, "read.projections")?;
-    Ok(Json(json!({
-        "routes": super::request_latency_snapshot(),
-        "cost_counters": crate::profile::cost_snapshot(),
-    })))
+    let mut latency = super::request_latency_windows();
+    latency["routes"] = json!(super::request_latency_snapshot());
+    latency["cost_counters"] = crate::profile::cost_snapshot();
+    Ok(Json(latency))
 }
 
 // A client holds one socket for all its current collection views. A subscription
@@ -86,6 +86,8 @@ struct CollectionSubscription {
     roster_revision: u64,
     /// The same for every other published view: its revision when this window's last read began.
     view_revision: u64,
+    /// When the client subscribed, until its first snapshot is sent.
+    opened: Option<std::time::Instant>,
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 16;
@@ -701,6 +703,9 @@ async fn deliver_collection(
     if !sent {
         return Refreshed::Closed;
     }
+    if let Some(opened) = subscription.opened.take() {
+        super::record_stream_latency(&request.collection, opened.elapsed(), false);
+    }
     subscription.delivered = true;
     subscription.previous = Arc::new(current);
     subscription.order = order;
@@ -1035,6 +1040,9 @@ fn conversation_stream_error(id: &str, error: &ApiError) -> Value {
         "retryable":client_error_retryable(error.status, Some(&error.code))})
 }
 
+/// Follow a conversation with no subscription time. The collections socket calls
+/// [`follow_conversation_since`]; this form is for the tests that exercise the follower itself.
+#[cfg(test)]
 async fn follow_conversation(
     state: AppState,
     session: ClientSession,
@@ -1043,6 +1051,23 @@ async fn follow_conversation(
     session_id: String,
     remote: Option<String>,
     outbox: tokio::sync::mpsc::UnboundedSender<(String, u64, Value)>,
+) {
+    follow_conversation_since(state, session, id, generation, session_id, remote, outbox, None)
+        .await;
+}
+
+/// [`follow_conversation`] for a subscription made at `subscribed`, so its first page counts
+/// as opening the conversation.
+#[allow(clippy::too_many_arguments)]
+async fn follow_conversation_since(
+    state: AppState,
+    session: ClientSession,
+    id: String,
+    generation: u64,
+    session_id: String,
+    remote: Option<String>,
+    outbox: tokio::sync::mpsc::UnboundedSender<(String, u64, Value)>,
+    mut subscribed: Option<std::time::Instant>,
 ) {
     let remote = remote.as_deref();
     let failed = |error: &ApiError| conversation_stream_error(&id, error);
@@ -1092,6 +1117,9 @@ async fn follow_conversation(
         }
         if outbox.send((id.clone(), generation, frame)).is_err() {
             return;
+        }
+        if let Some(subscribed) = subscribed.take() {
+            super::record_stream_latency("conversation", subscribed.elapsed(), remote.is_some());
         }
         let mut after = start["next_cursor"].as_str().map(str::to_owned);
         loop {
@@ -1264,6 +1292,8 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut window_revisions = [0; 8];
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
+    // When each terminal subscription began, until its first screen is sent.
+    let mut terminals_opened = BTreeMap::<String, std::time::Instant>::new();
     let mut conversations = ConversationFollowers::default();
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, u64, Value)>();
@@ -1320,6 +1350,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                             subscriptions.remove(&request.id);
                             reread_due.remove(&request.id);
                             terminals.remove(&request.id);
+                            terminals_opened.remove(&request.id);
                             conversations.stop(&request.id);
                             break 'command;
                         }
@@ -1340,6 +1371,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         subscriptions.remove(&request.id);
                         reread_due.remove(&request.id);
                         terminals.remove(&request.id);
+                        terminals_opened.remove(&request.id);
                         conversations.stop(&request.id);
                         // Allocate a fresh token for every accepted subscribe, including terminal
                         // replacements, so queued collection/conversation results cannot reuse it.
@@ -1350,6 +1382,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                             let subscription_id = request.id.clone();
                             let id = subscription_id.clone();
                             let admission_slots = admission_slots.clone();
+                            let opened = std::time::Instant::now();
                             let follower = tokio::spawn(async move {
                                 let permits = ConversationAdmissionPermits {
                                     _socket: admission_slots.acquire_owned().await.expect("socket admission slots stay open"),
@@ -1357,7 +1390,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                                 };
                                 match admit(state.clone(), session.clone(), request, permits).await {
                                     Ok((session_id, remote)) => {
-                                        follow_conversation(state, session, id, generation, session_id, remote, outbox).await;
+                                        follow_conversation_since(state, session, id, generation, session_id, remote, outbox, Some(opened)).await;
                                     }
                                     Err(error) => {
                                         let frame = json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message});
@@ -1369,9 +1402,11 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                             break 'command;
                         }
                         if request.collection == "terminal" {
+                            let opened = std::time::Instant::now();
                             match open_terminal_subscription(&state, &session, &request).await {
                                 Ok(receiver) => {
                                     terminals.insert(request.id.clone(), receiver);
+                                    terminals_opened.insert(request.id.clone(), opened);
                                 }
                                 Err(error) => {
                                     if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "collection":"terminal", "code":error.code, "message":error.message})).await { return; }
@@ -1381,7 +1416,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         refresh.push(request.id.clone());
                         // Collection results and conversation frames share the same generation fence.
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, view_revision: 0, request });
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, view_revision: 0, opened: Some(std::time::Instant::now()), request });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -1535,6 +1570,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 continue;
             }
             (id, frame) = next_terminal_frame(&mut terminals), if !command_waiting && !terminals.is_empty() => {
+                let message_is_screen = matches!(frame, Some(TerminalFrame::Screen(_)));
                 let message = match frame {
                     Some(TerminalFrame::Waiting) => continue,
                     Some(TerminalFrame::Screen(envelope)) => json!({"kind":"screen", "id":id, "collection":"terminal", "snapshot":envelope["snapshot"], "value":envelope["value"]}),
@@ -1548,6 +1584,9 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                     }
                 };
                 if !send_collection(&mut socket, message).await { return; }
+                if message_is_screen && let Some(opened) = terminals_opened.remove(&id) {
+                    super::record_stream_latency("terminal", opened.elapsed(), false);
+                }
                 continue;
             }
         }
@@ -3814,10 +3853,11 @@ fn operation_reports() -> std::sync::MutexGuard<'static, BTreeMap<usize, Operati
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Start the daemon's first diagnostic report off the request path, so no read waits for it. The
-/// daemon calls this as its API starts to listen; until the report is made, the operations
-/// collection says that it is being made.
-pub(super) fn start_operation_report(state: &AppState) {
+/// Start the first diagnostic report off the request path and hand its operation audit to the
+/// startup repair. Only this first report shares its audit; refreshes inspect current state.
+pub(super) fn start_operation_report(
+    state: &AppState,
+) -> Option<tokio::sync::oneshot::Receiver<anyhow::Result<Vec<String>>>> {
     let key = Arc::as_ptr(&state.store) as usize;
     let mut reports = operation_reports();
     if reports.get(&key).is_some_and(|report| {
@@ -3826,7 +3866,7 @@ pub(super) fn start_operation_report(state: &AppState) {
             .upgrade()
             .is_some_and(|store| Arc::ptr_eq(&store, &state.store))
     }) {
-        return;
+        return None;
     }
     reports.insert(
         key,
@@ -3837,8 +3877,11 @@ pub(super) fn start_operation_report(state: &AppState) {
             refreshing: true,
         },
     );
+    drop(reports);
+    let (audit_sender, audit_receiver) = tokio::sync::oneshot::channel();
     let state = state.clone();
-    std::thread::spawn(move || refresh_operation_report(&state, key));
+    std::thread::spawn(move || refresh_operation_report(&state, key, Some(audit_sender)));
+    Some(audit_receiver)
 }
 
 /// The last diagnostic report, or `None` while the first one since the daemon started is being
@@ -3861,7 +3904,7 @@ fn operation_checks(
             {
                 report.refreshing = true;
                 let state = state.clone();
-                std::thread::spawn(move || refresh_operation_report(&state, key));
+                std::thread::spawn(move || refresh_operation_report(&state, key, None));
             }
             return Ok(report.checks.clone());
         }
@@ -3881,10 +3924,22 @@ fn operation_checks(
     Ok(Some(checks))
 }
 
-fn refresh_operation_report(state: &AppState, key: usize) {
-    let checks = doctor_report(state)
-        .ok()
-        .map(|report| Arc::new(report.0.checks));
+fn refresh_operation_report(
+    state: &AppState,
+    key: usize,
+    startup_audit: Option<tokio::sync::oneshot::Sender<anyhow::Result<Vec<String>>>>,
+) {
+    let report = if let Some(sender) = startup_audit {
+        let drift = state.store.operation_projection_drift();
+        let report = doctor_report_with_operation_drift(state, &drift);
+        // The repair owns these findings, including any scan error. It re-derives just the
+        // drifted rows from current claims, never reuses expected values from this snapshot.
+        let _ = sender.send(drift);
+        report
+    } else {
+        doctor_report(state)
+    };
+    let checks = report.ok().map(|report| Arc::new(report.0.checks));
     let mut reports = operation_reports();
     let Some(report) = reports.get_mut(&key) else {
         return;
@@ -14705,6 +14760,54 @@ subscription "watch/source" {
         assert_eq!(statements(40), few.get());
     }
 
+    #[test]
+    fn startup_operation_audit_is_shared_and_later_reports_are_fresh() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.append_client_claim(&ClaimInput {
+            subject: "resource/startup-audit".into(),
+            kind: "resource.observed".into(),
+            actor: None,
+            fields: BTreeMap::from([("kind".into(), json!("custom.test.startup-audit"))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some("startup-audit-operation".into()),
+        }).unwrap();
+        let corrupt = || {
+            state.store.connection.write()
+                .execute("UPDATE operations SET state='conflict'", []).unwrap();
+        };
+        corrupt();
+
+        let key = Arc::as_ptr(&state.store) as usize;
+        operation_reports().insert(key, OperationReport {
+            store: Arc::downgrade(&state.store),
+            checks: None,
+            at: Instant::now(),
+            refreshing: true,
+        });
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        refresh_operation_report(&state, key, Some(sender));
+        let drift = receiver.blocking_recv().unwrap().unwrap();
+        assert_eq!(drift.len(), 1);
+        let checks = operation_checks(&state).unwrap().unwrap();
+        let projection = checks.iter().find(|check| check.name == "operation-projection").unwrap();
+        assert_eq!(projection.status, "fail");
+        assert_eq!(projection.message, format!("operation projection drift: {}", drift.join(", ")));
+
+        assert!(state.store.repair_operation_projection_drift_from_audit(&drift).unwrap());
+        let projection_status = || {
+            doctor_report(&state).unwrap().0.checks.into_iter()
+                .find(|check| check.name == "operation-projection").unwrap().status
+        };
+        assert_eq!(projection_status(), "pass");
+        corrupt();
+        assert_eq!(projection_status(), "fail");
+        refresh_operation_report(&state, key, None);
+        let checks = operation_checks(&state).unwrap().unwrap();
+        assert_eq!(checks.iter().find(|check| check.name == "operation-projection").unwrap().status, "fail");
+    }
+
     /// The operations collection answers while the first diagnostic report since a start is
     /// being made, saying so, and lists the report once it is made.
     #[test]
@@ -14731,7 +14834,7 @@ subscription "watch/source" {
         assert_eq!(pending[0]["severity"], "info");
         assert_eq!(pending[0]["state"], "running");
         assert_eq!(pending[0]["updated_at"], "2026-09-30T00:00:00Z");
-        refresh_operation_report(&state, key);
+        refresh_operation_report(&state, key, None);
         let report = operation_resources(&state, "2026-09-30T00:00:00Z").unwrap();
         assert!(
             report.iter().all(|item| item["state"] != "running"),
@@ -14747,7 +14850,12 @@ subscription "watch/source" {
         // A started report is made on its own thread, and a second start keeps it.
         let other = tempfile::tempdir().unwrap();
         let started = test_state(other.path());
-        start_operation_report(&started);
+        let audit = start_operation_report(&started).unwrap();
+        let drift = audit.blocking_recv().unwrap().unwrap();
+        assert!(drift.is_empty());
+        crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+        assert!(!started.store.repair_operation_projection_drift_from_audit(&drift).unwrap());
+        assert_eq!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get), 0);
         let deadline = Instant::now() + Duration::from_secs(30);
         while operation_checks(&started).unwrap().is_none() {
             assert!(
@@ -14757,7 +14865,7 @@ subscription "watch/source" {
             std::thread::sleep(Duration::from_millis(10));
         }
         let made = operation_checks(&started).unwrap().unwrap();
-        start_operation_report(&started);
+        assert!(start_operation_report(&started).is_none());
         assert!(Arc::ptr_eq(
             &made,
             &operation_checks(&started).unwrap().unwrap()

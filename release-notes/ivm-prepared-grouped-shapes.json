@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Share prepared output shape discovery across a bounded table group",
+  "replay": {
+    "status": "none",
+    "detail": "Consolidate same-cut prepared metadata discovery with unchanged table/column/FK limits, refusal and atomic acceptance; no persisted schema, publication, Runtime, installer activation or writer changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Consolidate same-cut prepared metadata discovery with unchanged table/column/FK limits, refusal and atomic acceptance; no persisted schema, publication, Runtime, installer activation or writer changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Consolidate same-cut prepared metadata discovery with unchanged table/column/FK limits, refusal and atomic acceptance; no persisted schema, publication, Runtime, installer activation or writer changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Consolidate same-cut prepared metadata discovery with unchanged table/column/FK limits, refusal and atomic acceptance; no persisted schema, publication, Runtime, installer activation or writer changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Consolidate same-cut prepared metadata discovery with unchanged table/column/FK limits, refusal and atomic acceptance; no persisted schema, publication, Runtime, installer activation or writer changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Consolidate same-cut prepared metadata discovery with unchanged table/column/FK limits, refusal and atomic acceptance; no persisted schema, publication, Runtime, installer activation or writer changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Consolidate same-cut prepared metadata discovery with unchanged table/column/FK limits, refusal and atomic acceptance; no persisted schema, publication, Runtime, installer activation or writer changes."
+  }
+}

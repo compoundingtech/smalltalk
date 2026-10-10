@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Allow the native TEMP clock while retaining admitted/applied fixture shadow refusal",
+  "replay": {
+    "status": "none",
+    "detail": "Test fixture and source-contract correction only; no production behavior, schema, admission, source installation or activation change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Test fixture and source-contract correction only; no production behavior, schema, admission, source installation or activation change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Test fixture and source-contract correction only; no production behavior, schema, admission, source installation or activation change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test fixture and source-contract correction only; no production behavior, schema, admission, source installation or activation change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Test fixture and source-contract correction only; no production behavior, schema, admission, source installation or activation change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Test fixture and source-contract correction only; no production behavior, schema, admission, source installation or activation change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Test fixture and source-contract correction only; no production behavior, schema, admission, source installation or activation change."
+  }
+}

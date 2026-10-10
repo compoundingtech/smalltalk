@@ -4,6 +4,7 @@
   "workspaces": [
     "apps/ios",
     "clients/typescript/st3-client",
+    "clients/typescript/st3-scenarios",
     "clients/typescript/st3-views"
   ],
   "packageManager": "pnpm@12.7.0",

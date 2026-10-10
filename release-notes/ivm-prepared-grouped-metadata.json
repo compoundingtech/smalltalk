@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Share one bounded foreign-key inventory across prepared output table capture",
+  "replay": {
+    "status": "none",
+    "detail": "Additive grouped prepared-table capture with unchanged output/fanout refusal, row limits and publication semantics; existing one-table API remains. No persisted schema, source installation, Runtime or activation change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Additive grouped prepared-table capture with unchanged output/fanout refusal, row limits and publication semantics; existing one-table API remains. No persisted schema, source installation, Runtime or activation change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Additive grouped prepared-table capture with unchanged output/fanout refusal, row limits and publication semantics; existing one-table API remains. No persisted schema, source installation, Runtime or activation change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Additive grouped prepared-table capture with unchanged output/fanout refusal, row limits and publication semantics; existing one-table API remains. No persisted schema, source installation, Runtime or activation change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Additive grouped prepared-table capture with unchanged output/fanout refusal, row limits and publication semantics; existing one-table API remains. No persisted schema, source installation, Runtime or activation change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Additive grouped prepared-table capture with unchanged output/fanout refusal, row limits and publication semantics; existing one-table API remains. No persisted schema, source installation, Runtime or activation change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Additive grouped prepared-table capture with unchanged output/fanout refusal, row limits and publication semantics; existing one-table API remains. No persisted schema, source installation, Runtime or activation change."
+  }
+}

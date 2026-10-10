@@ -26,6 +26,35 @@ subtract writer wait or report only a hierarchy component. This is server comple
 network delivery time. Abandoned and still-running requests have no sample. Existing long-poll
 route durations include deliberate waiting.
 
+## Targets and live windows
+
+[`slo/targets.toml`](../../slo/targets.toml) holds the daemon's targets: reads a person waits on,
+writes and acks, terminal attach to first screen, one SQL statement, any transaction or hold of
+the writer, and daemon CPU. Every daemon builds the file in. CI's daemon_load reads the same file.
+A target describes what we aim for and gates nothing by itself.
+
+The request-latency read adds `targets` and `paths` to `routes`. Each target and each path keeps
+rolling 1-minute, 5-minute and 1-hour windows with `count`, `p50_ms`, `p99_ms`, `max_ms`,
+`over_target` and `over_target_share`. A path is `METHOD /route`, or `stream COLLECTION` for the
+time from a subscription on the client collections socket to its first snapshot, conversation
+page or terminal screen. A read the daemon relayed from another machine's owner counts toward
+the target's `remote_windows` and its remote target. A request that asks to wait (`wait_ms` above
+zero, or `wait=true`) is a long poll: it is kept under `METHOD /route (long poll)` and counts
+toward no target. The `sql-statement`, `transaction` (`read`, `write`, `writer_hold`) and `cpu`
+rows cover the store's statements, its read and write transactions, each hold of its single
+writer, and the process's CPU in cores.
+
+The windows live in memory. Each is a ring of slots (12 of 5 seconds, 10 of 30 seconds, 12 of 5
+minutes). Each slot is a sparse histogram with 16 buckets per doubling, so a percentile is
+within a sixteenth of its sample and never above the window's exact maximum. The share over target
+is counted exactly as each sample finishes. Nothing samples on a thread of its own. A window ages
+out when it is next written or read, and a restart empties it.
+
+`st doctor` prints a `slo/NAME` line for each target and a line for each of the ten paths furthest
+over their target in the last five minutes. A p99 target is missed in a window when more than 1%
+of its samples are over. A max target is missed when any one sample is over. A miss is `info`,
+not `warn`, so `st doctor --strict` does not fail on a target.
+
 For a deployed latency receipt, retain the process/source identity and before/after count delta.
 A low-volume tail can include requests from before the measurement window, and a restart resets
 these in-memory counters. The endpoint alone supplies no queue-versus-work breakdown; the phase

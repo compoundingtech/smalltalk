@@ -481,6 +481,7 @@ impl ClientRelay {
         let target = host_id
             .strip_prefix("host/")
             .context("the owner host ID is invalid")?;
+        crate::api::note_remote_read();
         let started = std::time::Instant::now();
         match self
             .send_toward(
@@ -1715,6 +1716,43 @@ pub async fn run_worker(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_read_through_the_relay_marks_its_request_as_a_remote_read() {
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        // The only peer refuses connections: the read fails, but it was a read from another
+        // machine, so the request that made it counts toward the remote target.
+        let relay = ClientRelay::from_config(&Config {
+            node: "gateway-node".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "owner-node".into(),
+                url: "http://127.0.0.1:1".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        let read = ClientReadRequest {
+            authority_actor: "person/example".into(),
+            relay: None,
+            request: ClientReadOperation::Timeline {
+                session_id: "session/example".into(),
+                limit: 1,
+                cursor: None,
+            },
+        };
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = crate::api::track_remote_reads(flag.clone(), relay.read("host/owner-node", &read)).await;
+        assert!(result.is_err());
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+        // Outside a request there is nothing to mark, and the read still runs.
+        assert!(relay.read("host/owner-node", &read).await.is_err());
+    }
     use crate::model::ClaimInput;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;

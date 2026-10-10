@@ -382,12 +382,13 @@ workflow-level path filters. `linux-gate` does not depend on them.
   `base_sha..head_sha`. `--no-renames` counts both sides of a rename. Missing or malformed
   SHAs, failed fetches and failed diffs fail closed; `workflow_dispatch` forces execution.
   Relevant paths are `apps/fractal-web/**`, `packages/fractal-ui/**`,
-  `clients/typescript/st3-views/**` and `fixtures/**`. Within `clients/typescript/st3-client`,
-  only the consumed export graph (`index.ts`, `Models.generated.ts`, `Client.generated.ts`,
-  `Schema.generated.ts`, `errors.ts`), `package.json`, `tsconfig.json`, `tsconfig.schema.json`,
-  `types.test.ts` and `BUCK*` trigger web execution. Rust generators and their schema/docs
-  inputs do not trigger it without a changed generated client file; root flake-only changes
-  also do not trigger it. Other relevant paths are
+  `clients/typescript/st3-views/**`, `clients/typescript/st3-scenarios/**` and `fixtures/**`.
+  Within `clients/typescript/st3-client`, only the consumed export graph (`index.ts`,
+  `Models.generated.ts`, `Client.generated.ts`, `Schema.generated.ts`, `errors.ts`),
+  `package.json`, `tsconfig.json`, `tsconfig.schema.json`, `types.test.ts` and `BUCK*`
+  trigger web execution. Rust generators and their schema/docs inputs do not trigger it
+  without a changed generated client file; root flake-only changes also do not trigger it.
+  Other relevant paths are
   root `package.json*`, `pnpm-workspace.yaml*`, `pnpm-lock.yaml`,
   `pnpm-install-contract.json*`, `.npmrc`, root `tsconfig*.json*`, `.buckroot*`,
   `.buckconfig*`, root `BUCK*`, `buck2/**`, `genie/**`, `nix/web/**`,
@@ -581,6 +582,11 @@ Relative latency tolerates 5 ms of noise, or 50 ms when either path has fewer th
 those sparse p99s are effectively observed maxima. This bounded tolerance still catches large
 regressions on rare paths. CPU tolerates 0.05 cores. A PR without a main baseline fails as P0;
 a main bootstrap may check only absolute budgets and errors.
+
+The CPU budget (2 cores) comes from [`slo/targets.toml`](../slo/targets.toml), which st3 builds in:
+a missing file fails the build and an invalid one fails the run, with no default. The report and step summary also show each
+path's p99 target from that file (`descriptive_target_ms`, `over_descriptive_target`) when the path
+stands for one. Targets describe and never gate: the budgets and main's baseline remain the gates.
 
 Performance uses the small `.#perf` Nix shell and the opt-in `perf_load` test target (feature
 `perf-load`), which imports the same `daemon_load` and `daemon_bench` modules without compiling
