@@ -121,7 +121,7 @@ fn directive_note_local_and_replicated_admission_require_subject_person() {
 #[test]
 fn directive_note_visibility_unions_account_owner_author_and_mission_requester() {
     let store = store();
-    for person in ["person/owner", "person/author", "person/requester", "person/unrelated"] {
+    for person in ["person/owner", "person/avery", "person/requester", "person/intruder"] {
         store.set_directive_note(person, person, Some(person), None).unwrap();
     }
     let intent = declare(&store, r#"version 2
@@ -132,7 +132,7 @@ mission "notes" state="ready" {
   agent "worker" { workspace "/tmp"; harness "claude" { account-pool "person/owner"; }; }
   step "work" { assigned-to "agent/worker"; goal "Work."; }
 }
-"#, "person/author", "visibility");
+"#, "person/avery", "visibility");
     let run = store.create_mission_run(&MissionRunRequest {
         mission: intent.missions["notes"].id.clone(), revision: None, workspace: "/tmp".into(),
         requester: Some("person/requester".into()), mode: Some("run".into()), inputs: BTreeMap::new(), idempotency_key: "notes-run".into(),
@@ -147,7 +147,7 @@ mission "notes" state="ready" {
     store.apply_as(&execution, &planned.subject_tokens, "materialize-worker", Some(&run.requester)).unwrap();
     let worker = format!("agent/{}/worker", run.id);
     let people = |actor: &str| store.directive_notes(actor).unwrap().into_iter().map(|note| note.person).collect::<BTreeSet<_>>();
-    assert_eq!(people("agent/note/parent"), BTreeSet::from(["person/author".into(), "person/owner".into()]));
+    assert_eq!(people("agent/note/parent"), BTreeSet::from(["person/avery".into(), "person/owner".into()]));
     assert_eq!(people(&worker), BTreeSet::from(["person/owner".into(), "person/requester".into()]));
     // The spawned declaration's author may itself be an agent owned by a different person.
     let child_kdl = "version 2\nagent \"note/child\" { workspace \"/tmp\"; command \"true\"; }";
@@ -157,8 +157,8 @@ mission "notes" state="ready" {
     desired.owner_generation = Some(run.generation.clone());
     let planned = store.mission(&child, IntentInput { kdl: child_kdl.into(), source_name: None }).unwrap();
     store.apply_as(&child, &planned.subject_tokens, "child-visibility", Some("agent/note/parent")).unwrap();
-    assert_eq!(people("agent/note/child"), BTreeSet::from(["person/author".into(), "person/owner".into(), "person/requester".into()]));
-    assert_eq!(people("person/unrelated"), BTreeSet::from(["person/unrelated".into()]));
+    assert_eq!(people("agent/note/child"), BTreeSet::from(["person/avery".into(), "person/owner".into(), "person/requester".into()]));
+    assert_eq!(people("person/intruder"), BTreeSet::from(["person/intruder".into()]));
     assert!(people("agent/unknown").is_empty());
     assert!(people("host/alder").is_empty());
 }
@@ -392,7 +392,7 @@ mission "protected-note" state="ready" revisions="human-only" revision-reviewer=
 #[test]
 fn directive_note_visibility_tracks_multiple_current_work_requesters_not_available_seats() {
     let store = store();
-    for person in ["person/author", "person/requester-a", "person/requester-b"] {
+    for person in ["person/avery", "person/alex", "person/blair"] {
         store.set_directive_note(person, person, Some("Context"), None).unwrap();
     }
     let intent = declare(&store, r#"version 2
@@ -403,25 +403,25 @@ mission "shared-work" state="ready" {
   goal "Work for the real requester."
   step "work" { assigned-to "agent/note/worker"; goal "Work."; }
 }
-"#, "person/author", "shared-work");
+"#, "person/avery", "shared-work");
     let mut runs = Vec::new();
-    for (person, key) in [("person/requester-a", "run-a"), ("person/requester-b", "run-b")] {
+    for (person, key) in [("person/alex", "run-a"), ("person/blair", "run-b")] {
         runs.push(store.create_mission_run(&MissionRunRequest {
             mission: intent.missions["shared-work"].id.clone(), revision: None, workspace: "/tmp".into(),
             requester: Some(person.into()), mode: Some("run".into()), inputs: BTreeMap::new(), idempotency_key: key.into(),
         }).unwrap());
     }
     let people = |actor: &str| store.directive_notes(actor).unwrap().into_iter().map(|note| note.person).collect::<BTreeSet<_>>();
-    assert_eq!(people("agent/note/worker"), BTreeSet::from(["person/author".into(), "person/requester-a".into(), "person/requester-b".into()]));
+    assert_eq!(people("agent/note/worker"), BTreeSet::from(["person/avery".into(), "person/alex".into(), "person/blair".into()]));
     store.connection.batched(|tx| -> Result<()> {
         tx.execute("UPDATE step_runs SET available_to='[\"agent/note/offered\"]' WHERE subject=?1", [&runs[0].steps[0].subject])?;
         Ok(())
     }).unwrap().unwrap();
-    assert_eq!(people("agent/note/offered"), BTreeSet::from(["person/author".into()]), "an offer is not a work-for relationship");
+    assert_eq!(people("agent/note/offered"), BTreeSet::from(["person/avery".into()]), "an offer is not a work-for relationship");
     for run in runs {
         store.set_mission_run_state(&run.id, "cancelled", "normal", None).unwrap();
     }
-    assert_eq!(people("agent/note/worker"), BTreeSet::from(["person/author".into()]));
+    assert_eq!(people("agent/note/worker"), BTreeSet::from(["person/avery".into()]));
 }
 
 #[test]
