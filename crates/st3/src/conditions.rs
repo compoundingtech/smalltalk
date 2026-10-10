@@ -77,9 +77,11 @@ pub enum Metric {
     ProcessRssBytes,
     /// The claim database file and its write-ahead log.
     DbSizeBytes,
+    /// Physical net database-plus-WAL growth, normalized over 24 hours of hourly samples.
+    DbGrowthBytesPerDay,
     /// Bytes of claims this member wrote in the last 24 hours. Every member stores every claim, so
     /// this is what each member adds to every database in the fleet.
-    DbGrowthBytesPerDay,
+    DbAuthoredBytesPerDay,
     /// Model spend by seats on this member in the last 24 hours.
     CostUsdPerDay,
     /// The daemon's own CPU, from its request-latency windows.
@@ -104,6 +106,11 @@ const METRICS: &[(&str, Metric, Scope)] = &[
     (
         "db.growth-bytes-per-day",
         Metric::DbGrowthBytesPerDay,
+        Scope::Member,
+    ),
+    (
+        "db.authored-bytes-per-day",
+        Metric::DbAuthoredBytesPerDay,
         Scope::Member,
     ),
     ("cost.usd-per-day", Metric::CostUsdPerDay, Scope::Member),
@@ -151,7 +158,8 @@ impl Metric {
             Self::DiskFreeBytes
             | Self::ProcessRssBytes
             | Self::DbSizeBytes
-            | Self::DbGrowthBytesPerDay => bytes(value),
+            | Self::DbGrowthBytesPerDay
+            | Self::DbAuthoredBytesPerDay => bytes(value),
             Self::ProcessCpuCores | Self::DaemonCpuCores => format!("{} cores", round(value)),
             Self::CostUsdPerDay => format!("${}", round(value)),
             Self::SloBurnRate => format!("{}x budget", round(value)),

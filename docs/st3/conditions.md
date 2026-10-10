@@ -32,7 +32,8 @@ Route and daemon CPU metrics accept `window "1m"`, `"5m"`, or `"1h"`. Routes def
 | process | `process.cpu-cores` | CPU seconds per elapsed second, summed by process name |
 | process | `process.rss-bytes` | resident bytes, summed by process name |
 | member | `db.size-bytes` | database and WAL bytes |
-| member | `db.growth-bytes-per-day` | locally authored claim bytes per day |
+| member | `db.growth-bytes-per-day` | physical database plus WAL net growth per day |
+| member | `db.authored-bytes-per-day` | locally authored claim bytes per day |
 | member | `cost.usd-per-day` | recorded model spend in USD over 24 hours |
 | member | `daemon.cpu-cores` | daemon CPU from SLO windows |
 | route | `slo.burn-rate` | share over target divided by the 1% p99 error budget |
@@ -49,9 +50,13 @@ and an established breach continues without sending another entry message.
 Disk, process and available-memory probes use kernel facts on Linux. macOS reads cached mount facts with `getfsstat`; other hosts
 check `/` when no mount table is available; process and memory readings can be
 unavailable. A tick reads at most 256 local filesystems and 16,384 process entries. Process names match `/proc/PID/comm` exactly. CPU needs two samples.
-Database growth counts this member's contribution to the replicated claim log,
-rather than physical file allocation, compaction or another member's claims.
-It uses hourly buckets over 24 hours; a count still catching up has no reading.
+Physical database growth compares hourly database-plus-WAL samples spanning 24
+hours, including received claims and compaction (which can make growth negative).
+The daemon retains 48 hours locally, samples at most once per UTC hour, and needs
+a full day before it can report growth. A stale latest sample or missing daily
+baseline has no reading. The separate authored-byte metric attributes each member's
+contribution to the replicated claim log in hourly buckets over 24 hours; a count
+still catching up has no reading.
 
 `owner` accepts `agent/NAME` or `person/NAME`. Agent notifications cite the state
 claim and include the value, threshold, breach start, and series location.

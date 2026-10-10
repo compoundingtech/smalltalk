@@ -7,7 +7,7 @@
   },
   "schema": {
     "status": "changed",
-    "detail": "Adds the condition subject, root declaration and system-only durable condition.state claim. Registry digest expands. Storage version stays 18; three local condition cache/counter/notification tables and a desired-condition index are created on store open."
+    "detail": "Adds the condition subject, root declaration and system-only durable condition.state claim. Registry digest expands. Storage version stays 18; four local condition cache/counter/notification/hourly-size tables and a desired-condition index are created on store open."
   },
   "rules": {
     "status": "none",

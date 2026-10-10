@@ -6,7 +6,7 @@
 //! newest state claim of each instance, so a read finds it with one lookup however long the
 //! history; the evaluator folds new claims into it, its own and replicated ones, each tick.
 //! `local_condition_claim_bytes` counts, per hour, the bytes of claims this member wrote, for
-//! `db.growth-bytes-per-day`. Neither replicates: the claims are the authority.
+//! `db.authored-bytes-per-day`. Neither replicates: the claims are the authority.
 
 use super::*;
 use crate::conditions::{ConditionDecl, Phase, Recorded, Tracker, Transition, parse_condition};
@@ -21,6 +21,11 @@ CREATE TABLE IF NOT EXISTS local_condition_heads (
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS local_condition_notifications (
     store_index INTEGER PRIMARY KEY
+);
+CREATE TABLE IF NOT EXISTS local_condition_database_samples (
+    hour_unix_ms INTEGER PRIMARY KEY,
+    measured_at_unix_ms INTEGER NOT NULL,
+    bytes REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS local_condition_claim_bytes (
     hour_unix_ms INTEGER PRIMARY KEY,
@@ -97,6 +102,18 @@ pub struct ConditionRecord<'a> {
     pub tracker: &'a Tracker,
     pub transition: Option<Transition>,
     pub now: u128,
+}
+
+#[derive(Clone, Copy)]
+struct Notification<'a> {
+    condition: &'a str,
+    owner: &'a str,
+    instance: &'a str,
+    transition: Transition,
+    breach_since: u128,
+    title: &'a str,
+    body: &'a str,
+    evidence: Option<&'a str>,
 }
 
 fn meta_integer(connection: &Connection, key: &str) -> Result<Option<i64>> {
@@ -395,41 +412,21 @@ impl Store {
         Ok(claim)
     }
 
-    /// Tell an agent owner of a transition, once: the message's subject and idempotency key are
-    /// the transition's, so a retry after a failed write sends nothing twice.
-    pub fn send_condition_message(
+    /// Tell the recorded owner once. Historical text and owner remain stable across retries.
+    fn send_condition_notification(
         &self,
-        decl: &ConditionDecl,
-        instance: &str,
-        transition: Transition,
-        breach_since: u128,
-        title: &str,
-        body: &str,
-        evidence: Option<&str>,
+        notification: &Notification<'_>,
     ) -> Result<Option<String>> {
-        self.send_condition_notification(
-            &decl.subject(),
-            &decl.owner,
+        let Notification {
+            condition,
+            owner,
             instance,
             transition,
             breach_since,
             title,
             body,
             evidence,
-        )
-    }
-
-    fn send_condition_notification(
-        &self,
-        condition: &str,
-        owner: &str,
-        instance: &str,
-        transition: Transition,
-        breach_since: u128,
-        title: &str,
-        body: &str,
-        evidence: Option<&str>,
-    ) -> Result<Option<String>> {
+        } = *notification;
         if !owner.starts_with("agent/") {
             return Ok(None);
         }
@@ -498,18 +495,18 @@ impl Store {
                 Some("recover") => Transition::Recover,
                 _ => continue,
             };
-            if let Some(message) = self.send_condition_notification(
-                &subject,
-                fields["owner"].as_str().unwrap_or(""),
-                fields["instance"].as_str().unwrap_or(""),
+            if let Some(message) = self.send_condition_notification(&Notification {
+                condition: &subject,
+                owner: fields["owner"].as_str().unwrap_or(""),
+                instance: fields["instance"].as_str().unwrap_or(""),
                 transition,
-                u128::from(fields["breach_since"].as_u64().unwrap_or(0)),
-                fields["notification_title"]
+                breach_since: u128::from(fields["breach_since"].as_u64().unwrap_or(0)),
+                title: fields["notification_title"]
                     .as_str()
                     .unwrap_or("Condition changed"),
-                fields["notification_body"].as_str().unwrap_or(""),
-                Some(&claim),
-            )? {
+                body: fields["notification_body"].as_str().unwrap_or(""),
+                evidence: Some(&claim),
+            })? {
                 messages.push(message);
             }
             self.connection
@@ -667,6 +664,56 @@ impl Store {
             })
             .map_err(|error| anyhow::anyhow!("{error}"))??;
         Ok(())
+    }
+
+    /// Sample physical size at most once per UTC hour, even after daemon restarts.
+    pub fn condition_database_sample_due(&self, now: u128) -> Result<bool> {
+        let hour = i64::try_from(now - now % HOUR_MS)?;
+        Ok(!self.readers.get().query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_condition_database_samples WHERE hour_unix_ms=?1)",
+            [hour],
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
+
+    pub fn record_condition_database_sample(&self, now: u128, bytes: f64) -> Result<()> {
+        anyhow::ensure!(bytes.is_finite() && bytes >= 0.0, "invalid database size");
+        let hour = i64::try_from(now - now % HOUR_MS)?;
+        let measured = i64::try_from(now)?;
+        let oldest = i64::try_from(now.saturating_sub(48 * HOUR_MS))?;
+        self.connection.batched(move |tx| {
+            tx.execute("INSERT OR IGNORE INTO local_condition_database_samples(hour_unix_ms, measured_at_unix_ms, bytes) VALUES (?1, ?2, ?3)", params![hour, measured, bytes])?;
+            tx.execute("DELETE FROM local_condition_database_samples WHERE hour_unix_ms < ?1", [oldest])
+        }).map_err(|error| anyhow::anyhow!("{error}"))??;
+        Ok(())
+    }
+
+    /// Net physical growth per day, including received claims and compaction. Require a full
+    /// day of samples; a stale latest sample or a missing baseline produces no reading.
+    pub fn condition_database_growth_per_day(&self, now: u128) -> Result<Option<f64>> {
+        let connection = self.readers.get();
+        let latest = connection.query_row(
+            "SELECT measured_at_unix_ms, bytes FROM local_condition_database_samples ORDER BY hour_unix_ms DESC LIMIT 1", [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))).optional()?;
+        let Some((at, bytes)) = latest else {
+            return Ok(None);
+        };
+        let at_u128 = u128::try_from(at)?;
+        if now < at_u128 || now.saturating_sub(at_u128) > 2 * HOUR_MS {
+            return Ok(None);
+        }
+        let start = at.saturating_sub(DAY_MS as i64);
+        let baseline = connection
+            .query_row(
+                "SELECT measured_at_unix_ms, bytes FROM local_condition_database_samples
+             WHERE hour_unix_ms <= ?1 AND measured_at_unix_ms <= ?2 AND measured_at_unix_ms >= ?3
+             ORDER BY hour_unix_ms DESC LIMIT 1",
+                params![start, start, start.saturating_sub(HOUR_MS as i64)],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)),
+            )
+            .optional()?;
+        Ok(baseline
+            .map(|(before, previous)| (bytes - previous) * DAY_MS as f64 / (at - before) as f64))
     }
 
     /// Bytes of claims this member wrote in the last 24 hours. Until a day has been counted, the
@@ -862,6 +909,57 @@ condition "fleet/collector-cpu" {
     }
 
     #[test]
+    fn physical_growth_uses_daily_size_deltas_including_compaction_and_received_bytes() {
+        let (_directory, store) = store();
+        let start = 1_760_000_000_000u128;
+        let before = store.index().unwrap();
+        assert!(store.condition_database_sample_due(start).unwrap());
+        store
+            .record_condition_database_sample(start, 1_000.0)
+            .unwrap();
+        assert!(!store.condition_database_sample_due(start).unwrap());
+        store
+            .record_condition_database_sample(start + 10, 9_999.0)
+            .unwrap();
+        assert_eq!(
+            store
+                .condition_database_growth_per_day(start + HOUR_MS)
+                .unwrap(),
+            None
+        );
+        // The physical bytes include whatever arrived from other members; no origin filter.
+        store
+            .record_condition_database_sample(start + DAY_MS, 4_000.0)
+            .unwrap();
+        assert_eq!(
+            store
+                .condition_database_growth_per_day(start + DAY_MS)
+                .unwrap(),
+            Some(3_000.0)
+        );
+        assert_eq!(
+            store
+                .condition_database_growth_per_day(start + DAY_MS + 3 * HOUR_MS)
+                .unwrap(),
+            None
+        );
+        store
+            .record_condition_database_sample(start + 2 * DAY_MS, 500.0)
+            .unwrap();
+        assert_eq!(
+            store
+                .condition_database_growth_per_day(start + 2 * DAY_MS)
+                .unwrap(),
+            Some(-3_500.0)
+        );
+        assert_eq!(
+            store.index().unwrap(),
+            before,
+            "local sampling is not a graph event"
+        );
+    }
+
+    #[test]
     fn a_declared_condition_reads_back_with_no_state_until_one_is_recorded() {
         let (_directory, store) = store();
         let conditions = store.conditions().unwrap();
@@ -937,15 +1035,16 @@ condition "fleet/collector-cpu" {
         let disk = decl(&store, "condition/fleet/disk");
         let message = |transition, since| {
             store
-                .send_condition_message(
-                    &disk,
-                    "alder:/",
+                .send_condition_notification(&Notification {
+                    condition: &disk.subject(),
+                    owner: &disk.owner,
+                    instance: "alder:/",
                     transition,
-                    since,
-                    "Condition breached: fleet/disk on alder:/",
-                    "body",
-                    None,
-                )
+                    breach_since: since,
+                    title: "Condition breached: fleet/disk on alder:/",
+                    body: "body",
+                    evidence: None,
+                })
                 .unwrap()
                 .unwrap()
         };
@@ -969,7 +1068,16 @@ condition "fleet/collector-cpu" {
         let cpu = decl(&store, "condition/fleet/collector-cpu");
         assert_eq!(
             store
-                .send_condition_message(&cpu, "alder", Transition::Enter, 5, "t", "b", None)
+                .send_condition_notification(&Notification {
+                    condition: &cpu.subject(),
+                    owner: &cpu.owner,
+                    instance: "alder",
+                    transition: Transition::Enter,
+                    breach_since: 5,
+                    title: "t",
+                    body: "b",
+                    evidence: None,
+                })
                 .unwrap(),
             None
         );

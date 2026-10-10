@@ -156,6 +156,7 @@ struct Readings {
     database: Option<Option<f64>>,
     slo: Option<Value>,
     claim_bytes: Option<Option<f64>>,
+    physical_growth: Option<f64>,
 }
 
 impl Evaluator {
@@ -207,10 +208,24 @@ impl Evaluator {
         let mut readings = Readings::default();
         if decls
             .iter()
-            .any(|decl| decl.metric == Metric::DbGrowthBytesPerDay)
+            .any(|decl| decl.metric == Metric::DbAuthoredBytesPerDay)
         {
             store.fold_condition_claim_bytes(now)?;
             readings.claim_bytes = Some(store.condition_claim_bytes_per_day(now)?);
+        }
+        if decls
+            .iter()
+            .any(|decl| decl.metric == Metric::DbGrowthBytesPerDay)
+        {
+            if store.condition_database_sample_due(now)? {
+                let size = *readings
+                    .database
+                    .get_or_insert_with(|| self.probe.database_bytes());
+                if let Some(size) = size {
+                    store.record_condition_database_sample(now, size)?;
+                }
+            }
+            readings.physical_growth = store.condition_database_growth_per_day(now)?;
         }
         let process_names = decls
             .iter()
@@ -338,6 +353,10 @@ impl Evaluator {
                 .map(|value| vec![(host, value)])
                 .unwrap_or_default(),
             Metric::DbGrowthBytesPerDay => readings
+                .physical_growth
+                .map(|value| vec![(host, value)])
+                .unwrap_or_default(),
+            Metric::DbAuthoredBytesPerDay => readings
                 .claim_bytes
                 .flatten()
                 .map(|value| vec![(host, value)])
