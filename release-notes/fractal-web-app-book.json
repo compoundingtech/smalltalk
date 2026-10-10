@@ -1,10 +1,10 @@
 {
   "version": 1,
-  "summary": "Add a production-mounted Fractal App Storybook with deterministic schema-decoded scenarios, light/dark width matrices and transcript identity play controls.",
+  "summary": "Add a production-mounted Fractal App Storybook with deterministic schema-decoded scenarios, light/dark width matrices, working development HMR and lazy-inclusive bidirectional App identity gates with planted-copy controls.",
   "replay": { "status": "none", "detail": "No replay or rebuild of stored data." },
   "schema": { "status": "none", "detail": "No new wire or storage schema; fixtures decode with the production client codecs." },
   "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
-  "compatibility": { "status": "none", "detail": "Development-only app book and fixture adapter; production component implementations, transport and public protocol are unchanged. Storybook dependencies match the kit at 10.6.1." },
+  "compatibility": { "status": "none", "detail": "Development-only app book and fixture adapter; production component implementations, transport, public protocol and app CSP are unchanged. Only Storybook excludes the app-document CSP plugin. Storybook dependencies match the kit at 10.6.1. The initial corpus contains three authored sessions; availability labels are not additional sessions." },
   "downtime": { "status": "none", "detail": "None." },
   "manual": { "status": "none", "detail": "Run pnpm --filter fractal-web storybook for local review, or build-storybook before the kit composition build." },
   "recovery": { "status": "none", "detail": "Nothing to recover; generated storybook-static output is not committed." }

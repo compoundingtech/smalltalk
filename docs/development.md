@@ -101,6 +101,12 @@ their production modules, under `DataSourceProvider` and `fixtureSource`. It nev
 imports the live bootstrap or starts a gateway. Its Vite builder loads the app's
 unchanged `vite.config.ts`, including the production StyleX compiler and virtual
 CSS pipeline; the preview imports the real app stylesheet and theme roots.
+Storybook owns different HTML and a middleware-mode HMR server, so its `viteFinal`
+excludes only `fractal-content-security-policy`. That policy hashes and protects
+the app's own document, not Storybook's manager/iframe. Production Vite builds,
+app development and app preview retain the unchanged enforcing CSP plugin.
+The book imports the compiler's collected virtual CSS only during a static build;
+development uses the production StyleX compiler's runtime style injection and HMR.
 
 ```sh
 pnpm --filter fractal-web storybook
@@ -111,14 +117,27 @@ pnpm --filter fractal-web test
 
 Development listens on `127.0.0.1:53706`; the static build is
 `apps/fractal-web/storybook-static` (ignored by Git). Build the app first, then the
-kit, never concurrently. The kit landing composes the app as ref `fractal-app`,
-title **Fractal App**. Canonical suites are `Fractal/App/LiveAgentWorkspace` and
+kit, never concurrently. The companion kit landing is responsible for composing
+ref `fractal-app`, title **Fractal App**. Canonical suites are `Fractal/App/LiveAgentWorkspace` and
 `Fractal/App/ConversationPane`. Each has four AllStates variants: dark/light ×
 600/1440px, showing loading, empty, populated, a failed tool, offline/stale,
 unavailable and the existing scripted repair session. Fixture time is frozen.
 The adapter decodes production DTOs and reuses the existing timeline projector;
 its unit tests run the scenario corpus decode/privacy gates and an intentional
 stub control that must reject the missing production transcript.
+
+There are **three distinct authored sessions** today: the two scenario-world
+threads and the existing scripted repair stream. Seven availability labels are
+not seven sessions; the approved 6–8-session q94 corpus is not complete until the
+shared corpus expansion lands.
+
+`LiveAgentWorkspace.graph.integration.test.ts` preserves the eager startup guard
+and adds a separate lazy-inclusive App coverage check. It resolves mounted
+`meta.component` identities, compares canonical stories against the production
+graph in both directions for the two required boundaries, and rejects planted
+story-local and lazy-imported copies. It reads classified exceptions from
+`packages/fractal-ui/storybook-manifest.json` when present; an absent manifest
+means an empty exception list, not an implicit waiver.
 
 There is no kit Storybook test-runner task in this checkout. To exercise plays,
 serve the static directory with a loopback static server, open each story's
