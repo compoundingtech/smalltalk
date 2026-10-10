@@ -43,18 +43,18 @@ function usageText(usage: Extract<Row['usage'], { _tag: 'Known' }>): string {
   return `$${usage.usd} / ${usage.tokens} tokens; ${usage.scope === '24h-root-and-subagents' ? '24h root and subagents' : 'lifetime including subagents'}`
 }
 export const sidebarRowTitle = (row: Row): string => row.title
-/** Reported metadata stays accessible; fields the source never reported are omitted, never described as unknown. */
-export function sidebarRowDescription(row: Row): string {
-  const parts: string[] = [row.title]
+/** Reported metadata stays accessible; fields the source never reported are omitted, never described as unknown. `named` drops facts the reader already hears in an accessible name. */
+export function sidebarRowDescription(row: Row, named: { readonly title?: boolean; readonly status?: boolean; readonly needsMe?: boolean; readonly unread?: boolean } = {}): string {
+  const parts: string[] = named.title ? [] : [row.title]
   if (row.description !== undefined) parts.push(row.description)
-  parts.push(`Host: ${row.host}. Status: ${row.statusLabel}; ${row.freshness} observation`)
+  parts.push(`Host: ${row.host}. ${named.status ? `Observation: ${row.freshness}` : `Status: ${row.statusLabel}; ${row.freshness} observation`}`)
   if (row.usage._tag === 'Known') parts.push(usageText(row.usage))
   if (row.duration._tag === 'Known') parts.push(`${row.duration.scope === '24h-activity-span' ? '24h activity span' : 'Lifetime duration'}: ${row.duration.ms} milliseconds`)
   if (row.lastTurn._tag === 'Known') parts.push(`${row.lastTurn.kind === 'activity' ? 'Since activity' : 'Last completed turn'}: ${new Date(row.lastTurn.at).toISOString()}`)
   if (row.harness !== undefined) parts.push(`Harness: ${row.harness}`)
   if (row.model !== undefined) parts.push(`Model: ${row.model}`)
-  if (row.needsMe !== undefined) parts.push(row.needsMe ? 'Needs your attention' : 'No attention requested')
-  if (row.unread !== undefined) parts.push(`Unread: ${row.unread}`)
+  if (row.needsMe !== undefined && !named.needsMe) parts.push(row.needsMe ? 'Needs your attention' : 'No attention requested')
+  if (row.unread !== undefined && !named.unread) parts.push(`Unread: ${row.unread}`)
   if (row.statusSince !== undefined) parts.push(`Status boundary: ${new Date(row.statusSince).toISOString()}`)
   if (row.lastActivityAt !== undefined) parts.push(`Last activity: ${new Date(row.lastActivityAt).toISOString()}`)
   if (row.branch !== undefined) parts.push(`Branch: ${row.branch}`)
@@ -148,9 +148,14 @@ export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, varia
   const spendFields = item.usage._tag === 'Unknown' ? null : <span {...stylex.props(styles.metric)}><span data-row-field="total-usd" title={`${usageScope}: $${usd}`} aria-label={`${usageScope}: $${usd}`}>{spendCount.format(item.usage.usd)}</span><span data-row-field="total-tokens" data-line1-drop="tokens" title={`${usageScope}: ${tokens} tokens`} aria-label={`${usageScope}: ${tokens} tokens`}>{tokenCount.format(item.usage.tokens)}</span></span>
   const durationField = item.duration._tag === 'Unknown' ? null : <span data-row-field="total-duration"><SidebarDuration row={item} /></span>
   const lastTurnField = item.lastTurn._tag === 'Unknown' ? null : <span data-row-field="last-turn"><SidebarTime at={item.lastTurn.at} {...clock} kind={item.lastTurn.kind === 'turn-completed' ? 'turn' : 'activity'} compact /></span>
-  // The status glyph and badges sit outside the row button; their reported facts join its content-derived name. SG-2 already shows the status word.
+  // The status glyph and badges sit outside the row button; their reported facts join its content-derived name. The SG-2 status word and the SR2-C status label already show the status inside it.
   // The hidden span is block-level for accessible-name purposes, so browsers separate it from the title with a space: hence the parentheses.
-  const nameFacts = [rowGlyph === 'SG-2' || item.statusLabel.trim() === '' ? undefined : item.statusLabel, extraSignals.includes('X-needs') && item.needsMe ? 'needs your attention' : undefined, extraSignals.includes('X-unread') && (item.unread ?? 0) > 0 ? `${item.unread} unread` : undefined].filter(fact => fact !== undefined)
+  const statusNamed = item.statusLabel.trim() !== ''
+  const needsNamed = extraSignals.includes('X-needs') && item.needsMe === true
+  const unreadNamed = extraSignals.includes('X-unread') && (item.unread ?? 0) > 0
+  const nameFacts = [statusNamed && rowGlyph !== 'SG-2' && rowLayout !== 'SR2-C' ? item.statusLabel : undefined, needsNamed ? 'needs your attention' : undefined, unreadNamed ? `${item.unread} unread` : undefined].filter(fact => fact !== undefined)
+  // The button's description carries only what its name does not already say; hover, details and title keep the full metadata.
+  const buttonDescription = React.useMemo(() => sidebarRowDescription(item, { title: true, status: statusNamed, needsMe: needsNamed, unread: unreadNamed }), [item, statusNamed, needsNamed, unreadNamed])
   const content = <>
     <span data-row-column="title" {...stylex.props(styles.title, variant === 'SR-2' && item.children.length > 0 && styles.hasChildren)} title={metadata}>{rowGlyph === 'SG-2' && <span {...stylex.props(styles.statusWord)}>{item.statusLabel}</span>}<span data-row-column="title-text" {...stylex.props(styles.name)}><Highlight value={title} query={query} />{nameFacts.length > 0 && <VisuallyHidden elementType="span" data-row-name-facts>({nameFacts.join(', ')})</VisuallyHidden>}</span></span>
     {variant !== 'SR-1' && <SidebarRowSignals>
@@ -172,7 +177,7 @@ export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, varia
       <span data-row-trailing-signals {...stylex.props(styles.trailingSignals)}>{extraSignals.includes('X-unread') && (item.unread ?? 0) > 0 && <span data-row-signal="X-unread" aria-label={`${item.unread} unread`} {...stylex.props(styles.unread)}>{item.unread}</span>}{extraSignals.includes('X-needs') && item.needsMe && <span data-row-signal="X-needs" data-row-column="attention" title="Needs your attention" aria-label="Needs your attention" {...stylex.props(styles.needsYou)}>!</span>}</span>
       <span data-row-column="time" data-quick-open={quickOpen ? 'true' : undefined} {...stylex.props(styles.statusTime, quickOpen && styles.timeCovered)}>{rowLayout === 'SR2-A' ? lastTurnField : rowLayout === 'SR2-C' ? spendFields : durationField}{quickOpen && <Button data-row-action="open" aria-label={`Open ${title}`} onPress={open} {...stylex.props(styles.quickOpen)}><Icon name="message" size={12} /></Button>}</span>
       {/* The button's name is its visible content; React Aria drops aria-description, so reported facts describe it by reference. */}
-      {inTree ? <div aria-current={active ? 'page' : undefined} aria-description={metadata} {...rowStyle}>{content}</div> : <><Button aria-describedby={descriptionId} aria-current={active ? 'page' : undefined} isDisabled={!canOpen} onPress={open} {...rowStyle}>{content}</Button><span id={descriptionId} hidden>{metadata}</span></>}
+      {inTree ? <div aria-current={active ? 'page' : undefined} aria-description={metadata} {...rowStyle}>{content}</div> : <><Button aria-describedby={descriptionId} aria-current={active ? 'page' : undefined} isDisabled={!canOpen} onPress={open} {...rowStyle}>{content}</Button><span id={descriptionId} hidden>{buttonDescription}</span></>}
       <div {...stylex.props(styles.actions)}>
         <DialogTrigger><TooltipTrigger delay={150} closeDelay={300} isOpen={hoverOpen} onOpenChange={setHoverOpen}><VisuallyHidden isFocusable><Button ref={detailsTrigger} aria-label={`Reported details for ${title}`} onPress={() => setHoverOpen(false)} {...stylex.props(styles.iconButton)}><Icon name="message" /></Button></VisuallyHidden><Tooltip triggerRef={tooltipAnchor} placement="right" {...stylex.props(styles.hovercard)}><AgentHoverCard row={item} {...clock} /></Tooltip></TooltipTrigger><Popover triggerRef={tooltipAnchor} placement="right" {...stylex.props(styles.hovercard)}><Dialog aria-label={`Reported details for ${title}`}><AgentRowDetails row={item} {...clock} /></Dialog></Popover></DialogTrigger>
         <MenuTrigger><Button ref={menuTrigger} data-agent-menu="true" aria-label={`Actions for ${title}`} className={({ isHovered, isPressed, isFocusVisible }) => stylex.props(styles.iconButton, styles.menuButton, (hoverOpen || isHovered || isPressed || isFocusVisible) && styles.menuVisible, variant === 'SR-1' && styles.menuSingle).className ?? ''}><Icon name="gear" /></Button><Popover placement="bottom end" {...stylex.props(styles.popover)}><Menu aria-label={`Actions for ${title}`} {...stylex.props(styles.menu)}>

@@ -71,7 +71,7 @@ function DetailsPair({ row }: { readonly row: Row }) {
     <div {...stylex.props(styles.aside)}><AgentRowDetails row={row} now={storyNow} /></div>
   </div>
 }
-/** The open row button's description: its name is the visible content, reported facts arrive by `aria-describedby`. */
+/** The open row button's description: its name is the visible content plus name facts, the remaining reported facts arrive by `aria-describedby`. */
 const rowDescription = (pair: HTMLElement) => {
   const button = pair.querySelector<HTMLElement>('[data-testid="taste-agent-row"] button[aria-describedby]')
   return button === null ? null : pair.ownerDocument.getElementById(button.getAttribute('aria-describedby')!)?.textContent ?? null
@@ -82,7 +82,7 @@ async function assertCountsOmitted(pair: HTMLElement) {
   for (const label of ['Needs you', 'Unread']) await expect(labels, `${label} rendered without a reported value`).not.toContain(label)
   await expect(pair.textContent).not.toMatch(/unknown/i)
   for (const element of pair.querySelectorAll('[title], [aria-label], [aria-description]')) await expect(['title', 'aria-label', 'aria-description'].map(name => element.getAttribute(name) ?? '').join(' ')).not.toMatch(/unknown|not reported/i)
-  await expect(rowDescription(pair), 'row description').toMatch(/^[^.]+ session\. .*Status: Working/)
+  await expect(rowDescription(pair), 'row description').toMatch(/(?:^|\. )Host: host-1\. Observation: live\./)
   await expect(rowDescription(pair)).not.toMatch(/unread|attention/i)
 }
 
@@ -106,11 +106,12 @@ export const CountsUnreported: Story = { name: 'Details · attention and unread 
   await assertCountsOmitted(uncounted)
   await expect(within(uncounted).getByTitle('model: glm-5')).toBeInTheDocument()
   await expect(within(uncounted).getByTitle('branch: feat/rows')).toBeInTheDocument()
-  // Control: reported counts render as pairs and in the row description, so the omission check must fail on them.
+  // Control: reported counts render as pairs, so the omission check must fail on them. The button names them, so its description does not repeat them.
   const known = canvas.getByTestId('details-sample')
   const labels = [...known.querySelectorAll('dt')].map(label => label.textContent)
   await expect(labels).toEqual(expect.arrayContaining(['Needs you', 'Unread']))
-  await expect(rowDescription(known)).toMatch(/Needs your attention\. Unread: 2\./)
+  await expect(within(known).getByRole('button', { name: /^Sample session \(Working, needs your attention, 2 unread\) / })).toBeEnabled()
+  await expect(rowDescription(known)).not.toMatch(/attention|unread/i)
   await expect(assertCountsOmitted(known)).rejects.toThrow()
 } }
 export const CountsUnreportedLight: Story = { ...CountsUnreported, name: 'Details · attention and unread unreported (light)', render: () => <main {...stylex.props(styles.root, lightTheme)}><DetailsPair row={uncountedRow} /><DetailsPair row={knownRow} /></main> }
@@ -133,34 +134,69 @@ export const QuickOpenAction: Story = { name: 'Row hover · quick Open', render:
   await expect(target.querySelector('[aria-current="page"]')).not.toBeNull()
 } }
 export const AllStates: Story = { render: () => <main {...stylex.props(styles.root)}><CardPair row={knownRow} /><CardPair row={unreportedRow} /><CohortList /></main> }
+/** One row per name shape: SG-1 layouts name the glyph and badges, SG-2 and SR2-C already show the status inside the button. */
+const nameShapes = {
+  default: { variant: 'SR-2', layout: 'SR2-A', glyph: 'SG-1', row: knownRow },
+  'sr2-b': { variant: 'SR-2', layout: 'SR2-B', glyph: 'SG-1', row: knownRow },
+  'sr2-c': { variant: 'SR-2', layout: 'SR2-C', glyph: 'SG-1', row: knownRow },
+  'sr-3': { variant: 'SR-3', layout: 'SR2-A', glyph: 'SG-1', row: knownRow },
+  compact: { variant: 'SR-1', layout: 'SR2-A', glyph: 'SG-1', row: knownRow },
+  'sg-2': { variant: 'SR-1', layout: 'SR2-A', glyph: 'SG-2', row: knownRow },
+  'sr-3-sg-2': { variant: 'SR-3', layout: 'SR2-A', glyph: 'SG-2', row: knownRow },
+  uncounted: { variant: 'SR-1', layout: 'SR2-A', glyph: 'SG-1', row: uncountedRow },
+} as const
+/** Exact computed names for the fixture rows; Playwright's snapshot agrees in Chromium. */
+const expectedNames: Record<keyof typeof nameShapes, string> = {
+  default: 'Sample session (Working, needs your attention, 2 unread) Reviews the selection model Host host-1 24h root and subagents: $1.84 24h root and subagents: 412000 tokens 24h activity span: 1h',
+  'sr2-b': 'Sample session (Working, needs your attention, 2 unread) Reviews the selection model Host host-1 Last completed turn: 5m ago',
+  'sr2-c': 'Sample session (needs your attention, 2 unread) Working Reviews the selection model Host host-1 24h activity span: 1h Last completed turn: 5m ago',
+  'sr-3': 'Sample session (Working, needs your attention, 2 unread) Reviews the selection model Host host-1 24h root and subagents: $1.84 24h root and subagents: 412000 tokens 24h activity span: 1h Reviews the selection model / seat-1 / glm-5 / feat/rows / ~/rows / PR #42',
+  compact: 'Sample session (Working, needs your attention, 2 unread)',
+  'sg-2': 'Working Sample session (needs your attention, 2 unread)',
+  'sr-3-sg-2': 'Working Sample session (needs your attention, 2 unread) Reviews the selection model Host host-1 24h root and subagents: $1.84 24h root and subagents: 412000 tokens 24h activity span: 1h Reviews the selection model / seat-1 / glm-5 / feat/rows / ~/rows / PR #42',
+  uncounted: 'Uncounted session (Working)',
+}
 function NameRows() {
   return <div data-frame-rows {...stylex.props(styles.list)}>
-    <div data-testid="name-default"><SidebarAgentRow item={knownRow} now={storyNow} onOpen={() => undefined} /></div>
-    <div data-testid="name-compact"><SidebarAgentRow item={knownRow} variant="SR-1" now={storyNow} onOpen={() => undefined} /></div>
-    <div data-testid="name-uncounted"><SidebarAgentRow item={uncountedRow} variant="SR-1" now={storyNow} onOpen={() => undefined} /></div>
+    {Object.entries(nameShapes).map(([key, shape]) => <div key={key} data-testid={`name-${key}`}><SidebarAgentRow item={shape.row} variant={shape.variant} layout={shape.layout} glyph={shape.glyph} now={storyNow} onOpen={() => undefined} /></div>)}
   </div>
 }
-const reportedName = 'Sample session (Working, needs your attention, 2 unread)'
-const startsReported = (name: string) => name.startsWith(`${reportedName} `)
-/** Default SR2-A and compact SR-1 both use SG-1, whose glyph and badges sit outside the row button; the button name still carries them. */
+const occurrences = (text: string, fact: string) => text.split(fact).length - 1
+/** The name says the title and status once, plus attention and unread when reported; the description repeats none of them. */
+async function assertNamed(container: HTMLElement, key: keyof typeof nameShapes) {
+  const row = nameShapes[key].row
+  const button = within(container).getByRole('button', { name: expectedNames[key] })
+  await expect(button).toBeEnabled()
+  await expect(occurrences(expectedNames[key], row.statusLabel), `${key} status in name`).toBe(1)
+  const description = rowDescription(container)!
+  await expect(description, `${key} description`).toMatch(/\S/)
+  for (const fact of [row.title, row.statusLabel, 'attention', 'unread', 'Unread']) await expect(description, `${key} description repeats ${fact}`).not.toContain(fact)
+}
 export const AccessibleName: Story = { name: 'Row name · status and badges', render: () => <main {...stylex.props(styles.root)}><NameRows /></main>, play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
-  const defaultRow = canvas.getByTestId('name-default')
-  const compact = canvas.getByTestId('name-compact')
-  await expect(within(defaultRow).getByRole('button', { name: startsReported })).toBeEnabled()
-  await expect(within(compact).getByRole('button', { name: reportedName })).toBeEnabled()
-  // Unreported attention and unread are omitted, not named as unknown.
-  await expect(within(canvas.getByTestId('name-uncounted')).getByRole('button', { name: 'Uncounted session (Working)' })).toBeEnabled()
+  const keys = Object.keys(nameShapes) as (keyof typeof nameShapes)[]
+  for (const key of keys) await assertNamed(canvas.getByTestId(`name-${key}`), key)
   await expect(canvas.queryAllByRole('button', { name: /unknown|not reported/i })).toHaveLength(0)
-  // Control: without the name facts (the glyph-only shape) the same role queries fail.
-  const facts = [...canvasElement.querySelectorAll<HTMLElement>('[data-row-name-facts]')]
-  await expect(facts).toHaveLength(3)
-  for (const fact of facts) fact.hidden = true
-  await expect(within(defaultRow).queryByRole('button', { name: startsReported })).toBeNull()
-  await expect(within(compact).queryByRole('button', { name: reportedName })).toBeNull()
-  await expect(within(compact).getByRole('button', { name: 'Sample session' })).toBeEnabled()
-  for (const fact of facts) fact.hidden = false
-  await expect(within(compact).getByRole('button', { name: reportedName })).toBeEnabled()
+  for (const key of keys) {
+    const container = canvas.getByTestId(`name-${key}`)
+    const facts = container.querySelector<HTMLElement>('[data-row-name-facts]')!
+    const describedBy = container.ownerDocument.getElementById(container.querySelector('button[aria-describedby]')!.getAttribute('aria-describedby')!)!
+    const description = describedBy.textContent
+    // Control: the glyph-only name (facts hidden) must fail the exact name.
+    facts.hidden = true
+    await expect(assertNamed(container, key), `${key} name control`).rejects.toThrow()
+    facts.hidden = false
+    // Control: the status always prepended to the facts (the shape before SG-2/SR2-C suppression) must fail.
+    const text = facts.textContent!
+    facts.textContent = `(${nameShapes[key].row.statusLabel}, ${text.slice(1)}`
+    await expect(assertNamed(container, key), `${key} status control`).rejects.toThrow()
+    facts.textContent = text
+    // Control: the full metadata as description repeats the name facts and must fail.
+    describedBy.textContent = container.querySelector('[data-row-column="title"]')!.getAttribute('title')
+    await expect(assertNamed(container, key), `${key} description control`).rejects.toThrow()
+    describedBy.textContent = description
+    await assertNamed(container, key)
+  }
 } }
 export const AccessibleNameLight: Story = { ...AccessibleName, name: 'Row name · status and badges (light)', render: () => <main {...stylex.props(styles.root, lightTheme)}><NameRows /></main> }
 
