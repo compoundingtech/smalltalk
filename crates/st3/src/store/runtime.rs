@@ -57,8 +57,10 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_roster_fresh_wanted: tokio::sync::Notify,
     /// Rosters assembled in chunks because no short fold could complete them, by why.
     pub(crate) agent_roster_chunked: Mutex<BTreeMap<String, u64>>,
-    /// Counts complete current roster publications, same graph index or not, so collection
-    /// streams that read an earlier one reread the newer.
+    /// One current client-ready publication, never another presented copy in every raw entry.
+    pub(crate) agents_publication: agents_publication::Owner,
+    /// Legacy HTTP/history and bounded-window wake notices, not immutable publication metadata.
+    /// Revisioned readers use agents_publication's authoritative Arc watch instead.
     pub(crate) agent_roster_published: tokio::sync::watch::Sender<u64>,
     /// Every other collection's published view revisions, for the same rereads.
     pub(crate) published_views: published_views::PublishedViews,
@@ -106,6 +108,12 @@ impl SmalltalkRuntime {
             return registry;
         }
         st3_schema::registry()
+    }
+
+    pub(crate) fn agents_publication_demand(&self) -> bool {
+        let read_at = self.agent_roster_read_at.load(std::sync::atomic::Ordering::Acquire);
+        self.agents_publication.has_subscribers() || (read_at != 0
+            && (now_ms() as u64).saturating_sub(read_at) < AGENT_ROSTER_READ_LATELY.as_millis() as u64)
     }
 }
 
@@ -384,14 +392,9 @@ impl Runtime for SmalltalkRuntime {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-        // Nothing is published now, and a refold from the log takes seconds on a large store.
-        // Where agents lists are being read, start it here rather than when the next read finds
-        // no roster and waits for it. A node nobody reads keeps folding only on demand, so a
-        // long catch-up or trim that forgets once per chunk does not refold it once per chunk.
-        let read_at = self.agent_roster_read_at.load(std::sync::atomic::Ordering::Acquire);
-        let read_lately = read_at != 0
-            && (now_ms() as u64).saturating_sub(read_at) < AGENT_ROSTER_READ_LATELY.as_millis() as u64;
-        if let Some(wake) = self.agent_roster_refresh.get().filter(|_| read_lately) {
+        self.agents_publication.reset();
+        // Idle catch-up and trim stay on demand; a revisioned subscriber is active demand too.
+        if let Some(wake) = self.agent_roster_refresh.get().filter(|_| self.agents_publication_demand()) {
             let _ = self.agent_roster_requested_at.compare_exchange(
                 0, now_ms() as u64, std::sync::atomic::Ordering::AcqRel,
                 std::sync::atomic::Ordering::Relaxed,

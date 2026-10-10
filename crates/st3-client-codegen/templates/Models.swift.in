@@ -21,6 +21,31 @@ public struct Snapshot: Codable, Sendable, Equatable {
     enum CodingKeys: String, CodingKey { case id, hostID = "host_id", storeIndex = "store_index", projectionVersion = "projection_version", createdAt = "created_at" }
 }
 
+/// Node-local source cut; do not compare across nodes or publication epochs.
+public struct AgentsStatusWatermark: Codable, Sendable, Equatable {
+    public let storeIndex: UInt64
+    public let localFrontier: UInt64
+    enum CodingKeys: String, CodingKey { case storeIndex = "store_index", localFrontier = "local_frontier" }
+}
+
+/// Immutable publication identity; materialization time is not producer time.
+public struct AgentsPublicationMetadata: Codable, Sendable, Equatable {
+    public let nodeEpoch: String
+    public let revision: UInt64
+    public let statusWatermark: AgentsStatusWatermark
+    public let materializedAtMS: UInt64
+    enum CodingKeys: String, CodingKey { case nodeEpoch = "node_epoch", revision, statusWatermark = "status_watermark", materializedAtMS = "materialized_at_ms" }
+}
+
+/// Complete current view; the wire contract requires `hasMore` to be false.
+public struct AgentsPublication: Codable, Sendable {
+    public let publication: AgentsPublicationMetadata
+    public let items: [AgentResource]
+    public let order: [String]
+    public let hasMore: Bool
+    enum CodingKeys: String, CodingKey { case publication, items, order, hasMore = "has_more" }
+}
+
 public struct ErrorEnvelope: Codable, Error, Sendable {
     public let apiVersion: String
     public let errorVersion: String

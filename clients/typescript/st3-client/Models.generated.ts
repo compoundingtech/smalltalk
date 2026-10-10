@@ -256,6 +256,25 @@ export type AgentWorkspace = {
   workspace: string;
 };
 
+export type AgentsPublication = {
+  has_more: false;
+  items: Array<Agent>;
+  order: Array<Id>;
+  publication: AgentsPublicationMetadata;
+};
+
+export type AgentsPublicationMetadata = {
+  materialized_at_ms: number;
+  node_epoch: string;
+  revision: number;
+  status_watermark: AgentsStatusWatermark;
+};
+
+export type AgentsStatusWatermark = {
+  local_frontier: number;
+  store_index: number;
+};
+
 export type Arrangement = ResourceHeader & {
   body: ArrangementBody;
   deleted: false;

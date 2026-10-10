@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Publish immutable complete current agents views with epoch-local revisions",
+  "replay": {"status": "none", "detail": "Only the latest current publication is retained. No history or replay transport is added."},
+  "schema": {"status": "none", "detail": "No database tables, indexes, migrations or claim schemas change. Client contract definitions add publication metadata and a complete current view."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes. Publication revisions identify node-local in-memory views."},
+  "compatibility": {"status": "none", "detail": "Legacy HTTP and WebSocket grammars and HTTP response budgets are unchanged. No endpoint, transport opt-in or capability availability is added. A fresh read retains the failed-only fallback when no newer attempt is in flight."},
+  "downtime": {"status": "none", "detail": "An ordinary binary upgrade restart starts a new publication epoch. No additional service interruption is required."},
+  "manual": {"status": "none", "detail": "Existing installations require no configuration or state changes."},
+  "recovery": {"status": "none", "detail": "Publications are process-local and disposable. Returning to the previous binary requires no database rollback."}
+}

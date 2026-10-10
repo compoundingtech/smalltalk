@@ -7,6 +7,17 @@
     "public_listener": false,
     "remote_mode": "online-thin-client"
   },
+  "agents_publication_contract": {
+    "description": "Transport-neutral complete current view definition only. No endpoint, transport opt-in or capability availability is added.",
+    "metadata": "AgentsPublicationMetadata",
+    "watermark": "AgentsStatusWatermark",
+    "view": "AgentsPublication",
+    "owner": "background-roster-refresher",
+    "replacement": "atomic-latest-value",
+    "history": "not-included",
+    "replay": "not-provided",
+    "legacy_http_and_websocket_grammar": "unchanged"
+  },
   "streams": [
     { "id": "collections.stream", "method": "GET", "path": "/v1/client/collections/stream", "websocket_protocol": "st3.client.collections.v0", "command": "CollectionCommand", "frame": "CollectionFrame", "max_subscriptions": 8 }
   ],

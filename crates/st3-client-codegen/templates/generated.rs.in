@@ -27,6 +27,31 @@ pub struct Snapshot {
     pub created_at: String,
 }
 
+/// Node-local source cut; do not compare across nodes or publication epochs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentsStatusWatermark {
+    pub store_index: u64,
+    pub local_frontier: u64,
+}
+
+/// Immutable publication identity; materialization time is not producer time.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentsPublicationMetadata {
+    pub node_epoch: String,
+    pub revision: u64,
+    pub status_watermark: AgentsStatusWatermark,
+    pub materialized_at_ms: u64,
+}
+
+/// Complete current view; the wire contract requires `has_more` to be false.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentsPublication {
+    pub publication: AgentsPublicationMetadata,
+    pub items: Vec<Agent>,
+    pub order: Vec<String>,
+    pub has_more: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ErrorEnvelope {
     pub api_version: String,
