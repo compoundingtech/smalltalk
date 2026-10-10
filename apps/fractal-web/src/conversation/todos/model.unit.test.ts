@@ -78,7 +78,7 @@ test.each([
       feed: observed({ value: [agent], freshness }),
       agentRef: todoAgentRef,
     })
-    expect(state._tag === 'Observed' && state.stale).toBe(true)
+    expect(state._tag === 'Observed' && state.binding).toBe('stale')
     expect(state._tag === 'Observed' && state.completed).toBe(2)
   },
 )

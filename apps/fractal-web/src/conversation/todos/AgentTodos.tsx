@@ -4,7 +4,7 @@ import { DateTime, Option } from 'effect'
 import * as React from 'react'
 
 import { scale, tokens } from '../../ui-compat/tokens.stylex.ts'
-import { geometryVars as g, spaceVars as s } from '../../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
+import { colorVars as c, geometryVars as g, spaceVars as s } from '../../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 
 import { useDataSource } from '../../data/react.tsx'
 import { agentTodosAtom, type TodoState } from './model.ts'
@@ -73,7 +73,7 @@ const styles = stylex.create({
   list: { listStyle: 'none', margin: 0, padding: 0 },
   task: { display: 'flex', gap: s.md, paddingBlock: scale.space1, lineHeight: 1.5 },
   content: { minWidth: 0, overflowWrap: 'anywhere' },
-  done: { color: tokens['--ds-gray-900'] },
+  done: { color: c.fg },
   status: { color: tokens['--ds-gray-900'], width: 16, flexShrink: 0, textAlign: 'center' },
   active: { color: tokens['--ds-blue-900'] },
   note: {
@@ -123,7 +123,8 @@ export const AgentTodos = ({
       </p>
     )
   }
-  const { todo, completed, total, phase, stale } = state
+  const { todo, completed, total, phase, binding } = state
+  const stale = binding === 'stale'
   const snapshot = todo.snapshot
   const label =
     phase?.name ??
@@ -195,7 +196,7 @@ export const AgentTodos = ({
       <div {...stylex.props(styles.provenance)}>
         <p {...stylex.props(styles.note)}>
           Source: fact.todo · {snapshot.harness} / {snapshot.source_op} ·{' '}
-          {stale ? 'stale snapshot' : 'current binding'}
+          {binding === 'pending' ? 'binding verification pending' : stale ? 'stale snapshot' : 'current binding'}
         </p>
         <p {...stylex.props(styles.note)}>
           Observed{' '}
@@ -216,7 +217,7 @@ export const AgentTodos = ({
       <h2 {...stylex.props(styles.heading)}>
         <span>Todos · {label}</span>
         <span {...stylex.props(styles.count)}>
-          {completed}/{total} completed{stale ? ' · Stale' : ''}
+          {completed}/{total} completed{binding === 'pending' ? ' · Pending' : stale ? ' · Stale' : ''}
         </span>
       </h2>
       {list}
@@ -236,7 +237,7 @@ export const AgentTodos = ({
               {completed}/{total}
             </span>
             <span {...stylex.props(styles.source, stale && styles.stale)}>
-              {stale ? 'Stale · ' : ''}
+              {binding === 'pending' ? 'Pending · ' : stale ? 'Stale · ' : ''}
               {snapshot.harness}
               {snapshot.truncated ? ' · Partial' : ''}
             </span>

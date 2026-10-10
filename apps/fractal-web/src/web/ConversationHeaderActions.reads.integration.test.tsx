@@ -88,3 +88,24 @@ it('keeps the Todos disclosure with phase, progress and harness inside Resources
   expect(summary).toContain(`${state.completed}/${state.total}`)
   expect(summary).toContain(state.todo.snapshot.harness)
 })
+it('keeps the Resources portal inside its owning scheme root', async () => {
+  host.dataset.scheme = 'light'
+  await show(todoAgentRef)
+  await click('Resources')
+  const dialog = document.querySelector('[role="dialog"][aria-label="Agent resources"]')!
+  expect(dialog.closest('[data-scheme]')).toBe(host)
+  expect(dialog.closest('[aria-hidden="true"]')).toBeNull()
+})
+
+it('shows pending binding verification instead of Stale while the roster request is pending', async () => {
+  const state = projectTodos({
+    feed: observed({ value: [todoAgent], freshness: 'stale' }),
+    agentRef: todoAgentRef,
+    sync: { _tag: 'Requested', since: 0 },
+  })
+  await act(async () => root.render(<AgentTodos state={state} placement="resources" />))
+  const summary = host.querySelector('summary')!
+  expect(summary.textContent).toContain('Pending · omp')
+  expect(summary.textContent).not.toContain('Stale')
+  expect(host.textContent).toContain('binding verification pending')
+})
