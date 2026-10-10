@@ -761,6 +761,7 @@
       "command": "st conversations reply",
       "description": "Reply to one canonical message ID while preserving its thread",
       "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_silent_kinds_and_count_reads_survive_restart",
         "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -777,6 +778,7 @@
       "command": "st conversations send",
       "description": "Send one durable normalized message to an agent",
       "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_silent_kinds_and_count_reads_survive_restart",
         "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -1988,6 +1990,7 @@
       "command": "st usage",
       "description": "Show token spend over a period, with the largest spenders first",
       "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_silent_kinds_and_count_reads_survive_restart",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"

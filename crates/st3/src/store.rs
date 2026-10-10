@@ -165,6 +165,7 @@ pub(crate) mod mission_ivm;
 pub(crate) mod client_summary;
 mod unread_mail;
 mod agent_messages;
+mod coordination;
 pub mod agent_view;
 mod conversation_reads;
 mod usage_period;
@@ -13458,6 +13459,34 @@ impl Store {
         Ok(count)
     }
 
+    pub fn held_mail_count_before(&self, before: u128) -> Result<u64> {
+        Ok(self.readers.get().query_row(
+            "SELECT COUNT(*) FROM coordination_sends INDEXED BY coordination_sends_held WHERE held=1 AND sent_ms<?1",
+            [i64::try_from(before).unwrap_or(i64::MAX)], |row| row.get(0))?)
+    }
+
+    /// Each seat's unread held mail sent before the cutoff: its count and oldest send time.
+    /// A read: it never folds the unread queue, and reads the queued subjects as they stand.
+    pub fn held_mail_before(&self, before_unix_ms: u128) -> Result<Vec<(String, u64, u128)>> {
+        let mut seats = BTreeMap::<String, (u64, u128)>::new();
+        for sent in unread_mail::sent_before(&self.readers.get(), before_unix_ms)? {
+            if sent
+                .tags
+                .iter()
+                .any(|tag| crate::silent::is_silent_tag(tag))
+                && !crate::silent::always_wakes(&sent.from, &sent.tags)
+            {
+                let seat = seats.entry(sent.to).or_insert((0, sent.sent_unix_ms));
+                seat.0 += 1;
+                seat.1 = seat.1.min(sent.sent_unix_ms);
+            }
+        }
+        Ok(seats
+            .into_iter()
+            .map(|(seat, (count, oldest))| (seat, count, oldest))
+            .collect())
+    }
+
     pub fn messages(
         &self,
         recipient: Option<&str>,
@@ -13474,6 +13503,24 @@ impl Store {
         include_closed: bool,
         through: u64,
     ) -> Result<Vec<MessageView>> {
+        self.messages_through_inner(recipient, include_closed, through, false)
+    }
+
+    pub(crate) fn messages_for_delivery_through(
+        &self,
+        recipient: &str,
+        through: u64,
+    ) -> Result<Vec<MessageView>> {
+        self.messages_through_inner(Some(recipient), false, through, true)
+    }
+
+    fn messages_through_inner(
+        &self,
+        recipient: Option<&str>,
+        include_closed: bool,
+        through: u64,
+        delivery: bool,
+    ) -> Result<Vec<MessageView>> {
         smallclaims::touched::note_read(|| match recipient {
             Some(recipient) => format!("mailbox:{recipient}"),
             None => "kind:message.sent".to_owned(),
@@ -13482,7 +13529,7 @@ impl Store {
         let mut all = Vec::new();
         loop {
             let (items, next) =
-                self.messages_page(recipient, include_closed, after, through, 200)?;
+                self.messages_page_inner(recipient, include_closed, after, through, 200, delivery)?;
             all.extend(items);
             match next {
                 Some(cursor) => after = Some(cursor),
@@ -13650,6 +13697,28 @@ impl Store {
         through: u64,
         limit: usize,
     ) -> Result<(Vec<MessageView>, Option<u64>)> {
+        self.messages_page_inner(recipient, include_closed, after, through, limit, false)
+    }
+
+    pub(crate) fn messages_page_for_delivery(
+        &self,
+        recipient: &str,
+        after: Option<u64>,
+        through: u64,
+        limit: usize,
+    ) -> Result<(Vec<MessageView>, Option<u64>)> {
+        self.messages_page_inner(Some(recipient), false, after, through, limit, true)
+    }
+
+    fn messages_page_inner(
+        &self,
+        recipient: Option<&str>,
+        include_closed: bool,
+        after: Option<u64>,
+        through: u64,
+        limit: usize,
+        delivery: bool,
+    ) -> Result<(Vec<MessageView>, Option<u64>)> {
         let recipient = recipient.map(normalize_message_party);
         let connection = self.readers.get();
         // Native harnesses repeatedly ask for their complete durable mailbox so
@@ -13663,7 +13732,7 @@ impl Store {
                 .unwrap_or(value)
         });
         if let (Some(recipient), Some(bare_recipient)) = (fast_recipient, bare_recipient) {
-            let mut statement = connection.prepare(
+            let mut statement = connection.prepare(if delivery {
                 "WITH candidates(subject) AS (
                      SELECT subject FROM claims INDEXED BY claims_message_to_index
                      WHERE kind='message.sent'
@@ -13680,14 +13749,46 @@ impl Store {
                              WHERE claims.subject=candidates.subject) created_index
                      FROM candidates
                  )
-                 SELECT subject, created_index FROM created
+                 , ranked AS (
+                     SELECT created.*, COALESCE(meta.held,0) held,
+                            ROW_NUMBER() OVER (PARTITION BY COALESCE(meta.held,0) ORDER BY created_index DESC,created.subject DESC) held_rank,
+                            SUM(COALESCE(meta.held,0)) OVER () held_total
+                     FROM created LEFT JOIN coordination_sends meta ON meta.subject=created.subject
+                     WHERE created_index<=?4
+                 )
+                 SELECT subject, created_index, CASE WHEN ?7 THEN MAX(held_total-8,0) ELSE 0 END FROM ranked
                  WHERE created_index>?3 AND created_index<=?4
+                   AND (NOT ?7 OR held=0 OR held_rank<=8)
+                   AND (?6 OR NOT EXISTS (
+                     SELECT 1 FROM claims closed
+                     WHERE closed.subject=ranked.subject AND closed.kind='message.closed'
+                   ))
+                 ORDER BY created_index, subject LIMIT ?5"
+            } else {
+                "WITH candidates(subject) AS (
+                     SELECT subject FROM claims INDEXED BY claims_message_to_index
+                     WHERE kind='message.sent'
+                       AND json_extract(body, '$.fields.to') IN (?1, ?2)
+                     UNION
+                     SELECT desired.subject FROM desired,
+                            json_each(desired.body, '$.children') child
+                     WHERE desired.kind='message'
+                       AND json_extract(child.value, '$.name')='to'
+                       AND json_extract(child.value, '$.arguments[0]') IN (?1, ?2)
+                 ), created AS (
+                     SELECT subject,
+                            (SELECT MIN(store_index) FROM claims
+                             WHERE claims.subject=candidates.subject) created_index
+                     FROM candidates
+                 )
+                 SELECT subject, created_index, 0 FROM created
+                 WHERE (?7 OR NOT ?7) AND created_index>?3 AND created_index<=?4
                    AND (?6 OR NOT EXISTS (
                      SELECT 1 FROM claims closed
                      WHERE closed.subject=created.subject AND closed.kind='message.closed'
                    ))
-                 ORDER BY created_index, subject LIMIT ?5",
-            )?;
+                 ORDER BY created_index, subject LIMIT ?5"
+            })?;
             let mut subjects = statement
                 .query_map(
                     params![
@@ -13697,19 +13798,31 @@ impl Store {
                         through,
                         limit.saturating_add(1),
                         include_closed,
+                        delivery,
                     ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, usize>(2)?,
+                        ))
+                    },
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
             let has_more = subjects.len() > limit;
             subjects.truncate(limit);
             let next_after = has_more
-                .then(|| subjects.last().map(|(_, index)| *index))
+                .then(|| subjects.last().map(|(_, index, _)| *index))
                 .flatten();
             let mut output = Vec::new();
-            for (subject, created_index) in subjects {
-                let message = self.message_view_cached(&connection, &subject, created_index)?;
+            for (subject, created_index, remaining) in subjects {
+                let mut message = self.message_view_cached(&connection, &subject, created_index)?;
                 if message.to == recipient && (include_closed || message.status != "closed") {
+                    if remaining > 0 && crate::silent::waits_for_turn(&message) {
+                        message
+                            .tags
+                            .push(format!("{}{remaining}", crate::silent::REMAINING_PREFIX));
+                    }
                     output.push(message);
                 }
             }
@@ -22335,13 +22448,20 @@ fn message_view_tx(
                 values
                     .iter()
                     .filter_map(Value::as_str)
-                    .map(str::to_owned)
+                    .filter(|tag| !crate::silent::is_remaining_tag(tag))
+                    .map(crate::silent::view_tag)
                     .collect()
             })
             .unwrap_or_else(|| {
                 desired
                     .as_ref()
-                    .map(|value| canonical_child_strings(value, "tag"))
+                    .map(|value| {
+                        canonical_child_strings(value, "tag")
+                            .into_iter()
+                            .filter(|tag| !crate::silent::is_remaining_tag(tag))
+                            .map(|tag| crate::silent::view_tag(&tag))
+                            .collect()
+                    })
                     .unwrap_or_default()
             }),
         // A replicated claim is another member's word: keep only references a file name can be
