@@ -182,7 +182,10 @@ mod tests {
                     "UPDATE local_coordination_backfill SET cursor=0,ceiling=?1,complete=0",
                     [current_index(tx)?],
                 )?;
-                backfill(tx)
+                // Simulate opening an older store before the allowance cache existed.
+                // Its existing rebuild must not populate all new count metadata at once.
+                tx.execute("DELETE FROM meta WHERE key='agent_message_days_v1'", [])?;
+                agent_messages::open(tx)
             })
             .unwrap()
             .unwrap();

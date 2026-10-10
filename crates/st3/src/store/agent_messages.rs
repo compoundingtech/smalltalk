@@ -70,7 +70,9 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
              SELECT DISTINCT subject FROM claims WHERE kind='message.sent';",
         )?;
     }
-    flush(transaction)?;
+    // The older allowance cache can prime all history. New coordination metadata must
+    // still bootstrap in bounded pages rather than piggyback on that legacy rebuild.
+    flush_with_coordination(transaction, filled)?;
     coordination::backfill(transaction)?;
     if !filled {
         transaction.execute(
@@ -135,6 +137,10 @@ fn eligible(fields: &Value) -> bool {
 }
 
 pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
+    flush_with_coordination(transaction, true)
+}
+
+fn flush_with_coordination(transaction: &Transaction<'_>, coordination_live: bool) -> Result<()> {
     let pending = transaction
         .prepare_cached("SELECT subject FROM local_agent_message_pending")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -150,13 +156,15 @@ pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if sent.is_none() {
+        if coordination_live && sent.is_none() {
             coordination::sync(transaction, &subject, None)?;
         }
         let desired = sent
             .map(|(at, body)| -> Result<_> {
                 let body: Value = serde_json::from_str(&body)?;
-                coordination::sync(transaction, &subject, Some((at, &body["fields"])))?;
+                if coordination_live {
+                    coordination::sync(transaction, &subject, Some((at, &body["fields"])))?;
+                }
                 Ok(eligible(&body["fields"])
                     .then(|| (at, body["fields"]["to"].as_str().unwrap().to_owned())))
             })
