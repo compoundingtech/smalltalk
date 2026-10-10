@@ -2222,6 +2222,8 @@ pub struct Fence {
 pub enum ActionType {
     #[serde(rename = "custom.reply")]
     CustomReply,
+    #[serde(rename = "prompt.respond")]
+    PromptRespond,
     #[serde(rename = "arrangement.edit")]
     ArrangementEdit,
     #[serde(rename = "attention.resolve")]
