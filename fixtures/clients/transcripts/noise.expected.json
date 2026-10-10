@@ -23,9 +23,9 @@
   {
     "body": {
       "kind": "event",
-      "value": "error: claude-channel-unattached: attachment could not be verified; mail is held while the driver recovers ×3"
+      "value": "delivery paused, then resumed ×3"
     },
-    "id": "timeline-entry/noise-09"
+    "id": "timeline-entry/noise-10"
   },
   {
     "body": {
@@ -39,34 +39,41 @@
         "to": "fleet/fixture-builder"
       }
     },
-    "id": "timeline-entry/noise-15#0"
+    "id": "timeline-entry/noise-18#0"
   },
   {
     "body": {
       "kind": "event",
       "value": "background task completed: Background command \"Run the example build\" completed (exit code 0)"
     },
-    "id": "timeline-entry/noise-17#0"
+    "id": "timeline-entry/noise-20#0"
   },
   {
     "body": {
       "kind": "event",
       "value": "status: failed · the harness reported an error"
     },
-    "id": "timeline-entry/noise-18"
+    "id": "timeline-entry/noise-21"
   },
   {
     "body": {
       "kind": "event",
       "value": "content withheld: credential (42 bytes, 1 items)"
     },
-    "id": "timeline-entry/noise-19"
+    "id": "timeline-entry/noise-22"
   },
   {
     "body": {
       "kind": "event",
       "value": "transcript unavailable: transcript not bound: Claude session 00000000-0000-4000-8000-000000000000 has no transcript file yet"
     },
-    "id": "timeline-entry/noise-20"
+    "id": "timeline-entry/noise-24"
+  },
+  {
+    "body": {
+      "kind": "event",
+      "value": "delivery paused · channel not verified yet"
+    },
+    "id": "timeline-entry/noise-23"
   }
 ]
