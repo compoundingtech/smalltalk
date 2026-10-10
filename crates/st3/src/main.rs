@@ -130,8 +130,13 @@ enum Command {
         #[command(subcommand)]
         command: LaunchCommand,
     },
-    /// Show and manage work that needs a person.
+    /// Show and answer alerts: asks, gates and approvals that wait on a person.
+    ///
+    /// Each alert belongs to the conversation of the agent behind it. Updates that ask nothing
+    /// are listed after the alerts and are not counted. `st attention` is the older name.
     #[command(
+        name = "alerts",
+        alias = "attention",
         after_help = "Messages never appear here; read them with `st conversations`.\nFaults never appear here; st sends each one to the agent that owns it, which asks a person with `st work ask` only if it needs to."
     )]
     Attention {
@@ -3703,7 +3708,7 @@ struct SubscriptionRequestArgs {
 
 #[derive(Subcommand)]
 enum AttentionCommand {
-    /// List all current human attention items.
+    /// List current alerts, then unread updates.
     Ls {
         /// Follow current collection changes.
         #[arg(long, conflicts_with_all = ["all", "cursor"])]
@@ -3711,7 +3716,7 @@ enum AttentionCommand {
         #[arg(add = ArgValueCompleter::new(Complete(Entity::Person)))]
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
-        /// Include resolved and historical attention.
+        /// Include resolved and historical items.
         #[arg(long)]
         all: bool,
         /// Resume the next bounded page returned by an earlier list.
@@ -3720,7 +3725,7 @@ enum AttentionCommand {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Explain one attention item and show the exact available actions.
+    /// Explain one alert or update and show the exact available actions.
     Show {
         #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
         subject: String,
@@ -3728,8 +3733,8 @@ enum AttentionCommand {
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
     },
-    /// Chat about an item: send a message to the agent involved, titled after the item, with a
-    /// reference to what it is about. This is what "Chat about this" does in stui.
+    /// Chat about an alert: send a message to the agent whose conversation it belongs to, titled
+    /// after it, with a reference to what it is about. This is what "Chat about this" does in stui.
     Discuss(AttentionDiscussArgs),
     /// Legacy mutation: returns attention-migrated. Use work ask or remedy the source.
     Request(AttentionRequestArgs),
@@ -3747,7 +3752,7 @@ enum AttentionCommand {
 
 #[derive(Args)]
 struct AttentionDiscussArgs {
-    /// The item to talk about: its `attention/...` ID from `st attention ls`.
+    /// The item to talk about: its `attention/...` ID from `st alerts ls`.
     #[arg(add = ArgValueCompleter::new(Complete(Entity::Attention)))]
     subject: String,
     /// What to say. The message also names the item, so the agent knows what it is about.
@@ -4381,7 +4386,7 @@ struct ReviewArgs {
     /// Exact gate.requested claim ID when acting for a person.
     #[arg(long, requires = "acted_for")]
     episode: Option<String>,
-    /// The gate to answer: its `attention/...` ID from `st attention ls`, or the step, mission
+    /// The gate to answer: its `attention/...` ID from `st alerts ls`, or the step, mission
     /// or loop run (`step-run/...`, `mission-run/...`, `loop-run/...`) that owns it.
     target: String,
     #[arg(long)]
@@ -4443,7 +4448,7 @@ struct DelegationPolicyArgs {
 
 #[derive(Args)]
 struct FeedbackReviewArgs {
-    /// The feedback gate to answer: its `attention/...` ID from `st attention ls`, or the
+    /// The feedback gate to answer: its `attention/...` ID from `st alerts ls`, or the
     /// step run that owns it.
     target: String,
     #[arg(long)]
@@ -8631,6 +8636,7 @@ fn render_now_page(page: &ClientPage, continuation_command: &str) -> String {
         .items
         .retain(|item| matches!(item, ClientResource::Attention(_)));
     needs_you.page.next_cursor = None;
+    needs_you.filters.clear();
     let mut unhealthy = page.clone();
     unhealthy.items.retain(|item| match item {
         ClientResource::Operation(_) => true,
@@ -8657,9 +8663,10 @@ fn render_now_page(page: &ClientPage, continuation_command: &str) -> String {
     if let Some(sync) = &page.sync {
         output.push_str(&render_sync_notice(sync, now_ms()));
     }
-    output.push_str(&render_product_page(
-        "NEEDS YOU",
+    // `N alerts` and the alerts, then updates; nothing at all when nothing waits.
+    output.push_str(&render_alert_sections(
         &needs_you,
+        None,
         continuation_command,
     ));
     // The server fills Now with attention, and adds work only for an explicit work
@@ -8667,12 +8674,17 @@ fn render_now_page(page: &ClientPage, continuation_command: &str) -> String {
     // server never filled does not read as zero.
     for (title, section) in [("WORKING", &working), ("UNHEALTHY", &unhealthy)] {
         if !section.items.is_empty() {
-            output.push('\n');
+            if !output.is_empty() {
+                output.push('\n');
+            }
             output.push_str(&render_product_page(title, section, continuation_command));
         }
     }
     if working.items.is_empty() && unhealthy.items.is_empty() {
-        output.push_str("\nWork: st work ls · Health: st doctor\n");
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str("Work: st work ls · Health: st doctor\n");
     }
     if let Some(cursor) = page.page.next_cursor.as_deref() {
         use std::fmt::Write as _;
@@ -9144,6 +9156,11 @@ async fn run_collection_watch(
                     "{}",
                     render_client_agents(&page.value, false, false, "st agents ls --watch")
                 );
+            } else if collection == "attention" {
+                print!(
+                    "{}",
+                    render_alert_sections(&page.value, Some(title), "st alerts ls --watch")
+                );
             } else {
                 print_product_page(title, &page, false, &format!("st {collection} ls --watch"))?;
             }
@@ -9220,7 +9237,9 @@ fn attention_word(item: &st3_client::Attention) -> &'static str {
 /// with its priority and state only when they are not the usual normal and open.
 fn attention_heading(item: &st3_client::Attention, now_unix_ms: u128) -> String {
     let mut about = Vec::new();
-    if let Some(from) = &item.requester_id {
+    // The agent whose conversation it belongs to, which a gate or an approval names even though
+    // no agent asked it; an older daemon names only the requester.
+    if let Some(from) = item.conversation_id.as_ref().or(item.requester_id.as_ref()) {
         about.push(format!("from {}", from.strip_prefix("agent/").unwrap_or(from)));
     }
     about.push(ago(&item.requested_at, now_unix_ms));
@@ -9272,10 +9291,77 @@ fn render_mission_runs(mission: &st3_client::Mission) -> String {
 }
 
 fn render_product_page(title: &str, page: &ClientPage, continuation_command: &str) -> String {
+    render_product_page_headed(
+        &format!("{title}  {}", page.items.len()),
+        page,
+        continuation_command,
+    )
+}
+
+/// Whether an attention item is an alert: it blocks or waits on its person. A daemon that
+/// predates alerts does not say, and then everything but an update is one.
+fn is_alert(item: &st3_client::Attention) -> bool {
+    item.alert.unwrap_or(item.update.is_none())
+}
+
+/// `3 alerts`: the first thing a person reads. No alert prints nothing at all.
+fn alerts_heading(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 alert".into()),
+        count => Some(format!("{count} alerts")),
+    }
+}
+
+/// An attention page as a person reads it: its alerts under `heading`, then the updates that
+/// ask nothing under their own heading, uncounted as alerts. `heading` gets the alert count;
+/// None prints the alerts under `N alerts`, and nothing when there are none.
+fn render_alert_sections(
+    page: &ClientPage,
+    heading: Option<&str>,
+    continuation_command: &str,
+) -> String {
+    let attention = |item: &ClientResource| matches!(item, ClientResource::Attention(_));
+    let alert = |item: &ClientResource| matches!(item, ClientResource::Attention(item) if is_alert(item));
+    let mut alerts = page.clone();
+    alerts.items.retain(alert);
+    alerts.page.next_cursor = None;
+    let mut updates = page.clone();
+    updates.items.retain(|item| attention(item) && !alert(item));
+    updates.page.next_cursor = None;
+    updates.filters.clear();
+    let mut output = match heading {
+        Some(heading) => render_product_page(heading, &alerts, continuation_command),
+        None => alerts_heading(alerts.items.len())
+            .map(|heading| render_product_page_headed(&heading, &alerts, continuation_command))
+            .unwrap_or_default(),
+    };
+    if !updates.items.is_empty() {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&render_product_page("UPDATES", &updates, continuation_command));
+    }
+    if let Some(cursor) = page.page.next_cursor.as_deref() {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            output,
+            "More items are available: {continuation_command} --cursor {cursor} --limit {}",
+            page.page.limit
+        );
+    }
+    output
+}
+
+fn render_product_page_headed(
+    heading: &str,
+    page: &ClientPage,
+    continuation_command: &str,
+) -> String {
     use std::fmt::Write as _;
 
     let mut output = String::new();
-    let _ = writeln!(output, "{title}  {}", page.items.len());
+    let _ = writeln!(output, "{heading}");
     if !page.filters.is_empty() {
         let filters = page
             .filters
@@ -9304,10 +9390,10 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                 };
                 let _ = writeln!(
                     output,
-                    "  action{reads}: st attention show {} --as {}",
+                    "  action{reads}: st alerts show {} --as {}",
                     item.source_id, item.person_id
                 );
-                // What `st attention approve` and its siblings take: a person copies it from here.
+                // What `st alerts approve` and its siblings take: a person copies it from here.
                 let _ = writeln!(output, "  id: {}", item.header.id);
                 if item.header.operational.as_ref().is_some_and(|operational| {
                     operational
@@ -15082,10 +15168,10 @@ async fn run_attention(
             cursor,
             limit,
         } => {
-            let actor = configured_human(actor.as_deref(), configured_person, "attention")?;
+            let actor = configured_human(actor.as_deref(), configured_person, "alerts")?;
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
-                "the attention limit must be 1 through 200"
+                "the alerts limit must be 1 through 200"
             );
             if watch {
                 return run_collection_watch(
@@ -15095,7 +15181,7 @@ async fn run_attention(
                     None,
                     None,
                     limit,
-                    &format!("HUMAN ATTENTION FOR {actor}"),
+                    &format!("ALERTS FOR {actor}"),
                     json_output,
                 )
                 .await;
@@ -15104,15 +15190,27 @@ async fn run_attention(
                 .attention_list(cursor.as_deref(), Some(limit), all)
                 .await?;
             let history = if all { " --all" } else { "" };
-            print_product_page(
-                &format!("HUMAN ATTENTION FOR {actor}"),
-                &response,
-                json_output,
-                &format!("st attention ls --as {actor}{history}"),
-            )
+            let command = format!("st alerts ls --as {actor}{history}");
+            if json_output {
+                print_value(&response, true)?;
+            } else {
+                if let Some(sync) = &response.value.sync {
+                    print!("{}", render_sync_notice(sync, now_ms()));
+                }
+                print!(
+                    "{}",
+                    render_alert_sections(
+                        &response.value,
+                        Some(&format!("ALERTS FOR {actor}")),
+                        &command
+                    )
+                );
+            }
+            note_partial_page(&response.value);
+            Ok(())
         }
         AttentionCommand::Show { subject, actor } => {
-            let actor = configured_human(actor.as_deref(), configured_person, "attention")?;
+            let actor = configured_human(actor.as_deref(), configured_person, "alerts")?;
             let (item, _) = actionable_attention_item(client, endpoint, &subject, &actor).await?;
             if json_output {
                 print_value(&item, true)?;
@@ -15150,16 +15248,19 @@ async fn run_attention(
             Ok(())
         }
         AttentionCommand::Discuss(args) => {
-            let actor = configured_human(args.actor.as_deref(), configured_person, "attention")?;
+            let actor = configured_human(args.actor.as_deref(), configured_person, "alerts")?;
             let (item, card_id) =
                 actionable_attention_item(client, endpoint, &args.subject, &actor).await?;
+            // The agent whose conversation the alert belongs to; an older daemon names only the
+            // agent that asked.
             let to = match args.to {
                 Some(to) => to,
                 None => item
-                    .requester_id
+                    .conversation
                     .clone()
-                    .filter(|requester| requester.starts_with("agent/"))
-                    .context("this item names no agent to talk to; pass --to AGENT")?,
+                    .or_else(|| item.requester_id.clone())
+                    .filter(|agent| agent.starts_with("agent/"))
+                    .context("this alert names no agent to talk to; pass --to AGENT")?,
             };
             let id = card_id.unwrap_or_else(|| item.subject.clone());
             // The same words stui's "Chat about this" sends.
@@ -27073,7 +27174,7 @@ mod tests {
         // An attention item leads with its kind and title, then who it is from and how long ago
         // (which moves with the clock) and its priority when it is not normal.
         let (head, rest) = mixed
-            .split_once("  action: st attention show")
+            .split_once("  action: st alerts show")
             .expect(&mixed);
         assert!(
             head.starts_with("NOW  3\n\nrequest   Review release\n          "),
@@ -27132,7 +27233,7 @@ mod tests {
         }
         let rendered = render_product_page("NOW", &page, "st now");
         assert!(
-            rendered.contains("  action (marks it read): st attention show launch/release"),
+            rendered.contains("  action (marks it read): st alerts show launch/release"),
             "{rendered}"
         );
         item.state = "snoozed".into();
@@ -27148,10 +27249,7 @@ mod tests {
             &fixture_product_page(&["attention"], false),
             "st now --as person/alex",
         );
-        assert!(
-            attention_only.starts_with("NEEDS YOU  1\n"),
-            "{attention_only}"
-        );
+        assert!(attention_only.starts_with("1 alert\n"), "{attention_only}");
         assert!(!attention_only.contains("WORKING"), "{attention_only}");
         assert!(!attention_only.contains("UNHEALTHY"), "{attention_only}");
         assert!(
@@ -27166,6 +27264,54 @@ mod tests {
         assert!(with_work.contains("\nWORKING  1\n"), "{with_work}");
         assert!(!with_work.contains("UNHEALTHY"), "{with_work}");
         assert!(!with_work.contains("Work: st work ls"), "{with_work}");
+    }
+
+    #[test]
+    fn now_counts_alerts_alone_and_says_nothing_when_none_wait() {
+        let page = fixture_product_page(&["attention"], false);
+        let mut alerts = page.clone();
+        alerts.items = [page.items.clone(), page.items.clone()].concat();
+        assert!(
+            render_now_page(&alerts, "st now").starts_with("2 alerts\n"),
+            "{}",
+            render_now_page(&alerts, "st now")
+        );
+        // An update asks nothing: it is listed apart and never counted as an alert.
+        let mut updates = page.clone();
+        let ClientResource::Attention(update) = &mut updates.items[0] else {
+            panic!("expected attention fixture");
+        };
+        update.update = Some(st3_client::PersonUpdate {
+            version: 1,
+            entry_type: "update".into(),
+            about: "message/abc".into(),
+            subjects: Vec::new(),
+            summary: None,
+        });
+        update.alert = Some(false);
+        let now = render_now_page(&updates, "st now");
+        assert!(now.starts_with("UPDATES  1\n"), "{now}");
+        assert!(!now.contains("1 alert\n") && !now.contains("0 alerts"), "{now}");
+        // Nothing waits: no line about alerts at all, not even a zero.
+        assert_eq!(
+            render_now_page(&fixture_product_page(&[], false), "st now"),
+            "Work: st work ls · Health: st doctor\n"
+        );
+        // `st alerts ls` counts the alerts under its heading, then lists updates apart.
+        let mut mixed = page.clone();
+        mixed.items.extend(updates.items.clone());
+        let listed = render_alert_sections(&mixed, Some("ALERTS FOR person/alex"), "st alerts ls");
+        assert!(listed.starts_with("ALERTS FOR person/alex  1\n"), "{listed}");
+        assert!(listed.contains("\nUPDATES  1\n"), "{listed}");
+        // A daemon that predates alerts says nothing: an update is still not an alert.
+        let ClientResource::Attention(update) = &mut mixed.items[1] else {
+            panic!("expected attention fixture");
+        };
+        update.alert = None;
+        assert_eq!(
+            render_alert_sections(&mixed, Some("ALERTS FOR person/alex"), "st alerts ls"),
+            listed
+        );
     }
 
     #[test]
@@ -27368,11 +27514,11 @@ mod tests {
         );
         assert_eq!(
             contract["purposes"]["attention"]["human_example"],
-            "st attention ls --as person/alex"
+            "st alerts ls --as person/alex"
         );
         assert_eq!(
             contract["purposes"]["attention"]["json_example"],
-            "st attention ls --as person/alex --json"
+            "st alerts ls --as person/alex --json"
         );
     }
 

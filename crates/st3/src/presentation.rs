@@ -536,12 +536,12 @@ pub(crate) fn render_attention_list(
 ) -> String {
     let mut output = String::new();
     let title = person.map_or_else(
-        || "HUMAN ATTENTION".to_owned(),
-        |person| format!("HUMAN ATTENTION FOR {person}"),
+        || "ALERTS".to_owned(),
+        |person| format!("ALERTS FOR {person}"),
     );
     let _ = writeln!(output, "{}", style.heading(title));
     if items.is_empty() {
-        let _ = writeln!(output, "{}", style.muted("No human attention is waiting."));
+        let _ = writeln!(output, "{}", style.muted("No alert is waiting."));
         return output;
     }
     let _ = writeln!(output, "{} waiting · oldest first", items.len());
@@ -578,7 +578,7 @@ pub(crate) fn render_attention_list(
         let _ = writeln!(output, "    subject: {}", item.subject);
         let _ = writeln!(
             output,
-            "    inspect: st attention show {} --as {}",
+            "    inspect: st alerts show {} --as {}",
             item.subject, item.person
         );
         for action in &item.actions {
@@ -600,12 +600,21 @@ pub(crate) fn render_attention_show(
     now_unix_ms: u128,
 ) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "{}  {}", style.heading("ATTENTION"), item.title);
+    let heading = if item.is_update() { "UPDATE" } else { "ALERT" };
+    let _ = writeln!(output, "{}  {}", style.heading(heading), item.title);
     let _ = writeln!(output, "SUBJECT   {}", item.subject);
     let _ = writeln!(output, "KIND      {}", item.kind);
     let _ = writeln!(output, "PERSON    {}", item.person);
     if let Some(requester) = &item.requester_id {
         let _ = writeln!(output, "FROM      {requester}");
+    }
+    // The agent whose conversation it belongs to, when that is not who asked.
+    if let Some(conversation) = item
+        .conversation
+        .as_ref()
+        .filter(|conversation| item.requester_id.as_ref() != Some(*conversation))
+    {
+        let _ = writeln!(output, "AGENT     {conversation}");
     }
     let _ = writeln!(
         output,
@@ -1652,7 +1661,7 @@ mod tests {
             OutputStyle::plain(),
             180_000,
         );
-        assert!(rendered.contains("HUMAN ATTENTION FOR person/alex"));
+        assert!(rendered.contains("ALERTS FOR person/alex"));
         assert!(rendered.contains("1 waiting · oldest first"));
         assert!(rendered.contains("[fault] Fabric needs review"));
         assert!(rendered.contains("requested 2m ago"));
@@ -1660,11 +1669,11 @@ mod tests {
         assert!(rendered.contains("--reason 'It is fixed'"));
         assert!(!rendered.contains("The queue did not recover."));
         assert!(
-            rendered.contains("inspect: st attention show attention/fabric --as person/alex")
+            rendered.contains("inspect: st alerts show attention/fabric --as person/alex")
         );
 
         let shown = render_attention_show(&item, OutputStyle::plain(), 180_000);
-        assert!(shown.contains("ATTENTION  Fabric needs review"));
+        assert!(shown.contains("ALERT  Fabric needs review"));
         assert!(shown.contains("The queue did not recover."));
         assert!(shown.contains("TARGETS\n  doc/fabric/report@abc"));
     }
@@ -1674,7 +1683,7 @@ mod tests {
         let rendered = render_attention_list(None, &[], OutputStyle::plain(), 180_000);
         assert_eq!(
             rendered,
-            "HUMAN ATTENTION\nNo human attention is waiting.\n"
+            "ALERTS\nNo alert is waiting.\n"
         );
     }
 

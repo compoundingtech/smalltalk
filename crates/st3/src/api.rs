@@ -6589,7 +6589,7 @@ fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -
         return DoctorCheck {
             name: "attention-age".into(),
             status: "pass".into(),
-            message: "no attention item has been open for more than a day".into(),
+            message: "no alert or fault has been open for more than a day".into(),
         };
     }
     stale.sort_by(|left, right| {
@@ -6618,7 +6618,7 @@ fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -
         name: "attention-age".into(),
         status: "warn".into(),
         message: format!(
-            "{} attention items have been open for more than a day; `st attention ls --as PERSON` shows how to close a person's item, and a fault closes at its source: {}",
+            "{} alerts and faults have been open for more than a day; `st alerts ls --as PERSON` shows how to close a person's alert, and a fault closes at its source: {}",
             stale.len(),
             listed.join("; ")
         ),
@@ -11811,7 +11811,7 @@ fn review_owner(state: &AppState, target: &str) -> Result<String, ApiError> {
     }
     Err(unknown(format!(
         "`{target}` names no step run, mission run, loop or attention card; \
-         `st attention ls --as PERSON` lists the reviews waiting"
+         `st alerts ls --as PERSON` lists the reviews waiting"
     )))
 }
 
@@ -19582,7 +19582,7 @@ mission "orchid" state="ready" { goal "Expose a scheduler wait."; step "work" { 
         assert!(
             stale
                 .message
-                .starts_with("2 attention items have been open for more than a day"),
+                .starts_with("2 alerts and faults have been open for more than a day"),
             "{}",
             stale.message
         );
@@ -25581,7 +25581,7 @@ version 2
                     .as_array()
                     .unwrap()
                     .iter()
-                    .all(|action| action["argv"][1] == "attention" && action["argv"][4] == "--as")
+                    .all(|action| action["argv"][1] == "alerts" && action["argv"][4] == "--as")
             }),
             "{attention}"
         );

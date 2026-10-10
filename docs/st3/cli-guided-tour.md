@@ -49,7 +49,7 @@ st now --as person/alex
 st now --as person/alex --json
 ```
 
-The default lists human attention only. Mission work is in `work ls` and Control; an explicit
+The default lists alerts, then unread updates; with no alert it prints no alert line at all. Mission work is in `work ls` and Control; an explicit
 `--owner-run` opts it into this combined view. Fleet diagnostics are in `doctor` and Operations.
 Check whether the default is calm, current, and actionable. `--all`, `--owner-run`, `--cursor`, and
 `--limit` must make sense from help alone.
@@ -124,15 +124,16 @@ st work revision cancel --help
 Check that a person can understand ownership, readiness, blockers, lease/incarnation, elapsed time,
 goals, constraints, and usage without learning internal graph vocabulary.
 
-### 4. `attention` — Alex's explicit inbox
+### 4. `alerts` — what waits on Alex
 
-Why: decisions and faults needing a person belong in one low-noise, actor-specific inbox.
+Why: asks, gates and approvals waiting on a person belong in one low-noise, actor-specific list,
+each in the conversation of the agent behind it. `st attention` is the older name.
 
 ```sh
-st attention --help
-st attention ls --help
-st attention ls --as person/alex
-st attention show --help
+st alerts --help
+st alerts ls --help
+st alerts ls --as person/alex
+st alerts show --help
 ```
 
 If `ls` returns an item, copy its ID into `show`. Inspect the mutation help without changing live
@@ -141,14 +142,14 @@ state:
 ```sh
 st work ask --help
 st work done --help
-st attention approve --help
-st attention reject --help
+st alerts approve --help
+st alerts reject --help
 ```
 
 Every row should say why Alex is involved, what happens if he does nothing, whether it is stale,
 and the exact actions available now.
 
-A subscription that holds mission requests for a person raises one attention item. Inspect the
+A subscription that holds mission requests for a person raises one alert. Inspect the
 subscription request commands without changing live state:
 
 ```sh
