@@ -26,6 +26,8 @@ export interface EmbraceComposerProps {
   readonly history?: readonly string[]
   /** Opt in to the history action in layouts other than C3. */
   readonly showHistory?: boolean
+  /** Plain hosts may defer loading submitted drafts until the first recall. */
+  readonly historySource?: { readonly available: boolean; readonly get: () => readonly string[] }
   /** Structured drafts parallel to `history`; recall restores chips instead of re-parsing text. */
   readonly tokenHistory?: readonly Draft[]
   readonly targetLabel?: string
@@ -298,7 +300,7 @@ export function EmbraceComposerToolbar({ target, recipients, models, onTargetCha
   </>
 }
 
-function PlainComposer({ history = emptyHistory, showHistory = false, targetLabel, disabledReason, toolbar, style, onRequestSubmit, submitLabel, submitIcon, inputStyle, fieldStyle, footerStyle, input, actions, placeholder = 'Message, @ mentions and / commands as text' }: EmbraceComposerProps) {
+function PlainComposer({ history = emptyHistory, historySource, showHistory = false, targetLabel, disabledReason, toolbar, style, onRequestSubmit, submitLabel, submitIcon, inputStyle, fieldStyle, footerStyle, input, actions, placeholder = 'Message, @ mentions and / commands as text' }: EmbraceComposerProps) {
   const isDisabled = useAuiState((s) => s.thread.isDisabled)
   const readOnly = disabledReason !== undefined || isDisabled
   const helpId = React.useId()
@@ -309,27 +311,38 @@ function PlainComposer({ history = emptyHistory, showHistory = false, targetLabe
   const { compact } = React.useContext(CompactComposerContext)
   const aui = useAui()
   const formRef = React.useRef<HTMLFormElement>(null)
-  const recall = React.useRef<{ index: number; original: string } | undefined>(undefined)
+  const recall = React.useRef<{ index: number; original: string; entries: readonly string[] } | undefined>(undefined)
+  const hasHistory = historySource?.available ?? history.length > 0
   const recallHistory = (direction: 'previous' | 'next') => {
-    if (readOnly || history.length === 0) return
-    const state = recall.current ?? { index: history.length, original: runtimeText }
-    const index = Math.max(0, Math.min(history.length, state.index + (direction === 'previous' ? -1 : 1)))
-    recall.current = index === history.length ? undefined : { ...state, index }
-    aui.composer.setText(index === history.length ? state.original : history[index]!)
-    formRef.current?.querySelector<HTMLTextAreaElement>('textarea')?.focus()
+    if (readOnly || !hasHistory) return
+    const entries = recall.current?.entries ?? historySource?.get() ?? history
+    if (entries.length === 0) return
+    const state = recall.current ?? { index: entries.length, original: runtimeText, entries }
+    const index = Math.max(0, Math.min(entries.length, state.index + (direction === 'previous' ? -1 : 1)))
+    recall.current = index === entries.length ? undefined : { ...state, index }
+    aui.composer.setText(index === entries.length ? state.original : entries[index]!)
+    const field = formRef.current?.querySelector<HTMLTextAreaElement>('textarea')
+    field?.focus()
+    const end = (index === entries.length ? state.original : entries[index]!).length
+    field?.setSelectionRange(end, end)
   }
   return (
     <ComposerPrimitive.Root
       ref={formRef}
       onInput={() => { recall.current = undefined }}
       {...stylex.props(styles.root, style)}
-      onSubmit={event => { if (readOnly || onRequestSubmit !== undefined) event.preventDefault(); if (!readOnly) onRequestSubmit?.(false) }}
+      onSubmit={event => { recall.current = undefined; if (readOnly || onRequestSubmit !== undefined) event.preventDefault(); if (!readOnly) onRequestSubmit?.(false) }}
       onCompositionStartCapture={() => { composing.current = true }}
       onCompositionEndCapture={() => { composing.current = false }}
       onKeyDownCapture={event => {
         if (showHistory && !readOnly && !composing.current && !event.nativeEvent.isComposing && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
-          if (event.key === 'ArrowUp' && (runtimeText === '' || recall.current !== undefined)) { event.preventDefault(); recallHistory('previous'); return }
-          if (event.key === 'ArrowDown' && recall.current !== undefined) { event.preventDefault(); recallHistory('next'); return }
+          const field = event.target
+          if (field instanceof HTMLTextAreaElement && field.selectionStart === field.selectionEnd) {
+            const caret = field.selectionStart
+            const firstBreak = field.value.indexOf('\n')
+            if (event.key === 'ArrowUp' && (firstBreak < 0 || caret <= firstBreak) && hasHistory) { event.preventDefault(); recallHistory('previous'); return }
+            if (event.key === 'ArrowDown' && caret > field.value.lastIndexOf('\n') && recall.current !== undefined) { event.preventDefault(); recallHistory('next'); return }
+          }
         }
         if (event.key !== 'Enter') return
         const target = event.target
@@ -357,7 +370,7 @@ function PlainComposer({ history = emptyHistory, showHistory = false, targetLabe
         </div>
         {toolbar}
         <div {...stylex.props(styles.grow)} />
-        {showHistory ? <Button aria-label="Recall previous message" aria-description="ArrowUp on an empty field" isDisabled={readOnly || history.length === 0} onPress={() => recallHistory('previous')} {...stylex.props(styles.button, styles.submitIcon)}><Icon name="clock" /></Button> : null}
+        {showHistory ? <Button aria-label="Recall previous message" aria-description="ArrowUp on the first line" isDisabled={readOnly || !hasHistory} onPress={() => recallHistory('previous')} {...stylex.props(styles.button, styles.submitIcon)}><Icon name="clock" /></Button> : null}
         {actions !== undefined ? actions(compact) : onRequestSubmit === undefined ? <ComposerPrimitive.Send disabled={readOnly} aria-label={submitIcon === undefined ? undefined : 'Send'} {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? 'Send'}</ComposerPrimitive.Send> : <Button isDisabled={readOnly || !canSend} onPress={() => onRequestSubmit(false)} aria-label={submitIcon === undefined ? undefined : submitLabel ?? 'Send'} {...stylex.props(styles.button, styles.primary, submitIcon !== undefined && styles.submitIcon)}>{submitIcon ?? submitLabel ?? 'Send'}</Button>}
       </div>
     </ComposerPrimitive.Root>

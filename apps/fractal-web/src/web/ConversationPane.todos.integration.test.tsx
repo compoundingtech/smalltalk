@@ -12,7 +12,6 @@ vi.mock('@stylexjs/stylex', () => ({
   keyframes: () => 'test-animation',
   props: () => ({}),
 }))
-vi.mock('@effect/atom-react', () => ({ useAtomValue: () => false }))
 vi.mock('../data/react.tsx', () => ({
   useDataSource: () => ({}), useConversation: () => state.tag === 'Waiting' ? { _tag: 'Waiting' } : { _tag: 'Unavailable', reason: 'failed', detail: 'example' },
   useConversationSync: () => undefined, useFeedInterest: () => {}, useGrants: () => ({ messageSend: 'ungranted' }), useNow: () => 0,

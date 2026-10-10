@@ -279,6 +279,19 @@ describe('ConversationPane composition activation', () => {
       .toEqual(reasoning.map(item => item._tag === 'Reasoning' ? item.text : ''))
   })
 
+  it('does not recall pending, failed, or other-human transcript messages as submitted drafts', async () => {
+    const own = scenario[0]!
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [
+      own,
+      { ...own, id: 'pending/one', _tag: 'Text', role: 'user', text: 'Pending', attachments: [], streaming: false, at: at(1), sendState: { _tag: 'Pending' } },
+      { _tag: 'Text', id: 'failed', role: 'user', text: 'Failed', attachments: [], streaming: false, at: at(2), sendState: { _tag: 'Failed', reason: 'failed', detail: 'Refused' } },
+      { _tag: 'Text', id: 'other', role: 'user', text: 'Other human', attachments: [], streaming: false, at: at(3), sender: { kind: 'human', label: 'Other person' } },
+    ], hasOlder: false, observation: { empty: false } } }
+    await mount()
+    expect(source.composerProps.at(-1)?.history).toBeUndefined()
+    expect(source.composerProps.at(-1)?.historySource?.available).toBe(false)
+    expect(source.composerProps.at(-1)?.historySource?.get()).toEqual([])
+  })
   it('insets the composer dock so its focus outline stays inside the viewport', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
     await mount()
