@@ -531,13 +531,21 @@ impl Slice {
     fn prune(&self) -> Result<usize> {
         let mut writer = self.store.connection.write_background();
         let tx = writer.transaction()?;
-        self.check(&tx)?;
+        let count = self.prune_in(&tx)?;
+        tx.commit()?;
+        Ok(count)
+    }
+
+    // The ordinary, rollback, refused-COMMIT and crash cases share this exact body.
+    // The caller owns the managed outer transaction and its physical writer loan.
+    fn prune_in(&self, tx: &Transaction<'_>) -> Result<usize> {
+        self.check(tx)?;
         let applied: u64 = tx.query_row(
             "SELECT revision FROM main.ivm_install_roots WHERE view=?1",
             [VIEW],
             |r| r.get(0),
         )?;
-        self.installer.prune_journal(&tx, SOURCE, PAGE_ROWS)?;
+        self.installer.prune_journal(tx, SOURCE, PAGE_ROWS)?;
         tx.execute("UPDATE main.slice_limits SET draining=1 WHERE id=1", [])?;
         let count = tx.execute(
             "DELETE FROM main.slice_images WHERE revision IN
@@ -545,7 +553,6 @@ impl Slice {
             params![applied, PAGE_ROWS],
         )?;
         tx.execute("UPDATE main.slice_limits SET draining=0 WHERE id=1", [])?;
-        tx.commit()?;
         Ok(count)
     }
 }
@@ -1558,5 +1565,595 @@ fn canonical_metadata_inventory_growth_reports_actual_page_work() -> Result<()> 
 fn canonical_metadata_inventory_growth_reports_actual_page_work() {
     panic!(
         "required growth measurement is unavailable: build with test-support and require this exact name with positive traced statement counts; missing instrumentation is not evidence"
+    );
+}
+
+// Retention controls are private to this single-consumer, fixed-width fixture.
+// This oracle copies actual rows separately from the counters it reconciles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RetainedImage {
+    revision: u64,
+    store_index: u64,
+    id: String,
+    subject: String,
+    kind: String,
+    body: Vec<u8>,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RetainedReference {
+    revision: u64,
+    payload: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RetentionState {
+    // admitted revision, source available, journal rows, journal bytes
+    source: (u64, bool, u64, u64),
+    // retained rows, retained bytes, lifetime total rows, capturing, draining
+    counters: (u64, u64, u64, u64, u64),
+    // applied revision, persisted ready bit, generation, status revision
+    root: (u64, bool, u64, u64),
+    coverage: u64,
+    images: Vec<RetainedImage>,
+    journal: Vec<RetainedReference>,
+    output: Vec<(String, String, String, String)>,
+    native: Vec<(String, String, String, String)>,
+}
+
+impl Slice {
+    fn retention_state(&self) -> Result<RetentionState> {
+        self.read(|db| {
+            self.check(db)?;
+            let source = db.query_row(
+                "SELECT revision,available,journal_rows,journal_bytes
+                 FROM main.ivm_install_sources WHERE name=?1",
+                [SOURCE],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            let counters = db.query_row(
+                "SELECT retained_rows,retained_bytes,total_rows,capturing,draining
+                 FROM main.slice_limits WHERE id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?;
+            let root = db.query_row(
+                "SELECT revision,ready,generation,status_revision
+                 FROM main.ivm_install_roots WHERE view=?1",
+                [VIEW],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )?;
+            let namespace: String = db.query_row(
+                "SELECT namespace FROM main.ivm_install_roots WHERE view=?1",
+                [VIEW],
+                |r| r.get(0),
+            )?;
+            let coverage = db.query_row(
+                "SELECT through FROM main.slice_coverage WHERE namespace=?1",
+                [&namespace],
+                |r| r.get(0),
+            )?;
+            let images = db
+                .prepare(
+                    "SELECT revision,store_index,claim_id,subject,kind,body,bytes
+                          FROM main.slice_images ORDER BY revision LIMIT 257",
+                )?
+                .query_map([], |r| {
+                    Ok(RetainedImage {
+                        revision: r.get(0)?,
+                        store_index: r.get(1)?,
+                        id: r.get(2)?,
+                        subject: r.get(3)?,
+                        kind: r.get(4)?,
+                        body: r.get(5)?,
+                        bytes: r.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(
+                images.len() <= PENDING_ROWS as usize,
+                "retention oracle image bound"
+            );
+            let journal = db
+                .prepare(
+                    "SELECT revision,payload,bytes FROM main.ivm_install_journal
+                          WHERE source=?1 ORDER BY revision LIMIT 257",
+                )?
+                .query_map([SOURCE], |r| {
+                    Ok(RetainedReference {
+                        revision: r.get(0)?,
+                        payload: r.get(1)?,
+                        bytes: r.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(
+                journal.len() <= PENDING_ROWS as usize,
+                "retention oracle journal bound"
+            );
+            let output = db
+                .prepare(
+                    "SELECT claim_id,subject,kind,digest FROM main.slice_output
+                          WHERE namespace=?1 ORDER BY claim_id LIMIT 4097",
+                )?
+                .query_map([&namespace], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(
+                output.len() <= TOTAL_ROWS as usize,
+                "retention oracle output bound"
+            );
+            let native = db
+                .prepare("SELECT id,subject,kind,body FROM main.claims ORDER BY id LIMIT 4097")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(
+                native.len() <= TOTAL_ROWS as usize,
+                "retention oracle native bound"
+            );
+            Ok(RetentionState {
+                source,
+                counters,
+                root,
+                coverage,
+                images,
+                journal,
+                output,
+                native,
+            })
+        })
+    }
+}
+
+impl RetentionState {
+    fn reconcile(&self) -> Result<()> {
+        ensure!(
+            self.source.1 && self.root.1,
+            "retention fixture must retain compatible coverage"
+        );
+        ensure!(
+            self.root.0 == self.coverage,
+            "retention coverage differs from applied prefix"
+        );
+        ensure!(
+            self.counters.3 == 0 && self.counters.4 == 0,
+            "retention mode left active"
+        );
+        let mut image_bytes = 0u64;
+        for image in &self.images {
+            let actual =
+                8 + image.id.len() + image.subject.len() + image.kind.len() + image.body.len();
+            ensure!(
+                actual <= IMAGE_BYTES && image.bytes == actual as u64,
+                "retention image byte oracle differs from stored size"
+            );
+            image_bytes += actual as u64;
+        }
+        ensure!(
+            self.counters.0 == self.images.len() as u64 && self.counters.1 == image_bytes,
+            "retained row/byte counters differ from actual images"
+        );
+        let mut journal_bytes = 0u64;
+        for reference in &self.journal {
+            ensure!(
+                reference.payload.len() <= REFERENCE_BYTES
+                    && reference.bytes == reference.payload.len() as u64,
+                "journal byte oracle differs from actual payload"
+            );
+            journal_bytes += reference.payload.len() as u64;
+            let mutation: Mutation = serde_json::from_str(&reference.payload)?;
+            let image = self
+                .images
+                .iter()
+                .find(|i| i.revision == reference.revision)
+                .context("retained reference lost its immutable image")?;
+            let key: Value = serde_json::from_str(&mutation.key)?;
+            ensure!(
+                key[0] == "claims"
+                    && key[1][0].as_u64() == Some(image.store_index)
+                    && mutation.old.is_none()
+                    && mutation.new.as_ref().and_then(|v| v["revision"].as_u64())
+                        == Some(image.revision),
+                "retained reference does not identify its immutable image"
+            );
+        }
+        ensure!(
+            self.source.2 == self.journal.len() as u64 && self.source.3 == journal_bytes,
+            "journal counters differ from actual payloads"
+        );
+        ensure!(
+            self.images.len() == self.journal.len(),
+            "image/reference prefix differs"
+        );
+        ensure!(
+            self.counters.2 == self.native.len() as u64 && self.source.0 == self.counters.2,
+            "lifetime admitted total differs from fixed native fixture"
+        );
+        Ok(())
+    }
+
+    // Compute the expected single prune from copied rows, not from stored counters.
+    fn after_consumed_prune(&self) -> Result<Self> {
+        self.reconcile()?;
+        let consumed: Vec<_> = self
+            .images
+            .iter()
+            .filter(|i| i.revision <= self.root.0)
+            .collect();
+        ensure!(
+            consumed.len() <= PAGE_ROWS,
+            "oracle covers exactly one bounded prune"
+        );
+        let mut expected = self.clone();
+        expected.images.retain(|i| i.revision > self.root.0);
+        expected.journal.retain(|r| r.revision > self.root.0);
+        expected.counters.0 = expected.images.len() as u64;
+        expected.counters.1 = expected.images.iter().map(|i| i.bytes).sum();
+        expected.source.2 = expected.journal.len() as u64;
+        expected.source.3 = expected
+            .journal
+            .iter()
+            .map(|r| r.payload.len() as u64)
+            .sum();
+        Ok(expected)
+    }
+
+    fn assert_complete_output(&self) -> Result<()> {
+        self.reconcile()?;
+        ensure!(self.root.0 == self.source.0, "native inputs remain pending");
+        let expected = self
+            .native
+            .iter()
+            .map(|(id, subject, kind, body)| {
+                let body: Value = serde_json::from_str(body)?;
+                let canonical = smallclaims::hash::canonical_json_text(&body)?;
+                Ok((
+                    id.clone(),
+                    subject.clone(),
+                    kind.clone(),
+                    hex::encode(Sha256::digest(canonical.as_bytes())),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            self.output, expected,
+            "output ID/subject/kind/digest must match native rows"
+        );
+        Ok(())
+    }
+}
+
+fn retention_split(slice: &Slice) -> Result<PreparedPage> {
+    for n in 0..PAGE_ROWS * 2 {
+        append(slice, &format!("note/retention-{n:02}"))?;
+    }
+    let page = slice.capture()?.reduce()?;
+    slice.publish(&page)?;
+    let state = slice.retention_state()?;
+    state.reconcile()?;
+    ensure!(
+        state.source.0 == 32
+            && state.root.0 == 16
+            && state.images.len() == 32
+            && state.output.len() == 16,
+        "fixed retention split not established"
+    );
+    Ok(page)
+}
+
+#[test]
+fn applied_prefix_prune_rollback_and_refused_commit_preserve_exact_retention() -> Result<()> {
+    use rusqlite::hooks::Action;
+    use std::sync::atomic::AtomicUsize;
+
+    let (_root, slice) = fixture()?;
+    let _old_page = retention_split(&slice)?;
+    let before = slice.retention_state()?;
+    for refuse_commit in [false, true] {
+        let images_deleted = Arc::new(AtomicUsize::new(0));
+        let journal_deleted = Arc::new(AtomicUsize::new(0));
+        let commit_refused = Arc::new(AtomicBool::new(false));
+        {
+            let mut writer = slice.store.connection.write_background();
+            let images = images_deleted.clone();
+            let journal = journal_deleted.clone();
+            writer.update_hook(Some(
+                move |action: Action, database: &str, table: &str, _: i64| {
+                    if action == Action::SQLITE_DELETE && database == "main" {
+                        if table == "slice_images" {
+                            images.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if table == "ivm_install_journal" {
+                            journal.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                },
+            ));
+            if refuse_commit {
+                let refused = commit_refused.clone();
+                // SQLite nonzero commit-hook return converts COMMIT to ROLLBACK.
+                // The exact SQLITE_CONSTRAINT_COMMITHOOK code is checked below.
+                writer.commit_hook(Some(move || {
+                    refused.store(true, Ordering::Release);
+                    true
+                }));
+            }
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let tx = writer.transaction()?;
+                    ensure!(
+                        slice.prune_in(&tx)? == PAGE_ROWS,
+                        "fault prune must delete one page"
+                    );
+                    ensure!(
+                        slice.retention_state()? == before,
+                        "WAL reader observed uncommitted reclamation"
+                    );
+                    if refuse_commit {
+                        tx.commit()?;
+                    } else {
+                        tx.rollback()?;
+                    }
+                    Ok(())
+                }));
+            // Also remove both hooks on an unexpected panic before the loan can return.
+            writer.commit_hook(None::<fn() -> bool>);
+            writer.update_hook(None::<fn(Action, &str, &str, i64)>);
+            ensure!(writer.is_autocommit(), "fault prune left an active writer");
+            match result {
+                Ok(Ok(())) => ensure!(!refuse_commit, "commit hook did not refuse"),
+                Ok(Err(error)) if refuse_commit => {
+                    let sqlite = error
+                        .downcast_ref::<rusqlite::Error>()
+                        .context("commit refusal lost SQLite cause")?;
+                    match sqlite {
+                        rusqlite::Error::SqliteFailure(code, _) => assert_eq!(
+                            code.extended_code,
+                            rusqlite::ffi::SQLITE_CONSTRAINT_COMMITHOOK
+                        ),
+                        other => bail!("unexpected commit refusal: {other:?}"),
+                    }
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        assert_eq!(images_deleted.load(Ordering::Acquire), PAGE_ROWS);
+        assert_eq!(journal_deleted.load(Ordering::Acquire), PAGE_ROWS);
+        assert_eq!(commit_refused.load(Ordering::Acquire), refuse_commit);
+        let after = slice.retention_state()?;
+        after.reconcile()?;
+        assert_eq!(after, before);
+        assert!(
+            slice.ready_rows().is_err(),
+            "pending prefix must not become ready"
+        );
+        assert_eq!(
+            slice.capture()?.images.len(),
+            PAGE_ROWS,
+            "pending images must survive"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn committed_prune_preserves_pending_images_and_counter_reconciliation() -> Result<()> {
+    let (_root, slice) = fixture()?;
+    let old_page = retention_split(&slice)?;
+    let before = slice.retention_state()?;
+    let expected = before.after_consumed_prune()?;
+    assert_eq!(slice.prune()?, PAGE_ROWS);
+    let after = slice.retention_state()?;
+    after.reconcile()?;
+    assert_eq!(
+        after, expected,
+        "pending images/references must remain byte-identical"
+    );
+    assert!(
+        slice.publish(&old_page).is_err(),
+        "consumed page cannot replay after reclamation"
+    );
+    assert_eq!(slice.retention_state()?, after);
+    assert!(slice.ready_rows().is_err());
+    slice.publish(&slice.capture()?.reduce()?)?;
+    slice.retention_state()?.assert_complete_output()?;
+    let applied = slice.retention_state()?;
+    assert_eq!(slice.prune()?, PAGE_ROWS);
+    let empty = slice.retention_state()?;
+    empty.assert_complete_output()?;
+    assert_eq!(empty, applied.after_consumed_prune()?);
+    assert_eq!(empty.counters, (0, 0, 32, 0, 0));
+    assert_eq!((empty.source.2, empty.source.3), (0, 0));
+    assert_eq!(slice.ready_rows()?.len(), 32);
+    Ok(())
+}
+
+fn durable_retention_artifact(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::File::open(path.parent().context("artifact parent missing")?)?.sync_all()?;
+    Ok(())
+}
+
+#[test]
+fn actual_prune_crash_child() -> Result<()> {
+    let Some(phase) = std::env::var_os("SLICE_RETENTION_CHILD_PHASE") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(
+        std::env::var_os("SLICE_RETENTION_CHILD_PATH").context("retention child path missing")?,
+    );
+    let phase = phase.to_str().context("retention child phase invalid")?;
+    let code = match phase {
+        "uncommitted-prune" => 76,
+        "committed-prune" => 77,
+        _ => bail!("unknown retention child phase"),
+    };
+    let slice = Slice::create(&path)?;
+    let _page = retention_split(&slice)?;
+    let before = slice.retention_state()?;
+    durable_retention_artifact(
+        &path.with_extension("retention-before.json"),
+        &serde_json::to_vec(&before)?,
+    )?;
+    let mut writer = slice.store.connection.write_background();
+    let deleted = Arc::new(AtomicBool::new(false));
+    let witnessed = deleted.clone();
+    writer.update_hook(Some(
+        move |action: rusqlite::hooks::Action, database: &str, table: &str, _: i64| {
+            if action == rusqlite::hooks::Action::SQLITE_DELETE
+                && database == "main"
+                && table == "slice_images"
+            {
+                witnessed.store(true, Ordering::Release);
+            }
+        },
+    ));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+        let tx = writer.transaction()?;
+        ensure!(
+            slice.prune_in(&tx)? == PAGE_ROWS && deleted.load(Ordering::Acquire),
+            "child must witness actual prune DML"
+        );
+        // Child intentionally dies with the transaction open in the uncommitted case.
+        // Remove its fixture hook before death; no connection is lent back by process::exit.
+        tx.update_hook(None::<fn(rusqlite::hooks::Action, &str, &str, i64)>);
+        if phase == "committed-prune" {
+            tx.commit()?;
+        } else {
+            durable_retention_artifact(&path.with_extension("retention-phase"), phase.as_bytes())?;
+            println!("SLICE_RETENTION_CRASH {phase}");
+            std::io::stdout().flush()?;
+            std::process::exit(code);
+        }
+        Ok(())
+    }));
+    writer.update_hook(None::<fn(rusqlite::hooks::Action, &str, &str, i64)>);
+    match result {
+        Ok(result) => result?,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+    ensure!(
+        writer.is_autocommit(),
+        "committed child writer must be idle"
+    );
+    drop(writer);
+    durable_retention_artifact(&path.with_extension("retention-phase"), phase.as_bytes())?;
+    println!("SLICE_RETENTION_CRASH {phase}");
+    std::io::stdout().flush()?;
+    std::process::exit(code);
+}
+
+#[test]
+fn prune_crash_reopen_preserves_only_committed_reclamation() -> Result<()> {
+    for (phase, code) in [("uncommitted-prune", 76), ("committed-prune", 77)] {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("claims.db");
+        let output = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "actual_prune_crash_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("SLICE_RETENTION_CHILD_PHASE", phase)
+            .env("SLICE_RETENTION_CHILD_PATH", &path)
+            .output()?;
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("SLICE_RETENTION_CRASH {phase}"))
+        );
+        assert_eq!(
+            std::fs::read(path.with_extension("retention-phase"))?,
+            phase.as_bytes()
+        );
+        let mut bytes = Vec::new();
+        std::fs::File::open(path.with_extension("retention-before.json"))?
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() <= 1024 * 1024,
+            "retention child oracle exceeds bound"
+        );
+        let before: RetentionState = serde_json::from_slice(&bytes)?;
+        before.reconcile()?;
+        let expected = if phase == "committed-prune" {
+            before.after_consumed_prune()?
+        } else {
+            before
+        };
+        let reopened = Slice::open(&path)?;
+        let observed = reopened.retention_state()?;
+        observed.reconcile()?;
+        assert_eq!(
+            observed, expected,
+            "open must not replay or repair reclamation"
+        );
+        assert!(reopened.ready_rows().is_err());
+        reopened.publish(&reopened.capture()?.reduce()?)?;
+        reopened.retention_state()?.assert_complete_output()?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn full_prune_accounting_includes_physical_writer_return() -> Result<()> {
+    let (_root, slice) = fixture()?;
+    let _page = retention_split(&slice)?;
+    let before = slice.retention_state()?;
+    let expected = before.after_consumed_prune()?;
+    let removed_bytes: u64 = before
+        .images
+        .iter()
+        .filter(|i| i.revision <= before.root.0)
+        .map(|i| i.bytes)
+        .sum();
+    let scope = smallclaims::sqlite::work::SqliteWorkScope::start();
+    let removed_rows = slice.prune()?;
+    let work = scope.finish(); // acquisition, SQL/COMMIT and physical writer return, before oracle
+    eprintln!(
+        "whole-prune accounted work including physical writer return: {work:?} removed_rows={removed_rows} removed_image_bytes={removed_bytes}"
+    );
+    assert!(
+        work.statements > 0 && work.vm_steps > 0,
+        "zero measured work cannot qualify pruning"
+    );
+    assert!(
+        work.statements <= 128,
+        "unqualified prune statement work: {work:?}"
+    );
+    assert!(
+        work.vm_steps <= 50000,
+        "unqualified prune VM work: {work:?}"
+    );
+    assert_eq!(
+        work.autoindex_rows, 0,
+        "prune must not build an automatic index"
+    );
+    assert_eq!(removed_rows, PAGE_ROWS);
+    let after = slice.retention_state()?;
+    after.reconcile()?;
+    assert_eq!(after, expected);
+    assert_eq!(before.counters.1 - after.counters.1, removed_bytes);
+    Ok(())
+}
+
+#[cfg(not(feature = "test-support"))]
+#[test]
+fn full_prune_accounting_includes_physical_writer_return() {
+    panic!(
+        "required prune accounting is unavailable: build with test-support and require this exact name with positive SQL/VM counts; missing instrumentation is not a passed or omitted prerequisite"
     );
 }
