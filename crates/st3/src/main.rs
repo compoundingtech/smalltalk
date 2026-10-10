@@ -21475,12 +21475,41 @@ fn codex_continued_thread(argv: &[String]) -> Option<String> {
         .filter(|thread| st3::native_resume::codex_check(argv, thread).is_ok())
 }
 
+/// How the Codex driver learns its person's answer to the approval it waits on: this daemon's
+/// prompt state for the seat, read from the driver's blocking control thread.
+fn codex_prompt_answers(
+    client: &Client,
+    subject: &str,
+) -> st_drivers::session_control::PromptAnswers {
+    let client = client.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let agent = urlencoding::encode(subject).into_owned();
+    st_drivers::session_control::PromptAnswers::new(move |ownership, transition| {
+        let path = format!(
+            "/v1/harness-prompts/state?agent={agent}&ownership={ownership}&transition={transition}"
+        );
+        runtime.block_on(async {
+            // Bounded: the control thread reads Codex's socket between these reads.
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                client.get::<st_drivers::session_control::PromptAnswer>(&path),
+            )
+            .await
+            .ok()?
+            .ok()
+        })
+    })
+}
+
 fn spawn_codex_provider(
+    client: &Client,
+    subject: &str,
     paths: &NativePaths,
     state_dir: &Path,
     argv: &[String],
     start: ProviderStart,
 ) -> tokio::task::JoinHandle<Result<()>> {
+    let prompt_answers = codex_prompt_answers(client, subject);
     let paths = paths.clone();
     let state_dir = state_dir.to_path_buf();
     let argv = argv.to_vec();
@@ -21503,6 +21532,7 @@ fn spawn_codex_provider(
                     paths.runtime_id,
                     argv,
                     paths.delivery_gate,
+                    Some(prompt_answers),
                     thread,
                 )
             }
@@ -21527,6 +21557,7 @@ fn spawn_codex_provider(
                 socket_path,
                 safe_fallback,
                 paths.delivery_gate,
+                Some(prompt_answers),
             ),
             ProviderStart::Adopt(session) => {
                 anyhow::bail!("a Codex driver cannot adopt this provider session: {session:?}")
@@ -21610,7 +21641,7 @@ async fn drive_codex_native(
     ))
         .then(|| codex_continued_thread(&argv))
         .flatten();
-    let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
+    let mut task = spawn_codex_provider(client, subject, &paths, &state_dir, &argv, start);
     let mut reported_session = None;
     // The Codex control pump keeps the subagent ledger; this driver records it on the seat.
     let mut subagents = st3::subagents::Publisher::start(
@@ -21676,7 +21707,7 @@ async fn drive_codex_native(
                     };
                     let _ = replacement.exec(subject, &root, &resume);
                     loop_state = resume.loop_state;
-                    task = spawn_codex_provider(&paths, &state_dir, &argv, ProviderStart::Adopt(session));
+                    task = spawn_codex_provider(client, subject, &paths, &state_dir, &argv, ProviderStart::Adopt(session));
                     completion_announced = false;
                     continue;
                 }
