@@ -79,8 +79,10 @@ export const Expanded: Story = { args: { state: 'expanded' }, play: async ({ can
   await expect(previews[1]).toHaveTextContent('selection retained')
   await expect(canvas.getByTestId('work-log-divider')).toBeInTheDocument()
   await expect(canvas.getByRole('button', { name: 'Thinking' })).toHaveAttribute('aria-expanded', 'false')
+  // A silent success with input stays collapsed: no preview, but it can still be expanded for its raw input.
   const empty = canvasElement.querySelector('[data-tool-status="success"]:last-child')!
-  await expect(empty.querySelector('button')).toBeNull()
+  await expect(empty.querySelector('button')).toHaveAttribute('aria-expanded', 'false')
+  await expect(empty.querySelector('[data-testid="tool-detail-preview"]')).toBeNull()
   await expect(empty).toHaveTextContent('No output')
   await userEvent.click(canvas.getByRole('button', { name: 'Open read tool detail' }))
   await expect(canvas.getByRole('region', { name: 'Opened tool detail' }).querySelector('pre')?.textContent).toBe(source)
@@ -162,6 +164,39 @@ export const RawInputDefaultDetail: Story = { render: args => <main {...stylex.p
   await expect(canvasElement.textContent).toContain(rawMarker)
 } }
 export const RawInputDefaultDetailLight: Story = { ...RawInputDefaultDetail, args: { scheme: 'light' } }
+const silentItems: readonly ConversationItem[] = [
+  { _tag: 'ToolCall', id: 'silent/read', callId: 'silent/read', name: 'read', input: { path: 'src/empty.ts', note: `${rawMarker}:silent/read` }, status: 'success', result: { content: '', isError: false, at }, callSeen: true, at },
+  { _tag: 'ToolCall', id: 'silent/run', callId: 'silent/run', name: 'run', input: { command: 'pnpm test rows', note: `${rawMarker}:silent/run` }, status: 'error', callSeen: true, at },
+]
+const liveItems: readonly ConversationItem[] = [{ _tag: 'ToolCall', id: 'live/run', callId: 'live/run', name: 'run', input: { command: 'pnpm build', note: `${rawMarker}:live/run` }, status: 'running', callSeen: true, at }]
+const withoutOutputData: TranscriptStoryData = { sync: { _tag: 'Live', since: now }, turns: [
+  { id: 'silent', items: silentItems, work: workLogTurnFromItems(silentItems, { kindFor: name => name === 'run' ? 'run' : 'read', running: false, failed: true, interrupted: false, startedAt: at, completeHistory: true, failureNote: 'The run stopped; your conversation and changes are retained.' }) },
+  { id: 'live', items: liveItems, work: workLogTurnFromItems(liveItems, { kindFor: () => 'run', running: true, failed: false, interrupted: false, startedAt: at }) },
+] }
+/** A silent success, a failed call without output and an in-flight call each expand to their raw input alone. */
+export const RawInputWithoutOutput: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={withoutOutputData} onOpenTool={() => {}} onRetry={() => {}} /></main>, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const notice = await canvas.findByRole('alert')
+  const rows = [...canvasElement.querySelectorAll<HTMLElement>('[data-tool-status] > button')]
+  await expect(rows).toHaveLength(3)
+  for (const row of rows) await expect(row).toHaveAttribute('aria-expanded', 'false')
+  await expect(canvas.queryAllByTestId('tool-detail-preview')).toHaveLength(0)
+  await expect(canvasElement.textContent).not.toContain(rawMarker)
+  for (const [index, id] of ['silent/read', 'silent/run', 'live/run'].entries()) {
+    const row = rows[index]!
+    await userEvent.click(row)
+    await expect(row).toHaveAttribute('aria-expanded', 'true')
+    const preview = row.parentElement!.querySelector<HTMLElement>('[data-testid="tool-detail-preview"]')!
+    await expect(within(preview).getByTestId('tool-raw-input')).toHaveTextContent(`"note": "${rawMarker}:${id}"`)
+    // Only the input: no empty-output block or placeholder.
+    await expect(preview.querySelectorAll('pre')).toHaveLength(1)
+    await expect(preview.textContent).not.toMatch(/No output/)
+  }
+  // Control: the whole-canvas absence probe that passed while collapsed now fails.
+  await expect(canvasElement.textContent).toContain(rawMarker)
+  await expect(notice.textContent).not.toContain(rawMarker)
+} }
+export const RawInputWithoutOutputLight: Story = { ...RawInputWithoutOutput, args: { scheme: 'light' } }
 const nativeOutputItems: readonly ConversationItem[] = [
   { name: 'string output', content: 'String result retained.' },
   { name: 'native array output', content: [{ type: 'text', text: 'First native line.' }, { type: 'image', data: 'synthetic-bytes' }, { type: 'text', text: 'Second native line.' }] },

@@ -69,7 +69,8 @@ export function workLogTurnFromItems(items: readonly ConversationItem[], facts: 
     const extension = dot > 0 ? filename.slice(dot + 1).toLowerCase() : undefined
     return [{
       id: call.id, kind, title: call.name, argsSummary: summarizeArgs(call.input),
-      rawInput: typeof call.input === 'string' ? call.input : call.input === undefined || call.input === null ? undefined : JSON.stringify(call.input, null, 2),
+      // Empty input carries nothing to inspect, so it does not make a row expandable.
+      rawInput: typeof call.input === 'string' ? call.input || undefined : call.input === undefined || call.input === null || typeof call.input === 'object' && Object.keys(call.input).length === 0 ? undefined : JSON.stringify(call.input, null, 2),
       status: call.status, startedAt: call.at, endedAt: call.result?.at,
       detail: toolOutput(call.result?.content) || undefined,
       outputLanguage: (media === undefined ? undefined : outputMediaLanguages[media]) ?? (kind === 'run' ? 'bash' : kind === 'read' ? extension : undefined),
