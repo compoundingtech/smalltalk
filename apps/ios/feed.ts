@@ -253,7 +253,7 @@ export class Feed {
   private loaded(name: FeedWindow | typeof GLASSES | typeof ARRANGEMENTS): void {
     clearTimeout(this.retries[name]?.timer);
     delete this.retries[name];
-    if (name !== GLASSES) { clearTimeout(this.reports[name]); delete this.reports[name]; }
+    if (name !== GLASSES && name !== ARRANGEMENTS) { clearTimeout(this.reports[name]); delete this.reports[name]; }
   }
 
   private async connect(): Promise<void> {

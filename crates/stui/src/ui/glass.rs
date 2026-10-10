@@ -2017,6 +2017,7 @@ impl Ui {
                 bar(theme::fg(theme::ACCENT)),
             ));
         }
+        let mut machines_shown = false;
         if !fresh {
             let mut x;
             if alerts > 0 {
@@ -2091,7 +2092,7 @@ impl Ui {
             );
             spans.push(Span::styled(active_text, bar(theme::fg(theme::SAPPHIRE))));
             let machines = self.world.machines.items();
-            let machines_shown = !machines.is_empty();
+            machines_shown = !machines.is_empty();
             if machines_shown {
                 let count = |reach: &[Reach]| {
                     machines

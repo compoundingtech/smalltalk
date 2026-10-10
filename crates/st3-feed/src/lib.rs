@@ -100,6 +100,9 @@ impl Window {
     }
 }
 
+/// The glasses capability version whose glasses are splits of tab groups.
+const GLASSES_VERSION: u32 = 1;
+
 /// The most glasses st keeps live for one person.
 const GLASSES: usize = 100;
 
@@ -1451,6 +1454,7 @@ mod tests {
         let feed = tokio::spawn(run_members_with_sidebar(
             vec![client],
             false,
+            true,
             true,
             Some("person/avery".into()),
             tx,
