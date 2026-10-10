@@ -24,21 +24,19 @@ vi.mock('../../../../packages/fractal-ui/src/assistant-ui/EmbraceComposer.tsx', 
 vi.mock('../conversation/todos/AgentTodos.tsx', () => ({ LiveAgentTodos: () => <details aria-label="Harness todos"><summary>Todos · Example phase 1/2</summary></details> }))
 import { ConversationPane } from './ConversationPane.tsx'
 
-it('pins native Todos and preserves the composer during conversation loading and unavailability', async () => {
+it('keeps Todos out of the pane and preserves the composer during conversation loading and unavailability', async () => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true)
   const container = document.createElement('div')
   document.body.append(container)
   const root = createRoot(container)
   try {
     await act(async () => root.render(<ConversationPane agentRef="agent/example" agentName="Example" onOpenTool={() => {}} />))
-    const todos = container.querySelector('[aria-label="Harness todos"]')
     const composer = container.querySelector('textarea')
-    expect(todos?.textContent).toContain('Todos · Example phase 1/2')
+    expect(container.querySelector('[aria-label="Harness todos"]')).toBeNull()
     expect(composer).not.toBeNull()
-    expect(todos?.compareDocumentPosition(composer!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
     state.tag = 'Unavailable'
     await act(async () => root.render(<ConversationPane agentRef="agent/example" agentName="Example" onOpenTool={() => {}} />))
-    expect(container.querySelector('[aria-label="Harness todos"]')).toBe(todos)
+    expect(container.querySelector('[aria-label="Harness todos"]')).toBeNull()
     expect(container.querySelector('textarea')).toBe(composer)
   } finally {
     await act(async () => root.unmount())

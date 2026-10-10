@@ -8,6 +8,10 @@ import { DataSourceProvider } from '../data/react.tsx'
 import { fixtureSource } from '../data/fixtureSource.ts'
 import { gatewayResources } from '../resources/agent/source.ts'
 import { ConversationHeaderActions } from './ConversationHeaderActions.tsx'
+import { AgentTodos } from '../conversation/todos/AgentTodos.tsx'
+import { todoAgent, todoAgentRef } from '../conversation/todos/fixtures.ts'
+import { projectTodos } from '../conversation/todos/model.ts'
+import { observed } from '../data/source.ts'
 
 vi.mock('@stylexjs/stylex', () => ({ create: (styles: unknown) => styles, defineVars: (variables: unknown) => variables, createTheme: () => ({}), keyframes: () => 'test-animation', props: () => ({}) }))
 const snapshot = { id: 'snapshot/example', host_id: 'host/example', store_index: 1, projection_version: 'client-projection.v0', created_at: '2026-10-09T00:00:00Z' }
@@ -65,4 +69,43 @@ it('ends the resource poll when its inspector closes, not on the next seat switc
   await act(async () => vi.advanceTimersByTimeAsync(30_000))
   await settle()
   expect(requests).toEqual([])
+})
+it('shows the agent Todos as the first Resources section, naming a missing snapshot', async () => {
+  await show('agent/example')
+  await click('Resources')
+  const sections = [...document.querySelectorAll('[role="dialog"] section[aria-label]')]
+  expect(sections.map(section => section.getAttribute('aria-label'))).toEqual(['Todos', 'Agent queue', 'Observed resources'])
+  expect(sections[0]!.textContent).toBe('TodosNo harness todo snapshot observed. This is not an empty todo list.')
+})
+it('keeps the Todos disclosure with phase, progress and harness inside Resources', async () => {
+  const state = projectTodos({ feed: observed({ value: [todoAgent] }), agentRef: todoAgentRef })
+  expect(state._tag).toBe('Observed')
+  await act(async () => root.render(<AgentTodos state={state} placement="resources" />))
+  const disclosure = host.querySelector('details[aria-label="Harness todos"]') as HTMLDetailsElement
+  expect(disclosure.open).toBe(false)
+  const summary = disclosure.querySelector('summary')!.textContent!
+  if (state._tag !== 'Observed') return
+  expect(summary).toContain(`${state.completed}/${state.total}`)
+  expect(summary).toContain(state.todo.snapshot.harness)
+})
+it('keeps the Resources portal inside its owning scheme root', async () => {
+  host.dataset.scheme = 'light'
+  await show(todoAgentRef)
+  await click('Resources')
+  const dialog = document.querySelector('[role="dialog"][aria-label="Agent resources"]')!
+  expect(dialog.closest('[data-scheme]')).toBe(host)
+  expect(dialog.closest('[aria-hidden="true"]')).toBeNull()
+})
+
+it('shows pending binding verification instead of Stale while the roster request is pending', async () => {
+  const state = projectTodos({
+    feed: observed({ value: [todoAgent], freshness: 'stale' }),
+    agentRef: todoAgentRef,
+    sync: { _tag: 'Requested', since: 0 },
+  })
+  await act(async () => root.render(<AgentTodos state={state} placement="resources" />))
+  const summary = host.querySelector('summary')!
+  expect(summary.textContent).toContain('Pending · omp')
+  expect(summary.textContent).not.toContain('Stale')
+  expect(host.textContent).toContain('binding verification pending')
 })

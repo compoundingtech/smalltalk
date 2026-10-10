@@ -20,10 +20,12 @@ Tool rows show a short description rather than raw commands or infrastructure pa
 Protocol events are hidden by default; the conversation menu can show payload-free
 event notices for inspection. Process and agent senders use readable captions.
 
-The pinned **Todos · phase completed/total** disclosure reads the accepted harness
-snapshot, independently of transcript loading. It remains above the composer while
-the conversation reconnects. A missing snapshot is not an empty task list, and stale
-or truncated snapshots keep their freshness and full-source progress labels.
+In the web workspace, **Resources** starts with a **Todos · phase completed/total**
+disclosure reading the accepted harness snapshot independently of transcript loading.
+The sheet follows the workspace's light or dark scheme, including completed task text.
+A missing snapshot is not an empty task list. While the roster request is pending,
+retained tasks say **Pending** rather than claiming a stale binding; once verified,
+stale or truncated snapshots keep their freshness and full-source progress labels.
 
 If a conversation cannot be found or access is not granted, ask the gateway owner
 to grant access to the surface. Your saved work is unchanged.

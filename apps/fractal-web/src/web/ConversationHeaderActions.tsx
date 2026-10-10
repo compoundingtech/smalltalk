@@ -10,6 +10,7 @@ import { colorVars as c, typeVars as t, spaceVars as s } from '../../../../packa
 import { compactTime } from '../../../../packages/fractal-ui/src/assistant-ui/sidebar/model.ts'
 import { useDataSource, useNow } from '../data/react.tsx'
 import { unavailable, waiting, type Feed } from '../data/source.ts'
+import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
 import { resourceState, resourceTitle, type ResourcePage } from '../resources/agent/model.ts'
 import { systemEventsPreference } from './conversationPreferences.ts'
 
@@ -21,6 +22,8 @@ export const ConversationHeaderActions = ({ agentRef }: { readonly agentRef: str
   const source = useDataSource()
   const [showSystemEvents, setShowSystemEvents] = useAtom(systemEventsPreference)
   const [resourcesOpen, setResourcesOpen] = React.useState(false)
+  // Keep portaled sheets under the owning workspace's semantic theme variables.
+  const portalContainer = React.useRef<HTMLDivElement>(null)
   // A closed inspector has no read demand. Otherwise each switch starts discovery plus a
   // resource read and keeps its 15-second poll alive despite showing no resources.
   const resources = useAtomValue(source.resources === undefined ? unsupportedResources
@@ -30,10 +33,10 @@ export const ConversationHeaderActions = ({ agentRef }: { readonly agentRef: str
     ? resources.reason === 'ungranted' ? 'Read access to agent resources has not been granted.'
       : resources.reason === 'unsupported' ? 'This connection does not support agent resources.' : undefined
     : undefined
-  return <div {...stylex.props(styles.actions)}>
+  return <div ref={portalContainer} {...stylex.props(styles.actions)}>
     <Aria.DialogTrigger isOpen={resourcesOpen} onOpenChange={setResourcesOpen}>
       <Aria.Button aria-label="Resources" aria-expanded={resourcesOpen} isDisabled={disabledReason !== undefined} aria-describedby={disabledReason === undefined ? undefined : reasonId} {...stylex.props(styles.button)}><CompositionIcon name="folder" />Resources</Aria.Button>
-      <Aria.ModalOverlay isDismissable {...stylex.props(styles.overlay)}>
+      <Aria.ModalOverlay isDismissable UNSTABLE_portalContainer={portalContainer.current ?? undefined} {...stylex.props(styles.overlay)}>
         <Aria.Modal {...stylex.props(styles.modal)}>
           <Aria.Dialog aria-label="Agent resources" {...stylex.props(styles.dialog)}>
             <header {...stylex.props(styles.heading)}><strong>Resources</strong><Aria.Button aria-label="Close resources" onPress={() => setResourcesOpen(false)} {...stylex.props(styles.button)}>Close resources</Aria.Button></header>
@@ -62,6 +65,10 @@ const ResourceContents = ({ agentRef, resources }: {
   const queue = useAtomValue(source.subjectReads.agentQueue.feed(agentRef))
   const now = useNow()
   return <div {...stylex.props(styles.contents)}>
+    <section aria-label="Todos">
+      <h2 {...stylex.props(styles.sectionTitle)}>Todos</h2>
+      <LiveAgentTodos agentRef={agentRef} placement="resources" />
+    </section>
     <section aria-label="Agent queue">
       <h2 {...stylex.props(styles.sectionTitle)}>Agent queue</h2>
       {queue._tag !== 'Observed' ? <ReadNotice feed={queue} label="Agent queue" /> : <>
