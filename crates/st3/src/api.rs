@@ -23873,7 +23873,7 @@ mission "wake" state="ready" {
             let (published, after, _) = store.published_agent_roster(cut, history).unwrap();
             assert_eq!(published, cut);
             for subject in ["agent/retained-fault", "agent/known-clear", "agent/new-unknown"] {
-                assert_eq!(card(&after, subject)["runtime_id"], "new");
+                assert_eq!(card(&after, subject)["runtime_ids"], json!(["runtime/new"]));
             }
             assert_eq!(card(&after, "agent/retained-fault")["fault"], "previous failure");
             assert!(card(&after, "agent/known-clear")["fault"].is_null());
@@ -23917,7 +23917,7 @@ mission "wake" state="ready" {
                 let (status, page) = get_request(router(state.clone()),
                     &format!("/v1/client/agents?history={history}&fresh=true")).await;
                 assert_eq!(status, StatusCode::OK, "never-published fault degradation must answer 200");
-                assert_eq!(page["items"][0]["runtime_id"], runtime);
+                assert_eq!(page["items"][0]["runtime_ids"], json!([format!("runtime/{runtime}")]));
                 assert_eq!(page["items"][0]["fault"], "fault status unknown");
             }
             Store::expire_card_fault_reads_for_test(0);
@@ -23989,7 +23989,7 @@ mission "wake" state="ready" {
         let (published, cards, _) = store.published_agent_roster(cut, false).unwrap();
         assert_eq!(published, cut);
         assert_eq!(cards.len(), count);
-        assert!(cards.iter().all(|card| card["runtime_id"] == "new" && card["fault"].is_null()));
+        assert!(cards.iter().all(|card| card["runtime_ids"] == json!(["runtime/new"]) && card["fault"].is_null()));
         assert_eq!(store.agent_resources_refolded_cards_for_test() - before, count,
             "a deadline must not trigger another fold inside this refresh attempt");
         let before = store.agent_resources_refolded_cards_for_test();
@@ -24093,7 +24093,7 @@ mission "wake" state="ready" {
         worker.await.unwrap().unwrap();
         assert_eq!(snapshot.store_index, store.index().unwrap());
         assert!(snapshot.store_index > old_cut);
-        assert_eq!(page.items[0]["runtime_id"], "new");
+        assert_eq!(page.items[0]["runtime_ids"], json!(["runtime/new"]));
     }
 
 
