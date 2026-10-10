@@ -281,14 +281,15 @@ const loadEarlier = fn()
 /** Reaching the top reveals a bounded older chunk; idle backfill eventually makes the boundary reachable. */
 export const TopMountsOlderTurns: Story = { args: { history: { _tag: 'HasOlder', onLoadEarlier: loadEarlier } }, play: async ({ canvasElement }) => {
   loadEarlier.mockClear()
-  await expect(await reopen(canvasElement)).toBeLessThan(200)
+  const first = await reopen(canvasElement)
+  await expect(first).toBeLessThan(200)
   const scroll = scroller(canvasElement)
   await frame()
   scroll.dispatchEvent(new WheelEvent('wheel', { deltaY: -scroll.scrollHeight }))
   scroll.scrollTop = 0
   await frame()
   await frame()
-  await expect(turnCount(canvasElement)).toBeGreaterThan(2)
+  await expect(turnCount(canvasElement)).toBeGreaterThan(first)
   await expect(turnCount(canvasElement)).toBeLessThan(200)
   await settled(canvasElement, 200)
   scroll.scrollTop = 0

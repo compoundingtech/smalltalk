@@ -187,7 +187,7 @@ const contentVersion = (item: ConversationItem): string => {
 }
 /** The window is counted in source rows, not turns: a single agent turn can contain thousands of entries. */
 type MountedTurns = { readonly _tag: 'NewestPage' } | { readonly _tag: 'From'; readonly id: string } | { readonly _tag: 'All' }
-const newestPageRows = 8
+const newestPageRows = 6
 const backfillChunkRows = 4
 const mountedStart = (mounted: MountedTurns, rows: readonly ConversationItem[]) =>
   mounted._tag === 'All' ? 0 : mounted._tag === 'NewestPage' ? Math.max(0, rows.length - newestPageRows) : Math.max(0, rows.findIndex(row => row.id === mounted.id))
@@ -212,6 +212,15 @@ const whenIdle = (task: () => void): (() => void) => {
   }
   const handle = setTimeout(task, 16)
   return () => clearTimeout(handle)
+}
+/** Older engines and non-layout DOMs lack checkVisibility; retained hidden ancestors still must not backfill. */
+const hasVisibleBox = (element: HTMLElement): boolean => {
+  if (typeof element.checkVisibility === 'function') return element.checkVisibility()
+  for (let ancestor: HTMLElement | null = element; ancestor !== null; ancestor = ancestor.parentElement) {
+    const style = element.ownerDocument.defaultView?.getComputedStyle(ancestor)
+    if (style?.display === 'none' || style?.contentVisibility === 'hidden') return false
+  }
+  return true
 }
 /** Growing a partial turn must not re-render the already mounted message subtrees. */
 const PreparedMessage = React.memo(function PreparedMessage({ item, stranded, caption }: { readonly item: ConversationItem; readonly stranded: boolean; readonly caption?: string }) {
@@ -311,7 +320,8 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     let cancel = () => {}
     const frame = requestAnimationFrame(() => {
       cancel = whenIdle(function step() {
-        if (timeline.current?.checkVisibility() === false) cancel = whenIdle(step)
+        if (timeline.current === null) return
+        if (!hasVisibleBox(timeline.current)) cancel = whenIdle(step)
         else mountOlder(false)
       })
     })
