@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { buildFabricDefault, decodeFabricTarget, encodeFabricTarget, fabricTarget, fabricTargetFromQuery, fabricTargetFromText, fabricTargetLabel, sameFabricTarget } from './fabricTarget.ts';
+import { buildFabricDefault, fabricGatewayId, isFabricGatewayId, decodeFabricTarget, encodeFabricTarget, fabricTarget, fabricTargetFromQuery, fabricTargetFromText, fabricTargetLabel, sameFabricTarget } from './fabricTarget.ts';
 
 const node = 'AB'.repeat(32);
 const lower = node.toLowerCase();
@@ -48,3 +48,8 @@ assert.equal(fabricTargetLabel(target), `st3-client/demo on ${lower.slice(0, 8)}
 assert.deepEqual(fabricTargetFromText(`  node=${node}&service=s  `), { node: lower, service: 's' });
 assert.deepEqual(fabricTargetFromText(`com.example.app://fabric?node=${node}&service=s`), { node: lower, service: 's' });
 assert.equal(fabricTargetFromText('hello'), null);
+
+// A device paired over fabric alone is identified by its target; that identity is never a route.
+assert.equal(fabricGatewayId(target), `fabric://${lower}/st3-client%2Fdemo`);
+assert.ok(isFabricGatewayId(fabricGatewayId(target)));
+assert.ok(!isFabricGatewayId('http://100.64.1.2:8443') && !isFabricGatewayId(''));

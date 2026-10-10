@@ -16,7 +16,7 @@ import { sendFences } from './sendFence';
 import { Feed } from './feed';
 import { FabricCarrier, routeLabel, selectRoute, type CarrierChoice, type FabricSnapshot, type Route } from './carrier';
 import { Observations, type Context } from './observations';
-import { buildFabricDefault, decodeFabricTarget, encodeFabricTarget, fabricTargetFromText, type FabricTarget } from './fabricTarget';
+import { buildFabricDefault, decodeFabricTarget, encodeFabricTarget, fabricGatewayId, fabricTargetFromText, isFabricGatewayId, type FabricTarget } from './fabricTarget';
 import { fabricAvailable, fabricIdentity, fabricPathInUse, nativeCarrierPorts } from './fabricBridge';
 import { ForegroundGate } from './foreground';
 import type { FabricProfile } from './fabricProof';
@@ -159,7 +159,7 @@ function useAppStore(proof?: FabricProfile) {
   const selected = useMemo(
     () => proof
       ? { baseUrl: url || null, route: { kind: 'none', fellBack: false, why: '' } as Route, pending: false, issue: '' }
-      : selectRoute(fabricBuilt ? carrierChoice : 'tailscale', fallbackOn, url || null, fabricSnapshot, !!fabricTarget),
+      : selectRoute(fabricBuilt ? carrierChoice : 'tailscale', fallbackOn, url && !isFabricGatewayId(url) ? url : null, fabricSnapshot, !!fabricTarget),
     [proof, url, fabricBuilt, carrierChoice, fallbackOn, fabricSnapshot, fabricTarget],
   );
   const routeRef = useRef<Route>(selected.route); routeRef.current = selected.route;
@@ -339,7 +339,7 @@ function useAppStore(proof?: FabricProfile) {
     if (client || proof) return;
     if (!credential || (!url && !fabricTarget)) setStatus('setup');
     else if (selected.pending) setStatus('connecting');
-    else { setStatus('offline'); setConnectionIssue(selected.issue); }
+    else { setStatus('offline'); setConnectionIssue(selected.issue || (isFabricGatewayId(url) ? 'This device is paired over Fabric only. Turn Fabric on to connect.' : '')); }
   }, [client, proof, credential, url, fabricTarget, selected.pending, selected.issue]);
   useEffect(() => {
     if (proof) foreground.current.update(proof.ready && url === proof.url ? AppState.currentState : 'background');
@@ -419,6 +419,7 @@ function useAppStore(proof?: FabricProfile) {
     // With fabric chosen and its bridge open, the pairing requests go over fabric to the same member: the
     // gateway typed (or saved) stays this device's identity and its fallback route.
     const requestUrl = fabricBuilt && carrierChoice === 'fabric' && fabricSnapshot.phase === 'ready' ? fabricSnapshot.bridgeUrl : gateway;
+    if (isFabricGatewayId(gateway) && requestUrl === gateway) throw new Error('Fabric is not connected yet, so there is nowhere to pair. Wait a moment and try again, or check the member\'s fabric grant for this phone.');
     const response = await requestFetch(`${requestUrl}/v1/client/capabilities`);
     const text = await response.text();
     if (!response.ok || text.length > 8192) throw new Error('Member cannot advertise pairing proofs; upgrade it. The code was not submitted.');
@@ -474,7 +475,9 @@ function useAppStore(proof?: FabricProfile) {
       await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError('');
     },
     async pair(id: string, code: string, fingerprint: string, unpinned = false): Promise<boolean> {
-      const gateway = pairDraft?.gateway ?? url;
+      // With fabric chosen and a target saved, a device with no gateway pairs over fabric alone.
+      const fabricOnly = !pairDraft && !url && fabricBuilt && carrierChoice === 'fabric' && fabricTarget ? fabricGatewayId(fabricTarget) : '';
+      const gateway = pairDraft?.gateway ?? (url || fabricOnly);
       if (!gateway || !id.trim() || !code.trim()) return false;
       setBusy(true);
       try { await completePairing(id.trim(), code.trim(), fingerprint, unpinned, gateway); return true; } catch (e) { setError(errorText(e)); return false; } finally { setBusy(false); }

@@ -183,7 +183,11 @@ function CarrierSection() {
 
 // Pairing: the one screen before a device has a credential.
 export function PairScreen() {
-  const { url, urlDraft, setUrlDraft, pairDraft, busy, actions } = useStore();
+  const { carrierInfo: fabricInfo, actions: fabricActions } = useStore();
+  useEffect(() => { if (fabricInfo.built) void fabricActions.loadFabricNode(); }, [fabricInfo.built]);
+  const { url, urlDraft, setUrlDraft, pairDraft, busy, actions, carrierInfo } = useStore();
+  // Fabric chosen with a target saved (a build can carry one): a device with no gateway pairs over fabric alone.
+  const overFabric = carrierInfo.built && carrierInfo.choice === 'fabric' && !!carrierInfo.target;
   const [id, setId] = useState(pairDraft?.id ?? ''), [code, setCode] = useState(pairDraft?.code ?? '');
   const [fingerprint, setFingerprint] = useState(''), [unpinned, setUnpinned] = useState(false);
   useEffect(() => {
@@ -194,12 +198,15 @@ export function PairScreen() {
     <Banners />
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, paddingBottom: 48 }} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
       <T soft>Begin pairing on a trusted st machine, then enter its short-lived ID, code, and the person-root fingerprint copied separately. Use HTTPS or an already encrypted path such as Tailscale for the paired-only gateway.</T>
-      {pairDraft ? <T soft>Pairing with {pairDraft.gateway}</T> : <>
+      {pairDraft ? <T soft>Pairing with {pairDraft.gateway}</T> : overFabric && !url ? <>
+        <T soft>Pairing over Fabric with {carrierInfo.target ? fabricTargetLabel(carrierInfo.target) : ''}. {carrierInfo.fabric.phase === 'ready' ? 'Fabric is connected.' : carrierInfo.fabric.phase === 'failed' || carrierInfo.fabric.phase === 'refused' ? carrierInfo.fabric.reason : 'Connecting to Fabric…'}</T>
+        {carrierInfo.node ? <><T dim>This phone's fabric node ID, for the member's grant (public):</T><T selectable>{carrierInfo.node}</T></> : null}
+      </> : <>
       <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} keyboardType="url" placeholder="https://gateway, http://100.x.y.z:port, or http://host.local:port" value={urlDraft} onChangeText={setUrlDraft} />
       {gatewayTransport(urlDraft) === 'lan' ? <T color={theme.waiting}>{LAN_HTTP_WARNING}</T> : null}
       <Button label="save gateway" onPress={() => void actions.saveUrl()} />
       </>}
-      {url || pairDraft ? <>
+      {url || pairDraft || overFabric ? <>
         <SectionHeader title="pair" />
         <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} placeholder="pairing ID" value={id} onChangeText={setId} />
         <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} placeholder="pairing code" value={code} onChangeText={setCode} />

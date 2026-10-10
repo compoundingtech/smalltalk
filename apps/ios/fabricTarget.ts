@@ -65,6 +65,15 @@ export function sameFabricTarget(a: FabricTarget | null | undefined, b: FabricTa
   return !!a && !!b && a.node === b.node && a.service === b.service;
 }
 
+/**
+ * The identity of a device paired over fabric alone: it names the member and service, so the saved
+ * gateway and the projection cache have something stable to key on. It is not a route and is never dialed.
+ */
+export function fabricGatewayId(target: FabricTarget): string {
+  return `fabric://${target.node}/${encodeURIComponent(target.service)}`;
+}
+export function isFabricGatewayId(url: string): boolean { return url.startsWith('fabric://'); }
+
 /** A short label for a screen: the service and the first bytes of the node ID. */
 export function fabricTargetLabel(target: FabricTarget): string {
   return `${target.service} on ${target.node.slice(0, 8)}…`;
