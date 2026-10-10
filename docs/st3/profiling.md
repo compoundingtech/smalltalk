@@ -40,7 +40,11 @@ time from a subscription on the client collections socket to its first snapshot,
 page or terminal screen. A read the daemon relayed from another machine's owner counts toward
 the target's `remote_windows` and its remote target. A request that asks to wait (`wait_ms` above
 zero, or `wait=true`) is a long poll: it is kept under `METHOD /route (long poll)` and counts
-toward no target. The `sql-statement`, `transaction` (`read`, `write`, `writer_hold`) and `cpu`
+toward no target. An agents list asked to be fresh (`fresh=true`, which `st agents ls` and
+`st agents tree` always send) waits for one roster refresh by design but is still a wait a person
+sits through, so it is the path `GET /v1/client/agents (fresh)` with its own `person-read-fresh`
+target and counts toward no other: a first page is held to the 100 ms of `person-read`, a fresh
+list to 300 ms. The `sql-statement`, `transaction` (`read`, `write`, `writer_hold`) and `cpu`
 rows cover the store's statements, its read and write transactions, each hold of its single
 writer, and the process's CPU in cores.
 

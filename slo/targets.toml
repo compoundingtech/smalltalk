@@ -7,6 +7,8 @@
 # A path is `METHOD /route` as the daemon routes it, or `stream COLLECTION` for the time from a
 # subscription on the client collections socket to its first snapshot or screen. A request that
 # asks to wait (`wait_ms` above zero, or `wait=true`) is a long poll and counts toward no target.
+# An agents list asked to be fresh (`fresh=true`) waits for one roster refresh by design: it is
+# the path `GET /v1/client/agents (fresh)` and counts toward its own target, not the first page's.
 
 [[latency]]
 name = "person-read"
@@ -36,6 +38,14 @@ paths = [
   "GET /v1/client/documents/content",
   "GET /v1/documents",
   "GET /v1/documents/content",
+]
+
+[[latency]]
+name = "person-read-fresh"
+about = "An agents list asked to be fresh (st agents ls and tree always ask): it waits for one roster refresh by design, so it has its own target and counts toward no other"
+p99_ms = 300
+paths = [
+  "GET /v1/client/agents (fresh)",
 ]
 
 [[latency]]

@@ -116,10 +116,21 @@ impl AgentsRead {
     }
 }
 
-/// Whether the answer is a designed wait, so its time says nothing about a latency target: a
-/// fresh agents read waits for the next roster publication.
-pub(super) fn waits_by_design(method: &Method, route: &str, query: Option<&str>) -> bool {
+/// Whether the request asked the agents list to be fresh: it waits for one roster refresh by
+/// design. A person still waits on it, so it has its own target rather than none.
+pub(super) fn is_fresh_agents_read(method: &Method, route: &str, query: Option<&str>) -> bool {
     AgentsRead::classify(method, route, query) == Some(AgentsRead::Fresh)
+}
+
+/// What a request waits for beyond its own work, which decides the target it counts toward.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Wait {
+    /// Nothing: it counts toward the target of its own path.
+    No,
+    /// A change it asked to wait for, so its time is mostly that wait: it counts toward no target.
+    LongPoll,
+    /// A fresh agents list: it counts toward the target of its `(fresh)` path.
+    Fresh,
 }
 
 #[derive(Default)]
@@ -186,19 +197,21 @@ pub(super) struct Timed {
 impl Timed {
     /// `path` is `GET /v1/client/now`, or `stream agents` for a socket subscription's first
     /// snapshot. `remote` says it read from another machine that owns it, through this daemon.
-    /// A `long_poll` asked to wait for a change, so its time is mostly the wait it asked for:
-    /// it is kept under its own key and counts toward no target.
-    pub(super) fn resolve(path: &str, remote: bool, long_poll: bool) -> Self {
-        if long_poll {
-            return Self {
-                key: format!("{path} (long poll)"),
-                target: None,
-                remote,
-            };
-        }
+    /// What it `wait`ed for sets its key: a long poll is kept under `(long poll)` and counts
+    /// toward no target, and a fresh agents list under `(fresh)` and its own target.
+    pub(super) fn resolve(path: &str, remote: bool, wait: Wait) -> Self {
+        let key = match wait {
+            Wait::No => path.to_owned(),
+            Wait::LongPoll => format!("{path} (long poll)"),
+            Wait::Fresh => format!("{path} (fresh)"),
+        };
+        let target = match wait {
+            Wait::LongPoll => None,
+            Wait::No | Wait::Fresh => crate::slo::targets().index_of(&key),
+        };
         Self {
-            key: path.to_owned(),
-            target: crate::slo::targets().index_of(path),
+            key,
+            target,
             remote,
         }
     }
@@ -427,10 +440,11 @@ mod tests {
     fn paths_count_toward_their_target_with_the_remote_target_for_remote_reads() {
         let mut meter = Meter::default();
         let now = Instant::now();
-        let time = |meter: &mut Meter, path, remote, long_poll, ms| {
+        let time = |meter: &mut Meter, path, remote, long_poll: bool, ms| {
+            let wait = if long_poll { Wait::LongPoll } else { Wait::No };
             meter.time(
                 now,
-                Timed::resolve(path, remote, long_poll),
+                Timed::resolve(path, remote, wait),
                 Duration::from_millis(ms),
             );
         };
@@ -470,16 +484,37 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_agents_read_waits_by_design_and_counts_toward_no_target() {
-        assert!(waits_by_design(&Method::GET, AGENTS, Some("limit=5&fresh=true")));
-        assert!(!waits_by_design(&Method::GET, AGENTS, Some("fresh=false")));
-        assert!(!waits_by_design(&Method::GET, AGENTS, None));
-        assert!(!waits_by_design(&Method::GET, AGENTS, Some("fresh=true&cursor=page")));
-        assert!(!waits_by_design(&Method::POST, AGENTS, Some("fresh=true")));
-        assert!(!waits_by_design(&Method::GET, "/v1/client/work", Some("fresh=true")));
-        let fresh = Timed::resolve("GET /v1/client/agents", false, true);
-        assert!(fresh.target.is_none());
-        assert_eq!(fresh.key, "GET /v1/client/agents (long poll)");
+    fn a_fresh_agents_read_has_its_own_target_and_counts_toward_no_other() {
+        assert!(is_fresh_agents_read(&Method::GET, AGENTS, Some("limit=5&fresh=true")));
+        assert!(!is_fresh_agents_read(&Method::GET, AGENTS, Some("fresh=false")));
+        assert!(!is_fresh_agents_read(&Method::GET, AGENTS, None));
+        assert!(!is_fresh_agents_read(&Method::GET, AGENTS, Some("fresh=true&cursor=page")));
+        assert!(!is_fresh_agents_read(&Method::POST, AGENTS, Some("fresh=true")));
+        assert!(!is_fresh_agents_read(&Method::GET, "/v1/client/work", Some("fresh=true")));
+        let targets = crate::slo::targets();
+        let named = |timed: &Timed| timed.target.map(|index| targets.latency[index].name.as_str());
+        let first = Timed::resolve("GET /v1/client/agents", false, Wait::No);
+        assert_eq!(named(&first), Some("person-read"));
+        let fresh = Timed::resolve("GET /v1/client/agents", false, Wait::Fresh);
+        assert_eq!(fresh.key, "GET /v1/client/agents (fresh)");
+        assert_eq!(named(&fresh), Some("person-read-fresh"));
+        let poll = Timed::resolve("GET /v1/client/agents", false, Wait::LongPoll);
+        assert_eq!(poll.key, "GET /v1/client/agents (long poll)");
+        assert_eq!(named(&poll), None);
+        // A fresh read over its own 300 ms is over that target, not the 100 ms of a first page.
+        let mut meter = Meter::default();
+        let now = Instant::now();
+        meter.time(now, Timed::resolve("GET /v1/client/agents", false, Wait::Fresh), Duration::from_millis(200));
+        meter.time(now, Timed::resolve("GET /v1/client/agents", false, Wait::Fresh), Duration::from_millis(400));
+        meter.time(now, Timed::resolve("GET /v1/client/agents", false, Wait::No), Duration::from_millis(150));
+        let report = meter.windows(now);
+        let row = |name: &str| {
+            report["targets"].as_array().unwrap().iter().find(|row| row["name"] == name).unwrap().clone()
+        };
+        assert_eq!(row("person-read-fresh")["windows"]["1m"]["count"], 2);
+        assert_eq!(row("person-read-fresh")["windows"]["1m"]["over_target"], 1);
+        assert_eq!(row("person-read")["windows"]["1m"]["count"], 1);
+        assert_eq!(row("person-read")["windows"]["1m"]["over_target"], 1);
     }
 
     #[test]
