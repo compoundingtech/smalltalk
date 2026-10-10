@@ -451,6 +451,9 @@ impl Incremental {
             || key.len() > CONTEXT_KEY_BYTES
             || (!state.contexts.contains_key(key) && state.contexts.len() >= CONTEXT_KEYS)
         {
+            // An evaluation may succeed with this unretained input. Its next encodable
+            // context must be compared afresh, not against an older evaluation's digest.
+            state.contexts.remove(key);
             Self::mark_locked(&mut state, key);
             return false;
         }
@@ -787,6 +790,56 @@ mod tests {
         );
         incremental.retain("context:", &BTreeSet::new());
         assert!(incremental.observe_context("overflow", &1));
+    }
+
+    #[test]
+    fn refused_context_evaluated_successfully_cannot_reuse_an_older_digest() {
+        struct Unencodable;
+        impl serde::Serialize for Unencodable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(<S::Error as serde::ser::Error>::custom(
+                    "fixture context refused",
+                ))
+            }
+        }
+
+        fn check(refused: &impl serde::Serialize) {
+            let incremental = Incremental::default();
+            let item = "observer:a";
+            let unrelated = "observer:b";
+            for name in [item, unrelated] {
+                assert!(incremental.observe_context(name, &"C0"));
+                incremental.evaluated(name, BTreeSet::from([name.to_owned()]), None);
+                assert!(!incremental.needs(name, 0));
+            }
+            assert!(!incremental.observe_context(item, refused));
+            assert!(incremental.needs(item, 0));
+            assert!(
+                !incremental
+                    .state
+                    .lock()
+                    .unwrap()
+                    .contexts
+                    .contains_key(item)
+            );
+            // This is a successful evaluation against the refused C1, rather than a
+            // failure that would remain dirty and mask a stale fingerprint.
+            incremental.evaluated(item, BTreeSet::from([item.to_owned()]), None);
+            assert!(!incremental.needs(item, 0));
+            assert!(incremental.observe_context(item, &"C0"));
+            assert!(
+                incremental.needs(item, 0),
+                "returning C0 must be evaluated again"
+            );
+            assert!(!incremental.needs(unrelated, 0));
+            incremental.evaluated(item, BTreeSet::from([item.to_owned()]), None);
+            assert!(incremental.observe_context(item, &"C0"));
+            assert!(!incremental.needs(item, 0), "a later unchanged C0 can skip");
+            assert!(!incremental.needs(unrelated, 0));
+        }
+
+        check(&"x".repeat(CONTEXT_BYTES + 1));
+        check(&Unencodable);
     }
 
     #[test]
