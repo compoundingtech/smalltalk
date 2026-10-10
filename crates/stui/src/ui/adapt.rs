@@ -696,6 +696,12 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                         .iter()
                         .map(|label| label_text(model, label))
                         .collect(),
+                    next_mission: agent.next_work.as_ref().map(|label| label.mission_id.clone()),
+                    queue_missions: agent
+                        .upcoming_work
+                        .iter()
+                        .map(|label| label.mission_id.clone())
+                        .collect(),
                     queued: agent.queued_work_count,
                     harness_state: agent.harness_state.clone(),
                     runtime: None,

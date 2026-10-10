@@ -6380,6 +6380,37 @@ mod tests {
     }
 
     #[test]
+    fn the_missions_under_next_in_an_agents_details_open_when_clicked() {
+        // Nathan, 2026-10-10: the missions listed under `next` should open their mission.
+        let mut world = demo::world();
+        let Load::Ready(agents) = &mut world.agents else { panic!() };
+        let id = agents[0].id.clone();
+        agents[0].details.next = Some("Atlas move › cleanup".into());
+        agents[0].details.next_mission = Some("mission/fleet/atlas/store-move".into());
+        agents[0].details.queue = vec!["Atlas move › cleanup".into(), "Weekly release › publish".into()];
+        agents[0].details.queue_missions =
+            vec!["mission/fleet/atlas/store-move".into(), "mission/fleet/release/weekly".into()];
+        let mut ui = Ui::new(world);
+        ui.switch_tab(1);
+        ui.open(&id);
+        let shown = frame(&ui, 140, 50);
+        let at = |needle: &str| {
+            let row = shown.iter().position(|line| line.contains(needle)).expect(needle);
+            let column = shown[row].find(needle).unwrap();
+            (shown[row][..column].chars().count() as u16, row as u16)
+        };
+        let hits = ui.frame.borrow().hits.clone();
+        let on = |(x, y): (u16, u16)| {
+            hits.iter()
+                .rev()
+                .find(|(rect, _)| rect.contains((x, y).into()))
+                .map(|(_, hit)| hit.clone())
+        };
+        assert_eq!(on(at("Atlas move › cleanup")), Some(Hit::Open("mission/fleet/atlas/store-move".into())));
+        assert_eq!(on(at("Weekly release › publish")), Some(Hit::Open("mission/fleet/release/weekly".into())));
+    }
+
+    #[test]
     fn shift_o_simplifies_every_conversation_and_back() {
         let mut ui = Ui::new(demo::world());
         ui.tab = 1;

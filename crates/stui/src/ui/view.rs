@@ -356,6 +356,9 @@ pub struct AgentDetails {
     /// The next step queued for it, as "mission › step".
     pub next: Option<String>,
     pub queue: Vec<String>,
+    /// The mission each of `next` and `queue` belongs to, by the same place, for opening it.
+    pub next_mission: Option<String>,
+    pub queue_missions: Vec<String>,
     pub queued: u64,
     pub harness_state: Option<String>,
     pub runtime: Option<String>,
