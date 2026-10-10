@@ -410,6 +410,8 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
                     })
                 })
             {
+                fs::create_dir_all(&artifacts)
+                    .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
                 let companion = sessions.join(artifact_name);
                 return match fs::symlink_metadata(&companion) {
                     Ok(_) => Ok(false),
@@ -446,7 +448,10 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
     let filename = transcript.file_name().expect("validated transcript filename");
     symlink(parent.join(filename), prepared.path().join(filename))
         .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
-    // OMP creates artifacts lazily; keep the link even before its target exists.
+    // Recursive artifact creation through a dangling symlink fails: prepare its target first.
+    // create_dir_all uses the harness's default directory mode, subject to the process umask.
+    fs::create_dir_all(&artifacts)
+        .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
     symlink(&artifacts, prepared.path().join(artifact_name))
         .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
     if migrate {
@@ -826,7 +831,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn authored_transcript_artifacts_are_linked_before_creation_and_reconciled() {
+    fn authored_transcript_first_artifact_write_through_inventory_and_repair_succeed() {
         let root = tempfile::tempdir().unwrap();
         let id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
         let transcript = root.path().join(format!("time_{id}.jsonl"));
@@ -836,10 +841,12 @@ mod tests {
         assert!(pi_family_link_transcript(&arguments, &managed).unwrap());
         let companion = managed.join(transcript.file_stem().unwrap());
         assert_eq!(fs::read_link(&companion).unwrap(), transcript.with_extension(""));
-        assert!(!companion.exists());
+        assert!(companion.is_dir());
         assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
-        fs::create_dir(transcript.with_extension("")).unwrap();
-        fs::write(transcript.with_extension("").join("artifact"), "lazy artifact").unwrap();
+        // ArtifactManager recursively creates this directory before its first write.
+        fs::create_dir_all(&companion).unwrap();
+        fs::write(companion.join("artifact"), "lazy artifact").unwrap();
+        assert_eq!(fs::read_to_string(transcript.with_extension("").join("artifact")).unwrap(), "lazy artifact");
         assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
         assert_eq!(fs::read_to_string(companion.join("artifact")).unwrap(), "lazy artifact");
         // Repair an inventory created by the previous version without replacing it.
@@ -849,6 +856,14 @@ mod tests {
         assert_eq!(fs::read_to_string(companion.join("artifact")).unwrap(), "lazy artifact");
         assert_eq!(fs::read_to_string(managed.join("preserve")).unwrap(), "keep");
         assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
+        // Repair a dangling companion from the earlier implementation too.
+        fs::remove_file(companion.join("artifact")).unwrap();
+        fs::remove_dir(transcript.with_extension("")).unwrap();
+        assert!(!companion.exists());
+        assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
+        fs::create_dir_all(&companion).unwrap();
+        fs::write(companion.join("artifact"), "repaired target").unwrap();
+        assert_eq!(fs::read_to_string(transcript.with_extension("").join("artifact")).unwrap(), "repaired target");
     }
 
     #[cfg(unix)]
