@@ -325,7 +325,7 @@ mod tests {
         let store = Store::open_memory("node").unwrap();
         store.connection.write().execute("INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms) VALUES('idle-queue','node',1,'fixture','1')", []).unwrap();
         store.seed_idle_history("agent/node.worker", 1, 0..0, 0..2);
-        store.connection.write().execute("UPDATE claims SET body=?1,accepted_at_unix_ms='2' WHERE id='fixture-pr-1'", [json!({"fields":{"facts":{"state":"open","merge_queue":{"state":"unqueued"}},"attribution_only":"invalid"}}).to_string()]).unwrap();
+        store.connection.write().execute("UPDATE claims SET body=?1,accepted_at_unix_ms='2' WHERE id='fixture-pr-1'", [json!({"fields":{"facts":{"state":"open","merge_queue":null},"attribution_only":"invalid"}}).to_string()]).unwrap();
         let thread = ThreadRef::parse("acme/garden#12").unwrap();
         assert_eq!(store.thread_left_merge_queue(&thread, 0).unwrap(), Some(2));
     }
