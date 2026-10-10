@@ -488,6 +488,7 @@ pub fn fabric_router(state: AppState) -> Router {
 }
 
 fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> Router {
+    crate::slo::install();
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
@@ -954,6 +955,8 @@ async fn response_envelope_unbounded(
     let request_method = request.method().clone();
     let request_path = request.uri().path().to_owned();
     let request_query = request.uri().query().map(str::to_owned);
+    let long_poll = request_query.as_deref().is_some_and(asks_to_wait);
+    let served_remote = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let request_route = request
         .extensions()
         .get::<axum::extract::MatchedPath>()
@@ -1065,6 +1068,7 @@ async fn response_envelope_unbounded(
             let mut diagnostic_queue =
                 crate::relay_trace::span(crate::relay_trace::Phase::HandlerQueue);
             let forwarded_handler = request_path == crate::peer::CLIENT_READ_FORWARD_PATH;
+            let remote = served_remote.clone();
             match crate::api::read_deadline::spawn_handler(move || {
                 diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
                 drop(handler_queue);
@@ -1075,7 +1079,7 @@ async fn response_envelope_unbounded(
                 crate::performance::with_cpu(Some(&cpu_kind), Some(&cpu_client), || {
                     let mut diagnostic_handler =
                         crate::relay_trace::span(crate::relay_trace::Phase::Handler);
-                    let response = runtime.block_on(crate::api::read_deadline::handler(async move {
+                    let response = runtime.block_on(track_remote_reads(remote, crate::api::read_deadline::handler(async move {
                         // Cancel the actual forwarded relay, not only its outer waiter.
                         // Other routes retain their existing cooperative cancellation;
                         // this transport's mutation variants carry no read budget.
@@ -1092,7 +1096,7 @@ async fn response_envelope_unbounded(
                         } else {
                             next.run(request).await
                         }
-                    }));
+                    })));
                     diagnostic_handler.finish(if response.status().is_success() {
                         crate::relay_trace::Outcome::Completed
                     } else {
@@ -1122,6 +1126,10 @@ async fn response_envelope_unbounded(
             request_query.as_deref(),
             &caller,
             started,
+            Served {
+                long_poll,
+                remote: served_remote.load(std::sync::atomic::Ordering::Relaxed),
+            },
         );
         if let Some(profile) = profile {
             profile.finish();
@@ -1213,6 +1221,10 @@ async fn response_envelope_unbounded(
         request_query.as_deref(),
         &caller,
         started,
+        Served {
+            long_poll,
+            remote: served_remote.load(std::sync::atomic::Ordering::Relaxed),
+        },
     );
     if let Some(profile) = profile {
         profile.enveloped(enveloping.elapsed(), body.len());
@@ -1231,6 +1243,56 @@ fn request_latency_snapshot() -> Vec<Value> {
     request_latency().lock().unwrap().snapshot()
 }
 
+/// Every target's live windows, and every path's: see `slo/targets.toml`.
+fn request_latency_windows() -> Value {
+    request_latency().lock().unwrap().windows(Instant::now())
+}
+
+tokio::task_local! {
+    /// Set while a request is handled; a read relayed from another machine's owner marks it.
+    static SERVED_REMOTE: Arc<std::sync::atomic::AtomicBool>;
+}
+
+/// Run a request's handler with its remote-read flag in scope. The flag follows the handler's
+/// own task. A relay awaited inside a `tokio::spawn` would lose it, so such a spawn must pass
+/// its own flag, as the collections socket does for the conversation follower.
+pub(crate) async fn track_remote_reads<F: Future>(
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    handler: F,
+) -> F::Output {
+    SERVED_REMOTE.scope(flag, handler).await
+}
+
+/// The request being handled read from another machine, so its target is the remote one.
+pub(crate) fn note_remote_read() {
+    let _ = SERVED_REMOTE.try_with(|remote| remote.store(true, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// A query that asks the daemon to wait for a change makes the request a long poll.
+fn asks_to_wait(query: &str) -> bool {
+    query.split('&').any(|pair| match pair.split_once('=') {
+        Some(("wait_ms", value)) => value.parse::<u64>().is_ok_and(|ms| ms > 0),
+        Some(("wait", value)) => value == "true",
+        _ => false,
+    })
+}
+
+/// How a completed request was served, for its target.
+#[derive(Clone, Copy, Default)]
+struct Served {
+    long_poll: bool,
+    remote: bool,
+}
+
+/// A client collections socket's subscription sent its first snapshot or screen.
+pub(crate) fn record_stream_latency(collection: &str, elapsed: Duration, remote: bool) {
+    let timed = request_latency::Timed::resolve(&format!("stream {collection}"), remote, false);
+    request_latency()
+        .lock()
+        .unwrap()
+        .time(Instant::now(), timed, elapsed);
+}
+
 fn record_request_latency(
     method: &axum::http::Method,
     route: &str,
@@ -1238,13 +1300,20 @@ fn record_request_latency(
     query: Option<&str>,
     caller: &str,
     started: Instant,
+    served: Served,
 ) {
     let elapsed = started.elapsed();
     crate::performance::record_request(route, Some(caller), elapsed);
-    request_latency()
-        .lock()
-        .unwrap()
-        .record(method, route, path, query, elapsed);
+    // The key and the target lookup allocate and scan; do them before taking the lock. A designed
+    // wait (a long poll, a fresh agents read) counts toward no target.
+    let waits = served.long_poll || request_latency::waits_by_design(method, route, query);
+    let timed =
+        request_latency::Timed::resolve(&format!("{method} {route}"), served.remote, waits);
+    {
+        let mut meter = request_latency().lock().unwrap();
+        meter.record(method, route, path, query, elapsed);
+        meter.time(Instant::now(), timed, elapsed);
+    }
     if elapsed < Duration::from_secs(1) {
         return;
     }
@@ -6319,6 +6388,13 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
                 "{} requests; recent p50 {} ms, p99 {} ms, max {} ms",
                 route["count"], route["p50_ms"], route["p99_ms"], route["max_ms"]
             ),
+        });
+    }
+    for (name, status, message) in crate::slo::doctor_lines(&request_latency_windows()) {
+        report.checks.push(DoctorCheck {
+            name,
+            status: status.into(),
+            message,
         });
     }
     report.checks.extend(github_usage_checks(
@@ -16173,6 +16249,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             None,
             "stui",
             Instant::now() - Duration::from_secs(2),
+            Served::default(),
         );
         // The old implementation spawned a blocking write, so give that write
         // time to finish before proving the request caused no graph change.
