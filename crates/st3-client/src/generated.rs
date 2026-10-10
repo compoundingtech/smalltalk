@@ -962,6 +962,8 @@ pub struct MissionStep {
     #[serde(default)]
     pub last_progress: Option<String>,
     #[serde(default)]
+    pub progress_at: Option<String>,
+    #[serde(default)]
     pub blocked_reason: Option<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
@@ -1032,6 +1034,8 @@ pub struct Work {
     pub title: Option<String>,
     pub assigned_to: Option<String>,
     pub last_progress: Option<String>,
+    #[serde(default)]
+    pub progress_at: Option<String>,
     pub state: String,
     pub gate_kind: Option<String>,
     pub attempt: u32,
@@ -3318,6 +3322,14 @@ pub struct AttentionResolveParameters {
     pub reason: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageKind {
+    Silent,
+    #[default]
+    Wake,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MessageSendParameters {
     pub to: String,
@@ -3330,6 +3342,9 @@ pub struct MessageSendParameters {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// Silent holds unread mail until the next wake; wake is the default.
+    #[serde(default)]
+    pub kind: MessageKind,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<AttachmentInput>,
     /// The sending device's signature over the message, as `docs/st3/device-signing.md` lays out.
@@ -3909,4 +3924,51 @@ pub struct ConversationContentChunk {
     pub size: u64,
     pub data: String,
     pub next_offset: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationReport {
+    pub report_id: String,
+    pub samples: Vec<ObservationSample>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum ObservationSample {
+    #[serde(rename = "latency")]
+    Latency {
+        target: String,
+        carrier: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        interval_start: String,
+        interval_end: String,
+        count: u64,
+        over_target: u64,
+        max_ms: u64,
+        buckets: Vec<(u64, u64)>,
+    },
+    #[serde(rename = "live-share")]
+    LiveShare {
+        target: String,
+        carrier: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        interval_start: String,
+        interval_end: String,
+        foreground_ms: u64,
+        live_ms: u64,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObservationAccepted {
+    pub accepted: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ObservationResponse {
+    pub api_version: String,
+    pub request_id: String,
+    pub value: ObservationAccepted,
 }

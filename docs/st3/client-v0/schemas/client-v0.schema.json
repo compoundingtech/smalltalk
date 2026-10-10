@@ -4,6 +4,8 @@
   "$id": "https://st3.local/schemas/client-v0.schema.json",
   "title": "st3 client v0",
   "oneOf": [
+    { "$ref": "#/$defs/ObservationReport" },
+    { "$ref": "#/$defs/ObservationResponse" },
     { "$ref": "#/$defs/Envelope" },
     { "$ref": "#/$defs/ErrorEnvelope" },
     { "$ref": "#/$defs/ActionRequest" },
@@ -12,6 +14,13 @@
     { "$ref": "#/$defs/PairingAdvertisement" }
   ],
   "$defs": {
+    "ObservationLatency": {"type": "object", "additionalProperties": false, "required": ["target", "carrier", "interval_start", "interval_end", "kind", "count", "over_target", "max_ms", "buckets"], "properties": {"target": {"enum": ["ios-open-to-live", "ios-connect", "ios-message-ack", "ios-conversation-open", "ios-terminal-open", "ios-recover"]}, "carrier": {"enum": ["fabric", "tailscale", "lan"]}, "path": {"enum": ["direct", "relay"]}, "interval_start": {"type": "string", "format": "date-time", "maxLength": 32}, "interval_end": {"type": "string", "format": "date-time", "maxLength": 32}, "kind": {"const": "latency"}, "count": {"type": "integer", "minimum": 1, "maximum": 1000000}, "over_target": {"type": "integer", "minimum": 0, "maximum": 1000000}, "max_ms": {"type": "integer", "minimum": 0, "maximum": 3600000}, "buckets": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "array", "prefixItems": [{"type": "integer", "minimum": 0, "maximum": 3670015}, {"type": "integer", "minimum": 1, "maximum": 1000000}], "minItems": 2, "maxItems": 2}}}},
+    "ObservationLiveShare": {"type": "object", "additionalProperties": false, "required": ["target", "carrier", "interval_start", "interval_end", "kind", "foreground_ms", "live_ms"], "properties": {"target": {"const": "ios-live-share"}, "carrier": {"enum": ["fabric", "tailscale", "lan"]}, "path": {"enum": ["direct", "relay"]}, "interval_start": {"type": "string", "format": "date-time", "maxLength": 32}, "interval_end": {"type": "string", "format": "date-time", "maxLength": 32}, "kind": {"const": "live-share"}, "foreground_ms": {"type": "integer", "minimum": 1, "maximum": 60000}, "live_ms": {"type": "integer", "minimum": 0, "maximum": 60000}}},
+    "ObservationSample": {"oneOf": [{"$ref": "#/$defs/ObservationLatency"}, {"$ref": "#/$defs/ObservationLiveShare"}]},
+    "ObservationReport": {"type": "object", "additionalProperties": false, "required": ["report_id", "samples"], "properties": {"report_id": {"type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "minLength": 36, "maxLength": 36}, "samples": {"type": "array", "minItems": 1, "maxItems": 32, "items": {"$ref": "#/$defs/ObservationSample"}}}},
+    "ObservationAccepted": {"type": "object", "additionalProperties": false, "required": ["accepted"], "properties": {"accepted": {"const": true}}},
+    "ObservationResponse": {"type": "object", "additionalProperties": false, "required": ["api_version", "request_id", "value"], "properties": {"api_version": {"const": "st3.client.v0"}, "request_id": {"$ref": "#/$defs/RequestId"}, "value": {"$ref": "#/$defs/ObservationAccepted"}}},
+
     "PairingAdvertisement": {
       "description": "Static unauthenticated pairing preflight; no envelope, presence update or graph information.",
       "type": "object", "additionalProperties": false,
@@ -879,7 +888,7 @@
         "status": { "type": "string" },
         "phase": { "type": "string" },
         "progress": { "type": "object", "required": ["done", "total"], "properties": { "done": { "type": "integer" }, "total": { "type": "integer" } } },
-        "current_steps": { "type": "array", "items": { "type": "object", "required": ["id", "title", "state", "since"], "properties": { "id": { "$ref": "#/$defs/StepRunId" }, "title": { "type": ["string", "null"] }, "assignee": { "oneOf": [{ "$ref": "#/$defs/ActorRef" }, { "type": "null" }] }, "claimant": { "oneOf": [{ "$ref": "#/$defs/ActorRef" }, { "type": "null" }] }, "state": { "$ref": "#/$defs/WorkState" }, "since": { "$ref": "#/$defs/Timestamp" } } } },
+        "current_steps": { "type": "array", "items": { "type": "object", "required": ["id", "title", "state", "since"], "properties": { "id": { "$ref": "#/$defs/StepRunId" }, "title": { "type": ["string", "null"] }, "assignee": { "oneOf": [{ "$ref": "#/$defs/ActorRef" }, { "type": "null" }] }, "claimant": { "oneOf": [{ "$ref": "#/$defs/ActorRef" }, { "type": "null" }] }, "state": { "$ref": "#/$defs/WorkState" }, "since": { "$ref": "#/$defs/Timestamp" }, "progress_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." } } } },
         "must_act": {"$ref": "#/$defs/MustAct"},
         "state_since": { "$ref": "#/$defs/Timestamp" },
         "outcome": { "oneOf": [{ "$ref": "#/$defs/MissionRunOutcome" }, { "type": "null" }], "description": "The outcome a person or an authorized agent set after the run finished." },
@@ -917,6 +926,7 @@
         "agentless": { "type": "boolean" },
         "since": { "$ref": "#/$defs/Timestamp" },
         "last_progress": { "type": ["string", "null"] },
+        "progress_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." },
         "blocked_reason": { "type": ["string", "null"] },
         "blockers": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
         "goals": { "type": "array", "items": { "type": "string" } },
@@ -976,6 +986,7 @@
             "title": { "type": ["string", "null"] },
             "assigned_to": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "last_progress": { "type": ["string", "null"] },
+            "progress_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." },
             "state": { "$ref": "#/$defs/WorkState" },
             "attempt": { "type": "integer", "minimum": 0 },
             "readiness_epoch": { "type": "integer", "minimum": 0 },
@@ -1967,7 +1978,7 @@
             "type": { "const": "message.send" },
             "parameters": {
               "type": "object", "additionalProperties": false, "required": ["to", "content"],
-              "properties": { "to": { "$ref": "#/$defs/Id" }, "session_id": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }, "signature": { "$ref": "#/$defs/DeviceSignature" }, "attachments": { "type": "array", "maxItems": 4, "items": { "$ref": "#/$defs/AttachmentInput" } } }
+              "properties": { "to": { "$ref": "#/$defs/Id" }, "session_id": { "$ref": "#/$defs/Id" }, "content": { "type": "string" }, "title": { "type": "string" }, "in_reply_to": { "$ref": "#/$defs/Id" }, "tags": { "type": "array", "items": { "type": "string" }, "uniqueItems": true }, "kind": { "type": "string", "enum": ["silent", "wake"], "description": "Wake is the default; silent holds unread mail until the next real wake." }, "signature": { "$ref": "#/$defs/DeviceSignature" }, "attachments": { "type": "array", "maxItems": 4, "items": { "$ref": "#/$defs/AttachmentInput" } } }
             }
           }
         },

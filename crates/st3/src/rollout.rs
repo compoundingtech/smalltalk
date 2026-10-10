@@ -228,6 +228,7 @@ pub fn blockers(store: &Store, subject: &str, operation: &Operation) -> Result<V
     }
     if store.messages(Some(subject), false)?.iter().any(|message| {
         matches!(message.status.as_str(), "sent" | "staged" | "delivered")
+            && !crate::silent::waits_for_turn(message)
             && store.rollout_message_allowed(message).unwrap_or(true)
     }) {
         blockers.push("pending-delivery".into());

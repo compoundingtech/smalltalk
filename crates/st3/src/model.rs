@@ -2026,6 +2026,10 @@ pub struct MessageView {
 pub struct MessageSendReceipt {
     #[serde(flatten)]
     pub message: MessageView,
+    /// This daemon's accepted delivery kind. Absent on pre-silent daemons: tags alone
+    /// cannot confirm that an older daemon honors silent delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// The key that names this message: a request with the same key and content returns it again.
     #[serde(default)]
     pub idempotency_key: String,

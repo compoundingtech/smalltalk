@@ -16,6 +16,7 @@ pub const SOURCE: &str = include_str!("../../../slo/targets.toml");
 #[serde(deny_unknown_fields)]
 pub struct Targets {
     pub latency: Vec<Latency>,
+    pub share: Vec<Share>,
     pub statement: Statement,
     pub transaction: Transaction,
     pub cpu: Cpu,
@@ -31,6 +32,15 @@ pub struct Latency {
     /// The same reads served through this daemon from another machine that owns them.
     pub remote_p99_ms: Option<u64>,
     pub paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Share {
+    pub name: String,
+    pub about: String,
+    pub min_percent: u64,
+    pub path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +107,10 @@ pub fn parse(text: &str) -> Result<Targets> {
         );
         ensure!(!latency.paths.is_empty(), "target {} has no paths", latency.name);
         for path in &latency.paths {
+            if path.starts_with("client/ios/") {
+                ensure!(paths.insert(path.as_str()), "path {path:?} has two targets");
+                continue;
+            }
             let (method, route) = path
                 .split_once(' ')
                 .with_context(|| format!("path {path:?} names no method"))?;
@@ -110,6 +124,11 @@ pub fn parse(text: &str) -> Result<Targets> {
             );
             ensure!(paths.insert(path.as_str()), "path {path:?} has two targets");
         }
+    }
+    for share in &targets.share {
+        ensure!(names.insert(share.name.as_str()), "duplicate share target");
+        ensure!(share.min_percent > 0 && share.min_percent <= 100, "invalid share target");
+        ensure!(share.path.starts_with("client/ios/") && paths.insert(&share.path), "invalid share path");
     }
     ensure!(
         targets.statement.p99_ms > 0 && targets.statement.max_ms >= targets.statement.p99_ms,
@@ -281,6 +300,27 @@ pub fn doctor_lines(report: &Value) -> Vec<(String, &'static str, String)> {
     let mut lines = Vec::new();
     for target in report["targets"].as_array().into_iter().flatten() {
         let name = target["name"].as_str().unwrap_or_default();
+        if target["population"].as_str().is_some_and(|p| p.starts_with("client-observed")) {
+            let min_percent = target["min_percent"].as_u64();
+            let share = min_percent.is_some();
+            let seen = WINDOWS.iter().any(|w| target["windows"][*w]["count"].as_u64().unwrap_or(0) > 0);
+            let met = min_percent.map_or_else(|| verdict(&target["windows"],true).met, |min| {
+                WINDOWS.iter().all(|w| {
+                    let row=&target["windows"][*w];
+                    u128::from(row["over_target"].as_u64().unwrap_or(0))*100
+                        <= u128::from(row["foreground_ms"].as_u64().unwrap_or(0))*u128::from(100-min)
+                })
+            });
+            let text = WINDOWS.iter().map(|w| {
+                let row = &target["windows"][*w];
+                if share {format!("{w} {} live / {} foreground ms",row["live_ms"],row["foreground_ms"])}
+                else {describe_window(w,row)}
+            }).collect::<Vec<_>>().join(" · ");
+            let goal=min_percent.map_or_else(||format!("p99 ≤ {} ms",target["p99_ms"]),|min|format!("live ≥ {min}%"));
+            lines.push((format!("slo/{name}"), if seen {status(met)} else {"info"},
+                format!("{goal}; client-observed reported population only; closed UTC minutes, delayed/incomplete coverage: {text}")));
+            continue;
+        }
         match name {
             "sql-statement" => {
                 let max = target["max_ms"].as_f64().unwrap_or_default();
@@ -504,4 +544,17 @@ mod tests {
         assert!(verdict(&windows(0), false).met);
         assert!(verdict(&windows(0), true).message.contains("1m p99 2 ms, max 3 ms, 0.0% over of 100"));
     }
+    #[test]
+    fn client_share_doctor_uses_declared_minimum_and_empty_population_is_info() {
+        let window=json!({"count":10000,"foreground_ms":10000,"live_ms":9500,"over_target":500,"over_target_share":0.05});
+        let windows=json!({"1m":window,"5m":window,"1h":window});
+        let mut target=json!({"name":"ios-live-share","population":"client-observed-foreground-ms","min_percent":90,"windows":windows});
+        let report=|target:Value|json!({"targets":[target],"paths":[]});
+        assert_eq!(doctor_lines(&report(target.clone()))[0].1,"pass");
+        target["min_percent"]=json!(99);
+        assert_eq!(doctor_lines(&report(target.clone()))[0].1,"info");
+        target["windows"]=json!({"1m":{"count":0},"5m":{"count":0},"1h":{"count":0}});
+        assert_eq!(doctor_lines(&report(target))[0].1,"info");
+    }
+
 }

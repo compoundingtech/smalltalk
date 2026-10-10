@@ -424,7 +424,8 @@ export const ActionRequest = /*#__PURE__*/ (() => Schema.Union([
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": PersonStepParameters, "type": Schema.Literals(["work.done","work.cancel-ask"]) }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": Schema.Struct({ "attention_id": Id, "outcome": Schema.String, "reason": optionalKey(Schema.String) }), "type": Schema.Literal("attention.resolve") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": TargetParameters, "type": Schema.Literals(["review.approve","review.reject","review.request-changes"]) }),
-  Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": Schema.Struct({ "attachments": optionalKey(Schema.Array(AttachmentInput).check(Schema.isMaxLength(4))), "content": Schema.String, "in_reply_to": optionalKey(Id), "session_id": optionalKey(Id), "signature": optionalKey(DeviceSignature), "tags": optionalKey(Schema.Array(Schema.String).check(Schema.isUnique())), "title": optionalKey(Schema.String), "to": Id }), "type": Schema.Literal("message.send") }),
+  Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": Schema.Struct({ "attachments": optionalKey(Schema.Array(AttachmentInput).check(Schema.isMaxLength(4))), "content": Schema.String, "in_reply_to": optionalKey(Id), /** Wake is the default; silent holds unread mail until the next real wake. */
+"kind": optionalKey(Schema.Literals(["silent","wake"])).annotate({ description: "Wake is the default; silent holds unread mail until the next real wake." }), "session_id": optionalKey(Id), "signature": optionalKey(DeviceSignature), "tags": optionalKey(Schema.Array(Schema.String).check(Schema.isUnique())), "title": optionalKey(Schema.String), "to": Id }), "type": Schema.Literal("message.send") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": TargetParameters, "type": Schema.Literals(["message.read","message.close"]) }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": Schema.Struct({ "effort": optionalKey(Schema.String.check(Schema.isMinLength(1))), "model": optionalKey(Schema.String.check(Schema.isMinLength(1))), "provider": optionalKey(Schema.Literals(["codex","claude","pi","omp","opencode"])), "request": Schema.String, "target": Schema.Union([Schema.Struct({ "mission_id": Id, "type": Schema.Literal("new-mission"), "workspace": Schema.String }), Schema.Struct({ "generation_id": Id, "mission_run_id": Id, "type": Schema.Literal("mission-run") })], { mode: "oneOf" }), "title": Schema.String }), "type": Schema.Literal("launch.create") }),
   Schema.Struct({ "api_version": Schema.Literal("st3.client.v0"), "fence": Fence, "id": Id, "idempotency_key": Schema.String.check(Schema.isMinLength(16)).check(Schema.isMaxLength(256)).pipe(Schema.brand("st3/IdempotencyKey")), "parameters": Schema.Struct({ "feedback": Schema.String, "launch_id": Id }), "type": Schema.Literal("launch.revise") }),
@@ -1613,6 +1614,8 @@ export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   /** When st last nudged this held step's holder for idling with nothing set to wake it. */
   "nudged_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "When st last nudged this held step's holder for idling with nothing set to wake it." }),
   "path": Schema.String,
+  /** Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress. */
+  "progress_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." }),
   "since": Timestamp,
   "state": WorkState,
   "title": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -1631,7 +1634,8 @@ export type MustActEncoded = typeof MustAct.Encoded
 export const MissionRunSummary = /*#__PURE__*/ (() => Schema.Struct({
   "after": Schema.OptionFromOptionalNullOr(Id, NULL_NONE),
   "blocker": Schema.OptionFromOptionalNullOr(Schema.Record(Schema.String, Schema.Unknown), NULL_NONE),
-  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "id": StepRunId, "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
+  "current_steps": Schema.Array(Schema.Struct({ "assignee": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "claimant": Schema.OptionFromOptionalNullOr(ActorRef, NULL_NONE), "id": StepRunId, /** Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress. */
+"progress_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." }), "since": Timestamp, "state": WorkState, "title": Schema.OptionFromNullOr(Schema.String) })),
   "deadline": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE),
   "generation_id": optionalKey(RunGenerationId),
   "id": MissionRunId,
@@ -1895,6 +1899,8 @@ export const Work = /*#__PURE__*/ (() => Schema.Struct({
   "path": Schema.String,
   /** Responses to the asks this attempt made, or a person ask's own response. */
   "person_answers": optionalKey(Schema.Array(PersonAnswerRecord)).annotate({ description: "Responses to the asks this attempt made, or a person ask's own response." }),
+  /** Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress. */
+  "progress_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." }),
   "readiness_epoch": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "revision": Revision,
   "state": WorkState,
@@ -2557,6 +2563,62 @@ export const HostRepositories = /*#__PURE__*/ (() => Schema.Struct({
 }).annotate({ identifier: "HostRepositories" }))()
 export type HostRepositories = typeof HostRepositories.Type
 export type HostRepositoriesEncoded = typeof HostRepositories.Encoded
+
+export const ObservationAccepted = /*#__PURE__*/ (() => Schema.Struct({
+  "accepted": Schema.Literal(true)
+}).annotate({ identifier: "ObservationAccepted" }))()
+export type ObservationAccepted = typeof ObservationAccepted.Type
+export type ObservationAcceptedEncoded = typeof ObservationAccepted.Encoded
+
+export const ObservationLatency = /*#__PURE__*/ (() => Schema.Struct({
+  "buckets": Schema.Array(Schema.Tuple([Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(3670015)), Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(1000000))])).check(Schema.isMinLength(1)).check(Schema.isMaxLength(64)),
+  "carrier": Schema.Literals(["fabric","tailscale","lan"]),
+  "count": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(1000000)),
+  "interval_end": Schema.String.check(Schema.isMaxLength(32)).check(Schema.isPattern(DATE_TIME, { expected: "an RFC 3339 date-time" })),
+  "interval_start": Schema.String.check(Schema.isMaxLength(32)).check(Schema.isPattern(DATE_TIME, { expected: "an RFC 3339 date-time" })),
+  "kind": Schema.Literal("latency"),
+  "max_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(3600000)),
+  "over_target": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(1000000)),
+  "path": optionalKey(Schema.Literals(["direct","relay"])),
+  "target": Schema.Literals(["ios-open-to-live","ios-connect","ios-message-ack","ios-conversation-open","ios-terminal-open","ios-recover"])
+}).annotate({ identifier: "ObservationLatency" }))()
+export type ObservationLatency = typeof ObservationLatency.Type
+export type ObservationLatencyEncoded = typeof ObservationLatency.Encoded
+
+export const ObservationLiveShare = /*#__PURE__*/ (() => Schema.Struct({
+  "carrier": Schema.Literals(["fabric","tailscale","lan"]),
+  "foreground_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(60000)),
+  "interval_end": Schema.String.check(Schema.isMaxLength(32)).check(Schema.isPattern(DATE_TIME, { expected: "an RFC 3339 date-time" })),
+  "interval_start": Schema.String.check(Schema.isMaxLength(32)).check(Schema.isPattern(DATE_TIME, { expected: "an RFC 3339 date-time" })),
+  "kind": Schema.Literal("live-share"),
+  "live_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).check(Schema.isLessThanOrEqualTo(60000)),
+  "path": optionalKey(Schema.Literals(["direct","relay"])),
+  "target": Schema.Literal("ios-live-share")
+}).annotate({ identifier: "ObservationLiveShare" }))()
+export type ObservationLiveShare = typeof ObservationLiveShare.Type
+export type ObservationLiveShareEncoded = typeof ObservationLiveShare.Encoded
+
+export const ObservationSample = /*#__PURE__*/ (() => Schema.Union([
+  ObservationLatency,
+  ObservationLiveShare
+], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("kind")).annotate({ identifier: "ObservationSample" }))()
+export type ObservationSample = typeof ObservationSample.Type
+export type ObservationSampleEncoded = typeof ObservationSample.Encoded
+
+export const ObservationReport = /*#__PURE__*/ (() => Schema.Struct({
+  "report_id": Schema.String.check(Schema.isPattern(new RegExp("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "u"))).check(Schema.isMinLength(36)).check(Schema.isMaxLength(36)),
+  "samples": Schema.Array(ObservationSample).check(Schema.isMinLength(1)).check(Schema.isMaxLength(32))
+}).annotate({ identifier: "ObservationReport" }))()
+export type ObservationReport = typeof ObservationReport.Type
+export type ObservationReportEncoded = typeof ObservationReport.Encoded
+
+export const ObservationResponse = /*#__PURE__*/ (() => Schema.Struct({
+  "api_version": Schema.Literal("st3.client.v0"),
+  "request_id": RequestId,
+  "value": ObservationAccepted
+}).annotate({ identifier: "ObservationResponse" }))()
+export type ObservationResponse = typeof ObservationResponse.Type
+export type ObservationResponseEncoded = typeof ObservationResponse.Encoded
 
 /** Static unauthenticated pairing preflight; no envelope, presence update or graph information. */
 export const PairingAdvertisement = /*#__PURE__*/ (() => Schema.Struct({

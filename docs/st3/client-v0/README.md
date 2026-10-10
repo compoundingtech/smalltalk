@@ -34,6 +34,12 @@ The collections socket's `CollectionCommand` and `CollectionFrame` definitions l
 schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
 command/frame definitions, and subscription bound; see [collections](collections.md).
 
+### Phone observations
+
+Paired sessions can send bounded disjoint UTC minute diagnostics with
+[`observations.report`](observations.md). This command has no action receipt, replication
+or snapshot fence. Live-share is typed foreground/live time, separate from latency histograms.
+
 ### Mission run timing
 
 `GET /v1/client/missions/{id}` requires `read.projections`, like other projection reads.
@@ -65,6 +71,22 @@ RFC 3339 UTC strings; unknown values are null. Older servers may omit these opti
 Loop and wake enrichment is detail-only and bounded to open runs plus the latest finish;
 null timing fields on lists or older finished runs are not proof of no loop or wake.
 Clients can render `round N/M · wakes in …` without reading claim envelopes.
+
+### Claim progress timestamp
+
+Work resources (`work ls` and `work show`) and enriched mission detail step rows expose
+optional nullable `progress_at`: the RFC3339 time of the latest nonempty `work.progress`
+summary in the current attempt. It belongs to the claim's progress summary, not harness
+activity. Lease renewal, incoming mail and nudge receipts do not move it; retry attempts
+start without an earlier attempt's progress. No progress summary means null on enriched
+surfaces. Older servers may omit it. When the current attempt has no progress summary, consumers can
+use the existing Work `execution_started_at_unix_ms` (execution start) as the age origin;
+if both are absent the age is unknown. This fallback adds no field or history read.
+
+Lightweight mission list cards also return null but do not hydrate progress summaries:
+that null does **not** prove no progress. Use the enriched work collection or mission
+detail for progress coverage. This field alone does not classify current idle holding
+or protective waits; it introduces no watcher, ask, gate, retry, mail or subagent predicate.
 
 ### Agent lifecycle metadata
 
@@ -1793,3 +1815,5 @@ chunk reads do not rebuild the session. The owner never requests transcript HTTP
 URLs. External images use an `image_link` block for explicit client opening; file
 reads are restricted to content-addressed files in the bound Pi/OMP blob store. MIME comes from passive image
 signatures, with SVG/HTML/unrecognized bytes returned only as opaque octets.
+
+`message.send` accepts `kind: "silent" | "wake"`; omitted kind means wake. Silent mail stays unread until a real wake offers at most eight held messages, or it is read on demand. Replies default to wake independently of their parent; there is no question tag or per-seat wake policy. Person and system wake events always wake. Signed silent requests carry `st3-silent` in signed tags. Old daemons ignore the kind field and do not hold silent tags; inspect receipt tags in mixed-version fleets. See [silent messages](../silent-messages.md).

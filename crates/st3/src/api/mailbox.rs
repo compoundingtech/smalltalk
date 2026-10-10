@@ -206,7 +206,65 @@ type Snapshot = (
 
 type MaintenanceIds = std::collections::BTreeSet<String>;
 /// Canonical order keys of a stream's admitted mail, kept across its updates.
-type MailboxOrder = std::collections::BTreeMap<String, smallclaims::store::canonical::ClaimKey>;
+#[derive(Default)]
+struct MailboxOrder {
+    keys: std::collections::BTreeMap<String, smallclaims::store::canonical::ClaimKey>,
+    remaining: usize,
+}
+impl MailboxOrder {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn clear(&mut self) {
+        self.keys.clear();
+    }
+    fn remove(&mut self, subject: &str) {
+        self.keys.remove(subject);
+    }
+    fn bound_held(&mut self, messages: &mut Vec<MessageView>, refreshed: bool) {
+        if refreshed {
+            self.remaining = messages
+                .iter()
+                .flat_map(|m| &m.tags)
+                .filter_map(|tag| {
+                    tag.strip_prefix(crate::silent::REMAINING_PREFIX)?
+                        .parse::<usize>()
+                        .ok()
+                })
+                .max()
+                .unwrap_or(0);
+        }
+        let mut held = messages
+            .iter()
+            .filter(|m| crate::silent::waits_for_turn(m))
+            .map(|m| (m.created_index, m.subject.clone()))
+            .collect::<Vec<_>>();
+        held.sort();
+        self.remaining = self
+            .remaining
+            .saturating_add(held.len().saturating_sub(crate::silent::BATCH_LIMIT));
+        let selected = held
+            .into_iter()
+            .rev()
+            .take(crate::silent::BATCH_LIMIT)
+            .map(|(_, subject)| subject)
+            .collect::<std::collections::BTreeSet<_>>();
+        messages.retain(|m| !crate::silent::waits_for_turn(m) || selected.contains(&m.subject));
+        for m in messages.iter_mut() {
+            m.tags
+                .retain(|tag| !tag.starts_with(crate::silent::REMAINING_PREFIX));
+        }
+        if self.remaining > 0
+            && let Some(m) = messages.iter_mut().find(|m| m.status == "sent")
+        {
+            m.tags.push(format!(
+                "{}{remaining}",
+                crate::silent::REMAINING_PREFIX,
+                remaining = self.remaining
+            ));
+        }
+    }
+}
 /// The seat's rollout intake hold, read at most once per update; `None` until first needed.
 type IntakeHold = Option<Option<crate::rollout::Operation>>;
 type SnapshotUpdate = (crate::store::MailboxWatermark, Snapshot, bool, MaintenanceIds);
@@ -241,8 +299,9 @@ fn retain_live_mail(
             && sent.accepted_at_unix_ms >= since;
         if after_connection || recovered.contains(&message.subject) {
             live.push(message);
-        } else if sent.accepted_at_unix_ms
-            > since.saturating_sub(u128::from(super::mail_backlog::THRESHOLD_MS))
+        } else if (crate::silent::is_held(&message)
+            || sent.accepted_at_unix_ms
+                > since.saturating_sub(u128::from(super::mail_backlog::THRESHOLD_MS)))
             && never_offered(store, &message)?
         {
             recovered.insert(message.subject.clone());
@@ -266,13 +325,18 @@ pub(super) fn hold_pre_boot_mail(
     };
     let Some((since, through)) = store.native_mail_boot_floor(&peer.agent)? else {
         for message in messages {
-            message.status = "closed".into();
+            if !crate::silent::waits_for_turn(message) {
+                message.status = "closed".into();
+            }
         }
         return Ok(());
     };
     // A closed projection only removes old native inbox files. Explicit conversation
     // reads still see the original graph status, with no synthetic receipt or close.
     for message in messages {
+        if crate::silent::waits_for_turn(message) {
+            continue;
+        }
         let Some(sent) = store.latest_claim(&message.subject, Some("message.sent"))? else {
             message.status = "closed".into();
             continue;
@@ -303,7 +367,7 @@ fn raw_snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
             .into_iter()
             .next();
         let messages = if binding.component == "delivery" {
-            store.messages_through(Some(&binding.subject), false, through)?
+            store.messages_for_delivery_through(&binding.subject, through)?
         } else {
             Vec::new()
         };
@@ -416,6 +480,7 @@ where
                     .chain(policy_rechecks.iter().cloned())
                     .collect::<std::collections::BTreeSet<_>>();
                 let mut reorder = false;
+                let mut waking_added = false;
                 for subject in subjects {
                     policy_rechecks.remove(&subject);
                     let old = messages.iter().find(|message| message.subject == subject);
@@ -436,6 +501,10 @@ where
                         &mut hold,
                     )?);
                     retain_live_mail(store, &mut changed, since, Some(through), admitted)?;
+                    waking_added |= old.is_none()
+                        && changed
+                            .first()
+                            .is_some_and(|m| m.status == "sent" && !crate::silent::is_held(m));
                     if serde_json::to_value(old)? != serde_json::to_value(changed.first())? {
                         messages.retain(|message| message.subject != subject);
                         messages.extend(changed);
@@ -443,8 +512,25 @@ where
                         updated = true;
                     }
                 }
+                // A waking change refills the bounded held batch from durable metadata.
+                // This is one bulk read per real turn, never an extra seek per delivery.
+                if waking_added && order.remaining > 0 {
+                    let (_, refreshed) = read(store, binding)?;
+                    messages = refreshed;
+                    close_own.extend(filter_messages(
+                        store,
+                        binding,
+                        &mut messages,
+                        policy_rechecks,
+                        &mut hold,
+                    )?);
+                    retain_live_mail(store, &mut messages, since, Some(through), admitted)?;
+                    order.clear();
+                    order.bound_held(&mut messages, true);
+                }
+                order.bound_held(&mut messages, false);
                 if reorder {
-                    store.order_mailbox_messages(&mut messages, order)?;
+                    store.order_mailbox_messages(&mut messages, &mut order.keys)?;
                 }
                 return Ok((changes.mark, (seat, messages), updated));
             }
@@ -479,6 +565,7 @@ where
         )?);
         policy_rechecks.retain(|subject| eligible.contains(subject));
         retain_live_mail(store, &mut messages, since, Some(through), admitted)?;
+        order.bound_held(&mut messages, true);
         Ok((mark, (seat, messages), true))
     });
     // Reading never commits a closure or builds persistent derived state. The background
@@ -795,6 +882,9 @@ async fn stream_with_timers_inner<F, S, H>(
                 .map(|message| message.subject.clone())
                 .collect::<Vec<_>>();
             subscription.messages(&subjects);
+            // Held mail stays admitted to this stream, so the next waking message releases it
+            // without another read; until then the seat is offered none of it.
+            crate::silent::release(&mut messages);
             let bytes = serde_json::to_vec(&messages).unwrap_or_default();
             if fence.component == "delivery" && bytes != previous_mailbox {
                 if send(&mut socket, &Frame::Mailbox { messages })
@@ -1492,6 +1582,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn held_mail_older_than_a_day_survives_reconnect_until_the_next_wake() {
+        let store = Store::open_memory("node").unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "message/old-silent".into(),
+                kind: "message.sent".into(),
+                actor: Some("agent/example/writer".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("agent/example/writer")),
+                    ("to".into(), json!("agent/example/reader")),
+                    ("content".into(), json!("A held update.")),
+                    ("tags".into(), json!([crate::silent::SILENT_TAG])),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let since = client_now_ms() + crate::silent::HELD_TOO_LONG_MS + 1;
+        let mut messages = store.messages(Some("agent/example/reader"), false).unwrap();
+        let mut recovered = std::collections::BTreeSet::new();
+        retain_live_mail(
+            &store,
+            &mut messages,
+            since,
+            Some(store.index().unwrap()),
+            &mut recovered,
+        )
+        .unwrap();
+        assert_eq!(messages.len(), 1);
+        let peer = NativeDeliveryPeer {
+            agent: "agent/example/reader".into(),
+            transport: "codex",
+            pid: 123,
+            archives_inbox: true,
+        };
+        // No boot floor: legacy polling must not synthesize closed for held mail.
+        hold_pre_boot_mail(&store, Some(&peer), Some(&peer.agent), &mut messages).unwrap();
+        assert_eq!(messages[0].status, "sent");
+        store
+            .append_claim(&ClaimInput {
+                subject: peer.agent.clone(),
+                kind: "runtime.observed".into(),
+                actor: Some("daemon/runtime".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("incarnation_id".into(), json!("current")),
+                    ("runtime_id".into(), json!("fixture-runtime")),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(store.native_mail_boot_floor(&peer.agent).unwrap().is_some());
+        hold_pre_boot_mail(&store, Some(&peer), Some(&peer.agent), &mut messages).unwrap();
+        assert_eq!(
+            messages[0].status, "sent",
+            "a boot floor must also preserve held mail"
+        );
+        let mut offered = messages.clone();
+        crate::silent::release(&mut offered);
+        assert!(offered.is_empty(), "reconnect alone cannot wake the seat");
+        let mut waking = messages[0].clone();
+        waking.subject = "message/question".into();
+        waking.tags.clear();
+        messages.push(waking);
+        crate::silent::release(&mut messages);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            store.message("message/old-silent").unwrap().unwrap().status,
+            "sent"
+        );
+        assert!(
+            store
+                .claims_for("message/old-silent", Some("message.read"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     async fn restart_recovers_recent_unoffered_mail_once(transport: &'static str) {
         let root = tempfile::tempdir().unwrap();
         let mut state = super::super::tests::state(root.path());
@@ -1812,6 +1985,290 @@ mod tests {
             state.store.messages(Some(seat), false).unwrap()[0].status,
             "sent"
         );
+        server.abort();
+    }
+
+    /// The next mail frame, skipping seat and control frames.
+    async fn next_mail(
+        socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+    ) -> Vec<crate::model::MessageView> {
+        loop {
+            if let Frame::Mailbox { messages } = next(socket).await {
+                return messages;
+            }
+        }
+    }
+
+    /// No mail frame arrives for a while: nothing was offered to the seat.
+    async fn no_mail(socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>) {
+        let quiet = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Frame::Mailbox { messages } = serde_json::from_str(&text).unwrap() {
+                            return messages;
+                        }
+                    }
+                    Some(Ok(Message::Ping(bytes))) => socket.send(Message::Pong(bytes)).await.unwrap(),
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        })
+        .await;
+        if let Ok(messages) = quiet {
+            panic!("held mail was offered: {messages:?}");
+        }
+    }
+
+    /// Each receipt updates the frame; the mailbox ends empty once the seat has read it all.
+    async fn drained(socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>) {
+        while !next_mail(socket).await.is_empty() {}
+    }
+
+    /// The seat reads each message, as its channel does.
+    async fn read_all(client: &Client, fence: &Fence, messages: &[crate::model::MessageView]) {
+        for message in messages {
+            for lifecycle in ["staged", "delivered", "read"] {
+                let _: ClaimRecord = client
+                    .post(
+                        "/v1/mailbox/receipts",
+                        &Receipt {
+                            fence: fence.clone(),
+                            message: message.subject.clone(),
+                            lifecycle: lifecycle.into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn held_mail_wakes_nobody_and_goes_out_with_the_next_waking_message() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = super::super::tests::state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
+        crate::mailbox::tests::ready(&state.store, "session-1");
+        let kdl =
+            "version 2\nagent \"eval.worker\" { workspace \"/work\"; command \"sleep 60\"; }\n";
+        let intent = crate::graph::parse_test_intent(kdl, "node").unwrap();
+        let planned = state
+            .store
+            .mission(&intent, IntentInput { kdl: kdl.into(), source_name: None })
+            .unwrap();
+        state.store.apply(&intent, &planned.subject_tokens, "seat").unwrap();
+        let peer = NativeDeliveryPeer {
+            agent: "agent/eval.worker".into(),
+            transport: "claude-channel",
+            pid: 37,
+            archives_inbox: false,
+        };
+        let path = root.path().join("daemon.sock");
+        let server_path = path.clone();
+        let app = admitted_fixture_router(state.clone(), peer);
+        let server = tokio::spawn(async move { serve_unix(&server_path, app).await.unwrap() });
+        let client = Client::new(Endpoint::Unix(path.clone()));
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let fence: Fence = client
+            .post("/v1/mailbox/bind", &Fence::new("agent/eval.worker", "session-1", "delivery"))
+            .await
+            .unwrap();
+        let mut socket = client.open_mailbox(&fence).await.unwrap();
+        assert!(next_mail(&mut socket).await.is_empty());
+        let send = |key: &str, from: &str, tags: &[&str], in_reply_to: Option<&str>| {
+            super::super::accept_message(
+                &state,
+                MessageSendRequest {
+                    idempotency_key: key.into(),
+                    from: from.into(),
+                    to: fence.subject.clone(),
+                    content: format!("{key} words"),
+                    title: Some(key.into()),
+                    in_reply_to: in_reply_to.map(str::to_owned),
+                    tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+                    attachments: Vec::new(),
+                },
+                None,
+                None,
+            )
+            .unwrap()
+            .0
+        };
+        // Two explicit silent messages wake nobody.
+        let silent = send(
+            "silent",
+            "agent/eval.peer",
+            &[crate::silent::SILENT_TAG],
+            None,
+        );
+        let status = send(
+            "status",
+            "agent/eval.peer",
+            &[crate::silent::SILENT_TAG],
+            None,
+        );
+        signal_changed(&state);
+        no_mail(&mut socket).await;
+        // Nothing is lost: both are unread, in the seat's mailbox.
+        for held in [&silent, &status] {
+            assert_eq!(
+                state.store.message(&held.subject).unwrap().unwrap().status,
+                "sent"
+            );
+        }
+        let listed = state.store.held_mail_before(u128::MAX).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!((listed[0].0.as_str(), listed[0].1), ("agent/eval.worker", 2));
+
+        // An ordinary default-wake question releases the held mail in send order.
+        let question = send("question", "agent/eval.peer", &[], None);
+        signal_changed(&state);
+        let batch = next_mail(&mut socket).await;
+        assert_eq!(
+            batch
+                .iter()
+                .map(|message| message.subject.as_str())
+                .collect::<Vec<_>>(),
+            [
+                silent.subject.as_str(),
+                status.subject.as_str(),
+                question.subject.as_str()
+            ]
+        );
+        read_all(&client, &fence, &batch).await;
+        drained(&mut socket).await;
+
+        // A large backlog is bounded on this connection and refilled on later real turns.
+        for n in 0..20 {
+            send(
+                &format!("backlog-{n}"),
+                "agent/eval.peer",
+                &[crate::silent::SILENT_TAG],
+                None,
+            );
+        }
+        signal_changed(&state);
+        no_mail(&mut socket).await;
+        for (turn, offered, remaining) in [(0, 8, 12), (1, 8, 4), (2, 4, 0)] {
+            send(
+                &format!("wake-backlog-{turn}"),
+                "agent/eval.peer",
+                &[],
+                None,
+            );
+            signal_changed(&state);
+            let batch = next_mail(&mut socket).await;
+            assert_eq!(batch.len(), offered + 1, "turn {turn}");
+            let notices = batch
+                .iter()
+                .flat_map(|m| &m.tags)
+                .filter_map(|tag| tag.strip_prefix(crate::silent::REMAINING_PREFIX))
+                .collect::<Vec<_>>();
+            if remaining > 0 {
+                assert_eq!(notices, vec![remaining.to_string()]);
+            } else {
+                assert!(notices.is_empty());
+            }
+            read_all(&client, &fence, &batch).await;
+            drained(&mut socket).await;
+        }
+
+        // A reply defaults to wake even when its parent was silent.
+        let asked = super::super::accept_message(
+            &state,
+            MessageSendRequest {
+                idempotency_key: "asked".into(),
+                from: fence.subject.clone(),
+                to: "agent/eval.peer".into(),
+                content: "Which branch?".into(),
+                title: None,
+                in_reply_to: None,
+                tags: vec![crate::silent::SILENT_TAG.into()],
+                attachments: Vec::new(),
+            },
+            None,
+            None,
+        )
+        .unwrap()
+        .0;
+        let answer = send("answer", "agent/eval.peer", &[], Some(&asked.subject));
+        assert!(!crate::silent::is_held(&answer), "{:?}", answer.tags);
+        signal_changed(&state);
+        let woken = next_mail(&mut socket).await;
+        assert_eq!(woken.len(), 1);
+        read_all(&client, &fence, &woken).await;
+        drained(&mut socket).await;
+
+        // Each system kind still wakes and releases held mail.
+        let kinds: [(&str, &str, &[&str]); 8] = [
+            ("person", "person/eval", &[]),
+            (
+                "handoff",
+                "daemon/runtime",
+                &["st3-work-handoff:step-run/r/s"],
+            ),
+            ("fault", "daemon/runtime", &["st3-fault:episode"]),
+            ("ready-step", "daemon/runtime", &["st3-work:step-run/r/s@1@1@x"]),
+            ("gh-watch", "daemon/node", &[crate::github_watch::WATCH_TAG]),
+            ("run-report", "daemon/runtime", &["st3-run-report:failed"]),
+            ("retry", "daemon/runtime", &["st3-provider-capacity-retry"]),
+            (
+                "product-wait",
+                "daemon/runtime",
+                &["st3-product-wait:step-run/r/s"],
+            ),
+        ];
+        for (kind, from, tags) in kinds {
+            let held = send(
+                &format!("held-before-{kind}"),
+                "agent/eval.peer",
+                &[crate::silent::SILENT_TAG],
+                None,
+            );
+            signal_changed(&state);
+            no_mail(&mut socket).await;
+            // st's own messages are appended as claims, like the daemon does; the others are sent.
+            let subject = if from.starts_with("daemon/") {
+                let subject = format!("message/{kind}");
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: subject.clone(),
+                        kind: "message.sent".into(),
+                        actor: Some(from.into()),
+                        fields: BTreeMap::from([
+                            ("status".into(), json!("sent")),
+                            ("from".into(), json!(from)),
+                            ("to".into(), json!(fence.subject)),
+                            ("content".into(), json!(kind)),
+                            ("tags".into(), json!(tags)),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(kind.into()),
+                    })
+                    .unwrap();
+                subject
+            } else {
+                send(kind, from, tags, None).subject
+            };
+            signal_changed(&state);
+            let batch = next_mail(&mut socket).await;
+            assert_eq!(
+                batch.iter().map(|message| message.subject.as_str()).collect::<Vec<_>>(),
+                [held.subject.as_str(), subject.as_str()],
+                "{kind} wakes the seat and carries its held mail"
+            );
+            read_all(&client, &fence, &batch).await;
+            drained(&mut socket).await;
+        }
+        assert!(state.store.held_mail_before(u128::MAX).unwrap().is_empty());
         server.abort();
     }
 
