@@ -179,10 +179,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         if steps.is_empty() {
             return Ok(());
         }
-        if !harness_quiet(self.store.latest_harness_report(agent)?.as_ref())
-            || !self.store.open_subagents(agent)?.is_empty()
-            || self.store.has_undelivered_message(agent)?
-        {
+        if !harness_quiet(self.store.latest_harness_report(agent)?.as_ref()) {
             return Ok(());
         }
 
@@ -267,6 +264,13 @@ impl<R: RuntimeControl> Reconciler<R> {
         reason: NudgeReason<'_>,
         now: u128,
     ) -> Result<()> {
+        // Pending input and child seats matter only when a quiet deadline or an action
+        // can send a nudge. Claim writes maintain the mailbox index; this is a pure read.
+        if self.store.has_undelivered_message(agent)?
+            || !self.store.open_subagents(agent)?.is_empty()
+        {
+            return Ok(());
+        }
         let event = match &reason {
             NudgeReason::Quiet(_) => "quiet".to_owned(),
             NudgeReason::Action(_, action) => action.key.clone(),

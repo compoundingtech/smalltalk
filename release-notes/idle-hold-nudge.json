@@ -3,11 +3,11 @@
   "summary": "Nudge a seat that sits idle holding claimed work with nothing set to wake it, once, naming the step and its waits, and record the nudge on the step",
   "replay": {
     "status": "none",
-    "detail": "No history is folded or rebuilt. The check runs inside each running seat's existing wake evaluation and reads facts already recorded: the seat's harness report, mailbox, watches, steps, open runs and watched threads."
+    "detail": "No shared projection replay is needed. A new disposable local message index is populated during first startup and maintained on claim writes; reads never populate or rebuild it."
   },
   "schema": {
     "status": "changed",
-    "detail": "Two additive lookup indexes select watches by their recipient and report-to runs by their reporter. No tables, columns or triggers change, and no projection replay is needed. The claim vocabulary gains work.nudged (system-only, append, on step-run) with optional attempt, agent, message, idle_since_unix_ms, reason and waits fields. The client contract adds an optional nudged_at_unix_ms to work and nudged_at to mission steps."
+    "detail": "Two additive lookup indexes select watches by recipient and report-to runs by reporter. local_idle_messages is a disposable local table with two indexes and three claim-lifecycle triggers: pending input and last delivered source wakes are indexed reads instead of mailbox-history scans. Startup backfill commits at most 64 message subjects per transaction and resumes after interruption. No shared tables or columns change. The claim vocabulary gains work.nudged (system-only, append, on step-run) with optional attempt, agent, message, idle_since_unix_ms, reason and waits fields. The client contract adds optional nudged_at_unix_ms to work and nudged_at to mission steps."
   },
   "rules": {
     "status": "none",
@@ -19,7 +19,7 @@
   },
   "downtime": {
     "status": "changed",
-    "detail": "The first startup creates two additive lookup indexes over existing declarations and run-report claims. Index creation may add startup time; it does not replay claims or rebuild projections. A seat that is not idle-holding costs no further reads. An idle-holding seat checks its own indexed mailbox, watches and reporting runs inside its existing wake evaluation, when the seat changes or a deadline falls due."
+    "detail": "First startup creates the additive lookup indexes before requests are admitted. CREATE INDEX holds the SQLite writer during creation. On a copy of the 200,790-claim benchmark store with 700 declarations, five report-index creations including commit had a 69.4 ms median and 1,980.7 ms maximum; watch-index creation had a 19.6 ms median and 19.8 ms maximum. The initial report-index execution alone took 92.8 ms, and a concurrent writer was refused during it. These are measured startup costs, not bounds for larger stores. Initial local message-index backfill took 1,148.6 ms for 5,125 messages in 81 transactions of at most 64 subjects; the longest writer batch was 35.2 ms. Restart after successful backfill only checks its marker. Idle checks run in the existing incremental seat wake evaluation and register their next deadlines; they add no sampler or polling thread. Pending mailbox and child-seat reads happen only when a nudge can be sent."
   },
   "manual": {
     "status": "none",
@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "none",
-    "detail": "Swap back to the previous binary at any time. Nudges stop, and work.nudged claims already written stay in the graph unread."
+    "detail": "Swap back to the previous binary at any time. Nudges stop, and work.nudged claims stay in the graph unread. The disposable local_idle_messages table, indexes and triggers can remain; older binaries ignore the table. Schema setup for a newer build resumes an interrupted message-index backfill."
   }
 }

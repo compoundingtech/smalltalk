@@ -1186,9 +1186,16 @@ idle_nudge_quiet_watch = "2h"
 ```
 
 The check runs inside the seat's existing wake evaluation, after the cheap conditions: a held
-step, an idle harness, the step's back-off, a quiet report, no subagents, no pending mail. It then
-reads each wait source, cheapest first, and stops at the first wait that holds. A seat that is not
-due yet records when it will be, so nothing polls.
+step, an idle harness, the step's back-off and a quiet report. Its own asks, gates and retries
+hold the check before external sources. GitHub action checks use at most 400 timestamp-indexed
+observations per watched thread; the quiet check then stops at the first wait that holds. Pending
+input and subagents are checked only when a quiet deadline or an action can send a nudge. A seat
+that is not due yet records when it will be, so nothing polls.
+
+A disposable local message index records pending input and each source's delivered wakes. Claim
+writes maintain it, so the reads seek current state without walking retained mailbox history.
+First startup backfills it in resumable batches of at most 64 message subjects; reads never build
+it. See `release-notes/idle-hold-nudge.json` for measured startup and writer costs.
 
 ## Runtime sequence
 

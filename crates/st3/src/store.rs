@@ -139,6 +139,7 @@ pub(crate) mod work_summaries_ivm;
 mod subagents;
 mod watches;
 mod idle_holds;
+mod idle_mail;
 pub use idle_holds::WORK_NUDGED_KIND;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
 pub use limits::{AccountLimit, LIMITS_ACTOR, LIMITS_CATCH_UP_PAGE, LimitsOutcome, LimitsPolicy};

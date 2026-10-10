@@ -1,8 +1,8 @@
 //! What the idle-hold nudge reads about a seat: whether mail waits for it, the GitHub watches it
 //! holds, when each watch last woke it, whether a watched thread left the merge queue without
 //! merging, the runs that report to it, and the nudges its steps already got. Each read is an
-//! indexed lookup bounded by one seat's mailbox or watches, the open runs, or one thread's
-//! observations since its seat was last woken.
+//! indexed lookup of pending mail or a delivered wake, one seat's watches and reporting runs,
+//! or a fixed number of one thread's newest observations.
 
 use super::*;
 use crate::github_watch::{self, ThreadRef};
@@ -13,6 +13,23 @@ pub const WORK_NUDGED_KIND: &str = "work.nudged";
 /// How many of a thread's newest observations a merge-queue check reads at most. A thread is
 /// observed only when it changes.
 const THREAD_SCAN: u32 = 400;
+
+const QUEUE_EXIT_SQL: &str = "SELECT json_extract(body, '$.fields.facts'), accepted_at_unix_ms,
+             COALESCE(json_extract(body, '$.fields.attribution_only'), 0)
+             FROM claims INDEXED BY claims_subject_kind_accepted_index
+             WHERE subject=?1 AND kind='resource.observed'
+             ORDER BY length(accepted_at_unix_ms) DESC,accepted_at_unix_ms DESC,store_index DESC
+             LIMIT ?2";
+
+// Each mailbox alias contributes at most one row; the aggregate never sorts retained wakes.
+const LAST_WAKE_SQL: &str = "SELECT MAX(sent_at) FROM (
+    SELECT sent_at FROM (SELECT sent_at FROM local_idle_messages INDEXED BY local_idle_messages_wake
+        WHERE recipient=?1 AND wait_tag=?3 AND source_prefix=?4 AND delivered=1
+        ORDER BY sent_at DESC LIMIT 1)
+    UNION ALL
+    SELECT sent_at FROM (SELECT sent_at FROM local_idle_messages INDEXED BY local_idle_messages_wake
+        WHERE recipient=?2 AND wait_tag=?3 AND source_prefix=?4 AND delivered=1
+        ORDER BY sent_at DESC LIMIT 1))";
 
 /// One live GitHub watch a seat holds.
 #[derive(Clone, Debug, PartialEq)]
@@ -32,14 +49,8 @@ impl Store {
         let connection = self.readers.get();
         let found: Option<String> = connection
             .prepare_cached(
-                "SELECT sent.subject FROM claims sent INDEXED BY claims_message_to_index
-                 WHERE sent.kind='message.sent'
-                   AND json_extract(sent.body, '$.fields.to') IN (?1, ?2)
-                   AND NOT EXISTS (
-                     SELECT 1 FROM claims later
-                     WHERE later.subject=sent.subject
-                       AND later.kind IN ('message.delivered', 'message.read', 'message.closed'))
-                 LIMIT 1",
+                "SELECT subject FROM local_idle_messages INDEXED BY local_idle_messages_pending
+                 WHERE recipient IN (?1,?2) AND pending=1 LIMIT 1",
             )?
             .query_row(params![recipient, bare_recipient], |row| row.get(0))
             .optional()?;
@@ -51,6 +62,8 @@ impl Store {
 
     /// The newest delivered wake carrying the exact wait tag and the source's tag prefix.
     /// A nudge or a conversation that merely mentions the wait is not a source wake.
+    /// Both source producers put their source tag first and exact wait tag second; claim
+    /// writes materialize those fields and delivery state in the disposable message index.
     pub(crate) fn last_wake_to(
         &self,
         agent: &str,
@@ -60,36 +73,12 @@ impl Store {
         let (recipient, bare_recipient) = recipients(agent);
         smallclaims::touched::note_read(|| format!("mailbox:{recipient}"));
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(
-            "SELECT sent.body, sent.accepted_at_unix_ms
-             FROM claims sent INDEXED BY claims_message_to_index
-             WHERE sent.kind='message.sent'
-               AND json_extract(sent.body, '$.fields.to') IN (?1, ?2)
-               AND instr(sent.body, ?3)>0
-               AND EXISTS (SELECT 1 FROM claims delivered
-                           WHERE delivered.subject=sent.subject
-                             AND delivered.kind IN ('message.delivered','message.read'))",
-        )?;
-        let mut latest = None::<u128>;
-        for row in statement.query_map(params![recipient, bare_recipient, tag], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })? {
-            let (body, at) = row?;
-            let body: Value = serde_json::from_str(&body)?;
-            let tags = body.pointer("/fields/tags").and_then(Value::as_array);
-            if tags.is_some_and(|tags| {
-                tags.iter().any(|value| value.as_str() == Some(tag))
-                    && tags.iter().any(|value| {
-                        value
-                            .as_str()
-                            .is_some_and(|value| value.starts_with(prefix))
-                    })
-            }) && let Ok(at) = at.parse::<u128>()
-            {
-                latest = Some(latest.map_or(at, |latest| latest.max(at)));
-            }
-        }
-        Ok(latest)
+        Ok(connection
+            .prepare_cached(LAST_WAKE_SQL)?
+            .query_row(params![recipient, bare_recipient, tag, prefix], |row| {
+                row.get::<_, Option<u64>>(0)
+            })?
+            .map(u128::from))
     }
 
     /// The watches `agent` holds that have not ended. Watch subjects end with their seat, so
@@ -144,21 +133,22 @@ impl Store {
         let item = format!("{resource}/pull-request/{}", thread.number);
         smallclaims::touched::note_read(|| item.clone());
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(
-            "SELECT json_extract(body, '$.fields.facts'), accepted_at_unix_ms FROM claims
-             WHERE subject=?1 AND kind='resource.observed'
-               AND COALESCE(json_extract(body, '$.fields.attribution_only'), 0)=0
-             ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC, store_index DESC
-             LIMIT ?2",
-        )?;
+        let mut statement = connection.prepare_cached(QUEUE_EXIT_SQL)?;
         let mut rows = statement.query_map(params![item, THREAD_SCAN], |row| {
-            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
         })?;
         // Newest first: while the thread is out of the queue, the oldest such observation is when
         // it left; the one before that must have it queued.
         let mut left = None::<u128>;
         for row in &mut rows {
-            let (facts, at) = row?;
+            let (facts, at, attribution_only) = row?;
+            if attribution_only {
+                continue;
+            }
             let facts = facts
                 .map(|facts| serde_json::from_str::<Value>(&facts))
                 .transpose()?
@@ -248,7 +238,7 @@ impl Store {
 
     /// A step's newest nudge.
     pub(crate) fn latest_nudge(&self, step: &str) -> Result<Option<ClaimRecord>> {
-        Ok(self.latest_claim(step, Some(WORK_NUDGED_KIND))?)
+        self.latest_claim(step, Some(WORK_NUDGED_KIND))
     }
 
     /// The newest `harness.observed` of a seat, for its quiescence report.
@@ -268,4 +258,55 @@ fn recipients(agent: &str) -> (String, String) {
         .unwrap_or(&recipient)
         .to_owned();
     (recipient, bare_recipient)
+}
+
+#[cfg(test)]
+impl Store {
+    pub(crate) fn idle_lookup_plans(&self, agent: &str, tag: &str) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        let mut plans = Vec::new();
+        for (label, sql, args) in [
+            (
+                "pending",
+                "SELECT subject FROM local_idle_messages INDEXED BY local_idle_messages_pending WHERE recipient IN (?1,?2) AND pending=1 LIMIT 1",
+                vec![Value::String(agent.into()), Value::String(agent.into())],
+            ),
+            (
+                "wake",
+                LAST_WAKE_SQL,
+                vec![
+                    json!(agent),
+                    json!(agent),
+                    json!(tag),
+                    json!("github-watch"),
+                ],
+            ),
+            (
+                "queue",
+                QUEUE_EXIT_SQL,
+                vec![
+                    json!("resource/github/acme/garden/pull-request/12"),
+                    json!(THREAD_SCAN),
+                ],
+            ),
+        ] {
+            let args = args
+                .into_iter()
+                .map(|value| match value {
+                    Value::String(value) => rusqlite::types::Value::Text(value),
+                    Value::Number(value) => {
+                        rusqlite::types::Value::Integer(value.as_i64().unwrap())
+                    }
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            let mut statement = connection.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            for row in statement.query_map(rusqlite::params_from_iter(args), |row| {
+                row.get::<_, String>(3)
+            })? {
+                plans.push(format!("{label}: {}", row?));
+            }
+        }
+        Ok(plans)
+    }
 }

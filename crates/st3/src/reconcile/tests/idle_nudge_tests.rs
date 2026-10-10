@@ -715,3 +715,72 @@ fn readiness_without_a_turn_does_not_rearm_a_nudge() {
     idle.evaluate();
     assert_eq!(idle.nudges().len(), 2);
 }
+
+#[test]
+fn idle_lookup_cost_is_flat_with_delivered_mail_and_pr_history() {
+    let idle = fixture();
+    let step = idle.hold("queued", "history-cost");
+    let watch = idle.watch();
+    for number in 13..17 {
+        let thread =
+            crate::github_watch::ThreadRef::parse(&format!("acme/garden#{number}")).unwrap();
+        idle.seat.store.declare_watch(&thread, SEAT, None).unwrap();
+    }
+    idle.observe(json!({}));
+    idle.at(MINUTE);
+    idle.observe(
+        json!({"required_checks":{"state":"pass","source":"rules","checks":["build"],"failed":[]}}),
+    );
+    idle.read_mail();
+    idle.harness("idle");
+    idle.at(40 * MINUTE);
+    let work = idle.seat.store.work_for_reconcile(SEAT).unwrap();
+    let harness = idle.seat.store.current_harness(SEAT).unwrap();
+    let measure = || {
+        let start = std::time::Instant::now();
+        let scope = smallclaims::sqlite::work::SqliteWorkScope::start();
+        idle.seat
+            .reconciler
+            .nudge_idle_holder(SEAT, &work, harness.as_ref(), now_ms())
+            .unwrap();
+        // Also exercise the negative mailbox lookup which a holding quiet wait avoids.
+        assert!(!idle.seat.store.has_undelivered_message(SEAT).unwrap());
+        (scope.finish(), start.elapsed())
+    };
+    // Delivered but unread/unclosed messages are retained, so this cannot pass by archiving.
+    idle.seat
+        .store
+        .seed_idle_history(SEAT, idle.start, 0..10_000, 0..2_000);
+    let baseline = measure();
+    idle.seat
+        .store
+        .seed_idle_history(SEAT, idle.start, 10_000..20_000, 2_000..4_000);
+    let grown = measure();
+    let plans = idle.seat.store.idle_lookup_plans(SEAT, &watch).unwrap();
+    eprintln!(
+        "idle retained-history: 10k delivered / 5 watches / 2k observations = {baseline:?}; 20k / 5 / 4k = {grown:?}; plans={plans:?}"
+    );
+    assert_eq!(baseline.0.fullscan_steps, 0);
+    assert_eq!(grown.0.fullscan_steps, 0);
+    assert!(
+        grown.0.vm_steps <= baseline.0.vm_steps + 50,
+        "{baseline:?} -> {grown:?}"
+    );
+    assert!(grown.0.statements <= baseline.0.statements + 1);
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.contains("local_idle_messages_pending"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.contains("local_idle_messages_wake"))
+    );
+    assert!(
+        plans
+            .iter()
+            .any(|plan| plan.contains("claims_subject_kind_accepted_index"))
+    );
+    assert!(idle.seat.store.latest_nudge(&step).unwrap().is_none());
+}
