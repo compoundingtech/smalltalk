@@ -20935,7 +20935,7 @@ async fn run_pi_channel(
         None
     };
     let mut todo_observations = if driver == "omp" && observer.is_none()
-        && retry_while_daemon_unreachable(subject, || current_agent_incarnation(client, subject))
+        && retry_channel_activation_read(subject, || current_agent_incarnation(client, subject))
             .await?.as_deref() == Some(&incarnation)
     {
         Some(activate_channel_todo_observations(catalog, subject, &mut state)?)
@@ -22728,6 +22728,44 @@ where
         match call().await {
             Ok(value) => return Ok(value),
             Err(error) => tolerate_driver_api_outage(subject, error, &mut last_warning)?,
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+// The Pi-family channel activates its todo publisher after hello. This read can
+// receive a legacy internal JoinError while a daemon runtime is shutting down.
+// Keep that tolerance local to activation; other driver calls retain their classifier.
+async fn retry_channel_activation_read<T, F, Fut>(subject: &str, mut call: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut last_warning = None;
+    loop {
+        let error = match call().await {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let cancelled_reader = st3::client::api_error_parts(&error).is_some_and(
+            |(status, code, message, _)| {
+                status == 500
+                    && code == "internal"
+                    && message.strip_prefix("task ")
+                        .and_then(|message| message.strip_suffix(" was cancelled"))
+                        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+            },
+        );
+        if cancelled_reader {
+            let now = Instant::now();
+            if last_warning.is_none_or(|prior| now.duration_since(prior) >= Duration::from_secs(10)) {
+                let _ = write_driver_log(subject, &format!(
+                    "the channel's startup read was cancelled ({error:#}); the channel keeps running and retries every second"
+                ));
+                last_warning = Some(now);
+            }
+        } else {
+            tolerate_driver_api_outage(subject, error, &mut last_warning)?;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -31618,6 +31656,56 @@ mission "review" state="ready" {
         assert!(mission_run_follow_succeeded("standing"));
         assert!(!mission_run_follow_succeeded("running"));
         assert!(!mission_run_follow_succeeded("failed"));
+    }
+
+    #[tokio::test]
+    async fn channel_activation_retries_only_a_typed_cancelled_reader_over_http() {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse as _, routing::get};
+        for (status, code, message, retry) in [
+            (500, "internal", "task 19 was cancelled", true),
+            (500, "internal", "task 19 failed", false),
+            (500, "internal", "task nineteen was cancelled", false),
+            (500, "internal", "task 19 was cancelled by the caller", false),
+            (409, "stale-incarnation", "task 19 was cancelled", false),
+            (403, "foreign-mailbox", "task 19 was cancelled", false),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = calls.clone();
+            let app = Router::new().route("/value", get(move || {
+                let calls = counted.clone();
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (StatusCode::from_u16(status).unwrap(), Json(json!({
+                            "code":code, "message":message, "details":{}
+                        }))).into_response()
+                    } else {
+                        Json(json!({"api_version":"st3.v1", "value":42})).into_response()
+                    }
+                }
+            })).route("/ordinary", get(|| async {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                    "code":"internal", "message":"task 19 was cancelled", "details":{}
+                })))
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Client::new(Endpoint::Http(format!("http://{}", listener.local_addr().unwrap())));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let result: Result<u64> = tokio::time::timeout(Duration::from_secs(3),
+                retry_channel_activation_read("agent/cancelled-reader", || client.get("/value"))
+            ).await.expect("startup retry must finish");
+            if retry {
+                assert_eq!(result.unwrap(), 42);
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+                let ordinary: Result<u64> = client.get("/ordinary").await;
+                assert!(tolerate_driver_api_outage(
+                    "agent/cancelled-reader", ordinary.unwrap_err(), &mut None
+                ).is_err(), "ordinary driver calls must retain their classification");
+            } else {
+                assert_eq!(st3::client::api_error_code(&result.unwrap_err()), Some(code));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+            server.abort();
+        }
     }
 
     #[test]

@@ -273,10 +273,13 @@ fn files_containing(directory: &Path, needle: &str) -> Vec<PathBuf> {
 }
 
 fn assert_alive(child: &mut Child, what: &str) {
-    assert!(
-        child.try_wait().unwrap().is_none(),
-        "{what} exited during the daemon outage"
-    );
+    if let Some(status) = child.try_wait().unwrap() {
+        let mut stderr = String::new();
+        if let Some(output) = child.stderr.take() {
+            output.take(8192).read_to_string(&mut stderr).unwrap();
+        }
+        panic!("{what} exited during the daemon outage: {status}; stderr={stderr}");
+    }
 }
 
 fn stop(mut child: Child) -> String {
@@ -1025,16 +1028,14 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
 
     daemon.stop().await;
     // The harness goes idle and a message arrives while the daemon is down.
-    writeln!(input, "{}", json!({"type": "state", "state": "idle"})).unwrap();
-    input.flush().unwrap();
+    write_channel_frame(&mut input, &mut channel, json!({"type": "state", "state": "idle"}));
     daemon.send("message/restart-omp-mail", seat, "COPPER KITE");
     tokio::time::sleep(Duration::from_millis(2_500)).await;
     assert_alive(&mut channel, "the omp channel");
     assert!(daemon.harness_states(seat, incarnation).is_empty());
 
     daemon.start().await;
-    writeln!(input, "{}", json!({"type":"state", "state":"idle"})).unwrap();
-    input.flush().unwrap();
+    write_channel_frame(&mut input, &mut channel, json!({"type":"state", "state":"idle"}));
     wait_until(
         "the channel publishes a fresh state after the outage",
         Duration::from_secs(10),
@@ -1081,6 +1082,91 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
     let log = driver_log(root);
     assert!(log.contains("may be restarting"), "{log}");
     assert!(!log.contains("st3 up"), "{log}");
+}
+
+fn write_channel_frame(input: &mut std::process::ChildStdin, channel: &mut Child, frame: Value) {
+    if let Err(error) = writeln!(input, "{frame}").and_then(|_| input.flush()) {
+        let status = channel.try_wait().unwrap();
+        let mut stderr = String::new();
+        if status.is_some() && let Some(output) = channel.stderr.take() {
+            output.take(8192).read_to_string(&mut stderr).unwrap();
+        }
+        panic!("channel frame failed: {error}; exit={status:?}; stderr={stderr}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pi_family_channel_retries_a_cancelled_startup_read_without_ending() {
+    use axum::{Json, http::StatusCode, middleware, response::IntoResponse as _};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    if st3::test_support::supervise_test() { return; }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let seat = "agent/restart-cancelled-omp";
+    let incarnation = "4344:2026-09-27T12:00:00.000Z";
+    let mut daemon = Daemon::new(root);
+    daemon.observe_running(seat, incarnation);
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = reads.clone();
+    let context_read = Arc::new(AtomicBool::new(false));
+    let hello = Arc::new(Notify::new());
+    let hello_seen = hello.clone();
+    let app = st3::api::router(daemon.state()).layer(middleware::from_fn(
+        move |request: axum::extract::Request, next: middleware::Next| {
+            let reads = counted.clone();
+            let context_read = context_read.clone();
+            let hello_seen = hello_seen.clone();
+            async move {
+                if request.uri().path() == "/v1/documents" {
+                    let response = next.run(request).await;
+                    context_read.store(true, Ordering::SeqCst);
+                    return response;
+                }
+                // The context lookup immediately precedes hello. Hold the next
+                // status reply until the test has consumed hello, then reproduce
+                // the captured shutdown error on that activation read.
+                if request.uri().path() == "/v1/status"
+                    && context_read.load(Ordering::SeqCst)
+                    && reads.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    hello_seen.notified().await;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                        "code":"internal", "message":"task 19 was cancelled", "details":{}
+                    }))).into_response();
+                }
+                next.run(request).await
+            }
+        },
+    ));
+    daemon.start_isolated_app(app).await;
+    let mut channel = seat_command(root, &daemon.socket)
+        .env("ST_AGENT", seat)
+        .arg("--catalog").arg(root.join("catalog"))
+        .args(["driver", "omp-channel", "--identity", "restart-cancelled-omp"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().unwrap();
+    let mut input = channel.stdin.take().unwrap();
+    let (frames, received) = std::sync::mpsc::channel::<Value>();
+    let output = channel.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(output).lines() {
+            let Ok(line) = line else { break };
+            if let Ok(frame) = serde_json::from_str(&line) { let _ = frames.send(frame); }
+        }
+    });
+    assert_eq!(received.recv_timeout(Duration::from_secs(10)).unwrap()["type"], "hello");
+    hello.notify_one();
+    wait_until("the cancelled startup read is retried", Duration::from_secs(5),
+        || {
+            assert_alive(&mut channel, "the channel during its cancelled startup read");
+            reads.load(Ordering::SeqCst) >= 2
+        }).await;
+    assert_alive(&mut channel, "the channel after its cancelled startup read");
+    write_channel_frame(&mut input, &mut channel, json!({"type":"state", "state":"idle"}));
+    wait_until("the recovered channel publishes idle", Duration::from_secs(10),
+        || daemon.harness_states(seat, incarnation) == ["idle"]).await;
+    assert!(stop(channel).is_empty());
+    assert!(driver_log(root).contains("task 19 was cancelled"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
