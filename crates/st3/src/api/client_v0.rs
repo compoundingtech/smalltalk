@@ -20,6 +20,8 @@ mod stream_start_tests;
 #[cfg(test)]
 pub(super) mod observer_subscription_detail_tests;
 #[cfg(test)]
+mod launch_detail_tests;
+#[cfg(test)]
 mod agents_window_tests;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
@@ -2583,11 +2585,12 @@ fn mission_list_cards_at(
                 "id":step.subject,"path":step.step,"title":step.title,"state":client_work_state(&step.status),
                 "attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,
                 "agentless":step.agentless,"since":client_timestamp(step.updated_at_unix_ms),
+                "progress_at": null,
                 "blocked_reason":step.blocked_reason.as_deref().or_else(|| scheduler_fault.as_deref().filter(|_| step.status=="pending")),"blockers":step.blockers,
                 "goals":step.goals,"constraints":step.constraints
             })).collect::<Vec<_>>();
             let current=shown.iter().filter(|s| matches!(s["state"].as_str(),Some("ready"|"claimed"|"verifying"|"blocked")))
-                .map(|s| json!({"id":s["id"],"title":s["title"],"assignee":s["assignee"],"claimant":s["claimant"],"state":s["state"],"since":s["since"]})).collect::<Vec<_>>();
+                .map(|s| json!({"id":s["id"],"title":s["title"],"assignee":s["assignee"],"claimant":s["claimant"],"state":s["state"],"since":s["since"],"progress_at":s["progress_at"]})).collect::<Vec<_>>();
             Ok::<Value,anyhow::Error>(json!({
                 "id":run["id"],"generation_id":run["generation_id"],"requester":run["requester"],
                 "status":run["status"],"phase":run["phase"],"progress":{"done":done,"total":total},
@@ -2820,6 +2823,7 @@ fn mission_resources_filtered(
                                 "claimant": step.claimant,
                                 "state": client_work_state(&step.status),
                                 "since": client_timestamp(step.updated_at_unix_ms),
+                                "progress_at": step.progress_at_unix_ms.map(client_timestamp),
                             })
                         })
                         .collect::<Vec<_>>();
@@ -2912,6 +2916,7 @@ fn mission_resources_filtered(
                                     "agentless": step.agentless,
                                     "since": client_timestamp(step.updated_at_unix_ms),
                                     "last_progress": step.progress_summary,
+                                    "progress_at": step.progress_at_unix_ms.map(client_timestamp),
                                     "blocked_reason": step.blocked_reason.as_deref().or_else(|| run.scheduler_fault.as_deref().filter(|_| step.status == "pending")),
                                     "blockers": step.blockers,
                                     "goals": step.goals,
@@ -5329,11 +5334,34 @@ fn managed_transcript(
             ),
         }
     };
+    // A seat that started moments ago has not had time to bind a transcript, whichever piece is
+    // missing yet: that is starting up, not a fault, and a person watching a new agent is told so
+    // calmly instead of "could not be loaded".
+    let transcript = match transcript {
+        Err(missing) if !missing.not_yet && started_recently(incarnation) => {
+            Err(Missing::not_yet(missing.reason))
+        }
+        other => other,
+    };
     Ok(Some(ManagedTranscript {
         driver,
         anchor,
         transcript,
     }))
+}
+
+/// How long after a seat's incarnation starts a missing transcript binding is still startup.
+const TRANSCRIPT_STARTUP_GRACE_MS: i64 = 120_000;
+
+/// Whether `incarnation` (`PID:START`, START an RFC 3339 time) started within the startup grace.
+fn started_recently(incarnation: &str) -> bool {
+    incarnation
+        .split_once(':')
+        .and_then(|(_, started)| chrono::DateTime::parse_from_rfc3339(started).ok())
+        .is_some_and(|started| {
+            let age = chrono::Utc::now().timestamp_millis() - started.timestamp_millis();
+            (0..TRANSCRIPT_STARTUP_GRACE_MS).contains(&age)
+        })
 }
 
 /// The timeline entry that says a managed seat's native transcript is not shown, and why.
@@ -8998,6 +9026,80 @@ fn parameter_string(parameters: &Value, key: &str) -> Result<String, ApiError> {
         .ok_or_else(|| validation(format!("action parameters require `{key}`")))
 }
 
+#[cfg(test)]
+#[test]
+fn message_kinds_default_to_wake_and_replies_do_not_inherit_silence() {
+    assert!(message_send_tags(&json!({})).unwrap().is_empty());
+    assert!(
+        message_send_tags(&json!({"kind":"wake", "in_reply_to":"message/silent"}))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        message_send_tags(&json!({"kind":"silent"})).unwrap(),
+        vec![crate::silent::SILENT_TAG]
+    );
+    for value in [
+        json!({"kind":"question"}),
+        json!({"kind":false}),
+        json!({"kind":null}),
+        json!({"fyi":true}),
+        json!({"question":true}),
+        json!({"silent":true}),
+        json!({"kind":"wake","tags":[crate::silent::SILENT_TAG]}),
+    ] {
+        assert!(message_send_tags(&value).is_err(), "{value}");
+    }
+    assert!(message_send_tags(&json!({"kind":"silent","signature":{}})).is_err());
+    assert_eq!(
+        message_send_tags(
+            &json!({"kind":"silent","tags":[crate::silent::SILENT_TAG],"signature":{}})
+        )
+        .unwrap(),
+        vec![crate::silent::SILENT_TAG]
+    );
+}
+
+/// Silent is recorded in accepted tags; wake is the default for every sender and seat.
+fn message_send_tags(parameters: &Value) -> Result<Vec<String>, ApiError> {
+    if ["fyi", "silent", "question"]
+        .iter()
+        .any(|field| parameters.get(field).is_some())
+    {
+        return Err(validation(
+            "message.send uses kind: silent | wake, not boolean message types",
+        ));
+    }
+    let kind = match parameters.get("kind") {
+        None => "wake",
+        Some(Value::String(kind)) if matches!(kind.as_str(), "silent" | "wake") => kind.as_str(),
+        _ => return Err(validation("message kind must be silent or wake")),
+    };
+    let mut tags: Vec<String> = parameters
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    let marked_silent = tags.iter().any(|tag| crate::silent::is_silent_tag(tag));
+    if kind == "wake" && marked_silent {
+        return Err(validation(
+            "wake messages cannot carry the silent delivery tag",
+        ));
+    }
+    if kind == "silent" && !marked_silent {
+        if parameters.get("signature").is_some() {
+            return Err(validation(
+                "a signed silent message carries st3-silent in its signed tags",
+            ));
+        }
+        tags.push(crate::silent::SILENT_TAG.into());
+    }
+    Ok(tags)
+}
+
 fn validate_message_session(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -9847,14 +9949,7 @@ async fn dispatch_action(
                         .get("in_reply_to")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
-                    tags: p
-                        .get("tags")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect(),
+                    tags: message_send_tags(p)?,
                     attachments: p
                         .get("attachments")
                         .cloned()
@@ -15992,6 +16087,44 @@ mission "example/steps" state="ready" {
             .collect::<BTreeMap<_, _>>();
         assert_eq!(progress[runs[0].as_str()], "Half built.");
         assert_eq!(progress[runs[1].as_str()], Value::Null);
+        let progressed = claimed
+            .steps
+            .iter()
+            .find(|step| step.step == "build")
+            .unwrap();
+        let expected_at = progressed.progress_at_unix_ms.map(client_timestamp);
+        assert!(expected_at.is_some());
+        let projected = details.iter().find(|run| run["id"] == runs[0]).unwrap();
+        let build = projected["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["path"] == "build")
+            .unwrap();
+        assert_eq!(build["progress_at"], json!(expected_at));
+        assert_eq!(projected["current_steps"][0]["progress_at"], json!(expected_at));
+        let no_progress = details.iter().find(|run| run["id"] == runs[1]).unwrap();
+        assert!(no_progress["steps"].as_array().unwrap().iter().all(|step| step["progress_at"].is_null()));
+        // Renewing the operational lease does not prove the claimant made progress.
+        state.store.work_action(&progressed.subject, "renew", &crate::model::WorkRequest {
+            actor: progressed.claimant.clone(),
+            incarnation: Some("builder-1".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: "progress-timestamp-renew".into(),
+        }).unwrap();
+        let index = state.store.index().unwrap();
+        let work = super::client_work_resources(&state.store, None, false, client_now_ms(), index).unwrap();
+        let item = work.iter().find(|step| step["id"] == progressed.subject).unwrap();
+        assert_eq!(item["progress_at"], json!(expected_at));
+        let item_detail = super::client_work_item(&state.store, &progressed.subject, None, client_now_ms(), index)
+            .unwrap()
+            .unwrap();
+        assert_eq!(item_detail["progress_at"], json!(expected_at));
+        let cards = mission_list_cards(&state.store, &["mission/example/steps".into()]).unwrap();
+        assert!(cards[0]["run_details"].as_array().unwrap().iter().all(|run|
+            run["steps"].as_array().unwrap().iter().all(|step| step.get("progress_at") == Some(&Value::Null))));
         let tree_runs = tree["runs"]
             .as_array()
             .unwrap()
@@ -18356,6 +18489,86 @@ mission "example/zero-run" state="ready" {
             stale.reason.contains("does not name a driver process") && !stale.not_yet,
             "{stale:?}"
         );
+    }
+
+    #[test]
+    fn a_seat_that_started_moments_ago_is_starting_not_failed() {
+        // Nathan, 2026-10-10: a new agent's conversation said it could not be loaded for a
+        // while. Whatever binding piece is missing, a seat in its first minutes is starting.
+        let age = |seconds: i64| {
+            let started = chrono::Utc::now() - chrono::Duration::seconds(seconds);
+            format!("1234:{}", started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        };
+        assert!(super::started_recently(&age(5)));
+        assert!(!super::started_recently(&age(600)));
+        assert!(!super::started_recently("native-pty:current"));
+        assert!(!super::started_recently("no-colon"));
+        // A start time in the future is not "recent": the clock is wrong, not the seat young.
+        assert!(!super::started_recently(&age(-60)));
+
+        for (seconds, not_yet) in [(5, true), (600, false)] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let mut state = test_state_named(root.path(), "managed-claude-young-test");
+            state.native_session_home = Some(home);
+            let owner = "agent/managed-claude-young";
+            let incarnation = age(seconds);
+            let append = |kind: &str, fields: BTreeMap<String, Value>| {
+                state
+                    .store
+                    .append_claim(&ClaimInput {
+                        subject: owner.into(),
+                        kind: kind.into(),
+                        actor: Some(owner.into()),
+                        fields,
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            };
+            append(
+                "runtime.observed",
+                BTreeMap::from([
+                    ("status".into(), json!("running")),
+                    ("runtime_id".into(), json!("managed-claude-pty")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("terminal".into(), json!(true)),
+                ]),
+            );
+            append(
+                "harness.observed",
+                BTreeMap::from([
+                    ("state".into(), json!("working")),
+                    ("driver".into(), json!("claude")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("evidence_incarnation".into(), json!("4194303-1000-0")),
+                ]),
+            );
+            let session = ClientSession::local(Some("person/alex")).unwrap();
+            let items = timeline_value(
+                &state,
+                &new_client_snapshot(&state),
+                &session,
+                &super::managed_session_id(owner, &incarnation),
+                &ClientListQuery::default(),
+            )
+            .unwrap()
+            .0["items"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let notice = items
+                .iter()
+                .find(|item| item["body"]["code"] == "transcript-not-bound")
+                .expect("the timeline says why the transcript is missing");
+            assert_eq!(
+                notice["body"]["details"]["not_yet"] == true,
+                not_yet,
+                "{seconds}s old: {notice:#}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,56 @@
+{
+  "name": "@smalltalk/fractal-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/kit.tsx",
+    "./tokens.css": "./src/tokens.css",
+    "./assistant-ui": "./src/assistant-ui/index.ts",
+    "./assistant-ui/shell": "./src/assistant-ui/shell.ts",
+    "./assistant-ui/resources": "./src/assistant-ui/resources/index.ts",
+    "./assistant-ui/work-log": "./src/assistant-ui/taste/work-log.ts",
+    "./assistant-ui/tool-attention": "./src/assistant-ui/embrace-tool-attention.ts",
+    "./assistant-ui/workbench-model": "./src/assistant-ui/workbench/workbench-model.ts",
+    "./assistant-ui/sync": "./src/assistant-ui/st3-views/index.ts",
+    "./assistant-ui/sync-status": "./src/assistant-ui/st3-views/sync-line.ts"
+  },
+  "scripts": {
+    "storybook": "storybook dev -p 53705 --host 127.0.0.1 --no-open --disable-telemetry",
+    "build-storybook": "storybook build --disable-telemetry",
+    "typecheck": "tsc --noEmit",
+    "test:palettes": "node --test src/legacy-palettes.test.mjs",
+    "test:transcript": "node --test --test-force-exit src/assistant-ui/composition/Transcript.unit.test.mjs",
+    "check:shell-imports": "node scripts/check-shell-imports.mjs",
+    "test:work-log": "node --test --test-force-exit src/assistant-ui/taste/work-log.unit.test.mjs"
+  },
+  "dependencies": {
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-aria-components": "1.21.1",
+    "react-aria": "3.52.1",
+    "@assistant-ui/react": "0.15.25",
+    "@stylexjs/stylex": "0.19.0",
+    "@effect/atom-react": "4.0.0-rc.118",
+    "effect": "4.0.0-rc.118",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
+    "refractor": "5.0.0"
+  },
+  "devDependencies": {
+    "storybook": "10.6.1",
+    "@storybook/react-vite": "10.6.1",
+    "@storybook/addon-a11y": "10.6.1",
+    "@storybook/addon-docs": "10.6.1",
+    "@tailwindcss/vite": "4.2.2",
+    "@stylexjs/unplugin": "0.19.0",
+    "tailwindcss": "4.2.2",
+    "typescript": "6.0.3",
+    "@types/node": "26.6.4",
+    "@types/hast": "3.0.5",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "vite": "8.0.5"
+  },
+  "packageManager": "pnpm@12.7.0"
+}

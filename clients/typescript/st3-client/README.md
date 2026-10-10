@@ -60,6 +60,12 @@ headers.
 Web streams require a header-capable `socket` factory: the browser's native
 WebSocket API cannot set these headers.
 
+Collection subscribe commands additionally carry `trace: { traceparent, tracestate? }`, captured when the subscribe is issued rather than when a queued command flushes; daemons ignore unknown command fields.
+
+`client.withTraceContext(callback)` returns a view whose requests and streams carry that callback's context instead, sharing credentials, transport, and discovered capabilities with the original. Use it when one call has its own span, since an asynchronous call reads the callback after its first `await`.
+
+Browser `WebSocket` cannot set headers. A browser socket factory must move the context it receives in `headers` to the `traceparent`/`tracestate` URL query parameters, which the Fractal gateway validates and strips before forwarding.
+
 ## Rich Effect schemas
 
 Import `@smalltalk/st3-client/schema` (or `Schema.generated.ts` directly) for Effect 4 `Schema.Struct` codecs and their `typeof X.Type` decoded types. Rich consumers must provide the pinned `effect@4.0.0-rc.118` peer dependency. The raw client entry point does not import Effect, so existing fetch/Expo consumers need no dependency or API migration.

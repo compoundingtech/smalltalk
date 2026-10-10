@@ -489,7 +489,7 @@ export function conversationEntries(timeline: Entry[], names: Names, filters: re
       }
       case 'error': {
         if (str(body.code) === 'transcript-not-bound' && record(body.details).not_yet === true) {
-          push(entry, entry.id, { kind: 'event', tone: 'quiet', text: 'nothing in the harness yet since this seat started' });
+          push(entry, entry.id, { kind: 'event', tone: 'quiet', text: 'starting · transcript unavailable until the harness writes its first line' });
           break;
         }
         const tone = diagnosticTone(body);

@@ -2490,6 +2490,9 @@ impl UsageBy {
 
 #[derive(Args)]
 struct UsageArgs {
+    /// Count coordination messages only, without token usage or message bodies (JSON output).
+    #[arg(long)]
+    messages_only: bool,
     /// Length of the period ending now.
     #[arg(long, default_value_t = 24)]
     hours: u64,
@@ -4242,8 +4245,11 @@ enum MessageCommand {
     /// Send one durable normalized message to an agent.
     ///
     /// A message is a direct connection: it wakes the recipient agent for a full turn,
-    /// which rereads its context. People have no inbox: a send or reply to a person fails.
-    /// To reach a person, print in the chat.
+    /// which rereads its context. Use `--kind wake` (the default) for a question, answer or conversational handoff, `st work handoff` for work, and `--kind silent` for anything
+    /// else, which wakes nobody and reaches the recipient at its next turn. Status goes to
+    /// `work progress` (it lands in the graph and wakes nobody), run events to report-to.
+    /// People have no inbox: a send or reply to a person fails. To reach a person, print in
+    /// the chat.
     Send(MessageSendArgs),
     /// List the current mailbox for one explicit identity.
     Ls(MessageListArgs),
@@ -4255,7 +4261,7 @@ enum MessageCommand {
     /// Reply to one canonical message ID while preserving its thread.
     ///
     /// A message is a direct connection: it wakes the recipient agent for a full turn,
-    /// which rereads its context.
+    /// which rereads its context. A reply that only acknowledges or reports is `--kind silent`.
     Reply(MessageReplyArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
@@ -4339,6 +4345,8 @@ struct MessageSendArgs {
     /// member and fetched by the machine that reads or delivers the message.
     #[arg(long = "attach", value_name = "FILE")]
     attach: Vec<PathBuf>,
+    #[command(flatten)]
+    wake: MessageWakeArgs,
     /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
@@ -4347,6 +4355,31 @@ struct MessageSendArgs {
     /// the message already sent instead of sending it twice.
     #[arg(long)]
     idempotency_key: Option<String>,
+}
+
+/// Whether a message wakes its recipient. A person's message, a handoff, a fault, a ready step
+/// and a gh watch event always wake it.
+#[derive(Args)]
+struct MessageWakeArgs {
+    /// Wake the recipient (default), or hold unread mail for its next real turn.
+    #[arg(long, value_parser = ["silent", "wake"], default_value = "wake")]
+    kind: String,
+}
+
+impl Default for MessageWakeArgs {
+    fn default() -> Self {
+        Self {
+            kind: "wake".into(),
+        }
+    }
+}
+
+impl MessageWakeArgs {
+    fn tags(&self) -> impl Iterator<Item = String> {
+        (self.kind == "silent")
+            .then(|| st3::silent::SILENT_TAG.to_owned())
+            .into_iter()
+    }
 }
 
 #[derive(Args)]
@@ -4395,6 +4428,8 @@ struct MessageReplyArgs {
     /// Attach an image (PNG, JPEG, GIF or WebP, at most 10 MiB, up to 4).
     #[arg(long = "attach", value_name = "FILE")]
     attach: Vec<PathBuf>,
+    #[command(flatten)]
+    wake: MessageWakeArgs,
     /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
@@ -6163,6 +6198,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let _contention_retry = retry_projection_contention(Arc::downgrade(&store), notify.clone(), event_notify.clone(), config.state_dir.clone());
     tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(migrate_event_payloads(store.clone()));
+    tokio::spawn(catch_up_coordination_counts(store.clone()));
     spawn_response_expiry(store.clone());
     tokio::spawn(trim_local_observations(
         store.clone(),
@@ -9689,10 +9725,15 @@ async fn run_usage(client: &Client, args: UsageArgs, json_output: bool) -> Resul
     anyhow::ensure!(args.hours > 0, "usage hours must be positive");
     let until = current_unix_ms()? as u64;
     let since = until.saturating_sub(args.hours.saturating_mul(3_600_000));
+    let path = if args.messages_only {
+        "/v1/usage/messages"
+    } else {
+        "/v1/usage"
+    };
     let report: Value = client
-        .get(&format!("/v1/usage?since_ms={since}&until_ms={until}"))
+        .get(&format!("{path}?since_ms={since}&until_ms={until}"))
         .await?;
-    if json_output {
+    if json_output || args.messages_only {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -15372,6 +15413,7 @@ async fn run_attention(
                     tags: Vec::new(),
                     from: actor,
                     attach: Vec::new(),
+                    wake: MessageWakeArgs::default(),
                     print_kdl: false,
                     idempotency_key: args.idempotency_key,
                 },
@@ -16609,6 +16651,7 @@ async fn run_message(
                     in_reply_to: Some(original.subject),
                     tags: Vec::new(),
                     from: args.from,
+                    wake: args.wake,
                     print_kdl: args.print_kdl,
                     idempotency_key: args.idempotency_key,
                 },
@@ -16854,6 +16897,15 @@ async fn send_message(
     st3::model::refuse_person_recipient(&to).map_err(|error| anyhow::anyhow!(error.message))?;
     reject_foreign_agent_actor(&args.from)?;
     let from = normalize_message_subject(&args.from);
+    let mut args = args;
+    if args.wake.kind == "wake" && args.tags.iter().any(|tag| tag == st3::silent::SILENT_TAG) {
+        anyhow::bail!("wake messages cannot carry the silent delivery tag; use --kind silent");
+    }
+    for tag in args.wake.tags() {
+        if !args.tags.contains(&tag) {
+            args.tags.push(tag);
+        }
+    }
     let kdl = message_mission_intent(
         &mission_id,
         &id,
@@ -16891,7 +16943,10 @@ async fn send_message(
             if let Some(previous) = hour.checked_sub(1) {
                 let previous = derived_message_key(&request, incarnation.as_deref(), previous);
                 match client.sent_message(&previous).await {
-                    Ok(Some(receipt)) => return Ok(Some(receipt)),
+                    Ok(Some(receipt)) => {
+                        warn_unconfirmed_silent(&request, &receipt);
+                        return Ok(Some(receipt));
+                    }
                     Ok(None) => {}
                     // A daemon from before the lookup has no such route. Its sends still repeat
                     // only within the hour.
@@ -16908,8 +16963,25 @@ async fn send_message(
         }
     };
     match client.send_message(&request).await {
-        Ok(receipt) => Ok(Some(receipt)),
+        Ok(receipt) => {
+            warn_unconfirmed_silent(&request, &receipt);
+            Ok(Some(receipt))
+        }
         Err(error) => Err(message_send_error(error, &request.idempotency_key)),
+    }
+}
+
+fn warn_unconfirmed_silent(request: &MessageSendRequest, receipt: &MessageSendReceipt) {
+    if request.from.starts_with("agent/")
+        && request
+            .tags
+            .iter()
+            .any(|tag| tag == st3::silent::SILENT_TAG)
+        && receipt.kind.as_deref() != Some("silent")
+    {
+        eprintln!(
+            "st: daemon did not confirm silent holding; this message may wake its recipient. Upgrade the sender and recipient owner daemons."
+        );
     }
 }
 
@@ -20128,7 +20200,7 @@ fn pi_family_message_frame(
     json!({
         "type": "message",
         "deliverAs": "steer",
-        "content": st_drivers::ding::with_dictation_notice(st_drivers::ding::st3_notification_with_attachments(
+        "content": st_drivers::ding::with_tag_notices(st_drivers::ding::st3_notification_with_attachments(
             &message.subject,
             &message.from,
             &message.to,
@@ -20136,7 +20208,7 @@ fn pi_family_message_frame(
             body,
             &st_drivers::ding::st3_body_sha256(body),
             attachments,
-        ), &message.tags),
+        ), &message.tags.iter().filter(|tag| tag.as_str() != st3::silent::SILENT_TAG || st3::silent::is_held(message)).cloned().collect::<Vec<_>>()),
         "meta": {
             "from": message.from,
             "messageId": message.subject,
@@ -20599,6 +20671,7 @@ async fn run_pi_channel(
                     subscription.report(serde_json::from_str(&report)?);
                 }
                 let mut cursor = None;
+                let mut pending_silent = Vec::new();
                 loop {
                     let page = if subscription.is_some() {
                         MessagePage { items: pushed_messages.clone(), has_more: false, next_cursor: None, limit: pushed_messages.len() }
@@ -20621,7 +20694,9 @@ async fn run_pi_channel(
                     }
                     // A prior incarnation's handoff is not proof that the model consumed mail.
                     // The incarnation-local set survives channel reexec and prevents repeats here.
-                    for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered")) {
+                    let mut items = page.items;
+                    st3::silent::release_page(&mut items, &mut pending_silent);
+                    for message in items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered")) {
                     if state.retry_after_ms.get(&message.subject).is_some_and(|after|
                         current_unix_ms().unwrap_or_default() < u128::from(*after)) {
                         continue;
@@ -21449,12 +21524,41 @@ fn codex_continued_thread(argv: &[String]) -> Option<String> {
         .filter(|thread| st3::native_resume::codex_check(argv, thread).is_ok())
 }
 
+/// How the Codex driver learns its person's answer to the approval it waits on: this daemon's
+/// prompt state for the seat, read from the driver's blocking control thread.
+fn codex_prompt_answers(
+    client: &Client,
+    subject: &str,
+) -> st_drivers::session_control::PromptAnswers {
+    let client = client.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let agent = urlencoding::encode(subject).into_owned();
+    st_drivers::session_control::PromptAnswers::new(move |ownership, transition| {
+        let path = format!(
+            "/v1/harness-prompts/state?agent={agent}&ownership={ownership}&transition={transition}"
+        );
+        runtime.block_on(async {
+            // Bounded: the control thread reads Codex's socket between these reads.
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                client.get::<st_drivers::session_control::PromptAnswer>(&path),
+            )
+            .await
+            .ok()?
+            .ok()
+        })
+    })
+}
+
 fn spawn_codex_provider(
+    client: &Client,
+    subject: &str,
     paths: &NativePaths,
     state_dir: &Path,
     argv: &[String],
     start: ProviderStart,
 ) -> tokio::task::JoinHandle<Result<()>> {
+    let prompt_answers = codex_prompt_answers(client, subject);
     let paths = paths.clone();
     let state_dir = state_dir.to_path_buf();
     let argv = argv.to_vec();
@@ -21477,6 +21581,7 @@ fn spawn_codex_provider(
                     paths.runtime_id,
                     argv,
                     paths.delivery_gate,
+                    Some(prompt_answers),
                     thread,
                 )
             }
@@ -21501,6 +21606,7 @@ fn spawn_codex_provider(
                 socket_path,
                 safe_fallback,
                 paths.delivery_gate,
+                Some(prompt_answers),
             ),
             ProviderStart::Adopt(session) => {
                 anyhow::bail!("a Codex driver cannot adopt this provider session: {session:?}")
@@ -21584,7 +21690,7 @@ async fn drive_codex_native(
     ))
         .then(|| codex_continued_thread(&argv))
         .flatten();
-    let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
+    let mut task = spawn_codex_provider(client, subject, &paths, &state_dir, &argv, start);
     let mut reported_session = None;
     // The Codex control pump keeps the subagent ledger; this driver records it on the seat.
     let mut subagents = st3::subagents::Publisher::start(
@@ -21650,7 +21756,7 @@ async fn drive_codex_native(
                     };
                     let _ = replacement.exec(subject, &root, &resume);
                     loop_state = resume.loop_state;
-                    task = spawn_codex_provider(&paths, &state_dir, &argv, ProviderStart::Adopt(session));
+                    task = spawn_codex_provider(client, subject, &paths, &state_dir, &argv, ProviderStart::Adopt(session));
                     completion_announced = false;
                     continue;
                 }
@@ -23194,6 +23300,16 @@ fn native_queued_message(
         ),
     ];
     tags.extend(
+        view.tags
+            .iter()
+            .filter(|tag| {
+                (tag.as_str() == st3::silent::SILENT_TAG && st3::silent::is_held(view))
+                    || tag.as_str() == "dictated"
+                    || tag.starts_with(st3::silent::REMAINING_PREFIX)
+            })
+            .cloned(),
+    );
+    tags.extend(
         attachments
             .iter()
             .map(st_drivers::ding::AttachmentNotice::to_tag),
@@ -23432,6 +23548,7 @@ async fn forward_projected_messages_reporting(
     }?;
     let mut cursor = None;
     let mut failures = Vec::new();
+    let mut pending_silent = Vec::new();
     loop {
         let page = message_page_reporting(
             client,
@@ -23441,7 +23558,10 @@ async fn forward_projected_messages_reporting(
             if cursor.is_none() { report } else { None },
         )
         .await?;
-        for message in page.items {
+        let mut items = page.items;
+        // Held mail goes to the seat only beside a message that wakes it.
+        st3::silent::release_page(&mut items, &mut pending_silent);
+        for message in items {
             active_subjects.insert(message.subject.clone());
             if matches!(message.status.as_str(), "read" | "closed") {
                 consumed_by_recipient.insert(message.subject);
@@ -24437,6 +24557,27 @@ async fn convert_envelope_payloads(store: Arc<Store>) {
     }
 }
 
+/// Exactly one awaited bootstrap job, then a pause longer than the writer's batch window.
+/// This never wakes a seat and stops once historical count metadata is complete.
+async fn catch_up_coordination_counts(store: Arc<Store>) {
+    loop {
+        let page_store = store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            st3::profile::task("task coordination-counts-catch-up", || {
+                page_store.advance_coordination_counts()
+            })
+        }).await;
+        match result {
+            Ok(Ok(true)) => return,
+            Ok(Ok(false)) => tokio::time::sleep(Duration::from_millis(100)).await,
+            error => {
+                eprintln!("st3: coordination count bootstrap failed: {error:?}");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    }
+}
+
 async fn migrate_event_payloads(store: Arc<Store>) {
     match st3::maintenance::migrate_event_payloads(store).await {
         Ok(report) if report.pending_at_start => {
@@ -24944,6 +25085,13 @@ async fn trim_local_observations(store: Arc<Store>, observations: st3::config::O
             Ok(Ok(count)) => eprintln!("st3: trimmed {count} local observations"),
             Ok(Err(error)) => eprintln!("st3: local observation trim failed: {error:#}"),
             Err(error) => eprintln!("st3: local observation trim stopped: {error}"),
+        }
+        // The database target's sample: after the trims, so it counts what they freed.
+        let size_store = store.clone();
+        match tokio::task::spawn_blocking(move || size_store.record_database_size(now_ms())).await {
+            Ok(Ok(size)) => st3::slo::note_database_size(&size),
+            Ok(Err(error)) => eprintln!("st3: database size sample failed: {error:#}"),
+            Err(error) => eprintln!("st3: database size sample stopped: {error}"),
         }
         tokio::time::sleep(LOCAL_OBSERVATION_TRIM_INTERVAL).await;
     }
@@ -25765,6 +25913,39 @@ mod tests {
             )
         );
         assert_eq!(omp["meta"]["messageId"], "message/0123456789abcdef");
+    }
+
+    #[test]
+    fn native_push_preserves_delivery_notices_and_person_signatures() {
+        let mut view = MessageView {
+            subject: "message/notice".into(),
+            from: "agent/example/writer".into(),
+            to: "agent/example/reader".into(),
+            content: "body".into(),
+            status: "sent".into(),
+            title: None,
+            in_reply_to: None,
+            tags: vec![
+                st3::silent::SILENT_TAG.into(),
+                "dictated".into(),
+                format!("{}12", st3::silent::REMAINING_PREFIX),
+            ],
+            attachments: vec![],
+            created_index: 1,
+        };
+        let queued = native_queued_message(&view, "body".into(), &[]);
+        let rendered = st_drivers::ding::with_tag_notices("body".into(), &queued.tags);
+        assert!(rendered.contains("silent: held"));
+        assert!(rendered.contains("12 older silent held; st conversations ls"));
+        assert!(rendered.contains("dictated by voice"));
+        assert_eq!(queued.body, "body");
+        view.from = "person/operator".into();
+        let queued = native_queued_message(&view, "body".into(), &[]);
+        assert!(!queued.tags.iter().any(|tag| tag == st3::silent::SILENT_TAG));
+        assert!(
+            view.tags.iter().any(|tag| tag == st3::silent::SILENT_TAG),
+            "signed durable tags are unchanged"
+        );
     }
 
     #[test]
@@ -28099,6 +28280,7 @@ mod tests {
             tags: Vec::new(),
             from: "agent/example/worker".into(),
             attach: Vec::new(),
+            wake: MessageWakeArgs::default(),
             print_kdl: false,
             idempotency_key: Some("refuse-a-person".into()),
         };

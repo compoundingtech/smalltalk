@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web keeps the shell bound to the viewport with a large roster and shows only reported values in roster rows and the thread header",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only change; no runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Client-only change against existing gateway routes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; the app is not deployed by this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

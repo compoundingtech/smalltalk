@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A new agent's conversation reads as starting instead of an error: for the first two minutes of a seat's incarnation any missing transcript binding is reported as not yet (details.not_yet) rather than a failure, stui and the phone show one calm 'starting' line for it, and an empty conversation of a starting seat says it is starting",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, stored data or transcript change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, operation or contract digest change. The transcript-not-bound timeline entry keeps its shape; details.not_yet is set in more cases."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Older clients show the same entry as before for the cases that are now not_yet; newer clients against an older daemon behave as before."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, durable payload or initialization changes."
+  }
+}

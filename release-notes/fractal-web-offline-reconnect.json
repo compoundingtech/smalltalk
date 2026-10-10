@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web marks browser offline as stale immediately, reconnects on online or explicit action, and probes a subscription on visible resume with a bounded response deadline; the footer uses user-facing connection wording without exposing gateway hosts and the composer notice has a typed app-side seam pending its shared UI slot",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only connection handling; no runtime replay change. Healthy idle sockets are not periodically recycled. Visible-resume probes neither bypass reconnect backoff nor interrupt an in-flight attempt."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change. Connection and domain observations remain memory-only."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Uses existing collection subscriptions and authoritative responses; no wire-format change. The composer-docked banner is not rendered until the shared UI supplies its notice slot."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced. A missing live-socket probe response closes the socket after 15 seconds and reuses existing backoff; removing or replacing its subscription generation cancels the deadline. Explicit reconnect may make one reachability attempt despite an offline hint, and a successful transport overrides that hint. Repeated actions coalesce until the read and upgrade complete."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; this change does not deploy the app."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change. Last-known roster and conversation content is retained while stale."
+  }
+}

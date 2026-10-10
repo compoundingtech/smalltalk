@@ -2,7 +2,7 @@
 
 The inventory covers every offered CLI command, every typed client action, every stui daemon effect, and the palette and local controls. It distinguishes real CLI/Unix transport tests, the live stui adapter, local reducer tests, and shared implementations. A test reference describes its actual layer; a shared implementation test alone is not a claim that the entire interactive UI was driven.
 
-`action-coverage.json` is the machine-readable source. Tests compare its 222 CLI rows with Clap's offered command tree, its 55 typed actions with the generated client contract and real dispatch builders, and its 19 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
+`action-coverage.json` is the machine-readable source. Tests compare its 223 CLI rows with Clap's offered command tree, its 55 typed actions with the generated client contract and real dispatch builders, and its 18 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
 
 ## Restart and stale-state model
 
@@ -354,3 +354,13 @@ edits and removes retired subjects without changing unfiltered reads.
 | edit or discard a draft | local UI state; no daemon mutation, restart fence not applicable | [`drafts_take_the_terminal_editing_keys`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/mod.rs) |
 | simplify or expand tool detail | local UI state; no daemon mutation, restart fence not applicable | [`shift_o_simplifies_every_conversation_and_back`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/mod.rs) |
 | dismiss/remind me later | local UI state; no daemon mutation, restart fence not applicable | [`remind_me_later_hides_a_message_and_the_badge_counts_what_is_left`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/mod.rs) |
+
+## Diagnostic client commands
+
+`client_commands` records `observations.report` separately from fenced graph actions.
+The real paired HTTP router control in `api/client_observations.rs` covers read-only pairing
+authorization, unpaired/revoked refusal, identical retry, conflicting reuse, body limit,
+unchanged graph index and reader/doctor population. Admission/history controls cover
+atomic validation, overlap, filesystem failure, rotation, expiry and retained files across
+fresh process-memory admission state. This is local diagnostic acceptance, without a
+replicated acknowledgement or a full-day live-phone SLO claim.
