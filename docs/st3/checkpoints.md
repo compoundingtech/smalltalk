@@ -292,7 +292,9 @@ A stable checkpoint is trimmed in two steps, and a crash between them is safe.
 A crash while the checkpoint is `recording` leaves some tombstones recorded and every row still
 present. A sealed set never reads the tombstones of a checkpoint that is `recording`, so the next
 pass plans exactly the drop it verified, records what is missing (recording a tombstone again
-changes nothing) and goes on. A crash after that leaves every tombstone recorded with some rows
+changes nothing) and goes on. If its own rows no longer give that drop (a repair arrived in
+between), it first deletes the tombstones it recorded, newest first and in the same 20 ms chunks,
+and then adopts the manifest from a peer like a node that did not take part. A crash after that leaves every tombstone recorded with some rows
 still present, and the next pass deletes what is left.
 At every point the node's inventory, authority digest and graph are the same, so peers cannot tell a
 node mid-trim from one that has not started.

@@ -975,6 +975,52 @@ fn a_trim_that_stops_anywhere_finishes_the_same_after_a_restart() {
     }
 }
 
+/// A trim stops part way through recording, and a repair then changes what the node seals before
+/// the cut, so its own plan no longer gives the drop it verified. The tombstones it recorded go
+/// before it turns to a peer's manifest.
+#[test]
+fn a_plan_that_changes_after_an_interrupted_recording_leaves_no_tombstones_behind() {
+    let scratch = tempfile::tempdir().unwrap();
+    let context = context(scratch.path(), 0);
+    let cut = newest_due_cut(context.now_unix_ms);
+    let path = scratch.path().join("alder.sqlite3");
+    let alder = Store::open(&path, "alder").unwrap();
+    let birch = Store::open_memory("birch").unwrap();
+    let checkpoint = stable_pair(&alder, &birch, &context);
+    assert_eq!(kinds(&step(&birch, &context)), ["trimmed"]);
+    alder.set_trim_chunk_envelopes(2);
+    alder.set_trim_row_cost(std::time::Duration::from_millis(12));
+    alder.set_trim_fault(Some(TrimFault::AfterTombstoneChunk(1)));
+    assert!(alder.checkpoint_step(&context).is_err());
+    drop(alder);
+
+    let alder = Store::open(&path, "alder").unwrap();
+    let recorded = |store: &Store| -> u64 {
+        store.readers.get().query_row(
+            "SELECT (SELECT COUNT(*) FROM checkpoint_envelopes) + (SELECT COUNT(*) FROM checkpoint_claims)",
+            [], |row| row.get(0),
+        ).unwrap()
+    };
+    assert!(recorded(&alder) > 0, "the crash left tombstones recorded");
+    let manifest = birch.checkpoint_manifest(&checkpoint, cut).unwrap();
+    alder.connection.write().execute(
+        "UPDATE replica_records SET state='repaired' WHERE claim_id=?1",
+        [&manifest.claims[0].id],
+    ).unwrap();
+    assert_eq!(kinds(&step(&alder, &context)), ["manifest-needed"]);
+    assert_eq!(recorded(&alder), 0, "no tombstone outlives the plan it came from");
+    assert_eq!(
+        smallclaims::store::checkpoint_trim::local_checkpoint(&alder.readers.get(), &checkpoint)
+            .unwrap()
+            .map(|(state, _)| state)
+            .as_deref(),
+        Some("plan-changed")
+    );
+    // Adopting the peer's manifest from here is what any node does that cannot trim from its
+    // own plan; `a_node_that_did_not_take_part_adopts_the_manifest_and_nothing_else` covers it.
+    assert_eq!(alder.checkpoint_manifest_need().unwrap().map(|need| need.checkpoint), Some(checkpoint));
+}
+
 #[test]
 fn a_node_that_did_not_take_part_adopts_the_manifest_and_nothing_else() {
     let scratch = tempfile::tempdir().unwrap();

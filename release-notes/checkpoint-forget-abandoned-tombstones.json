@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "An interrupted trim whose plan changed deletes the tombstones it had recorded before adopting a peer's manifest",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No tables, columns or indexes; the deletion walks each tombstone table down from its newest rowid."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "Inventories and manifests are unchanged: the deleted tombstones belong to a checkpoint still recording, which no sealed set or manifest reads, and their envelopes are still held."},
+  "downtime": {"status": "none", "detail": "None. Deletion runs in 20 ms transactions."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Binary rollback needs no store change."}
+}
