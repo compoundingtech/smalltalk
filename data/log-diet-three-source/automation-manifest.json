@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "scope": "SOURCE AUTOMATION PREPARATION ONLY; no publication/execution assignment",
+  "automation_base": "5e4c45196413a44d85ebe2807dfcca15cd1144f5",
+  "source_recipe_review": "doc/fleet/smalltalk/speed/2026-10-10/log-diet-three-source-recipe-review@942f0632e011b753dedd91ca8c9691ebf4f576e29300db6484363ec9f04abe04",
+  "files": [
+    {
+      "path": ".github/workflows/perf.yml",
+      "bytes": 9765,
+      "sha256": "fb26c5e659b7991e98dde2777a1380b156a1890fc517831d72b8965ffe757aad"
+    },
+    {
+      "path": ".github/workflows/perf.yml.genie.ts",
+      "bytes": 9250,
+      "sha256": "f24eb0d9e274ad340810394469e3eace575b5e188fdf825a9967a2a98d6b8ac9"
+    },
+    {
+      "path": "scripts/ci-log-diet-actionlint.py",
+      "bytes": 799,
+      "sha256": "9b0da36d32bdff4e05f2f46a618d64c8cf4aab2111ab3ce1d7eb4c50baff9a50"
+    },
+    {
+      "path": "scripts/ci-log-diet-arm.py",
+      "bytes": 8407,
+      "sha256": "430ccc73fdc6e7a89ff174335fe5807a41eb967c2116a8ea4cd32a5e0e76b6b7"
+    },
+    {
+      "path": "scripts/ci-log-diet-common.py",
+      "bytes": 11879,
+      "sha256": "f64a69133b172affcbafffe0031f77f77b36696a32d95e26f4766c3bbcb41202"
+    },
+    {
+      "path": "scripts/ci-log-diet-study.py",
+      "bytes": 10106,
+      "sha256": "7f2572ee50fe718335f7d94b3e27b822bd52859bf24f9d097016bb4eb5c9d925"
+    },
+    {
+      "path": "scripts/ci-log-diet-test.py",
+      "bytes": 19538,
+      "sha256": "5f7afe66be2684a43d293a447413ca2e54e5dbd9be84e04e069ae20536d13c9c"
+    },
+    {
+      "path": "data/log-diet-three-source/actionlint.yaml",
+      "bytes": 209,
+      "sha256": "870d5557d614c04bea4c835a75337e9d80dbf227456e93ac4aeacd4c2de2b805"
+    },
+    {
+      "path": "data/log-diet-three-source/diagnostic.patch",
+      "bytes": 7034,
+      "sha256": "1f7f1c17318b6c2f7b4be79555b61bed37102bea81be2e2e4d3279aba7ee3ed2"
+    },
+    {
+      "path": "data/log-diet-three-source/guardian.py",
+      "bytes": 6853,
+      "sha256": "516bd69b22eedcd006925070ab5011c9c270e89451a77473940a592369d22acc"
+    },
+    {
+      "path": "data/log-diet-three-source/identity.json",
+      "bytes": 1800,
+      "sha256": "81e04cc9ae2b8ec081a0fbfdcfdde6583c235ca0a8c13d3d65c0ec5b5d60ff6f"
+    },
+    {
+      "path": "data/log-diet-three-source/recipe.json",
+      "bytes": 11906,
+      "sha256": "8c8e65fa75412faabb13b9d8836fe8564ee735122bbda9d1f27ea021798186a8"
+    },
+    {
+      "path": "data/log-diet-three-source/source.bundle",
+      "bytes": 29712168,
+      "sha256": "24e647764a5ea4a295c0d20d54e0eec99770b40812352fb332bede83b1fb9a8b"
+    },
+    {
+      "path": "data/log-diet-three-source/sources.json",
+      "bytes": 12300,
+      "sha256": "f9a8daf275f35787a0be45e07da52a541fdaf75501d45b08b3fa709f363cf5d9"
+    },
+    {
+      "path": "release-notes/log-diet-three-source-diagnostic.json",
+      "bytes": 1131,
+      "sha256": "a0dd23d5bfdea25fda0eaf620956c2507a79d5c69905bf6c7ffdc430bd29d4e3"
+    }
+  ],
+  "manifest_self_hash_excluded": true,
+  "assignment_input_contract": "doc/fleet/smalltalk/speed/2026-10-10/log-diet-three-source-execution-assignment@64-lowercase-hex (future explicit Speed assignment; absent now)",
+  "limits": {
+    "setup": 600,
+    "arms": 3,
+    "arm": 1800,
+    "active_per_arm": 1680,
+    "case": 180,
+    "cleanup_per_arm": 120,
+    "work_cutoff": 6000,
+    "upload": 900,
+    "initial_margin": 300,
+    "job": 7200
+  },
+  "known_source_correction": "Frozen flakes have devShells.default and devShells.genie, not #ci. Source pins unchanged.",
+  "snapshot_not_live_main": true
+}

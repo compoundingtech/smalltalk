@@ -1,0 +1,189 @@
+{
+  "scope": "SOURCE/RECIPE ONLY, no execution/publication grant",
+  "disposition": "doc/fleet/smalltalk/speed/2026-10-10/reconcile-log-diet-diagnostic-source-disposition@d497c62967be7154137b09c75cf8474c37c450f1abf39737f2f483c0f8526091",
+  "cut": "step-run/01a10b272a4e794396203ea7c69937e3/cut",
+  "source_order": [
+    "5e4c45196413a44d85ebe2807dfcca15cd1144f5",
+    "32895fd5f7571ac98b5e4814bab6fced6daf3c6b",
+    "af02c83f923abf27e21ec56757e7c928677dcac2"
+  ],
+  "source_transfer": {
+    "path": "/home/myobie/.local/state/st3/agent-artifacts/ci-speed-2026-10-05/log-diet-three-source-planning/frozen-three-source.bundle",
+    "bytes": 29712168,
+    "sha256": "24e647764a5ea4a295c0d20d54e0eec99770b40812352fb332bede83b1fb9a8b",
+    "heads": [
+      "5e4c45196413a44d85ebe2807dfcca15cd1144f5 refs/heads/frozen/main",
+      "32895fd5f7571ac98b5e4814bab6fced6daf3c6b refs/heads/frozen/32895",
+      "af02c83f923abf27e21ec56757e7c928677dcac2 refs/heads/frozen/af02"
+    ],
+    "complete_history": "bundled from exact locally held source objects; no prerequisites selected",
+    "candidate_checkout_or_execution": false,
+    "overlay_included": false
+  },
+  "source_manifest_sha256": "f9a8daf275f35787a0be45e07da52a541fdaf75501d45b08b3fa709f363cf5d9",
+  "selected_test": {
+    "package": "st3",
+    "binary": "integration",
+    "features": [
+      "test-support"
+    ],
+    "name": "log_diet::a_busy_daemon_replicates_at_most_a_fifth_of_what_main_would",
+    "ignored": false,
+    "cases_total": 3,
+    "case_per_source": 1,
+    "retries": 0,
+    "no_fe48_fourth": true,
+    "no_ten_minute_ignored_case": true,
+    "inventory": "actual exact nonignored name count1 in integration inventory before each case; zero/multiple refuse"
+  },
+  "hosted_job": {
+    "workflow": "perf.yml / exact perf.yml.genie.ts, new diagnostic manual-only job; full generated parity required",
+    "jobs": 1,
+    "runs_on": [
+      "nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=2",
+      "namespace-features:github.run-id=${{ github.run_id }}"
+    ],
+    "timeout_minutes": 120,
+    "permissions": "contents/read only; no host SSH/token/runner-capacity mutation",
+    "other_jobs": "all existing productive events/bytes preserved; no perf-load on this diagnostic dispatch",
+    "dispatch_assignment": "REQUIRES future separately recorded immutable execution assignment; currently absent"
+  },
+  "bounds": {
+    "first_step_start": "CLOCK_MONOTONIC samehost; capture before checkout/install, immutable run/attempt/job/runner binding",
+    "setup_seconds": 600,
+    "commands": 3,
+    "command_seconds": 1800,
+    "command_active_seconds": 1680,
+    "cleanup_reserve_per_command_seconds": 120,
+    "child_case_seconds": 180,
+    "work_cutoff_from_first_step_seconds": 6000,
+    "upload_reserve_seconds": 900,
+    "initial_action_margin_seconds": 300,
+    "hard_job_seconds": 7200,
+    "sum": "600+3*1800+900+300=7200",
+    "rules": "Arm end is min(pre-nix startup+1800, first-step+6000); active=end-120. Full180 external case or refuse. No resets or shortened case."
+  },
+  "three_top_level_commands": [
+    "See ci-log-diet-study.py argv: arm window.json is fixed BEFORE nix develop; no inner budget reset.",
+    "See ci-log-diet-study.py argv: arm window.json is fixed BEFORE nix develop; no inner budget reset.",
+    "See ci-log-diet-study.py argv: arm window.json is fixed BEFORE nix develop; no inner budget reset."
+  ],
+  "arm_command_contract": {
+    "one_compile": [
+      "cargo",
+      "test",
+      "-p",
+      "st3",
+      "--features",
+      "test-support",
+      "--test",
+      "integration",
+      "--locked",
+      "--no-run",
+      "--message-format=json"
+    ],
+    "no_extra_compile": "No cargo-nextest list/build, no fallback or second Cargo invocation after a failed build; resolved feature metadata read-only cargo metadata --locked --offline after successful compile, charged to same budget.",
+    "actual_executable": "parse exactly one matching Cargo compiler-artifact packageid st3/target integration/test-profile executable; hash actual binary and record profile/features/tool/env; no source-name-as-binary inventory inference",
+    "actual_inventory": [
+      "{actual_binary}",
+      "--exact",
+      "log_diet::a_busy_daemon_replicates_at_most_a_fifth_of_what_main_would",
+      "--list",
+      "--format",
+      "terse"
+    ],
+    "case_argv": [
+      "python3",
+      "scripts/st3_test_process.py",
+      "--owner",
+      "{arm_controller_pid}",
+      "--temporary-root",
+      "HOME",
+      "log-diet-home-",
+      "{private_arm_parent}",
+      "--temporary-root",
+      "TMPDIR",
+      "log-diet-tmp-",
+      "{private_arm_parent}",
+      "--keep",
+      "--",
+      "{gnu_timeout}",
+      "--signal=TERM",
+      "--kill-after=10s",
+      "180s",
+      "{actual_binary}",
+      "--exact",
+      "log_diet::a_busy_daemon_replicates_at_most_a_fifth_of_what_main_would",
+      "--nocapture",
+      "--test-threads",
+      "1"
+    ],
+    "case_deadline": "Require at least full180 before active cutoff. Always GNU timeout180; never shorten original case. Guardian cleanup is charged to the same arm end.",
+    "normal_environment": "No owner unset/impersonation, no CARGO_SLOT_HELD/CARGO_REAL/priority/heavy/general-slot/cache/toolchain/DBUS override; PATH resolves normal installed Cargo/devshell. Keep actual GITHUB_ACTIONS/event/run/job identity. Preserve bus/runtime/cgroup/slices. No ssh local path.",
+    "admission_checks": "Before devshell and before Cargo record only allowlisted nonsecret CI keys, owner presence/value, executable paths+hashes, cgroup membership and controller PID/starttime; preserve any installed wrappers. Refuse owner-impersonation request or mismatch, do not sanitize before admission.",
+    "fixture_identity": [
+      {
+        "source": "5e4c45196413a44d85ebe2807dfcca15cd1144f5",
+        "api_path": "crates/st3/src/api.rs",
+        "api_blob": "ddfc75a059429e4bfeb8e171b0b174b0b7319502",
+        "fixture_sha256": "5c14137a6f42daeeb27593ecb18bac9265c9b1e14b656d50c8feab151f5be408",
+        "same_process_server_client": "Daemon::start tokio server task + Client::Unix; does not launch host daemon",
+        "binding": "serve_unix->serve_unix_inner(...,false)->bind_ancestry=false; no agent-header masquerade or owner removal required",
+        "warning": "Must reverify in final effective overlay; source witness is not runtime proof"
+      },
+      {
+        "source": "32895fd5f7571ac98b5e4814bab6fced6daf3c6b",
+        "api_path": "crates/st3/src/api.rs",
+        "api_blob": "7a95057fab4be9afe77507f3727996eedaab6b92",
+        "fixture_sha256": "5c14137a6f42daeeb27593ecb18bac9265c9b1e14b656d50c8feab151f5be408",
+        "same_process_server_client": "Daemon::start tokio server task + Client::Unix; does not launch host daemon",
+        "binding": "serve_unix->serve_unix_inner(...,false)->bind_ancestry=false; no agent-header masquerade or owner removal required",
+        "warning": "Must reverify in final effective overlay; source witness is not runtime proof"
+      },
+      {
+        "source": "af02c83f923abf27e21ec56757e7c928677dcac2",
+        "api_path": "crates/st3/src/api.rs",
+        "api_blob": "7a95057fab4be9afe77507f3727996eedaab6b92",
+        "fixture_sha256": "5c14137a6f42daeeb27593ecb18bac9265c9b1e14b656d50c8feab151f5be408",
+        "same_process_server_client": "Daemon::start tokio server task + Client::Unix; does not launch host daemon",
+        "binding": "serve_unix->serve_unix_inner(...,false)->bind_ancestry=false; no agent-header masquerade or owner removal required",
+        "warning": "Must reverify in final effective overlay; source witness is not runtime proof"
+      }
+    ],
+    "guardian_path": "scripts/st3_test_process.py",
+    "guardian_sha256": "516bd69b22eedcd006925070ab5011c9c270e89451a77473940a592369d22acc",
+    "guardian_semantics": "Pinned existing clean exec if needed, owner+launcher pidfds opened before double fork, setsid+double fork, PR_SET_CHILD_SUBREAPER before task, task pidfd watched, SIGTERM/owner death causes owned task group kill and adopted descendant kill/reap, returned status only after no children. No wider fleet census/signalling.",
+    "process_cleanup": "Guardian wraps selected child, controller owns Cargo group until compile finishes. Cancellation/timeout signal only recorded live owned groups with pid/starttime validation; await pinned guardian returned status and no children under command120 cleanup bound; missing proof of cleanup stops all later arms, no forced unrelated kill. Need concrete reviewed orchestrator implementation before execution.",
+    "source_build_identity": "Record original source/tree and corrected overlay effective commit/tree/blob manifest, automation separate. Cargo manifests/toolchains differ across main and historical arms; record per-arm actual toolchain/libclosure/features, do not assert build parity.",
+    "cache": "Normal existing Nix/cache configuration only, no new shared snapshot writer/restore or sccache bypass",
+    "stores": "Fixture retains private memoryStore and TempDir as source; guardian-owned HOME/TMPDIR preserved on success/failure, no fixture behavior change",
+    "devshell": "Actual frozen devShells.default for each arm; actual devShells.genie for automation preflight. Prior proposed #ci did not exist and is superseded."
+  },
+  "terminal": {
+    "source_outcome": "Each actual initial named PASS or FAIL only; build failure/zero selection/timeouts/cleanup incomplete/missing diagnostics are incomplete, never PASS",
+    "expected_raw": "Exactly running1 + named full initial result +1 passed/0failed/0ignored on success; no synthetic nested double-harness expectation (log_diet does not supervise_test itself)",
+    "negative_retention": "Keep build stdout/stderr/status, inventory/raw/terminal diagnosis, failure-preserving diagnostic output or explicit unavailable, argv/source/envhash/tool/binary identities and all fresh private files; bound output -> incomplete rather than silent truncation. No secrets/authheaders in receipt.",
+    "continue": "Only complete original named PASS or FAIL with confirmed cleanup and actual diagnostic completeness continues; missing/malformed/unavailable/truncated witness on FAIL preserves FAIL and stops remaining arms.",
+    "aggregate": "Three independent histories, no causal/pair/producer/performance/cure/parent2140GO from success",
+    "upload": "always original artifacts/manifest with hashes within900s; failure stays incomplete even if upload succeeds"
+  },
+  "pending_dependencies": [
+    "Independent exact automation source/generated/input/resource review and separately recorded immutable execution/publication assignment."
+  ],
+  "validation_now": "All3actualbase/overlaytree+singlepath/blob identities independently reconstructed with isolated indexes; transferredbundle and sourcehashes verified. Python AST parse only. No candidatecheckout, compiler/Rust/native/SQLite/control execution.",
+  "fc871": "Existing run38053247996 and original resources/deadlines untouched",
+  "overlay": {
+    "document": "doc/fleet/smalltalk/reconcile-cost/2026-10-10/log-diet-failure-witness-v2@3bd8baf9a8182a73d1e9596639be8af01502cc40237b4dd11e9f19be11448158",
+    "patch_sha256": "1f7f1c17318b6c2f7b4be79555b61bed37102bea81be2e2e4d3279aba7ee3ed2",
+    "effective_trees": [
+      "f4965e5a18c717625e7a8f5e1c78460983c1690e",
+      "003cf2446c8fd2554adac06a0f5871ebe2f3a4fd",
+      "fe48e3dca6b267ca7ab2e49adae26594b65ca7c8"
+    ],
+    "changed_path": "crates/st3/tests/log_diet.rs",
+    "overlay_blob": "32af4ebd36701b1a93e4eca9126a2e7d3ace15b0",
+    "overlay_sha256": "5f87ca42481f23f7aa6301d5074a4d42ece44ac196ead0f25b5c1af89d9b3515",
+    "original_failure_preserved": "Originaloutcome held, catch_unwind-contained diagnostic, same unwrap/assertion, failure-only reporting; independent runtimebehavior still UNRUN",
+    "old_e1d": "superseded; not used"
+  }
+}

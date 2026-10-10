@@ -1,0 +1,29 @@
+[
+  {
+    "source": "5e4c45196413a44d85ebe2807dfcca15cd1144f5",
+    "api_path": "crates/st3/src/api.rs",
+    "api_blob": "ddfc75a059429e4bfeb8e171b0b174b0b7319502",
+    "fixture_sha256": "5c14137a6f42daeeb27593ecb18bac9265c9b1e14b656d50c8feab151f5be408",
+    "same_process_server_client": "Daemon::start tokio server task + Client::Unix; does not launch host daemon",
+    "binding": "serve_unix->serve_unix_inner(...,false)->bind_ancestry=false; no agent-header masquerade or owner removal required",
+    "warning": "Must reverify in final effective overlay; source witness is not runtime proof"
+  },
+  {
+    "source": "32895fd5f7571ac98b5e4814bab6fced6daf3c6b",
+    "api_path": "crates/st3/src/api.rs",
+    "api_blob": "7a95057fab4be9afe77507f3727996eedaab6b92",
+    "fixture_sha256": "5c14137a6f42daeeb27593ecb18bac9265c9b1e14b656d50c8feab151f5be408",
+    "same_process_server_client": "Daemon::start tokio server task + Client::Unix; does not launch host daemon",
+    "binding": "serve_unix->serve_unix_inner(...,false)->bind_ancestry=false; no agent-header masquerade or owner removal required",
+    "warning": "Must reverify in final effective overlay; source witness is not runtime proof"
+  },
+  {
+    "source": "af02c83f923abf27e21ec56757e7c928677dcac2",
+    "api_path": "crates/st3/src/api.rs",
+    "api_blob": "7a95057fab4be9afe77507f3727996eedaab6b92",
+    "fixture_sha256": "5c14137a6f42daeeb27593ecb18bac9265c9b1e14b656d50c8feab151f5be408",
+    "same_process_server_client": "Daemon::start tokio server task + Client::Unix; does not launch host daemon",
+    "binding": "serve_unix->serve_unix_inner(...,false)->bind_ancestry=false; no agent-header masquerade or owner removal required",
+    "warning": "Must reverify in final effective overlay; source witness is not runtime proof"
+  }
+]

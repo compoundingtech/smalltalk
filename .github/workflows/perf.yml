@@ -39,7 +39,13 @@ on:
       - scripts/ci-perf*
       - scripts/ci-nix-cache
       - .github/workflows/perf.yml
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      log_diet_assignment:
+        description: Immutable separately approved three-source diagnostic assignment
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -51,7 +57,74 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
 jobs:
+  log-diet-three-source:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.log_diet_assignment != '' }}
+    name: log-diet-three-source
+    runs-on:
+      [
+        nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=2,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      LOG_DIET_ASSIGNMENT: ${{ inputs.log_diet_assignment }}
+    steps:
+      - name: Bind the first-step absolute deadline before checkout or installation
+        run: |
+          python3 - <<'PYBOOT'
+          import json, os, time, hashlib
+          from pathlib import Path
+          start = time.monotonic()
+          root = Path(os.environ['RUNNER_TEMP']) / 'log-diet-three-source'
+          root.mkdir()
+          keys = ('ST_AGENT','ST3_SUBJECT','GITHUB_ACTIONS','GITHUB_EVENT_NAME','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_JOB','RUNNER_NAME')
+          identity = {k: os.environ.get(k) for k in keys}
+          record = {'identity': identity, 'start': start, 'cutoff': start + 6000, 'setup_end': start + 600, 'upload_end': start + 6900, 'boot_sha256': hashlib.sha256(Path('/proc/sys/kernel/random/boot_id').read_bytes()).hexdigest()}
+          with (root / 'deadline.json').open('x') as f: json.dump(record, f)
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write('LOG_DIET_ROOT=' + str(root) + '\nLOG_DIET_DEADLINE=' + str(root / 'deadline.json') + '\n')
+          PYBOOT
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+      - name: Full generation, actionlint and three original cases under shared deadlines
+        run: python3 scripts/ci-log-diet-study.py study --repo "$GITHUB_WORKSPACE" --root "$LOG_DIET_ROOT" --deadline "$LOG_DIET_DEADLINE" --assignment "$LOG_DIET_ASSIGNMENT"
+      - id: retain
+        name: Retain negative and incomplete outcomes before upload
+        if: always()
+        run: python3 scripts/ci-log-diet-study.py retain --root "$LOG_DIET_ROOT" --deadline "$LOG_DIET_DEADLINE"
+      - name: Retain original diagnostics and actual tool, feature, binary and cleanup receipts
+        if: always() && steps.retain.outputs.upload_minutes != ''
+        uses: actions/upload-artifact@v4
+        timeout-minutes: ${{ fromJSON(steps.retain.outputs.upload_minutes) }}
+        with:
+          name: "log-diet-three-source-${{ github.run_attempt }}"
+          path: |
+            ${{ runner.temp }}/log-diet-three-source/
+            !${{ runner.temp }}/log-diet-three-source/sources/
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
   perf-load:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.log_diet_assignment == '' }}
     name: perf-load
     runs-on:
       [

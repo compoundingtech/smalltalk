@@ -1,0 +1,7 @@
+self-hosted-runner:
+  labels:
+    - nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=2
+    - nscloud-ubuntu-24.04-amd64-8x16-with-features;job.priority=1
+    - ci1
+    - ci1-priority
+    - ci1-merge

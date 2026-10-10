@@ -1,0 +1,145 @@
+--- a/crates/st3/tests/log_diet.rs
++++ b/crates/st3/tests/log_diet.rs
+@@ -194,13 +194,124 @@
+         }
+     }
+ 
++    // Diagnostics must not replace the original join error or assertion. Contain
++    // read/serialization/output failures, including panics, and never format a
++    // caught panic payload. Its destructor can panic too, so discard it by leaking
++    // only that failed diagnostic payload before propagating the original failure.
++    fn failure_witness(&self, boundary: &str) {
++        let diagnostic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            self.try_failure_witness(boundary)
++        }));
++        let unavailable = match diagnostic {
++            Ok(Ok(())) => false,
++            Ok(Err(_)) => true,
++            Err(payload) => {
++                std::mem::forget(payload);
++                true
++            }
++        };
++        if unavailable {
++            // Best effort even if stderr itself is unavailable. Neither an I/O
++            // error nor a panic here may displace the original failure.
++            let notice = std::panic::catch_unwind(|| {
++                use std::io::Write as _;
++                let _ = std::io::stderr().lock().write_all(
++                    b"st3-log-diet-witness diagnostic unavailable; original failure preserved\n",
++                );
++            });
++            if let Err(payload) = notice {
++                std::mem::forget(payload);
++            }
++        }
++    }
++
++    // Failure-only diagnostics for the two fixed root loop steps. These sequential
++    // private-store reads are after the failing pass, not its original snapshot.
++    fn try_failure_witness(&self, boundary: &str) -> std::io::Result<()> {
++        fn text(value: &str) -> Value {
++            let mut end = value.len().min(4096);
++            while !value.is_char_boundary(end) {
++                end -= 1;
++            }
++            json!({
++                "value": &value[..end],
++                "original_utf8_bytes": value.len(),
++                "truncated": end != value.len(),
++            })
++        }
++        fn field(body: &Value, key: &str) -> Value {
++            match body.get("fields").and_then(|fields| fields.get(key)) {
++                Some(Value::String(value)) => text(value),
++                Some(Value::Null) => json!({"availability": "null"}),
++                Some(_) => json!({"availability": "non-string"}),
++                None => json!({"availability": "missing"}),
++            }
++        }
++        for index in 0..LOOPS {
++            let run_subject = self.store.mission_run_subject_for_idempotency_key(
++                &format!("diet-run:diet/loop-{index}"),
++            );
++            let witness = match self.store.mission_run(&run_subject) {
++                Ok(Some(run)) => {
++                    match run.steps.iter().find(|step| step.step == "improve") {
++                        Some(step) => {
++                            let fault = match self.store.latest_claim(
++                                &step.subject, Some("reconcile.fault"),
++                            ) {
++                                Ok(Some(claim)) => json!({
++                                    "claim_id": text(&claim.id),
++                                    "subject": text(&claim.subject),
++                                    "scope": field(&claim.body, "scope"),
++                                    "status": field(&claim.body, "status"),
++                                    "reason": field(&claim.body, "reason"),
++                                }),
++                                Ok(None) => json!({"availability": "absent"}),
++                                Err(error) => json!({"availability": "unavailable", "read_error": text(&format!("{error:#}"))}),
++                            };
++                            json!({
++                                "run_subject": text(&run_subject),
++                                "run_status": text(&run.status),
++                                "run_phase": text(&run.phase),
++                                "step_subject": text(&step.subject),
++                                "step_status": text(&step.status),
++                                "step_reason": step.blocked_reason.as_deref().map(text),
++                                "claim_expires_at_unix_ms": step.claim_expires_at_unix_ms,
++                                "execution_started_at_unix_ms": step.execution_started_at_unix_ms,
++                                "timeout_ms": step.timeout_ms,
++                                "timeout_extension_ms": step.timeout_extension_ms,
++                                "latest_reconcile_fault": fault,
++                            })
++                        }
++                        None => json!({"run_subject": text(&run_subject), "step": "missing"}),
++                    }
++                }
++                Ok(None) => json!({"run_subject": text(&run_subject), "run": "absent"}),
++                Err(error) => json!({"run_subject": text(&run_subject), "availability": "unavailable", "read_error": text(&format!("{error:#}"))}),
++            };
++            let value = json!({
++                "boundary": boundary,
++                "sampling": "sequential private-store reads after failure, not the pass cut",
++                "root_loop_index": index,
++                "witness": witness,
++            });
++            let encoded = serde_json::to_vec(&value).map_err(std::io::Error::other)?;
++            use std::io::Write as _;
++            let mut stderr = std::io::stderr().lock();
++            stderr.write_all(b"st3-log-diet-witness ")?;
++            stderr.write_all(&encoded)?;
++            stderr.write_all(b"\n")?;
++        }
++        Ok(())
++    }
++
+     /// One reconcile pass, off the async runtime, as the daemon runs it.
+     async fn reconcile(&self) {
+         let reconciler = self.reconciler.clone();
+-        tokio::task::spawn_blocking(move || reconciler.reconcile_once())
+-            .await
+-            .unwrap()
+-            .unwrap();
++        let outcome = tokio::task::spawn_blocking(move || reconciler.reconcile_once()).await;
++        if !matches!(&outcome, Ok(Ok(_))) {
++            self.failure_witness("reconcile-error-or-join-panic");
++        }
++        outcome.unwrap().unwrap();
+     }
+ 
+     /// Reconcile until the file observer records `content` as the file's content.
+@@ -217,8 +328,12 @@
+             if observed == Some(Value::String(hash.clone())) {
+                 return;
+             }
++            let within_deadline = started.elapsed() < Duration::from_secs(60);
++            if !within_deadline {
++                self.failure_witness("observer-unchanged-at-original-60s-deadline");
++            }
+             assert!(
+-                started.elapsed() < Duration::from_secs(60),
++                within_deadline,
+                 "the observer never recorded the change; it last recorded {observed:?}"
+             );
+             tokio::time::sleep(Duration::from_millis(100)).await;
