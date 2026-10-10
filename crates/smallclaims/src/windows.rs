@@ -53,6 +53,7 @@ fn upper(bucket: u16) -> u64 {
 struct Histogram {
     count: u64,
     over: u64,
+    /// Histogram unit: microseconds for Series, integer milliseconds for IntervalSeries.
     max_us: u64,
     /// Sorted by bucket.
     buckets: Vec<(u16, u64)>,

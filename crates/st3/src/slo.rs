@@ -268,15 +268,24 @@ pub fn doctor_lines(report: &Value) -> Vec<(String, &'static str, String)> {
     for target in report["targets"].as_array().into_iter().flatten() {
         let name = target["name"].as_str().unwrap_or_default();
         if target["population"].as_str().is_some_and(|p| p.starts_with("client-observed")) {
-            let share = target.get("min_percent").is_some();
+            let min_percent = target["min_percent"].as_u64();
+            let share = min_percent.is_some();
             let seen = WINDOWS.iter().any(|w| target["windows"][*w]["count"].as_u64().unwrap_or(0) > 0);
+            let met = min_percent.map_or_else(|| verdict(&target["windows"],true).met, |min| {
+                WINDOWS.iter().all(|w| {
+                    let row=&target["windows"][*w];
+                    u128::from(row["over_target"].as_u64().unwrap_or(0))*100
+                        <= u128::from(row["foreground_ms"].as_u64().unwrap_or(0))*u128::from(100-min)
+                })
+            });
             let text = WINDOWS.iter().map(|w| {
                 let row = &target["windows"][*w];
                 if share {format!("{w} {} live / {} foreground ms",row["live_ms"],row["foreground_ms"])}
                 else {describe_window(w,row)}
             }).collect::<Vec<_>>().join(" · ");
-            lines.push((format!("slo/{name}"), if seen {status(verdict(&target["windows"],true).met)} else {"info"},
-                format!("client-observed; closed UTC minutes, delayed/incomplete reported population: {text}")));
+            let goal=min_percent.map_or_else(||format!("p99 ≤ {} ms",target["p99_ms"]),|min|format!("live ≥ {min}%"));
+            lines.push((format!("slo/{name}"), if seen {status(met)} else {"info"},
+                format!("{goal}; client-observed reported population only; closed UTC minutes, delayed/incomplete coverage: {text}")));
             continue;
         }
         match name {
@@ -446,4 +455,17 @@ mod tests {
         assert!(verdict(&windows(0), false).met);
         assert!(verdict(&windows(0), true).message.contains("1m p99 2 ms, max 3 ms, 0.0% over of 100"));
     }
+    #[test]
+    fn client_share_doctor_uses_declared_minimum_and_empty_population_is_info() {
+        let window=json!({"count":10000,"foreground_ms":10000,"live_ms":9500,"over_target":500,"over_target_share":0.05});
+        let windows=json!({"1m":window,"5m":window,"1h":window});
+        let mut target=json!({"name":"ios-live-share","population":"client-observed-foreground-ms","min_percent":90,"windows":windows});
+        let report=|target:Value|json!({"targets":[target],"paths":[]});
+        assert_eq!(doctor_lines(&report(target.clone()))[0].1,"pass");
+        target["min_percent"]=json!(99);
+        assert_eq!(doctor_lines(&report(target.clone()))[0].1,"info");
+        target["windows"]=json!({"1m":{"count":0},"5m":{"count":0},"1h":{"count":0}});
+        assert_eq!(doctor_lines(&report(target))[0].1,"info");
+    }
+
 }

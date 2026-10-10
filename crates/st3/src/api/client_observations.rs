@@ -107,9 +107,11 @@ fn validate(report: &ObservationReport, now: u64) -> Result<Vec<Validated>, ApiE
             ));
         }
         let key = (target.clone(), carrier.clone(), path.clone());
-        // One interval per population per report keeps preflight aggregate admission atomic.
-        if !keys.insert(key.clone()) {
-            return Err(invalid("one interval per target/carrier/path per report"));
+        // Disjoint minutes may batch within a population; duplicate minutes cannot.
+        if !keys.insert((key.clone(), start)) {
+            return Err(invalid(
+                "one sample per target/carrier/path/minute per report",
+            ));
         }
         let summary = match sample {
             ObservationSample::Latency {
@@ -191,7 +193,7 @@ fn validate(report: &ObservationReport, now: u64) -> Result<Vec<Validated>, ApiE
                     || live_ms > foreground_ms
                 {
                     return Err(invalid(
-                        "live-share needs the known share target and 0 < live <= foreground <= 60000ms (live may be zero)",
+                        "live-share requires 0 < foreground <= 60000ms and 0 <= live <= foreground",
                     ));
                 }
                 MinuteSummary {
@@ -311,7 +313,7 @@ impl Admission {
         if !request_latency()
             .lock()
             .map_err(|_| unavailable())?
-            .can_report(&samples)
+            .can_report(now, &samples)
         {
             return Err(invalid("minute population capacity exceeded"));
         }
@@ -821,5 +823,15 @@ mod tests {
             .unwrap();
         assert_eq!(admission.reports.len(), REPORTS);
         assert_eq!(admission.reports.front().unwrap().id, "old-2");
+    }
+    #[test]
+    fn observation_reports_batch_disjoint_minutes_but_refuse_repeated_minutes() {
+        let now = client_now_ms() as u64;
+        let start = now / 60_000 * 60_000 - 60_000;
+        let mut r = report_at(start);
+        r.samples.push(report_at(start - 60_000).samples.remove(0));
+        assert_eq!(validate(&r, now).unwrap().len(), 2);
+        r.samples.push(r.samples[0].clone());
+        assert!(validate(&r, now).is_err());
     }
 }

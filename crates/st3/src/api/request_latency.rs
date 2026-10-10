@@ -364,16 +364,20 @@ impl Meter {
         json!({"targets": rows, "paths": paths})
     }
 
-    pub(super) fn can_report(&self, samples: &[super::client_observations::Validated]) -> bool {
-        samples.iter().all(|s| self.client_intervals.get(&s.key).is_none_or(|series| series.can_record(&s.minute)))
+    pub(super) fn can_report(&self, now_ms: u64, samples: &[super::client_observations::Validated]) -> bool {
+        samples.iter().filter(|s| Self::live_minute(now_ms, &s.minute)).all(|s| self.client_intervals.get(&s.key).is_none_or(|series| series.can_record(&s.minute)))
     }
 
     pub(super) fn report(&mut self, now_ms: u64, samples: &[super::client_observations::Validated]) {
         for s in samples {
-            if s.minute.start_ms >= now_ms.saturating_sub(3_600_000) {
+            if Self::live_minute(now_ms, &s.minute) {
                 self.client_intervals.entry(s.key.clone()).or_default().record(now_ms,&s.minute);
             }
         }
+    }
+
+    fn live_minute(now_ms: u64, minute: &smallclaims::windows::MinuteSummary) -> bool {
+        minute.start_ms >= now_ms.saturating_sub(3_600_000) && minute.start_ms.saturating_add(60_000) <= now_ms
     }
 
     fn client_windows(&self, now_ms: u64, target: &str, share: bool) -> Value {
@@ -683,4 +687,23 @@ mod tests {
         assert_eq!(renew["max_ms"], 600);
         assert_eq!(meter.snapshot().len(), ROUTES + 1);
     }
+    #[test]
+    fn client_intervals_batch_disjoint_minutes_and_old_reports_are_history_only() {
+        use super::super::client_observations::Validated;
+        let key: (String,String,Option<String>)=("ios-connect".into(),"lan".into(),None);
+        let sample=|start,count|Validated {key:key.clone(), minute:smallclaims::windows::MinuteSummary {
+            start_ms:start,count,over:0,max_ms:100,buckets:vec![(smallclaims::windows::histogram_upper_ms(100),count)]
+        }};
+        let mut meter=Meter::default();
+        meter.report(60_000,&[sample(0,1_000_000_000)]);
+        let now=3_660_000;
+        assert!(meter.can_report(now,&[sample(0,1)]),"expired slot capacity cannot reject history-only reports");
+        meter.report(now,&[sample(0,1)]);
+        assert_eq!(meter.client_windows(now,"ios-connect",false)["1h"]["count"],0);
+        let batch=[sample(3_540_000,100),sample(3_600_000,200)];
+        assert!(meter.can_report(now,&batch));meter.report(now,&batch);
+        assert_eq!(meter.client_windows(now,"ios-connect",false)["5m"]["count"],300);
+        assert_eq!(meter.client_windows(now,"ios-connect",false)["1m"]["count"],200);
+    }
+
 }

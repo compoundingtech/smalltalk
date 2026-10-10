@@ -41,8 +41,8 @@ Carrier is `fabric`, `tailscale` or `lan`; optional `path` is `direct` or `relay
 Intervals must be exactly one closed minute with minute-aligned UTC `Z` timestamps.
 The oldest permitted start is seven days before admission; end may be at most 120 seconds
 in the future for clock skew. Future-skewed intervals are retained as history only at admission.
-Reports must contain disjoint intervals, never cumulative summaries. One report carries at
-most one interval per target/carrier/path. Unknown fields, targets or enum values are refused;
+Reports must contain disjoint intervals, never cumulative summaries. One report can batch disjoint minutes of the same population, with at
+most one sample per target/carrier/path/minute. Unknown fields, targets or enum values are refused;
 there are no content, addresses, node identities or credential fields.
 
 Latency count is 1–1,000,000, `over_target` is 0–count and max is 0–3,600,000 integer ms.
@@ -85,20 +85,24 @@ merge into the reported population. Repeating a minute from the same pairing is 
 while its accepted report is retained; identical ID/payload retries do not add a line or
 sample. Conflicting ID reuse returns HTTP 409. IDs/overlap proofs expire after seven days,
 on oldest-first capacity eviction or restart. Deduplication is member/process local;
-retrying after eviction, restart or on a different member can count again. Clients must
+retrying after eviction, restart or on a different member can count again. A buggy or
+malicious paired session can also repeat a live minute after its overlap proof is evicted. Clients must
 keep stable IDs and drop intervals only after local acceptance.
 
 History is one JSONL line `{accepted_at:<unix_ms>,report:<original report>}` per newly
 accepted report in `state-dir/client-observations.jsonl`. Append, rotation and expiry run
 in a bounded blocking worker, outside async workers and the Store handler/SQLite writer.
 Only one admission runs at a time; concurrent/busy admission returns HTTP 503 and should
-retry the identical report. There is no outbox or retry store. Files rotate at 4 MiB or on
+retry the identical report with jitter to avoid lockstep retries. There is no outbox or retry store. Files rotate at 4 MiB or on
 a UTC-day change into `.1` through `.7`, for at most eight segments / 32 MiB. Segments
 older than seven days since their last append are removed on the next admission. There
 is no idle cleanup thread; inactive expired files can remain until the next report.
 Size rotation can reduce retained coverage; seven days is an upper retention bound,
 not guaranteed coverage. Files are never replicated. Retained JSONL survives daemon
 restart, but deduplication and live windows start empty and are not rebuilt from history.
+Retried reports after dedup eviction or restart may also append duplicate report IDs to
+history; history consumers should deduplicate by report_id. Admission mutex poisoning
+fails closed with 503 until restart rather than resuming a potentially partial admission.
 A torn last line is repaired from a bounded tail before append. A failed append is
 truncated to its original length; any history failure returns 503 before memory admission.
 Rotation can have removed old history before a subsequent append fails. No historical
