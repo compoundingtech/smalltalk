@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep lazily created authored-transcript artifacts accessible through the private session inventory",
+  "replay": {"status": "none", "detail": "No graph replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "changed", "detail": "Create the transcript's companion artifact link before its target exists. On later starts, repair a missing companion link in a matching real inventory without replacing the inventory or its contents."},
+  "downtime": {"status": "none", "detail": "No service lifecycle change."},
+  "manual": {"status": "none", "detail": "No operator steps required."},
+  "recovery": {"status": "none", "detail": "Original artifacts and existing inventory entries remain in place."}
+}

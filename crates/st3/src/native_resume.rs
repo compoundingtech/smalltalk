@@ -388,6 +388,8 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
         ));
     }
     let mut migrate = false;
+    let artifact_name = transcript.file_stem().expect("validated transcript filename");
+    let artifacts = parent.join(artifact_name);
     match fs::symlink_metadata(sessions) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             if fs::canonicalize(sessions).ok().as_ref() != Some(&parent) {
@@ -408,7 +410,16 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
                     })
                 })
             {
-                return Ok(false);
+                let companion = sessions.join(artifact_name);
+                return match fs::symlink_metadata(&companion) {
+                    Ok(_) => Ok(false),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        symlink(&artifacts, &companion)
+                            .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
+                        Ok(true)
+                    }
+                    Err(error) => Err(Refusal::new("managed-directory-unreadable", error.to_string())),
+                };
             }
             // remove_dir is the empty-directory check too: never recursively remove contents.
             fs::remove_dir(sessions)
@@ -435,12 +446,9 @@ pub fn pi_family_link_transcript(argv: &[String], sessions: &Path) -> Result<boo
     let filename = transcript.file_name().expect("validated transcript filename");
     symlink(parent.join(filename), prepared.path().join(filename))
         .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
-    // OMP stores session artifacts beside the transcript, in its extensionless directory.
-    let artifacts = parent.join(transcript.file_stem().expect("validated transcript filename"));
-    if artifacts.is_dir() {
-        symlink(&artifacts, prepared.path().join(artifacts.file_name().unwrap()))
-            .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
-    }
+    // OMP creates artifacts lazily; keep the link even before its target exists.
+    symlink(&artifacts, prepared.path().join(artifact_name))
+        .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
     if migrate {
         exchange_transcript_inventory(prepared.path(), sessions)
             .map_err(|error| Refusal::new("managed-directory-link-failed", error.to_string()))?;
@@ -659,7 +667,7 @@ mod tests {
         // An existing inventory with the same inode is left as a directory.
         fs::create_dir(&managed).unwrap();
         fs::hard_link(&transcript, managed.join(transcript.file_name().unwrap())).unwrap();
-        assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
+        assert!(pi_family_link_transcript(&arguments, &managed).unwrap());
         let alternate = managed.join(format!("earlier_{id}.jsonl"));
         fs::hard_link(&transcript, &alternate).unwrap();
         fs::remove_file(managed.join(transcript.file_name().unwrap())).unwrap();
@@ -671,6 +679,7 @@ mod tests {
                 .is_symlink()
         );
         fs::remove_file(&alternate).unwrap();
+        fs::remove_file(managed.join(transcript.file_stem().unwrap())).unwrap();
         fs::write(managed.join("other.jsonl"), "preserve me").unwrap();
         assert_eq!(
             pi_family_link_transcript(&arguments, &managed)
@@ -813,6 +822,33 @@ mod tests {
     #[test]
     fn authored_transcripts_migrate_legacy_shared_links() {
         assert_private_authored_inventories(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authored_transcript_artifacts_are_linked_before_creation_and_reconciled() {
+        let root = tempfile::tempdir().unwrap();
+        let id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
+        let transcript = root.path().join(format!("time_{id}.jsonl"));
+        fs::write(&transcript, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n")).unwrap();
+        let arguments = argv(&["omp", "--resume", transcript.to_str().unwrap()]);
+        let managed = root.path().join("managed");
+        assert!(pi_family_link_transcript(&arguments, &managed).unwrap());
+        let companion = managed.join(transcript.file_stem().unwrap());
+        assert_eq!(fs::read_link(&companion).unwrap(), transcript.with_extension(""));
+        assert!(!companion.exists());
+        assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
+        fs::create_dir(transcript.with_extension("")).unwrap();
+        fs::write(transcript.with_extension("").join("artifact"), "lazy artifact").unwrap();
+        assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
+        assert_eq!(fs::read_to_string(companion.join("artifact")).unwrap(), "lazy artifact");
+        // Repair an inventory created by the previous version without replacing it.
+        fs::remove_file(&companion).unwrap();
+        fs::write(managed.join("preserve"), "keep").unwrap();
+        assert!(pi_family_link_transcript(&arguments, &managed).unwrap());
+        assert_eq!(fs::read_to_string(companion.join("artifact")).unwrap(), "lazy artifact");
+        assert_eq!(fs::read_to_string(managed.join("preserve")).unwrap(), "keep");
+        assert!(!pi_family_link_transcript(&arguments, &managed).unwrap());
     }
 
     #[cfg(unix)]
