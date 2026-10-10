@@ -287,6 +287,15 @@ pub fn bound_session(
         }))
 }
 
+/// Normalized authored selector scope supplied by the owner to its driver.
+pub const SELECTOR_SCOPE_ENV: &str = "ST3_NATIVE_SELECTOR_SCOPE";
+
+/// New refusals have a typed identity, so a stale legacy authored refusal cannot swallow
+/// a later permanent failure for the same session.
+pub fn typed_continue_unavailable_key(subject: &str, session: &str, reason: &str, scope: Option<&str>) -> String {
+    format!("{CONTINUE_UNAVAILABLE_CODE}:v2:{subject}:{session}:{reason}:{}", scope.unwrap_or("permanent"))
+}
+
 /// The key of the diagnostic a driver records once when it cannot continue `session`.
 pub fn continue_unavailable_key(subject: &str, session: &str) -> String {
     format!("{CONTINUE_UNAVAILABLE_CODE}:{subject}:{session}")
@@ -300,6 +309,7 @@ pub fn continue_session(
     subject: &str,
     harness: &str,
     account: Option<&str>,
+    selector_scope: Option<&str>,
 ) -> Result<Option<(String, Option<String>)>> {
     let Some(bound) = store
         .claims_for(subject, Some("harness.session-file"))?
@@ -323,9 +333,18 @@ pub fn continue_session(
         .any(|claim| {
             claim.store_index > bound.store_index && field(claim, "action") == Some("fresh-context")
         });
-    let refused = store
-        .operation_claim(&continue_unavailable_key(subject, &session))?
-        .is_some();
+    let legacy_refusal = store.operation_claim(&continue_unavailable_key(subject, &session))?;
+    let refusals = store.claims_for(subject, Some("harness.diagnostic"))?;
+    let refused = refusals.iter().any(|claim| {
+        let legacy = legacy_refusal.as_ref().is_some_and(|legacy| legacy.id == claim.id);
+        let typed = field(claim, "session_id") == Some(session.as_str())
+            && field(claim, "code") == Some(CONTINUE_UNAVAILABLE_CODE);
+        (legacy || typed) && if field(claim, "status") == Some("authored-session-selection") {
+            selector_scope.is_some_and(|scope| field(claim, "selector_scope").is_none_or(|recorded| recorded == scope))
+        } else {
+            true
+        }
+    });
     if fresh_since || refused {
         return Ok(None);
     }
@@ -461,6 +480,7 @@ pub fn annotate_quiescence(fields: &mut std::collections::BTreeMap<String, Value
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn a_move_survives_a_crash_after_placement_and_a_later_label_change() {
@@ -557,6 +577,60 @@ mod tests {
             current(&store, subject).unwrap().unwrap().phase,
             "restoring"
         );
+    }
+
+    fn continuation_claim(store: &Store, kind: &str, fields: Value, key: Option<String>) {
+        store.append_claim(&crate::model::ClaimInput {
+            subject: "agent/example".into(), kind: kind.into(), actor: Some("agent/example".into()),
+            fields: serde_json::from_value(fields).unwrap(), evidence: Vec::new(),
+            expected_subject: None, idempotency_key: key,
+        }).unwrap();
+    }
+
+    #[test]
+    fn continuation_refusal_scope_repairs_legacy_and_keeps_later_failure_permanent() {
+        for legacy in [false, true] {
+            let store = Store::open_memory("node").unwrap();
+            continuation_claim(&store, "harness.session-file", json!({"harness":"omp","session_id":"native","account_ref":"one"}), None);
+            let key = if legacy { continue_unavailable_key("agent/example", "native") } else {
+                typed_continue_unavailable_key("agent/example", "native", "authored-session-selection", Some("selector"))
+            };
+            let mut fields = json!({"code":CONTINUE_UNAVAILABLE_CODE,"status":"authored-session-selection","session_id":"native"});
+            if !legacy { fields["selector_scope"] = json!("selector"); }
+            continuation_claim(&store, "harness.diagnostic", fields, Some(key));
+            assert!(continue_session(&store, "agent/example", "omp", Some("one"), Some("selector")).unwrap().is_none());
+            assert_eq!(continue_session(&store, "agent/example", "omp", Some("one"), None).unwrap().unwrap().0, "native");
+            assert!(continue_session(&store, "agent/example", "omp", Some("two"), None).unwrap().is_none());
+            let permanent = typed_continue_unavailable_key("agent/example", "native", "transcript-missing", None);
+            continuation_claim(&store, "harness.diagnostic", json!({"code":CONTINUE_UNAVAILABLE_CODE,"status":"transcript-missing","session_id":"native"}), Some(permanent.clone()));
+            assert!(store.operation_claim(&permanent).unwrap().is_some());
+            assert!(continue_session(&store, "agent/example", "omp", Some("one"), None).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn continuation_fresh_context_wins_over_stale_authored_refusal() {
+        let store = Store::open_memory("node").unwrap();
+        continuation_claim(&store, "harness.session-file", json!({"harness":"omp","session_id":"native"}), None);
+        continuation_claim(&store, "harness.diagnostic", json!({"status":"authored-session-selection"}), Some(continue_unavailable_key("agent/example", "native")));
+        continuation_claim(&store, "runtime.action.requested", json!({"action":"fresh-context"}), None);
+        assert!(continue_session(&store, "agent/example", "omp", None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn continuation_concurrent_permanent_receipts_are_one_durable_refusal() {
+        let store = std::sync::Arc::new(Store::open_memory("node").unwrap());
+        continuation_claim(&store, "harness.session-file", json!({"harness":"omp","session_id":"native"}), None);
+        std::thread::scope(|threads| {
+            for _ in 0..8 {
+                let store = store.clone();
+                threads.spawn(move || continuation_claim(&store, "harness.diagnostic",
+                    json!({"code":CONTINUE_UNAVAILABLE_CODE,"status":"transcript-missing","session_id":"native"}),
+                    Some(typed_continue_unavailable_key("agent/example", "native", "transcript-missing", None))));
+            }
+        });
+        assert_eq!(store.claims_for("agent/example", Some("harness.diagnostic")).unwrap().len(), 1);
+        assert!(continue_session(&store, "agent/example", "omp", None, None).unwrap().is_none());
     }
 
     #[test]
