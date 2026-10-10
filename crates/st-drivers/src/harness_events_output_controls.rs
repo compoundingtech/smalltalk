@@ -420,6 +420,209 @@ mod tests {
         .collect()
     }
 
+    // Compare persisted shared effects. Queue time and outbox sequence belong to
+    // each independent spool; output events intentionally consume extra sequence
+    // numbers, so timeline event ordering and content are compared instead.
+    fn shared_timeline_image(root: &Path) -> Vec<Vec<String>> {
+        let connection = super::super::open(root).unwrap();
+        [
+            "SELECT json_array(key,value) FROM metadata WHERE key LIKE 'timeline-next:%' ORDER BY key",
+            "SELECT json_array(id,incarnation,source,body) FROM timeline ORDER BY id",
+            "SELECT json_array(runtime_incarnation,kind,body) FROM events WHERE kind='harness-timeline' ORDER BY sequence",
+        ]
+        .into_iter()
+        .map(|sql| {
+            connection
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+        .collect()
+    }
+
+    fn pending_bytes(root: &Path) -> u64 {
+        super::super::open(root)
+            .unwrap()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM metadata WHERE key='pending-bytes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn output_event_bytes(root: &Path) -> u64 {
+        super::super::open(root)
+            .unwrap()
+            .query_row(
+                "SELECT COALESCE(SUM(length(CAST(body AS BLOB))),0) FROM events WHERE kind=?1",
+                [SNAPSHOT_KIND],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn production_and_private_writes_match_shared_timeline_effects() {
+        for driver in ["codex", "claude", "pi", "omp", "opencode"] {
+            let production = tempfile::tempdir().unwrap();
+            let private = tempfile::tempdir().unwrap();
+            let (_, _, _, production_seq) = prepare(production.path(), driver);
+            let (_, mut record, mut operation, seq) = prepare(private.path(), driver);
+            assert_eq!(production_seq, seq);
+            let production_before = pending_bytes(production.path());
+            let private_before = pending_bytes(private.path());
+            let production_state = super::super::read_snapshot(production.path(), "harness-state")
+                .unwrap()
+                .unwrap();
+            let private_state = super::super::read_snapshot(private.path(), "harness-state")
+                .unwrap()
+                .unwrap();
+
+            // First append then finalization of unchanged content: both actual
+            // writer entry points process the identical submitted operation.
+            for revision in [1, 2] {
+                operation.revision = revision;
+                operation.final_entry = revision == 2;
+                operation.operation = if revision == 1 { "append" } else { "finalize" }.into();
+                record.operations = vec![operation.clone()];
+                super::super::write_timeline(
+                    production.path(),
+                    &record,
+                    std::slice::from_ref(&operation),
+                )
+                .unwrap();
+                let progress = [OutputProgress {
+                    operation: &operation,
+                    original_at_ms: revision * 10,
+                    body_changed: true,
+                    tool_identity_complete: true,
+                }];
+                write_timeline_with_output(
+                    private.path(),
+                    &record,
+                    std::slice::from_ref(&operation),
+                    &batch(&record, seq, &progress),
+                )
+                .unwrap();
+                assert_eq!(
+                    shared_timeline_image(production.path()),
+                    shared_timeline_image(private.path()),
+                    "{driver}: revision {revision}"
+                );
+                assert_eq!(
+                    pending_bytes(production.path()) - production_before,
+                    pending_bytes(private.path())
+                        - private_before
+                        - output_event_bytes(private.path()),
+                    "{driver}: shared outbox byte accounting at revision {revision}"
+                );
+            }
+            assert_eq!(
+                super::super::read_snapshot(production.path(), "harness-state")
+                    .unwrap()
+                    .unwrap(),
+                production_state
+            );
+            assert_eq!(
+                super::super::read_snapshot(private.path(), "harness-state")
+                    .unwrap()
+                    .unwrap(),
+                private_state
+            );
+            assert!(
+                super::super::read_snapshot(production.path(), SNAPSHOT_KIND)
+                    .unwrap()
+                    .is_none()
+            );
+            let image: Envelope = serde_json::from_slice(
+                &super::super::read_snapshot(private.path(), SNAPSHOT_KIND)
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(image.output.last_output.unwrap().at_unix_ms, 10);
+        }
+    }
+
+    #[test]
+    fn superseded_token_is_refused_by_production_and_private_timeline_writes() {
+        for private in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (_, mut record, mut operation, old_seq) = prepare(root.path(), "omp");
+            let successor = claim(root.path(), "agent/example", "omp", "provider-b").unwrap();
+            assert!(successor > old_seq);
+            let mut writer = Writer::new(
+                root.path(),
+                "agent/example",
+                "omp",
+                Some("private-control-pty".into()),
+            )
+            .with_ownership("provider-b", successor);
+            writer
+                .observe(Observation::new(
+                    Activity::Active,
+                    BlockedOn::None,
+                    InputBuffer::Unknown,
+                ))
+                .unwrap();
+            assert_eq!(
+                super::super::current_token(&super::super::open(root.path()).unwrap())
+                    .unwrap()
+                    .as_deref(),
+                Some("provider-b")
+            );
+            let before = spool_image(root.path());
+            let result = if private {
+                write_timeline_with_output(
+                    root.path(),
+                    &record,
+                    std::slice::from_ref(&operation),
+                    &batch(&record, old_seq, &[]),
+                )
+            } else {
+                super::super::write_timeline(root.path(), &record, std::slice::from_ref(&operation))
+            };
+            assert!(
+                result.is_err(),
+                "private={private}: retired owner must be refused"
+            );
+            assert_eq!(spool_image(root.path()), before);
+
+            // An accepted successor prevents blanket refusal from satisfying the
+            // negative control; no native callback provenance is inferred.
+            record.incarnation_id = "provider-b".into();
+            operation.incarnation_id = "provider-b".into();
+            record.operations = vec![operation.clone()];
+            if private {
+                write_timeline_with_output(
+                    root.path(),
+                    &record,
+                    std::slice::from_ref(&operation),
+                    &batch(&record, successor, &[]),
+                )
+                .unwrap();
+            } else {
+                super::super::write_timeline(
+                    root.path(),
+                    &record,
+                    std::slice::from_ref(&operation),
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                super::super::read_timeline(root.path())
+                    .unwrap()
+                    .unwrap()
+                    .operations,
+                vec![operation]
+            );
+        }
+    }
+
     #[test]
     fn all_harnesses_commit_original_output_time_with_timeline_and_outbox() {
         for driver in ["codex", "claude", "pi", "omp", "opencode"] {
