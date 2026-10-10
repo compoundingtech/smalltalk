@@ -876,6 +876,7 @@ impl Store {
                         format!("{}{}", condition.rule.as_deref().unwrap_or("unknown"), if stale { "; this observation is stale; check the evaluating host" } else { "" }),
                     ),
                     request: None,
+                    answers: Vec::new(),
                     mission: None,
                     mission_run: None,
                     step: None,
