@@ -6,6 +6,7 @@ export class FollowAnimation {
   private frame: number | undefined
   private started = 0
   private from = 0
+  private motion: MediaQueryList | undefined
 
   constructor(private readonly writeTop: (top: number) => void) {}
 
@@ -13,6 +14,13 @@ export class FollowAnimation {
 
   start(element: HTMLElement) {
     this.cancel()
+    const motion = window.matchMedia('(prefers-reduced-motion: reduce)')
+    if (motion.matches) {
+      this.writeTop(Math.max(0, element.scrollHeight - element.clientHeight))
+      return
+    }
+    this.motion = motion
+    motion.addEventListener('change', this.motionChanged)
     this.element = element
     this.from = element.scrollTop
     this.started = performance.now()
@@ -23,8 +31,17 @@ export class FollowAnimation {
     const active = this.active
     if (this.frame !== undefined) cancelAnimationFrame(this.frame)
     this.frame = undefined
+    this.motion?.removeEventListener('change', this.motionChanged)
+    this.motion = undefined
     this.element = null
     return active
+  }
+
+  private readonly motionChanged = (event: MediaQueryListEvent) => {
+    const element = this.element
+    if (!event.matches || element === null) return
+    this.cancel()
+    this.writeTop(Math.max(0, element.scrollHeight - element.clientHeight))
   }
 
   private readonly step = (time: number) => {
@@ -36,6 +53,6 @@ export class FollowAnimation {
     const end = Math.max(0, element.scrollHeight - element.clientHeight)
     this.writeTop(this.from + (end - this.from) * eased)
     if (progress < 1) this.frame = requestAnimationFrame(this.step)
-    else { this.frame = undefined; this.element = null }
+    else this.cancel()
   }
 }
