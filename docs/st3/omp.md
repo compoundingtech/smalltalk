@@ -37,6 +37,10 @@ Conversation readers use the current incarnation's exact native binding (session
 not the newest sibling in that directory. An unreadable bound transcript, or a linked inventory
 without a current binding, stays unavailable rather than displaying another seat's conversation.
 
+The native conversation header counts assistant usage and cost once per message, including
+messages containing only tool calls. Message-level metadata belongs to its first projected block;
+thinking and text parts do not each contribute another response's cost.
+
 Messages delivered during a running turn are held until the current tool batch returns. A tool call
 that runs longer than the hold limit can still be backgrounded. Read the exact graph message with
 `st conversations read` before acting on it, and archive it after the related action completes.

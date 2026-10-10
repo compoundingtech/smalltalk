@@ -63,6 +63,7 @@ pub(crate) fn derive(items: &[Value], window_truncated: bool) -> Value {
                 if let Some(tokens) = metadata.get("context_tokens").and_then(Value::as_u64) {
                     context = Some((tokens, at.clone()));
                 }
+                // The native normalizer attaches message usage to exactly one block.
                 if let Some(usd) = metadata
                     .pointer("/usage/cost_usd")
                     .and_then(Value::as_f64)

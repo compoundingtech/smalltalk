@@ -4251,29 +4251,6 @@ fn normalize_omp(
         &timestamp,
         role,
     );
-    if let Some(metadata) = crate::native_views::assistant_metadata(message) {
-        for item in &mut items[first_content..] {
-            if let Some(blocks) = item["body"]["blocks"].as_array_mut() {
-                for block in blocks {
-                    if matches!(block["kind"].as_str(), Some("text" | "reasoning")) {
-                        if let Some(existing) =
-                            block.get_mut("metadata").and_then(Value::as_object_mut)
-                        {
-                            if let Some(additions) = metadata.as_object() {
-                                existing.extend(
-                                    additions
-                                        .iter()
-                                        .map(|(key, value)| (key.clone(), value.clone())),
-                                );
-                            }
-                        } else {
-                            block["metadata"] = metadata.clone();
-                        }
-                    }
-                }
-            }
-        }
-    }
     if native_role == Some("assistant")
         && let Some(view) = omp_assistant_error_view(message)
     {
@@ -4295,6 +4272,27 @@ fn normalize_omp(
         block["source_type"] = json!(format!("{}/assistant_error", driver.as_str()));
         block["payload"] = json!({"body_ref": true});
         block["view"] = view;
+    }
+    // Message-level metadata has one owner: the first emitted block, including a
+    // tool call or an error when the assistant has no text. Header consumers can
+    // sum usage without counting each text/reasoning part as another response.
+    if let Some(metadata) = crate::native_views::assistant_metadata(message)
+        && let Some(block) = items[first_content..]
+            .iter_mut()
+            .filter_map(|item| item["body"]["blocks"].as_array_mut())
+            .find_map(|blocks| blocks.first_mut())
+    {
+        if let Some(existing) = block.get_mut("metadata").and_then(Value::as_object_mut) {
+            if let Some(additions) = metadata.as_object() {
+                existing.extend(
+                    additions
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+            }
+        } else {
+            block["metadata"] = metadata;
+        }
     }
 }
 
@@ -4646,6 +4644,51 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
+    fn assert_omp_message_usage_once(content: Value) {
+        for driver in [ExternalDriver::Omp, ExternalDriver::Pi] {
+            let mut items = Vec::new();
+            for (sequence, usd) in [(0, 0.25), (100, 0.5)] {
+                let record = json!({
+                    "type": "message",
+                    "message": {
+                        "role": "assistant", "content": content, "model": "test-model",
+                        "usage": {"input": 12, "output": 5, "totalTokens": 17, "cost": {"total": usd}},
+                        "contextSnapshot": {"promptTokens": 23},
+                    },
+                });
+                let first = items.len();
+                normalize_omp(driver, &record, sequence, "2026-10-06T00:00:00Z", &mut items);
+                let blocks: Vec<_> = items[first..]
+                    .iter()
+                    .flat_map(|item| item["body"]["blocks"].as_array().unwrap())
+                    .collect();
+                assert_eq!(blocks[0]["metadata"]["usage"]["cost_usd"], usd);
+                assert_eq!(blocks[0]["metadata"]["usage"]["total"], 17);
+                assert_eq!(blocks.iter().filter(|block| block["metadata"]["usage"].is_object()).count(), 1);
+            }
+            let header = crate::conversation_header::derive(&items, false);
+            assert_eq!(header["cost"]["value"]["usd"], 0.75);
+            assert_eq!(header["model"]["value"], "test-model");
+            assert_eq!(header["context"]["value"]["tokens"], 23);
+        }
+    }
+
+    #[test]
+    fn omp_thinking_and_text_count_message_usage_once() {
+        assert_omp_message_usage_once(json!([
+            {"type": "thinking", "thinking": "Consider the request"},
+            {"type": "text", "text": "Answer"},
+        ]));
+    }
+
+    #[test]
+    fn omp_tool_call_only_counts_message_usage_once() {
+        assert_omp_message_usage_once(json!([
+            {"type": "toolCall", "id": "first", "name": "read", "arguments": {"path": "a"}},
+            {"type": "toolCall", "id": "second", "name": "read", "arguments": {"path": "b"}},
+        ]));
+    }
+
     #[test]
     fn omp_parity_fixture_projects_all_views_without_losing_native_payloads() {
         for driver in [ExternalDriver::Omp, ExternalDriver::Pi] {
@@ -4741,10 +4784,10 @@ mod tests {
                     .any(|block| block["view"]["type"] == "tool_start"
                         && block["visibility"] == "internal")
             );
+            assert!(blocks.iter().any(|block| block["metadata"]["context_tokens"] == 23
+                && block["metadata"]["usage"]["cost_usd"] == 0.01));
             for kind in ["text", "reasoning"] {
-                assert!(blocks.iter().any(|block| block["kind"] == kind
-                    && block["metadata"]["context_tokens"] == 23
-                    && block["metadata"]["usage"]["cost_usd"] == 0.01));
+                assert!(blocks.iter().any(|block| block["kind"] == kind));
             }
             assert!(items.iter().any(|item| item["body"]["text"]
                 == "Synthetic extension fallback"
