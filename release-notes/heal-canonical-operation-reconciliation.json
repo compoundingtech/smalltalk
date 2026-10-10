@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Reconcile complete canonical operation receipts and known-key logical caches at the writer cut",
+  "replay": {
+    "status": "none",
+    "detail": "rebuild_operations_tx retains its full canonical production callers: explicit projection rebuild, version-gated derived/startup rebuild, shared-memory open, Runtime full replay and checkpoint scratch replay. The import_replication full-rebuild caller is cfg(test)-only, not every production import. Healthy incremental projection registers affected operation claims; refusal/recovery can still enter a full replay. Exact rows are retained only with matching known-key logical cache; damaged or inconsistently cached rows use existing delete/insert refresh triggers after complete discovery at the same writer cut."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No DDL, migration, schema version or producer changes. Existing operations is an ordinary rowid table; raw cached storage types are inspected without UTF-8 decode exclusion."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Canonical reducer, repaired exclusions, live/checkpoint precedence and operation authority are unchanged; no rules digest change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No wire/API/Runtime dispatch changes. Exact operation rows with matching logical cache receive no attempted DML. Hosted characterization output retention changes no selection, retry policy, threads, assertions or work ceilings. All eight controls passed initially at14e7; the disclosure-only successor still requires normal exact-head eligibility."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Full-rebuild writer hold remains unbounded: two complete canonical source reads, one raw actual/cache LEFT JOIN scan, per-row cache probes/JSON and map/vector memory; all-changed DML remains unbounded. There is no every-healthy-production-import full fold added by this change. Historical hosted helper characterization at14e7 excludes outer COMMIT/finalization/writer return and establishes no production saving or bounded full-replay hold."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No live heal/reset/copy, production corruption or new runtime action is requested."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Existing transaction rollback/FK/finalizer/ACK boundaries remain. Coverage includes missing/wrong known-key cache with consistently corresponding count/sum, not arbitrary corrupt accumulator/cache storage or malformed DDL. All eight controls passed initially at14e7; no runtime repair or production mutation is authorized by those results."
+  }
+}

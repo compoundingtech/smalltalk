@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "iOS: alerts show in each agent's conversation, answerable there; the phone counts alerts, and a compacting seat reads as compacting",
+  "replay": {"status": "none", "detail": "Phone app change only; no replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "No client protocol change: the phone reads the existing alert, conversation_id and activity fields and keeps the attention wire names, so older and newer builds work against the same daemons."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No deployed installation action required; a new phone build is installed by the person."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

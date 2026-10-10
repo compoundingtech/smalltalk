@@ -55,7 +55,7 @@
 "harness.context-clear.requested" = { class = "transition", window = "7d", pending = "no reader audit yet" }
 "harness.context-clear.result" = { class = "transition", window = "7d", pending = "no reader audit yet" }
 "harness.diagnostic" = { class = "transition", window = "7d", pending = "only the seat status history rule retains its sources" }
-"harness.limits" = { class = "current", pending = "the account fold compares readings across seats and reset windows" }
+"harness.limits" = { class = "current" }
 # Other nodes read the current harness state: step readiness is judged on the mission's node and
 # fleet views run anywhere. Nothing reads a heartbeat, so only changes replicate.
 "harness.observed" = { class = "current", log = "on-change" }
@@ -65,6 +65,11 @@
 "harness.telemetry" = { class = "otel", log = "local" }
 "harness.timeline" = { class = "transition", window = "7d", log = "local" }
 "harness.todo.observed" = { class = "current", log = "on-change" }
+# Every response goes to OpenTelemetry through [observations.otlp]. The replicated rollups keep
+# the last snapshot of each UTC hour for seven days, then each series' newest: account allowances
+# are weekly, so those seven days are usage's current window, which `st usage` and budget
+# forecasting read across the fleet, not old history. On a 14 GB production member this kind is
+# about 450 MB with its overhead, and checkpoints already drop 88% of its claims.
 "harness.usage" = { class = "otel", log = "on-change" }
 "intent.desired" = { class = "durable" }
 "lane.approved" = { class = "durable" }
@@ -129,7 +134,7 @@
 "runtime.action.succeeded" = { class = "transition", window = "7d", log = "system-local" }
 "runtime.observed" = { class = "current", pending = "only the seat status history rule retains its sources" }
 "runtime.readiness-deadline-reached" = { class = "transition", window = "7d", log = "local" }
-"runtime.reconcile-decision" = { class = "current", pending = "no reader audit yet" }
+"runtime.reconcile-decision" = { class = "current" }
 "runtime.restart-window-reset" = { class = "transition", window = "7d", pending = "restart windows read every reset" }
 "schedule.occurrence-cancelled" = { class = "durable" }
 "schedule.occurrence-reached" = { class = "durable" }
@@ -275,9 +280,22 @@ when = ["semantics=context_occupancy"]
 slot = ["incarnation_id"]
 keep = "newest"
 
+# The account fold reads, for each account group (driver, account, declared account, weekly or
+# five-hour only), the readings measured within an hour of the group's newest, and each seat's
+# newest reading. A group's newest only moves forward, so a reading older than that hour is
+# never read again, whatever arrives later.
 [[rules]]
 kind = "harness.limits"
-keep = "all-source-observations"
+slot = []
+keep = "newest,newest-reading,every-reading-within-1h-of-its-account-group-newest-measured_at"
+
+# The reconciler writes a decision only when it differs from the subject's newest, and reads
+# whether a decision with a given key was recorded, the newest member-reconcile decision, and the
+# subject's newest decision. Each key keeps its newest.
+[[rules]]
+kind = "runtime.reconcile-decision"
+slot = ["key"]
+keep = "newest,newest-carrier-of-each-field"
 
 [[rules]]
 kind = "resource.observed"

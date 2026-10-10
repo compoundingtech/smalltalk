@@ -13,6 +13,13 @@ use serde_json::Value;
 
 use crate::harness_timeline::{Operation, Record};
 
+#[cfg(test)]
+#[path = "harness_output_model_controls.rs"]
+mod output_model;
+#[cfg(test)]
+#[path = "harness_events_output_controls.rs"]
+mod output_controls;
+
 pub const WAKE_PIPE: &str = ".st-harness-events-wake";
 pub const DATABASE: &str = "st-harness-events.sqlite";
 const MAX_PENDING_BYTES: u64 = 64 * 1024 * 1024;

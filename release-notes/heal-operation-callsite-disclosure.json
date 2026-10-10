@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Correct operation rebuild caller frequency disclosure",
+  "replay": {
+    "status": "none",
+    "detail": "Correct prior every-import frequency disclosure: the legacy import_replication helper is cfg(test)-only. Production full canonical rebuild callers remain explicit/version-gated/open/full Runtime replay/checkpoint; selected incremental receive registers affected operations. Production/control/source-authority/corruption-repair bytes unchanged; full rebuild scans/memory/all-changed DML and writer hold remain unbounded. No dirty-gating, caller skip, Runtime adoption or VM-to-wall-time bound."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Correct prior every-import frequency disclosure: the legacy import_replication helper is cfg(test)-only. Production full canonical rebuild callers remain explicit/version-gated/open/full Runtime replay/checkpoint; selected incremental receive registers affected operations. Production/control/source-authority/corruption-repair bytes unchanged; full rebuild scans/memory/all-changed DML and writer hold remain unbounded. No dirty-gating, caller skip, Runtime adoption or VM-to-wall-time bound."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Correct prior every-import frequency disclosure: the legacy import_replication helper is cfg(test)-only. Production full canonical rebuild callers remain explicit/version-gated/open/full Runtime replay/checkpoint; selected incremental receive registers affected operations. Production/control/source-authority/corruption-repair bytes unchanged; full rebuild scans/memory/all-changed DML and writer hold remain unbounded. No dirty-gating, caller skip, Runtime adoption or VM-to-wall-time bound."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Correct prior every-import frequency disclosure: the legacy import_replication helper is cfg(test)-only. Production full canonical rebuild callers remain explicit/version-gated/open/full Runtime replay/checkpoint; selected incremental receive registers affected operations. Production/control/source-authority/corruption-repair bytes unchanged; full rebuild scans/memory/all-changed DML and writer hold remain unbounded. No dirty-gating, caller skip, Runtime adoption or VM-to-wall-time bound."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Correct prior every-import frequency disclosure: the legacy import_replication helper is cfg(test)-only. Production full canonical rebuild callers remain explicit/version-gated/open/full Runtime replay/checkpoint; selected incremental receive registers affected operations. Production/control/source-authority/corruption-repair bytes unchanged; full rebuild scans/memory/all-changed DML and writer hold remain unbounded. No dirty-gating, caller skip, Runtime adoption or VM-to-wall-time bound."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Correct prior every-import frequency disclosure: the legacy import_replication helper is cfg(test)-only. Production full canonical rebuild callers remain explicit/version-gated/open/full Runtime replay/checkpoint; selected incremental receive registers affected operations. Production/control/source-authority/corruption-repair bytes unchanged; full rebuild scans/memory/all-changed DML and writer hold remain unbounded. No dirty-gating, caller skip, Runtime adoption or VM-to-wall-time bound."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Correct prior every-import frequency disclosure: the legacy import_replication helper is cfg(test)-only. Production full canonical rebuild callers remain explicit/version-gated/open/full Runtime replay/checkpoint; selected incremental receive registers affected operations. Production/control/source-authority/corruption-repair bytes unchanged; full rebuild scans/memory/all-changed DML and writer hold remain unbounded. No dirty-gating, caller skip, Runtime adoption or VM-to-wall-time bound."
+  }
+}

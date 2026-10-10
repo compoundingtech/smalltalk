@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Restore an existing repair control and preserve complete-rebuild known-key logical-cache parity",
+  "replay": {
+    "status": "none",
+    "detail": "Canonical expected_operations and full rebuild callers remain unchanged. Source candidate retains an exact operation row only with its exact SQLite-encoded known-key logical cache; other known-key cache states receive the existing delete/insert refresh path."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema/migration/version change. Store create_schema initializes projection digest tables/triggers before actual Runtime open/replay callers use the existing transaction helper."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No source authority, reduction, membership or rules digest change. Cache check cannot supply canonical receipt authority."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Public helper signature/Runtime dispatch/wire unchanged. The old failed-repair control body is restored byte-for-byte; only module comment and appended controls differ."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Known-key cache comparison is now part of one raw actual/cache joined scan, with no additional per-row prepared statement. CASE guards unsupported raw storage types; raw canonical byte equality still rejects invalid UTF-8 TEXT. Complete scan/probe/map/vector/all-changed work remains unbounded and unmeasured."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Source/static-only correction; no push/PR/queue, compiler/SQLite/native/workload, production repair or off-writer API action requested."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Known-key missing/wrong logical cache with consistently corresponding count/accumulator is covered by one additional unrun differential control. Arbitrary physically corrupt cache schema/storage or digest accumulator remains outside that claim."
+  }
+}
