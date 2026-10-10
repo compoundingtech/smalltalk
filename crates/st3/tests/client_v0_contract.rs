@@ -314,6 +314,77 @@ fn resource_fields_and_generation_map_keys_enforce_family_references() {
     }
 }
 
+#[test]
+fn mission_step_actor_references_conform_without_accepting_other_id_families() {
+    let mission = fixture("person-ask-mission.json");
+    let paths = [
+        "/run_details/0/current_steps/0/assignee",
+        "/run_details/0/current_steps/0/claimant",
+        "/run_details/0/steps/0/assignee",
+        "/run_details/0/steps/0/claimant",
+        "/run_details/0/steps/0/wake/assignee",
+    ];
+    for validator in [consumer_validator("Mission"), contract_validator("Mission")] {
+        assert_conforms(&validator, "person-ask mission fixture", &mission);
+        for path in paths {
+            for actor in ["agent/asker", "daemon/reconciler", "person/avery"] {
+                let mut row = mission.clone();
+                *row.pointer_mut(path).unwrap() = serde_json::json!(actor);
+                assert_conforms(&validator, path, &row);
+            }
+            for invalid in ["mission/not-an-actor", "person/", "daemon/white space", "agent/"] {
+                let mut row = mission.clone();
+                *row.pointer_mut(path).unwrap() = serde_json::json!(invalid);
+                assert!(!validator.is_valid(&row), "{path} accepted {invalid}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn emitted_person_ask_mission_list_and_detail_conform_and_decode() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        state.store.origin(),
+    )
+    .unwrap();
+    state.store.apply_internal(&intent, "contract-person-asker").unwrap();
+    let ask = state.store.ask_person(&st3::model::PersonAskRequest {
+        legacy_request: None,
+        person: "person/avery".into(),
+        title: "Choose a release date".into(),
+        reason: "Release needs a date".into(),
+        actor: format!("agent/{}.asker", state.store.origin()),
+        step: None,
+        new_run: Some("choose-date".into()),
+        incarnation: None,
+        idempotency_key: "contract-person-ask".into(),
+        request: None,
+    }).unwrap();
+    let app = st3::api::router(state);
+    let (status, list) = client_json(app.clone(), "/v1/client/missions").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let mission = list["value"]["items"].as_array().unwrap().iter()
+        .find(|row| row["runs"].as_array().unwrap().contains(&serde_json::json!(ask.run)))
+        .expect("person ask must remain in the mission collection");
+    let detail_uri = format!("/v1/client/missions/{}", mission["id"].as_str().unwrap());
+    let (status, detail) = client_json(app, &detail_uri).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    for row in [mission, &detail["value"]] {
+        assert_conforms(&contract_validator("Mission"), "emitted person-ask mission", row);
+        let decoded: st3_client::Mission = serde_json::from_value(row.clone()).unwrap();
+        let run = decoded.run_details.iter()
+            .find(|run| run.id == ask.run).unwrap();
+        assert_eq!(run.current_steps[0]["assignee"], "person/avery");
+        let step = run.steps.as_ref().unwrap().iter().find(|step| step.id == ask.subject).unwrap();
+        assert_eq!(step.assignee.as_deref(), Some("person/avery"));
+        assert!(step.claimant.is_none());
+    }
+    assert_eq!(detail["value"]["run_details"][0]["steps"][0]["wake"]["assignee"], "person/avery");
+}
+
 #[tokio::test]
 async fn outbound_rust_collection_commands_conform_with_none_options() {
     use axum::extract::ws::WebSocketUpgrade;
@@ -1195,6 +1266,25 @@ async fn attention_socket_evicts_completed_sources_and_reconnects_without_cached
         .iter()
         .find(|c| c["source_id"] == ask.subject)
         .unwrap();
+    // The ask is an alert in its asker's conversation.
+    assert_eq!(card["alert"], true, "{card}");
+    assert_eq!(
+        card["conversation_id"],
+        format!("agent/{}.asker", state.store.origin())
+    );
+    // `alerts` is the same collection under the name a person reads.
+    stream
+        .subscribe("alerts", "alerts", 20, None, None)
+        .await
+        .unwrap();
+    let alerts = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(alerts["id"], "alerts");
+    assert_eq!(alerts["items"], first["items"]);
+    stream.unsubscribe("alerts").await.unwrap();
     let card_id = card["id"].clone();
     let revision = card["revision"].clone();
     let app = st3::api::router(state.clone());
@@ -2132,10 +2222,15 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
     assert_eq!(capability_state("mission.cancel-revision"), "ungranted");
     assert_eq!(capability_state("launch.create"), "granted");
     assert_eq!(capability_state("message.send"), "ungranted");
+    assert_eq!(capability_state("alerts"), "granted");
 
     let (status, attention) =
         client_json_auth(fabric.clone(), "/v1/client/attention", credential).await;
     assert_eq!(status, StatusCode::OK, "{attention}");
+    let (status, alerts) =
+        client_json_auth(fabric.clone(), "/v1/client/alerts", credential).await;
+    assert_eq!(status, StatusCode::OK, "{alerts}");
+    assert_eq!(alerts["value"]["items"], attention["value"]["items"]);
     let item = |id: &str| {
         attention["value"]["items"]
             .as_array()

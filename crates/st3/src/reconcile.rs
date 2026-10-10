@@ -5324,6 +5324,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         launch_member
             .environment
             .remove(crate::suspension::CONTINUE_PATH_ENV);
+        let selector_scope = crate::native_resume::selection_scope(member);
+        launch_member.environment.remove(crate::suspension::SELECTOR_SCOPE_ENV);
+        if let Some(scope) = &selector_scope {
+            launch_member.environment.insert(crate::suspension::SELECTOR_SCOPE_ENV.into(), scope.clone());
+        }
         let continued = if subject.kind == "agent"
             && !member
                 .environment
@@ -5335,6 +5340,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 &subject.subject,
                 harness,
                 launch_member.environment.get("ST3_ACCOUNT").map(String::as_str),
+                selector_scope.as_deref(),
             )?
         } else {
             None
@@ -26781,6 +26787,28 @@ mission "waiting" state="ready" {
                 "{person:?}"
             );
         }
+
+        // Each is an alert in the conversation of the agent behind it: the gate in the builder's
+        // whose work it reviews, the mission's person step in the run's requester's.
+        let conversations = store
+            .attention_items(Some("person/alex"))
+            .unwrap()
+            .into_iter()
+            .map(|item| (item.kind.clone(), (item.is_alert(), item.conversation)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            conversations,
+            BTreeMap::from([
+                (
+                    "human-gate".to_owned(),
+                    (true, Some("agent/node.builder".to_owned()))
+                ),
+                (
+                    "person-step".to_owned(),
+                    (true, Some("agent/node.lead".to_owned()))
+                ),
+            ])
+        );
 
         // Each owner heard about its fault once, however many passes ran.
         let faults_for = |agent: &str| {

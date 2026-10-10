@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Schedule required PR Workspace checks with merge checks ahead of optional Namespace work",
+  "replay": {
+    "status": "none",
+    "detail": "CI scheduling only; no production runtime or database change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI scheduling only; no production runtime or database change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Namespace scheduling only; no runtime authority or claim rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Runner labels, shapes, run affinity, fork isolation, local admission and all test/compiler arguments remain unchanged except the required PR queue priority."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI scheduling only; no production runtime or database change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Takes effect through the normal workflow merge; existing queued jobs retain their labels and finish naturally. No repository variable or ruleset change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "CI scheduling only; no production runtime or database change."
+  }
+}
