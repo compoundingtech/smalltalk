@@ -782,5 +782,12 @@ fn idle_lookup_cost_is_flat_with_delivered_mail_and_pr_history() {
             .iter()
             .any(|plan| plan.contains("claims_subject_kind_accepted_index"))
     );
+    assert!(plans.iter().all(|plan| !plan.contains("TEMP B-TREE")));
+    // The aggregate scans at most two one-row subquery results; no retained table is scanned.
+    assert!(
+        plans
+            .iter()
+            .all(|plan| !plan.contains("SCAN ") || plan.contains("SCAN (subquery-"))
+    );
     assert!(idle.seat.store.latest_nudge(&step).unwrap().is_none());
 }

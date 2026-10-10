@@ -15,7 +15,7 @@ pub const WORK_NUDGED_KIND: &str = "work.nudged";
 const THREAD_SCAN: u32 = 400;
 
 const QUEUE_EXIT_SQL: &str = "SELECT json_extract(body, '$.fields.facts'), accepted_at_unix_ms,
-             COALESCE(json_extract(body, '$.fields.attribution_only'), 0)
+             CASE WHEN json_extract(body, '$.fields.attribution_only') IN (1,'true') THEN 1 ELSE 0 END
              FROM claims INDEXED BY claims_subject_kind_accepted_index
              WHERE subject=?1 AND kind='resource.observed'
              ORDER BY length(accepted_at_unix_ms) DESC,accepted_at_unix_ms DESC,store_index DESC
@@ -23,12 +23,12 @@ const QUEUE_EXIT_SQL: &str = "SELECT json_extract(body, '$.fields.facts'), accep
 
 // Each mailbox alias contributes at most one row; the aggregate never sorts retained wakes.
 const LAST_WAKE_SQL: &str = "SELECT MAX(sent_at) FROM (
-    SELECT sent_at FROM (SELECT sent_at FROM local_idle_messages INDEXED BY local_idle_messages_wake
-        WHERE recipient=?1 AND wait_tag=?3 AND source_prefix=?4 AND delivered=1
+    SELECT sent_at FROM (SELECT sent_at FROM local_idle_messages INDEXED BY local_idle_messages_wake_v1
+        WHERE recipient=?1 AND wait_tag=?3 AND source_prefix=?4 AND source_prefix IS NOT NULL AND delivered=1
         ORDER BY sent_at DESC LIMIT 1)
     UNION ALL
-    SELECT sent_at FROM (SELECT sent_at FROM local_idle_messages INDEXED BY local_idle_messages_wake
-        WHERE recipient=?2 AND wait_tag=?3 AND source_prefix=?4 AND delivered=1
+    SELECT sent_at FROM (SELECT sent_at FROM local_idle_messages INDEXED BY local_idle_messages_wake_v1
+        WHERE recipient=?2 AND wait_tag=?3 AND source_prefix=?4 AND source_prefix IS NOT NULL AND delivered=1
         ORDER BY sent_at DESC LIMIT 1))";
 
 /// One live GitHub watch a seat holds.
@@ -144,7 +144,9 @@ impl Store {
         // Newest first: while the thread is out of the queue, the oldest such observation is when
         // it left; the one before that must have it queued.
         let mut left = None::<u128>;
+        let mut examined = 0;
         for row in &mut rows {
+            examined += 1;
             let (facts, at, attribution_only) = row?;
             if attribution_only {
                 continue;
@@ -164,6 +166,9 @@ impl Store {
                 return Ok(None);
             }
             left = Some(at);
+        }
+        if examined == THREAD_SCAN {
+            tracing::warn!(%item, limit=THREAD_SCAN, "idle nudge queue-exit history is unknown: bounded observation window exhausted");
         }
         Ok(None)
     }
@@ -308,5 +313,20 @@ impl Store {
             }
         }
         Ok(plans)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_queue_exit_tolerates_non_integer_attribution() {
+        let store = Store::open_memory("node").unwrap();
+        store.connection.write().execute("INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms) VALUES('idle-queue','node',1,'fixture','1')", []).unwrap();
+        store.seed_idle_history("agent/node.worker", 1, 0..0, 0..2);
+        store.connection.write().execute("UPDATE claims SET body=?1,accepted_at_unix_ms='2' WHERE id='fixture-pr-1'", [json!({"fields":{"facts":{"state":"open","merge_queue":{"state":"unqueued"}},"attribution_only":"invalid"}}).to_string()]).unwrap();
+        let thread = ThreadRef::parse("acme/garden#12").unwrap();
+        assert_eq!(store.thread_left_merge_queue(&thread, 0).unwrap(), Some(2));
     }
 }
