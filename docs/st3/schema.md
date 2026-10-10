@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `0f4a8d0564e72b68daa5e0f4866caf97832b4a3d93da8154f7f3f3a8bd44d14d`
+Digest: `262aea3a57ae93bd510e3f22ad4bd732b02ab886abb1e1108b124aabcc2fa9ee`
 Storage version: `18`
 Storage digest: `d11a3e5db57db0a0bd6a9b27474cdd93958a401b3a6482b62aea3595530dbcef`
 
@@ -204,6 +204,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `work.claimed` | `step-run` | `authorized-participant` | `state-transition` | `durable` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `extend_ms:integer`, `handoff_acknowledged:subject-reference`, `handoff_key:string`, `handoff_message:subject-reference`, `handoff_request:object`, `handoff_to:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
 | `work.extended` | `step-run` | `authorized-participant` | `append` | `durable` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `extend_ms:integer`, `handoff_acknowledged:subject-reference`, `handoff_key:string`, `handoff_message:subject-reference`, `handoff_request:object`, `handoff_to:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
 | `work.failed` | `step-run` | `authorized-participant` | `once-per-attempt` | `durable` | `attempt:integer`, `claim_expires_at_unix_ms:integer`, `claim_incarnation:string`, `claimant:subject-reference`, `extend_ms:integer`, `handoff_acknowledged:subject-reference`, `handoff_key:string`, `handoff_message:subject-reference`, `handoff_request:object`, `handoff_to:subject-reference`, `readiness_epoch:integer`, `reason:string`, `status:string`, `summary:string`, `worker_reported:boolean` |  |
+| `work.nudged` | `step-run` | `system-only` | `append` | `durable` | `agent:subject-reference`, `attempt:integer`, `idle_since_unix_ms:string`, `message:subject-reference`, `reason:string`, `waits:array` |  |
 | `work.person-asked` | `step-run` | `authorized-participant` | `append` | `durable` | `attempt:integer`, `generation:subject-reference`, `key:string`, `legacy_request:string`, `mission_spec:object`, `origin_attempt:integer`, `origin_step:subject-reference`, `owner_generation:subject-reference`, `owner_run:subject-reference`, `person:subject-reference`, `reason:string`, `request:object`, `requester_declaration:string`, `run:subject-reference`, `status:string`, `title:string`, `waiting_since:string` |  |
 | `work.person-cancelled` | `step-run` | `authorized-participant` | `append` | `durable` | `answer:object`, `attempt:integer`, `episode:string`, `key:string`, `status:string`, `summary:string` |  |
 | `work.person-done` | `step-run` | `authorized-participant` | `append` | `durable` | `acted_for:subject-reference(person)`, `answer:object`, `attempt:integer`, `delegation:object`, `episode:string`, `key:string`, `status:string`, `summary:string` |  |

@@ -7760,6 +7760,7 @@ mod tests {
                 st3_ui_model::missions::StepMetadata {
                     blocked_reason: None,
                     last_progress: Some("Tests pass; opening the PR".into()),
+                    nudged: None,
                 },
             );
         }

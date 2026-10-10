@@ -2275,6 +2275,7 @@ fn client_work_values(
                 "claim_incarnation": work.claim_incarnation,
                 "claim_expires_at_unix_ms": work.claim_expires_at_unix_ms,
                 "execution_started_at_unix_ms": work.execution_started_at_unix_ms,
+                "nudged_at_unix_ms": work.nudged_at_unix_ms,
                 "execution_elapsed_ms": work.execution_elapsed_ms,
                 "timeout_ms": work.timeout_ms,
                 "goals": work.goals,
