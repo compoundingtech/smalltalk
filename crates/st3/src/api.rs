@@ -318,6 +318,62 @@ mod storage_contention_response_tests {
     }
 
     #[test]
+    fn fresh_register_becomes_stale_at_ninety_seconds_without_a_write() {
+        use serde_json::json;
+        let store = crate::store::Store::open_memory("owner").unwrap();
+        store
+            .append_claim(&crate::model::ClaimInput {
+                subject: "agent/fresh-boundary".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    json!({"status":"running","host":"owner","incarnation_id":"one"}),
+                )
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let now = st_drivers::message::now_ms();
+        store
+            .append_claim(&crate::model::ClaimInput {
+                subject: "agent/fresh-boundary".into(),
+                kind: "harness.observed".into(),
+                actor: None,
+                fields: serde_json::from_value(json!({"state":"working","driver":"codex",
+                "incarnation_id":"one","observed_at_ms":now}))
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let harness = store
+            .current_harness("agent/fresh-boundary")
+            .unwrap()
+            .unwrap();
+        let make = || {
+            vec![
+                json!({"id":"agent/fresh-boundary","state":"running","harness_state":"working",
+            "updated_at":"","_status_source":harness}),
+            ]
+        };
+        let boundary = store.current_observation_boundary().unwrap();
+        let mut fresh = make();
+        super::overlay_agent_resources_at(&store, &mut fresh, "", u128::from(now) + 90_000)
+            .unwrap();
+        assert_eq!(fresh[0]["observation"], "current");
+        let mut stale = make();
+        super::overlay_agent_resources_at(&store, &mut stale, "", u128::from(now) + 90_001)
+            .unwrap();
+        assert_eq!(stale[0]["observation"], "stale");
+        assert_eq!(stale[0]["harness_state"], "indeterminate");
+        assert_eq!(stale[0]["state"], "waiting");
+        assert_eq!(store.current_observation_boundary().unwrap(), boundary);
+    }
+
+    #[test]
     fn current_write_deadline_is_typed_unavailable_and_retryable() {
         let error = super::ApiError::bad(super::St3Error::new("current-value-deadline", "write expired"));
         assert_eq!(error.status, super::StatusCode::SERVICE_UNAVAILABLE);
@@ -2483,6 +2539,15 @@ fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Re
 }
 
 fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
+    overlay_agent_resources_at(store, items, at, client_now_ms())
+}
+
+fn overlay_agent_resources_at(
+    store: &Store,
+    items: &mut [Value],
+    at: &str,
+    now: u128,
+) -> anyhow::Result<()> {
     let local_host = client_host_id(store.origin());
     let subjects = items
         .iter()
@@ -2509,11 +2574,7 @@ fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyh
         // reads diagnostic or observation history; a same-incarnation heartbeat stays current.
         let observation = match harness {
             None => "missing",
-            Some(harness)
-                if client_now_ms().saturating_sub(harness.observed_at_unix_ms) > 90_000 =>
-            {
-                "stale"
-            }
+            Some(harness) if now.saturating_sub(harness.observed_at_unix_ms) > 90_000 => "stale",
             Some(_) => "current",
         };
         item["observation"] = json!(observation);
@@ -5628,17 +5689,17 @@ pub fn start_stopped_usage_flush(state: &AppState) {
     });
 }
 
-fn current_fleet_hosts(state: &AppState) -> BTreeSet<String> {
+fn current_fleet_hosts(state: &AppState) -> Result<BTreeSet<String>, St3Error> {
     state.client_relay.as_ref().map_or_else(
         || {
-            state
+            Ok(state
                 .configured_peers
                 .iter()
                 .cloned()
                 .chain(std::iter::once(state.node.clone()))
-                .collect()
+                .collect())
         },
-        |relay| relay.current_hosts(),
+        |relay| relay.current_hosts().map_err(smallclaims::error::internal),
     )
 }
 
@@ -5648,15 +5709,29 @@ pub fn start_current_value_maintenance(state: &AppState) {
     tokio::spawn(async move {
         let mut after = String::new();
         let mut last_warning = None;
+        let mut recovery_sweeps = 0;
+        let mut refusals = state.store.current_value_refusals();
         loop {
             let mut pause = Duration::from_secs(1);
-            let store = state.store.clone();
-            let hosts = current_fleet_hosts(&state);
+            let worker = state.clone();
             let cursor = after.clone();
-            match blocking_action(move || store.maintain_current_values(&hosts, &cursor)).await {
+            let next_refusals = state.store.current_value_refusals();
+            if next_refusals != refusals {
+                recovery_sweeps = 2;
+                refusals = next_refusals;
+            }
+            match blocking_action(move || {
+                let hosts = current_fleet_hosts(&worker)?;
+                worker.store.maintain_current_values(&hosts, &cursor)
+            })
+            .await
+            {
                 Ok(batch) => {
                     after = batch.after;
-                    if batch.history_visited != 0 {
+                    if after.is_empty() && recovery_sweeps > 0 {
+                        recovery_sweeps -= 1;
+                    }
+                    if batch.history_visited != 0 || batch.removed != 0 || recovery_sweeps > 0 {
                         pause = Duration::from_millis(100);
                     }
                     if batch.removed != 0 {
@@ -5672,7 +5747,10 @@ pub fn start_current_value_maintenance(state: &AppState) {
                     }
                 }
             }
-            tokio::time::sleep(pause).await;
+            tokio::select! {
+                _ = tokio::time::sleep(pause) => {},
+                _ = state.store.current_value_maintenance_wake().notified() => {},
+            }
         }
     });
 }
@@ -11379,12 +11457,14 @@ async fn receive_current_value(
     State(state): State<AppState>,
     Json(record): Json<ClaimRecord>,
 ) -> Result<Json<Value>, ApiError> {
-    let hosts = current_fleet_hosts(&state);
-    let store = state.store.clone();
+    let worker = state.clone();
     let transition =
         record.kind == "harness.observed" && record.body["fields"]["status_transition"] != false;
     let (changed, semantic) =
-        blocking_action(move || store.receive_current_value_for_hosts(&record, &hosts)).await?;
+        blocking_action(move || {
+            let hosts = current_fleet_hosts(&worker)?;
+            worker.store.receive_current_value_for_hosts(&record, &hosts)
+        }).await?;
     if semantic {
         signal_local_change(&state);
         if transition {

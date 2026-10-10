@@ -459,6 +459,14 @@ fn absolute_failures(report: &Report) -> Vec<String> {
             report.daemon_cores
         ));
     }
+    // Count classified one-shot drops for diagnosis, but do not use them to waive
+    // writer contention in the acceptance profile.
+    if report.current_dropped != 0 {
+        failures.push(format!(
+            "{} current samples dropped on writer contention",
+            report.current_dropped
+        ));
+    }
     let requests = report.paths.values().map(|path| path.count).sum::<usize>();
     let failed = report.failed.values().sum::<usize>();
     // A rare path's timeout must not disappear inside an overall error allowance.
@@ -751,7 +759,12 @@ fn latency_needs_five_main_runs_but_cpu_compares_during_bootstrap() {
             serde_json::to_vec(&baseline.report).unwrap(),
         )
         .unwrap();
-        assert_eq!(worst_of(directory.path(), LoadProfile::Agents).unwrap().runs, run + 1);
+        assert_eq!(
+            worst_of(directory.path(), LoadProfile::Agents)
+                .unwrap()
+                .runs,
+            run + 1
+        );
     }
 }
 
@@ -837,6 +850,13 @@ fn relative_tolerance_keeps_every_absolute_budget_and_correctness_check() {
         );
     }
     assert!(absolute_failures(&report).is_empty());
+    report.current_dropped = 1;
+    assert!(
+        absolute_failures(&report)
+            .iter()
+            .any(|failure| failure.contains("current samples dropped"))
+    );
+    report.current_dropped = 0;
     for name in report.paths.keys().cloned().collect::<Vec<_>>() {
         let path = report.paths.get_mut(&name).unwrap();
         path.p99_ms = path.budget_ms + 0.01;

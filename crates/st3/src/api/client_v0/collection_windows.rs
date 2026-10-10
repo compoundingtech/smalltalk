@@ -684,6 +684,70 @@ mod tests {
     }
 
     #[test]
+    fn stale_to_fresh_heartbeat_invalidates_a_held_window() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let windows = Windows::attach(&state.store).unwrap();
+        let session = ClientSession::local(None).unwrap();
+        let now = client_now_ms() as u64;
+        let publish = |at| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "agent/heartbeat".into(),
+                    kind: "harness.observed".into(),
+                    actor: None,
+                    fields: serde_json::from_value(json!({"state":"working","driver":"codex",
+                "incarnation_id":"one","observed_at_ms":at}))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        publish(now - 90_001);
+        let count = AtomicUsize::new(0);
+        read(&windows, &state, &session, &request("agents"), 0, &count);
+        let commits = windows.commits();
+        let frontier = state
+            .store
+            .current_observation_boundary()
+            .unwrap()
+            .local_cursor;
+        let first = state
+            .store
+            .read_snapshot(|index| windows.revision(&state.store, index, "agents", commits))
+            .unwrap();
+        let recovered = publish(now);
+        assert_eq!(recovered.body["_semantic_transition"], true);
+        assert!(
+            state
+                .store
+                .current_observation_boundary()
+                .unwrap()
+                .local_cursor
+                > frontier
+        );
+        assert!(
+            state
+                .store
+                .read_snapshot(|index| windows.revision(&state.store, index, "agents", commits))
+                .unwrap()
+                .is_none()
+        );
+        read(&windows, &state, &session, &request("agents"), 0, &count);
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let next = state
+            .store
+            .read_snapshot(|index| {
+                windows.revision(&state.store, index, "agents", windows.commits())
+            })
+            .unwrap();
+        assert_ne!(first, next);
+    }
+
+    #[test]
     fn restamped_heartbeats_keep_collection_windows_until_a_semantic_change() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -705,7 +769,8 @@ mod tests {
                 })
                 .unwrap()
         };
-        publish(10, "working");
+        let now = client_now_ms() as u64;
+        publish(now, "working");
         let count = AtomicUsize::new(0);
         for name in ["agents", "attention"] {
             read(&windows, &state, &session, &request(name), 0, &count);
@@ -717,7 +782,7 @@ mod tests {
                 windows.revision(&state.store, index, "summary", windows.commits())
             })
             .unwrap();
-        for at in 11..41 {
+        for at in now + 1..now + 31 {
             // Capture the real read fence, then commit from another thread before its
             // snapshot checks that fence. This reproduced the aggregate-restamp race.
             let commits = windows.commits();
@@ -771,7 +836,7 @@ mod tests {
                 .unwrap(),
             summary
         );
-        publish(41, "idle");
+        publish(now + 31, "idle");
         for name in ["agents", "attention"] {
             read(&windows, &state, &session, &request(name), 0, &count);
         }

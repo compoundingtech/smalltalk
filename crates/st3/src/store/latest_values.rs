@@ -399,14 +399,38 @@ fn record_semantic_frontier(
     if changed {
         connection
             .execute(
-                "INSERT INTO current_value_frontiers VALUES(?1,
-            max(?2,coalesce((SELECT MAX(revision) FROM current_value_frontiers),0)+1))
+                "INSERT INTO current_value_frontiers VALUES(?1,?2)
             ON CONFLICT(subject) DO UPDATE SET revision=excluded.revision",
                 params![subject, source_id],
             )
             .map_err(internal)?;
     }
     Ok(())
+}
+
+// Collection consumes the same AUTOINCREMENT clock as timeline and register inserts.
+// One id covers a deletion batch; no payload row is retained for this tombstone.
+fn consume_observation_clock(connection: &Connection) -> Result<i64, St3Error> {
+    connection
+        .execute(
+            "UPDATE sqlite_sequence SET seq=max(seq,
+        coalesce((SELECT MAX(revision) FROM current_value_frontiers),0))+1
+        WHERE name='local_observations'",
+            [],
+        )
+        .map_err(internal)?;
+    if connection.changes() == 0 {
+        connection.execute("INSERT INTO sqlite_sequence(name,seq)
+            VALUES('local_observations',coalesce((SELECT MAX(revision) FROM current_value_frontiers),0)+1)", [])
+            .map_err(internal)?;
+    }
+    connection
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name='local_observations'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(internal)
 }
 
 pub(crate) struct CurrentMaintenance {
@@ -423,6 +447,40 @@ pub(super) fn initialize_semantic_frontiers(connection: &Connection) -> Result<(
         [],
         |row| row.get(0),
     )?;
+    // Repair clock drift from older collectors before any new observation can be inserted.
+    // Both reads use indexed maxima; this does not scan observation payloads.
+    let frontier: i64 = connection.query_row(
+        "SELECT coalesce(MAX(revision),0) FROM current_value_frontiers",
+        [],
+        |r| r.get(0),
+    )?;
+    let clock: i64 = connection.query_row(
+        "SELECT coalesce((SELECT seq FROM sqlite_sequence WHERE name='local_observations'),0)",
+        [],
+        |r| r.get(0),
+    )?;
+    if frontier > clock {
+        let deadline = std::time::Instant::now() + crate::client::LATEST_VALUE_TIMEOUT;
+        connection.progress_handler(100, Some(move || std::time::Instant::now() >= deadline));
+        let result = (|| -> Result<()> {
+            let tx =
+                Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)?;
+            tx.execute(
+                "UPDATE sqlite_sequence SET seq=?1 WHERE name='local_observations'",
+                [frontier],
+            )?;
+            if tx.changes() == 0 {
+                tx.execute(
+                    "INSERT INTO sqlite_sequence(name,seq) VALUES('local_observations',?1)",
+                    [frontier],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        connection.progress_handler(0, None::<fn() -> bool>);
+        result?;
+    }
     if done {
         return Ok(());
     }
@@ -470,6 +528,63 @@ pub(super) fn initialize_semantic_frontiers(connection: &Connection) -> Result<(
         [],
     )?;
     Ok(())
+}
+
+struct HistoryBatch {
+    subject: String,
+    kind: String,
+    cursor: i64,
+    cutoff: i64,
+    visited: usize,
+    last: i64,
+    delete: String,
+}
+
+// Payload inspection is bounded and read-only; the writer only rechecks the job and
+// live-row fence, deletes selected IDs, and advances its durable cursor.
+fn prepare_history_batch(reader: &Connection) -> Result<Option<HistoryBatch>, St3Error> {
+    let job: Option<(String,String,i64,i64)> = reader.query_row(
+        "SELECT subject,kind,cursor,cutoff FROM current_value_retirements ORDER BY subject,kind LIMIT 1",
+        [],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(internal)?;
+    let Some((subject, kind, cursor, cutoff)) = job else {
+        return Ok(None);
+    };
+    let rows = reader
+        .prepare_cached(
+            "SELECT id,body,EXISTS(SELECT 1 FROM latest_values v WHERE v.local_id=o.id)
+        FROM local_observations o WHERE subject=?1 AND kind=?2 AND id>?3 AND id<=?4
+        ORDER BY id LIMIT 256",
+        )
+        .map_err(internal)?
+        .query_map(params![subject, kind, cursor, cutoff], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, bool>(2)?,
+            ))
+        })
+        .map_err(internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)?;
+    let mut delete = Vec::new();
+    for (id, body, live) in &rows {
+        if !live
+            && (kind != "harness.usage"
+                || serde_json::from_str::<Value>(body).map_err(internal)?["fields"]["semantics"]
+                    == "context_occupancy")
+        {
+            delete.push(*id);
+        }
+    }
+    Ok(Some(HistoryBatch {
+        subject,
+        kind,
+        cursor,
+        cutoff,
+        visited: rows.len(),
+        last: rows.last().map_or(cutoff, |r| r.0),
+        delete: serde_json::to_string(&delete).map_err(internal)?,
+    }))
 }
 
 struct CurrentKey {
@@ -749,7 +864,9 @@ pub(super) fn append(
         }
         // Queue legacy history retirement; each background pass visits at most 256 rows.
         // The current transaction never parses the retained numeric series.
-        if previous.is_none() || retired_slots != 0 {
+        if (previous.is_none() || retired_slots != 0) && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM local_observations WHERE subject=?1 AND kind=?2 AND id<?3)",
+            params![input.subject,input.kind,sequence],|r|r.get::<_,bool>(0)).map_err(internal)? {
             tx.execute(
                 "INSERT INTO current_value_retirements VALUES(?1,?2,0,?3)
                 ON CONFLICT(subject,kind) DO UPDATE SET cutoff=max(cutoff,excluded.cutoff)",
@@ -816,13 +933,20 @@ fn update_readiness(tx: &Transaction<'_>, input: &ClaimInput) -> Result<(), St3E
 }
 
 impl Store {
+    pub(crate) fn current_value_refusals(&self) -> u64 {
+        self.smalltalk.current_value_refusals.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    pub(crate) fn current_value_maintenance_wake(&self) -> &tokio::sync::Notify {
+        &self.smalltalk.current_value_maintenance_wake
+    }
+
     /// The explicit reconnect boundary for consumers of current-observation transitions.
     /// Read this alongside the feed/snapshot in a pinned read transaction. A cursor behind
     /// retired evidence must resync from current values rather than promise missing history.
     pub fn current_observation_boundary(&self) -> Result<CurrentObservationBoundary> {
         Ok(self.readers.get().query_row(
             "SELECT (SELECT value FROM meta WHERE key='current-value-epoch'),
-                    (SELECT COALESCE(MAX(id),0) FROM local_observations),
+                    COALESCE((SELECT seq FROM sqlite_sequence WHERE name='local_observations'),0),
                     COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='current-value-retired-through'),0)",
             [], |row| Ok(CurrentObservationBoundary {
                 epoch: row.get(0)?, local_cursor: row.get(1)?,
@@ -972,16 +1096,9 @@ impl Store {
                 obsolete.push(key);
             }
         }
-        let job: Option<(String, String)> = reader
-            .query_row(
-                "SELECT subject,kind FROM current_value_retirements ORDER BY subject,kind LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .map_err(internal)?;
+        let history_work = prepare_history_batch(&reader);
         drop(reader);
-        if obsolete.is_empty() && job.is_none() {
+        if obsolete.is_empty() && matches!(history_work, Ok(None)) {
             return Ok(CurrentMaintenance {
                 removed: 0,
                 history_visited: 0,
@@ -997,94 +1114,101 @@ impl Store {
         connection
             .busy_timeout(std::time::Duration::ZERO)
             .map_err(internal)?;
-        let (removed, history_visited, kinds) = current_transaction(&mut connection, |tx| {
-            let mut removed = 0;
-            let mut kinds = BTreeSet::new();
-            for key in &obsolete {
-                if !obsolete_key(tx, key, hosts)? {
-                    continue;
-                }
-                let count=tx.execute("DELETE FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3 AND source_id=?4",
+        let (removed, kinds) = if obsolete.is_empty() {
+            (0, BTreeSet::new())
+        } else {
+            current_transaction(&mut connection, |tx| {
+                let mut removed = 0;
+                let mut kinds = BTreeSet::new();
+                let mut deleted_subjects = BTreeSet::new();
+                for key in &obsolete {
+                    if !obsolete_key(tx, key, hosts)? {
+                        continue;
+                    }
+                    let count=tx.execute("DELETE FROM latest_values WHERE subject=?1 AND kind=?2 AND slot=?3 AND source_id=?4",
                     params![key.subject,key.kind,key.slot,key.source_id]).map_err(internal)?;
-                if count == 0 {
-                    continue;
-                }
-                retire_feed_through(tx, key.local_id)?;
-                tx.execute("DELETE FROM local_observations WHERE id=?1", [key.local_id])
-                    .map_err(internal)?;
-                if key.kind == "harness.observed" {
-                    tx.execute(
-                        "DELETE FROM latest_readiness WHERE subject=?1",
-                        [&key.subject],
-                    )
-                    .map_err(internal)?;
-                }
-                let clock: i64 = tx
-                    .query_row(
-                        "SELECT coalesce((SELECT seq FROM sqlite_sequence
-                    WHERE name='local_observations'),0)+1",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(internal)?;
-                record_semantic_frontier(tx, &key.subject, clock, true)?;
-                kinds.insert(key.kind.clone());
-                removed += count;
-            }
-            let mut visited = 0;
-            if let Some((subject, kind)) = &job {
-                let bounds: Option<(i64, i64)> = tx
-                    .query_row(
-                        "SELECT cursor,cutoff FROM current_value_retirements
-                    WHERE subject=?1 AND kind=?2",
-                        params![subject, kind],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()
-                    .map_err(internal)?;
-                if let Some((cursor, cutoff)) = bounds {
-                    let rows=tx.prepare_cached("SELECT id,body,EXISTS(SELECT 1 FROM latest_values v WHERE v.local_id=o.id)
-                        FROM local_observations o WHERE subject=?1 AND kind=?2 AND id>?3 AND id<=?4
-                        ORDER BY id LIMIT 256").map_err(internal)?
-                        .query_map(params![subject,kind,cursor,cutoff],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,bool>(2)?)))
-                        .map_err(internal)?.collect::<rusqlite::Result<Vec<_>>>().map_err(internal)?;
-                    visited = rows.len();
-                    let mut delete = Vec::new();
-                    for (id, body, live) in &rows {
-                        if *live {
-                            continue;
-                        }
-                        if kind != "harness.usage"
-                            || serde_json::from_str::<Value>(body).map_err(internal)?["fields"]["semantics"]
-                                == "context_occupancy"
-                        {
-                            delete.push(*id);
-                        }
+                    if count == 0 {
+                        continue;
                     }
-                    if let Some(last) = delete.iter().max() {
-                        retire_feed_through(tx, *last)?;
-                    }
-                    tx.execute("DELETE FROM local_observations WHERE id IN (SELECT value FROM json_each(?1))",
-                        [serde_json::to_string(&delete).map_err(internal)?]).map_err(internal)?;
-                    if visited < 256 {
+                    retire_feed_through(tx, key.local_id)?;
+                    tx.execute("DELETE FROM local_observations WHERE id=?1", [key.local_id])
+                        .map_err(internal)?;
+                    if key.kind == "harness.observed" {
                         tx.execute(
-                            "DELETE FROM current_value_retirements WHERE subject=?1 AND kind=?2",
-                            params![subject, kind],
+                            "DELETE FROM latest_readiness WHERE subject=?1",
+                            [&key.subject],
                         )
                         .map_err(internal)?;
-                    } else {
-                        tx.execute("UPDATE current_value_retirements SET cursor=?3 WHERE subject=?1 AND kind=?2",
-                            params![subject,kind,rows.last().unwrap().0]).map_err(internal)?;
                     }
+                    deleted_subjects.insert(key.subject.clone());
+                    kinds.insert(key.kind.clone());
+                    removed += count;
                 }
-            }
-            Ok((removed, visited, kinds))
-        })?;
+                if !deleted_subjects.is_empty() {
+                    let clock = consume_observation_clock(tx)?;
+                    for subject in deleted_subjects {
+                        record_semantic_frontier(tx, &subject, clock, true)?;
+                    }
+                    retire_feed_through(tx, clock)?;
+                }
+                Ok((removed, kinds))
+            })?
+        };
         for kind in kinds {
             self.graph
                 .runtime
                 .current_observation_committed(&kind, true);
         }
+        // History retirement owns a separate transaction: a bad job cannot roll back
+        // already committed collection or prevent its cursor from advancing.
+        let history = match history_work {
+            Err(error) => Err(error),
+            Ok(None) => Ok(0),
+            Ok(Some(job)) => current_transaction(&mut connection, |tx| {
+                let bounds: Option<(i64, i64)> = tx
+                    .query_row(
+                        "SELECT cursor,cutoff FROM current_value_retirements
+                    WHERE subject=?1 AND kind=?2",
+                        params![job.subject, job.kind],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                let Some((cursor, cutoff)) = bounds else {
+                    return Ok(0);
+                };
+                if cursor != job.cursor {
+                    return Ok(0);
+                };
+                let deleted=tx.prepare_cached("DELETE FROM local_observations
+                    WHERE id IN (SELECT value FROM json_each(?1))
+                    AND NOT EXISTS(SELECT 1 FROM latest_values v WHERE v.local_id=local_observations.id)
+                    RETURNING id").map_err(internal)?
+                    .query_map([&job.delete],|r|r.get::<_,i64>(0)).map_err(internal)?
+                    .collect::<rusqlite::Result<Vec<_>>>().map_err(internal)?;
+                if let Some(last) = deleted.iter().max() {
+                    retire_feed_through(tx, *last)?;
+                }
+                if job.visited < 256 && cutoff == job.cutoff {
+                    tx.execute(
+                        "DELETE FROM current_value_retirements WHERE subject=?1 AND kind=?2",
+                        params![job.subject, job.kind],
+                    )
+                    .map_err(internal)?;
+                } else {
+                    tx.execute("UPDATE current_value_retirements SET cursor=?3 WHERE subject=?1 AND kind=?2",
+                        params![job.subject,job.kind,job.last]).map_err(internal)?;
+                }
+                Ok(job.visited)
+            }),
+        };
+        let history_visited = match history {
+            Ok(visited) => visited,
+            Err(error) => {
+                eprintln!("st3: current history retirement deferred: {error:?}");
+                0
+            }
+        };
         Ok(CurrentMaintenance {
             removed,
             history_visited,
@@ -1332,6 +1456,7 @@ impl Store {
         }).inspect_err(|error| {
             if error.code == "current-value-capacity" {
                 let count = self.smalltalk.current_value_refusals.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                self.smalltalk.current_value_maintenance_wake.notify_one();
                 if count == 1 || count.is_multiple_of(100) {
                     eprintln!("st3: current register capacity refused {} {} (refusal {count}); collector will reclaim obsolete keys", record.subject, record.kind);
                 }
@@ -1539,6 +1664,33 @@ mod tests {
     }
 
     #[test]
+    fn reopen_repairs_an_older_collectors_clock_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("clock.sqlite3");
+        let old_frontier;
+        {
+            let store = Store::open(&path, "owner").unwrap();
+            append(&store.graph, &state("idle", "one", 1), 1, None).unwrap();
+            old_frontier = store.current_cache_revision().unwrap() + 64;
+            store
+                .connection
+                .write()
+                .execute(
+                    "UPDATE current_value_frontiers SET revision=?1",
+                    [old_frontier],
+                )
+                .unwrap();
+        }
+        let store = Store::open(&path, "owner").unwrap();
+        assert_eq!(
+            store.current_observation_boundary().unwrap().local_cursor,
+            old_frontier
+        );
+        append(&store.graph, &state("working", "one", 2), 2, None).unwrap();
+        assert_eq!(store.current_cache_revision().unwrap(), old_frontier + 1);
+    }
+
+    #[test]
     fn categorical_history_retires_without_a_legacy_slot() {
         let store = Store::open_memory("owner").unwrap();
         declare(&store, "owner");
@@ -1705,6 +1857,191 @@ mod tests {
                 )
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn broken_history_job_does_not_roll_back_register_collection() {
+        let store = Store::open_memory("owner").unwrap();
+        let mut input = state("idle", "one", 1);
+        input.subject = "agent/retired".into();
+        append(&store.graph, &input, 1, None).unwrap();
+        store.connection.write().execute("INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+            VALUES(0,'agent/broken','harness.usage','invalid-json',1)",[]).unwrap();
+        let cutoff = store.current_observation_boundary().unwrap().local_cursor;
+        store
+            .connection
+            .write()
+            .execute(
+                "INSERT INTO current_value_retirements VALUES('agent/broken','harness.usage',0,?1)",
+                [cutoff],
+            )
+            .unwrap();
+        let frontier = store.current_cache_revision().unwrap();
+        let batch = store
+            .maintain_current_values(&BTreeSet::from(["owner".into()]), "")
+            .unwrap();
+        assert_eq!(batch.removed, 1);
+        assert_eq!(batch.history_visited, 0);
+        assert!(store.current_cache_revision().unwrap() > frontier);
+        assert_eq!(
+            store
+                .readers
+                .get()
+                .query_row("SELECT count(*) FROM latest_values", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .readers
+                .get()
+                .query_row("SELECT cursor FROM current_value_retirements", [], |r| r
+                    .get::<_, u64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_refusal_wakes_collection_and_recovers_retired_keys_sorting_last() {
+        let source = Store::open_memory("owner").unwrap();
+        let peer = Store::open_memory("peer").unwrap();
+        declare(&peer, "owner");
+        // Live workspace keys consume two pages; retired seat keys sort afterwards.
+        let intent = crate::graph::parse_intent(
+            "version 2\nagent \"example/aaa\" { workspace \"/tmp\"; argv \"fixture\"; }\nagent \"example/cedar\" { workspace \"/tmp\"; argv \"fixture\"; }",
+            "owner",
+        )
+        .unwrap();
+        peer.apply_internal(&intent, "live-prefix").unwrap();
+        peer.connection
+            .write()
+            .execute(
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<128)
+            INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+            SELECT 0,'agent/example/aaa','workspace.observed','{}',1 FROM n",
+                [],
+            )
+            .unwrap();
+        peer.connection.write().execute("INSERT INTO latest_values
+            SELECT subject,kind,printf('%03d',id),'owner',1,'live/'||id,id,0,NULL,'{}' FROM local_observations",[]).unwrap();
+        peer.connection
+            .write()
+            .execute(
+                "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<10000)
+            INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+            SELECT 0,'agent/zzz-retired/'||i,'harness.observed','{}',1 FROM n",
+                [],
+            )
+            .unwrap();
+        peer.connection
+            .write()
+            .execute(
+                "INSERT INTO latest_values
+            SELECT subject,kind,'','owner',1,'retired/'||id,id,0,NULL,'{}'
+            FROM local_observations WHERE kind='harness.observed'",
+                [],
+            )
+            .unwrap();
+        let hosts = BTreeSet::from(["owner".into(), "peer".into()]);
+        let record = source.append_claim(&state("idle", "one", 10)).unwrap();
+        assert_eq!(
+            peer.receive_current_value_for_hosts(&record, &hosts)
+                .unwrap_err()
+                .code,
+            "current-value-capacity"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            peer.current_value_maintenance_wake().notified(),
+        )
+        .await
+        .unwrap();
+        let mut after = String::new();
+        for page in 0..3 {
+            let batch = peer.maintain_current_values(&hosts, &after).unwrap();
+            assert_eq!(batch.removed, if page < 2 { 0 } else { 64 });
+            after = batch.after;
+        }
+        assert!(
+            peer.receive_current_value_for_hosts(&record, &hosts)
+                .unwrap()
+                .0
+        );
+    }
+
+    #[test]
+    fn collected_tombstones_and_later_timeline_rows_share_one_clock() {
+        let store = Store::open_memory("owner").unwrap();
+        for n in 0..64 {
+            let mut input = state("idle", "one", 1);
+            input.subject = format!("agent/retired/{n}");
+            append(&store.graph, &input, 1, None).unwrap();
+        }
+        let before = store.current_observation_boundary().unwrap();
+        let batch = store
+            .maintain_current_values(&BTreeSet::from(["owner".into()]), "")
+            .unwrap();
+        assert_eq!(batch.removed, 64);
+        let collected = store.current_observation_boundary().unwrap();
+        assert_eq!(collected.local_cursor, before.local_cursor + 1);
+        assert!(collected.requires_resync(&before.epoch, before.local_cursor));
+        let mut frontier =
+            roster_local_frontier(&store.readers.get(), store.index().unwrap()).unwrap();
+        assert_eq!(frontier, collected.local_cursor);
+        for n in 0..3 {
+            store.connection.write().execute("INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+                VALUES(?1,'agent/live','harness.timeline','{}',?2)",params![store.index().unwrap(),n]).unwrap();
+            let next = roster_local_frontier(&store.readers.get(), store.index().unwrap()).unwrap();
+            assert_eq!(
+                next,
+                frontier + 1,
+                "each timeline event must invalidate the roster immediately"
+            );
+            frontier = next;
+        }
+    }
+
+    #[test]
+    fn stale_heartbeat_recovery_advances_semantic_clock_and_revisions() {
+        let store = Store::open_memory("owner").unwrap();
+        let now = now_ms() as u64;
+        append(
+            &store.graph,
+            &state("working", "one", now - 90_001),
+            u128::from(now - 90_001),
+            None,
+        )
+        .unwrap();
+        let frontier = store.current_cache_revision().unwrap();
+        let aggregate = store.graph.runtime.current_observation_revision("");
+        let kind = store
+            .graph
+            .runtime
+            .current_observation_revision("harness.observed");
+        let fresh = append(
+            &store.graph,
+            &state("working", "one", now),
+            u128::from(now),
+            None,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(fresh.body["_semantic_transition"], true);
+        assert!(store.current_cache_revision().unwrap() > frontier);
+        assert!(store.graph.runtime.current_observation_revision("") > aggregate);
+        assert!(
+            store
+                .graph
+                .runtime
+                .current_observation_revision("harness.observed")
+                > kind
+        );
+        assert_eq!(
+            store.changed_current_agents(frontier).unwrap(),
+            BTreeSet::from(["agent/example/cedar".into()])
         );
     }
 

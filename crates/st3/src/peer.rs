@@ -308,7 +308,10 @@ impl ClientRelay {
         else {
             return;
         };
-        let view = self.fleet_view();
+        let relay = self.clone();
+        let Ok(Ok(view)) = tokio::task::spawn_blocking(move || relay.try_fleet_view()).await else {
+            return;
+        };
         let targets = dial_targets(
             &view,
             &self.node,
@@ -414,10 +417,7 @@ impl ClientRelay {
             });
         futures_util::future::join_all(attempts).await;
     }
-    fn fleet_view(&self) -> Arc<FleetView> {
-        let Some(store) = &self.links else {
-            return Arc::default();
-        };
+    fn read_fleet_view(&self, read: impl FnOnce() -> Result<FleetView>) -> Result<Arc<FleetView>> {
         let mut cached = self
             .membership
             .lock()
@@ -425,11 +425,27 @@ impl ClientRelay {
         if let Some((read_at, view)) = cached.as_ref()
             && read_at.elapsed() < CLIENT_READ_LINKS_TTL
         {
-            return view.clone();
+            return Ok(view.clone());
         }
-        let view = Arc::new(store.fleet_view_sealed().unwrap_or_default());
+        // A failed refresh must not certify an empty fleet, nor extend an old view's TTL.
+        let view = Arc::new(read()?);
         *cached = Some((std::time::Instant::now(), view.clone()));
-        view
+        Ok(view)
+    }
+
+    fn try_fleet_view(&self) -> Result<Arc<FleetView>> {
+        self.read_fleet_view(|| {
+            self.links.as_ref().map_or_else(
+                || Ok(FleetView::default()),
+                |store| store.fleet_view_sealed(),
+            )
+        })
+    }
+
+    fn fleet_view(&self) -> Arc<FleetView> {
+        // Routing may fail closed with no targets. Mutating lifecycle decisions propagate
+        // the error through current_hosts instead of using this convenience fallback.
+        self.try_fleet_view().unwrap_or_default()
     }
 
     pub(crate) fn is_dial_out_owner(&self, host: &str) -> bool {
@@ -480,8 +496,8 @@ impl ClientRelay {
         })
     }
 
-    pub(crate) fn current_hosts(&self) -> BTreeSet<String> {
-        let view = self.fleet_view();
+    pub(crate) fn current_hosts(&self) -> Result<BTreeSet<String>> {
+        let view = self.try_fleet_view()?;
         let mut hosts = view
             .members
             .iter()
@@ -498,7 +514,7 @@ impl ClientRelay {
                 }
             }
         }
-        hosts
+        Ok(hosts)
     }
 
     /// The fleet's observed up links, read again once the last reading is a few seconds old.
@@ -1847,6 +1863,76 @@ mod tests {
     use std::collections::BTreeSet;
     use std::os::unix::fs::PermissionsExt as _;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn failed_membership_refresh_skips_collection_and_is_not_cached() {
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join("secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let store = Arc::new(Store::open_memory("owner").unwrap());
+        store
+            .record_transport_observation("peer", "up", None, None)
+            .unwrap();
+        let relay = ClientRelay::from_config(&Config {
+            node: "owner".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "peer".into(),
+                url: "http://peer".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap()
+        .with_links(store.clone());
+        let before = store.current_observation_boundary().unwrap();
+        let result = store.read_snapshot(|_| {
+            // Interrupt the real SQL membership read on this pinned reader connection.
+            let connection = store.readers.get();
+            connection.progress_handler(1, Some(|| true));
+            let result = relay.current_hosts().and_then(|hosts| {
+                store
+                    .maintain_current_values(&hosts, "")
+                    .map_err(Into::into)
+            });
+            connection.progress_handler(0, None::<fn() -> bool>);
+            result
+        });
+        assert!(
+            result.is_err(),
+            "failed membership must skip the entire pass"
+        );
+        assert!(
+            relay.membership.lock().unwrap().is_none(),
+            "failed reads must not cache an empty view"
+        );
+        assert!(store.own_transport_value("peer").unwrap().is_some());
+        assert_eq!(store.current_observation_boundary().unwrap(), before);
+        assert!(
+            relay.current_hosts().unwrap().contains("peer"),
+            "the next read retries immediately, without a TTL delay"
+        );
+        // An expired successful cache also keeps its old timestamp on failure.
+        let old = std::time::Instant::now() - CLIENT_READ_LINKS_TTL - Duration::from_secs(1);
+        relay.membership.lock().unwrap().as_mut().unwrap().0 = old;
+        assert!(
+            relay
+                .read_fleet_view(|| Err(anyhow::anyhow!("another read failure")))
+                .is_err()
+        );
+        assert_eq!(relay.membership.lock().unwrap().as_ref().unwrap().0, old);
+        assert!(relay.current_hosts().unwrap().contains("peer"));
+        assert_eq!(
+            store
+                .maintain_current_values(&relay.current_hosts().unwrap(), "")
+                .unwrap()
+                .removed,
+            0
+        );
+        assert!(store.own_transport_value("peer").unwrap().is_some());
+    }
 
     #[tokio::test]
     async fn current_receive_authentication_origin_and_backend_deadline_are_http_contracts() {
