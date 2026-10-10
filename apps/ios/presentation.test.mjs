@@ -3,12 +3,13 @@ import { agentHeaderDetail, agentHealth, attentionActionLabel, attentionHeadline
 
 const now = Date.parse('2026-09-25T08:25:00Z');
 
-// (1) An unreadable attention projection must never read as an empty inbox.
-assert.deepEqual(attentionHeadline({ count: 0, loaded: true }), { text: 'Nothing needs your attention.', warning: false });
-assert.deepEqual(attentionHeadline({ count: 7, loaded: true }), { text: '7 actionable items', warning: false });
-assert.deepEqual(attentionHeadline({ count: 0, loaded: true, error: 'forbidden: device inventory requires an explicitly authenticated person' }), { text: 'Attention could not be loaded: forbidden: device inventory requires an explicitly authenticated person', warning: true });
-assert.deepEqual(attentionHeadline({ count: 0, loaded: false }), { text: 'Attention has not loaded yet.', warning: true });
-assert.deepEqual(attentionHeadline({ count: 3, loaded: true, error: 'offline' }), { text: '3 actionable items from the last load · refresh failed: offline', warning: true });
+// (1) An unreadable alerts projection must never read as no alerts; no alerts prints nothing.
+assert.deepEqual(attentionHeadline({ count: 0, loaded: true }), { text: '', warning: false });
+assert.deepEqual(attentionHeadline({ count: 7, loaded: true }), { text: '7 alerts', warning: false });
+assert.deepEqual(attentionHeadline({ count: 1, loaded: true }), { text: '1 alert', warning: false });
+assert.deepEqual(attentionHeadline({ count: 0, loaded: true, error: 'forbidden: device inventory requires an explicitly authenticated person' }), { text: 'Alerts could not be loaded: forbidden: device inventory requires an explicitly authenticated person', warning: true });
+assert.deepEqual(attentionHeadline({ count: 0, loaded: false }), { text: 'Alerts have not loaded yet.', warning: true });
+assert.deepEqual(attentionHeadline({ count: 3, loaded: true, error: 'offline' }), { text: '3 alerts from the last load · refresh failed: offline', warning: true });
 
 
 // (2) Queued work shows how long the next step has been waiting, from the queue st joined into the
