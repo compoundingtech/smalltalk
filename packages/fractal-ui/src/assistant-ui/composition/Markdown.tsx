@@ -32,10 +32,36 @@ export const MarkdownImagePolicy = React.createContext<MarkdownImageOptions>(NO_
 export interface MarkdownProps { text: string; streaming?: boolean; resources?: readonly InlineResource[]; onOpenResource?: (path?: string) => void; renderInlineReference?: InlineReferenceRenderer; resolveImage?: MarkdownImageResolver; onLoadImage?: MarkdownImageOpener }
 const EMPTY_RESOURCES: readonly InlineResource[] = []
 const REMARK_PLUGINS = [remarkGfm]
-const STREAMING_PLUGINS = [markStreamingTail]
+const PROSE_PLUGINS = [preserveProseLineBreaks]
+const STREAMING_PLUGINS = [preserveProseLineBreaks, markStreamingTail]
 type ReferenceOptions = Omit<MarkdownProps, 'text' | 'streaming'>
 const EMPTY_REFERENCES: ReferenceOptions = {}
 const ReferenceContext = React.createContext<ReferenceOptions>(EMPTY_REFERENCES)
+/** Preserve assistant paragraph lines without changing lists or literal code. */
+function preserveProseLineBreaks() {
+  return (tree: Root) => {
+    const breakLines = (node: Root | Extract<SyntaxNode, { type: 'element' }>) => {
+      node.children = node.children.flatMap(child => {
+        if (child.type === 'text') {
+          return child.value.split('\n').flatMap((value, index): SyntaxNode[] => [
+            ...(index === 0 ? [] : [{ type: 'element' as const, tagName: 'br', properties: {}, children: [] }]),
+            { type: 'text', value },
+          ])
+        }
+        if (child.type === 'element' && child.tagName !== 'code') breakLines(child)
+        return [child]
+      })
+    }
+    const visit = (node: Root | Extract<SyntaxNode, { type: 'element' }>) => {
+      for (const child of node.children) {
+        if (child.type !== 'element' || ['pre', 'ul', 'ol'].includes(child.tagName)) continue
+        if (child.tagName === 'p') breakLines(child)
+        else visit(child)
+      }
+    }
+    visit(tree)
+  }
+}
 /** Paragraphs keep the caret on their final line; every other terminal block gets an inline fallback. */
 function markStreamingTail() {
   return (tree: Root) => {
@@ -56,7 +82,7 @@ export const Markdown = React.memo(function Markdown({ text, streaming = false, 
   const inherited = React.useContext(MarkdownImagePolicy)
   const references = React.useMemo(() => ({ resources, onOpenResource, renderInlineReference, resolveImage: resolveImage ?? inherited.resolveImage, onLoadImage: onLoadImage ?? inherited.onLoadImage }), [resources, onOpenResource, renderInlineReference, resolveImage, onLoadImage, inherited])
   const source = React.useMemo(() => streaming ? completeStreamingTail(text) : text, [text, streaming])
-  return <ReferenceContext.Provider value={references}><div data-testid="markdown" {...stylex.props(styles.markdown)}><ReactMarkdown skipHtml urlTransform={(url, key) => key === 'src' ? url : defaultUrlTransform(url)} remarkPlugins={REMARK_PLUGINS} rehypePlugins={streaming ? STREAMING_PLUGINS : undefined} components={MARKDOWN_COMPONENTS}>{source}</ReactMarkdown></div></ReferenceContext.Provider>
+  return <ReferenceContext.Provider value={references}><div data-testid="markdown" {...stylex.props(styles.markdown)}><ReactMarkdown skipHtml urlTransform={(url, key) => key === 'src' ? url : defaultUrlTransform(url)} remarkPlugins={REMARK_PLUGINS} rehypePlugins={streaming ? STREAMING_PLUGINS : PROSE_PLUGINS} components={MARKDOWN_COMPONENTS}>{source}</ReactMarkdown></div></ReferenceContext.Provider>
 })
 
 function DeferredImage({ src = '', alt = '' }: React.ComponentProps<'img'>) {
