@@ -256,6 +256,28 @@ describe('ConversationPane composition activation', () => {
     } finally { height.mockRestore(); client.mockRestore(); bounds.mockRestore() }
   })
 
+  it.each([false, true])('groups eleven adjacent reasoning entries, respecting tool boundaries (separated=%s)', async separated => {
+    const reasoning: ConversationItem[] = Array.from({ length: 11 }, (_, index) => ({
+      _tag: 'Reasoning', id: `thought-${index}`, text: `Thought number ${index + 1}.`, streaming: false, at: at(index + 1),
+    }))
+    const items = separated ? [...reasoning.slice(0, 5), scenario[1]!, ...reasoning.slice(5)] : reasoning
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [scenario[0]!, ...items, scenario[3]!], hasOlder: false, observation: { empty: false } } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    // The bounded transcript backfills older rows after a painted frame; let frames run for this case.
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => setTimeout(() => callback(0), 0))
+    await mount()
+    await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')!.click() })
+    // Grouping is asserted on the complete turn, after idle backfill.
+    await vi.waitFor(() => expect(container.querySelectorAll('[data-testid="thinking-entry"] button')).toHaveLength(separated ? 2 : 1))
+    const disclosures = [...container.querySelectorAll<HTMLButtonElement>('[data-testid="thinking-entry"] button')]
+    expect(disclosures).toHaveLength(separated ? 2 : 1)
+    expect(disclosures.every(button => button.getAttribute('aria-expanded') === 'false')).toBe(true)
+    expect(text()).not.toContain('Thought number 1.')
+    for (const button of disclosures) await act(async () => { button.click() })
+    expect([...container.querySelectorAll('[data-testid="thinking-entry"] [data-conversation-entry-id]')].map(element => element.textContent))
+      .toEqual(reasoning.map(item => item._tag === 'Reasoning' ? item.text : ''))
+  })
+
   it('insets the composer dock so its focus outline stays inside the viewport', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
     await mount()
