@@ -101,6 +101,100 @@ fn unchanged_intake_component_sql_does_not_grow_with_foreign_inventory() {
 }
 
 #[test]
+fn incremental_off_evaluates_all_intake_stages_despite_an_unrelated_feed_decode_error() {
+    let _clock = Clock::at(START);
+    let (store, mut reconciler, entries) = fixture(2);
+    let desired = store.desired_subjects().unwrap();
+    stages(&reconciler, &desired);
+    entries.take();
+    let fault = ("schedule/cycle-0".to_owned(), "schedule".to_owned());
+    reconciler
+        .record_fault(
+            &fault.0,
+            &fault.1,
+            Err(anyhow::anyhow!("prior fixture fault")),
+        )
+        .unwrap();
+    reconciler.incremental.observe(&store).unwrap();
+    // Private reader-corruption fixture: TEXT affinity with invalid UTF-8 survives metadata
+    // type/width admission, but the change feed's String decoding fails. It belongs to no
+    // declaration or evaluated dependency. Store admission never creates this row.
+    let bad_row = {
+        let writer = store.connection.write();
+        writer
+            .execute(
+                "INSERT INTO local_observations
+                 (after_store_index,subject,kind,body,observed_at_unix_ms)
+                 VALUES (0,CAST(X'80' AS TEXT),'fixture.invalid-utf8','{}',?1)",
+                [START as i64],
+            )
+            .unwrap();
+        writer.last_insert_rowid()
+    };
+    assert!(reconciler.incremental.observe(&store).is_err());
+    assert!(
+        reconciler
+            .reconcile_resource_observers(&desired, &desired)
+            .is_err()
+    );
+    assert!(reconciler.reconcile_schedules(&desired).is_err());
+    assert!(reconciler.reconcile_scheduled_work(&desired).is_err());
+    assert!(
+        entries.take().is_empty(),
+        "on retains its stage error identity"
+    );
+
+    assert!(
+        reconciler
+            .open_faults()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains_key(&fault)
+    );
+    reconciler.skip_unneeded = false;
+    let expected = BTreeSet::from([
+        ("observer".into(), "observer/repo-0".into()),
+        ("observer".into(), "observer/repo-1".into()),
+        ("schedule".into(), "schedule/cycle-0".into()),
+        ("schedule".into(), "schedule/cycle-1".into()),
+        ("schedule-work".into(), "schedule/cycle-0".into()),
+        ("schedule-work".into(), "schedule/cycle-1".into()),
+    ]);
+    for _ in 0..2 {
+        stages(&reconciler, &desired);
+        let actual = entries.take();
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "all work evaluated exactly once"
+        );
+        assert_eq!(actual.into_iter().collect::<BTreeSet<_>>(), expected);
+        assert!(reconciler.runtime.starts.lock().unwrap().is_empty());
+        assert!(
+            reconciler
+                .open_faults()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty(),
+            "selected evaluation actually succeeds and recovers the retained fault"
+        );
+        assert!(reconciler.unrecorded_faults.lock().unwrap().is_empty());
+    }
+    // The rollback keeps guarded-item diagnostics; it neither repairs the broken row nor
+    // claims the old stage's byte-identical behavior or a SQL-free path.
+    assert!(reconciler.incremental.observe(&store).is_err());
+    store
+        .connection
+        .write()
+        .execute("DELETE FROM local_observations WHERE id=?1", [bad_row])
+        .unwrap();
+    reconciler.skip_unneeded = true;
+    stages(&reconciler, &desired);
+}
+
+#[test]
 fn unrelated_traffic_stays_clean_but_exact_observer_and_schedule_writes_select_work() {
     let _clock = Clock::at(START);
     let (store, reconciler, entries) = fixture(8);

@@ -1,0 +1,32 @@
+{
+  "replay": {
+    "status": "none",
+    "detail": "No replay or durable format change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No SQL query, DDL, index or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission, source/canonical rules and fresh effect fences are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption beyond a normal binary swap; no deployment implied."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Uses the existing ST3_INCREMENTAL=off switch; no new configuration or budget changes."
+  },
+  "version": 1,
+  "summary": "Keep intake evaluation available when incremental skipping is disabled",
+  "compatibility": {
+    "status": "changed",
+    "detail": "Observer, schedule and scheduled-work stages perform their fatal entry dependency-feed read only when incremental skipping is enabled. With ST3_INCREMENTAL=off every supplied item still evaluates, even when an unrelated feed row cannot be decoded. Off disables skipping; it is not byte-identical to the stages before dependency selection."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Guarded-item clock/read/due recording, successful evaluation and error/fault/recovery behavior remain. Existing per-item diagnostic feed refresh can still run, conservatively invalidate and ignore its read error when an already clean item is evaluated anyway. Off therefore is neither a SQL-free feed bypass nor a replacement for independent authority checks; other existing stages keep their own feed contracts. A private invalid-UTF8 row control distinguishes enabled fatal entry errors from two disabled passes successfully evaluating every supplied foreign item, retaining the prior fault during enabled-stage failure and recovering it after disabled-mode success. No mutation-certificate, full-pass under500 or production savings proof."
+  }
+}

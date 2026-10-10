@@ -11596,7 +11596,9 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_schedules(&self, desired: &[DesiredSubject]) -> Result<()> {
-        self.incremental.observe(&self.store)?;
+        if self.skip_unneeded {
+            self.incremental.observe(&self.store)?;
+        }
         let full = !self.skip_unneeded || self.incremental.take_full_pass("schedule", now_ms());
         let mut active = BTreeSet::new();
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
@@ -12006,7 +12008,9 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_scheduled_work(&self, desired: &[DesiredSubject]) -> Result<()> {
-        self.incremental.observe(&self.store)?;
+        if self.skip_unneeded {
+            self.incremental.observe(&self.store)?;
+        }
         let full =
             !self.skip_unneeded || self.incremental.take_full_pass("schedule-work", now_ms());
         let schedules = desired
@@ -12826,7 +12830,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         desired: &[DesiredSubject],
         agents: &[DesiredSubject],
     ) -> Result<()> {
-        self.incremental.observe(&self.store)?;
+        if self.skip_unneeded {
+            self.incremental.observe(&self.store)?;
+        }
         let full = !self.skip_unneeded || self.incremental.take_full_pass("observer", now_ms());
         let observer_resources = desired
             .iter()
