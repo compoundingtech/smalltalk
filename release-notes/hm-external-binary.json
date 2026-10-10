@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Home Manager can use a stable executable path owned by an external deployer without installing or restarting Smalltalk when its package changes.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "The default Home Manager configuration is unchanged. The optional services.smalltalk.binary.path applies to Linux and macOS. No wire or client change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No required downtime. Switching binary ownership changes the service configuration and may restart the daemon once."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No required step. To opt in, set services.smalltalk.binary.path to the external deployer's stable absolute executable path. That deployer must install the executable and manage upgrade restarts."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Set binary.path back to null to restore Home Manager installation and package-triggered restarts."
+  }
+}
