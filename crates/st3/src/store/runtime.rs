@@ -406,6 +406,10 @@ impl Runtime for SmalltalkRuntime {
         checkpoint_rules::subject_answers(connection, subject, cut)
     }
 
+    fn checkpoint_global_answers(&self, transaction: &Transaction<'_>) -> Result<Option<Value>> {
+        checkpoint_rules::global_answers(transaction).map(Some)
+    }
+
     fn checkpoint_subject_answers_with_sources(
         &self,
         connection: &Connection,
