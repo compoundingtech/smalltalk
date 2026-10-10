@@ -1320,16 +1320,21 @@ impl Store {
         let connection = self.readers.get();
         let snapshot = connection.unchecked_transaction()?;
         snapshot.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0))?;
-        let cloned = clone_file(&self.path, copy).and_then(|()| match clone_file(&wal, &copy_wal) {
+        let store = clone_file(&self.path, copy);
+        let wal = store.as_ref().map(|()| match clone_file(&wal, &copy_wal) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && !wal.exists() => Ok(()),
             result => result,
         });
         snapshot.commit()?;
         drop(connection);
-        if cloned.is_err() {
-            let _ = fs::remove_file(copy);
-            let _ = fs::remove_file(&copy_wal);
-            return Ok(false);
+        match wal {
+            Ok(Ok(())) => {}
+            // A failed clone leaves nothing behind, so only the store clone needs removing.
+            Ok(Err(_)) => {
+                fs::remove_file(copy)?;
+                return Ok(false);
+            }
+            Err(_) => return Ok(false),
         }
         // Fold the cloned WAL into the copy, so it is one file, as a `VACUUM INTO` copy is.
         Connection::open(copy)?.query_row("PRAGMA journal_mode = DELETE", [], |_| Ok(()))?;
