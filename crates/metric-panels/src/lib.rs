@@ -1,4 +1,5 @@
 //! Composition happens once; clients receive panels, not PromQL or st response shapes.
+#![forbid(unsafe_code)]
 mod generated;
 pub use generated::*;
 mod terminal;
