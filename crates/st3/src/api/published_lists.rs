@@ -36,6 +36,7 @@ const FOLD_CLAIMS: u64 = 10_000;
 /// a forget. For a list its refresher does not govern, readers then fold on read and its windows
 /// follow commits again; a governed list is withdrawn this way only when its refresher ends.
 fn withdraw<R>(store: &Store, list: fn(&Store) -> &PublishedList<R>, name: &'static str) {
+    // An ended list stopped serving already, so this warns only of an ungoverned withdrawal.
     if list(store).withdraw() {
         eprintln!("st3: WARN the {name} list is no longer published; windows fold on read until it is");
     }
@@ -194,7 +195,8 @@ fn spawn<R: Send + Sync + 'static>(
         // The writer's callback only wakes this task; it never reads.
         let commits = Arc::clone(&wake);
         let _observer = store.observe_commits(move |_| commits.notify_one());
-        // Should this task ever stop, windows fold on read and follow commits again.
+        // Should this task ever stop, the list ends: a governed list's readers refuse, and an
+        // ungoverned list's windows fold on read and follow commits again.
         let _withdraw = Withdraw { store: Arc::clone(&store), list, name };
         let mut failures = 0;
         loop {

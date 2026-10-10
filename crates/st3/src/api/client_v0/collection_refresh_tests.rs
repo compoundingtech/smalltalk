@@ -391,9 +391,18 @@ async fn assert_parity(fixture: &Fixture, session: &ClientSession, held: &BTreeM
         // A published work window is also what the direct read it replaces gives at its cut.
         if request.collection == "work" {
             let store = &fixture.state.store;
-            let index = store.index().unwrap();
-            let published = store.published_work().expect("the work list is published");
-            assert_eq!(published.cut, index, "{step}: the work list is published at the current cut");
+            // The refresher folds a trailing commit, such as the harness's own claims, after a
+            // pause: wait, bounded, for it to reach the current cut.
+            let waited = tokio::time::Instant::now();
+            let index = loop {
+                let index = store.index().unwrap();
+                if store.published_work().is_some_and(|published| published.cut == index) {
+                    break index;
+                }
+                assert!(waited.elapsed() < Duration::from_secs(10), "{step}: the work list reaches the current cut");
+                store.published_work_list().request_refresh();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
             let mut direct = client_work_resources(
                 store, request.actor.as_deref(), false, store.projection_time_at(index).unwrap(), index,
             ).unwrap();
@@ -688,12 +697,14 @@ async fn a_real_work_window_waits_for_the_published_list_and_ends_with_its_refre
     let state = super::tests::test_state_named(root.path(), "alder");
     ready_work(&state.store);
     let list = state.store.published_work_list();
+    // Held, before its refresher starts: governed already, so never a direct read.
     state.store.hold_collection_view("work");
-    list.start();
     let direct = state.store.direct_work_reads();
     let mut fixture = Fixture::open(state.clone(), true, None, &["work"]).await;
     let first = fixture.frame().await;
-    assert_eq!(first["kind"], "resync", "cold: {first}");
+    assert_eq!(first["kind"], "resync", "held before start: {first}");
+    assert_eq!(state.store.direct_work_reads(), direct);
+    list.start();
     fixture.claim("daemon/fixture", "daemon.diagnostic",
         json!({"code":"fixture", "severity":"error", "reason":"unrelated"}));
     fixture.quiet().await;
@@ -722,5 +733,62 @@ async fn a_real_work_window_waits_for_the_published_list_and_ends_with_its_refre
     state.store.publish_collection_view("work");
     fixture.quiet().await;
     assert_eq!(fixture.counts(), counts(&[("work", 5)]), "read once for the end, then removed");
+    assert_eq!(state.store.direct_work_reads(), direct);
+}
+
+#[tokio::test]
+async fn an_ungoverned_work_window_still_reads_directly() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "alder");
+    ready_work(&state.store);
+    // No refresher holds the list, as with ST3_PUBLISHED_LISTS=off: the direct read, as before.
+    let direct = state.store.direct_work_reads();
+    let mut fixture = Fixture::open(state.clone(), true, None, &["work"]).await;
+    let snapshot = fixture.frame().await;
+    assert_eq!(snapshot["kind"], "snapshot", "{snapshot}");
+    assert_eq!(snapshot["items"].as_array().unwrap().len(), 2);
+    assert!(state.store.direct_work_reads() > direct);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_revoked_grant_ends_a_waiting_work_window_through_the_real_read() {
+    let root = tempfile::tempdir().unwrap();
+    let state = super::tests::test_state_named(root.path(), "alder");
+    ready_work(&state.store);
+    let grant = "custom/client/phone-work";
+    let paired = state.store.append_claim(&ClaimInput {
+        subject: grant.into(), kind: "custom.client.pairing-completed".into(),
+        actor: Some("person/avery".into()),
+        fields: serde_json::from_value(json!({
+            "session_actor":"client/phone-work", "person_id":"person/avery",
+            "credential_hash":"test-not-a-secret", "expires_at_unix_ms":u64::MAX,
+            "scopes":["read.projections"],
+        })).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let session = paired_client_session(&state, &paired, "fabric-loopback", false).unwrap();
+    state.store.hold_collection_view("work");
+    state.store.published_work_list().start();
+    let direct = state.store.direct_work_reads();
+    let mut fixture = Fixture::open_as(state.clone(), session, true, None, &["work"]).await;
+    let first = fixture.frame().await;
+    assert_eq!((first["kind"].as_str(), first["retryable"].as_bool()), (Some("resync"), Some(true)), "{first}");
+    // The clock rechecks the grant through the real read, which says nothing new.
+    tokio::time::advance(ATTENTION_CLOCK_INTERVAL).await;
+    fixture.quiet().await;
+    assert_eq!(fixture.counts(), counts(&[("work", 2)]));
+    // Revoked while it waits: the next recheck ends the window before the work list is read.
+    state.store.append_claim(&ClaimInput {
+        subject: grant.into(), kind: "custom.client.pairing-revoked".into(),
+        actor: Some("person/avery".into()), fields: BTreeMap::new(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    tokio::time::advance(ATTENTION_CLOCK_INTERVAL).await;
+    let revoked = fixture.frame().await;
+    assert_eq!((revoked["kind"].as_str(), revoked["retryable"].as_bool()), (Some("error"), Some(false)), "{revoked}");
+    // Gone: a later publication reads and sends nothing.
+    super::super::published_lists::refresh_work_once(&state.store);
+    fixture.quiet().await;
+    assert_eq!(fixture.counts(), counts(&[("work", 3)]));
     assert_eq!(state.store.direct_work_reads(), direct);
 }
