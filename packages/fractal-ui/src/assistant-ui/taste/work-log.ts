@@ -11,6 +11,8 @@ export interface WorkLogCall {
   readonly startedAt: string
   readonly endedAt?: string
   readonly detail?: string
+  /** Verbatim tool input (pretty JSON, or the raw string). Shown only in an expanded tool detail, never in the row label or failure overlay. */
+  readonly rawInput?: string
   readonly outputLanguage?: string
   /** Observed edit/write path, not a guessed title. */
   readonly changedPath?: string
@@ -67,6 +69,7 @@ export function workLogTurnFromItems(items: readonly ConversationItem[], facts: 
     const extension = dot > 0 ? filename.slice(dot + 1).toLowerCase() : undefined
     return [{
       id: call.id, kind, title: call.name, argsSummary: summarizeArgs(call.input),
+      rawInput: typeof call.input === 'string' ? call.input : call.input === undefined || call.input === null ? undefined : JSON.stringify(call.input, null, 2),
       status: call.status, startedAt: call.at, endedAt: call.result?.at,
       detail: toolOutput(call.result?.content) || undefined,
       outputLanguage: (media === undefined ? undefined : outputMediaLanguages[media]) ?? (kind === 'run' ? 'bash' : kind === 'read' ? extension : undefined),
