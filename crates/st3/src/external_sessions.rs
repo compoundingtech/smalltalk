@@ -3918,9 +3918,7 @@ fn omp_assistant_error_view(message: &Value) -> Option<Value> {
                 )
             }
             _ => {
-                let Some(text) = error_message else {
-                    return None;
-                };
+                let text = error_message?;
                 if text.is_empty() || silent_abort || user_interrupt {
                     return None;
                 }
