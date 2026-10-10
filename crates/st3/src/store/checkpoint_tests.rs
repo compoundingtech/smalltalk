@@ -2749,3 +2749,175 @@ fn a_repaired_usage_claim_is_folded_afresh_once_kept_reductions_are_forgotten() 
     assert_eq!(store.usage_summaries_at(&subjects, None).unwrap().remove(AGENT),
         store.usage_summary_at(AGENT, None, None).unwrap());
 }
+
+
+/// The rules description of rules version 14, before `retention.toml` named the rules. Moving
+/// the rules into the policy file changes no rule, so it renders this text exactly and the rules
+/// digest every member seals with stays the same.
+const RULES_V14_DESCRIPTION: &str = "\
+harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start
+seat.status-history slot=subject sources=exclude-status_transition-false-or-numeric-zero-heartbeats keep=last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,previous-transition-per-visible-incarnation-even-before-window,current-state-run-start
+harness.timeline slot=subject,incarnation_id keep=newest min-age-before-cut=5d
+loop.state slot=subject keep=first-and-last-of-each-run-of-status-and-round,first-with-items
+subscription.mission-deferred slot=subject,request keep=all-while-open,newest
+observer.observed slot=subject keep=newest,newest-carrier-of-each-field
+daemon.diagnostic slot=subject,code keep=newest,newest-carrier-of-each-field
+transport.observed slot=subject,origin keep=newest,newest-carrier-of-each-field
+runtime.action.requested actor=null slot=subject,action,incarnation_id,operation_status keep=newest min-age-before-cut=5d
+runtime.action.succeeded actor=null slot=subject,action,incarnation_id,operation_status keep=newest min-age-before-cut=5d
+runtime.action.failed actor=null slot=subject,action,incarnation_id,operation_status keep=newest min-age-before-cut=5d
+runtime.action.deadline-reached actor=null slot=subject,action,incarnation_id,operation_status keep=newest min-age-before-cut=5d
+harness.usage semantics=response_rollup slot=subject,incarnation_id,model,account,owner_run,owner_step,host keep=newest,last-of-each-utc-hour-by-observed_at-within-7d-before-cut,newest-before-that
+harness.usage semantics=session_cumulative slot=subject,incarnation_id keep=newest,largest-total_tokens
+harness.usage semantics=context_occupancy slot=subject,incarnation_id keep=newest
+harness.limits keep=all-source-observations
+resource.observed actor=null observer=set slot=subject keep=newest
+render.applied slot=subject keep=newest min-age-before-cut=5d
+runtime.readiness-deadline-reached slot=subject keep=newest min-age-before-cut=5d
+sekret.called slot=subject keep=newest min-age-before-cut=5d
+sekret.exited slot=subject keep=newest min-age-before-cut=5d
+sekret.refused slot=subject keep=newest min-age-before-cut=5d
+sekret.changed slot=subject keep=newest min-age-before-cut=5d
+sealed=every-admitted-claim-of-an-envelope-before-the-cut-but-repaired-originals
+proof=the-sealed-claims-and-the-blobs-they-reference
+graph=shared-projection-tables-including-arrangements-and-arrangement_registers-even-when-empty
+replay=clear-arrangements-and-arrangement_registers,rebuild-from-sealed-arrangement-claims
+guards=person-actor,once-cardinality,record-not-valid,repair-replacement,projection-reference,claim-in-two-envelopes,cited-as-evidence,mission-run-input,shared-operation,writer-newest-envelope,whole-envelope
+witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
+carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
+
+#[test]
+fn the_policy_renders_the_rules_version_14_description() {
+    assert_eq!(super::checkpoint_rules::RULES_VERSION, 14);
+    assert_eq!(super::checkpoint_rules::rules_description(), RULES_V14_DESCRIPTION);
+}
+
+/// `slot_of` as it was before the policy file, to show the policy groups claims into the same
+/// slots under the same planner functions.
+fn legacy_slot_of(claim: &ClaimRecord) -> Option<(&'static str, Vec<String>)> {
+    use super::checkpoint_rules::{field_str, field_text, fields};
+    let subject = claim.subject.clone();
+    let kind = claim.kind.clone();
+    let slot = |extra: &[&str]| {
+        let mut slot = vec![subject.clone(), kind.clone()];
+        slot.extend(extra.iter().map(|name| field_text(claim, name)));
+        slot
+    };
+    match claim.kind.as_str() {
+        "harness.observed" => field_str(claim, "incarnation_id")
+            .map(|_| ("harness", slot(&["incarnation_id"]))),
+        "harness.timeline" => Some(("aged", slot(&["incarnation_id"]))),
+        "loop.state" => Some(("loop", slot(&[]))),
+        "subscription.mission-deferred" => Some(("deferral", slot(&["request"]))),
+        "observer.observed" => Some(("newest", slot(&[]))),
+        "daemon.diagnostic" => Some(("newest", slot(&["code"]))),
+        "transport.observed" => {
+            let mut slot = slot(&[]);
+            slot.push(claim.origin.clone());
+            Some(("newest", slot))
+        }
+        "runtime.action.requested"
+        | "runtime.action.succeeded"
+        | "runtime.action.failed"
+        | "runtime.action.deadline-reached"
+            if claim.actor.is_none() =>
+        {
+            Some(("aged", slot(&["action", "incarnation_id", "operation_status"])))
+        }
+        "render.applied" | "runtime.readiness-deadline-reached" => Some(("aged", slot(&[]))),
+        "sekret.called" | "sekret.exited" | "sekret.refused" | "sekret.changed" => {
+            Some(("aged", slot(&[])))
+        }
+        "harness.limits" => None,
+        "harness.todo.observed" => Some(("newest", slot(&[]))),
+        "resource.observed"
+            if claim.actor.is_none()
+                && fields(claim).is_some_and(|fields| fields.contains_key("observer")) =>
+        {
+            Some(("newest", slot(&[])))
+        }
+        "harness.usage" => match field_str(claim, "semantics")? {
+            "response_rollup" => Some((
+                "series",
+                slot(&["incarnation_id", "model", "account", "owner_run", "owner_step", "host"]),
+            )),
+            "session_cumulative" => Some(("cumulative", slot(&["semantics", "incarnation_id"]))),
+            "context_occupancy" => Some(("newest", slot(&["semantics", "incarnation_id"]))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[test]
+fn the_policy_groups_claims_into_the_slots_the_rules_did() {
+    use super::checkpoint_rules::{Rule, slot_of};
+    let name = |rule: Rule| match rule {
+        Rule::Newest => "newest",
+        Rule::NewestAged(age) => {
+            assert_eq!(age, 5 * DAY_MS);
+            "aged"
+        }
+        Rule::HarnessObserved => "harness",
+        Rule::LoopState => "loop",
+        Rule::Deferral => "deferral",
+        Rule::UsageSeries => "series",
+        Rule::UsageCumulative => "cumulative",
+    };
+    let field_sets = [
+        json!({}),
+        json!({"incarnation_id": "inc-1", "state": "idle"}),
+        json!({"incarnation_id": "inc-2", "code": "slow", "request": "request-1"}),
+        json!({"incarnation_id": 7, "action": "start", "operation_status": "done"}),
+        json!({"semantics": "response_rollup", "incarnation_id": "inc-1", "model": "m", "account": "a", "owner_run": "r", "owner_step": "s", "host": "h"}),
+        json!({"semantics": "response_rollup", "incarnation_id": "inc-1", "model": "m", "account": "b"}),
+        json!({"semantics": "session_cumulative", "incarnation_id": "inc-1"}),
+        json!({"semantics": "session_cumulative", "incarnation_id": "inc-2"}),
+        json!({"semantics": "context_occupancy", "incarnation_id": "inc-1"}),
+        json!({"semantics": "context_occupancy", "incarnation_id": "inc-2"}),
+        json!({"semantics": "per_response", "incarnation_id": "inc-1"}),
+        json!({"observer": "observer/example", "facts": {}}),
+        json!({"code": "slow", "request": "request-2"}),
+    ];
+    let mut kinds = st3_schema::registry().claims.keys().cloned().collect::<Vec<_>>();
+    kinds.push("custom.example.kind".into());
+    let mut claims = Vec::new();
+    for kind in &kinds {
+        for subject in ["agent/alder.worker", "observer/example"] {
+            for origin in ["alder", "birch"] {
+                for actor in [None, Some("agent/alder.worker"), Some("person/avery")] {
+                    for fields in &field_sets {
+                        claims.push(ClaimRecord {
+                            id: format!("claim-{}", claims.len()),
+                            store_index: claims.len() as u64,
+                            batch_id: "batch".into(),
+                            subject: subject.into(),
+                            kind: kind.clone(),
+                            origin: origin.into(),
+                            actor: actor.map(str::to_owned),
+                            operation_id: None,
+                            request_digest: None,
+                            body: json!({"fields": fields}),
+                            predecessors: Vec::new(),
+                            accepted_at_unix_ms: 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // The same claims share a slot under each, with the same planner function.
+    let mut old_to_new = BTreeMap::new();
+    let mut new_to_old = BTreeMap::new();
+    for claim in &claims {
+        let old = legacy_slot_of(claim);
+        let new = slot_of(claim).map(|(rule, slot)| (name(rule), slot));
+        assert_eq!(old.is_some(), new.is_some(), "{} {}", claim.kind, claim.body);
+        if let (Some(old), Some(new)) = (old, new) {
+            assert_eq!(old.0, new.0, "{} {}", claim.kind, claim.body);
+            assert_eq!(*old_to_new.entry(old.clone()).or_insert(new.clone()), new);
+            assert_eq!(*new_to_old.entry(new).or_insert(old.clone()), old);
+        }
+    }
+    assert!(old_to_new.len() > 50, "the corpus covers many slots");
+}

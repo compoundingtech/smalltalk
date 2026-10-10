@@ -29,11 +29,6 @@ use smallclaims::store::checkpoint::*;
 /// Version 14 retains the predecessor of each incarnation's first visible status transition.
 pub const RULES_VERSION: u32 = 14;
 
-/// Kinds that are now local observations are dropped only when they are dated at least five days
-/// before the cut, so they are seven days old when the checkpoint is due. That matches the local
-/// observation log's default retention.
-pub(crate) const LOCAL_KIND_MIN_AGE_MS: u128 = 5 * DAY_MS;
-
 /// Usage rollups keep their hourly history for this long before the cut, so a usage period that
 /// ends within it is exact to the hour. Before it, each rollup series keeps only its newest
 /// snapshot: the series' total, and the baseline for a period that starts at the window's edge.
@@ -63,31 +58,8 @@ pub(crate) const REQUEST_CLOSERS: [&str; 3] = [
     "subscription.mission-request-cancelled",
 ];
 
-/// A canonical description of every rule. The rules digest hashes it with `RULES_VERSION`.
-pub(crate) const RULES_DESCRIPTION: &str = "\
-harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start
-seat.status-history slot=subject sources=exclude-status_transition-false-or-numeric-zero-heartbeats keep=last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,previous-transition-per-visible-incarnation-even-before-window,current-state-run-start
-harness.timeline slot=subject,incarnation_id keep=newest min-age-before-cut=5d
-loop.state slot=subject keep=first-and-last-of-each-run-of-status-and-round,first-with-items
-subscription.mission-deferred slot=subject,request keep=all-while-open,newest
-observer.observed slot=subject keep=newest,newest-carrier-of-each-field
-daemon.diagnostic slot=subject,code keep=newest,newest-carrier-of-each-field
-transport.observed slot=subject,origin keep=newest,newest-carrier-of-each-field
-runtime.action.requested actor=null slot=subject,action,incarnation_id,operation_status keep=newest min-age-before-cut=5d
-runtime.action.succeeded actor=null slot=subject,action,incarnation_id,operation_status keep=newest min-age-before-cut=5d
-runtime.action.failed actor=null slot=subject,action,incarnation_id,operation_status keep=newest min-age-before-cut=5d
-runtime.action.deadline-reached actor=null slot=subject,action,incarnation_id,operation_status keep=newest min-age-before-cut=5d
-harness.usage semantics=response_rollup slot=subject,incarnation_id,model,account,owner_run,owner_step,host keep=newest,last-of-each-utc-hour-by-observed_at-within-7d-before-cut,newest-before-that
-harness.usage semantics=session_cumulative slot=subject,incarnation_id keep=newest,largest-total_tokens
-harness.usage semantics=context_occupancy slot=subject,incarnation_id keep=newest
-harness.limits keep=all-source-observations
-resource.observed actor=null observer=set slot=subject keep=newest
-render.applied slot=subject keep=newest min-age-before-cut=5d
-runtime.readiness-deadline-reached slot=subject keep=newest min-age-before-cut=5d
-sekret.called slot=subject keep=newest min-age-before-cut=5d
-sekret.exited slot=subject keep=newest min-age-before-cut=5d
-sekret.refused slot=subject keep=newest min-age-before-cut=5d
-sekret.changed slot=subject keep=newest min-age-before-cut=5d
+/// What the rule engine does beyond the policy's rules. The rules digest hashes it after them.
+const ENGINE_DESCRIPTION: &str = "\
 sealed=every-admitted-claim-of-an-envelope-before-the-cut-but-repaired-originals
 proof=the-sealed-claims-and-the-blobs-they-reference
 graph=shared-projection-tables-including-arrangements-and-arrangement_registers-even-when-empty
@@ -96,19 +68,30 @@ guards=person-actor,once-cardinality,record-not-valid,repair-replacement,project
 witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
 carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
 
+/// A canonical description of every rule: one line per rule of the retention policy
+/// (`crates/st3-schema/retention.toml`), then the engine's terms. The rules digest hashes it with
+/// `RULES_VERSION`.
+pub(crate) fn rules_description() -> &'static str {
+    static DESCRIPTION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DESCRIPTION.get_or_init(|| {
+        format!("{}\n{ENGINE_DESCRIPTION}", st3_schema::retention::policy().rules_description())
+    })
+}
+
 /// The digest of the rules this build applies.
 pub fn rules_digest() -> String {
     let mut digest = Sha256::new();
     digest.update(b"st3-checkpoint-rules-v1\0");
     digest.update(RULES_VERSION.to_be_bytes());
-    digest.update(RULES_DESCRIPTION.as_bytes());
+    digest.update(rules_description().as_bytes());
     hex::encode(digest.finalize())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum Rule {
     Newest,
-    NewestAged,
+    /// The newest, and only claims accepted at least this long before the cut go.
+    NewestAged(u128),
     HarnessObserved,
     LoopState,
     Deferral,
@@ -134,87 +117,82 @@ pub(crate) fn field_str<'a>(claim: &'a ClaimRecord, name: &str) -> Option<&'a st
         .and_then(Value::as_str)
 }
 
-/// The rule and slot of a claim, or `None` when no rule may drop it.
-pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
-    let subject = claim.subject.clone();
-    let kind = claim.kind.clone();
-    let slot = |extra: &[&str]| {
-        let mut slot = vec![subject.clone(), kind.clone()];
-        slot.extend(extra.iter().map(|name| field_text(claim, name)));
-        slot
-    };
-    match claim.kind.as_str() {
-        // A legacy observation without an incarnation falls back to store index comparisons in
-        // `current_harness_at`, so it stays.
-        "harness.observed" => field_str(claim, "incarnation_id")
-            .map(|_| (Rule::HarnessObserved, slot(&["incarnation_id"]))),
-        "harness.timeline" => Some((Rule::NewestAged, slot(&["incarnation_id"]))),
-        "loop.state" => Some((Rule::LoopState, slot(&[]))),
-        "subscription.mission-deferred" => Some((Rule::Deferral, slot(&["request"]))),
-        "observer.observed" => Some((Rule::Newest, slot(&[]))),
-        "daemon.diagnostic" => Some((Rule::Newest, slot(&["code"]))),
-        "transport.observed" => {
-            let mut slot = slot(&[]);
-            slot.push(claim.origin.clone());
-            Some((Rule::Newest, slot))
-        }
-        // A person's signal names its requester and replicates with its result, so only the
-        // reconciler's own records are dropped.
-        "runtime.action.requested"
-        | "runtime.action.succeeded"
-        | "runtime.action.failed"
-        | "runtime.action.deadline-reached"
-            if claim.actor.is_none() =>
-        {
-            Some((
-                Rule::NewestAged,
-                slot(&["action", "incarnation_id", "operation_status"]),
-            ))
-        }
-        "render.applied" | "runtime.readiness-deadline-reached" => {
-            Some((Rule::NewestAged, slot(&[])))
-        }
-        // Sekrets claims are local observations now; the ones written before that go with age.
-        // Nothing projects them, and a subject's history reads only what is kept.
-        "sekret.called" | "sekret.exited" | "sekret.refused" | "sekret.changed" => {
-            Some((Rule::NewestAged, slot(&[])))
-        }
-        // The account fold compares source times and percentages across reset windows. A later
-        // claim does not replace every use of an earlier reading (including a switched account).
-        "harness.limits" => None,
-        "harness.todo.observed" => Some((Rule::Newest, slot(&[]))),
-        // An observer records a resource's complete facts in every observation, so its newest
-        // observation replaces the older ones. A repository observer records each item as its
-        // own resource, so each item keeps its latest state. A version that a subscription request
-        // or a message was made for shares their envelope and stays with them.
-        "resource.observed"
-            if claim.actor.is_none()
-                && fields(claim).is_some_and(|fields| fields.contains_key("observer")) =>
-        {
-            Some((Rule::Newest, slot(&[])))
-        }
-        // A legacy per-response claim is summed by every usage read, so it stays.
-        "harness.usage" => match field_str(claim, "semantics")? {
-            "response_rollup" => Some((
-                Rule::UsageSeries,
-                slot(&[
-                    "incarnation_id",
-                    "model",
-                    "account",
-                    "owner_run",
-                    "owner_step",
-                    "host",
-                ]),
-            )),
-            "session_cumulative" => Some((
-                Rule::UsageCumulative,
-                slot(&["semantics", "incarnation_id"]),
-            )),
-            "context_occupancy" => Some((Rule::Newest, slot(&["semantics", "incarnation_id"]))),
-            _ => None,
+/// The planner function a policy rule's `keep` names, or `None` for a rule that keeps every
+/// claim. `seat.status-history` is planned across kinds in `plan_drops`, not by slot.
+fn planner_rule(rule: &st3_schema::retention::RulePolicy) -> Option<Rule> {
+    let min_age = rule.min_age.as_deref().map(|age| {
+        st3_schema::retention::days_ms(age).unwrap_or_else(|error| panic!("{}: {error}", rule.kind))
+    });
+    let planned = match rule.keep.as_str() {
+        "newest" | "newest,newest-carrier-of-each-field" => match min_age {
+            Some(age) => Rule::NewestAged(age),
+            None => Rule::Newest,
         },
-        _ => None,
+        "first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start" => {
+            Rule::HarnessObserved
+        }
+        "first-and-last-of-each-run-of-status-and-round,first-with-items" => Rule::LoopState,
+        "all-while-open,newest" => Rule::Deferral,
+        "newest,last-of-each-utc-hour-by-observed_at-within-7d-before-cut,newest-before-that" => {
+            Rule::UsageSeries
+        }
+        "newest,largest-total_tokens" => Rule::UsageCumulative,
+        "all-source-observations" => return None,
+        _ if rule.kind == "seat.status-history" => return None,
+        other => panic!("retention.toml: no planner keeps `{other}` for {}", rule.kind),
+    };
+    assert!(
+        min_age.is_none() || matches!(planned, Rule::NewestAged(_)),
+        "retention.toml: only a newest rule takes a minimum age ({})",
+        rule.kind
+    );
+    rule.slot.as_ref().map(|_| planned)
+}
+
+/// The policy's rules by kind, each with its planner function.
+fn policy_rules() -> &'static BTreeMap<&'static str, Vec<(&'static st3_schema::retention::RulePolicy, Rule)>> {
+    static RULES: std::sync::OnceLock<BTreeMap<&'static str, Vec<(&'static st3_schema::retention::RulePolicy, Rule)>>> =
+        std::sync::OnceLock::new();
+    RULES.get_or_init(|| {
+        let mut rules = BTreeMap::<&str, Vec<_>>::new();
+        for rule in &st3_schema::retention::policy().rules {
+            let planned = planner_rule(rule);
+            if let Some(planned) = planned {
+                rules.entry(rule.kind.as_str()).or_default().push((rule, planned));
+            }
+        }
+        rules
+    })
+}
+
+/// Whether one `when` condition of a rule holds for a claim.
+fn condition_holds(claim: &ClaimRecord, condition: &str) -> bool {
+    let (name, value) = condition.split_once('=').unwrap_or((condition, ""));
+    match (name, value) {
+        ("actor", "null") => claim.actor.is_none(),
+        (name, "set") => fields(claim).is_some_and(|fields| fields.contains_key(name)),
+        (name, value) => field_str(claim, name) == Some(value),
     }
+}
+
+/// The rule and slot of a claim, or `None` when no rule may drop it. The first policy rule for
+/// the claim's kind whose conditions hold applies.
+pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
+    let (rule, planned) = policy_rules()
+        .get(claim.kind.as_str())?
+        .iter()
+        .find(|(rule, _)| rule.when.iter().all(|condition| condition_holds(claim, condition)))?;
+    let mut slot = vec![claim.subject.clone(), claim.kind.clone()];
+    for name in rule.slot.iter().flatten() {
+        if name == "claim.origin" {
+            slot.push(claim.origin.clone());
+        } else if rule.require_slot {
+            slot.push(field_str(claim, name)?.to_owned());
+        } else {
+            slot.push(field_text(claim, name));
+        }
+    }
+    Some((*planned, slot))
 }
 
 /// Whether every field `claim` sets is set again by a later kept claim of its slot, whose field
@@ -514,7 +492,7 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
             .collect::<Vec<_>>();
         let newest = BTreeSet::from([members.len() - 1]);
         let keep = match rule {
-            Rule::Newest | Rule::NewestAged => newest,
+            Rule::Newest | Rule::NewestAged(_) => newest,
             Rule::HarnessObserved => harness_keep(&slot_claims),
             Rule::UsageSeries => usage_series_keep(&slot_claims, cut),
             Rule::UsageCumulative => usage_cumulative_keep(&slot_claims),
@@ -533,9 +511,12 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
             keep.extend(field_carriers(&slot_claims));
         }
         for (position, index) in members.iter().enumerate() {
-            let old_enough = *rule != Rule::NewestAged
-                || claims[*index].claim.accepted_at_unix_ms
-                    < cut.saturating_sub(LOCAL_KIND_MIN_AGE_MS);
+            let old_enough = match rule {
+                Rule::NewestAged(min_age) => {
+                    claims[*index].claim.accepted_at_unix_ms < cut.saturating_sub(*min_age)
+                }
+                _ => true,
+            };
             if !keep.contains(&position) && !status_keep.contains(index) && old_enough {
                 dropped[*index] = true;
             }

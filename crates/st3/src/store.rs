@@ -41305,7 +41305,7 @@ version 2
         let mut legacy_digest = Sha256::new();
         legacy_digest.update(b"st3-checkpoint-rules-v1\0");
         legacy_digest.update(5_u32.to_be_bytes());
-        legacy_digest.update(checkpoint_rules::RULES_DESCRIPTION.as_bytes());
+        legacy_digest.update(checkpoint_rules::rules_description().as_bytes());
         let legacy_digest = hex::encode(legacy_digest.finalize());
         assert_ne!(legacy_digest, rules_digest());
         let sealed = controller.checkpoint_sealed_identities(cut, None).unwrap();
