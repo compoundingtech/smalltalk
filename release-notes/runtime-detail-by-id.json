@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Read one runtime by id without reducing every runtime",
+  "replay": { "status": "none", "detail": "Existing claims and projections are read unchanged. No replay is required." },
+  "schema": { "status": "changed", "detail": "Add a local partial SQLite index on textual runtime ids from the same actual-state claims read by the canonical fold. The index is created automatically when the store opens. Claim registry, shared projection layout, schema document, compatibility digest and storage version are unchanged." },
+  "rules": { "status": "none", "detail": "Runtime detail and control resolve candidate owners by indexed folded-runtime-id sources, restrict candidates to subjects with a runtime observation at the selected snapshot, then use the existing canonical status reduction. Detail and control lookups run on blocking workers." },
+  "compatibility": { "status": "none", "detail": "Runtime resources, unknown-id responses, history and authorization semantics are unchanged." },
+  "downtime": { "status": "changed", "detail": "The first open builds the local index in one write transaction over retained claims. An isolated 118,390-claim fixture took 1.237 seconds; a linear same-mix estimate for 200,000 claims is 2.090 seconds, not a production measurement. This exceeds the 100 ms write-transaction target and is an open intake point. Later opens reuse the index." },
+  "manual": { "status": "none", "detail": "No manual migration is required." },
+  "recovery": { "status": "none", "detail": "Older binaries can read the unchanged claims without recovery." }
+}

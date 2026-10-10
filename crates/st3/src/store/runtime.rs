@@ -177,6 +177,7 @@ impl Runtime for SmalltalkRuntime {
 
     fn create_schema(&self, connection: &Connection) -> Result<()> {
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(&RUNTIME_ID_INDEX)?;
         connection.execute_batch(arrangements::SCHEMA)?;
         usage_period::create_schema(connection)?;
         migrate_local_usage_seen(connection)?;
