@@ -1,18 +1,18 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
 import type { Meta, StoryObj } from '@storybook/react-vite'
-import { Button, TextArea } from 'react-aria-components'
-import { expect, userEvent, within } from 'storybook/test'
+import { useAui } from '@assistant-ui/react'
+import { Button } from 'react-aria-components'
+import { expect, userEvent, waitFor, within } from 'storybook/test'
 import { encodeSteps, sessionByName, sessionCounts, sessionNames, stepTimestamp, worldNow, type Session, type SessionName } from '@smalltalk/st3-scenarios/sessions'
 import { Transcript, type TranscriptTurn } from './assistant-ui/composition/Transcript.tsx'
 import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime.tsx'
 import { EmbraceComposer } from './assistant-ui/EmbraceComposer.tsx'
-import { draftFromText, serializeDraft } from './assistant-ui/embrace-composer/draft.ts'
 import type { ConversationItem, TextItem } from './assistant-ui/embrace-data/model.ts'
 import { workLogTurnFromItems } from './assistant-ui/taste/work-log.ts'
 import { baselineTheme } from './assistant-ui/neutral-theme.ts'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme.ts'
-import { surfaceVars as surface, textVars as ink, spaceVars as s, typeVars as t, geometryVars as g } from './assistant-ui/composition-tokens.stylex.ts'
+import { surfaceVars as surface, textVars as ink, borderVars as border, radiusVars as r, spaceVars as s, typeVars as t, geometryVars as g } from './assistant-ui/composition-tokens.stylex.ts'
 
 /** Kit view fixtures, not a second wire projection. The app uses sessionEntries with its live fold.
  * Authored steps carry the existing kit view contract; wire IDs come from the prod-decoded emitter.
@@ -46,32 +46,42 @@ const viewTurn = (session: Session, count: number): readonly TranscriptTurn[] =>
 }
 
 const styles = stylex.create({
-  root: { backgroundColor: surface.bg, color: ink.fg, padding: s.panel, minHeight: '100vh', fontFamily: t.fontSans },
-  frame: { height: 650, display: 'flex', flexDirection: 'column', minWidth: 0 },
-  heading: { fontSize: t.bodySize, lineHeight: t.bodyLeading },
-  action: { backgroundColor: surface.controlFill, color: ink.fg, padding: s.md, borderWidth: g.hairline, borderStyle: 'solid', cursor: 'pointer' },
-  examples: { display: 'grid', gap: s.panel },
+  root: { height: '100vh', width: '100%', minWidth: 0, boxSizing: 'border-box', display: 'flex', flexDirection: 'column', backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans },
+  header: { display: 'flex', gap: s.lg, alignItems: 'baseline', paddingInline: s.lg, paddingBlock: s.md, fontSize: t.metaSize, lineHeight: t.metaLeading },
+  heading: { margin: 0, fontSize: t.bodySize, lineHeight: t.bodyLeading },
+  meta: { margin: 0, color: ink.fgMuted },
+  frame: { flex: '1 1 0', minHeight: 0, display: 'flex', flexDirection: 'column' },
+  dock: { flexShrink: 0, boxSizing: 'border-box', width: '100%', maxWidth: g.lane, marginInline: 'auto', padding: s.lg },
+  action: { alignSelf: 'center', marginBlock: s.md, backgroundColor: surface.controlFill, color: ink.fg, paddingBlock: s.xs, paddingInline: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.controlBorder, borderRadius: r.control, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer' },
+  examples: { display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: s.lg, padding: s.lg, backgroundColor: surface.canvas },
+  cell: { height: '720px', display: 'flex', flexDirection: 'column' },
+  embedded: { height: '100%' },
 })
 
-function SessionStory({ name = 'short-success', scheme = 'dark' }: { name?: SessionName; scheme?: Scheme }) {
+/** Host restore path: the saved draft is written back into the real composer runtime. */
+function RestoreDraft({ text }: { readonly text: string }) {
+  const aui = useAui()
+  React.useEffect(() => { aui.composer.setText(text) }, [aui, text])
+  return null
+}
+
+function SessionStory({ name = 'short-success', scheme = 'dark', embedded = false }: { name?: SessionName; scheme?: Scheme; embedded?: boolean }) {
   const session = sessionByName(name)
   const [count, setCount] = React.useState(session.initialStepCount ?? session.steps.length)
-  const [draft, setDraft] = React.useState(() => draftFromText(session.draft ?? ''))
   const turns = React.useMemo(() => viewTurn(session, count), [session, count])
   const messages = React.useMemo(() => turns.flatMap(turn => turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]), [turns])
   const offline = name === 'offline-retry' && count !== session.steps.length
   const options = React.useMemo(() => ({ messages, isRunning: false, onNew: async () => {} }), [messages])
   const counts = sessionCounts({ ...session, steps: session.steps.slice(0, count) })
-  return <section aria-label={`${session.title} session`} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}>
-    <h2 {...stylex.props(styles.heading)}>{session.title}</h2>
-    <p>{counts.entries} entries · {counts.toolCalls} tool calls · {counts.durationMs / 1000}s observed</p>
+  return <section aria-label={`${session.title} session`} {...stylex.props(styles.root, embedded && styles.embedded, ...baselineTheme, scheme === 'light' && lightTheme)}>
+    <header {...stylex.props(styles.header)}><h2 {...stylex.props(styles.heading)}>{session.title}</h2><p {...stylex.props(styles.meta)}>{counts.entries} entries · {counts.toolCalls} tool calls · {counts.durationMs / 1000}s observed</p></header>
     <EmbraceRuntimeProvider options={options}>
       <div {...stylex.props(styles.frame)}>
         <Transcript title={session.title} turns={turns} now={worldNow} observedAt={worldNow - 3000} history={{ _tag: 'Complete' }}
           sync={offline ? { _tag: 'Stale', reason: { _tag: 'Reconnecting', attempt: 1, nextAt: worldNow, issue: 'Offline connection' }, lastLiveAt: Date.parse(stepTimestamp(session, 17)) } : { _tag: 'Live', since: worldNow }}
           onRetrySync={() => setCount(session.steps.length)} emptyState={{ title: 'No messages yet', body: 'Receive the first result to start this fictional session.' }} landmarkContext={session.title} />
       </div>
-      {session.draft !== undefined && <EmbraceComposer variant="C1" plainText tokenDraft={draft} onTokenDraftChange={setDraft} sendDisabled={offline || name === 'interrupted-draft'} input={(inputStyle, descriptionId) => <TextArea aria-label="Preserved session draft" aria-describedby={descriptionId} value={serializeDraft(draft).text} onChange={event => setDraft(draftFromText(event.target.value))} {...stylex.props(inputStyle)} />} />}
+      {session.draft !== undefined && <div {...stylex.props(styles.dock)}><RestoreDraft text={session.draft} /><EmbraceComposer variant="C1" plainText sendDisabled={offline || name === 'interrupted-draft'} /></div>}
     </EmbraceRuntimeProvider>
     {offline && <Button onPress={() => setCount(session.steps.length)} {...stylex.props(styles.action)}>Retry connection</Button>}
     {name === 'first-result' && count === 0 && <Button onPress={() => setCount(session.steps.length)} {...stylex.props(styles.action)}>Receive first result</Button>}
@@ -111,16 +121,17 @@ const exerciseSession = async (canvasElement: HTMLElement, name: SessionName): P
   }
   if (name === 'offline-retry') {
     await expect(canvas.getByText('Cached stock is retained while the connection is offline. This result may be stale.')).toBeVisible()
-    await expect(canvas.getByRole('textbox', { name: 'Preserved session draft' })).toHaveValue(sessionByName(name).draft)
-    await userEvent.click(canvas.getByRole('button', { name: /Retry|Try again/i }))
+    await waitFor(() => expect(canvas.getByRole('textbox', { name: 'Message' })).toHaveValue(sessionByName(name).draft))
+    await userEvent.click(canvas.getByRole('button', { name: 'Retry connection' }))
   }
   await proveWitness(canvasElement, name)
   if (name === 'interrupted-draft' || name === 'offline-retry') {
-    await expect(canvas.getByRole('textbox', { name: 'Preserved session draft' })).toHaveValue(sessionByName(name).draft)
+    await waitFor(() => expect(canvas.getByRole('textbox', { name: 'Message' })).toHaveValue(sessionByName(name).draft))
   }
   if (name === 'long-debug') {
     await expect(canvas.getByRole('table')).toHaveTextContent('Repeated boundary')
-    await userEvent.click(canvas.getByRole('button', { name: /Worked/ }))
+    canvas.getByTestId('transcript-scroll').scrollTo({ top: 0 })
+    await userEvent.click(await canvas.findByRole('button', { name: /Worked/ }))
     await expect(canvas.getAllByText('No output')).toHaveLength(2)
   }
 }
@@ -138,7 +149,7 @@ export const FirstResult: Story = { args: { name: 'first-result' }, play: playSe
 export const LongDebug: Story = { args: { name: 'long-debug' }, play: playSession('long-debug') }
 export const WaitingQueued: Story = { args: { name: 'waiting-queued' }, play: playSession('waiting-queued') }
 export const AllStates: Story = {
-  render: ({ scheme }) => <div {...stylex.props(styles.examples)}>{sessionNames.map(name => <SessionStory key={name} name={name} scheme={scheme} />)}</div>,
+  render: ({ scheme }) => <div {...stylex.props(styles.examples)}>{sessionNames.map(name => <div key={name} {...stylex.props(styles.cell)}><SessionStory name={name} scheme={scheme} embedded /></div>)}</div>,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement)
     await expect(canvas.getAllByRole('region', { name: / session$/ })).toHaveLength(8)

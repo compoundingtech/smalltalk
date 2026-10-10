@@ -5,7 +5,8 @@ import { describe, expect, it } from 'vitest'
 import { scanContent, scanIdentities } from '../scripts/scan.ts'
 import { decodeSteps, encodeSteps, sessionCounts, sessionEntries, sessionNames, sessions, worldNow } from '../src/sessions/index.ts'
 
-const decode = decodeUnknownSync(TimelineEntry, 'strict')
+const decodeStrict = decodeUnknownSync(TimelineEntry, 'strict')
+const decode = (input: unknown) => decodeStrict(input)
 
 describe('hand-authored session corpus', () => {
   it('exports all eight stable names without repeated scripts', () => {

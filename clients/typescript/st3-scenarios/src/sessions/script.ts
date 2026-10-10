@@ -53,4 +53,4 @@ export const encodeSteps = (script: Script): readonly (readonly TimelineEntryEnc
 }
 
 export const decodeSteps = (script: Script): readonly (readonly TimelineEntry[])[] =>
-  encodeSteps(script).map(entries => entries.map(decodeUnknownSync(TimelineEntry, 'strict')))
+  encodeSteps(script).map(entries => entries.map(entry => decodeUnknownSync(TimelineEntry, 'strict')(entry)))
