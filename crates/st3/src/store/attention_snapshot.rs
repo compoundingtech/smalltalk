@@ -1439,8 +1439,12 @@ pub(super) fn conversation_agent(
 
 // Modern driver ownership and transition counters survive heartbeat re-stamps. Include
 // the register epoch so a restored database cannot suppress a new prompt with an old clear.
-// Unsequenced legacy publishers retain their original per-observation identity.
+// Durable graph observations and unsequenced legacy publishers retain their original
+// per-observation identity, including existing stored terminal clears.
 fn native_prompt_episode(observation: &str, subject: &str, fields: &Value) -> String {
+    if !observation.starts_with("local-observation/") {
+        return observation.into();
+    }
     let (Some(incarnation), Some(owner), Some(transition)) = (
         fields["incarnation_id"].as_str(),
         fields["ownership_sequence"].as_u64(),

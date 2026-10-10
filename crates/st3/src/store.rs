@@ -56280,10 +56280,12 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             subject: "agent/node.worker".into(), kind: "harness.observed".into(),
             actor: Some("agent/node.worker".into()),
             fields: serde_json::from_value(json!({"state":"working", "incarnation_id":"one",
-                "blocked_on":"human", "ask":"permission"})).unwrap(),
+                "blocked_on":"human", "ask":"permission",
+                "ownership_sequence":7, "transition_sequence":10})).unwrap(),
             evidence: vec![], expected_subject: None, idempotency_key: None,
         }).unwrap();
         assert!(checkpoint::claim_or_tombstone_exists(&store.readers.get(), &observation.id).unwrap());
+        assert_eq!(Store::native_prompt_episode(&observation), observation.id);
         let clear = store.record_native_prompt_gone(&observation, "one").unwrap();
         assert_eq!(clear.body["evidence"], json!([observation.id]));
     }
