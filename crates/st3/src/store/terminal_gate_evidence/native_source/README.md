@@ -33,6 +33,10 @@ clears pending after successful Installer publication. Native rows, pending meta
 Installer root and witness all roll back together. Raw-connection writes leave the
 reader unavailable until an explicit eligible writer finish; no reader recomputes.
 
+The `INDEXED BY claims_subject_index` clause is exclusive to the private fixture.
+It must not carry into a production trigger: a dropped or renamed index would fail
+every claim write. Production capture needs a separately reviewed mechanism.
+
 The fixture diagnostic has the Doctor line shape but is not an HTTP/CLI route. It emits
 only a proven warning or explicit unknown. It never emits pass. The lifecycle control
 models explicit private fences for rebuild/migrate/restore; it does not prove existing
@@ -54,6 +58,14 @@ statement, zero full scans and at most 40 VM steps. The semantic no-op assertion
 the proposed 96-statement/20000-VM/zero-full-scan target, without changing generation
 or output rows. These are unexecuted test assertions until hosted controls run; they
 are not an enforced production deadline or a feasibility, latency or cost claim.
+
+At each 0/1024/100000 prior-row size, the control also separately reports one unrelated
+claim INSERT (insert_count=1), including native and fixture trigger predicates, and
+the following idle finish. Batch setup is excluded. Expected statement counts are one
+for the INSERT and one for finish; the exact VM/fullscan numbers are currently UNRUN,
+and will be recorded from hosted output. INSERT retains the 20000-VM/zero-fullscan
+refusal target and finish the 40-VM/zero-fullscan target. The output also reports the
+unrelated point UPDATE and complete bound-key semantic no-op path separately.
 
 A future production hook must have a zero-SQL no-binding writer flag, prove installed
 but unrelated write cost, cover both proposed native hooks plus every lifecycle, and

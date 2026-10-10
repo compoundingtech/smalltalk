@@ -520,6 +520,7 @@ fn native_gate_unrelated_and_noop_work_at_zero_1024_and_100000_rows() {
         }
         let before = f.store.connection.write().total_changes();
         let work = f.measured(|_| {});
+        eprintln!("native source idle finish unrelated={n}: {work:?}");
         assert_eq!(work.statements, 1, "{n}: {work:?}");
         assert_eq!(work.fullscan_steps, 0, "{n}: {work:?}");
         assert!(work.vm_steps > 0 && work.vm_steps <= 40, "{n}: {work:?}");
@@ -528,6 +529,41 @@ fn native_gate_unrelated_and_noop_work_at_zero_1024_and_100000_rows() {
         let tx = writer.transaction().unwrap();
         let root = f.source.installer.root(&tx, VIEW).unwrap();
         let capture = f.source.state(&tx).unwrap();
+        tx.commit().unwrap();
+        drop(writer);
+        // Establish the unrelated batch outside the measured INSERT. Report one claim
+        // admission itself, including every native and fixture trigger WHEN predicate.
+        f.store.connection.write().execute(
+            "INSERT OR IGNORE INTO batches(id,origin,replica_sequence,accepted_at_unix_ms) VALUES('foreign','node',999,'1')",
+            [],
+        ).unwrap();
+        let mut writer = f.store.connection.write();
+        let tx = writer.transaction().unwrap();
+        let insert_scope = SqliteWorkScope::start();
+        tx.execute("INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+            VALUES('measured-unrelated','foreign','exec/measured-unrelated','runtime.observed','node','{}','[]','1')", []).unwrap();
+        let insert_work = insert_scope.finish();
+        eprintln!(
+            "native source per unrelated claim INSERT prior_rows={n} insert_count=1: {insert_work:?}"
+        );
+        assert_eq!(insert_work.statements, 1, "{n}: {insert_work:?}");
+        assert!(
+            insert_work.vm_steps > 0 && insert_work.vm_steps <= 20_000,
+            "{n}: {insert_work:?}"
+        );
+        assert_eq!(insert_work.fullscan_steps, 0, "{n}: {insert_work:?}");
+        let finish_scope = SqliteWorkScope::start();
+        f.source.finish(&tx).unwrap();
+        let finish_work = finish_scope.finish();
+        eprintln!("native source post-INSERT idle finish prior_rows={n}: {finish_work:?}");
+        assert_eq!(finish_work.statements, 1, "{n}: {finish_work:?}");
+        assert!(
+            finish_work.vm_steps > 0 && finish_work.vm_steps <= 40,
+            "{n}: {finish_work:?}"
+        );
+        assert_eq!(finish_work.fullscan_steps, 0, "{n}: {finish_work:?}");
+        assert_eq!(f.source.state(&tx).unwrap(), capture);
+        assert_eq!(f.source.installer.root(&tx, VIEW).unwrap(), root);
         tx.commit().unwrap();
         drop(writer);
         // At n=0 this is a genuine absent-key point operation; the larger sources update
