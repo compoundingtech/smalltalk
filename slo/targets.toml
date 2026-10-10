@@ -133,3 +133,8 @@ name = "ios-live-share"
 about = "Live foreground time / reported foreground time; disconnected foreground is over-target"
 min_percent = 99
 path = "client/ios/live-share"
+
+[database]
+about = "This member's store: the pages in use, and how much they grow a day once checkpoints and retention have run"
+max_live_gb = 8.0
+max_growth_mb_per_day = 300

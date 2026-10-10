@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(read["remote_windows"]["5m"]["count"], 2);
         assert_eq!(read["remote_windows"]["5m"]["over_target"], 1);
         assert_eq!(target("write-ack")["windows"]["1h"]["count"], 0);
-        for name in ["sql-statement", "transaction", "cpu"] {
+        for name in ["sql-statement", "transaction", "cpu", "database"] {
             target(name);
         }
         let paths = report["paths"].as_array().unwrap();

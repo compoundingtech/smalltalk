@@ -134,6 +134,8 @@ pub(crate) use mission_eligibility::MISSING_AGENT_CONDITION;
 mod revision_seats;
 pub(crate) mod delegation;
 mod limits;
+mod database_size;
+pub use database_size::DatabaseSize;
 mod person_work;
 pub(crate) mod work_summaries_ivm;
 mod subagents;
