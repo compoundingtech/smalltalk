@@ -156,9 +156,15 @@ impl Store {
                 },
                 conversation: Some(seat.clone()),
                 title: format!("{seat} is waiting for {what}"),
-                detail: format!(
-                    "{prompt}\n\nAnswer it in the seat's terminal (Ctrl+] in stui). This alert clears when the prompt is gone, however it was answered."
-                ),
+                detail: if answerable(&harness) {
+                    format!(
+                        "Claude asks to use {prompt}; the call it would make is the pending one in the seat's conversation. Allow or deny it here, or answer it in the seat's terminal (Ctrl+] in stui). This alert clears when the prompt is gone, however it was answered."
+                    )
+                } else {
+                    format!(
+                        "{prompt}\n\nAnswer it in the seat's terminal (Ctrl+] in stui). This alert clears when the prompt is gone, however it was answered."
+                    )
+                },
                 request: None,
                 mission: None,
                 mission_run: None,
@@ -1404,8 +1410,9 @@ fn native_prompt_gone_operation(observation: &str) -> String {
 }
 
 /// Whether st can answer the prompt `harness` reports from a client: a Claude permission prompt,
-/// whose hook waits for the answer, that says what it asks to run, so a person sees what an allow
-/// allows. Other prompts are answered in the seat's terminal.
+/// whose hook waits for the answer, that names its tool. The call's input is conversation content
+/// a client reads from the seat's conversation and shows beside the answers; it is never stored
+/// here. Other prompts are answered in the seat's terminal.
 fn answerable(harness: &Value) -> bool {
     harness["blocked_on"] == "human"
         && harness["ask"] == "permission"
@@ -1508,31 +1515,34 @@ impl Store {
                 NativePromptState::Open
             });
         };
-        if own != 0 {
-            return Ok(NativePromptState::Gone);
+        // Claude shows one prompt at a time: while every observation since the hook's own still
+        // waits on that permission, it is the same prompt, and an answer to any of them is the
+        // hook's. Anything else in between means the prompt is gone.
+        let mut chain = Vec::new();
+        for (claim, body) in &recent[..=own] {
+            let body: Value = serde_json::from_str(body)?;
+            if !answerable(body.get("fields").unwrap_or(&body)) {
+                return Ok(NativePromptState::Gone);
+            }
+            chain.push(claim.clone());
         }
-        let (claim, body) = &recent[own];
-        let body: Value = serde_json::from_str(body)?;
-        let harness = body.get("fields").unwrap_or(&body);
-        if !answerable(harness) {
-            return Ok(NativePromptState::Gone);
+        for claim in &chain {
+            // Refused in the terminal, which only the screen showed.
+            let refused: bool = connection
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_operation_index
+                       WHERE json_extract(body, '$._operation.id') IS NOT NULL
+                         AND json_extract(body, '$._operation.id')=?1)",
+                )?
+                .query_row([native_prompt_gone_operation(claim)], |row| row.get(0))?;
+            if refused {
+                return Ok(NativePromptState::Gone);
+            }
+            if let Some(answer) = native_prompt_answer(&connection, claim)? {
+                return Ok(NativePromptState::Answered { answer });
+            }
         }
-        let claim = claim.clone();
-        // Refused in the terminal, which only the screen showed.
-        let refused: bool = connection
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_operation_index
-                   WHERE json_extract(body, '$._operation.id') IS NOT NULL
-                     AND json_extract(body, '$._operation.id')=?1)",
-            )?
-            .query_row([native_prompt_gone_operation(&claim)], |row| row.get(0))?;
-        if refused {
-            return Ok(NativePromptState::Gone);
-        }
-        Ok(match native_prompt_answer(&connection, &claim)? {
-            Some(answer) => NativePromptState::Answered { answer },
-            None => NativePromptState::Open,
-        })
+        Ok(NativePromptState::Open)
     }
 
     /// Record `actor`'s answer to the native prompt `episode` (the observation that opened it) of

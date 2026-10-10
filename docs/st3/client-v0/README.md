@@ -610,11 +610,15 @@ to the seat's terminal to answer there.
 
 A Claude permission prompt can also be answered from a client: its alert lists `answers`
 (`allow`, `deny`) under `action_parameters["prompt.respond"]` with its `target_id` and
-`episode`, and offers the typed action `prompt.respond`. Only the seat's person answers, only the
-prompt still waiting, and only once; the answer is recorded as a replicated `harness.diagnostic`
-(`native-prompt-answered`), and the prompt's hook on the seat's host, which waits while Claude
-shows its own dialog, returns it to Claude. An answer in the terminal still wins at once. A
-question prompt, and prompts of other harnesses, are answered in the terminal.
+`episode`, and offers the typed action `prompt.respond`. The alert names only the tool; the call
+it would make (its command, path or other input) is conversation content, read from the seat's
+conversation, where Claude records the pending call before it asks. A client shows that pending
+call in full beside the answers and offers `allow` only when it can show it. Only the seat's
+person answers, only the prompt still waiting, and only once; the answer is recorded as a
+replicated `harness.diagnostic` (`native-prompt-answered`), and the prompt's hook on the seat's
+host, which waits while Claude shows its own dialog, returns it to Claude. An answer in the
+terminal still wins at once. A question prompt, and prompts of other harnesses, are answered in
+the terminal.
 
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
 generation, step, or agent), its current `state` and, when known, the `since`

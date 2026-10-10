@@ -55167,7 +55167,7 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         let asked = append(
             "harness.observed",
             json!({"state":"working", "driver":"claude", "incarnation_id":"one",
-                "blocked_on":"human", "ask":"permission", "reason":"Bash: ./migrate --apply",
+                "blocked_on":"human", "ask":"permission", "reason":"Bash",
                 "ownership_sequence":1, "transition_sequence":3}),
         );
         let prompt = || {
@@ -55226,20 +55226,35 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             NativePromptState::Gone
         );
         // The next prompt is its own: the earlier prompt's answer never answers it.
-        let next = append(
+        append(
             "harness.observed",
             json!({"state":"working", "driver":"claude", "incarnation_id":"one",
-                "blocked_on":"human", "ask":"permission", "reason":"Bash: rm -r build",
+                "blocked_on":"human", "ask":"permission", "reason":"Write",
                 "ownership_sequence":1, "transition_sequence":5}),
         );
         assert_eq!(
             store.native_prompt_state(seat, 1, 5).unwrap(),
             NativePromptState::Open
         );
-        assert_eq!(prompt().unwrap().detail.lines().next(), Some("Bash: rm -r build"));
+        // Only the tool is stored; the call itself is read from the seat's conversation.
+        assert!(prompt().unwrap().detail.starts_with("Claude asks to use Write;"));
+        // A later observation of the same waiting prompt: an answer to it is still the hook's.
+        let restated = append(
+            "harness.observed",
+            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"Write",
+                "provider_auth": true, "ownership_sequence":1, "transition_sequence":6}),
+        );
+        assert_eq!(prompt().unwrap().episode, restated.id);
         store
-            .answer_native_prompt(seat, &next.id, "allow", "person/avery")
+            .answer_native_prompt(seat, &restated.id, "allow", "person/avery")
             .unwrap();
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 5).unwrap(),
+            NativePromptState::Answered {
+                answer: "allow".into()
+            }
+        );
         // A prompt that does not say what it would run can only be answered in the terminal.
         append(
             "harness.observed",

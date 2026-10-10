@@ -1900,15 +1900,14 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
             } else {
                 Ask::Permission
             };
-            // What the prompt asks to do, so a person answering it away from the terminal sees
-            // the tool and its input. A payload that names no tool keeps the bare word.
+            // The tool the prompt asks to use. Its input is conversation content: a client reads
+            // the pending call from the seat's conversation, never from this replicated record.
             let reason = payload
                 .get("tool_name")
                 .and_then(serde_json::Value::as_str)
-                .map_or_else(
-                    || "permissionRequest".to_owned(),
-                    |tool| permission_summary(tool, payload.get("tool_input")),
-                );
+                .filter(|tool| !tool.is_empty())
+                .unwrap_or("permissionRequest")
+                .to_owned();
             Some(
                 Observation::new(Activity::Active, BlockedOn::Human, InputBuffer::Unknown)
                     .with_ask(ask)
@@ -1917,34 +1916,6 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
         }
         _ => None,
     }
-}
-
-/// The longest tool summary a permission observation carries.
-pub const PERMISSION_SUMMARY_CHARS: usize = 400;
-
-/// `Tool: input` for a permission prompt: a shell command or file path as Claude shows it, else
-/// the tool's input as compact JSON, cut at [`PERMISSION_SUMMARY_CHARS`] and marked when cut.
-pub fn permission_summary(tool: &str, input: Option<&serde_json::Value>) -> String {
-    let field = |name: &str| {
-        input
-            .and_then(|input| input.get(name))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-    };
-    let detail = field("command")
-        .or_else(|| field("file_path"))
-        .or_else(|| field("url"))
-        .or_else(|| input.map(serde_json::Value::to_string))
-        .unwrap_or_default();
-    let summary = format!("{tool}: {detail}");
-    if summary.chars().count() <= PERMISSION_SUMMARY_CHARS {
-        return summary;
-    }
-    let cut = summary
-        .chars()
-        .take(PERMISSION_SUMMARY_CHARS)
-        .collect::<String>();
-    format!("{cut}… (cut)")
 }
 
 /// The `StopFailure` error word that names a rejected provider credential.
@@ -2387,31 +2358,14 @@ mod tests {
     }
 
     #[test]
-    fn a_permission_prompt_says_what_it_would_run_bounded() {
+    fn a_permission_prompt_names_its_tool_and_keeps_its_input_out() {
         let observed = observe_hook_event(
             "PermissionRequest",
             &serde_json::json!({"tool_name":"Bash","tool_input":{"command":"rm -r build"}}),
         )
         .unwrap();
         assert_eq!(observed.blocked_on, BlockedOn::Human);
-        assert_eq!(observed.reason.as_deref(), Some("Bash: rm -r build"));
-        assert_eq!(
-            permission_summary(
-                "Write",
-                Some(&serde_json::json!({"file_path":"notes.txt","content":"hi"}))
-            ),
-            "Write: notes.txt"
-        );
-        assert_eq!(
-            permission_summary("mcp__fetch", Some(&serde_json::json!({"depth":2}))),
-            "mcp__fetch: {\"depth\":2}"
-        );
-        let long = permission_summary(
-            "Bash",
-            Some(&serde_json::json!({"command": "x".repeat(1_000)})),
-        );
-        assert!(long.ends_with("… (cut)"), "{long}");
-        assert_eq!(long.chars().count(), PERMISSION_SUMMARY_CHARS + "… (cut)".chars().count());
+        assert_eq!(observed.reason.as_deref(), Some("Bash"));
     }
 
     #[test]
