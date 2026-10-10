@@ -552,3 +552,119 @@ test('switching back restores the reader row although rows were backfilled above
   assert.equal(row.getBoundingClientRect().top, 23)
   assert.equal(lane.scrollTop, 1477)
 })
+
+// Row geometry is installed in mutation-phase refs, before the key-switch layout effect.
+// A and B intentionally share neither source ids nor geometry.
+const renderConversation = async (store, key, page, sourceIds = page.rows.map(row => row.id), anchorHistory) => {
+  const rows = page.rows.map(row => {
+    const attributes = row.kind === 'work summary'
+      ? { 'data-work-log-summary': '', 'data-scroll-anchor-id': row.id }
+      : { 'data-item-id': row.id, ...(row.kind === 'tool' ? { 'data-tool-status': 'success' } : row.kind === 'thinking' ? { 'data-testid': 'thinking-entry' } : {}) }
+    const leaf = React.createElement('div', {
+      key: row.id, ...attributes,
+      ref: element => {
+        if (element === null) return
+        const lane = element.closest('[data-testid="lane"]')
+        Object.defineProperties(lane, {
+          scrollHeight: { configurable: true, get: () => page.height },
+          clientHeight: { configurable: true, get: () => 400 },
+          clientWidth: { configurable: true, get: () => 800 },
+        })
+        lane.getBoundingClientRect = () => ({ top: 0, bottom: 400, left: 0, right: 800, width: 800, height: 400 })
+        element.getBoundingClientRect = () => ({ top: row.top - lane.scrollTop, bottom: row.top - lane.scrollTop + 200, left: 0, right: 800, width: 800, height: 200 })
+        if (row.kind !== undefined) element.parentElement.getBoundingClientRect = () => ({ top: row.turnTop - lane.scrollTop, bottom: row.turnTop - lane.scrollTop + 1000, left: 0, right: 800, width: 800, height: 1000 })
+      },
+    }, row.id)
+    return row.kind === undefined ? leaf : React.createElement('section', { key: row.id, 'data-testid': 'transcript-turn', 'data-item-id': row.turnId }, leaf)
+  })
+  await act(async () => root.render(React.createElement(ViewportStoreContext.Provider, { value: store },
+    React.createElement(EmbraceScrollViewport, {
+      ref: handle, stateKey: key, items: sourceIds.map(id => ({ id, version: id })), anchorHistory, 'data-testid': 'lane',
+    }, ...rows))))
+  return container.querySelector('[data-testid="lane"]')
+}
+
+for (const deliveredCapture of [false, true]) test(`disjoint conversation switch saves A before B commits (${deliveredCapture ? 'settled' : 'pending'} capture)`, async () => {
+  const store = new ViewportStore()
+  const a = { height: 2000, rows: [{ id: 'a/reader', top: 900 }, { id: 'a/reply', top: 1800 }] }
+  const b = { height: 3400, rows: [{ id: 'b/reader', top: 1700 }, { id: 'b/reply', top: 3200 }] }
+  const lane = await renderConversation(store, 'a', a)
+  await flush()
+  await act(async () => {
+    lane.dispatchEvent(new WheelEvent('wheel', { deltaY: -900 }))
+    lane.scrollTop = 877
+    lane.dispatchEvent(new Event('scroll'))
+  })
+  if (deliveredCapture) await flush()
+  await renderConversation(store, 'b', b)
+  assert.deepEqual(store.get('a').anchor, { id: 'a/reader', offset: 23 })
+  a.height += 600
+  for (const row of a.rows) row.top += 600
+  await renderConversation(store, 'a', a)
+  await flush()
+  assert.equal(lane.scrollTop, 1477)
+  assert.equal(lane.querySelector('[data-item-id="a/reader"]').getBoundingClientRect().top, 23)
+})
+
+test('authoritatively deleted restored row is retired and the fallback row is saved', async () => {
+  const store = new ViewportStore()
+  store.save('a', { top: 700, following: false, unread: false, anchor: { id: 'a/deleted', offset: 23 } })
+  const a = { height: 2000, rows: [{ id: 'a/fallback', top: 900 }, { id: 'a/reply', top: 1800 }] }
+  const b = { height: 3400, rows: [{ id: 'b/reader', top: 1700 }, { id: 'b/reply', top: 3200 }] }
+  await renderConversation(store, 'a', a)
+  await flush()
+  await renderConversation(store, 'b', b)
+  assert.equal(store.get('a').anchor.id, 'a/fallback')
+  assert.equal(store.get('a').anchor.offset, 200)
+})
+
+test('a source-present restored row survives while its DOM is not mounted yet', async () => {
+  const store = new ViewportStore()
+  store.save('a', { top: 700, following: false, unread: false, anchor: { id: 'a/older', offset: 23 } })
+  const a = { height: 2000, rows: [{ id: 'a/fallback', top: 900 }, { id: 'a/reply', top: 1800 }] }
+  const b = { height: 3400, rows: [{ id: 'b/reader', top: 1700 }, { id: 'b/reply', top: 3200 }] }
+  await renderConversation(store, 'a', a, ['a/older', 'a/fallback', 'a/reply'])
+  await flush()
+  await renderConversation(store, 'b', b)
+  assert.deepEqual(store.get('a').anchor, { id: 'a/older', offset: 23 })
+})
+
+test('partial history keeps a missing restore target until complete source membership retires it', async () => {
+  const store = new ViewportStore()
+  store.save('a', { top: 700, following: false, unread: false, anchor: { id: 'a/deleted', offset: 23 } })
+  const a = { height: 2000, rows: [{ id: 'a/fallback', top: 900 }, { id: 'a/reply', top: 1800 }] }
+  const b = { height: 3400, rows: [{ id: 'b/reader', top: 1700 }, { id: 'b/reply', top: 3200 }] }
+  await renderConversation(store, 'a', a, undefined, { _tag: 'Partial' })
+  await flush()
+  await renderConversation(store, 'b', b)
+  assert.equal(store.get('a').anchor.id, 'a/deleted')
+  await renderConversation(store, 'a', a)
+  await flush()
+  await renderConversation(store, 'b', b)
+  assert.equal(store.get('a').anchor.id, 'a/fallback')
+})
+
+for (const kind of ['tool', 'thinking', 'work summary']) test(`nested ${kind} switch-back restores the leaf after its turn prefix grows`, async () => {
+  const store = new ViewportStore()
+  const id = kind === 'work summary' ? JSON.stringify(['work-summary', 'a/turn']) : `a/${kind}`
+  const a = { height: 2000, rows: [{ id, top: 925, kind, turnId: 'a/turn', turnTop: 900 }, { id: 'a/reply', top: 1800 }] }
+  const b = { height: 3400, rows: [{ id: 'b/reader', top: 1700 }, { id: 'b/reply', top: 3200 }] }
+  const sourceIds = ['a/turn', id, 'a/reply']
+  const lane = await renderConversation(store, 'a', a, sourceIds)
+  await flush()
+  await act(async () => {
+    lane.dispatchEvent(new WheelEvent('wheel', { deltaY: -700 }))
+    lane.scrollTop = 901
+    lane.dispatchEvent(new Event('scroll'))
+  })
+  await flush()
+  await renderConversation(store, 'b', b)
+  assert.deepEqual(store.get('a').anchor, { id, offset: 24 })
+  a.height += 600
+  a.rows[0].top += 600 // The enclosing turn's top is intentionally unchanged.
+  await renderConversation(store, 'a', a, sourceIds)
+  await flush()
+  const leaf = [...lane.querySelectorAll('[data-item-id], [data-scroll-anchor-id]')].find(row => (row.dataset.scrollAnchorId ?? row.dataset.itemId) === id)
+  assert.equal(leaf.getBoundingClientRect().top, 24)
+  assert.equal(lane.scrollTop, 1501)
+})

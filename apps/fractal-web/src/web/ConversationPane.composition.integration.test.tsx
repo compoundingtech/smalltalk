@@ -17,6 +17,7 @@ import type * as Kit from '@smalltalk/fractal-ui/assistant-ui'
 import type * as KitRuntime from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceRuntime.tsx'
 import type * as KitTranscript from '../../../../packages/fractal-ui/src/assistant-ui/composition/Transcript.tsx'
 import type * as KitComposer from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceComposer.tsx'
+import type * as KitViewport from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceScrollViewport.tsx'
 import type { ConversationRuntimeOptions, TranscriptTurn } from '@smalltalk/fractal-ui/assistant-ui'
 import { Tracer } from 'effect'
 import { makeUxTelemetry, type UxTelemetry } from '../telemetry/ux.ts'
@@ -34,10 +35,16 @@ const source = vi.hoisted(() => ({
   feed: { _tag: 'Waiting' } as Feed<ConversationPage>,
   sync: undefined as FeedSyncObservation | undefined,
   now: 1000,
+  staticWorkLog: false,
   runtimeItems: [] as NonNullable<ConversationRuntimeOptions['messages']>[],
   transcriptTurns: [] as (readonly TranscriptTurn[])[],
   scrollToBottomKeys: [] as (string | undefined)[],
   composerProps: [] as React.ComponentProps<typeof Kit.EmbraceComposer>[],
+  viewportCommits: [] as {
+    readonly anchorHistory: React.ComponentProps<typeof KitViewport.EmbraceScrollViewport>['anchorHistory']
+    readonly rowIds: readonly string[]
+    readonly renderedIds: readonly string[]
+  }[],
 }))
 
 vi.mock('../data/react.tsx', async () => {
@@ -72,7 +79,8 @@ vi.mock('../../../../packages/fractal-ui/src/assistant-ui/composition/Transcript
     Transcript: (props: React.ComponentProps<typeof Kit.Transcript>) => {
       source.transcriptTurns.push(props.turns)
       source.scrollToBottomKeys.push(props.scrollToBottomKey)
-      return <kit.Transcript {...props} />
+      // Exercise the kit's read-only presentation without weakening the host's required navigation API.
+      return <kit.Transcript {...props} onOpenTool={source.staticWorkLog ? undefined : props.onOpenTool} />
     },
   }
 })
@@ -83,6 +91,24 @@ vi.mock('../../../../packages/fractal-ui/src/assistant-ui/EmbraceComposer.tsx', 
     EmbraceComposer: (props: React.ComponentProps<typeof Kit.EmbraceComposer>) => {
       source.composerProps.push(props)
       return <kit.EmbraceComposer {...props} />
+    },
+  }
+})
+vi.mock('../../../../packages/fractal-ui/src/assistant-ui/EmbraceScrollViewport.tsx', async importOriginal => {
+  const kit = await importOriginal<typeof KitViewport>()
+  return {
+    ...kit,
+    EmbraceScrollViewport: (props: React.ComponentProps<typeof KitViewport.EmbraceScrollViewport>) => {
+      React.useLayoutEffect(() => {
+        const lane = container.querySelector('[data-testid="transcript-scroll"]')
+        source.viewportCommits.push({
+          anchorHistory: props.anchorHistory,
+          rowIds: props.items.map(row => row.id),
+          renderedIds: Array.from(lane?.querySelectorAll('[data-item-id], [data-scroll-anchor-id]') ?? [],
+            row => row.getAttribute('data-item-id') ?? row.getAttribute('data-scroll-anchor-id')).filter((id): id is string => id !== null),
+        })
+      })
+      return <kit.EmbraceScrollViewport {...props} />
     },
   }
 })
@@ -106,10 +132,12 @@ const container = document.createElement('div')
 
 beforeEach(() => {
   source.now = 1000
+  source.staticWorkLog = false
   source.runtimeItems = []
   source.transcriptTurns = []
   source.scrollToBottomKeys = []
   source.composerProps = []
+  source.viewportCommits = []
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true)
   // jsdom has no layout observers; the kit instantiates one while attaching scroll.
   // Test-environment sizing (react-aria renders every row) needs no measured entries.
@@ -452,6 +480,124 @@ describe('ConversationPane composition activation', () => {
     expect(text()).not.toContain('sequences')
     expect(text()).not.toContain('Older history unavailable')
     expect(container.querySelector('[data-testid="history-boundary"] button')).toBeNull()
+  })
+
+  it.each(['interactive', 'static'] as const)('gives source-rendered tool, thinking and %s work-summary rows persistable leaf ids', async presentation => {
+    source.staticWorkLog = presentation === 'static'
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    const show = async (items: readonly ConversationItem[]) => {
+      source.feed = { _tag: 'Observed', freshness: 'live', value: { items, hasOlder: false, observation: { empty: false } } }
+      await act(async () => root!.render(<ConversationPane agentRef="agent/selected" agentName="Example Agent" onOpenTool={call => opened.push(call)} />))
+    }
+    await show(scenario.slice(0, 5))
+    const turn = container.querySelector('[data-testid="transcript-turn"]')!
+    const summary = turn.querySelector<HTMLElement>('[data-testid="work-log"] > button, [data-testid="work-log"] > div')!
+    expect(summary.getAttribute('data-scroll-anchor-id')).toBe('["work-summary","p1"]')
+    if (presentation === 'interactive') await act(async () => { summary.click() })
+    const tool = turn.querySelector('[data-tool-status]')!
+    const thinking = turn.querySelector('[data-testid="thinking-entry"]')!
+    expect(tool.getAttribute('data-item-id')).toBe('read')
+    expect(thinking.getAttribute('data-item-id')).toBe('reasoning')
+    expect(tool.querySelector('[data-testid="tool-detail-preview"]')?.closest('[data-item-id]')).toBe(tool)
+    await act(async () => { thinking.querySelector<HTMLButtonElement>('button')!.click() })
+    expect(thinking.textContent).toContain('Compare the observed selection')
+    expect(thinking.querySelector('p')?.closest('[data-item-id]')).toBe(thinking)
+
+    // Older source turns can land above the work log without changing any nested row's identity.
+    const older: readonly ConversationItem[] = [
+      { _tag: 'Text', id: 'older/prompt', role: 'user', text: 'Earlier prompt', attachments: [], streaming: false, at: at(0) },
+      { _tag: 'Text', id: 'older/answer', role: 'assistant', text: 'Earlier answer', attachments: [], streaming: false, at: at(0) },
+    ]
+    await show([...older, ...scenario.slice(0, 5)])
+    expect(container.querySelector('[data-item-id="read"][data-tool-status]')).toBe(tool)
+    expect(container.querySelector('[data-item-id="reasoning"][data-testid="thinking-entry"]')).toBe(thinking)
+    expect(summary.getAttribute('data-scroll-anchor-id')).toBe('["work-summary","p1"]')
+    if (presentation === 'interactive') {
+      await act(async () => { summary.click() })
+      expect(turn.querySelector('[data-tool-status]')).toBeNull()
+      expect(turn.querySelector('[data-testid="thinking-entry"]')).toBeNull()
+      expect(summary.getAttribute('data-scroll-anchor-id')).toBe('["work-summary","p1"]')
+    }
+  })
+
+  it('keeps full source anchor membership before rendered-prefix adoption and bounded reveal', async () => {
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    const items = Array.from({ length: 12 }, (_, index) => scenario.slice(0, 5).map(item =>
+      item._tag === 'ToolCall' ? { ...item, id: `turn/${index}/${item.id}`, callId: `call/${index}` } : { ...item, id: `turn/${index}/${item.id}` })).flat()
+    const show = async (messages: readonly ConversationItem[]) => {
+      source.feed = { _tag: 'Observed', freshness: 'live', value: { items: messages, hasOlder: false, observation: { empty: false } } }
+      await mount()
+    }
+    await show(items)
+    expect(container.querySelectorAll('[data-testid="transcript-turn"]')).toHaveLength(6)
+    expect(container.querySelector('[data-testid="user-message"][data-item-id="turn/0/p1"]')).toBeNull()
+    const newest = container.querySelector('[data-testid="transcript-turn"][data-item-id="turn/11/p1"]')!
+    await act(async () => { newest.querySelector<HTMLButtonElement>('[data-testid="work-log"] > button')!.click() })
+    const suffix: readonly ConversationItem[] = [
+      { _tag: 'ToolCall', id: 'suffix/tool', callId: 'suffix/call', name: 'read', input: {}, status: 'success', callSeen: true, result: { content: 'New output', isError: false, at: at(10) }, at: at(9) },
+      { _tag: 'Reasoning', id: 'suffix/thinking', text: 'New reasoning', streaming: false, at: at(11) },
+      { _tag: 'Text', id: 'suffix/answer', role: 'assistant', text: 'New answer', attachments: [], streaming: false, at: at(12) },
+    ]
+    source.viewportCommits = []
+    await show([...items, ...suffix])
+    const expectedIds = new Set([
+      ...items.map(item => item.id), ...suffix.map(item => item.id),
+      ...Array.from({ length: 12 }, (_, index) => JSON.stringify(['work-summary', `turn/${index}/p1`])),
+      ...Array.from({ length: 12 }, (_, index) => JSON.stringify(['thinking-summary', `turn/${index}/p1`])),
+    ])
+    const pending = source.viewportCommits.find(commit => commit.renderedIds.includes('turn/11/answer') && !commit.renderedIds.includes('suffix/answer'))
+    expect(pending).toBeDefined()
+    expect(pending?.anchorHistory?._tag).toBe('Complete')
+    if (pending?.anchorHistory?._tag !== 'Complete') throw new Error('Expected authoritative source membership before adoption')
+    expect(new Set(pending.anchorHistory.ids)).toEqual(expectedIds)
+    expect(pending.renderedIds).not.toContain('suffix/tool')
+    expect(pending.renderedIds).not.toContain('suffix/thinking')
+
+    const bounded = source.viewportCommits.at(-1)!
+    expect(bounded.rowIds).toContain('turn/0/p1')
+    expect(bounded.renderedIds).not.toContain('turn/0/p1')
+    expect(bounded.anchorHistory?._tag).toBe('Complete')
+    if (bounded.anchorHistory?._tag !== 'Complete') throw new Error('Expected authoritative source membership before bounded reveal')
+    expect(new Set(bounded.anchorHistory.ids)).toEqual(expectedIds)
+    expect(bounded.anchorHistory.ids).not.toContain('missing/source-row')
+    expect(container.querySelector('[data-tool-status][data-item-id="suffix/tool"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="thinking-entry"][data-item-id="suffix/thinking"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="agent-message"][data-item-id="suffix/answer"]')).not.toBeNull()
+
+    await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true })) })
+    expect(container.querySelectorAll('[data-testid="transcript-turn"]')).toHaveLength(12)
+    expect(container.querySelector('[data-testid="user-message"][data-item-id="turn/0/p1"]')).not.toBeNull()
+    expect(source.viewportCommits.at(-1)?.anchorHistory).toBe(bounded.anchorHistory)
+  })
+
+  it('distinguishes partial or unobserved history from complete source membership and authoritative empty history', async () => {
+    source.feed = { _tag: 'Waiting' }
+    source.sync = { status: { _tag: 'Requested', since: 990 }, observedAt: 990 }
+    await mount()
+    expect(source.viewportCommits.at(-1)?.anchorHistory).toEqual({ _tag: 'Partial' })
+
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [], hasOlder: false, observation: { empty: true } } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    expect(source.viewportCommits.at(-1)?.anchorHistory).toEqual({ _tag: 'Complete', ids: [] })
+    source.sync = { status: { _tag: 'Requested', since: 990 }, observedAt: 990 }
+    await mount()
+    expect(source.viewportCommits.at(-1)?.anchorHistory).toEqual({ _tag: 'Partial' })
+
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario.slice(0, 5), hasOlder: false, observation: { empty: false } } }
+    await mount()
+    expect(source.viewportCommits.at(-1)?.anchorHistory?._tag).toBe('Complete')
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario.slice(0, 5), hasOlder: true, observation: { empty: false } } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    expect(source.viewportCommits.at(-1)?.anchorHistory).toEqual({ _tag: 'Partial' })
+
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [scenario[0]!], hasOlder: false, observation: { empty: false } } }
+    await mount()
+    const removed = source.viewportCommits.at(-1)?.anchorHistory
+    expect(removed?._tag).toBe('Complete')
+    if (removed?._tag !== 'Complete') throw new Error('Expected complete source membership after removal')
+    expect([...new Set(removed.ids)]).toEqual(['p1'])
   })
 
   it('hands an opened tool call to the host surface from the kit work log', async () => {

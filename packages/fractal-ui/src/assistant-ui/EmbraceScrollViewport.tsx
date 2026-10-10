@@ -5,7 +5,7 @@ import { returnAffordanceFocus } from './embrace-virtual/AffordancePosition'
 import { FollowAffordance } from './embrace-virtual/FollowAffordance'
 import { FollowAnimation } from './embrace-virtual/FollowAnimation'
 
-const rowSelector = '[data-item-id], [data-embrace-entry-id], [data-tool-status], [data-testid="thinking-entry"], [data-work-log-summary]'
+const rowSelector = '[data-scroll-anchor-id], [data-item-id], [data-embrace-entry-id], [data-tool-status], [data-testid="thinking-entry"], [data-work-log-summary]'
 const navigationKeys: Readonly<Record<string, true>> = { PageUp: true, PageDown: true, Home: true, End: true, ArrowUp: true, ArrowDown: true, ' ': true }
 const readerScrollWindowMs = 250
 
@@ -28,8 +28,13 @@ export interface ViewportState {
   readonly anchor?: { readonly id: string; readonly offset: number }
 }
 
-const keyedRowSelector = '[data-item-id], [data-embrace-entry-id]'
-const rowKey = (row: HTMLElement): string | undefined => row.dataset.itemId ?? row.dataset.embraceEntryId
+const keyedRowSelector = '[data-scroll-anchor-id], [data-item-id], [data-embrace-entry-id]'
+const rowKey = (row: HTMLElement): string | undefined => row.dataset.scrollAnchorId ?? row.dataset.itemId ?? row.dataset.embraceEntryId
+
+/** Complete source membership is independent of which rows the runtime or backfill has mounted. */
+export type ViewportAnchorHistory =
+  | { readonly _tag: 'Complete'; readonly ids: readonly string[] }
+  | { readonly _tag: 'Partial' }
 
 /** Per-surface memory, one entry per conversation. Owners drop closed keys and dispose on unmount. */
 export class ViewportStore {
@@ -53,6 +58,8 @@ class ViewportController {
   private jumpButton: HTMLButtonElement | null = null
   private following = true
   private anchor: { element: HTMLElement; offset: number } | undefined
+  /** Captured while this conversation owns the DOM; releasing never reads replacement children. */
+  private snapshotAnchor: ViewportState['anchor']
   private frame: number | undefined
   private captureFrame: number | undefined
   private unread = false
@@ -78,6 +85,7 @@ class ViewportController {
     if (saved !== undefined && !saved.following) {
       this.restored = saved
       this.pendingAnchor = saved.anchor
+      this.snapshotAnchor = saved.anchor
       this.unread = saved.unread
     }
   }
@@ -98,14 +106,18 @@ class ViewportController {
 
   readonly released = (): ViewportState => {
     const state = { top: this.lastTop, following: this.following, unread: this.unread }
-    const element = this.element
-    if (this.following || element === null) return state
-    // A restore that has not found its row yet keeps the row it is still looking for.
-    if (this.pendingAnchor !== undefined) return { ...state, anchor: this.pendingAnchor }
-    this.capture()
-    const row = this.anchor?.element.isConnected ? this.anchor.element.closest<HTMLElement>(keyedRowSelector) : null
-    const id = row === null || !element.contains(row) ? undefined : rowKey(row)
-    return id === undefined ? state : { ...state, anchor: { id, offset: row!.getBoundingClientRect().top - element.getBoundingClientRect().top } }
+    const anchor = this.pendingAnchor ?? this.snapshotAnchor
+    return this.following || anchor === undefined ? state : { ...state, anchor }
+  }
+
+  /** A missing DOM row may still be awaiting adoption/backfill; only complete source absence retires it. */
+  readonly updateHistory = (history: ViewportAnchorHistory) => {
+    const saved = this.pendingAnchor ?? this.snapshotAnchor
+    if (saved === undefined || history._tag !== 'Complete' || history.ids.includes(saved.id)) return
+    this.pendingAnchor = undefined
+    this.snapshotAnchor = undefined
+    this.anchor = undefined
+    if (!this.following) this.capture()
   }
 
   /** Restores the saved row at its saved offset; false while that row is not mounted. */
@@ -114,10 +126,11 @@ class ViewportController {
     const saved = this.pendingAnchor
     if (element === null || saved === undefined) return false
     let row: HTMLElement | undefined
-    for (const candidate of element.querySelectorAll<HTMLElement>(keyedRowSelector)) if (rowKey(candidate) === saved.id) { row = candidate; break }
+    for (const candidate of element.querySelectorAll<HTMLElement>(keyedRowSelector)) if (candidate.dataset.testid !== 'transcript-turn' && rowKey(candidate) === saved.id) { row = candidate; break }
     if (row === undefined) return false
     this.writeTop(element.scrollTop + row.getBoundingClientRect().top - element.getBoundingClientRect().top - saved.offset)
     this.anchor = { element: row, offset: saved.offset }
+    this.snapshotAnchor = saved
     this.pendingAnchor = undefined
     this.pendingTop = undefined
     return true
@@ -126,6 +139,7 @@ class ViewportController {
   /** Swaps a reused viewport to another conversation without carrying its unread mark across. */
   readonly resume = (saved?: ViewportState) => {
     this.followAnimation.cancel()
+    this.snapshotAnchor = saved?.anchor
     this.readerInputAt = -Infinity
     this.readerGesture = false
     this.unread = saved !== undefined && !saved.following && saved.unread
@@ -154,7 +168,7 @@ class ViewportController {
     const top = viewport.top
     const hit = element.ownerDocument.elementFromPoint(viewport.left + viewport.width / 2, top + geometryNumbers.scrollEndTolerance)?.closest<HTMLElement>(rowSelector)
     if (hit !== undefined && hit !== null && element.contains(hit) && hit.dataset.testid !== 'transcript-turn') {
-      this.anchor = { element: hit, offset: hit.getBoundingClientRect().top - top }
+      this.remember(hit, hit.getBoundingClientRect().top - top)
       return
     }
     for (const row of element.querySelectorAll<HTMLElement>(rowSelector)) {
@@ -162,12 +176,22 @@ class ViewportController {
       if (row.dataset.testid === 'transcript-turn') continue
       const bounds = row.getBoundingClientRect()
       if (bounds.bottom > top) {
-        this.anchor = { element: row, offset: bounds.top - top }
+        this.remember(row, bounds.top - top)
         return
       }
     }
+    this.anchor = undefined
+    this.snapshotAnchor = undefined
+  }
+  private remember(row: HTMLElement, offset: number) {
+    this.anchor = { element: row, offset }
+    const id = rowKey(row)
+    if (id === undefined) this.snapshotAnchor = undefined
+    else if (this.snapshotAnchor?.id !== id || this.snapshotAnchor.offset !== offset) this.snapshotAnchor = { id, offset }
   }
   private scheduleCapture() {
+    // A switch can commit before the next frame. Serialize the old conversation at scroll delivery.
+    if (!this.following && this.pendingAnchor === undefined) this.capture()
     if (this.captureFrame !== undefined) return
     this.captureFrame = requestAnimationFrame(() => {
       this.captureFrame = undefined
@@ -197,7 +221,7 @@ class ViewportController {
     if (anchor.scrollOwner === viewport) this.writeTop(viewport.scrollTop + delta)
     else anchor.scrollOwner.scrollTop += delta
     // Hand history back in the compensated coordinate system; a stale offset would undo the press scroll.
-    if (this.anchor?.element.isConnected) this.anchor.offset = this.anchor.element.getBoundingClientRect().top - viewport.getBoundingClientRect().top
+    if (this.anchor?.element.isConnected) this.remember(this.anchor.element, this.anchor.element.getBoundingClientRect().top - viewport.getBoundingClientRect().top)
     return true
   }
 
@@ -478,6 +502,8 @@ export interface EmbraceScrollViewportHandle {
 export interface EmbraceScrollViewportProps extends React.HTMLAttributes<HTMLDivElement> {
   readonly ref?: React.Ref<EmbraceScrollViewportHandle>
   readonly items: readonly ViewportRow[]
+  /** Authoritative source ids, not just mounted DOM rows; omitted for complete flat `items`. */
+  readonly anchorHistory?: ViewportAnchorHistory
   readonly contentProps?: React.HTMLAttributes<HTMLDivElement>
   /** Each key keeps its own scroll state across viewport mounts. */
   readonly stateKey?: string
@@ -485,13 +511,14 @@ export interface EmbraceScrollViewportProps extends React.HTMLAttributes<HTMLDiv
   readonly scrollToBottomKey?: string
 }
 
-export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({ ref: viewportRef, items, children, contentProps, stateKey, scrollToBottomKey, ...props }: EmbraceScrollViewportProps) {
+export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({ ref: viewportRef, items, anchorHistory, children, contentProps, stateKey, scrollToBottomKey, ...props }: EmbraceScrollViewportProps) {
   const store = React.useContext(ViewportStoreContext)
   const [controller] = React.useState(() => new ViewportController(stateKey === undefined ? undefined : store?.get(stateKey)))
   React.useImperativeHandle(viewportRef, () => controller, [controller])
   const previousItems = React.useRef(items)
   const previousKey = React.useRef(stateKey)
   const previousCommand = React.useRef(scrollToBottomKey)
+  const history = React.useMemo<ViewportAnchorHistory>(() => anchorHistory ?? { _tag: 'Complete', ids: items.map(row => row.id) }, [anchorHistory, items])
   React.useLayoutEffect(() => {
     if (stateKey !== previousKey.current) {
       if (previousKey.current !== undefined) store?.save(previousKey.current, controller.released())
@@ -505,10 +532,11 @@ export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({
       if (sameRows(previousItems.current, items)) controller.schedule()
       else controller.changed()
     }
+    controller.updateHistory(history)
     // The first render is not a command, and a conversation switch adopts its key without scrolling.
     previousCommand.current = scrollToBottomKey
     previousItems.current = items
-  }, [controller, items, store, stateKey, scrollToBottomKey])
+  }, [controller, items, store, stateKey, scrollToBottomKey, history])
   // Every layout commit can insert above a pressed row, including runtime adoption without new items.
   React.useLayoutEffect(() => { controller.preservePress() })
   // Mutation-phase saves precede the owning surface's layout effect that removes closed keys.
