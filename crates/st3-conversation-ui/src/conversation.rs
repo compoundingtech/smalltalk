@@ -144,15 +144,15 @@ impl Cache {
             }
             let calls = &entries[index..index + run];
             let bundle = bundle_id(&calls[0].id);
-            for entry in calls {
-                doc.entries.push((entry.id.clone(), doc.lines.len()));
-            }
             let open = expanded.contains(&bundle);
             if run > 1 {
+                doc.entries.push((bundle.clone(), doc.lines.len()));
                 doc.append(bundle_line(calls, &bundle, open, width, spinner, theme), 0);
             }
             if run == 1 || open {
                 for entry in calls {
+                    // Content decorators own this call's range, not the bundle header.
+                    doc.entries.push((entry.id.clone(), doc.lines.len()));
                     if expanded.contains(&entry.id) {
                         doc.append(render_entry(entry, width, true, spinner, theme), 0);
                     } else {

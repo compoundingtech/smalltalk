@@ -940,6 +940,122 @@ mod tests {
             .join("\n")
     }
 
+    fn simple_run(image: bool) -> (Content, Vec<super::super::view::Entry>) {
+        let mut items = Vec::new();
+        for index in 0..3 {
+            let call_id = format!("c{index}");
+            let clipped = "preview\n[st truncated this native timeline value: size limit; 20000 bytes]";
+            let reference = if image && index == 1 {
+                serde_json::json!({"ref":"image-ref","media_type":"image/png","reason":"on-demand"})
+            } else {
+                serde_json::json!({"ref":format!("full-{index}"),"media_type":"application/json","reason":"size-limit"})
+            };
+            for (id, sequence, body) in [
+                (format!("call-{index}"), index * 2, serde_json::json!({
+                    "type":"tool_call","body":{"call_id":call_id,"name":"bash",
+                        "arguments":{"command":format!("printf row-{index}")},"blocks":[]}
+                })),
+                (format!("result-{index}"), index * 2 + 1, serde_json::json!({
+                    "type":"tool_result","body":{"call_id":call_id,"status":"success",
+                        "media_type":"text/plain","content":clipped,
+                        "blocks":[{"id":format!("block-{index}"),"kind":"tool_output","source_type":"native",
+                            "payload":clipped,"view":{"type":"bash","exit_code":0},"continuation":reference}]}
+                })),
+            ] {
+                let mut entry = serde_json::json!({
+                    "id":id,"sequence":sequence,"revision":1,"timestamp":"2026-10-08T10:00:00Z",
+                    "role":"assistant","final":true,
+                });
+                entry.as_object_mut().unwrap().extend(body.as_object().unwrap().clone());
+                items.push(serde_json::from_value(entry).unwrap());
+            }
+        }
+        let entries = super::super::adapt::conversation(&items, &BTreeMap::new());
+        assert_eq!(entries.len(), 3);
+        let timelines = BTreeMap::from([(
+            "agent/example".into(),
+            st3_conversation_ui::Timeline {
+                items,
+                session_id: Some("session/example".into()),
+                ..Default::default()
+            },
+        )]);
+        let mut content = Content::default();
+        content.index(&timelines);
+        (content, entries)
+    }
+
+    fn render_simple(content: &Content, entries: &[super::super::view::Entry], open: bool) -> Doc {
+        let mut expanded = HashSet::new();
+        if open {
+            expanded.extend(entries.iter().map(|entry| entry.id.clone()));
+            expanded.insert(st3_conversation_ui::bundle_id(&entries[0].id));
+        }
+        let mut doc = super::super::conversation::Cache::default().render(
+            entries, 120, &expanded, "*", st3_conversation_ui::Density::Simple,
+        );
+        content.decorate(&mut doc, "agent/example", &expanded, 120);
+        doc
+    }
+
+    fn assert_simple_content_row(doc: &Doc, content: &str, index: usize) {
+        let row = |id: &str| doc.entries.iter().find(|(entry, _)| entry == id).unwrap().1;
+        let at = doc.lines.iter().position(|line| {
+            line.spans.iter().any(|span| span.content.contains(content))
+        }).unwrap();
+        assert!(at >= row(&format!("call-{index}")));
+        if index < 2 {
+            assert!(at < row(&format!("call-{}", index + 1)));
+        }
+        let shown = words(doc);
+        assert!(shown.contains("3 tool calls"), "{shown}");
+        for index in 0..3 {
+            assert!(shown.contains(&format!("printf row-{index}")), "{shown}");
+        }
+    }
+
+    #[test]
+    fn simple_loaded_json_stays_under_its_call_in_a_multi_call_run() {
+        let (mut content, entries) = simple_run(false);
+        let key = content.request_tool("agent/example", "call-1").pop().unwrap();
+        content.complete(key, Ok(("application/json".into(), br#""loaded middle output""#.to_vec())));
+        let doc = render_simple(&content, &entries, true);
+        assert_simple_content_row(&doc, "loaded middle output", 1);
+        let folded = words(&render_simple(&content, &entries, false));
+        assert!(folded.contains("3 tool calls"));
+        assert!(!folded.contains("loaded middle output"));
+        assert!(!folded.contains("load full output"));
+    }
+
+    #[test]
+    fn simple_loaded_image_stays_under_its_call_in_a_multi_call_run() {
+        let (mut content, entries) = simple_run(true);
+        let key = content.tool_images("agent/example", "call-1").pop().unwrap();
+        assert!(content.toggle_image(&key));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0])))
+            .write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        content.complete(key.clone(), Ok(("image/png".into(), bytes.into_inner())));
+        let doc = render_simple(&content, &entries, true);
+        assert_simple_content_row(&doc, "[image image/png", 1);
+        let image = doc.targets.iter().find(|target| {
+            matches!(&target.hit, Hit::InlineImage(image) if image == &key)
+        }).unwrap();
+        let next = doc.entries.iter().find(|(id, _)| id == "call-2").unwrap().1;
+        assert!(image.line < next);
+    }
+
+    #[test]
+    fn simple_last_loaded_typed_result_does_not_replace_the_run() {
+        let (mut content, entries) = simple_run(false);
+        let key = content.request_tool("agent/example", "call-2").pop().unwrap();
+        content.complete(key.clone(), Ok(("application/json".into(), br#""loaded final output""#.to_vec())));
+        assert!(matches!(content.loaded.get(&key), Some(Loaded::Json {
+            presentation: Presentation::Typed(_), ..
+        })));
+        assert_simple_content_row(&render_simple(&content, &entries, true), "loaded final output", 2);
+    }
+
     #[test]
     fn ordinary_task_blocks_preserve_the_baseline_and_never_offer_full_loading() {
         let (mut content, mut timelines, _) = fixture(false);

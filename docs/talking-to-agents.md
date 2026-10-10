@@ -33,6 +33,8 @@ and fetched native images stay in memory only; collapsing output or hiding an im
 releases the fetched data, as does leaving the retained timeline. Reopening explicitly
 loads it again. This does not change mail attachment opening: stui still saves a
 received mail image under its attachment directory and opens the machine's viewer.
+In Simple density, full output and inline images stay beneath their individual call
+inside an opened tool bundle; loading the last call does not replace the other calls.
 
 ## From the CLI
 
