@@ -20,6 +20,8 @@ mod stream_start_tests;
 #[cfg(test)]
 pub(super) mod observer_subscription_detail_tests;
 #[cfg(test)]
+mod launch_detail_tests;
+#[cfg(test)]
 mod agents_window_tests;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
