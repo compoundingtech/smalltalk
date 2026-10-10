@@ -421,6 +421,7 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    get("GET /v1/conditions", "/v1/conditions"),
     get(
         "GET /v1/client/adapter/deliveries",
         "/v1/client/adapter/deliveries?after={adapter_frontier}&wait_ms=0",
@@ -1045,6 +1046,54 @@ const ARRANGEMENT_SUBJECT: &str = "arrangement/person/ada/019a0000-0000-7000-800
 const ARRANGEMENT_PATH: &str = "/v1/client/arrangements/ada/019a0000-0000-7000-8000-000000000001";
 const ARRANGEMENT_FOLDER: &str = "019a0000-0000-7000-8000-000000000010";
 const ARRANGEMENT_PLACEMENT: &str = "agent/fleet/fixture-cost-arrangements/seat";
+
+/// Keep one condition instance live while its durable sample history grows tenfold.
+fn seed_condition(store: &Store, scale: f64) {
+    let source = r#"version 2
+condition "bench/cost/database" {
+  metric "db.size-bytes"
+  scope "member"
+  above 1000000000
+  for "5m"
+  owner "person/ada"
+}
+"#;
+    let intent = st3::parse_intent(source, NODE).unwrap();
+    let plan = store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    store
+        .apply_as(&intent, &plan.subject_tokens, "cost-condition", Some("person/ada"))
+        .unwrap();
+    let decl = store.declared_conditions().unwrap().remove(0).decl.unwrap();
+    let mut tracker = st3::conditions::Tracker::default();
+    for sample in 0..((scale * 10_000.0).round() as usize).max(1) {
+        let now = sample as u128 * 30_000;
+        assert!(tracker.observe(&decl, 100.0 + sample as f64, now).is_none());
+        store
+            .record_condition_state(&st3::store::ConditionRecord {
+                decl: &decl,
+                host: NODE,
+                instance: NODE,
+                tracker: &tracker,
+                transition: None,
+                now,
+            })
+            .unwrap();
+    }
+    while store.fold_condition_heads().unwrap() == 500 {}
+    let views = store.conditions().unwrap();
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].instances.len(), 1);
+    assert_eq!(views[0].instances[0].phase, "clear");
+}
 
 /// Grow only durable history, not the live answer, to catch reads that fold old edits.
 fn seed_arrangement(store: &Store, scale: f64) -> String {
@@ -1696,7 +1745,10 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     sync(&peer, PEER, &store);
     let arrangement_revision = {
         let store = store.clone();
-        tokio::task::spawn_blocking(move || seed_arrangement(&store, scale))
+        tokio::task::spawn_blocking(move || {
+            seed_condition(&store, scale);
+            seed_arrangement(&store, scale)
+        })
             .await
             .unwrap()
     };

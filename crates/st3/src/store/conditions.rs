@@ -2,11 +2,12 @@
 //! writes: one `condition.state` claim when something changed, and a message to an agent owner on
 //! a transition.
 //!
-//! Two local tables serve the readers and the evaluator. `local_condition_heads` points at the
+//! Local tables serve the readers and the evaluator. `local_condition_heads` points at the
 //! newest state claim of each instance, so a read finds it with one lookup however long the
 //! history; the evaluator folds new claims into it, its own and replicated ones, each tick.
 //! `local_condition_claim_bytes` counts, per hour, the bytes of claims this member wrote, for
-//! `db.authored-bytes-per-day`. Neither replicates: the claims are the authority.
+//! `db.authored-bytes-per-day`. The notification queue retries transitions, and hourly database
+//! samples measure physical growth. These tables do not replicate.
 
 use super::*;
 use crate::conditions::{ConditionDecl, Phase, Recorded, Tracker, Transition, parse_condition};
