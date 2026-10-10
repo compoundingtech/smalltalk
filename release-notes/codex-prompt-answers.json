@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A Codex approval request can be answered (allow or deny) from its alert with the typed action prompt.respond; the Codex driver's control connection sends the answer to the app-server, which closes the TUI's prompt",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or backfill."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or client contract change. Answers are the existing harness.diagnostic claims with code native-prompt-answered; their driver field now names the seat's driver (codex or claude) instead of always claude."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim kind, field, checkpoint or authority rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Additive: harness-prompt alerts for Codex permission prompts (ask permission, reason waitingOnApproval) now carry answers and the prompt.respond action; older clients ignore them. While Codex waits on an approval request for the seat's own thread, the driver polls its local daemon's GET /v1/harness-prompts/state once a second and answers the request once (accept/decline for command and file changes, approved/denied for the legacy methods, the requested permissions or none for a permissions request; measured for item/commandExecution/requestApproval on Codex 0.160.1). An answer in the TUI still wins, and its serverRequest/resolved stops the poll. Running seats pick this up when their driver restarts; a daemon older than this build offers no Codex answers."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swap back freely: an older daemon offers no Codex answers, and an older driver never answers an approval request; an answer recorded meanwhile is ignored."
+  }
+}
