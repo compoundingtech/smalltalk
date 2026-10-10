@@ -4,8 +4,9 @@
  * Seat is required, with no default, and must contain the delimited word "scratch".
  * PLAYWRIGHT_MODULE: path or specifier of the playwright module (default 'playwright').
  * CHROMIUM_PATH: optional browser executable.
- * Pass = input enables, `echo <nonce>` echoes the nonce on its own grid row, Ctrl-C is accepted without
- * closing the input session, and the page never leaves the scratch seat.
+ * Pass = input enables, `echo <nonce>` reaches the terminal (the nonce appears on a grid row, which
+ * renders only gateway screen frames: a shell echo line or a TUI's input line both count), Ctrl-C is
+ * accepted without closing the input session, and the page never leaves the scratch seat.
  */
 import fs from 'node:fs'
 import { randomBytes } from 'node:crypto'
@@ -37,8 +38,9 @@ const onSeat = () => decodeURIComponent(new URL(page.url()).pathname) === `/w/${
 const pane = page.locator('[data-testid="terminal-pane"]')
 const grid = pane.locator('[aria-roledescription="terminal"]')
 const inputState = () => pane.locator('[data-terminal-input-state]').getAttribute('data-terminal-input-state')
+// The grid paints gateway screens only, never local keystrokes; the fresh nonce cannot predate typing.
 const echoed = () => grid.locator('[data-terminal-row]').evaluateAll(
-  (rows, token) => rows.some((row) => row.textContent.trim() === token),
+  (rows, token) => rows.some((row) => row.textContent.includes(token)),
   nonce,
 )
 const poll = async (check, ms) => {
