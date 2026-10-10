@@ -229,12 +229,17 @@ pub fn verdict(windows: &Value, p99: bool) -> Verdict {
 }
 
 /// This member's newest store size, which the daemon measures hourly.
-static DATABASE: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+static DATABASE: std::sync::Mutex<Option<crate::store::DatabaseSize>> = std::sync::Mutex::new(None);
 
-/// Remember the newest store size for the report.
+/// Remember the newest store size for its readers.
 pub fn note_database_size(size: &crate::store::DatabaseSize) {
-    *DATABASE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some(serde_json::to_value(size).unwrap_or(Value::Null));
+    *DATABASE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(size.clone());
+}
+
+/// The newest store size the daemon measured: the one sample every reader of the store's size
+/// and growth uses, the database target and disk-filling conditions alike.
+pub fn database_size() -> Option<crate::store::DatabaseSize> {
+    DATABASE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 /// The store's windows and the CPU's, and the store's size, with their targets.
@@ -268,7 +273,7 @@ pub fn store_report(cpu: Value) -> Vec<Value> {
             "about": targets.database.about,
             "max_live_gb": targets.database.max_live_gb,
             "max_growth_mb_per_day": targets.database.max_growth_mb_per_day,
-            "size": DATABASE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+            "size": database_size().map_or(Value::Null, |size| json!(size)),
         }),
     ]
 }
