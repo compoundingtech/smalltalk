@@ -406,6 +406,10 @@ impl Store {
             if selected.desired_token != expected_token {
                 return Err(St3Error::new("stale-rollout-target", "selected declaration changed; read it again"));
             }
+            if let Some(member) = selected.desired.member.as_ref() {
+                crate::native_resume::rollout_support(member)
+                    .map_err(|refusal| St3Error::new(refusal.code, refusal.reason))?;
+            }
             let actual = latest_actual(tx, subject).map_err(internal)?.unwrap_or(Value::Null);
             let prior = operation(tx,subject)?;
             let ended = matches!(actual["status"].as_str(),Some("stopped"|"exited"|"vanished"));

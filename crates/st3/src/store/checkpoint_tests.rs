@@ -2787,9 +2787,16 @@ witness=every-field-set-again-by-a-later-kept-claim-of-the-slot
 carriers=every-rule-but-loop.state-keeps-the-newest-carrier-of-each-field";
 
 #[test]
-fn the_policy_renders_the_rules_version_14_description() {
-    assert_eq!(super::checkpoint_rules::RULES_VERSION, 14);
-    assert_eq!(super::checkpoint_rules::rules_description(), RULES_V14_DESCRIPTION);
+fn the_policy_renders_the_rules_description_with_only_the_limits_rule_changed_since_14() {
+    assert_eq!(super::checkpoint_rules::RULES_VERSION, 15);
+    assert_eq!(
+        super::checkpoint_rules::rules_description(),
+        RULES_V14_DESCRIPTION.replace(
+            "harness.limits keep=all-source-observations",
+            "harness.limits slot=subject keep=newest,newest-reading,every-reading-within-1h-of-its-account-group-newest-measured_at\n\
+             runtime.reconcile-decision slot=subject,key keep=newest,newest-carrier-of-each-field",
+        )
+    );
 }
 
 /// `slot_of` as it was before the policy file, to show the policy groups claims into the same
@@ -2863,6 +2870,7 @@ fn the_policy_groups_claims_into_the_slots_the_rules_did() {
         Rule::Deferral => "deferral",
         Rule::UsageSeries => "series",
         Rule::UsageCumulative => "cumulative",
+        Rule::AccountLimits => "limits",
     };
     let field_sets = [
         json!({}),
@@ -2910,6 +2918,18 @@ fn the_policy_groups_claims_into_the_slots_the_rules_did() {
     let mut old_to_new = BTreeMap::new();
     let mut new_to_old = BTreeMap::new();
     for claim in &claims {
+        // Rules version 15 added rules for `harness.limits` and `runtime.reconcile-decision`;
+        // every other kind is unchanged.
+        if claim.kind == "harness.limits" {
+            let slot = vec![claim.subject.clone(), claim.kind.clone()];
+            assert_eq!(slot_of(claim).map(|(rule, slot)| (name(rule), slot)), Some(("limits", slot)));
+            continue;
+        }
+        if claim.kind == "runtime.reconcile-decision" {
+            let slot = vec![claim.subject.clone(), claim.kind.clone(), super::checkpoint_rules::field_text(claim, "key")];
+            assert_eq!(slot_of(claim).map(|(rule, slot)| (name(rule), slot)), Some(("newest", slot)));
+            continue;
+        }
         let old = legacy_slot_of(claim);
         let new = slot_of(claim).map(|(rule, slot)| (name(rule), slot));
         assert_eq!(old.is_some(), new.is_some(), "{} {}", claim.kind, claim.body);
@@ -2920,4 +2940,146 @@ fn the_policy_groups_claims_into_the_slots_the_rules_did() {
         }
     }
     assert!(old_to_new.len() > 50, "the corpus covers many slots");
+}
+
+
+const LIMITS_HOUR: u128 = 60 * 60 * 1000;
+
+/// A `harness.limits` reading by `seat` of `account`, accepted at `at`.
+fn limits_reading(store: &Store, seat: &str, account: &str, weekly: Option<f64>, measured: u128, at: u128) -> ClaimRecord {
+    store.set_write_clock_at(at).unwrap();
+    let mut fields = json!({
+        "driver": "claude", "account": account, "incarnation_id": "inc-1",
+        "five_hour_percent": 40.0, "five_hour_resets_at_unix_ms": 1_790_000_000_000_u64,
+        "weekly_resets_at_unix_ms": 1_800_000_000_000_u64, "measured_at_unix_ms": measured as u64,
+    });
+    if let Some(weekly) = weekly {
+        fields["weekly_percent"] = json!(weekly);
+    }
+    let claim = store
+        .append_claim(&input(seat, "harness.limits", Some(seat), fields, &format!("limits-{seat}-{at}")))
+        .unwrap();
+    store.seal_local_batches().unwrap();
+    claim
+}
+
+/// Seat one reads account a every twenty minutes for three hours; its highest weekly reading is
+/// in the last hour but is not its newest. Seat two read account a long ago and then switched to
+/// account b. Seat three's only reading of account a is a five-hour-only one, long ago.
+fn limits_history(store: &Store) -> (Vec<ClaimRecord>, ClaimRecord, ClaimRecord, ClaimRecord) {
+    let base = 10 * DAY_MS;
+    // A writer never dates a claim before its own newest, so they are written in time order.
+    let two_old = limits_reading(store, "agent/alder.two", "claude/a", Some(99.0), base, base);
+    let three = limits_reading(store, "agent/alder.three", "claude/a", None, base, base + 1);
+    let mut one = Vec::new();
+    let mut two_new = None;
+    for step in 0..10_u128 {
+        let weekly = if step == 7 { 95.0 } else { 50.0 + step as f64 };
+        let at = base + 2 + step * 20 * 60_000;
+        one.push(limits_reading(store, "agent/alder.one", "claude/a", Some(weekly), at, at));
+        if step == 3 {
+            let at = base + 3 + LIMITS_HOUR;
+            two_new = Some(limits_reading(store, "agent/alder.two", "claude/b", Some(10.0), at, at));
+        }
+    }
+    let two_new = two_new.unwrap();
+    // Each writer's newest envelope stays; keep it out of the way.
+    store.set_write_clock_at(base + 4 * LIMITS_HOUR).unwrap();
+    store.append_claim(&input("daemon/alder", "daemon.diagnostic", None,
+        json!({"severity": "warning", "code": "slow-request", "reason": "last"}), "limits-last")).unwrap();
+    store.seal_local_batches().unwrap();
+    (one, two_old, two_new, three)
+}
+
+#[test]
+fn account_limits_keep_each_seats_newest_and_the_last_hour_of_each_account() {
+    let store = Store::open_memory("alder").unwrap();
+    let (one, two_old, two_new, three) = limits_history(&store);
+    let before = store.account_limits().unwrap();
+    assert_eq!(before.iter().find(|limit| limit.account == "claude/a").unwrap().weekly_percent, Some(95.0));
+    let cut = 11 * DAY_MS;
+    let scratch = tempfile::tempdir().unwrap();
+    let (plan, proof) = store.plan_checkpoint(cut, scratch.path()).unwrap();
+    assert!(proof.passed, "{proof:?}");
+    let gone = dropped(&plan);
+    // Account a's newest reading was measured at 180 minutes, so readings before 120 go.
+    for (step, claim) in one.iter().enumerate() {
+        assert_eq!(gone.contains(&claim.id), step < 6, "seat one, step {step}");
+    }
+    assert!(gone.contains(&two_old.id), "below the floor and not the seat's newest");
+    assert!(!gone.contains(&two_new.id), "the seat's newest");
+    assert!(!gone.contains(&three.id), "the newest of its own group and of its seat");
+
+    // A node that trims and folds its kept claims again answers the same.
+    store.apply_checkpoint_drop("checkpoint/1970-01-11", &plan.envelopes, &plan.claims).unwrap();
+    {
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        super::limits::refold_limits_tx(&transaction).unwrap();
+        transaction.commit().unwrap();
+    }
+    assert_eq!(store.account_limits().unwrap(), before);
+}
+
+#[test]
+fn the_proof_compares_the_account_fold_across_seats() {
+    let store = Store::open_memory("alder").unwrap();
+    let (one, ..) = limits_history(&store);
+    let cut = 11 * DAY_MS;
+    let scratch = tempfile::tempdir().unwrap();
+    let (plan, proof) = store.plan_checkpoint(cut, scratch.path()).unwrap();
+    assert!(proof.passed, "{proof:?}");
+    // Dropping seat one's highest reading in the last hour changes no answer about seat one,
+    // whose newest claim stays, but changes the account's limits.
+    let sealed = store.checkpoint_sealed_set(cut).unwrap();
+    let highest = sealed.claims.iter().find(|claim| claim.claim.id == one[7].id).unwrap();
+    let mut wrong = plan.clone();
+    wrong.claims.push(claim_tombstone(highest));
+    let copy = scratch.path().join("wrong.sqlite3");
+    store.copy_store_to(&copy).unwrap();
+    let proof = prove_on_copy(&copy, &sealed, &wrong).unwrap();
+    assert!(!proof.passed);
+    assert_eq!(proof.mismatches, vec!["fleet account_limits".to_owned()], "{proof:?}");
+}
+
+
+#[test]
+fn reconcile_decisions_keep_the_newest_of_each_key() {
+    let store = Store::open_memory("alder").unwrap();
+    let decision = |key: Option<&str>, decision: &str, reason: &str, at: u128| {
+        store.set_write_clock_at(at).unwrap();
+        let mut fields = json!({"decision": decision, "reason": reason});
+        if let Some(key) = key {
+            fields["key"] = json!(key);
+        }
+        let claim = store
+            .append_claim(&input(AGENT, "runtime.reconcile-decision", None, fields, &format!("decision-{at}")))
+            .unwrap();
+        store.seal_local_batches().unwrap();
+        claim
+    };
+    let waits = (0..4).map(|step| decision(None, "wait", &format!("restart in {step}s"), 100 + step)).collect::<Vec<_>>();
+    let fault = decision(Some("member-reconcile"), "member-fault", "unreadable", 200);
+    let recovered = decision(Some("member-reconcile"), "member-recovered", "reconciled", 201);
+    let crash = decision(Some("runtime-crash-loop:token"), "raise", "three exits", 202);
+    let restart = decision(None, "wait", "restart in 9s", 203);
+    store.set_write_clock_at(300).unwrap();
+    store.append_claim(&input("daemon/alder", "daemon.diagnostic", None,
+        json!({"severity": "warning", "code": "slow-request", "reason": "last"}), "decision-last")).unwrap();
+    store.seal_local_batches().unwrap();
+    let fault_before = store.member_reconcile_fault(AGENT, None).unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let (plan, proof) = store.plan_checkpoint(DAY_MS, scratch.path()).unwrap();
+    assert!(proof.passed, "{proof:?}");
+    let gone = dropped(&plan);
+    for wait in &waits {
+        assert!(gone.contains(&wait.id), "an unkeyed decision replaced by a later one");
+    }
+    assert!(gone.contains(&fault.id), "replaced by the key's newest");
+    for kept in [&recovered, &crash, &restart] {
+        assert!(!gone.contains(&kept.id), "{}", kept.body);
+    }
+    store.apply_checkpoint_drop("checkpoint/1970-01-01", &plan.envelopes, &plan.claims).unwrap();
+    assert_eq!(store.member_reconcile_fault(AGENT, None).unwrap(), fault_before);
+    assert_eq!(store.latest_claim(AGENT, Some("runtime.reconcile-decision")).unwrap().unwrap().id, restart.id);
 }
