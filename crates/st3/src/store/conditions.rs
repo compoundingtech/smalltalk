@@ -518,6 +518,18 @@ impl Store {
                 ));
             }
             for slot in first_slot..crate::conditions::MAX_REMOTE_INSTANCES {
+                if known {
+                    let Some(origin) = current.get(slot) else {
+                        break;
+                    };
+                    if !condition
+                        .decl
+                        .as_ref()
+                        .is_ok_and(|decl| decl.applies_to(origin))
+                    {
+                        continue;
+                    }
+                }
                 if origin_work >= 128
                     || (origin_work > 0
                         && seed_started.elapsed() >= std::time::Duration::from_secs(1))
@@ -596,7 +608,7 @@ impl Store {
                     candidates.push((
                         Phase::parse(fields["phase"].as_str().unwrap_or(""))
                             .is_some_and(Phase::in_breach),
-                        claim.accepted_at_unix_ms,
+                        claim.store_index,
                         claim.id.clone(),
                         (
                             condition.subject.clone(),
@@ -728,7 +740,7 @@ impl Store {
     pub fn condition_evaluator_status(&self) -> Result<(Option<i64>, Option<String>)> {
         let connection = self.readers.get();
         let at = meta_integer(&connection, "condition_evaluator_completed")?;
-        let error = connection.query_row("SELECT value FROM meta WHERE key IN ('condition_evaluator_error','condition_notification_last_error','condition_heads_error','condition_heads_discovery','condition_notification_discarded') AND (key!='condition_notification_discarded' OR ?1-CAST((SELECT value FROM meta WHERE key='condition_notification_discarded_at') AS INTEGER)<3600000) ORDER BY key LIMIT 1", [i64::try_from(condition_now()).unwrap_or(i64::MAX)], |row| row.get(0)).optional()?;
+        let error = connection.query_row("SELECT group_concat(value, char(10)) FROM (SELECT value FROM meta WHERE key IN ('condition_evaluator_error','condition_notification_last_error','condition_heads_error','condition_heads_discovery','condition_notification_discarded') AND (key!='condition_notification_discarded' OR ?1-CAST((SELECT value FROM meta WHERE key='condition_notification_discarded_at') AS INTEGER)<3600000) ORDER BY key)", [i64::try_from(condition_now()).unwrap_or(i64::MAX)], |row| row.get::<_,Option<String>>(0))?;
         Ok((at, error))
     }
 
@@ -997,10 +1009,12 @@ impl Store {
 
     /// What the graph last recorded for each instance `host` evaluates, so a restarted
     /// evaluator continues instead of announcing a breach again.
+    #[cfg(test)]
     pub fn condition_trackers(&self, host: &str) -> Result<BTreeMap<(String, String), Tracker>> {
         self.condition_trackers_at(host, condition_now())
     }
 
+    #[cfg(test)]
     pub fn condition_trackers_at(
         &self,
         host: &str,
@@ -1640,6 +1654,20 @@ condition "fleet/collector-cpu" {
             }
             replicate(&remote, &target);
         }
+        let last_decl = declarations.last().unwrap();
+        let mut clear = Tracker::default();
+        clear.observe(last_decl, 10.0, 0);
+        let stale_clear = target
+            .record_condition_state(&ConditionRecord {
+                decl: last_decl,
+                host: "alder",
+                instance: "alder",
+                tracker: &clear,
+                transition: None,
+                now: 30_000,
+            })
+            .unwrap();
+        let stale_subject = last_decl.subject();
         for decl in &declarations {
             let mut tracker = Tracker::default();
             tracker.observe(decl, 1000.0, 0);
@@ -1655,12 +1683,26 @@ condition "fleet/collector-cpu" {
                 })
                 .unwrap();
         }
-        // A restart may have a caught-up fold cursor but a disposable empty heads cache.
-        target.connection.batched(|tx| {
+        // The fold cursor is caught up, but the last declaration has a stale Clear head.
+        // Partial bulk restoration would keep it and re-enter; direct restoration sees Breach.
+        target.connection.batched(move |tx| {
             tx.execute("DELETE FROM local_condition_heads", [])?;
+            tx.execute("INSERT INTO local_condition_heads(subject,origin,instance,store_index,breached,accepted_key) VALUES (?1,'alder','alder',?2,0,?3)", params![stale_subject,stale_clear.store_index,format!("{:020}",stale_clear.store_index)])?;
             tx.execute("INSERT INTO meta(key,value) SELECT 'condition_heads_cursor',MAX(store_index) FROM claims WHERE true ON CONFLICT(key) DO UPDATE SET value=excluded.value", [])?;
             Ok::<_,rusqlite::Error>(())
         }).unwrap().unwrap();
+        let stale = target.condition_trackers_at("alder", 90_000).unwrap();
+        assert_eq!(
+            stale[&(last_decl.subject(), "alder".to_owned())].phase,
+            Phase::Clear
+        );
+        assert_eq!(
+            target
+                .condition_tracker(&last_decl.subject(), "alder", 90_000)
+                .unwrap()
+                .phase,
+            Phase::Breach
+        );
         let mut evaluator = Evaluator::new("alder", Box::new(DatabaseProbe));
         let first = evaluator.tick(&target, 90_000).unwrap();
         assert!(
@@ -1690,7 +1732,7 @@ condition "fleet/collector-cpu" {
                 .iter()
                 .find(|instance| instance.host == "alder")
                 .unwrap();
-            assert_eq!(local.breach_since, Some(60_000));
+            assert_eq!(local.breach_since, Some(0));
             assert_eq!(local.phase, "breach");
         }
     }
@@ -1961,6 +2003,27 @@ condition "fleet/collector-cpu" {
     }
 
     #[test]
+    fn condition_status_keeps_capacity_discovery_and_probe_errors_visible() {
+        let (_directory, store) = store();
+        store
+            .note_condition_evaluator_status(condition_now(), Some("probe failed"))
+            .unwrap();
+        store.connection.batched(|tx| {
+            head_capacity_error(tx, "capacity dropped a breach")?;
+            tx.execute("INSERT INTO meta(key,value) VALUES ('condition_heads_discovery','discovery pending')", [])?;
+            Ok::<_,rusqlite::Error>(())
+        }).unwrap().unwrap();
+        let detail = store.condition_evaluator_status().unwrap().1.unwrap();
+        for expected in [
+            "probe failed",
+            "capacity dropped a breach",
+            "discovery pending",
+        ] {
+            assert!(detail.contains(expected), "{detail}");
+        }
+    }
+
+    #[test]
     fn condition_seed_fold_and_local_head_queries_use_bounded_indexes() {
         let (_directory, store) = store();
         let connection = store.readers.get();
@@ -1970,6 +2033,7 @@ condition "fleet/collector-cpu" {
             "SELECT store_index FROM claims WHERE kind='condition.state' AND store_index>1 ORDER BY store_index LIMIT 50",
             "SELECT c.id,c.body FROM local_condition_heads h JOIN claims c ON c.store_index=h.store_index WHERE h.subject='condition/a' AND h.origin='alder' LIMIT 256",
             "SELECT COUNT(*) FROM local_condition_heads WHERE subject='condition/a' AND origin='alder'",
+            "SELECT c.body FROM (SELECT store_index FROM local_condition_notifications ORDER BY store_index LIMIT 256) n JOIN claims c ON c.store_index=n.store_index",
             "SELECT origin,instance,store_index,breached,accepted_key FROM local_condition_heads WHERE subject='condition/a' AND origin='alder' ORDER BY breached,accepted_key,origin,instance LIMIT 1",
             "SELECT origin,instance,store_index,breached,accepted_key FROM local_condition_heads WHERE subject='condition/a' ORDER BY breached,accepted_key,origin,instance LIMIT 1",
         ] {
