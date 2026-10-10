@@ -58,6 +58,42 @@ the macOS 26.5 and 27 SDKs.
 The script builds and installs `st3`, `stui`, and `st3-migrate`, and makes `st` a symlink to
 the installed `st3`. `st` is never a separate build. On macOS, both tools live in a fixed app bundle; see [macOS installation and signing](st3/macos-installation.md). A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
 
+## Workspace dependency licenses
+
+The root pnpm workspace includes the iOS app and TypeScript clients.
+`buck2/dependencies/licenses.json` records every name/version in the lockfile's `packages`
+set, not just the narrower Buck dependency closure. The inventory is generated, including
+font licenses such as `MIT AND OFL-1.1`; do not edit its entries by hand.
+
+Regenerate after changing the lockfile:
+
+```sh
+nix develop .#web -c pnpm install --frozen-lockfile
+nix develop .#web -c python3 scripts/ci-fractal-web-licenses
+```
+
+The generator reads installed package manifests, including nested versions in the hoisted
+install, using `license` and falling back to legacy `licenses`. Missing installed packages
+are reported explicitly and resolved from their exact npm tarballs, verified against the
+lockfile's SHA-512 integrity before reading `package.json`. This covers optional binaries
+for other platforms without substituting registry metadata, hand-maintained exceptions or
+`UNKNOWN`. Generation and full checks need network access for any missing packages.
+Missing license declarations or conflicting installed copies fail closed.
+
+Two CI guards use the same script:
+
+```sh
+# No node_modules or network: exact package-set coverage and lockfile/provenance drift.
+python3 scripts/ci-fractal-web-licenses --check-lockfile
+# After a frozen install: exact inventory content versus package manifests.
+nix develop .#web -c python3 scripts/ci-fractal-web-licenses --check
+```
+
+`genie-freshness` runs the lock-only guard and the companion
+`python3 scripts/ci-fractal-web-licenses-test`. The fractal-web execution lane runs the
+full guard immediately after its frozen install. The generator/full guard restore the
+inventory's read-only permissions (Git does not preserve them).
+
 ## Continuous integration
 
 Workspace CI runs on pull requests and merge groups. The five required checks are `linux-gate`,

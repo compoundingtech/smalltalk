@@ -2,20 +2,13 @@
   "compilerOptions": {
     "strict": true,
     "noEmit": true,
+    "erasableSyntaxOnly": true,
     "allowImportingTsExtensions": true,
-    "target": "ES2022",
+    "target": "ES2020",
     "module": "esnext",
     "moduleResolution": "bundler",
-    "lib": [
-      "es2022",
-      "dom"
-    ],
+    "lib": ["es2020", "dom"],
     "types": []
   },
-  "include": [
-    "*.ts"
-  ],
-  "exclude": [
-    "*.genie.ts"
-  ]
+  "files": ["index.ts", "types.test.ts"]
 }
