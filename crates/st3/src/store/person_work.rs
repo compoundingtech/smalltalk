@@ -1049,6 +1049,27 @@ pub(super) fn project_minimal_run(
         .map_err(internal)?;
     }
     tx.execute("INSERT OR IGNORE INTO mission_definitions(mission_id,revision,state,claim_id) VALUES(?1,?2,'ready',?3)", params![mission.id, mission.revision, claim.id]).map_err(internal)?;
+    // A run-tree rebuild retains this definition too. Canonicalize its source only for
+    // the same revision; this does not elect another revision or change definition state.
+    let definition_source: Option<String> = tx
+        .query_row(
+            "SELECT claim_id FROM mission_definitions WHERE mission_id=?1 AND revision=?2",
+            params![mission.id, mission.revision],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(internal)?;
+    if let Some(previous) = definition_source
+        && previous != claim.id
+        && canonical::claim_key(tx, &claim.id).map_err(internal)?
+            < canonical::claim_key(tx, &previous).map_err(internal)?
+    {
+        tx.execute(
+            "UPDATE mission_definitions SET claim_id=?3 WHERE mission_id=?1 AND revision=?2",
+            params![mission.id, mission.revision, claim.id],
+        )
+        .map_err(internal)?;
+    }
     tx.execute("INSERT OR IGNORE INTO mission_runs(id,mission_id,initial_revision,current_generation_id,root_revision,root_run_id,
                 workspace,requester,inputs,mode,status,phase,created_at_unix_ms,updated_at_unix_ms)
                 VALUES(?1,?2,?3,?4,?3,?5,'.',?6,'{}','run','running','normal',?7,?7)",

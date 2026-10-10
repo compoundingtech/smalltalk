@@ -61,6 +61,18 @@ fn ordered_claims(store: &Store, a: &ClaimRecord, b: &ClaimRecord) -> (ClaimReco
     }
 }
 
+fn definition_row(store: &Store, spec: &MissionSpec) -> (String, String, String) {
+    store
+        .readers
+        .get()
+        .query_row(
+            "SELECT revision,state,claim_id FROM mission_definitions WHERE mission_id=?1",
+            [&spec.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+
 fn receive_both(first: &Store, second: &Store) -> Store {
     let target = Store::open_memory("cedar").unwrap();
     target.project_replication_backlog().unwrap();
@@ -84,6 +96,7 @@ fn independent_person_updates_select_one_revision_source_in_both_arrival_orders(
         let (canonical, _) = ordered_claims(&target, &a, &b);
         let after = revision_row(&target, &spec);
         assert_eq!(after.2, canonical.id);
+        assert_eq!(definition_row(&target, &spec).2, canonical.id);
         assert_eq!(
             (&after.0, &after.1, after.3),
             (&before.0, &before.1, before.3)
@@ -194,4 +207,66 @@ fn person_revision_source_repair_rolls_back_and_preserves_other_projection_table
         after_tables.remove("mission_revisions")
     );
     assert_eq!(before_tables, after_tables);
+}
+
+#[test]
+fn person_definition_source_repairs_even_when_revision_history_is_already_canonical() {
+    let (first, second, a, b) = independent_updates();
+    let target = receive_both(&first, &second);
+    let spec = mission(&a);
+    let (canonical, later) = ordered_claims(&target, &a, &b);
+    let history = revision_row(&target, &spec);
+    let expected = definition_row(&target, &spec);
+    // Model a retained definition from an incremental rebuild while history already agrees.
+    target
+        .connection
+        .batched(|tx| -> Result<()> {
+            assert_eq!(
+                tx.execute(
+                    "UPDATE mission_definitions SET claim_id=?2 WHERE mission_id=?1",
+                    params![spec.id, later.id],
+                )?,
+                1
+            );
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    let mut before_tables = projection_digest::tables(&target.readers.get()).unwrap();
+    let fields = &canonical.body["fields"];
+    target
+        .connection
+        .batched(|tx| {
+            project_minimal_run(
+                tx,
+                &canonical,
+                &spec,
+                fields["run"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("mission-run/"),
+                fields["generation"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("run-generation/"),
+                fields["run"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("mission-run/"),
+                "person ask",
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(definition_row(&target, &spec), expected);
+    assert_eq!(revision_row(&target, &spec), history);
+    let mut after_tables = projection_digest::tables(&target.readers.get()).unwrap();
+    assert_ne!(
+        before_tables.remove("mission_definitions"),
+        after_tables.remove("mission_definitions")
+    );
+    assert_eq!(before_tables, after_tables);
+    target.replay_replication_graph().unwrap();
+    assert_eq!(definition_row(&target, &spec), expected);
+    assert_eq!(revision_row(&target, &spec), history);
 }
