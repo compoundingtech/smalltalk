@@ -1261,6 +1261,14 @@ mission "garden/proposed" state="ready" revisions="human-only" revision-reviewer
     match handoff(&store, &plant, &seat, birch, "handoff-old-generation") {
         Ok(_) => {
             refresh_work_once(&store);
+            // Said, so a pass is read as the named-run path having run.
+            eprintln!(
+                "anchor control: handoff accepted; cut {}, lookups {} -> {}, seats read {:?}",
+                store.index().unwrap(),
+                lookups,
+                store.seat_lookups(),
+                store.last_seats_read()
+            );
             assert_eq!(claims_rebuilds(&store), rebuilds, "a warm fold");
             assert!(store.seat_lookups() > lookups);
             assert!(store.last_seats_read().contains(ash), "ash was read again through R1");
@@ -1272,7 +1280,15 @@ mission "garden/proposed" state="ready" revisions="human-only" revision-reviewer
         // does not exercise the index's coverage of named runs (the source argument and the
         // shared oracle do), nor the replicated `handoff_to` projection, which does not check the
         // generation. Any other error is a mistake in this fixture, not that refusal.
-        Err(error) => assert_eq!(error.code, "stale-run-generation", "{error:?}"),
+        Err(error) => {
+            // Said, so a pass is not read as the named-run path having run.
+            eprintln!(
+                "anchor control: local handoff refused ({}); cut {}, lookups {lookups}; the named-run path did not run",
+                error.code,
+                store.index().unwrap()
+            );
+            assert_eq!(error.code, "stale-run-generation", "{error:?}");
+        }
     }
 }
 

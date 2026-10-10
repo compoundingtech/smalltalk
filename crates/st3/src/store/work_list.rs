@@ -121,11 +121,13 @@ pub(crate) struct ActorOrders {
 
 type OrderCell = Arc<std::sync::OnceLock<Arc<Vec<u32>>>>;
 
-/// One actor's registered cell: kept, or overflow until it is built.
+/// One actor's registered cell: kept, or overflow until it is built, and how many reads hold
+/// it, counted under the registry's lock so the last one to leave decides its removal.
 struct ActorEntry {
     actor: String,
     cell: OrderCell,
     kept: bool,
+    readers: usize,
 }
 
 // A clone for the next fold's rows starts with no actor's order: they are of these rows only.
@@ -136,7 +138,10 @@ impl Clone for ActorOrders {
 }
 
 /// A read's registration of its cell, released however the read ends, its build's panic
-/// included. It removes only the very cell it registered, never a later one for the same actor.
+/// included. Under the registry's lock it counts itself out and decides: a built overflow cell
+/// is removed, a built kept one stays, and an unbuilt one (every build of it panicked) is
+/// removed by the last read to leave it, so none is stranded and none removed while another
+/// read can still build it. It removes only the very cell it registered, never a later one.
 struct Registration<'a> {
     orders: &'a ActorOrders,
     actor: &'a str,
@@ -150,15 +155,18 @@ impl Drop for Registration<'_> {
         let Some(position) =
             entries.iter().position(|entry| entry.actor == self.actor && Arc::ptr_eq(&entry.cell, self.cell))
         else {
+            // Evicted once built: nothing to release.
             return;
         };
+        let entry = &mut entries[position];
+        entry.readers -= 1;
         let remove = if self.cell.get().is_some() {
             // Built: an overflow cell has served the reads that shared it; a kept one stays.
             !self.kept
         } else {
-            // Its build panicked. With another read still waiting on this cell, that read builds
-            // it next and new reads find it; with none, a new read registers a new cell.
-            Arc::strong_count(self.cell) == 2
+            // Its build panicked. A read still holding the cell builds it next, and new reads
+            // find it; when none is left, a new read registers a new cell.
+            entry.readers == 0
         };
         if remove {
             entries.remove(position);
@@ -174,6 +182,7 @@ impl ActorOrders {
             let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
             match entries.iter().position(|entry| entry.actor == viewer) {
                 Some(position) => {
+                    entries[position].readers += 1;
                     let (cell, kept) = (Arc::clone(&entries[position].cell), entries[position].kept);
                     if kept {
                         let entry = entries.remove(position).expect("the entry just found");
@@ -198,7 +207,7 @@ impl ActorOrders {
                         }
                     }
                     let cell = OrderCell::default();
-                    entries.push_back(ActorEntry { actor: viewer.to_owned(), cell: Arc::clone(&cell), kept });
+                    entries.push_back(ActorEntry { actor: viewer.to_owned(), cell: Arc::clone(&cell), kept, readers: 1 });
                     (cell, kept)
                 }
             }
@@ -234,6 +243,13 @@ impl ActorOrders {
                     + order
             })
             .sum()
+    }
+
+    /// How many reads hold `actor`'s registered cell, if one is registered.
+    #[cfg(test)]
+    pub(crate) fn readers(&self, actor: &str) -> Option<usize> {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.iter().find(|entry| entry.actor == actor).map(|entry| entry.readers)
     }
 
     /// How many actors are kept, how many of those are still being built, and how many overflow
@@ -760,6 +776,15 @@ mod tests {
         assert_eq!(orders.overflow.load(Relaxed), 0);
     }
 
+    /// Wait until `count` reads hold `actor`'s registered cell: proof each one registered.
+    fn wait_for_readers(orders: &ActorOrders, actor: &str, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while orders.readers(actor) != Some(count) {
+            assert!(std::time::Instant::now() < deadline, "{actor} never had {count} readers");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// Block every kept slot's build, run `then` while they are all mid-build, then release them.
     fn while_saturated(orders: &ActorOrders, then: impl FnOnce()) {
         let (started, building) = std::sync::mpsc::channel();
@@ -811,6 +836,7 @@ mod tests {
                 assert_eq!(orders.kept().2, 1, "one overflow cell, registered");
                 // A second read of the same actor shares that cell: one build.
                 let second = scope.spawn(|| orders.get_or_build("agent/late", || panic!("a second build of agent/late")));
+                wait_for_readers(&orders, "agent/late", 2);
                 release.send(()).unwrap();
                 assert_eq!(first.join().unwrap(), (std::sync::Arc::new(vec![7]), true));
                 assert_eq!(second.join().unwrap(), (std::sync::Arc::new(vec![7]), false));
@@ -853,14 +879,59 @@ mod tests {
             });
             building.recv().unwrap();
             let waiting = scope.spawn(|| orders.get_or_build("agent/b", || vec![2]));
-            // Give the waiting read time to block on the cell; either way it builds once.
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // The waiting read holds the same cell before the first build fails.
+            wait_for_readers(&orders, "agent/b", 2);
             release.send(()).unwrap();
             assert!(failing.join().unwrap().is_err());
             assert_eq!(waiting.join().unwrap(), (std::sync::Arc::new(vec![2]), true));
         });
         assert_eq!(orders.kept(), (2, 0, 0), "a and b kept, built, nothing orphaned");
         assert_eq!(orders.get_or_build("agent/b", || panic!("kept, so not built again")).1, false);
+    }
+
+    /// Two reads of `actor`'s one cell, both of whose builds panic: the first blocks until the
+    /// second has registered, so both hold the same cell.
+    fn two_failing_reads(orders: &ActorOrders, actor: &str) {
+        let (started, building) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    orders.get_or_build(actor, move || {
+                        started.send(()).unwrap();
+                        held.recv().unwrap();
+                        panic!("the first build failed")
+                    })
+                }))
+            });
+            building.recv().unwrap();
+            let second = scope.spawn(|| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    orders.get_or_build(actor, || panic!("the second build failed too"))
+                }))
+            });
+            wait_for_readers(orders, actor, 2);
+            release.send(()).unwrap();
+            assert!(first.join().unwrap().is_err());
+            assert!(second.join().unwrap().is_err());
+        });
+    }
+
+    #[test]
+    fn two_reads_whose_builds_both_panic_strand_no_cell() {
+        // Kept: the last of the two reads to leave removes the unbuilt cell.
+        let orders = ActorOrders::default();
+        two_failing_reads(&orders, "agent/a");
+        assert_eq!(orders.readers("agent/a"), None);
+        assert_eq!(orders.kept(), (0, 0, 0), "no unbuilt cell left registered");
+        assert_eq!(orders.get_or_build("agent/a", || vec![1]), (std::sync::Arc::new(vec![1]), true));
+        // Overflow, with every kept slot mid-build: the same.
+        let full = ActorOrders::default();
+        while_saturated(&full, || {
+            two_failing_reads(&full, "agent/late");
+            assert_eq!(full.readers("agent/late"), None);
+            assert_eq!(full.kept(), (ACTOR_ORDERS, ACTOR_ORDERS, 0), "no overflow cell left registered");
+        });
     }
 
     #[test]
