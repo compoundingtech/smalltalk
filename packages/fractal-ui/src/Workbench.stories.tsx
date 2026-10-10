@@ -57,7 +57,7 @@ function WorkbenchStory({ scheme = 'dark', state = 'two', threadState = 'live', 
   </section>
 }
 const meta = {
-  title: 'Fractal UI/Workbench', component: WorkbenchStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', state: 'two', threadState: 'live', seed: 'running' },
+  title: 'Fractal/Explore/Workbench', component: WorkbenchStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', state: 'two', threadState: 'live', seed: 'running' },
   argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, state: { options: ['one', 'two', 'three', 'dragging', 'nested', 'tabs'], control: 'select' }, threadState: { options: ['live', 'empty', 'loading', 'stale', 'failed', 'unavailable'], control: 'select' }, seed: { options: ['running', 'idle'], control: 'radio' }, persist: { table: { disable: true } }, workspaceId: { table: { disable: true } } },
   render: (args, { id }) => <main aria-label="Workbench"><WorkbenchStory key={`${id}-${args.scheme}-${args.state}-${args.seed}-${args.threadState}`} {...args} workspaceId={`kit-b-${id}-${args.scheme}-${args.state}${args.seed === 'idle' ? '-idle' : ''}-${args.threadState}`} /></main>,
 } satisfies Meta<typeof WorkbenchStory>

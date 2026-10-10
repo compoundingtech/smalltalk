@@ -64,7 +64,7 @@ function QuickOpenCohort() {
 }
 
 const meta = {
-  title: 'Fractal UI/Sidebar/Agent Row',
+  title: 'Fractal/Kit/Sidebar/Agent Row',
   component: SidebarAgentRow,
   parameters: { layout: 'fullscreen', docs: { description: { component: 'Baseline agent row: reported facts only. The hover card and reported details omit unreported fields instead of showing placeholders; hovering a row swaps the time slot for a quick Open action; rows without a reported time keep the shared metric track so titles stay aligned.' } } },
 } satisfies Meta

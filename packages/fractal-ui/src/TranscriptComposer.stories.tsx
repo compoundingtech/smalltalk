@@ -40,7 +40,7 @@ function ColumnStory({ scheme, readingColumn }: { scheme: Scheme; readingColumn:
   </EmbraceRuntimeProvider></Surface>
 }
 
-const meta = { title: 'Fractal UI/Transcript composer', component: ColumnStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', readingColumn: true }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof ColumnStory>
+const meta = { title: 'Fractal/Kit/Transcript composer', component: ColumnStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', readingColumn: true }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof ColumnStory>
 export default meta
 type Story = StoryObj<typeof meta>
 

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# One publication unit: the app book (when introduced), then its kit landing. Never parallelize.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+node --test packages/fractal-ui/scripts/check-storybook-index.test.mjs
+if [ -d apps/fractal-web/.storybook ]; then
+  pnpm --filter fractal-web build-storybook
+  test -s apps/fractal-web/storybook-static/index.html
+  node packages/fractal-ui/scripts/check-storybook-index.mjs app apps/fractal-web/storybook-static/index.json
+else
+  echo 'App Storybook not introduced yet; publishing kit with a lazy, unavailable app ref.'
+fi
+pnpm --filter @smalltalk/fractal-ui build-storybook
+node packages/fractal-ui/scripts/check-storybook-index.mjs kit packages/fractal-ui/storybook-static/index.json

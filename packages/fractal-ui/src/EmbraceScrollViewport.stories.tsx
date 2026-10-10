@@ -14,7 +14,7 @@ function ScrollStory({ scheme = 'dark' }: { scheme?: Scheme }) {
   const rows = React.useMemo(() => Array.from({ length: count }, (_, index) => ({ id: `entry-${index}`, text: `Observed message ${index + 1}: preserve the reader's position as the conversation grows or the viewport changes width.` })), [count])
   return <main {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><div {...stylex.props(styles.actions)}><Button onPress={() => setCount(value => value + 1)} {...stylex.props(styles.button)}>Append message</Button><Button onPress={() => setNarrow(value => !value)} {...stylex.props(styles.button)}>Change width</Button></div><section {...stylex.props(styles.frame, narrow && styles.narrow)}><EmbraceScrollViewport items={rows} data-testid="scroll-viewport" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.viewport)} contentProps={stylex.props(styles.rows)}>{rows.map(row => <article key={row.id} data-item-id={row.id} {...stylex.props(styles.row)}>{row.text}</article>)}</EmbraceScrollViewport></section></main>
 }
-const meta = { title: 'Fractal UI/Scroll Viewport', component: ScrollStory, args: { scheme: 'dark' }, parameters: { layout: 'fullscreen' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof ScrollStory>
+const meta = { title: 'Fractal/Kit/Scroll Viewport', component: ScrollStory, args: { scheme: 'dark' }, parameters: { layout: 'fullscreen' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof ScrollStory>
 export default meta
 type Story = StoryObj<typeof meta>
 const frame = () => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))

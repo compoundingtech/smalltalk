@@ -4,7 +4,7 @@ import { Workshop } from './Workshop'
 import type { Theme } from './kit'
 
 const meta = {
-  title: 'Fractal UI/Visual language',
+  title: 'Fractal/Explore/Visual language',
   component: Workshop,
   args: { direction: 'folio', scheme: 'light', density: 'comfortable' },
   parameters: {

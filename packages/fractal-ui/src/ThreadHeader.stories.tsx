@@ -12,7 +12,7 @@ function ThreadHeaderStory({ scheme = 'dark', terminalDisabledReason }: { scheme
     <ThreadHeader folder="fractal" title="Row projection" panelOpen={false} drawerOpen={false} onTogglePanel={() => {}} onToggleDrawer={() => {}} terminalDisabledReason={terminalDisabledReason} />
   </main>
 }
-const meta = { title: 'Fractal UI/Thread header', component: ThreadHeaderStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof ThreadHeaderStory>
+const meta = { title: 'Fractal/Kit/Thread header', component: ThreadHeaderStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof ThreadHeaderStory>
 export default meta
 type Story = StoryObj<typeof meta>
 /** The host knows why the terminal is unavailable: the toggle stays in place, disabled and described. */

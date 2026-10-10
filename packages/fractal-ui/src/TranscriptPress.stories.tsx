@@ -58,7 +58,7 @@ function PressStory({ scheme }: { scheme: Scheme }) {
   </EmbraceRuntimeProvider></main>
 }
 
-const meta = { title: 'Fractal UI/Transcript press', component: PressStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof PressStory>
+const meta = { title: 'Fractal/Kit/Transcript press', component: PressStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof PressStory>
 export default meta
 type Story = StoryObj<typeof meta>
 

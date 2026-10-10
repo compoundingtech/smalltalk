@@ -14,7 +14,7 @@ const themes = { neutral: baselineTheme, composition: [], embrace: [...baselineT
 function DiffTintCanvas({ theme = 'neutral', scheme = 'dark' }: { theme?: keyof typeof themes; scheme?: 'dark' | 'light' }) {
   return <div data-scheme={scheme} {...stylex.props(styles.canvas, ...themes[theme], ...(scheme === 'light' ? lightTheme : []))}><DiffPanel open width="100%" diff={diff} path="sample/rows.ts" added={1} removed={1} /></div>
 }
-const meta = { title: 'Fractal UI/Diff Tint', component: DiffTintCanvas, args: { theme: 'neutral', scheme: 'dark' }, parameters: { layout: 'fullscreen' }, play: async ({ canvasElement, args }) => {
+const meta = { title: 'Fractal/Kit/Diff Tint', component: DiffTintCanvas, args: { theme: 'neutral', scheme: 'dark' }, parameters: { layout: 'fullscreen' }, play: async ({ canvasElement, args }) => {
   const receipt = assertDiffTint(canvasElement)
   canvasElement.dataset.diffTintReceipt = JSON.stringify(receipt)
   const counts = [...canvasElement.querySelectorAll('span')].filter(element => /^[-−+]1$/.test(element.textContent ?? ''))
