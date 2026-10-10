@@ -5,6 +5,7 @@ import { surfaceVars, textVars, borderVars, radiusVars, spaceVars, typeVars, geo
 
 const rowSelector = '[data-item-id], [data-embrace-entry-id]'
 const navigationKeys: Readonly<Record<string, true>> = { PageUp: true, PageDown: true, Home: true, End: true, ArrowUp: true, ArrowDown: true, ' ': true }
+const readerScrollWindowMs = 250
 
 /** A bounded lane owns scrolling; a misconfigured host may leave it to an ancestor or the page. */
 function pressScrollOwner(lane: HTMLElement): HTMLElement {
@@ -45,13 +46,15 @@ class ViewportController {
   private captureFrame: number | undefined
   private unread = false
   private lastTop = 0
-  private lastWidth = 0
   private programmaticTop: number | undefined
+  private readerInputAt = -Infinity
+  private readerGesture = false
   private restored: ViewportState | undefined
   /** A restored line whose content is settling; the first reader scroll clears it. */
   private pendingTop: number | undefined
   /** Pointers down somewhere on the page; the dock keeps its layout until all are released. */
   private readonly pressed = new Set<number>()
+  private readonly readerPointers = new Set<number>()
   private pressedAnchor: { pointerId: number; element: HTMLElement; scrollOwner: HTMLElement; top: number } | undefined
   private warnedScrollOwner = false
 
@@ -76,6 +79,8 @@ class ViewportController {
 
   /** Swaps a reused viewport to another conversation without carrying its unread mark across. */
   readonly resume = (saved?: ViewportState) => {
+    this.readerInputAt = -Infinity
+    this.readerGesture = false
     this.unread = saved !== undefined && !saved.following && saved.unread
     this.dock()
     if (saved !== undefined && !saved.following) {
@@ -150,7 +155,7 @@ class ViewportController {
       const element = this.element
       if (element === null) return
       // The pressed row takes precedence over the reader's history anchor.
-      if (this.preservePress()) { this.lastWidth = element.clientWidth; return }
+      if (this.preservePress()) return
       if (this.following) this.writeTop(element.scrollHeight)
       else if (this.pendingTop !== undefined) {
         this.writeTop(this.pendingTop)
@@ -161,17 +166,30 @@ class ViewportController {
       } else if (this.captureFrame === undefined && this.anchor?.element.isConnected) {
         this.writeTop(element.scrollTop + this.anchor.element.getBoundingClientRect().top - element.getBoundingClientRect().top - this.anchor.offset)
       }
-      this.lastWidth = element.clientWidth
     })
   }
 
   readonly jump = () => {
+    this.readerInputAt = -Infinity
+    this.readerGesture = false
     this.following = true
     this.unread = false
     this.anchor = undefined
     this.pendingTop = undefined
     this.dock()
     this.schedule()
+  }
+
+  readonly scrollTo = (top: number) => {
+    this.following = false
+    this.readerInputAt = -Infinity
+    this.readerGesture = false
+    this.pendingTop = undefined
+    this.pressedAnchor = undefined
+    this.anchor = undefined
+    this.writeTop(top)
+    if (this.element !== null) this.lastTop = this.element.scrollTop
+    this.scheduleCapture()
   }
 
   readonly changed = () => {
@@ -182,12 +200,30 @@ class ViewportController {
     this.schedule()
   }
 
+  /** Backfill is a layout change, not reader input. Keep end or the visible row. */
+  readonly preserveLayout = (change: () => void) => {
+    if (!this.following) this.capture()
+    change()
+    const element = this.element
+    if (element === null) return
+    if (!this.preservePress()) {
+      if (this.following) this.writeTop(element.scrollHeight)
+      else if (this.anchor?.element.isConnected) {
+        this.writeTop(element.scrollTop + this.anchor.element.getBoundingClientRect().top - element.getBoundingClientRect().top - this.anchor.offset)
+      }
+    }
+    this.schedule()
+  }
+
   readonly attach = (element: HTMLDivElement | null) => {
     if (element === null) return
     this.element = element
-    this.lastWidth = element.clientWidth
     const manual = (event: Event) => {
       if (event instanceof KeyboardEvent && (navigationKeys[event.key] !== true || (event.target instanceof HTMLElement && event.target.closest('input,textarea,[contenteditable="true"]')))) return
+      if (event.type === 'wheel' || event.type === 'touchmove' || event.type === 'keydown') {
+        this.readerInputAt = performance.now()
+        this.readerGesture = true
+      }
       if (event.type === 'wheel' || event.type === 'touchmove' || event.type === 'keydown') this.pressedAnchor = undefined
       this.following = false
       this.programmaticTop = undefined
@@ -197,33 +233,51 @@ class ViewportController {
       this.frame = undefined
     }
     const scroll = () => {
+      if (element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.scrollEndTolerance) {
+        this.following = true
+        this.unread = false
+        this.anchor = undefined
+        this.pendingTop = undefined
+        this.programmaticTop = undefined
+        this.lastTop = element.scrollTop
+        this.dock()
+        return
+      }
       if (this.programmaticTop !== undefined && Math.abs(element.scrollTop - this.programmaticTop) < geometryNumbers.scrollEndTolerance) {
         this.programmaticTop = undefined
         return
       }
-      // Reflow is not a request to follow. Width changes preserve the reader's anchor.
-      if (element.clientWidth !== this.lastWidth) { this.schedule(); return }
       if (Math.abs(element.scrollTop - this.lastTop) < geometryNumbers.scrollEndTolerance) return
       if (this.pendingTop !== undefined) {
         this.writeTop(this.pendingTop)
         return
       }
-      // A real reader scroll (including scrollbar dragging) takes ownership until the next press.
+      const readerIntent = this.readerGesture || this.readerPointers.size > 0 || performance.now() - this.readerInputAt <= readerScrollWindowMs
+      if (!readerIntent) {
+        if (this.following) this.schedule()
+        else {
+          this.lastTop = element.scrollTop
+          this.scheduleCapture()
+        }
+        return
+      }
       this.pressedAnchor = undefined
       this.lastTop = element.scrollTop
-      this.following = element.scrollHeight - element.clientHeight - element.scrollTop <= geometryNumbers.scrollEndTolerance
-      if (this.following) {
-        this.unread = false
-        this.dock()
-        this.anchor = undefined
-      } else this.scheduleCapture()
+      this.following = false
+      this.scheduleCapture()
+    }
+    const scrollend = () => {
+      this.readerGesture = false
+      this.readerInputAt = -Infinity
     }
     // Document-wide, so presses that start anywhere (a row action included) defer the reveal.
     const page = element.ownerDocument
     const view = page.defaultView
     const press = (event: PointerEvent) => {
       this.pressed.add(event.pointerId)
-      if (this.pressedAnchor !== undefined || !(event.target instanceof Element)) return
+      if (!(event.target instanceof Element)) return
+      if (element.contains(event.target)) this.readerPointers.add(event.pointerId)
+      if (this.pressedAnchor !== undefined) return
       const row = event.target.closest<HTMLElement>(rowSelector)
       if (row !== null && element.contains(row)) {
         const scrollOwner = pressScrollOwner(element)
@@ -236,17 +290,26 @@ class ViewportController {
     }
     const release = (event: PointerEvent) => {
       this.pressed.delete(event.pointerId)
+      this.readerPointers.delete(event.pointerId)
       if (this.pressedAnchor?.pointerId === event.pointerId) this.pressedAnchor = undefined
       this.dock()
     }
     // A release the page never sees (the window blurs, the tab hides) must not latch the dock.
     const abandon = () => {
+      scrollend()
       this.pressed.clear()
+      this.readerPointers.clear()
       this.pressedAnchor = undefined
       this.dock()
     }
     const hidden = () => { if (page.visibilityState === 'hidden') abandon() }
-    const observer = new ResizeObserver(() => { this.preservePress(); this.schedule() })
+    const observer = new ResizeObserver(() => {
+      if (!this.preservePress() && this.following) {
+        if (this.frame !== undefined) cancelAnimationFrame(this.frame)
+        this.frame = undefined
+        this.writeTop(element.scrollHeight)
+      } else this.schedule()
+    })
     observer.observe(element)
     if (element.firstElementChild !== null) observer.observe(element.firstElementChild)
     element.addEventListener('wheel', manual, { passive: true })
@@ -255,6 +318,7 @@ class ViewportController {
     element.addEventListener('pointerdown', manual, { passive: true })
     element.addEventListener('focusin', manual)
     element.addEventListener('scroll', scroll, { passive: true })
+    element.addEventListener('scrollend', scrollend, { passive: true })
     page.addEventListener('pointerdown', press, true)
     page.addEventListener('pointerup', release, true)
     page.addEventListener('pointercancel', release, true)
@@ -282,6 +346,7 @@ class ViewportController {
       element.removeEventListener('pointerdown', manual)
       element.removeEventListener('focusin', manual)
       element.removeEventListener('scroll', scroll)
+      element.removeEventListener('scrollend', scrollend)
       page.removeEventListener('pointerdown', press, true)
       page.removeEventListener('pointerup', release, true)
       page.removeEventListener('pointercancel', release, true)
@@ -289,6 +354,8 @@ class ViewportController {
       page.removeEventListener('visibilitychange', hidden)
       view?.removeEventListener('blur', abandon)
       this.pressed.clear()
+      this.readerPointers.clear()
+      scrollend()
       this.pressedAnchor = undefined
       this.element = null
     }
@@ -307,7 +374,14 @@ function sameRows(previous: readonly ViewportRow[], next: readonly ViewportRow[]
   })
 }
 
+export interface EmbraceScrollViewportHandle {
+  /** Commit a synchronous layout change without changing the reader's follow mode. */
+  readonly preserveLayout: (change: () => void) => void
+  readonly scrollTo: (top: number) => void
+}
+
 export interface EmbraceScrollViewportProps extends React.HTMLAttributes<HTMLDivElement> {
+  readonly ref?: React.Ref<EmbraceScrollViewportHandle>
   readonly items: readonly ViewportRow[]
   readonly contentProps?: React.HTMLAttributes<HTMLDivElement>
   /** Each key keeps its own scroll state across viewport mounts. */
@@ -316,9 +390,10 @@ export interface EmbraceScrollViewportProps extends React.HTMLAttributes<HTMLDiv
   readonly scrollToBottomKey?: string
 }
 
-export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({ items, children, contentProps, stateKey, scrollToBottomKey, ...props }: EmbraceScrollViewportProps) {
+export const EmbraceScrollViewport = React.memo(function EmbraceScrollViewport({ ref: viewportRef, items, children, contentProps, stateKey, scrollToBottomKey, ...props }: EmbraceScrollViewportProps) {
   const store = React.useContext(ViewportStoreContext)
   const [controller] = React.useState(() => new ViewportController(stateKey === undefined ? undefined : store?.get(stateKey)))
+  React.useImperativeHandle(viewportRef, () => controller, [controller])
   const previousItems = React.useRef(items)
   const previousKey = React.useRef(stateKey)
   const previousCommand = React.useRef(scrollToBottomKey)
