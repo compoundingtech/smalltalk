@@ -18,6 +18,28 @@ Send one JSON command per subscription:
 {"kind":"subscribe","id":"missions-tab","collection":"missions","limit":50}
 ```
 
+**Proposed trace context, pending [#1910](https://github.com/compoundingtech/smalltalk/pull/1910)
+and Nathan's decision:** subscribe frames may add
+`"trace": {"traceparent": "W3C value", "tracestate": "optional W3C value"}`.
+The lowercase `trace` wire key belongs to the repository-local client_v0 namespace;
+its members use W3C Trace Context, not a separate identifier format. This applies to
+all collection-socket subscribe variants, including conversations and terminals.
+It grants no authority and changes no subscription fields.
+
+The daemon accepts absent, null, and malformed `trace` values without rejecting the
+frame. It uses the W3C propagator to validate the parent; an invalid or non-string
+`traceparent`, or a non-object field, is ignored entirely. A valid context parents the
+bounded `st.subscription.first_frame` SERVER span, which also links to the upgrade.
+It records `st.parent.sampled` using the same policy as HTTP SERVER spans. Without a
+valid context the first-frame span remains an INTERNAL root linked to the upgrade.
+Later changes, rereads, and resyncs emit no spans. Existing older collection decoders
+ignore the unknown field; frames without it remain unchanged.
+
+Dedicated conversation and terminal streams have no subscribe frame, so their
+upgrade-linked behavior is unchanged. Unsubscribe, command frames, and strict HTTP
+bodies do not acquire this field. TypeScript and Swift SDK support and code generation
+are follow-up work after the #1910 decision; neither SDK is changed here.
+
 Collections are `missions`, `attention` (also subscribable as `alerts`, the name a person reads; frames name it `attention`), `agents`, `work`, `glasses`, and `arrangements`,
 plus `terminal` and `conversation` (below). The optional `actor` filter applies to work,
 `person` to attention, and `status` to agents. For `arrangements`, `person: "person/NAME"`

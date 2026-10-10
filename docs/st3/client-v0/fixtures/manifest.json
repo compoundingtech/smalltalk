@@ -14,6 +14,8 @@
     { "file": "agent-create.json", "definition": "ActionRequest" },
     { "file": "terminal-create.json", "definition": "ActionRequest" },
     { "file": "terminal-end.json", "definition": "ActionRequest" },
+    { "file": "collection-subscribe.json", "definition": "CollectionCommand" },
+    { "file": "collection-subscribe-trace-proposed.json", "definition": "CollectionCommand" },
 
     { "file": "pairing.json", "definition": "Envelope" },
     { "file": "terminal-screen.json", "definition": "Envelope" },

@@ -2416,6 +2416,12 @@
       }
     },
     "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses", "arrangements", "summary"] },
+    "SubscribeTraceContext": {
+      "description": "Proposed in #1910; pending decision. {traceparent: string, tracestate?: string}. Any JSON value is accepted; absent, null, non-object, missing/non-string traceparent or invalid W3C traceparent is ignored. The daemon validates with the W3C propagator, not this schema.",
+      "examples": [
+        { "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01", "tracestate": "vendor=value" }
+      ]
+    },
     "CollectionCommand": {
       "oneOf": [
         {
@@ -2426,6 +2432,7 @@
             "kind": { "const": "subscribe" },
             "id": { "type": "string", "minLength": 1, "maxLength": 128 },
             "collection": { "enum": ["missions", "attention", "agents", "work", "glasses", "summary"] },
+            "trace": { "$ref": "#/$defs/SubscribeTraceContext" },
             "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
             "person": { "type": ["string", "null"] },
             "actor": { "type": ["string", "null"] },
@@ -2440,6 +2447,7 @@
             "kind": { "const": "subscribe" },
             "id": { "type": "string", "minLength": 1, "maxLength": 128 },
             "collection": { "const": "arrangements" },
+            "trace": { "$ref": "#/$defs/SubscribeTraceContext" },
             "person": { "$ref": "#/$defs/ArrangementPerson" },
             "subject": { "$ref": "#/$defs/ArrangementId", "description": "Follow only this arrangement; its owner must equal person." },
             "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
@@ -2453,6 +2461,7 @@
             "kind": { "const": "subscribe" },
             "id": { "type": "string", "minLength": 1, "maxLength": 128 },
             "collection": { "const": "terminal" },
+            "trace": { "$ref": "#/$defs/SubscribeTraceContext" },
             "terminal": { "$ref": "#/$defs/Id" },
             "incarnation": { "type": ["string", "null"] },
             "capability": { "type": "string" }
@@ -2466,6 +2475,7 @@
             "kind": { "const": "subscribe" },
             "id": { "type": "string", "minLength": 1, "maxLength": 128 },
             "collection": { "const": "conversation" },
+            "trace": { "$ref": "#/$defs/SubscribeTraceContext" },
             "conversation": { "$ref": "#/$defs/Id" }
           }
         },

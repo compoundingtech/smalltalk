@@ -408,6 +408,8 @@ The collector sampling policy uses that attribute; the process exports every spa
 ```text
 HTTP upgrade SERVER span (ends at 101)
     <link> st.subscription.first_frame INTERNAL root (subscribe -> first frame sent)
+frame remote parent -> st.subscription.first_frame SERVER span (valid subscribe trace)
+    <link> HTTP upgrade SERVER span
 HTTP receive SERVER span
     <link> st.replication.projection INTERNAL root (new or deferred data only)
 st.roster.rebuild INTERNAL root (cold build only, no parent or link)
@@ -419,16 +421,28 @@ span. The context is captured before handler dispatch because the handler constr
 and terminal pumps. W3C context on the upgrade therefore survives task boundaries without
 extending the request span's lifetime.
 
-Each accepted subscribe constructs one `st.subscription.first_frame` root with an empty
-parent context and a link to the valid upgrade span context. It ends after the first
-frame is sent. Later rereads, resyncs, and changes construct no spans; there are no
-per-frame child spans. Construction is gated by the trace-export `AtomicBool`, before
-labels, collections, or counts are inspected (O11Y-R02, O11Y-R18).
+Each accepted subscribe constructs one bounded `st.subscription.first_frame` span,
+linked to the valid upgrade context. The proposed optional subscribe `trace` field
+(pending [#1910](https://github.com/compoundingtech/smalltalk/pull/1910)) carries W3C
+`traceparent` and optional `tracestate`; the field's repository-local naming and
+compatibility contract is in [collections.md](../../st3/client-v0/collections.md).
+All collection-socket subscribe variants, including conversations and terminals,
+use the W3C propagator to extract it. A valid frame context parents a SERVER span and
+records `st.parent.sampled` through the same helper as HTTP SERVER spans.
+Absent, null, malformed, or invalid context never rejects a frame: the span remains
+an INTERNAL root with an empty parent. Dedicated streams have no subscribe frame
+and retain the INTERNAL root behavior.
+
+The span ends after the first frame is sent. Later rereads, resyncs, and changes
+construct no spans; there are no per-frame child spans. Construction and extraction
+are gated by the trace-export `AtomicBool`, before labels, collections, or counts
+are inspected (O11Y-R02, O11Y-R18). No command or strict HTTP body gains frame context.
 
 | First-frame attribute | Type / vocabulary |
 | --- | --- |
 | `st.collection` | String: `missions`, `attention`, `agents`, `work`, `glasses`, `arrangements`, `conversation`, `terminal` |
 | `st.subscription.id` | String: protocol subscription identity, span-only |
+| `st.parent.sampled` | Boolean: valid frame remote parent's sampled flag, same policy as HTTP |
 | `st.projection.hit`, `st.projection.cold`, `st.projection.incremental`, `st.projection.shared` | Boolean: projection path used by the initial read |
 | `st.page.rows` | Integer: initial frame rows after truncation |
 | `st.page.bytes` | Integer: serialized initial frame bytes |
@@ -528,8 +542,11 @@ the single-span shape (phase attributes present, no admission/handler child span
 that a healthy request exports no below-WARN log record. A unit test pins the batch queue
 bounds.
 The stage-span receiver proof compares `st.request.id` with the HTTP envelope, checks
-roster/page stage values, and links first-frame roots to the exported upgrade trace/span
-ids. It asserts that repeated rereads or changes produce no additional first-frame
+roster/page stage values, and links first-frame spans to the exported upgrade trace/span
+ids. It checks valid frame parent trace/span IDs, SERVER kind, sampled and unsampled
+flags, and malformed-field fallback to an INTERNAL root without losing first-frame
+delivery. The client contract proof preserves old-shape subscribes and accepts malformed
+telemetry. Repeated rereads or changes produce no additional first-frame
 roots, cold roster builds are detached and unlinked, and receive projection roots are
 detached but linked to the receive request. Empty receives produce no projection root.
 The CLI shutdown helper is tested with an exporter that never returns from shutdown:
