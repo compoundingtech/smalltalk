@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Native conversation headers retain assistant usage, model and context when a large message crosses the newest-first header window boundary; message-level metadata is counted once on the last projected block.",
+  "replay": {
+    "status": "none",
+    "detail": "Accounting is derived from owner-native conversation reads; no claim replay or projection rebuild is added."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or client schema fields change. Message-level values remain in the existing block metadata field."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, retention or fleet coordination rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "The existing header and block metadata shapes are unchanged. Moving the single metadata owner to the last projected block preserves accounting in bounded newest-first windows without changing normal renderer labels."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration wait or coordinated outage is introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No configuration or manual migration is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No durable state changes; conversation content and derived metadata remain memory-only."
+  }
+}

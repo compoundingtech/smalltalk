@@ -4271,14 +4271,15 @@ fn normalize_omp(
         block["payload"] = json!({"body_ref": true});
         block["view"] = view;
     }
-    // Message-level metadata has one owner: the first emitted block, including a
-    // tool call or an error when the assistant has no text. Header consumers can
-    // sum usage without counting each text/reasoning part as another response.
+    // Message-level metadata has one owner: the last emitted block, including a
+    // tool call or an error. Newest-first header windows retain that block even
+    // when they split a message, without counting each part as another response.
     if let Some(metadata) = crate::native_views::assistant_metadata(message)
         && let Some(block) = items[first_content..]
             .iter_mut()
+            .rev()
             .filter_map(|item| item["body"]["blocks"].as_array_mut())
-            .find_map(|blocks| blocks.first_mut())
+            .find_map(|blocks| blocks.last_mut())
     {
         if let Some(existing) = block.get_mut("metadata").and_then(Value::as_object_mut) {
             if let Some(additions) = metadata.as_object() {
@@ -4645,7 +4646,7 @@ mod tests {
     fn assert_omp_message_usage_once(content: Value) {
         for driver in [ExternalDriver::Omp, ExternalDriver::Pi] {
             let mut items = Vec::new();
-            for (sequence, usd) in [(0, 0.25), (100, 0.5)] {
+            for (sequence, usd) in [(0, 0.25), (1000, 0.5)] {
                 let record = json!({
                     "type": "message",
                     "message": {
@@ -4660,8 +4661,9 @@ mod tests {
                     .iter()
                     .flat_map(|item| item["body"]["blocks"].as_array().unwrap())
                     .collect();
-                assert_eq!(blocks[0]["metadata"]["usage"]["cost_usd"], usd);
-                assert_eq!(blocks[0]["metadata"]["usage"]["total"], 17);
+                let owner = blocks.last().unwrap();
+                assert_eq!(owner["metadata"]["usage"]["cost_usd"], usd);
+                assert_eq!(owner["metadata"]["usage"]["total"], 17);
                 assert_eq!(blocks.iter().filter(|block| block["metadata"]["usage"].is_object()).count(), 1);
             }
             let header = crate::conversation_header::derive(&items, false);
@@ -4685,6 +4687,53 @@ mod tests {
             {"type": "toolCall", "id": "first", "name": "read", "arguments": {"path": "a"}},
             {"type": "toolCall", "id": "second", "name": "read", "arguments": {"path": "b"}},
         ]));
+    }
+
+    #[test]
+    fn omp_split_newest_header_window_keeps_latest_message_metadata() {
+        let mut content: Vec<_> = (0..201)
+            .map(|index| json!({"type": "text", "text": format!("part {index}")}))
+            .collect();
+        content.push(json!({
+            "type": "toolCall", "id": "last-call", "name": "read", "arguments": {"path": "a"},
+        }));
+        assert_omp_message_usage_once(json!(content));
+        for driver in [ExternalDriver::Omp, ExternalDriver::Pi] {
+            let mut items = Vec::new();
+            for (sequence, message, timestamp) in [
+                (0, json!({
+                    "role": "assistant", "content": "previous answer", "model": "old-model",
+                    "usage": {"cost": {"total": 0.25}},
+                    "contextSnapshot": {"promptTokens": 11},
+                }), "2026-10-06T00:00:00Z"),
+                (1000, json!({
+                    "role": "assistant", "content": content, "model": "latest-model",
+                    "usage": {"input": 12, "output": 5, "totalTokens": 17, "cost": {"total": 0.5}},
+                    "contextSnapshot": {"promptTokens": 23}, "ttft": 10, "duration": 30,
+                }), "2026-10-06T00:00:01Z"),
+            ] {
+                normalize_omp(driver, &json!({"type": "message", "message": message}),
+                    sequence, timestamp, &mut items);
+            }
+            let owner = &items.last().unwrap()["body"]["blocks"][0];
+            assert_eq!(owner["kind"], "tool_call");
+            assert_eq!(owner["metadata"]["usage"]["total"], 17);
+            assert_eq!(owner["metadata"]["ttft_ms"], 10);
+            assert_eq!(owner["metadata"]["duration_ms"], 30);
+            // Match the native header's newest-first 200-item window: the latest
+            // message spans 202 entries, so its first projected blocks are absent.
+            items.reverse();
+            let head = &items[..200];
+            assert_eq!(head.len(), 200);
+            assert!(head.iter().all(|item| item["sequence"].as_u64().unwrap() > 1001));
+            let header = crate::conversation_header::derive(head, true);
+            assert_eq!(header["cost"]["value"], json!({"usd": 0.5, "window": true}));
+            assert_eq!(header["model"]["value"], "latest-model");
+            assert_eq!(header["context"]["value"], json!({"tokens": 23, "window": true}));
+            for field in ["cost", "model", "context"] {
+                assert_eq!(header[field]["as_of"], "2026-10-06T00:00:01Z");
+            }
+        }
     }
 
     #[test]

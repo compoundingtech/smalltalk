@@ -38,8 +38,9 @@ not the newest sibling in that directory. An unreadable bound transcript, or a l
 without a current binding, stays unavailable rather than displaying another seat's conversation.
 
 The native conversation header counts assistant usage and cost once per message, including
-messages containing only tool calls. Message-level metadata belongs to its first projected block;
-thinking and text parts do not each contribute another response's cost.
+messages containing only tool calls. Message-level metadata belongs to its last projected block,
+so newest-first header windows retain it even when a message spans the window boundary.
+Thinking and text parts do not each contribute another response's cost.
 
 Messages delivered during a running turn are held until the current tool batch returns. A tool call
 that runs longer than the hold limit can still be backgrounded. Read the exact graph message with
