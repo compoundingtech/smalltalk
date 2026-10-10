@@ -1346,6 +1346,7 @@
       "command": "st missions show",
       "description": "Explain one mission run, its goals, state, work, and usage",
       "tests": [
+        "crates/st3/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -2080,6 +2081,7 @@
       "command": "st work ls",
       "description": "List current actionable work; use --as to filter one agent or --all for history",
       "tests": [
+        "crates/st3/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -2176,6 +2178,7 @@
       "command": "st work show",
       "description": "Explain one work item, its owner, readiness, lease, and evidence",
       "tests": [
+        "crates/st3/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"

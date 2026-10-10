@@ -2253,6 +2253,7 @@ fn client_work_values(
                 "title": work.title,
                 "assigned_to": work.assigned_to,
                 "last_progress": work.progress_summary,
+                "progress_at": work.progress_at_unix_ms.map(client_timestamp),
                 "state": state,
                 "agentless": work.agentless,
                 "gate_kind": gate_kind,
@@ -21497,6 +21498,7 @@ mission "visible-agentless" state="ready" {
         assert_eq!(step["title"], "Keep watch");
         assert_eq!(step["assigned_to"], Value::Null);
         assert_eq!(step["last_progress"], Value::Null);
+        assert_eq!(step["progress_at"], Value::Null);
         assert_eq!(step["agentless"], true);
         assert!(
             client_work_resources(

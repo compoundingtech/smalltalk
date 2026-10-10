@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Expose current-attempt work progress time on enriched client work and mission detail rows",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or stored claim changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema, index or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or fleet rules changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Additive optional nullable progress_at on client work and mission step rows. Older servers may omit it; lightweight list null means unhydrated. Existing clients tolerate extra fields."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No extra interruption beyond the ordinary binary deployment."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual data changes. Deploy the containing binary before consumers require progress_at; absence remains unknown."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database changes; ordinary binary swap-back preserves claims and merely omits the additive field."
+  }
+}
