@@ -4401,7 +4401,7 @@ impl PublishedWorkContract {
     fn of(cursor: &ClientPageCursor) -> Self {
         Self {
             limit: cursor.limit,
-            snapshot: serde_json::to_string(&cursor.snapshot).unwrap_or_default(),
+            snapshot: serde_json::to_string(&cursor.snapshot).expect("a client snapshot serializes"),
             person: cursor.person.clone(),
             actor: cursor.actor.clone(),
             owner_run: cursor.owner_run.clone(),

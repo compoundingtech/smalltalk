@@ -736,12 +736,13 @@ fn work_since(store: &Store, base: &Publication<WorkRows>) -> anyhow::Result<Adv
         // any state), seats a refolded row names before or after, and seats whose queue moved,
         // can have a new order. Rows refolded at other cuts, from nothing or in chunks, read
         // every shown seat's.
-        let complete = rows.orders_cut != 0;
-        let mut affected = if complete { rows.seats_of(&steps) } else { BTreeSet::new() };
+        // Whether the orders were whole at the base's cut, so they can be updated incrementally.
+        let orders_whole = rows.orders_cut != 0;
+        let mut affected = if orders_whole { rows.seats_of(&steps) } else { BTreeSet::new() };
         refold_work(store, &mut rows, &steps, time, cut)?;
         // Every affected seat's queue order at this same cut: an actor's ready work is ordered
         // by its queue as it stood at the rows' own cut, never a newer one.
-        let reordered = if complete {
+        let reordered = if orders_whole {
             affected.extend(rows.seats_of(&steps));
             affected.extend(store.step_assignees(&steps)?);
             affected.extend(changes.moved_seats.iter().cloned());

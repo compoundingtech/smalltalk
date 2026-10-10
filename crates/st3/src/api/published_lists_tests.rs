@@ -323,6 +323,19 @@ fn fold_work_checked(store: &Store) -> (Arc<Publication<WorkRows>>, bool) {
     assert!(time >= store.projection_time_at(publication.cut).unwrap());
     let (fresh, _) = fold_work(store, None).unwrap().unwrap();
     assert_eq!(publication.rows.orders_cut, publication.cut, "seat orders read at the rows' own cut");
+    // Each shown seat's queue order, kept incrementally, is the order a fold from nothing reads
+    // at the same cut: a stale order shows here even for a seat no fixture actor reads.
+    if fresh.cut == publication.cut {
+        let shown = publication.rows.seats_shown();
+        assert_eq!(shown, fresh.rows.seats_shown());
+        for seat in &shown {
+            assert_eq!(
+                publication.rows.seat_orders.get(seat),
+                fresh.rows.seat_orders.get(seat),
+                "{seat}'s queue order"
+            );
+        }
+    }
     for actor in ACTORS {
         // Every page the HTTP list slices from the publication, in turn, is the direct read.
         let (all, _) = work_oracle(store, time, actor, usize::MAX);
@@ -539,14 +552,14 @@ fn published_lists_follow_many_changes_and_a_revision_proposal() {
     assert_eq!(store.published_work_list().rebuilds()["chunked: work changed"], 1);
 
     // A revision proposal waits for its reviewer and then applies, changing the run with no
-    // claim on the run itself.
-    let proposed = |goal: &str, key: &str| {
+    // claim on the run itself. The approved one moves the step from ash's queue to birch's.
+    let proposed = |goal: &str, seat: &str, key: &str| {
         let source = format!(
             r#"version 2
 mission "garden/proposed" state="ready" revisions="human-only" revision-reviewer="person/reviewer" {{
   goal "Grow by proposal."
   agent "owner" {{ workspace "."; command "true" }}
-  step "plant" {{ assigned-to "agent/garden/ash"; goal {goal:?} }}
+  step "plant" {{ assigned-to {seat:?}; goal {goal:?} }}
 }}"#
         );
         let intent = crate::graph::parse_intent(&source, store.origin()).unwrap();
@@ -556,11 +569,11 @@ mission "garden/proposed" state="ready" revisions="human-only" revision-reviewer
         store.apply_as(&intent, &preview.subject_tokens, key, Some("person/operator")).unwrap();
         intent.missions["garden/proposed"].clone()
     };
-    proposed("Plant in beds.", "publish-proposed-beds");
+    proposed("Plant in beds.", "agent/garden/ash", "publish-proposed-beds");
     let run = start(&store, "garden/proposed", "proposed-1");
     fold(&store);
     fold_work_checked(&store);
-    let rows = proposed("Plant in rows.", "publish-proposed-rows");
+    let rows = proposed("Plant in rows.", "agent/garden/birch", "publish-proposed-rows");
     // A proposal cancelled before review releases the run.
     let cancelled = store
         .create_revision_proposal(
