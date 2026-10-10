@@ -145,9 +145,9 @@ describe('sidebar matrix operations', () => {
     expect(operationsForMove(doc, move('beta.one', { _tag: 'Into', folder: b }))).toMatchObject([{ op: 'subject.place', subject: 'agent/one', folder: b }])
     expect(canDrop(doc, move('agent/one', { _tag: 'Into', folder: b }))).toEqual({ refused: 'This item is no longer available.' })
   })
-  it('Collapse and expand are tri-state local view intent for folders and host groups', () => {
+  it('Collapse and expand are local view intent for folders and the Unfiled group', () => {
     const doc = setup()
-    const tree = sidebarTree(sidebarProjection(doc), roster, new Map([[a, true], ['host:alpha', false]]))
+    const tree = sidebarTree(sidebarProjection(doc), roster, new Map([[a, true], ['wf/unfiled', false]]))
     expect(tree[0]).toMatchObject({ _tag: 'Folder', collapsed: true })
     expect(tree.at(-1)).toMatchObject({ _tag: 'Group', collapsed: false })
     expect(doc).toEqual(setup())
@@ -155,9 +155,9 @@ describe('sidebar matrix operations', () => {
   it('Show unfiled agents after the complete forest in stable host and seat key order', () => {
     const doc = apply(setup(), [{ op: 'subject.place', subject: 'agent/one', folder: null, key: 'z' }])
     const tree = sidebarTree(sidebarProjection(doc), roster, new Map())
-    expect(tree.map((node) => node.id)).toEqual([a, b, 'host:alpha', 'host:beta'])
+    expect(tree.map((node) => node.id)).toEqual([a, b, 'wf/unfiled'])
     const group = tree[2]!
-    expect(group._tag === 'Group' ? group.children.map((node) => node.id) : []).toEqual(['alpha.new', 'alpha.one'])
+    expect(group._tag === 'Group' ? group.children.map((node) => node.id) : []).toEqual(['alpha.new', 'alpha.one', 'beta.one'])
   })
   it('New and returning agents use unfiled host order or their dormant stored slot without writes', () => {
     const doc = setup()
@@ -185,7 +185,7 @@ describe('sidebar matrix operations', () => {
   it('Search prunes empty folders and keeps ancestors and full sibling order for moves', () => {
     const doc = setup()
     const tree = filterSidebarTree(sidebarTree(sidebarProjection(doc), roster, new Map([[a, true]])), 'Two')
-    expect(tree).toMatchObject([{ id: a, collapsed: true, children: [{ id: 'alpha.two' }] }])
+    expect(tree).toMatchObject([{ id: a, collapsed: false, children: [{ id: 'alpha.two' }] }])
     expect(doc).toEqual(setup())
     expect(operationsForMove(doc, move('alpha.two', { _tag: 'Before', sibling: 'beta.one' }))).toHaveLength(1)
   })
