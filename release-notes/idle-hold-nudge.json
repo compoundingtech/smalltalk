@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Nudge a seat that sits idle holding claimed work with nothing set to wake it, once, naming the step and its waits, and record the nudge on the step",
+  "replay": {
+    "status": "none",
+    "detail": "No history is folded or rebuilt. The check runs inside each running seat's existing wake evaluation and reads facts already recorded: the seat's harness report, mailbox, watches, steps, open runs and watched threads."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Two additive lookup indexes select watches by their recipient and report-to runs by their reporter. No tables, columns or triggers change, and no projection replay is needed. The claim vocabulary gains work.nudged (system-only, append, on step-run) with optional attempt, agent, message, idle_since_unix_ms, reason and waits fields. The client contract adds an optional nudged_at_unix_ms to work and nudged_at to mission steps."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and their digests are unchanged. The claim registry digest changes with the new kind, as with any vocabulary addition: members on different builds keep replicating claims and skip comparing projection maps until all are upgraded."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A member on an older build does not know work.nudged, so it holds a replicated nudge as unknown and admits it after it upgrades. A seat on an older host is never nudged, because only the host that runs a seat evaluates it. [reconcile] gains idle_nudge_after (default 30m, or off) and idle_nudge_quiet_watch (default 2h). A config that sets either one fails to load on an older build, because [reconcile] denies unknown fields. Not tested against an older build."
+  },
+  "downtime": {
+    "status": "changed",
+    "detail": "The first startup creates two additive lookup indexes over existing declarations and run-report claims. Index creation may add startup time; it does not replay claims or rebuild projections. A seat that is not idle-holding costs no further reads. An idle-holding seat checks its own indexed mailbox, watches and reporting runs inside its existing wake evaluation, when the seat changes or a deadline falls due."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "On by default. Turn it off with idle_nudge_after = \"off\" under [reconcile]; the daemon reads it again within two minutes. The guide is in docs/st3/mission-graph-runtime.md under Idle holders."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swap back to the previous binary at any time. Nudges stop, and work.nudged claims already written stay in the graph unread."
+  }
+}

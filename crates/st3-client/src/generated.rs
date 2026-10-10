@@ -984,6 +984,9 @@ pub struct MissionStep {
     pub wake: Option<MissionWake>,
     #[serde(default)]
     pub claim_expires_at: Option<String>,
+    /// When st last nudged this held step's holder for idling with nothing set to wake it.
+    #[serde(default)]
+    pub nudged_at: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MissionWake {
@@ -1041,6 +1044,9 @@ pub struct Work {
     pub claim_expires_at_unix_ms: Option<u64>,
     #[serde(default)]
     pub execution_started_at_unix_ms: Option<u64>,
+    /// When st last nudged this held step's holder for idling with nothing set to wake it.
+    #[serde(default)]
+    pub nudged_at_unix_ms: Option<u64>,
     #[serde(default)]
     pub execution_elapsed_ms: u64,
     #[serde(default)]

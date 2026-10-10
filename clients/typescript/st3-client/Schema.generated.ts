@@ -1600,6 +1600,8 @@ export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   "loop_round": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE).annotate({ description: "Current round of this step's loop, enriched on mission detail reads." }),
   /** Observed not-before time: earliest work eligibility, not a promise of wake dispatch. */
   "next_wake_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Observed not-before time: earliest work eligibility, not a promise of wake dispatch." }),
+  /** When st last nudged this held step's holder for idling with nothing set to wake it. */
+  "nudged_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "When st last nudged this held step's holder for idling with nothing set to wake it." }),
   "path": Schema.String,
   "since": Timestamp,
   "state": WorkState,
@@ -1877,6 +1879,8 @@ export const Work = /*#__PURE__*/ (() => Schema.Struct({
   /** The mission this work's run belongs to. */
   "mission_id": Schema.OptionFromOptionalNullOr(Id, NULL_NONE).annotate({ description: "The mission this work's run belongs to." }),
   "mission_run_id": Id,
+  /** When st last nudged this held step's holder for idling with nothing set to wake it. */
+  "nudged_at_unix_ms": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.DateTimeUtcFromMillis.check(epochRange))), NULL_NONE).annotate({ description: "When st last nudged this held step's holder for idling with nothing set to wake it." }),
   "operational": optionalKey(Operational),
   "path": Schema.String,
   /** Responses to the asks this attempt made, or a person ask's own response. */

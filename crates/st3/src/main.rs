@@ -6105,6 +6105,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         recorder.map(|installation| installation.directory),
     )?.with_schedule_peers(state.configured_peers.clone()).with_client_relay(state.client_relay.clone()).with_person(config.person.clone()));
     reconciler.set_max_passes_per_minute(config.reconcile.max_passes_per_minute)?;
+    reconciler.set_idle_nudge(config.reconcile.idle_nudge()?);
     tokio::spawn(reconciler.clone().supervise());
     tokio::spawn(st3::profile::watch_runtime_lag());
     // The policy reads `[limits]` again on every pass, so an edit applies without a restart.
@@ -15909,6 +15910,17 @@ fn render_client_work_detail(work: &st3_client::Work) -> String {
     if let Some(incarnation) = &work.claim_incarnation {
         let _ = writeln!(output, "Incarnation: {incarnation}");
     }
+    if let Some(nudged) = work
+        .nudged_at_unix_ms
+        .and_then(|at| chrono::DateTime::from_timestamp_millis(i64::try_from(at).ok()?))
+    {
+        let at = nudged.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let _ = writeln!(
+            output,
+            "Nudged: {at} ({}), idle while holding it with nothing set to wake it",
+            ago(&at, now_ms())
+        );
+    }
     if let Some(reason) = &work.blocked_reason {
         // The store keeps the reason for any state change here, such as a failure or an
         // expired lease; only blocked work is blocked by it.
@@ -23726,6 +23738,7 @@ async fn enforce_account_limits(store: Arc<Store>, started_with: st3::config::Li
                 // Validation already passed; preserve last-start history while changing the rate.
                 reconciler.set_max_passes_per_minute(reconcile.max_passes_per_minute)
                     .expect("validated reconcile cap");
+                reconciler.set_idle_nudge(reconcile.idle_nudge().expect("validated idle nudge"));
                 limits = reloaded;
                 last_error = None;
             }
@@ -27275,6 +27288,22 @@ mod tests {
         assert!(
             blocked.contains("\nBlocked: the step's lease expired\n"),
             "{blocked}"
+        );
+    }
+
+    #[test]
+    fn work_detail_says_when_its_holder_was_nudged() {
+        let page = fixture_product_page(&["work"], false);
+        let ClientResource::Work(work) = &page.items[0] else {
+            panic!("expected work fixture");
+        };
+        let mut work = work.clone();
+        assert!(!render_client_work_detail(&work).contains("Nudged:"));
+        work.nudged_at_unix_ms = Some(1_791_581_505_000);
+        let rendered = render_client_work_detail(&work);
+        assert!(
+            rendered.contains("\nNudged: 2026-10-09T21:31:45Z ("),
+            "{rendered}"
         );
     }
 
