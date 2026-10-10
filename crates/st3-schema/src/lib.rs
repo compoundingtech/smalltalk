@@ -733,7 +733,13 @@ fn build_registry() -> Registry {
         (
             "condition",
             "condition/NAME",
-            "A threshold on a metric the daemon measures, with its owner; its state is a claim on it.",
+            "A threshold on a metric the daemon measures, with its owner.",
+            false,
+        ),
+        (
+            "condition-instance",
+            "condition-instance/CONDITION_HASH/INSTANCE_HASH",
+            "One daemon-evaluated instance's transition state, referencing its declaration.",
             false,
         ),
         (
@@ -2388,7 +2394,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
         ),
         (
             "condition.state",
-            &["condition"],
+            &["condition-instance"],
             WritePolicy::SystemOnly,
             Cardinality::Append,
             Some("conditions"),
@@ -3024,6 +3030,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("incarnation", string()),
         ],
         "condition.state" => &[
+            ("condition", required_string()),
             ("notification_title", string()),
             ("notification_body", string()),
             ("instance", required_string()),
@@ -4072,6 +4079,7 @@ mod tests {
                 "checkpoint",
                 "checkpoint-excusal",
                 "condition",
+                "condition-instance",
                 "custom",
                 "daemon",
                 "doc",

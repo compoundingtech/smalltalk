@@ -8,10 +8,10 @@
 //! once. Between the two a hysteresis threshold and a hold time keep a value near the line from
 //! flapping.
 //!
-//! The state of each instance is a fact in the graph, a `condition.state` claim on the
-//! condition's subject: its phase, the last few values, and the transition when there was one.
-//! Anything that reads the graph, `st doctor`, `st conditions`, a person's alerts and later a
-//! graph watch or an idle-wake wait, reads that claim. See `docs/st3/conditions.md`.
+//! Transitions of each instance are facts in the graph, a `condition.state` claim on its
+//! hashed instance subject. Routine samples stay in a bounded local cache. `st doctor`,
+//! `st conditions` and a person's alerts read that cache and the latest transition; later
+//! graph watches or idle-wake waits can subscribe to the transition. See `docs/st3/conditions.md`.
 
 pub mod evaluate;
 pub mod probe;
@@ -25,7 +25,12 @@ use serde_json::Value;
 pub const EVALUATE_EVERY_MS: u64 = 30_000;
 /// The most often an instance's value is written to the graph when its phase has not crossed a
 /// transition. A transition is written at once.
-pub const RECORD_EVERY_MS: u128 = 5 * 60_000;
+pub const MAX_CONDITIONS: usize = 32;
+pub const MAX_INSTANCES: usize = 8;
+pub const MAX_REMOTE_INSTANCES: usize = 256;
+pub const MAX_WRITES_PER_TICK: usize = 16;
+pub const COOLDOWN_MS: u128 = 5 * 60_000;
+pub const STALE_AFTER_MS: u128 = 90_000;
 /// How many recent samples a state claim carries.
 pub const RING: usize = 8;
 
@@ -104,7 +109,7 @@ const METRICS: &[(&str, Metric, Scope)] = &[
     ("process.rss-bytes", Metric::ProcessRssBytes, Scope::Process),
     ("db.size-bytes", Metric::DbSizeBytes, Scope::Member),
     (
-        "db.growth-bytes-per-day",
+        "db.physical-growth-bytes-per-day",
         Metric::DbGrowthBytesPerDay,
         Scope::Member,
     ),
@@ -359,6 +364,17 @@ fn duration(node: &Value, name: &str) -> Result<Option<u128>, String> {
 /// A condition declaration, from its canonical desired body. The publication check calls this
 /// too, so a declaration that is published is one the daemon can evaluate.
 pub fn parse_condition(subject: &str, desired: &Value) -> Result<ConditionDecl, String> {
+    if subject.len() > 256 || children(desired).take(49).count() > 48 {
+        return Err("condition name or declaration exceeds its bounded size".into());
+    }
+    for child in children(desired) {
+        if arguments(child)
+            .iter()
+            .any(|argument| argument.as_str().is_some_and(|text| text.len() > 1024))
+        {
+            return Err("condition strings must be at most 1024 bytes".into());
+        }
+    }
     let name = subject
         .strip_prefix("condition/")
         .ok_or_else(|| format!("`{subject}` is not a condition"))?;
@@ -468,12 +484,27 @@ pub fn parse_condition(subject: &str, desired: &Value) -> Result<ConditionDecl, 
         "a condition needs `for`: how long the threshold must be crossed, such as \"10m\"",
     )?;
     let recover_hold_ms = duration(desired, "recover-for")?.unwrap_or(hold_ms);
+    if hold_ms < 60_000 || recover_hold_ms < 60_000 {
+        return Err("condition entry and recovery holds must be at least 60 seconds".into());
+    }
+    if hosts.len() > 32 {
+        return Err("a condition accepts at most 32 host selectors".into());
+    }
     let owner = one_string(desired, "owner")?.ok_or("a condition needs an `owner`")?;
     let owner_name = owner
         .strip_prefix("agent/")
         .or_else(|| owner.strip_prefix("person/"))
         .ok_or_else(|| format!("owner `{owner}` is not an agent/... or a person/..."))?;
-    if owner_name.is_empty() {
+    if owner_name.is_empty()
+        || owner.len() > 256
+        || owner_name.split('/').any(|part| {
+            part.is_empty()
+                || matches!(part, "." | "..")
+                || !part
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        })
+    {
         return Err(format!("owner `{owner}` names no one"));
     }
     let link = one_string(desired, "link")?;
@@ -530,7 +561,9 @@ impl ConditionDecl {
     /// Where the owner can see the series of one instance.
     pub fn series_link(&self, host: &str, instance: &str) -> String {
         match &self.link {
-            Some(link) => link.replace("{host}", host).replace("{instance}", instance),
+            Some(link) => link
+                .replace("{host}", &urlencoding::encode(host))
+                .replace("{instance}", &urlencoding::encode(instance)),
             None => format!("st conditions show {}", self.name),
         }
     }
@@ -690,11 +723,17 @@ impl Tracker {
         if self.values.len() == RING {
             self.values.pop_front();
         }
-        self.values.push_back((now, round(value)));
+        self.values.push_back((now, value));
         let breaching = decl.breaches(value);
         let recovered = decl.recovered(value);
         match self.phase {
-            Phase::Clear if breaching => {
+            Phase::Clear
+                if breaching
+                    && !self.recorded.is_some_and(|recorded| {
+                        recorded.phase == Phase::Clear
+                            && now.saturating_sub(recorded.at) < COOLDOWN_MS
+                    }) =>
+            {
                 self.breach_since = Some(now);
                 self.set(Phase::Pending, now);
                 if decl.hold_ms == 0 {
@@ -739,20 +778,9 @@ impl Tracker {
         }
     }
 
-    /// Whether this sample is written to the graph: always with a transition, and otherwise when
-    /// the phase or the rounded value changed since the last write and that write is at least
-    /// [`RECORD_EVERY_MS`] old. A value near its threshold therefore writes at most once a
-    /// period, however often it crosses.
-    pub fn should_record(&self, transition: Option<Transition>, now: u128) -> bool {
-        if transition.is_some() {
-            return true;
-        }
-        let Some(recorded) = self.recorded else {
-            return true;
-        };
-        let value = self.values.back().map(|(_, value)| *value);
-        let changed = recorded.phase != self.phase || value != Some(recorded.value);
-        changed && now.saturating_sub(recorded.at) >= RECORD_EVERY_MS
+    /// Routine samples and hold phases stay local; only completed transitions replicate.
+    pub fn should_record(&self, transition: Option<Transition>, _now: u128) -> bool {
+        transition.is_some()
     }
 
     pub fn mark_recorded(&mut self, now: u128) {
@@ -824,7 +852,19 @@ pub fn transition_text(
         decl.subject(),
         instance,
     );
-    (title, body)
+    (bounded_text(title, 512), bounded_text(body, 3500))
+}
+
+fn bounded_text(mut text: String, limit: usize) -> String {
+    if text.len() > limit {
+        let mut boundary = limit - 3;
+        while !text.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        text.truncate(boundary);
+        text.push_str("...");
+    }
+    text
 }
 
 pub fn utc(ms: u128) -> String {
@@ -834,9 +874,60 @@ pub fn utc(ms: u128) -> String {
         .unwrap_or_else(|| ms.to_string())
 }
 
-/// The subject a wait on a breach watches: `condition.state` claims on the condition's subject
-/// whose `instance` matches and whose `transition` is `enter` or `recover`. Idle-wake waits and
-/// graph watches subscribe here; nothing else needs to change for them to see a transition.
+/// Stable per-instance subjects let latest-state reads skip history using the existing
+/// subject/kind index. The condition root is carried in the state fields for graph watches.
+pub fn instance_subject_prefix(condition: &str) -> String {
+    use sha2::Digest as _;
+    format!(
+        "condition-instance/{}/",
+        hex::encode(sha2::Sha256::digest(breach_subject(condition).as_bytes()))
+    )
+}
+
+pub fn instance_subject(condition: &str, instance: &str) -> String {
+    use sha2::Digest as _;
+    format!(
+        "{}{}",
+        instance_subject_prefix(condition),
+        hex::encode(sha2::Sha256::digest(instance.as_bytes()))
+    )
+}
+
+/// Verify that a state is bounded and belongs to its authenticated author. The instance
+/// contains that host so another member cannot choose an instance hash belonging to it.
+pub(crate) fn valid_state_identity(subject: &str, origin: &str, fields: &Value) -> bool {
+    let text = |name: &str| fields.get(name).and_then(Value::as_str).unwrap_or("");
+    let condition = text("condition");
+    let instance = text("instance");
+    text("host") == origin
+        && !origin.is_empty()
+        && origin.len() <= 256
+        && condition.starts_with("condition/")
+        && condition.len() <= 256
+        && instance.len() <= 2048
+        && (instance == origin
+            || instance
+                .strip_prefix(origin)
+                .is_some_and(|suffix| suffix.starts_with(':')))
+        && subject == instance_subject(condition, instance)
+        && text("owner").len() <= 256
+        && text("notification_title").len() <= 512
+        && text("notification_body").len() <= 3500
+        && fields
+            .get("values")
+            .and_then(Value::as_array)
+            .is_none_or(|values| {
+                values.len() <= RING
+                    && values.iter().all(|sample| {
+                        sample.as_array().is_some_and(|pair| {
+                            pair.len() == 2
+                                && pair[0].as_u64().is_some()
+                                && pair[1].as_f64().is_some_and(f64::is_finite)
+                        })
+                    })
+            })
+}
+
 pub fn breach_subject(condition: &str) -> String {
     if condition.starts_with("condition/") {
         condition.to_owned()
@@ -845,21 +936,44 @@ pub fn breach_subject(condition: &str) -> String {
     }
 }
 
-/// Summarize each declared condition using only published state.
+pub fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+/// Summarize each declared condition using only recorded state.
 pub fn doctor_lines(
     conditions: &[crate::store::ConditionView],
+) -> Vec<(String, &'static str, String)> {
+    doctor_lines_at(conditions, now_ms())
+}
+
+pub fn doctor_lines_at(
+    conditions: &[crate::store::ConditionView],
+    now: u128,
 ) -> Vec<(String, &'static str, String)> {
     conditions
         .iter()
         .map(|condition| {
+            let stale = |instance: &crate::store::ConditionInstanceView| {
+                instance.measured_at.is_some_and(|at| {
+                    now < u128::from(at) || now.saturating_sub(u128::from(at)) > STALE_AFTER_MS
+                })
+            };
             let status = if condition.invalid.is_some()
-                || condition.instances.is_empty()
+                || condition.instances.iter().any(|instance| {
+                    Phase::parse(&instance.phase).is_some_and(Phase::in_breach) || stale(instance)
+                }) {
+                "warn"
+            } else if condition.instances.is_empty()
                 || condition
                     .instances
                     .iter()
-                    .any(|instance| instance.phase != "clear")
+                    .any(|instance| instance.phase == "pending")
             {
-                "warn"
+                "info"
             } else {
                 "pass"
             };
@@ -868,9 +982,10 @@ pub fn doctor_lines(
                 .iter()
                 .map(|instance| {
                     format!(
-                        "{} {} (value {})",
+                        "{} {}{} (value {})",
                         instance.instance,
                         instance.phase,
+                        if stale(instance) { "; stale" } else { "" },
                         instance
                             .value
                             .map(|v| v.to_string())
@@ -1130,22 +1245,20 @@ mod tests {
     }
 
     #[test]
-    fn values_are_written_on_a_transition_or_a_changed_value_at_most_once_a_period() {
+    fn routine_values_stay_local_and_only_completed_transitions_replicate() {
         let decl = disk();
         let mut tracker = Tracker::default();
         tracker.observe(&decl, 40.0, 0);
         assert!(
-            tracker.should_record(None, 0),
-            "the first sample is written"
+            !tracker.should_record(None, 0),
+            "the first routine sample is local"
         );
-        tracker.mark_recorded(0);
         tracker.observe(&decl, 39.0, MIN);
         assert!(!tracker.should_record(None, MIN), "changed, but too soon");
         tracker.observe(&decl, 40.0, 6 * MIN);
         assert!(!tracker.should_record(None, 6 * MIN), "the same as written");
         tracker.observe(&decl, 41.0, 7 * MIN);
-        assert!(tracker.should_record(None, 7 * MIN));
-        tracker.mark_recorded(7 * MIN);
+        assert!(!tracker.should_record(None, 7 * MIN));
         let transition = tracker.observe(&decl, 1.0, 8 * MIN);
         assert_eq!(transition, None);
         tracker.observe(&decl, 1.0, 18 * MIN);
@@ -1155,6 +1268,69 @@ mod tests {
             tracker.observe(&decl, 1.0, minute * MIN);
         }
         assert_eq!(tracker.values.len(), RING);
+    }
+
+    #[test]
+    fn recovery_cooldown_prevents_repeated_entry_and_preserves_exact_values() {
+        let mut decl = disk();
+        decl.hold_ms = MIN;
+        decl.recover_hold_ms = MIN;
+        let mut tracker = Tracker::default();
+        tracker.observe(&decl, 12.3456, 0);
+        assert_eq!(
+            tracker.observe(&decl, 12.3456, MIN),
+            Some(Transition::Enter)
+        );
+        assert_eq!(
+            tracker.values.back().map(|(_, value)| *value),
+            Some(12.3456)
+        );
+        tracker.mark_recorded(MIN);
+        tracker.observe(&decl, 30.0, 2 * MIN);
+        assert_eq!(
+            tracker.observe(&decl, 30.0, 3 * MIN),
+            Some(Transition::Recover)
+        );
+        tracker.mark_recorded(3 * MIN);
+        for minute in 4..8 {
+            assert_eq!(tracker.observe(&decl, 12.0, minute * MIN), None);
+            assert_eq!(tracker.phase, Phase::Clear);
+        }
+        assert_eq!(tracker.observe(&decl, 12.0, 8 * MIN), None);
+        assert_eq!(tracker.phase, Phase::Pending);
+        assert_eq!(
+            tracker.observe(&decl, 12.0, 9 * MIN),
+            Some(Transition::Enter)
+        );
+    }
+
+    #[test]
+    fn state_identity_is_bound_to_the_authenticated_host_and_is_bounded() {
+        let mut fields = json!({"condition":"condition/fleet/disk", "host":"alder", "instance":"alder:/srv", "owner":"agent/ops", "values":[]});
+        let subject = instance_subject("condition/fleet/disk", "alder:/srv");
+        assert!(valid_state_identity(&subject, "alder", &fields));
+        assert!(!valid_state_identity(&subject, "birch", &fields));
+        fields["host"] = json!("birch");
+        assert!(!valid_state_identity(&subject, "birch", &fields));
+        fields["host"] = json!("alder");
+        fields["values"] = json!(vec![0; 9]);
+        assert!(!valid_state_identity(&subject, "alder", &fields));
+    }
+
+    #[test]
+    fn declarations_reject_holds_below_one_minute() {
+        for duration in ["0s", "30s"] {
+            let mut desired = body(json!([
+                {"name":"metric", "arguments":["disk.free-percent"]},
+                {"name":"scope", "arguments":["host"]},
+                {"name":"below", "arguments":[15]},
+                {"name":"for", "arguments":[duration]},
+                {"name":"owner", "arguments":["agent/ops"]}
+            ]));
+            assert!(parse_condition("condition/disk", &desired).is_err());
+            desired["children"][3]["arguments"] = json!(["1m"]);
+            assert!(parse_condition("condition/disk", &desired).is_ok());
+        }
     }
 
     #[test]

@@ -22,34 +22,48 @@ pub fn spawn(
     store: std::sync::Arc<Store>,
     host: String,
     database: PathBuf,
-    notify: std::sync::Arc<tokio::sync::Notify>,
+    _notify: std::sync::Arc<tokio::sync::Notify>,
     events: tokio::sync::watch::Sender<u64>,
 ) {
     tokio::spawn(async move {
-        let probe = HostProbe::new(database, Box::new(crate::api::request_latency_windows));
-        let mut evaluator = Evaluator::new(host, Box::new(probe));
+        let disks = probe::DiskSampler::spawn();
+        let probe = HostProbe::new(
+            database.clone(),
+            Box::new(crate::api::request_latency_windows),
+            disks.clone(),
+        );
+        let mut evaluator = Evaluator::new(host.clone(), Box::new(probe));
         let mut interval =
             tokio::time::interval(std::time::Duration::from_millis(super::EVALUATE_EVERY_MS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             let tick_store = store.clone();
-            let task = tokio::task::spawn_blocking(move || {
+            let mut task = tokio::task::spawn_blocking(move || {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                let result = evaluator.tick(&tick_store, now);
+                let result = evaluator.tick_guarded(&tick_store, now);
                 (evaluator, result)
-            })
-            .await;
+            });
+            let task = match tokio::time::timeout(std::time::Duration::from_secs(10), &mut task)
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    let status_store = store.clone();
+                    let _ = tokio::task::spawn_blocking(move || status_store.note_condition_evaluator_status(
+                        super::now_ms(), Some("condition tick exceeded 10 seconds; waiting for the existing worker, without spawning more"))).await;
+                    task.await
+                }
+            };
             match task {
                 Ok((next, result)) => {
                     evaluator = next;
                     match result {
                         Ok(report) => {
                             if report.recorded > 0 || !report.messages.is_empty() {
-                                notify.notify_one();
                                 events.send_modify(|index| *index = index.wrapping_add(1));
                             }
                             for error in report.errors {
@@ -60,8 +74,15 @@ pub fn spawn(
                     }
                 }
                 Err(error) => {
-                    tracing::error!(%error, "condition evaluator stopped");
-                    break;
+                    tracing::error!(%error, "condition evaluator worker failed; rebuilding it");
+                    evaluator = Evaluator::new(
+                        host.clone(),
+                        Box::new(HostProbe::new(
+                            database.clone(),
+                            Box::new(crate::api::request_latency_windows),
+                            disks.clone(),
+                        )),
+                    );
                 }
             }
         }
@@ -81,20 +102,30 @@ pub(crate) trait Probe: Send {
     fn database_bytes(&mut self) -> Option<f64>;
     /// The request-latency report: each target's and route's 1m, 5m and 1h windows.
     fn slo_windows(&mut self) -> Value;
+    fn errors(&self) -> Vec<String> {
+        Vec::new()
+    }
+    fn prepare(&mut self, _decls: &[ConditionDecl]) {}
 }
 
 /// The daemon's own host.
 pub(crate) struct HostProbe {
     database: PathBuf,
     processes: ProcessSampler,
+    disks: probe::DiskSampler,
     slo: Box<dyn Fn() -> Value + Send>,
 }
 
 impl HostProbe {
-    pub fn new(database: PathBuf, slo: Box<dyn Fn() -> Value + Send>) -> Self {
+    pub fn new(
+        database: PathBuf,
+        slo: Box<dyn Fn() -> Value + Send>,
+        disks: probe::DiskSampler,
+    ) -> Self {
         Self {
             database,
             processes: ProcessSampler::default(),
+            disks,
             slo,
         }
     }
@@ -102,11 +133,11 @@ impl HostProbe {
 
 impl Probe for HostProbe {
     fn filesystems(&mut self) -> BTreeMap<String, DiskSpace> {
-        probe::filesystems()
+        self.disks.filesystems()
     }
 
     fn filesystem_of(&mut self, path: &str) -> Option<DiskSpace> {
-        probe::filesystem_of(path)
+        self.disks.filesystem_of(path)
     }
 
     fn memory_available_percent(&mut self) -> Option<f64> {
@@ -123,6 +154,18 @@ impl Probe for HostProbe {
 
     fn slo_windows(&mut self) -> Value {
         (self.slo)()
+    }
+    fn errors(&self) -> Vec<String> {
+        self.disks.errors()
+    }
+    fn prepare(&mut self, decls: &[ConditionDecl]) {
+        self.disks.configure(
+            decls.iter().any(|decl| {
+                matches!(decl.metric, Metric::DiskFreePercent | Metric::DiskFreeBytes)
+                    && decl.path.is_none()
+            }),
+            decls.iter().filter_map(|decl| decl.path.clone()),
+        );
     }
 }
 
@@ -145,6 +188,7 @@ pub(crate) struct Evaluator {
     /// Transitions whose state claim is not written yet.
     unrecorded: BTreeMap<(String, String), Transition>,
     cost: Option<(u128, f64)>,
+    write_cursor: usize,
 }
 
 /// The values one tick read, each at most once.
@@ -169,25 +213,42 @@ impl Evaluator {
             last_tick: None,
             unrecorded: BTreeMap::new(),
             cost: None,
+            write_cursor: 0,
         }
+    }
+
+    pub fn tick_guarded(&mut self, store: &Store, now: u128) -> Result<TickReport> {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tick(store, now)))
+                .unwrap_or_else(|_| {
+                    self.restored = false;
+                    self.trackers.clear();
+                    self.unrecorded.clear();
+                    Err(anyhow::anyhow!(
+                        "condition tick panicked; restart state will be restored"
+                    ))
+                });
+        let error = match &result {
+            Ok(report) if report.errors.is_empty() => None,
+            Ok(report) => Some(report.errors.join("; ")),
+            Err(error) => Some(format!("{error:#}")),
+        };
+        store.note_condition_evaluator_status(now, error.as_deref())?;
+        result
     }
 
     pub fn tick(&mut self, store: &Store, now: u128) -> Result<TickReport> {
         let mut report = TickReport::default();
         // Bring the heads up to date first: they are what readers and a restart read.
-        let mut caught_up = false;
+        store.seed_condition_heads(!self.restored)?;
+        // Folding other members' new transitions does not gate local evaluation.
         for _ in 0..4 {
             if store.fold_condition_heads()? < 500 {
-                caught_up = true;
                 break;
             }
         }
-        if !caught_up {
-            report.messages = store.flush_condition_notifications()?;
-            return Ok(report);
-        }
         if !self.restored {
-            self.trackers = store.condition_trackers(&self.host)?;
+            self.trackers = store.condition_trackers_at(&self.host, now)?;
             self.restored = true;
         }
         if self
@@ -205,27 +266,42 @@ impl Evaluator {
             .filter_map(|condition| condition.decl.ok())
             .filter(|decl| decl.applies_to(&self.host))
             .collect::<Vec<_>>();
+        self.probe.prepare(&decls);
         let mut readings = Readings::default();
         if decls
             .iter()
             .any(|decl| decl.metric == Metric::DbAuthoredBytesPerDay)
         {
-            store.fold_condition_claim_bytes(now)?;
-            readings.claim_bytes = Some(store.condition_claim_bytes_per_day(now)?);
-        }
-        if decls
-            .iter()
-            .any(|decl| decl.metric == Metric::DbGrowthBytesPerDay)
-        {
-            if store.condition_database_sample_due(now)? {
-                let size = *readings
-                    .database
-                    .get_or_insert_with(|| self.probe.database_bytes());
-                if let Some(size) = size {
-                    store.record_condition_database_sample(now, size)?;
-                }
+            match store
+                .fold_condition_claim_bytes(now)
+                .and_then(|()| store.condition_claim_bytes_per_day(now))
+            {
+                Ok(value) => readings.claim_bytes = Some(value),
+                Err(error) => report.errors.push(format!("authored bytes: {error:#}")),
             }
-            readings.physical_growth = store.condition_database_growth_per_day(now)?;
+        }
+        if decls.iter().any(|decl| {
+            matches!(
+                decl.metric,
+                Metric::DbGrowthBytesPerDay | Metric::DbSizeBytes
+            )
+        }) {
+            let growth = (|| -> Result<Option<f64>> {
+                if store.condition_database_sample_due(now)? {
+                    let size = *readings
+                        .database
+                        .get_or_insert_with(|| self.probe.database_bytes());
+                    if let Some(size) = size {
+                        store.record_condition_database_sample(now, size)?;
+                    }
+                }
+                readings.database = Some(store.condition_database_size(now)?);
+                store.condition_database_growth_per_day(now)
+            })();
+            match growth {
+                Ok(value) => readings.physical_growth = value,
+                Err(error) => report.errors.push(format!("physical growth: {error:#}")),
+            }
         }
         let process_names = decls
             .iter()
@@ -238,14 +314,47 @@ impl Evaluator {
         }
         let mut live = BTreeSet::new();
         for decl in &decls {
-            for (instance, value) in self.values(store, decl, &mut readings, now) {
+            let subject = decl.subject();
+            let values = self
+                .values(store, decl, &mut readings, now)
+                .into_iter()
+                .take(super::MAX_INSTANCES)
+                .collect::<Vec<_>>();
+            let wanted = values
+                .iter()
+                .map(|(instance, _)| instance.as_str())
+                .collect::<BTreeSet<_>>();
+            self.trackers.retain(|key, _| {
+                key.0 != subject
+                    || wanted.contains(key.1.as_str())
+                    || self.unrecorded.contains_key(key)
+            });
+            for (instance, value) in values {
                 if !value.is_finite() {
                     continue;
                 }
                 let key = (decl.subject(), instance.clone());
                 live.insert(key.clone());
                 report.evaluated += 1;
-                let tracker = self.trackers.entry(key.clone()).or_default();
+                if !self.trackers.contains_key(&key) {
+                    if self
+                        .trackers
+                        .keys()
+                        .filter(|tracked| tracked.0 == subject)
+                        .count()
+                        >= super::MAX_INSTANCES
+                    {
+                        report.errors.push(format!(
+                            "{subject}: instance budget is waiting for pending transitions"
+                        ));
+                        continue;
+                    }
+                    self.trackers.insert(
+                        key.clone(),
+                        store.condition_tracker(&subject, &instance, now)?,
+                    );
+                }
+                let tracker = self.trackers.get_mut(&key).expect("just inserted");
                 if !self.unrecorded.contains_key(&key)
                     && let Some(transition) = tracker.observe(decl, value, now)
                 {
@@ -254,35 +363,62 @@ impl Evaluator {
                         .push((key.0.clone(), instance.clone(), transition));
                     self.unrecorded.insert(key.clone(), transition);
                 }
-                let transition = self.unrecorded.get(&key).copied();
-                if !tracker.should_record(transition, now) {
-                    continue;
-                }
-                match store.record_condition_state(&ConditionRecord {
-                    decl,
-                    host: &self.host,
-                    instance: &instance,
-                    tracker,
-                    transition,
-                    now,
-                }) {
-                    Ok(_) => {
-                        tracker.mark_recorded(now);
-                        report.recorded += 1;
-                        self.unrecorded.remove(&key);
-                    }
-                    Err(error) => report
-                        .errors
-                        .push(format!("{} {instance}: {error:#}", key.0)),
-                }
             }
         }
+        let mut pending = self.unrecorded.keys().cloned().collect::<Vec<_>>();
+        if !pending.is_empty() {
+            let rotate = self.write_cursor % pending.len();
+            pending.rotate_left(rotate);
+            self.write_cursor = self.write_cursor.wrapping_add(super::MAX_WRITES_PER_TICK);
+        }
+        for key in pending.into_iter().take(super::MAX_WRITES_PER_TICK) {
+            let Some(decl) = decls.iter().find(|decl| decl.subject() == key.0) else {
+                continue;
+            };
+            let Some(tracker) = self.trackers.get_mut(&key) else {
+                continue;
+            };
+            let transition = self.unrecorded.get(&key).copied();
+            match store.record_condition_state(&ConditionRecord {
+                decl,
+                host: &self.host,
+                instance: &key.1,
+                tracker,
+                transition,
+                now,
+            }) {
+                Ok(_) => {
+                    tracker.mark_recorded(now);
+                    report.recorded += 1;
+                    self.unrecorded.remove(&key);
+                }
+                Err(error) => report
+                    .errors
+                    .push(format!("{} {}: {error:#}", key.0, key.1)),
+            }
+        }
+        let records = live
+            .iter()
+            .filter(|key| !self.unrecorded.contains_key(*key))
+            .filter_map(|key| {
+                Some(ConditionRecord {
+                    decl: decls.iter().find(|decl| decl.subject() == key.0)?,
+                    host: &self.host,
+                    instance: &key.1,
+                    tracker: self.trackers.get(key)?,
+                    transition: None,
+                    now,
+                })
+            })
+            .collect::<Vec<_>>();
+        store.record_condition_observations(&records)?;
         // Instances of conditions that no longer apply here stop being tracked. One whose value
         // could not be read this tick keeps its state for the next.
         let declared = decls
             .iter()
             .map(ConditionDecl::subject)
             .collect::<BTreeSet<_>>();
+        self.unrecorded.retain(|key, _| declared.contains(&key.0));
         self.trackers
             .retain(|key, _| declared.contains(&key.0) || live.contains(key));
         for (key, tracker) in &mut self.trackers {
@@ -300,6 +436,7 @@ impl Evaluator {
             Ok(messages) => report.messages.extend(messages),
             Err(error) => report.errors.push(format!("notifications: {error:#}")),
         }
+        report.errors.extend(self.probe.errors());
         Ok(report)
     }
 
@@ -460,10 +597,17 @@ mod tests {
         free: Arc<Mutex<BTreeMap<String, (u64, u64)>>>,
         cpu: Arc<Mutex<Option<f64>>>,
         slo: Arc<Mutex<Value>>,
+        panic_once: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Probe for Fake {
         fn filesystems(&mut self) -> BTreeMap<String, DiskSpace> {
+            if self
+                .panic_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                panic!("injected probe panic");
+            }
             self.free
                 .lock()
                 .unwrap()
@@ -540,7 +684,7 @@ condition "fleet/elsewhere" {
   scope "member"
   host "birch"
   above 1
-  for "0s"
+  for "1m"
   owner "agent/ops"
 }
 "#;
@@ -691,6 +835,45 @@ condition "fleet/elsewhere" {
     }
 
     #[test]
+    fn instance_caps_bound_live_trackers_and_cached_rows_when_mounts_change() {
+        let (_directory, store) = store();
+        let fake = Fake::default();
+        for number in 0..100 {
+            fake.free
+                .lock()
+                .unwrap()
+                .insert(format!("/mount-{number}"), (90, 100));
+        }
+        let mut evaluator = Evaluator::new("alder", Box::new(fake.clone()));
+        assert_eq!(
+            evaluator.tick(&store, 1_000).unwrap().evaluated,
+            super::super::MAX_INSTANCES
+        );
+        assert_eq!(evaluator.trackers.len(), super::super::MAX_INSTANCES);
+        fake.free.lock().unwrap().clear();
+        for number in 0..super::super::MAX_INSTANCES {
+            fake.free
+                .lock()
+                .unwrap()
+                .insert(format!("/new-{number}"), (90, 100));
+        }
+        evaluator.tick(&store, 31_000).unwrap();
+        assert_eq!(evaluator.trackers.len(), super::super::MAX_INSTANCES);
+        let disk = store
+            .conditions()
+            .unwrap()
+            .into_iter()
+            .find(|condition| condition.subject == "condition/fleet/disk")
+            .unwrap();
+        assert_eq!(disk.instances.len(), super::super::MAX_INSTANCES);
+        assert!(
+            disk.instances
+                .iter()
+                .all(|instance| instance.instance.contains(":/new-"))
+        );
+    }
+
+    #[test]
     fn a_missing_reading_interrupts_entry_and_recovery_holds() {
         let (_directory, store) = store();
         let fake = Fake::default();
@@ -765,7 +948,7 @@ condition "fleet/elsewhere" {
     }
 
     #[test]
-    fn a_steady_value_writes_rarely_and_a_flapping_one_at_most_once_a_period() {
+    fn routine_steady_and_flapping_values_never_replicate_samples() {
         let (_directory, store) = store();
         let fake = Fake::default();
         fake.free.lock().unwrap().insert("/".into(), (50, 100));
@@ -780,9 +963,8 @@ condition "fleet/elsewhere" {
             assert!(report.transitions.is_empty());
             recorded += report.recorded;
         }
-        // The process condition has no reading (no process), so only the disk writes: the first
-        // sample, then at most one write each five minutes.
-        assert!(recorded <= 13, "{recorded} writes in an hour");
+        // Neither oscillating nor flat routine values append graph claims.
+        assert_eq!(recorded, 0, "routine samples must stay local");
         let mut steady = 0;
         fake.free.lock().unwrap().insert("/".into(), (50, 100));
         for tick in 120..240u128 {
@@ -791,7 +973,85 @@ condition "fleet/elsewhere" {
                 .unwrap()
                 .recorded;
         }
-        assert_eq!(steady, 1, "a steady value writes once, when it changed");
+        assert_eq!(steady, 0, "changed routine values remain local");
+    }
+
+    #[test]
+    fn a_probe_panic_is_visible_and_the_next_tick_recovers() {
+        let (_directory, store) = store();
+        let fake = Fake::default();
+        fake.free.lock().unwrap().insert("/".into(), (50, 100));
+        fake.panic_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut evaluator = Evaluator::new("alder", Box::new(fake));
+        let now = super::super::now_ms();
+        assert!(
+            evaluator
+                .tick_guarded(&store, now)
+                .unwrap_err()
+                .to_string()
+                .contains("panicked")
+        );
+        assert!(
+            store
+                .condition_evaluator_status()
+                .unwrap()
+                .1
+                .unwrap()
+                .contains("panicked")
+        );
+        assert_eq!(
+            evaluator
+                .tick_guarded(&store, now + 30_000)
+                .unwrap()
+                .evaluated,
+            1
+        );
+        assert_eq!(
+            store.condition_evaluator_status().unwrap(),
+            (Some((now + 30_000) as i64), None)
+        );
+    }
+
+    #[test]
+    fn transition_writes_have_a_budget_and_deferred_instances_are_not_lost() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("claims.sqlite3"), "alder").unwrap();
+        let mut source = String::from("version 2\n");
+        for number in 0..24 {
+            source.push_str(&format!("condition \"budget/{number}\" {{ metric \"db.size-bytes\"; scope \"member\"; above 1; for \"1m\"; owner \"person/ada\" }}\n"));
+        }
+        let intent = parse_intent(&source, "alder").unwrap();
+        let plan = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &plan.subject_tokens, "budget", Some("person/ada"))
+            .unwrap();
+        let mut evaluator = Evaluator::new("alder", Box::new(Fake::default()));
+        let now = super::super::now_ms();
+        assert_eq!(evaluator.tick(&store, now).unwrap().recorded, 0);
+        assert_eq!(
+            evaluator.tick(&store, now + 60_000).unwrap().recorded,
+            super::super::MAX_WRITES_PER_TICK
+        );
+        assert_eq!(evaluator.tick(&store, now + 90_000).unwrap().recorded, 8);
+        assert_eq!(
+            store
+                .conditions()
+                .unwrap()
+                .iter()
+                .filter(|view| view.instances[0].phase == "breach")
+                .count(),
+            24
+        );
+        assert!(evaluator.unrecorded.is_empty());
     }
 
     #[test]

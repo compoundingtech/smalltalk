@@ -281,3 +281,21 @@ The fix step must extend this foundation with non-empty fixtures for currently e
 1. Shared canonical helper + exhaustive local exceptions + behavioral coverage for shared winner selection independent of local arrival. Retain deterministic ancestry/operation selection and local cursor semantics.
 2. One incremental digest per logical shared table/source covering all shared columns, with insert/update/delete maintenance in the same transaction, stable serialization/PK order, full-rebuild validation and migration. Cheap cache invalidation alone is not incremental hashing. Physical indexes, receipt metadata, local clocks and live overlays stay outside. Extend replication status, heal diagnostics and doctor with named mismatches, and keep format/version compatibility explicit.
 3. Expand shuffle/restart/checkpoint CI coverage to every source and derived attention view. The audit commit intentionally contains the failing regression; it is not a green merge candidate. Only the completed fix PR with st/ci green on its own head may join the smalltalk merge train.
+
+### Local condition tables added after the baseline
+
+Condition declarations and entry/recovery `condition.state` claims are shared
+facts. Five disposable, host-owned tables serve background evaluation and reads:
+
+| Table | Scope | Authority / bound |
+| --- | --- | --- |
+| `local_condition_heads` | Local cache | Canonical latest transition pointer per declaration and instance; 32 declarations, at most 256 remote instances each. Rebuilt by indexed latest-state seeks. |
+| `local_condition_observations` | Local live overlay | Eight recent samples and hold phase; 32 declarations, eight instances each. Never replicated. |
+| `local_condition_notifications` | Local retry queue | Own-host transition deliveries, at most 16 attempts per tick and three attempts per failing row. Message identity is durable and idempotent. |
+| `local_condition_database_samples` | Local measurement | Hourly database-plus-WAL sizes, retained for 48 hours. |
+| `local_condition_claim_bytes` | Local counter | Two days of hourly authored-byte buckets, with bounded background folds. |
+
+These tables do not enter shared projection digests. Graph state uses canonical
+latest selection; local cursors, heartbeat and retry counters live in `meta`.
+Reads never rebuild these tables. Store open creates them without changing
+storage version 18; no global claim index is built at startup.

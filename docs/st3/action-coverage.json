@@ -391,6 +391,8 @@
     }
   ],
   "cli": [
+    {"command": "st conditions ls", "description": "Read recorded condition state and recent local values", "tests": ["crates/st3/tests/client_v0_cli.rs::conditions_cli_reads_local_values_and_transition_state_without_writes"], "verification": "real CLI over a private Unix socket; list, short/full subject lookup, human and JSON output; store index remains unchanged"},
+    {"command": "st conditions show", "description": "Read recorded condition state and recent local values", "tests": ["crates/st3/tests/client_v0_cli.rs::conditions_cli_reads_local_values_and_transition_state_without_writes"], "verification": "real CLI over a private Unix socket; list, short/full subject lookup, human and JSON output; store index remains unchanged"},
     {
       "command": "st activity",
       "description": "Read bounded changes since a stable cursor",

@@ -355,6 +355,58 @@ fn value(output: &Output) -> Value {
     })
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conditions_cli_reads_local_values_and_transition_state_without_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let source = r#"version 2
+condition "fleet/database" {
+  metric "db.size-bytes"
+  scope "member"
+  above 1000
+  for "1m"
+  owner "person/avery"
+}
+"#;
+    let intent = st3::parse_intent(source, &state.node).unwrap();
+    let plan = state.store.mission(&intent, IntentInput { kdl: source.into(), source_name: None }).unwrap();
+    state.store.apply_as(&intent, &plan.subject_tokens, "cli-condition", Some("person/avery")).unwrap();
+    let decl = state.store.declared_conditions().unwrap().remove(0).decl.unwrap();
+    let now = st3::conditions::now_ms();
+    let mut tracker = st3::conditions::Tracker::default();
+    tracker.observe(&decl, 2000.0, now - 60_000);
+    let transition = tracker.observe(&decl, 2200.0, now);
+    let record = st3::store::ConditionRecord { decl: &decl, host: &state.node, instance: &state.node, tracker: &tracker, transition, now };
+    state.store.record_condition_state(&record).unwrap();
+    state.store.fold_condition_heads().unwrap();
+    state.store.record_condition_observations(&[record]).unwrap();
+    let before = state.store.index().unwrap();
+    let app = st3::api::router(state.clone());
+    let served = socket.clone();
+    let server = tokio::spawn(async move { st3::api::serve_unix(&served, app).await });
+    for _ in 0..200 {
+        if tokio::net::UnixStream::connect(&socket).await.is_ok() { break; }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let listed = value(&run_cli(&socket, &["conditions", "ls"]).await);
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["instances"][0]["phase"], "breach");
+    assert_eq!(listed[0]["instances"][0]["value"], 2200.0);
+    for subject in ["fleet/database", "condition/fleet/database"] {
+        assert_eq!(value(&run_cli(&socket, &["conditions", "show", subject]).await), listed);
+    }
+    let human = run_cli_human(&socket, &["conditions", "show", "fleet/database"]).await;
+    assert!(human.status.success());
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(human.contains("breach") && human.contains("person/avery") && human.contains("2200"), "{human}");
+    assert!(!run_cli(&socket, &["conditions", "show", "missing"]).await.status.success());
+    let page: Value = st3::client::Client::unix_as(&socket, "person/avery").unwrap().get("/v1/client/attention").await.unwrap();
+    assert!(page["items"].as_array().is_some_and(|items| items.iter().any(|item| item["attention_kind"] == "condition")), "{page:#}");
+    assert_eq!(state.store.index().unwrap(), before, "inspection must not write");
+    server.abort();
+}
+
 #[test]
 fn person_admission_exception_is_local_reversible_and_never_spawns_the_producer() {
     use std::os::unix::fs::PermissionsExt;

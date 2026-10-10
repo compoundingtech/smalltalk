@@ -2,24 +2,24 @@
   "version": 1,
   "summary": "Declare metric thresholds in KDL; the daemon evaluates conditions in the background and notifies owners once on breach and recovery.",
   "replay": {
-    "status": "none",
-    "detail": "No claim replay is required. The background evaluator builds local condition heads and a retry queue from condition.state claims in bounded pages."
+    "status": "changed",
+    "detail": "No graph replay required. Local condition heads seed from indexed latest per-instance state, not historical replay. Replication re-admits old unknown-subject-family invalid records once per schema digest; genuinely invalid records remain invalid and do not retry on every pass."
   },
   "schema": {
     "status": "changed",
-    "detail": "Adds the condition subject, root declaration and system-only durable condition.state claim. Registry digest expands. Storage version stays 18; four local condition cache/counter/notification/hourly-size tables and a desired-condition index are created on store open."
+    "detail": "Adds condition declarations and condition-instance subjects with system-only durable condition.state transitions; routine values stay local. Registry digest expands. Storage version stays 18; five local condition tables and a desired-condition partial index are created on store open, without a global claims-index build."
   },
   "rules": {
     "status": "none",
-    "detail": "No checkpoint rule changes; condition.state has no trimming rule and remains durable. Public claim writes cannot publish condition.state."
+    "detail": "No checkpoint rule changes. Only entry/recovery transitions append durable condition.state; routine samples and intermediate phases stay in a bounded local overlay. Minimum holds and recovery cooldown bound flapping."
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Additive /v1/conditions read and st conditions ls/show commands. Older daemons cannot parse condition declarations or interpret condition.state claims. Upgrade every member before publishing conditions, daemon before CLI."
+    "detail": "Additive /v1/conditions and st conditions ls/show. Client-v0 attention_kind adds condition; generated clients and CONTRACT_SHA256 change. Deploy daemons before CLI, every member before publishing new facts, and clients before person-owned conditions. Older schemas reject the new subject families; upgrade retries those rejections once per new digest."
   },
   "downtime": {
     "status": "none",
-    "detail": "Ordinary daemon restart; existing breaches resume silently and pending holds start again. Kernel probes and evaluation run only on the background task every 30 seconds."
+    "detail": "Ordinary daemon restart; breaches resume silently and pending holds restart. Background evaluation every 30 seconds; hourly physical database sampling; one isolated disk worker with stale-cache diagnostics."
   },
   "manual": {
     "status": "changed",
@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "changed",
-    "detail": "Roll forward after conditions have been published; an older daemon cannot evaluate the new declarations. Notification retries use durable recorded transition details and deterministic message identities."
+    "detail": "Roll forward after declarations exist. An older daemon cannot evaluate them. Unknown-family records rejected by old registries heal on an upgraded schema; other invalid records require normal replication repair. Durable notification retries are idempotent, limited to three failures per row, and visible in doctor."
   }
 }

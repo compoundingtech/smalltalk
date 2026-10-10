@@ -2,7 +2,7 @@
 
 A condition is a root KDL fleet object. Each daemon evaluates the instances on
 its own host every 30 seconds, using local measurements. Owners receive one
-notification on entering breach and one on recovery. Samples and intermediate
+notification per instance on entering breach and one on recovery. Samples and intermediate
 hold phases do not wake an owner.
 
 ```kdl
@@ -20,7 +20,7 @@ condition "fleet/disk" {
 
 This checks every local data filesystem on every host. Add `host "alder"` to
 restrict evaluation to that member, or several `host` children for several
-members. Add `path "/srv/data"` to check the filesystem containing one absolute
+members. Each matching host evaluates and notifies independently. Add `path "/srv/data"` to check the filesystem containing one absolute
 path. A process condition needs `process "collector"`; a route condition needs
 `route "person-read"` (a target name from `slo/targets.toml`) or a measured path.
 Route and daemon CPU metrics accept `window "1m"`, `"5m"`, or `"1h"`. Routes default to `"1h"`; daemon CPU defaults to `"5m"`.
@@ -32,7 +32,7 @@ Route and daemon CPU metrics accept `window "1m"`, `"5m"`, or `"1h"`. Routes def
 | process | `process.cpu-cores` | CPU seconds per elapsed second, summed by process name |
 | process | `process.rss-bytes` | resident bytes, summed by process name |
 | member | `db.size-bytes` | database and WAL bytes |
-| member | `db.growth-bytes-per-day` | physical database plus WAL net growth per day |
+| member | `db.physical-growth-bytes-per-day` | physical database plus WAL net growth per day |
 | member | `db.authored-bytes-per-day` | locally authored claim bytes per day |
 | member | `cost.usd-per-day` | recorded model spend in USD over 24 hours |
 | member | `daemon.cpu-cores` | daemon CPU from SLO windows |
@@ -42,19 +42,37 @@ Route and daemon CPU metrics accept `window "1m"`, `"5m"`, or `"1h"`. Routes def
 Use exactly one of `above NUMBER` and `below NUMBER`. Crossing is strict;
 equality does not enter breach. `recover NUMBER` supplies hysteresis, defaulting
 to the breach threshold. `for` is required and is the continuous hold before
-entry. `recover-for` defaults to the entry hold. A missing reading interrupts a
+entry. Both holds must be at least 60 seconds. `recover-for` defaults to the entry hold.
+After recovery an instance waits five minutes before starting another entry hold. A missing reading interrupts a
 hold and keeps an established breach. A sampling gap over 75 seconds or a clock
 reversal also interrupts holds; machine sleep does not count. After a daemon restart, holds begin again
 and an established breach continues without sending another entry message.
 
-Disk, process and available-memory probes use kernel facts on Linux. macOS reads cached mount facts with `getfsstat`; other hosts
-check `/` when no mount table is available; process and memory readings can be
-unavailable. A tick reads at most 256 local filesystems and 16,384 process entries. Process names match `/proc/PID/comm` exactly. CPU needs two samples.
+Disk, process and available-memory probes use kernel facts on Linux. macOS reads
+cached native mount facts with `getfsstat`; process and memory readings can be
+unavailable. Disk selectors must name absolute paths on native filesystems.
+Network, autofs, FUSE and symlink selectors are unavailable. One disk worker
+reads at most 256 native mounts and refreshes a cache every 30 seconds. A kernel
+call taking more than ten seconds produces a diagnostic; disk readings expire
+after 90 seconds while other metrics continue. The worker waits for that call
+before starting another. Filesystem IDs deduplicate bind mounts where the
+kernel reports the same ID; btrfs subvolumes may have distinct IDs.
+A process tick visits at most 16,384 entries. Names match `/proc/PID/comm`
+exactly, are at most 15 bytes, and CPU needs two samples.
 Physical database growth compares hourly database-plus-WAL samples spanning 24
 hours, including received claims and compaction (which can make growth negative).
 The daemon retains 48 hours locally, samples at most once per UTC hour, and needs
-a full day before it can report growth. A stale latest sample or missing daily
-baseline has no reading. The separate authored-byte metric attributes each member's
+a daily baseline before it can report growth. The baseline is the nearest
+sample within 30 minutes of the 24-hour target; deltas are normalized to a day.
+A latest sample older than two hours or a missing baseline has no reading.
+Future-dated rows are deleted at the next hourly sample after a clock reversal.
+Size and growth have hourly resolution: a hold shorter than an hour can be
+satisfied by one cached sample. WAL checkpoints can move this metric in either
+direction, so growth thresholds need an operational baseline and holds that
+span several samples. The retention SLO's pages-in-use growth is a different
+measurement. A follow-up will consolidate physical readings into that hourly
+sampler and have conditions read its cache; first growth declarations follow
+that consolidation and fleet deployment. The separate authored-byte metric attributes each member's
 contribution to the replicated claim log in hourly buckets over 24 hours; a count
 still catching up has no reading.
 
@@ -74,14 +92,45 @@ st conditions ls --json
 st doctor
 ```
 
-These views read recorded facts. Kernel probes, state folds and notification
-retries run in the daemon background. Steady samples do not append claims;
-changed values and intermediate phases are recorded at most every five minutes,
-and transitions are recorded immediately. Each state carries eight samples.
-The durable notification queue retries recorded transitions across restarts;
-deterministic message identities prevent duplicate wakeups.
+These views read cached values and recorded transitions. Kernel probes, folds
+and notification retries run in the daemon background. Routine samples and
+intermediate hold phases never append claims or wake the reconciler. Each
+local instance keeps its eight most recent exact samples; notification values
+are formatted to three significant digits. Only entry and recovery append
+`condition.state`, on
+`condition-instance/SHA256(condition-root)/SHA256(instance-name)` with the
+condition root in its fields. Latest-state startup seeks skip historical
+claims using the existing subject index. Remote views show the last transition;
+only the evaluating daemon has fresh routine values.
 
-The `condition/NAME` subject and its `condition.state` claims are the seam for
+The daemon accepts at most 32 declarations, 32 host selectors per declaration,
+and eight local instances per condition. Its transition budget is 16 attempted
+writes per tick, with deferred transitions retained for later ticks. Local
+heads retain at most 256 remote instances per declaration. Names, selectors,
+links, notification text and sample rings have fixed size limits. Retired
+conditions lose their local caches. Vanished instances leave the active tracker
+set; an established breach remains as a stale last-known breach, since absence
+cannot prove recovery. A returning instance restores that breach silently.
+
+`st doctor` checks the local evaluator heartbeat and sample age. Breaches,
+recovering states, invalid declarations and stale data warn; a pending hold or
+an instance awaiting its first reading is informational. Other members' breaches
+do not fail the local strict doctor check. Person attention includes stale
+measurement details. A panicking tick is caught, reported and retried.
+
+The durable notification queue retries recorded transitions across restarts;
+deterministic message identities prevent duplicate wakeups. Startup only queues
+own-host transitions accepted in the last hour. A failing notification receives
+three attempts, then leaves the queue with a diagnostic visible in doctor, so
+it cannot block other owners. Authenticated claim origin and instance identity
+must agree with the host fields; received state cannot send as this member.
+
+The per-instance state subject and the condition root field are the seam for
 future waits on a breach. This feature does not implement those waits or accept
-OpenObserve alert webhooks. Upgrade every fleet daemon before publishing the
-new declaration kind.
+OpenObserve alert webhooks. Upgrade every fleet daemon before publishing
+conditions; daemon before CLI, and upgrade clients before a person-owned
+condition is declared. An older registry's unknown-subject-family rejection is
+retried once when its schema digest changes; genuinely invalid subjects remain
+invalid. Operations publishes declarations after confirming every member runs
+the new schema. Existing disk and watchdog missions remain until a real host
+has fired and recovered and operations agrees to retire them.

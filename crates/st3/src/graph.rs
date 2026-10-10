@@ -313,6 +313,9 @@ fn parse_intent_with_owner(
         .collect::<Result<Vec<_>, _>>()?;
     let normalized = json!({ "version": 2, "declarations": normalized_nodes });
     let source_hash = hash_json(&normalized);
+    if context.subjects.values().filter(|subject| subject.kind == "condition").count() > crate::conditions::MAX_CONDITIONS {
+        return Err(St3Error::new("condition-limit", "a document accepts at most 32 conditions"));
+    }
     Ok(NormalizedIntent {
         direct_message_registrations: declarations.iter()
             .filter(|node| !allow_execution_root && public_message_subscription(node))

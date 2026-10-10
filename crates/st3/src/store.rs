@@ -9312,6 +9312,14 @@ impl Store {
             blockers.push(format!("{}: {}", error.code, error.message));
         }
 
+        let condition_subjects = intent.subjects.values().filter(|subject| subject.kind == "condition").map(|subject| subject.subject.as_str()).collect::<BTreeSet<_>>();
+        if !condition_subjects.is_empty() {
+            let mut existing = connection.prepare_cached("SELECT subject FROM desired WHERE kind='condition' LIMIT 33").map_err(internal)?;
+            let mut all = condition_subjects.iter().map(|subject| (*subject).to_owned()).collect::<BTreeSet<_>>();
+            for subject in existing.query_map([], |row| row.get::<_, String>(0)).map_err(internal)? { all.insert(subject.map_err(internal)?); }
+            if all.len() > crate::conditions::MAX_CONDITIONS { blockers.push("condition-limit: at most 32 conditions may be active in the fleet".into()); }
+        }
+
         if intent.deprecated_syntax.contains("pty") {
             warnings.push(
                 "deprecated-kdl-node: `pty {}` is temporarily accepted; use canonical `terminal {}` before the friend-ready v0"
@@ -17823,6 +17831,7 @@ impl Store {
                 | "sekret.exited"
                 | "sekret.refused"
                 | "sekret.changed"
+                | "condition.state"
         )
     }
 
@@ -17836,7 +17845,7 @@ impl Store {
             "SELECT COUNT(*), COUNT(*) FILTER (
                  WHERE kind NOT IN ('harness.usage', 'work.renewed', 'subagent.renewed',
                                     'sekret.called', 'sekret.exited', 'sekret.refused',
-                                    'sekret.changed')
+                                    'sekret.changed', 'condition.state')
                    AND NOT (
                      kind IN ('message.sent', 'message.staged', 'message.delivered',
                               'message.read', 'message.closed')
@@ -27788,6 +27797,10 @@ fn classify_replicated_claim_with_registry(
                 claim.id, error.code, error.message
             ),
         ));
+    }
+    if claim.kind == "condition.state"
+        && !crate::conditions::valid_state_identity(&claim.subject, &claim.origin, &json!(fields)) {
+        return Err(St3Error::new("invalid-replicated-claim", "condition state origin, instance identity or payload bounds are invalid"));
     }
     crate::terminal_binding::validate_claim(&claim.kind, &claim.body, claim.actor.as_deref())?;
     if claim.kind == "owned-set.revised" { owned_sets::validate_receipt(&claim.subject, &claim.body)?; }
@@ -42801,6 +42814,15 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
 
     #[test]
     fn an_unknown_field_is_retryable_and_an_old_schema_rejection_is_readmitted() {
+        assert_old_schema_rejection_is_readmitted("unknown-claim-field");
+    }
+
+    #[test]
+    fn an_old_unknown_subject_family_rejection_is_readmitted_after_upgrade() {
+        assert_old_schema_rejection_is_readmitted("unknown-subject-family");
+    }
+
+    fn assert_old_schema_rejection_is_readmitted(old_code: &str) {
         let source = Store::open_memory("source").unwrap();
         let claim = source
             .append_claim(&ClaimInput {
@@ -42813,6 +42835,13 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 idempotency_key: Some("schema-upgrade-source".into()),
             })
             .unwrap();
+        if old_code == "unknown-subject-family" {
+            let mut old_registry = st3_schema::registry().clone();
+            old_registry.subjects.remove("host");
+            let rejection = classify_replicated_claim_with_registry(&claim, &old_registry).err().unwrap();
+            assert!(rejection.message.contains("unknown-subject-family"));
+            assert!(matches!(classify_replicated_claim_with_registry(&claim, st3_schema::registry()).unwrap(), ReplicatedClaimAdmission::Valid));
+        }
         let exchange = exchange_from(&source, &ReplicationInventory::default());
         let envelope = &exchange.envelopes[0];
 
@@ -42842,7 +42871,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                         claim.subject,
                         claim.kind,
                         format!(
-                            "replicated claim `{}` violates unknown-claim-field: field `future` is unknown",
+                            "replicated claim `{}` violates {old_code}: newer schema item is unknown",
                             claim.id
                         ),
                     ],
@@ -42863,6 +42892,35 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 .id,
             claim.id
         );
+    }
+
+    #[test]
+    fn unresolved_subject_families_retry_once_per_schema_and_invalid_subjects_stay_invalid() {
+        let source = Store::open_memory("source").unwrap();
+        source.append_claim(&ClaimInput {
+            subject: "host/source".into(), kind: "transport.observed".into(), actor: None,
+            fields: BTreeMap::from([("status".into(),json!("up"))]), evidence: Vec::new(), expected_subject: None,
+            idempotency_key: Some("invalid-subject".into()),
+        }).unwrap();
+        let mut exchange = exchange_from(&source, &ReplicationInventory::default());
+        exchange.envelopes = vec![rewrite_envelope(&exchange.envelopes[0], |payload| {
+            let claim = &mut payload.batch.claims[0];
+            claim.subject = "future-family/source".into();
+            claim.id = claim_hash(&claim.batch_id, &claim.subject, &claim.kind, &claim.origin, claim.actor.as_deref(), &claim.body, &claim.predecessors).unwrap();
+        })];
+        let target = Store::open_memory("target").unwrap();
+        let first = receive_and_project(&target, "source", &exchange);
+        assert_eq!(first.invalid, 1);
+        assert_eq!(target.validate_replication_backlog().unwrap().invalid, 0);
+        assert_eq!(target.replica_records(true).unwrap().len(), 1);
+        target.connection.batched(|tx| tx.execute("DELETE FROM meta WHERE key='unknown_subject_families_retried_digest'", [])).unwrap().unwrap();
+        assert_eq!(target.validate_replication_backlog().unwrap().invalid, 1);
+        assert_eq!(target.validate_replication_backlog().unwrap().invalid, 0);
+        assert_eq!(target.replica_records(true).unwrap()[0].state, "invalid");
+        // A known family with a malformed subject does not enter the schema-retry branch.
+        let mut claim = source.latest_claim("host/source", Some("transport.observed")).unwrap().unwrap();
+        claim.subject = "host/".into();
+        assert!(classify_replicated_claim_with_registry(&claim, st3_schema::registry()).is_err());
     }
 
     #[test]

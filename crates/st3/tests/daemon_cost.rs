@@ -1047,52 +1047,46 @@ const ARRANGEMENT_PATH: &str = "/v1/client/arrangements/ada/019a0000-0000-7000-8
 const ARRANGEMENT_FOLDER: &str = "019a0000-0000-7000-8000-000000000010";
 const ARRANGEMENT_PLACEMENT: &str = "agent/fleet/fixture-cost-arrangements/seat";
 
-/// Keep one condition instance live while its durable sample history grows tenfold.
+/// Keep eight breached instances live while their durable history grows tenfold.
 fn seed_condition(store: &Store, scale: f64) {
-    let source = r#"version 2
-condition "bench/cost/database" {
-  metric "db.size-bytes"
-  scope "member"
-  above 1000000000
-  for "5m"
+    let mut source = "version 2\n".to_owned();
+    for number in 0..4 {
+        source.push_str(&format!(r#"condition "bench/cost/disk-{number}" {{
+  metric "disk.free-percent"
+  scope "host"
+  above 1
+  for "1m"
   owner "person/ada"
-}
-"#;
-    let intent = st3::parse_intent(source, NODE).unwrap();
-    let plan = store
-        .mission(
-            &intent,
-            st3::model::IntentInput {
-                kdl: source.into(),
-                source_name: None,
-            },
-        )
-        .unwrap();
-    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
-    store
-        .apply_as(&intent, &plan.subject_tokens, "cost-condition", Some("person/ada"))
-        .unwrap();
-    let decl = store.declared_conditions().unwrap().remove(0).decl.unwrap();
-    let mut tracker = st3::conditions::Tracker::default();
-    for sample in 0..((scale * 10_000.0).round() as usize).max(1) {
-        let now = sample as u128 * 30_000;
-        assert!(tracker.observe(&decl, 100.0 + sample as f64, now).is_none());
-        store
-            .record_condition_state(&st3::store::ConditionRecord {
-                decl: &decl,
-                host: NODE,
-                instance: NODE,
-                tracker: &tracker,
-                transition: None,
-                now,
-            })
-            .unwrap();
+}}
+"#));
     }
-    while store.fold_condition_heads().unwrap() == 500 {}
+    let intent = st3::parse_intent(&source, NODE).unwrap();
+    let plan = store.mission(&intent, st3::model::IntentInput { kdl: source.clone(), source_name: None }).unwrap();
+    assert!(plan.blockers.is_empty(), "{:?}", plan.blockers);
+    store.apply_as(&intent, &plan.subject_tokens, "cost-condition", Some("person/ada")).unwrap();
+    for condition in store.declared_conditions().unwrap() {
+        let decl = condition.decl.unwrap();
+        for volume in 0..2 {
+            let instance = format!("{NODE}:/volume{volume}");
+            let mut tracker = st3::conditions::Tracker::default();
+            assert!(tracker.observe(&decl, 30.0, 0).is_none());
+            assert!(tracker.observe(&decl, 30.0, 60_000).is_some());
+            for sample in 0..((scale * 1_000.0).round() as usize).max(1) {
+                let now = 90_000 + sample as u128 * 30_000;
+                assert!(tracker.observe(&decl, 30.0 + (sample % 10) as f64, now).is_none());
+                store.record_condition_state(&st3::store::ConditionRecord {
+                    decl: &decl, host: NODE, instance: &instance, tracker: &tracker, transition: None, now,
+                }).unwrap();
+            }
+        }
+    }
+    store.seed_condition_heads(true).unwrap();
     let views = store.conditions().unwrap();
-    assert_eq!(views.len(), 1);
-    assert_eq!(views[0].instances.len(), 1);
-    assert_eq!(views[0].instances[0].phase, "clear");
+    assert_eq!(views.len(), 4);
+    for view in views {
+        assert_eq!(view.instances.len(), 2);
+        assert!(view.instances.iter().all(|instance| instance.phase == "breach"));
+    }
 }
 
 /// Grow only durable history, not the live answer, to catch reads that fold old edits.

@@ -6195,7 +6195,8 @@ impl Store {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let _timing = time_stage(&self.replication_timers.admission);
-        let (retry_hash_mismatches, envelopes) = {
+        let schema_digest = self.runtime.schema_digest();
+        let (retry_hash_mismatches, retry_subject_families, envelopes) = {
             // This query does not mutate source or authority. Fetch the pending payloads on a
             // reader and release its lease before queueing any admission writer transaction.
             let connection = self.readers.get();
@@ -6209,7 +6210,12 @@ impl Store {
                 )
                 .optional()?
                 .is_none();
-            let mut statement = connection.prepare(&admission_retry_query(retry_hash_mismatches))?;
+            // Unknown subject families stay invalid on this registry. Recheck old rejections
+            // once per schema digest, so a future upgrade heals them without repeated work.
+            let retried_digest: Option<String> = connection.query_row(
+                "SELECT value FROM meta WHERE key='unknown_subject_families_retried_digest'", [], |row| row.get(0)).optional()?;
+            let retry_subject_families = retried_digest.as_deref() != Some(schema_digest.as_str());
+            let mut statement = connection.prepare(&admission_retry_query_with_schema_retry(retry_hash_mismatches, retry_subject_families))?;
             let envelopes = statement
                 .query_map([], |row| {
                     Ok(ReplicaEnvelope {
@@ -6224,7 +6230,7 @@ impl Store {
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            (retry_hash_mismatches, envelopes)
+            (retry_hash_mismatches, retry_subject_families, envelopes)
         };
         let mut outcome = ReplicationAdmission::default();
         // Prepare the authority fold off the writer in one reader snapshot. A generation
@@ -6351,6 +6357,12 @@ impl Store {
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_claim_hash_retried', ?1)",
                 [now_ms().to_string()],
             )?;
+            transaction.commit()?;
+        }
+        if retry_subject_families {
+            let mut connection = self.connection.write_background();
+            let transaction = connection.transaction()?;
+            transaction.execute("INSERT OR REPLACE INTO meta(key,value) VALUES ('unknown_subject_families_retried_digest',?1)", [schema_digest])?;
             transaction.commit()?;
         }
         // Admitted claims, and any change to membership's trust roots, get their verdicts once
@@ -7671,6 +7683,15 @@ pub fn normalize_actor(value: &str, default_kind: &str) -> String {
 /// join then scanned every envelope: seconds on the writer, on every receive, with nothing
 /// pending. The hash-mismatch branch exists only until its one-time retry has run.
 pub fn admission_retry_query(retry_hash_mismatches: bool) -> String {
+    admission_retry_query_with_schema_retry(retry_hash_mismatches, true)
+}
+
+fn admission_retry_query_with_schema_retry(retry_hash_mismatches: bool, retry_subject_families: bool) -> String {
+    let subject_families = if retry_subject_families {
+        "UNION SELECT writer, sequence, envelope_hash FROM replica_records
+         WHERE state='invalid' AND error_code='invalid-replicated-claim'
+           AND error_message LIKE '%violates unknown-subject-family:%'"
+    } else { "" };
     let hash_mismatches = if retry_hash_mismatches {
         "UNION
              SELECT writer, sequence, envelope_hash FROM replica_records
@@ -7689,6 +7710,7 @@ pub fn admission_retry_query(retry_hash_mismatches: bool) -> String {
              SELECT writer, sequence, envelope_hash FROM replica_records
              WHERE state='invalid' AND error_code='invalid-replicated-claim'
                AND error_message LIKE '%violates unknown-claim-field:%'
+             {subject_families}
              {hash_mismatches}
          )
          SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,

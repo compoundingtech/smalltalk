@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `42eb24a96c8ef3de29ef68885dd53d23baa95e301238668cd0114260130a6c09`
+Digest: `87f3841005755ea1082c43478fc0f32fb769d74bfcd6bb64267af383cde0b7b6`
 Storage version: `18`
 Storage digest: `d11a3e5db57db0a0bd6a9b27474cdd93958a401b3a6482b62aea3595530dbcef`
 
@@ -17,7 +17,8 @@ Storage digest: `d11a3e5db57db0a0bd6a9b27474cdd93958a401b3a6482b62aea3595530dbce
 | `attention` | `attention/ID` | yes | An explicit request for human attention. |
 | `checkpoint` | `checkpoint/DAY` | no | A checkpoint that trims replicated history dated before a UTC day. |
 | `checkpoint-excusal` | `checkpoint-excusal/ID` | no | A person's excusal of an unreachable writer from checkpoints. |
-| `condition` | `condition/NAME` | no | A threshold on a metric the daemon measures, with its owner; its state is a claim on it. |
+| `condition` | `condition/NAME` | no | A threshold on a metric the daemon measures, with its owner. |
+| `condition-instance` | `condition-instance/CONDITION_HASH/INSTANCE_HASH` | no | One daemon-evaluated instance's transition state, referencing its declaration. |
 | `custom` | `custom/NAMESPACE/NAME` | yes | An extension subject. |
 | `daemon` | `daemon/NODE` | no | An st3 daemon. |
 | `doc` | `doc/NAME` | no | A named immutable document lineage. |
@@ -81,7 +82,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `checkpoint.excused` | `checkpoint-excusal` | `system-only` | `append` | `durable` | `reason!:string`, `writer!:string` |  |
 | `checkpoint.sealed` | `checkpoint` | `system-only` | `append` | `durable` | `build:string`, `checkpoint_protocol!:integer`, `cut_unix_ms!:integer`, `participants:array`, `rules_digest!:string`, `sealed_count!:integer`, `sealed_digest!:string` |  |
 | `checkpoint.verified` | `checkpoint` | `system-only` | `append` | `durable` | `build:string`, `checkpoint_protocol!:integer`, `cut_unix_ms!:integer`, `drop_digest!:string`, `dropped_claims!:integer`, `dropped_envelopes!:integer`, `graph_digest!:string`, `participants:array`, `reader_digest!:string`, `retained_digest!:string`, `rules_digest!:string`, `sealed_digest!:string` |  |
-| `condition.state` | `condition` | `system-only` | `append` | `durable` | `breach_since:integer`, `comparison:string`, `host!:string`, `instance!:string`, `measured_at:integer`, `metric:string`, `notification_body:string`, `notification_title:string`, `owner:string`, `phase!:string`, `phase_since:integer`, `recover_at:number`, `threshold:number`, `transition:string`, `value:number`, `values:array` |  |
+| `condition.state` | `condition-instance` | `system-only` | `append` | `durable` | `breach_since:integer`, `comparison:string`, `condition!:string`, `host!:string`, `instance!:string`, `measured_at:integer`, `metric:string`, `notification_body:string`, `notification_title:string`, `owner:string`, `phase!:string`, `phase_since:integer`, `recover_at:number`, `threshold:number`, `transition:string`, `value:number`, `values:array` |  |
 | `daemon.diagnostic` | `daemon` | `system-only` | `append` | `durable` | `code!:string`, `reason!:string`, `severity!:string`, `status:string` |  |
 | `daemon.started` | `daemon` | `system-only` | `append` | `durable` | `features:object`, `pid:integer`, `schema:string`, `schema_digest:string`, `status!:string`, `version:string` | `reset` |
 | `delivery.hold` | `agent` | `authorized-requester` | `state-transition` | `durable` | `held!:boolean`, `legacy_adoption:boolean`, `reason!:string`, `until_unix_ms!:integer` |  |

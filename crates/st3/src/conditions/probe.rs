@@ -7,6 +7,178 @@ use std::path::{Path, PathBuf};
 
 use crate::disk::{DiskSpace, disk_space};
 
+#[derive(Clone, Default)]
+struct DiskRequests {
+    all: bool,
+    paths: std::collections::BTreeSet<String>,
+}
+
+#[derive(Default)]
+struct DiskSnapshot {
+    at: u128,
+    all: BTreeMap<String, DiskSpace>,
+    paths: BTreeMap<String, DiskSpace>,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct DiskCache {
+    requests: std::sync::Mutex<DiskRequests>,
+    snapshot: std::sync::Mutex<DiskSnapshot>,
+}
+
+/// One native-filesystem worker per daemon. A stuck kernel call makes disk readings stale;
+/// the evaluator and its other metrics continue, and no replacement workers accumulate.
+#[derive(Clone)]
+pub(crate) struct DiskSampler(std::sync::Arc<DiskCache>);
+
+impl DiskSampler {
+    pub fn spawn() -> Self {
+        Self::spawn_with(|requests| {
+            let mut snapshot = DiskSnapshot::default();
+            if requests.all {
+                snapshot.all = filesystems();
+            }
+            for path in &requests.paths {
+                if let Some(space) = filesystem_of(path) {
+                    snapshot.paths.insert(path.clone(), space);
+                } else {
+                    snapshot.error = Some(format!(
+                        "unavailable native filesystem selector: {}",
+                        path.chars().take(256).collect::<String>()
+                    ));
+                }
+            }
+            snapshot
+        })
+    }
+
+    fn spawn_with(read: impl Fn(&DiskRequests) -> DiskSnapshot + Send + Sync + 'static) -> Self {
+        let cache = std::sync::Arc::new(DiskCache::default());
+        let weak = std::sync::Arc::downgrade(&cache);
+        let read = std::sync::Arc::new(read);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(cache) = weak.upgrade() else { break };
+                let requests = cache
+                    .requests
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                if !requests.all && requests.paths.is_empty() {
+                    continue;
+                }
+                let read = read.clone();
+                let mut task = tokio::task::spawn_blocking(move || read(&requests));
+                match tokio::time::timeout(std::time::Duration::from_secs(10), &mut task).await {
+                    Ok(Ok(mut snapshot)) => {
+                        snapshot.at = super::now_ms();
+                        *cache
+                            .snapshot
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) = snapshot;
+                    }
+                    Ok(Err(error)) => {
+                        cache
+                            .snapshot
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .error = Some(format!("disk probe failed: {error}"))
+                    }
+                    Err(_) => {
+                        cache
+                            .snapshot
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .error = Some(
+                            "disk probe exceeded 10 seconds; other condition metrics continue"
+                                .into(),
+                        );
+                        // Discard late data: earlier mounts in that result may already be stale.
+                        let _ = task.await;
+                    }
+                }
+            }
+        });
+        Self(cache)
+    }
+
+    pub fn configure(&self, all: bool, paths: impl Iterator<Item = String>) {
+        *self
+            .0
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = DiskRequests {
+            all,
+            paths: paths.take(super::MAX_CONDITIONS).collect(),
+        };
+    }
+
+    pub fn filesystems(&self) -> BTreeMap<String, DiskSpace> {
+        self.0
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .all = true;
+        let snapshot = self
+            .0
+            .snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if super::now_ms() < snapshot.at
+            || super::now_ms().saturating_sub(snapshot.at) > super::STALE_AFTER_MS
+        {
+            BTreeMap::new()
+        } else {
+            snapshot.all.clone()
+        }
+    }
+
+    pub fn filesystem_of(&self, path: &str) -> Option<DiskSpace> {
+        let mut requests = self
+            .0
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if requests.paths.len() < super::MAX_CONDITIONS {
+            requests.paths.insert(path.to_owned());
+        }
+        drop(requests);
+        let snapshot = self
+            .0
+            .snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        (super::now_ms() >= snapshot.at
+            && super::now_ms().saturating_sub(snapshot.at) <= super::STALE_AFTER_MS)
+            .then(|| snapshot.paths.get(path).cloned())
+            .flatten()
+    }
+
+    pub fn errors(&self) -> Vec<String> {
+        let requests = self
+            .0
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !requests.all && requests.paths.is_empty() {
+            return Vec::new();
+        }
+        drop(requests);
+        self.0
+            .snapshot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .error
+            .clone()
+            .into_iter()
+            .collect()
+    }
+}
+
 /// Filesystem types that hold data a host can run out of room on. Everything else in the mount
 /// table (proc, sysfs, cgroups, tmpfs, overlays, network filesystems) is skipped.
 const LOCAL_FILESYSTEMS: &[&str] = &[
@@ -59,7 +231,7 @@ fn unescape(path: &str) -> String {
 }
 
 /// Free space on each local filesystem, keyed by its first mount point. A host without a mount
-/// table reads `/` alone.
+/// table produces no disk reading.
 pub(crate) fn filesystems() -> BTreeMap<String, DiskSpace> {
     #[cfg(not(target_os = "macos"))]
     let mounts = std::fs::read_to_string("/proc/self/mountinfo")
@@ -67,11 +239,6 @@ pub(crate) fn filesystems() -> BTreeMap<String, DiskSpace> {
         .unwrap_or_default();
     #[cfg(target_os = "macos")]
     let mounts = apple_mount_points();
-    let mounts = if mounts.is_empty() {
-        vec!["/".to_owned()]
-    } else {
-        mounts
-    };
     let mut seen = std::collections::BTreeSet::new();
     let mut output = BTreeMap::new();
     for mount in mounts.into_iter().take(256) {
@@ -87,7 +254,7 @@ pub(crate) fn filesystems() -> BTreeMap<String, DiskSpace> {
 
 /// Caller-owned mount table: unlike getmntinfo, getfsstat does not return shared static storage.
 #[cfg(target_os = "macos")]
-fn apple_mount_points() -> Vec<String> {
+fn apple_mounts() -> Vec<(String, String)> {
     let mut mounts = Vec::<libc::statfs>::with_capacity(256);
     let bytes = mounts.capacity() * std::mem::size_of::<libc::statfs>();
     // SAFETY: the allocation can hold 256 statfs records. MNT_NOWAIT uses cached kernel facts.
@@ -107,24 +274,87 @@ fn apple_mount_points() -> Vec<String> {
             let kind = unsafe { std::ffi::CStr::from_ptr(mount.f_fstypename.as_ptr()) }
                 .to_str()
                 .ok()?;
-            if !LOCAL_FILESYSTEMS.contains(&kind) {
-                return None;
-            }
-            Some(
+            Some((
                 unsafe { std::ffi::CStr::from_ptr(mount.f_mntonname.as_ptr()) }
                     .to_str()
                     .ok()?
                     .to_owned(),
-            )
+                kind.to_owned(),
+            ))
         })
         .collect()
 }
 
+#[cfg(target_os = "macos")]
+fn apple_mount_points() -> Vec<String> {
+    apple_mounts()
+        .into_iter()
+        .filter(|(_, kind)| LOCAL_FILESYSTEMS.contains(&kind.as_str()))
+        .map(|(mount, _)| mount)
+        .collect()
+}
+
 /// Free space on the filesystem holding `path`.
+/// Select the enclosing native mount from kernel facts, then stat the mount itself.
+/// Never stat an authored path: it might traverse a symlink, autofs or a network mount.
 pub(crate) fn filesystem_of(path: &str) -> Option<DiskSpace> {
-    disk_space(Path::new(path))
+    if !Path::new(path).is_absolute()
+        || Path::new(path)
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    let mount = local_mount_for(path, &std::fs::read_to_string("/proc/self/mountinfo").ok()?)?;
+    #[cfg(target_os = "macos")]
+    let mount = apple_mounts()
+        .into_iter()
+        .filter(|(mount, _)| Path::new(path).starts_with(mount))
+        .max_by_key(|(mount, _)| mount.len())
+        .filter(|(_, kind)| LOCAL_FILESYSTEMS.contains(&kind.as_str()))?
+        .0;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return None;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut prefix = PathBuf::new();
+        for component in Path::new(path).components() {
+            prefix.push(component.as_os_str());
+            match std::fs::symlink_metadata(&prefix) {
+                Ok(metadata) if metadata.file_type().is_symlink() => return None,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    disk_space(Path::new(&mount))
         .ok()
         .filter(|space| space.total > 0)
+}
+
+/// An explicit selector cannot traverse a more-specific foreign mount.
+#[cfg(any(target_os = "linux", test))]
+fn local_mount_for(path: &str, mountinfo: &str) -> Option<String> {
+    let path = Path::new(path);
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let (mount, kind) = mountinfo
+        .lines()
+        .filter_map(|line| {
+            let (before, after) = line.split_once(" - ")?;
+            let mount = unescape(before.split(' ').nth(4)?);
+            let kind = after.split(' ').next()?;
+            path.starts_with(&mount).then_some((mount, kind))
+        })
+        .max_by_key(|(mount, _)| mount.len())?;
+    LOCAL_FILESYSTEMS.contains(&kind).then_some(mount)
 }
 
 pub(crate) fn free_percent(space: &DiskSpace) -> f64 {
@@ -215,6 +445,10 @@ impl ProcessSampler {
     /// Read every process whose `comm` is one of `names`, in one pass over the process table.
     /// A name with no running process has no reading.
     pub fn sample(&mut self, names: &[&str], now: u128) -> BTreeMap<String, ProcessReading> {
+        let names_set = names
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
         let mut found: HashMap<&str, HashMap<(u32, u64), ProcessStat>> = HashMap::new();
         if let Ok(entries) = std::fs::read_dir(&self.root) {
             for entry in entries.flatten().take(16_384) {
@@ -230,7 +464,7 @@ impl ProcessSampler {
                     continue;
                 };
                 let comm = comm.trim_end_matches('\n');
-                let Some(name) = names.iter().find(|name| **name == comm) else {
+                let Some(name) = names_set.get(comm) else {
                     continue;
                 };
                 let Some(stat) = std::fs::read_to_string(directory.join("stat"))
@@ -318,6 +552,44 @@ mod tests {
 27 22 0:31 /@home /home rw,relatime shared:6 - btrfs /dev/sda1 rw
 ";
         assert_eq!(mount_points(mountinfo), ["/", "/srv/data disk", "/home"]);
+    }
+
+    #[test]
+    fn authored_paths_do_not_select_foreign_mounts_or_parent_traversals() {
+        let mounts = "1 0 8:1 / / rw - ext4 /dev/a rw\n2 1 0:2 / /net rw - nfs server:/a rw\n3 1 0:3 / /auto rw - autofs auto rw\n4 1 0:4 / /fuse rw - fuse.sshfs remote rw\n";
+        assert_eq!(local_mount_for("/srv/data", mounts).as_deref(), Some("/"));
+        for path in [
+            "/net/data",
+            "/auto/data",
+            "/fuse/data",
+            "/srv/../net",
+            "relative",
+        ] {
+            assert_eq!(local_mount_for(path, mounts), None, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_blocked_disk_worker_does_not_block_cached_reads() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = std::sync::Mutex::new(release_rx);
+        let sampler = DiskSampler::spawn_with(move |_| {
+            if let Some(sender) = entered.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+            let _ = release.lock().unwrap().recv();
+            DiskSnapshot::default()
+        });
+        sampler.configure(true, std::iter::empty());
+        let started = tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await;
+        let reads = sampler.filesystems();
+        let errors = sampler.errors();
+        release_tx.send(()).unwrap();
+        assert!(started.is_ok());
+        assert!(reads.is_empty());
+        assert!(errors.is_empty());
     }
 
     #[test]

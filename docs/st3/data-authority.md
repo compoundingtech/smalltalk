@@ -244,3 +244,21 @@ A cleanup infrastructure error produces `eval.verdict` with `verdict=void`.
 agent workspace reconciliation. It carries `host`, `workspace`, and an optional `repository`.
 The reconciler writes only changed values. Repository suggestions combine those observations
 with current checkout declarations; a gateway reads graph evidence and never scans host disks.
+
+### Local condition tables added after the baseline
+
+Condition declarations and entry/recovery `condition.state` claims are shared
+facts. Five disposable, host-owned tables serve background evaluation and reads:
+
+| Table | Scope | Authority / bound |
+| --- | --- | --- |
+| `local_condition_heads` | Local cache | Canonical latest transition pointer per declaration and instance; 32 declarations, at most 256 remote instances each. Rebuilt by indexed latest-state seeks. |
+| `local_condition_observations` | Local live overlay | Eight recent samples and hold phase; 32 declarations, eight instances each. Never replicated. |
+| `local_condition_notifications` | Local retry queue | Own-host transition deliveries, at most 16 attempts per tick and three attempts per failing row. Message identity is durable and idempotent. |
+| `local_condition_database_samples` | Local measurement | Hourly database-plus-WAL sizes, retained for 48 hours. |
+| `local_condition_claim_bytes` | Local counter | Two days of hourly authored-byte buckets, with bounded background folds. |
+
+These tables do not enter shared projection digests. Graph state uses canonical
+latest selection; local cursors, heartbeat and retry counters live in `meta`.
+Reads never rebuild these tables. Store open creates them without changing
+storage version 18; no global claim index is built at startup.

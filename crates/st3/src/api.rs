@@ -7027,10 +7027,23 @@ fn doctor_report_with_operation_drift(
             message: error.to_string(),
         }),
     }
-    for (name, status, message) in crate::conditions::doctor_lines(
-        &state.store.conditions().map_err(ApiError::internal)?,
-    ) {
-        checks.push(DoctorCheck { name, status: status.into(), message });
+    match state.store.conditions_local(&state.node) {
+        Ok(conditions) => {
+            for (name, status, message) in crate::conditions::doctor_lines(&conditions) {
+                checks.push(DoctorCheck { name, status: status.into(), message });
+            }
+            if !conditions.is_empty() {
+                match state.store.condition_evaluator_status() {
+                    Ok((_, Some(error))) => checks.push(DoctorCheck { name: "condition-evaluator".into(), status: "warn".into(), message: error }),
+                    Ok((Some(at), None)) => checks.push(DoctorCheck { name: "condition-evaluator".into(),
+                        status: if at < 0 || crate::conditions::now_ms() < at as u128 || crate::conditions::now_ms().saturating_sub(at as u128) > crate::conditions::STALE_AFTER_MS { "warn" } else { "pass" }.into(),
+                        message: format!("last successful evaluation: {}", crate::conditions::utc(at as u128)) }),
+                    Ok((None, None)) => checks.push(DoctorCheck { name: "condition-evaluator".into(), status: "info".into(), message: "awaiting the first evaluation".into() }),
+                    Err(error) => checks.push(DoctorCheck { name: "condition-evaluator".into(), status: "fail".into(), message: error.to_string() }),
+                }
+            }
+        }
+        Err(error) => checks.push(DoctorCheck { name: "conditions".into(), status: "fail".into(), message: error.to_string() }),
     }
     match state.store.claim_verdict_counts() {
         Ok(counts) => checks.push(claim_signatures_check(&counts)),
@@ -17057,7 +17070,7 @@ condition "fleet/disk" {
   metric "disk.free-percent"
   scope "host"
   below 15
-  for "0s"
+  for "1m"
   owner "person/ada"
 }
 "#;
@@ -17066,9 +17079,10 @@ condition "fleet/disk" {
         state.store.apply_as(&intent, &plan.subject_tokens, "conditions", Some("person/ada")).unwrap();
         let decl = state.store.declared_conditions().unwrap().remove(0).decl.unwrap();
         let mut tracker = crate::conditions::Tracker::default();
-        let transition = tracker.observe(&decl, 10.0, 1_000);
+        tracker.observe(&decl, 10.0, 1_000);
+        let transition = tracker.observe(&decl, 10.0, 61_000);
         state.store.record_condition_state(&crate::store::ConditionRecord {
-            decl: &decl, host: "node", instance: "node:/", tracker: &tracker, transition, now: 1_000,
+            decl: &decl, host: "node", instance: "node:/", tracker: &tracker, transition, now: 61_000,
         }).unwrap();
         state.store.fold_condition_heads().unwrap();
         let before = state.store.index().unwrap();
