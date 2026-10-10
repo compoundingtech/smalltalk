@@ -13,7 +13,7 @@ import { makeScreen } from '../terminal/fixtures.ts'
 import { LiveAgentWorkspace } from './LiveAgentWorkspace.tsx'
 
 vi.mock('@stylexjs/stylex', () => ({ create: (styles: unknown) => styles, defineVars: (variables: unknown) => variables, createTheme: () => ({}), keyframes: () => 'animation', props: () => ({}) }))
-const agent = decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', name: 'Example Agent', host_id: 'host/example', runtime_ids: [], reachability: 'reachable', state: 'running', harness_state: 'idle', blocked_on: null, fault: null, revision: '1', updated_at: '2026-10-04T12:00:00.000Z' })
+const agent = decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', name: 'Example Agent', host_id: 'host/example', runtime_ids: ['runtime/example'], reachability: 'reachable', state: 'running', harness_state: 'idle', blocked_on: null, fault: null, revision: '1', updated_at: '2026-10-04T12:00:00.000Z' })
 const screen = { ...makeScreen({ scene: 'F3', columns: 40, rows: 4, frame: 0 }), terminal_id: 'terminal/example' as const }
 let registry: AtomRegistry.AtomRegistry
 let root: Root
@@ -33,9 +33,9 @@ beforeEach(() => {
   root = createRoot(host)
 })
 afterEach(async () => { await act(async () => root.unmount()); registry.dispose(); host.remove(); vi.unstubAllGlobals() })
-const mount = async (agents: Feed<readonly Agent[]>) => {
-  const source = fixtureSource({ world: { now: 0, agents: [agent], missions: [], attention: [], events: [], conversations: {}, terminals: { 'terminal/example': screen }, envelopes: {}, usage: { _tag: 'undeclared' } }, overrides: { agents } })
-  await act(async () => root.render(<DataSourceProvider source={source} registry={registry}><LiveAgentWorkspace /></DataSourceProvider>))
+const mount = async (agents: Feed<readonly Agent[]>, terminal: Feed<typeof screen> = observed({ value: screen }), retryTerminal?: (ref: string) => void) => {
+  const source = fixtureSource({ world: { now: 0, agents: [agent], missions: [], attention: [], events: [], conversations: { [agent.id]: { items: [], hasOlder: false } }, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' } }, overrides: { agents, terminal: { 'terminal/example': terminal } } })
+  await act(async () => root.render(<DataSourceProvider source={{ ...source, ...(retryTerminal === undefined ? {} : { retryTerminal }) }} registry={registry}><LiveAgentWorkspace /></DataSourceProvider>))
 }
 const toggle = () => host.querySelector<HTMLButtonElement>('[data-testid="thread-header"] button[aria-label="Toggle terminal drawer"]')
 const toggleDescription = () => (toggle()?.getAttribute('aria-describedby') ?? '').split(/\s+/).filter(Boolean)

@@ -429,6 +429,7 @@ resolution, refreshed fences after a runtime replacement, and bounded refusal ha
 For the stale-fence negative control, replace the SDK retry's `readTerminalRuntime(runtimeRef)`
 with `Effect.succeed(observation)`: the stale-attach test must fail because no fresh runtime
 is read and the replacement terminal cannot be subscribed.
+
 ## Continuous integration
 
 Workspace CI runs on pull requests and merge groups. The five required checks are `linux-gate`,

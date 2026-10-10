@@ -246,7 +246,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
               </aside>
               <ResizableSplit id="live-agent-sidebar" value={width} min={208} max={maxSidebar} collapsed={collapsed} label="Agent sidebar width" onChange={(value) => { setCollapsed(false); setDragWidth(value) }} onCommit={(value) => { setRatio(value / viewport); setDragWidth(undefined) }} onToggle={() => setCollapsed(!collapsed)} onReset={() => { setCollapsed(false); setRatio(256 / viewport) }} />
               <section aria-label="Agent workspace" {...stylex.props(styles.workspace)}>
-                <ThreadHeader terminalAvailable={terminalRef !== undefined} nativeActions={current === '' || selectedPane !== 'thread' ? undefined : <ConversationHeaderActions key={current} agentRef={current} />} actionPortalRef={setHeaderSlot} folder={agent?.host} title={agent?.name ?? (current || 'Select an agent')} status={headerRow?.status} statusLabel={headerRow?.statusLabel} statusSince={headerRow?.statusSince} freshness={stale ? 'stale' : agent === undefined ? 'unobserved' : 'live'} now={now} panelOpen={diffOpen} drawerOpen={selectedPane.includes('terminal/')} onTogglePanel={() => setDiffOpen((value) => !value)} onToggleDrawer={() => { if (selectedPane.startsWith('terminal/')) navigate(current); else if (terminalRef !== undefined) open({ ref: terminalRef }) }} />
+                <ThreadHeader terminalAvailable={terminalRef !== undefined} {...(terminalDisabledReason === undefined ? {} : { terminalDisabledReason })} nativeActions={current === '' ? undefined : <ConversationHeaderActions key={current} agentRef={current} />} actionPortalRef={setHeaderSlot} folder={agent?.host} title={agent?.name ?? (current || 'Select an agent')} status={headerRow?.status} statusLabel={headerRow?.statusLabel} statusSince={headerRow?.statusSince} freshness={stale ? 'stale' : agent === undefined ? 'unobserved' : 'live'} now={now} panelOpen={diffOpen} drawerOpen={selectedPane.includes('terminal/')} onTogglePanel={() => setDiffOpen((value) => !value)} onToggleDrawer={() => { if (selectedPane.startsWith('terminal/')) navigate(current); else if (terminalRef !== undefined) open({ ref: terminalRef }) }} />
                 {visiblePanes.length > 0 ? (
                   <div role="toolbar" aria-label="Workspace views" {...stylex.props(styles.tabs)}>
                     <Aria.Button aria-pressed={selectedPane === 'thread'} onPress={() => navigate(current)} {...stylex.props(styles.textButton)}>
@@ -309,7 +309,8 @@ export function WorkspaceBody({ current, rosterRefs, view, agentName, onOpenTool
   }, [viewportStore])
   const [retained, setRetained] = React.useState<readonly RetainedPane[]>([])
   const [switched, setSwitched] = React.useState<{ readonly shown: string; readonly covered: string | undefined }>({ shown: current, covered: undefined })
-  const visible = current !== '' && view._tag === 'Thread'
+  // The terminal is a drawer below the thread: the thread stays shown and usable beside it.
+  const visible = current !== '' && (view._tag === 'Thread' || view._tag === 'Terminal')
   const [visited, setVisited] = React.useState<readonly string[]>([])
   const rosterKeys = new Set(rosterRefs)
   const recent = visited.filter(ref => rosterKeys.has(ref))
@@ -333,22 +334,24 @@ export function WorkspaceBody({ current, rosterRefs, view, agentName, onOpenTool
     return () => { window.cancelAnimationFrame(frame); window.clearTimeout(timer) }
   }, [switched])
   return <ViewportStoreContext.Provider value={viewportStore}>
-    {retained.map(pane => {
-      const shown = visible && pane.ref === current
-      return <div key={pane.ref} {...stylex.props(styles.retainedPane, shown ? styles.shownPane : visible && pane.ref === switched.covered ? null : styles.hiddenPane)}>
-        <ConversationPaneLoadBoundary agentRef={pane.ref} agentName={pane.name} onOpenTool={onOpenTool} ux={ux} visible={shown} />
-      </div>
-    })}
-    {current === '' ? <div {...stylex.props(styles.empty)}>Choose an agent to open its live thread.</div>
-      : view._tag === 'Thread' ? null
-      : view._tag === 'Terminal' ? (
-        <div key={view.ref} data-testid="terminal-pane" {...stylex.props(styles.retainedPane, styles.terminalPane)}>
-          <React.Suspense fallback={<p role="status" {...stylex.props(styles.empty)}>Loading terminal…</p>}>
-            <TerminalDetail address={{ ref: view.ref, presentation: 'detail' }} visibility="visible" />
-          </React.Suspense>
+    <div {...stylex.props(styles.threadArea)}>
+      {retained.map(pane => {
+        const shown = visible && pane.ref === current
+        return <div key={pane.ref} {...stylex.props(styles.retainedPane, shown ? styles.shownPane : visible && pane.ref === switched.covered ? null : styles.hiddenPane)}>
+          <ConversationPaneLoadBoundary agentRef={pane.ref} agentName={pane.name} onOpenTool={onOpenTool} ux={ux} visible={shown} />
         </div>
-      )
-      : <p role="status" {...stylex.props(styles.empty)}>{workspaceViewNotice(view)}</p>}
+      })}
+      {current === '' ? <div {...stylex.props(styles.empty)}>Choose an agent to open its live thread.</div>
+        : view._tag === 'ViewUnavailable' ? <p role="status" {...stylex.props(styles.empty)}>{workspaceViewNotice(view)}</p>
+          : null}
+    </div>
+    {current !== '' && view._tag === 'Terminal' ? (
+      <section key={view.ref} aria-label="Terminal drawer" data-testid="terminal-pane" {...stylex.props(styles.terminalDrawer)}>
+        <React.Suspense fallback={<p role="status" {...stylex.props(styles.empty)}>Loading terminal…</p>}>
+          <TerminalDetail address={{ ref: view.ref, presentation: 'detail' }} visibility="visible" />
+        </React.Suspense>
+      </section>
+    ) : null}
   </ViewportStoreContext.Provider>
 }
 
@@ -372,7 +375,8 @@ const styles = stylex.create({
   retainedPane: { position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', minWidth: 0, minHeight: 0, backgroundColor: c.canvas },
   shownPane: { zIndex: 1 },
   hiddenPane: { contentVisibility: 'hidden' },
-  terminalPane: { zIndex: 2 },
+  threadArea: { position: 'relative', display: 'flex', flexDirection: 'column', flexGrow: 1, flexBasis: 0, minWidth: 0, minHeight: 0 },
+  terminalDrawer: { display: 'flex', flexDirection: 'column', flexGrow: 0, flexShrink: 0, flexBasis: '45%', minHeight: 160, minWidth: 0, overflow: 'hidden', backgroundColor: c.canvas, borderTopWidth: 1, borderTopStyle: 'solid', borderTopColor: c.border },
   tabs: { height: 32, display: 'flex', alignItems: 'center', gap: s.xs, paddingInline: s.lg, borderBottomWidth: 1, borderBottomStyle: 'solid', borderBottomColor: c.border, flexShrink: 0 },
   notice: { padding: s.lg, fontSize: t.metaSize, color: c.fgMuted },
   empty: { position: 'relative', zIndex: 2, margin: 'auto', padding: s.section, color: c.fgMuted },

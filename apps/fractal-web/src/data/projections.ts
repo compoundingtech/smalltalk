@@ -91,6 +91,7 @@ const agentFromRow = (row: St3.Agent): Agent => {
   return {
     ref: row.id,
     terminal: terminalSubjectForAgent(row.id),
+    ...(row.runtime_ids.length === 0 ? { terminalDisabledReason: 'This agent has no terminal.' } : {}),
     name: row.name,
     lifecycle: lifecycleOf(row),
     host: hostName(row),
@@ -234,6 +235,7 @@ const sameCheckout = Schema.toEquivalence(St3.AgentCheckout)
 const sameAgent = (a: Agent, b: Agent): boolean =>
   a.ref === b.ref &&
   a.terminal === b.terminal &&
+  a.terminalDisabledReason === b.terminalDisabledReason &&
   a.name === b.name &&
   a.lifecycle._tag === b.lifecycle._tag &&
   a.host === b.host &&

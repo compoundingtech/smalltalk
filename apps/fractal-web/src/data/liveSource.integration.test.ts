@@ -1,6 +1,7 @@
 import { it } from '@effect/vitest'
 import type {
   Agent,
+  ActionOf,
   CollectionCommand,
   CollectionFrame,
   CollectionSocket,
@@ -43,11 +44,24 @@ class Gateway {
   socket: CollectionSocket | undefined
   readonly commands: CollectionCommand[] = []
   readonly sentFollowSubscribes: Array<{ readonly id: string; readonly key: string }> = []
+  readonly runtimeReads: string[] = []
+  readonly terminalActions: ActionOf<'terminal.attach'>[] = []
+  readonly terminalRequests: Array<'read' | 'attach'> = []
+  terminalReplacement = ''
+  replaceOnAttach = false
+  terminalAttachRefusal: string | undefined
+  terminalAttachRetryable = false
+  terminalAttachStatus = 409
+  terminalAttachTransportFailure = false
+  runtimesWithoutTerminal = new Set<string>()
   messageGrant: 'granted' | 'ungranted' = 'granted'
   transportFailure = false
   capabilityGate: Promise<void> | undefined
   rejectedCredential = false
   runtimeRefusalStatus: number | undefined
+  runtimeRefusalCode: string | undefined
+  runtimeRefusalRetryable = false
+  runtimeTransportFailure = false
   sendGate: Promise<void> | undefined
   rejectSend = false
   currentSnapshot: Snapshot | undefined = snapshot
@@ -101,11 +115,14 @@ class Gateway {
         transport: 'fabric-loopback',
       }
     } else if (path.startsWith('/v1/client/runtimes/')) {
+      this.runtimeReads.push(decodeURIComponent(path.slice('/v1/client/runtimes/'.length)))
+      this.terminalRequests.push('read')
+      if (this.runtimeTransportFailure) throw new TypeError('Runtime connection interrupted')
       if (this.runtimeRefusalStatus !== undefined)
         return new Response(JSON.stringify({
           api_version: 'st3.client.v0', error_version: 'st3.client.error.v0',
-          code: this.runtimeRefusalStatus === 503 ? 'unavailable' : 'forbidden',
-          message: 'Runtime read refused', retryable: false, request_id: 'request/runtime', details: {},
+          code: this.runtimeRefusalCode ?? (this.runtimeRefusalStatus === 503 ? 'unavailable' : 'forbidden'),
+          message: 'Runtime read refused', retryable: this.runtimeRefusalRetryable, request_id: 'request/runtime', details: {},
         }), { status: this.runtimeRefusalStatus, headers: { 'content-type': 'application/json' } })
       const name = decodeURIComponent(path.slice('/v1/client/runtimes/'.length)).slice(
         'runtime/'.length,
@@ -116,13 +133,13 @@ class Gateway {
         revision: '1',
         updated_at: snapshot.created_at,
         desired_revision: null,
-        incarnation_id: `incarnation-${name}`,
+        incarnation_id: `incarnation-${name}${this.terminalReplacement}`,
         owner_host_id: 'host/example',
         owner_id: agent.id,
         runtime_id: name,
         runtime_kind: 'agent',
         state: 'running',
-        terminal_id: `terminal/${name}`,
+        terminal_id: this.runtimesWithoutTerminal.has(`runtime/${name}`) ? null : `terminal/${name}${this.terminalReplacement}`,
       } satisfies Runtime
     } else if (path === '/v1/client/actions' && typeof init?.body === 'string') {
       const action = JSON.parse(init.body)
@@ -177,6 +194,23 @@ class Gateway {
           snapshot_id: snapshot.id,
         }
       } else if (action.type === 'terminal.attach') {
+        this.terminalActions.push(action)
+        this.terminalRequests.push('attach')
+        if (this.terminalAttachTransportFailure) throw new TypeError('Terminal attach connection interrupted')
+        if (this.replaceOnAttach) {
+          this.replaceOnAttach = false
+          this.terminalReplacement = '-replacement'
+          this.currentSnapshot = { ...snapshot, id: 'snapshot/2', store_index: 2 }
+        }
+        const code = this.terminalAttachRefusal ?? (
+          action.fence.runtime_incarnation !== `incarnation-old${this.terminalReplacement}` &&
+          this.terminalReplacement !== '' ? 'stale-fence' : undefined
+        )
+        if (code !== undefined) return Response.json({
+          api_version: 'st3.client.v0', error_version: 'st3.client.error.v0',
+          code, message: 'Terminal attach refused', retryable: this.terminalAttachRetryable,
+          request_id: 'request/terminal-attach', details: {},
+        }, { status: code === 'forbidden' ? 403 : this.terminalAttachStatus })
         value = {
           terminal_attachment: {
             runtime_incarnation: action.fence.runtime_incarnation,
@@ -517,6 +551,299 @@ describe('cold conversation admission', () => {
 
 
 describe('terminal dependent-read authority', () => {
+  it.live('terminal failure contract: reports a seat missing from an authoritative live roster without runtime reads', () =>
+    withGateway((live, gateway) => Effect.gen(function* () {
+      live.registry.mount(live.source.agents)
+      yield* settle
+      gateway.fleet([])
+      yield* settle
+      const ref = 'terminal/example'
+      live.registry.mount(live.source.terminalInterest!(ref))
+      yield* settle
+      expect(live.registry.get(live.source.terminal(ref))).toEqual({
+        _tag: 'Unavailable', reason: 'failed', detail: 'This agent is not in the live agent roster.', retryable: false,
+      })
+      expect(gateway.runtimeReads).toEqual([])
+      expect(gateway.terminalActions).toEqual([])
+      live.source.retryTerminal?.(ref)
+      yield* settle
+      expect(gateway.runtimeReads).toEqual([])
+      expect(gateway.terminalActions).toEqual([])
+    })),
+  )
+
+  for (const runtimeIds of [[], ['runtime/one', 'runtime/two']]) {
+    it.live(`terminal failure contract: reports no terminal for ${runtimeIds.length} terminal-less runtimes`, () =>
+      withGateway((live, gateway) => Effect.gen(function* () {
+        for (const id of runtimeIds) gateway.runtimesWithoutTerminal.add(id)
+        live.registry.mount(live.source.agents)
+        yield* settle
+        gateway.fleet([{ ...agent, runtime_ids: runtimeIds }])
+        yield* settle
+        const ref = 'terminal/example'
+        live.registry.mount(live.source.terminalInterest!(ref))
+        yield* settle
+        expect(gateway.runtimeReads).toEqual(runtimeIds)
+        expect(gateway.terminalActions).toEqual([])
+        expect(live.registry.get(live.source.terminal(ref))).toEqual({
+          _tag: 'Unavailable', reason: 'failed', detail: 'This agent has no terminal.',
+          code: 'no-terminal', retryable: false,
+        })
+        expect(live.source.retryTerminal).toBeTypeOf('function')
+        live.source.retryTerminal?.(ref)
+        yield* settle
+        expect(gateway.runtimeReads).toEqual(runtimeIds)
+        expect(gateway.terminalActions).toEqual([])
+      })),
+    )
+  }
+
+  for (const refusal of [
+    { status: 401, code: 'forbidden', retryable: true, reason: 'ungranted', expectedRetryable: false },
+    { status: 403, code: 'forbidden', retryable: false, reason: 'ungranted', expectedRetryable: false },
+    { status: 400, code: 'unsupported-capability', retryable: true, reason: 'unsupported', expectedRetryable: false },
+    { status: 404, code: 'not-found', retryable: false, reason: 'failed', expectedRetryable: false },
+    { status: 503, code: 'unavailable', retryable: false, reason: 'failed', expectedRetryable: false },
+    { status: 503, code: 'unavailable', retryable: true, reason: 'failed', expectedRetryable: true },
+  ] as const) {
+    it.live(`terminal failure contract: preserves runtime ${refusal.status}/${refusal.code} retryable=${refusal.retryable}`, () =>
+      withGateway((live, gateway) => Effect.gen(function* () {
+        gateway.runtimeRefusalStatus = refusal.status
+        gateway.runtimeRefusalCode = refusal.code
+        gateway.runtimeRefusalRetryable = refusal.retryable
+        live.registry.mount(live.source.agents)
+        yield* settle
+        gateway.fleet([agent])
+        yield* settle
+        const ref = 'terminal/example'
+        live.registry.mount(live.source.terminalInterest!(ref))
+        yield* settle
+        expect(live.registry.get(live.source.terminal(ref))).toEqual({
+          _tag: 'Unavailable', reason: refusal.reason, detail: 'Runtime read refused',
+          code: refusal.code, retryable: refusal.expectedRetryable,
+        })
+        expect(gateway.runtimeReads).toEqual(['runtime/old'])
+        expect(gateway.terminalActions).toEqual([])
+        gateway.runtimeRefusalStatus = undefined
+        expect(live.source.retryTerminal).toBeTypeOf('function')
+        live.source.retryTerminal?.(ref)
+        yield* settle
+        expect(gateway.runtimeReads).toHaveLength(refusal.expectedRetryable ? 2 : 1)
+        expect(gateway.terminalActions).toHaveLength(refusal.expectedRetryable ? 1 : 0)
+        if (refusal.expectedRetryable) {
+          gateway.screen(gateway.subscription('terminal').id, 'old', 'Recovered screen')
+          yield* settle
+          expect(live.registry.get(live.source.terminal(ref))._tag).toBe('Observed')
+          live.source.retryTerminal?.(ref)
+          yield* settle
+          expect(gateway.runtimeReads).toHaveLength(2)
+        }
+      })),
+    )
+  }
+
+  it.live('terminal failure contract: retries a runtime transport failure without an automatic loop', () =>
+    withGateway((live, gateway) => Effect.gen(function* () {
+      gateway.runtimeTransportFailure = true
+      live.registry.mount(live.source.agents)
+      yield* settle
+      gateway.fleet([agent])
+      yield* settle
+      const ref = 'terminal/example'
+      live.registry.mount(live.source.terminalInterest!(ref))
+      yield* settle
+      expect(live.registry.get(live.source.terminal(ref))).toMatchObject({
+        _tag: 'Unavailable', reason: 'failed', detail: 'Runtime connection interrupted', retryable: true,
+      })
+      yield* Effect.promise(() => vi.advanceTimersByTimeAsync(5_000))
+      yield* settle
+      expect(gateway.runtimeReads).toEqual(['runtime/old'])
+      gateway.runtimeTransportFailure = false
+      expect(live.source.retryTerminal).toBeTypeOf('function')
+      live.source.retryTerminal?.(ref)
+      yield* settle
+      expect(gateway.runtimeReads).toEqual(['runtime/old', 'runtime/old'])
+      expect(gateway.terminalActions).toHaveLength(1)
+    })),
+  )
+  it.live('terminal failure contract: retries a retry-helpful attach HTTP transport failure', () =>
+    withGateway((live, gateway) => Effect.gen(function* () {
+      gateway.terminalAttachTransportFailure = true
+      live.registry.mount(live.source.agents)
+      yield* settle
+      gateway.fleet([agent])
+      yield* settle
+      const ref = 'terminal/example'
+      live.registry.mount(live.source.terminalInterest!(ref))
+      yield* settle
+      expect(live.registry.get(live.source.terminal(ref))).toMatchObject({
+        _tag: 'Unavailable', reason: 'failed', detail: 'Terminal attach connection interrupted', retryable: true,
+      })
+      expect(gateway.terminalActions).toHaveLength(1)
+      gateway.terminalAttachTransportFailure = false
+      expect(live.source.retryTerminal).toBeTypeOf('function')
+      live.source.retryTerminal?.(ref)
+      yield* settle
+      expect(gateway.runtimeReads).toEqual(['runtime/old', 'runtime/old'])
+      expect(gateway.terminalActions).toHaveLength(2)
+    })),
+  )
+
+
+  for (const retryable of [false, true]) {
+    it.live(`terminal failure contract: preserves attach HTTP retryable=${retryable}`, () =>
+      withGateway((live, gateway) => Effect.gen(function* () {
+        gateway.terminalAttachRefusal = 'unavailable'
+        gateway.terminalAttachRetryable = retryable
+        gateway.terminalAttachStatus = 503
+        live.registry.mount(live.source.agents)
+        yield* settle
+        gateway.fleet([agent])
+        yield* settle
+        const ref = 'terminal/example'
+        live.registry.mount(live.source.terminalInterest!(ref))
+        yield* settle
+        expect(live.registry.get(live.source.terminal(ref))).toEqual({
+          _tag: 'Unavailable', reason: 'failed', detail: 'Terminal attach refused', code: 'unavailable', retryable,
+        })
+        gateway.terminalAttachRefusal = undefined
+        expect(live.source.retryTerminal).toBeTypeOf('function')
+        live.source.retryTerminal?.(ref)
+        yield* settle
+        expect(gateway.runtimeReads).toHaveLength(retryable ? 2 : 1)
+        expect(gateway.terminalActions).toHaveLength(retryable ? 2 : 1)
+      })),
+    )
+
+    it.live(`terminal failure contract: preserves a terminal stream refusal retryable=${retryable}`, () =>
+      withGateway((live, gateway) => Effect.gen(function* () {
+        live.registry.mount(live.source.agents)
+        yield* settle
+        gateway.fleet([agent])
+        yield* settle
+        const ref = 'terminal/example'
+        live.registry.mount(live.source.terminalInterest!(ref))
+        yield* settle
+        gateway.send({
+          kind: 'error', id: gateway.subscription('terminal').id, collection: 'terminal',
+          code: 'owner-busy', message: 'The terminal owner is busy', retryable,
+        })
+        yield* settle
+        expect(live.registry.get(live.source.terminal(ref))).toEqual({
+          _tag: 'Unavailable', reason: 'failed', detail: 'The terminal owner is busy', code: 'owner-busy', retryable,
+        })
+        expect(live.source.retryTerminal).toBeTypeOf('function')
+        live.source.retryTerminal?.(ref)
+        yield* settle
+        expect(gateway.runtimeReads).toHaveLength(retryable ? 2 : 1)
+        expect(gateway.terminalActions).toHaveLength(retryable ? 2 : 1)
+      })),
+    )
+  }
+
+  it.live('terminal failure contract: clears a previous screen when runtime ownership becomes empty', () =>
+    withGateway((live, gateway) => Effect.gen(function* () {
+      live.registry.mount(live.source.agents)
+      yield* settle
+      gateway.fleet([agent])
+      yield* settle
+      const ref = 'terminal/example'
+      live.registry.mount(live.source.terminalInterest!(ref))
+      yield* settle
+      gateway.screen(gateway.subscription('terminal').id, 'old', 'Previous screen')
+      yield* settle
+      expect(live.registry.get(live.source.terminal(ref))._tag).toBe('Observed')
+      gateway.fleet([{ ...agent, revision: '2', runtime_ids: [] }])
+      yield* settle
+      expect(gateway.runtimeReads).toEqual(['runtime/old'])
+      expect(live.registry.get(live.source.terminal(ref))).toEqual({
+        _tag: 'Unavailable', reason: 'failed', detail: 'This agent has no terminal.', code: 'no-terminal', retryable: false,
+      })
+    })),
+  )
+
+  it.live('reads the runtime exactly once per attach, including a reconnect', () =>
+    withGateway((live, gateway) => Effect.gen(function* () {
+      live.registry.mount(live.source.agents)
+      yield* settle
+      gateway.fleet([agent])
+      yield* settle
+      live.registry.mount(live.source.terminalInterest!('terminal/example'))
+      yield* settle
+      expect(gateway.runtimeReads).toEqual(['runtime/old'])
+      expect(gateway.terminalRequests).toEqual(['read', 'attach'])
+      expect(gateway.terminalActions).toHaveLength(1)
+      expect(gateway.terminalActions[0]).toMatchObject({
+        fence: { snapshot_id: snapshot.id, runtime_incarnation: 'incarnation-old' },
+        parameters: { target_id: 'terminal/old' },
+      })
+      expect(gateway.subscription('terminal')).toMatchObject({
+        terminal: 'terminal/old', incarnation: 'incarnation-old',
+      })
+      gateway.terminalReplacement = '-replacement'
+      gateway.socket?.onclose?.({ code: 1006, reason: '' })
+      yield* settle
+      yield* Effect.promise(() => vi.advanceTimersByTimeAsync(1_000))
+      yield* settle
+      expect(gateway.runtimeReads).toEqual(['runtime/old', 'runtime/old'])
+      expect(gateway.terminalRequests).toEqual(['read', 'attach', 'read', 'attach'])
+      expect(gateway.terminalActions).toHaveLength(2)
+      expect(gateway.subscription('terminal')).toMatchObject({
+        terminal: 'terminal/old-replacement', incarnation: 'incarnation-old-replacement',
+      })
+    })),
+  )
+
+  it.live('re-reads the runtime and retries once after a stale attach fence', () =>
+    withGateway((live, gateway) => Effect.gen(function* () {
+      live.registry.mount(live.source.agents)
+      yield* settle
+      gateway.fleet([agent])
+      yield* settle
+      gateway.replaceOnAttach = true
+      live.registry.mount(live.source.terminalInterest!('terminal/example'))
+      yield* settle
+      expect(gateway.runtimeReads).toEqual(['runtime/old', 'runtime/old'])
+      expect(gateway.terminalRequests).toEqual(['read', 'attach', 'read', 'attach'])
+      expect(gateway.terminalActions).toHaveLength(2)
+      expect(gateway.terminalActions[0]).toMatchObject({
+        fence: { snapshot_id: 'snapshot/1', runtime_incarnation: 'incarnation-old' },
+        parameters: { target_id: 'terminal/old' },
+      })
+      expect(gateway.terminalActions[1]).toMatchObject({
+        fence: { snapshot_id: 'snapshot/2', runtime_incarnation: 'incarnation-old-replacement' },
+        parameters: { target_id: 'terminal/old-replacement' },
+      })
+      const subscribed = gateway.commands.filter((command) => command.kind === 'subscribe' && command.collection === 'terminal')
+      expect(subscribed).toHaveLength(1)
+      expect(subscribed[0]).toMatchObject({
+        terminal: 'terminal/old-replacement', incarnation: 'incarnation-old-replacement',
+        capability: 'capability-terminal/old-replacement',
+      })
+    })),
+  )
+
+  for (const code of ['stale-fence', 'forbidden']) {
+    it.live(`bounds terminal attach refreshes for ${code}`, () =>
+      withGateway((live, gateway) => Effect.gen(function* () {
+        live.registry.mount(live.source.agents)
+        yield* settle
+        gateway.fleet([agent])
+        yield* settle
+        gateway.terminalAttachRefusal = code
+        live.registry.mount(live.source.terminalInterest!('terminal/example'))
+        yield* settle
+        const attempts = code === 'stale-fence' ? 2 : 1
+        expect(gateway.runtimeReads).toHaveLength(attempts)
+        expect(gateway.terminalActions).toHaveLength(attempts)
+        expect(gateway.commands.filter((command) => command.kind === 'subscribe' && command.collection === 'terminal')).toHaveLength(0)
+        expect(live.registry.get(live.source.sync!.terminal('terminal/example')).sync.status).toEqual({
+          _tag: 'Failed', cause: { _tag: 'Server', code, message: 'Terminal attach refused' },
+        })
+      })),
+    )
+  }
+
   for (const status of [401, 403, 503]) {
     it.live(`handles replacement runtime refusal ${status} without disclosing revoked content`, () =>
       withGateway((live, gateway) =>

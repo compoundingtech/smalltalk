@@ -44,15 +44,21 @@ const mount = async ({ terminal, reachability = 'reachable' }: { readonly termin
 describe('terminal detail', () => {
   it.each([
     ['loading', waiting, 'Loading terminal…'],
-    ['ungranted', unavailable({ reason: 'ungranted', detail: 'forbidden: raw gateway refusal' }), 'This terminal is not available to this view.'],
-    ['unsupported', unavailable({ reason: 'unsupported', detail: 'raw capability detail' }), 'This gateway does not provide terminals.'],
-    ['failed', unavailable({ reason: 'failed', detail: 'agent/example has no terminal runtime' }), 'The terminal could not be opened. Return to the thread and open it again.'],
-  ] as const)('states %s with fixed copy and no transport detail', async (state, terminal, copy) => {
+    ['ungranted', unavailable({ reason: 'ungranted', detail: 'Terminal viewing is not permitted.' }), 'Terminal viewing is not permitted.'],
+    ['unsupported', unavailable({ reason: 'unsupported', detail: 'This gateway does not provide terminals.' }), 'This gateway does not provide terminals.'],
+    ['failed', unavailable({ reason: 'failed', detail: 'This agent has no terminal.', code: 'no-terminal' }), 'This agent has no terminal.'],
+  ] as const)('states %s with its specific reason', async (state, terminal, copy) => {
     await mount({ terminal })
     const status = host.querySelector('[data-terminal-state]')
     expect(status?.getAttribute('data-terminal-state')).toBe(state)
     expect(host.textContent).toBe(copy)
-    expect(host.textContent).not.toMatch(/raw|forbidden|runtime|Unknown/)
+    expect(host.textContent).not.toMatch(/\b(undefined|unknown)\b/i)
+  })
+
+  it.each(['', '   ', 'undefined', 'unknown'])('does not render a missing reason (%s)', async detail => {
+    await mount({ terminal: unavailable({ reason: 'failed', detail }) })
+    expect(host.textContent).toBe('The terminal could not be opened.')
+    expect(host.textContent).not.toMatch(/\b(undefined|unknown)\b/i)
   })
 
   it('renders the live grid with input gated exactly as the source publishes it and history honestly unavailable', async () => {

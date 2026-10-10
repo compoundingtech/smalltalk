@@ -20,15 +20,17 @@ import { TerminalKeyboardBinding } from './TerminalKeyboardBinding.tsx'
 import { TerminalPane } from './TerminalPane.tsx'
 import { TerminalResize } from './TerminalResize.tsx'
 
-/** Fixed copy for a terminal without an observed screen; transport details never reach the view. */
-export const terminalUnobservedCopy = (feed: UnobservedFeed): string =>
-  feed._tag === 'Waiting'
-    ? 'Loading terminal…'
-    : feed.reason === 'ungranted'
-      ? 'This terminal is not available to this view.'
-      : feed.reason === 'unsupported'
-        ? 'This gateway does not provide terminals.'
-        : 'The terminal could not be opened. Return to the thread and open it again.'
+/** A terminal source publishes a human reason; a blank or placeholder detail falls back to fixed copy. */
+export const terminalUnobservedCopy = (feed: UnobservedFeed): string => {
+  if (feed._tag === 'Waiting') return 'Loading terminal…'
+  const reason = feed.detail.trim()
+  if (reason !== '' && !/^(undefined|unknown|null)$/i.test(reason)) return reason
+  return feed.reason === 'ungranted'
+    ? 'This terminal is not available to this view.'
+    : feed.reason === 'unsupported'
+      ? 'This gateway does not provide terminals.'
+      : 'The terminal could not be opened.'
+}
 
 /** Native terminal observations retain their real grid and lifecycle instead of inventing an envelope. */
 export const TerminalDetail = React.memo(
@@ -43,13 +45,14 @@ export const TerminalDetail = React.memo(
     const terminal = useTerminal(address.ref)
     if (terminal._tag !== 'Observed')
       return (
-        <p
-          role="status"
-          data-terminal-state={terminal._tag === 'Waiting' ? 'loading' : terminal.reason}
-          {...stylex.props(styles.unobserved)}
-        >
-          {terminalUnobservedCopy(terminal)}
-        </p>
+        <div {...stylex.props(styles.unobserved)}>
+          <p role="status" data-terminal-state={terminal._tag === 'Waiting' ? 'loading' : terminal.reason}>
+            {terminalUnobservedCopy(terminal)}
+          </p>
+          {terminal._tag === 'Unavailable' && terminal.retryable === true && source.retryTerminal !== undefined ? (
+            <button type="button" onClick={() => source.retryTerminal?.(address.ref)}>Retry</button>
+          ) : null}
+        </div>
       )
     const screen = terminal.value
     const resizeReason =

@@ -1,4 +1,4 @@
-import { Agent, AgentId, Resource, Revision, decodeUnknownSync, type AgentEncoded } from '@smalltalk/st3-client/schema'
+import { Agent, AgentId, Resource, Revision, RuntimeId, decodeUnknownSync, type AgentEncoded } from '@smalltalk/st3-client/schema'
 import { expect, test } from 'vitest'
 
 import { fixtureAttention, fixtureMissions } from '../missions/fixtures.ts'
@@ -78,6 +78,17 @@ test.each(['example-seat', 'team/seat', 'terminal/example', '', 'agent/', 'agent
     expect(terminalSubjectForAgent(id)).toBeUndefined()
   },
 )
+
+test('terminal failure contract: projects authoritative empty runtime ownership as disabled', () => {
+  const project = createProjections()
+  const empty = project.fleetFromAgents([row])
+  expect(empty.agents[0]).toHaveProperty('terminalDisabledReason', 'This agent has no terminal.')
+  const running = { ...row, runtime_ids: [decodeUnknownSync(RuntimeId)('runtime/example')] }
+  const enabled = project.fleetFromAgents([running])
+  expect(enabled).not.toBe(empty)
+  expect(enabled.agents[0]).not.toHaveProperty('terminalDisabledReason')
+  expect(project.fleetFromAgents([row]).agents[0]).toHaveProperty('terminalDisabledReason', 'This agent has no terminal.')
+})
 
 test.each([
   { name: 'Declared standing', declaration: { lifecycle: 'standing' }, expected: 'Standing' },

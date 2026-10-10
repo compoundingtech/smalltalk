@@ -63,9 +63,12 @@ export type Feed<A> =
       readonly _tag: 'Unavailable'
       /** `ungranted`: the paired device lacks the scope (the read-only dev device); `unsupported`: the gateway lacks the capability. */
       readonly reason: 'ungranted' | 'unsupported' | 'failed'
+      /** Terminal feeds display this source-owned reason; other feeds treat it as diagnostic detail. */
       readonly detail: string
       /** The read error's machine code (for example `not-found`): classification and data-wf-* diagnostics only, never display copy. */
       readonly code?: string
+      /** Explicit terminal recovery policy; absence makes no retryability claim. */
+      readonly retryable?: boolean
     }
 
 /** Which adapter feeds the tree: the deterministic fixture world or the st gateway. */
@@ -94,6 +97,8 @@ export type SeatLifecycle =
 export interface Agent {
   readonly ref: string
   readonly terminal: string
+  /** An authoritative empty runtime list proves this agent has no terminal. */
+  readonly terminalDisabledReason?: string
   readonly name: string
   readonly lifecycle: SeatLifecycle
   readonly host: string
@@ -254,6 +259,8 @@ export interface DataSource {
   /** Keyed by terminal ref; live attaches a read-only viewer. */
   readonly terminal: (terminalRef: string) => Atom.Atom<Feed<TerminalScreen>>
   readonly terminalInterest?: (terminalRef: string) => Atom.Atom<void>
+  /** Explicit recovery for a retryable terminal failure; never retries a healthy or permanent feed. */
+  readonly retryTerminal?: (terminalRef: string) => void
   /** Explicit geometry action; never tied to the browser pane dimensions. */
   readonly terminalResize?: TerminalResizePort
   /** Retained owner scrollback, with its own independently granted availability. */
@@ -294,20 +301,23 @@ export const observed = <A>({
 })
 /** The feed before the first observation arrives. */
 export const waiting: Feed<never> = { _tag: 'Waiting' }
-/** A feed the source cannot serve; `detail` and `code` are diagnostics, never display copy. */
+/** A feed the source cannot serve; only terminal feeds use `detail` as display copy; `code` is diagnostic. */
 export const unavailable = ({
   reason,
   detail,
   code,
+  retryable,
 }: {
   readonly reason: 'ungranted' | 'unsupported' | 'failed'
   readonly detail: string
   readonly code?: string | undefined
+  readonly retryable?: boolean | undefined
 }): Feed<never> => ({
   _tag: 'Unavailable',
   reason,
   detail,
   ...(code === undefined ? {} : { code }),
+  ...(retryable === undefined ? {} : { retryable }),
 })
 
 /** Live sources' clock for ages and countdowns; ticks once a second while observed. */

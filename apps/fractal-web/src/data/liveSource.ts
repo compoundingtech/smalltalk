@@ -1,4 +1,4 @@
-import { ClientError, St3Client } from '@smalltalk/st3-client'
+import { ClientError, St3Client, isTransient } from '@smalltalk/st3-client'
 import { Runtime, Snapshot, decodeUnknownSync } from '@smalltalk/st3-client/schema'
 import type { Agent, Attention, Mission, TerminalScreen } from '@smalltalk/st3-client/schema'
 import {
@@ -90,6 +90,22 @@ interface RetainedConversation extends RetainedFeed<ConversationPage> {
 interface PendingSend {
   item: TextItem
 }
+/** Terminal-only presentation and recovery policy; unrelated feeds keep their existing verdicts. */
+const terminalUnavailable = (error: AttachFailure): Feed<never> => {
+  const authorizationRefusal =
+    error.authorizationRefused === true || error.code === 'forbidden' || error.status === 401 || error.status === 403
+  const unsupported = error.code === 'unsupported' || error.code === 'unsupported-capability'
+  const permanent =
+    authorizationRefusal || unsupported || error.code === 'no-terminal' ||
+    error.code === 'not-found' || error.code === 'terminal-ended'
+  return unavailable({
+    reason: authorizationRefusal ? 'ungranted' : unsupported ? 'unsupported' : 'failed',
+    detail: error.message,
+    code: error.code,
+    retryable: !permanent && error.retryable === true,
+  })
+}
+
 
 /** Connect retained workbench projections through one SDK runtime and frame writer. */
 export const liveSource = ({
@@ -226,7 +242,7 @@ export const liveSource = ({
     let latest: Feed<A> =
       readRejection === undefined
         ? waiting
-        : unavailable({ reason: 'ungranted', detail: readRejection })
+        : unavailable({ reason: 'ungranted', detail: readRejection, ...(telemetryKind === 'terminal' ? { retryable: false } : {}) })
     let syncLatest = initialFeedSync<A>(Date.now(), connectionAttempt)
     if (readRejection !== undefined)
       syncLatest = transitionFeedSync(
@@ -247,7 +263,7 @@ export const liveSource = ({
     const following = Atom.make((get): Feed<A> => {
       let active = true
       if (readRejection !== undefined)
-        latest = unavailable({ reason: 'ungranted', detail: readRejection })
+        latest = unavailable({ reason: 'ungranted', detail: readRejection, ...(telemetryKind === 'terminal' ? { retryable: false } : {}) })
       else if (latest._tag === 'Observed') {
         latest = { ...latest, freshness: 'stale' }
         syncLatest = transitionFeedSync(syncLatest, { _tag: 'Stale', reason: { _tag: 'Unknown' } }, Date.now())
@@ -275,7 +291,7 @@ export const liveSource = ({
           _tag: 'Failed',
           cause: { _tag: 'Local', kind: 'connection-rejected', detail: { message } },
         })
-        latest = unavailable({ reason: 'ungranted', detail: message })
+        latest = unavailable({ reason: 'ungranted', detail: message, ...(telemetryKind === 'terminal' ? { retryable: false } : {}) })
         ingest.accept({ key: commit, value: commit })
       }
       deniedReaders.add(deny)
@@ -354,11 +370,13 @@ export const liveSource = ({
                             detail: event.error.message,
                           },
                         }
-                      : unavailable({
-                          reason: authorizationRefusal ? 'ungranted' : 'failed',
-                          detail: event.error.message,
-                          code: failure._tag === 'Failed' && failure.cause._tag === 'Server' ? failure.cause.code : undefined,
-                        })
+                      : telemetryKind === 'terminal' && event.error._tag === 'Attach'
+                        ? terminalUnavailable(event.error)
+                        : unavailable({
+                            reason: authorizationRefusal ? 'ungranted' : 'failed',
+                            detail: event.error.message,
+                            code: failure._tag === 'Failed' && failure.cause._tag === 'Server' ? failure.cause.code : undefined,
+                          })
                 } else {
                   // SDK sync status owns the verdict; this event only degrades retained content.
                   if (latest._tag === 'Observed') latest = { ...latest, freshness: 'stale' }
@@ -377,12 +395,14 @@ export const liveSource = ({
               syncLatest = transitionFeedSync(syncLatest, failure, Date.now())
               const authorizationRefusal =
                 error.authorizationRefused === true || error.code === 'forbidden' || error.status === 401 || error.status === 403
-              latest = latest._tag === 'Observed' && !authorizationRefusal
+              latest = latest._tag === 'Observed' && !authorizationRefusal && !(telemetryKind === 'terminal' && error.code === 'no-terminal')
                 ? { ...latest, freshness: 'stale', error: { reason: 'failed', detail: error.message } }
-                : unavailable({
-                  reason: authorizationRefusal ? 'ungranted' : 'failed', detail: error.message,
-                  code: failure._tag === 'Failed' && failure.cause._tag === 'Server' ? failure.cause.code : undefined,
-                })
+                : telemetryKind === 'terminal'
+                  ? terminalUnavailable(error)
+                  : unavailable({
+                      reason: authorizationRefusal ? 'ungranted' : 'failed', detail: error.message,
+                      code: failure._tag === 'Failed' && failure.cause._tag === 'Server' ? failure.cause.code : undefined,
+                    })
               ingest.accept({ key: commit, value: commit })
             }),
           ),
@@ -449,7 +469,7 @@ export const liveSource = ({
       get(retained.snapshot)
       // Snapshot-only readers have no follow controller, but still lose read authority on rejection.
       const refusal = get(readRefusal)
-      if (refusal !== undefined) return unavailable({ reason: 'ungranted', detail: refusal })
+      if (refusal !== undefined) return unavailable({ reason: 'ungranted', detail: refusal, ...(telemetryKind === 'terminal' ? { retryable: false } : {}) })
       return latest
     })
     retained = {
@@ -759,21 +779,36 @@ export const liveSource = ({
           if (authority?._tag === 'Unavailable' && authority.reason === 'ungranted')
             return yield* new AttachFailure({ authorizationRefused: true, message: authority.detail })
           if (ids === undefined)
-            return yield* new AttachFailure({ message: `No live agent owns ${ref}` })
+            return yield* new AttachFailure({
+              message: authority?._tag === 'Observed' && authority.freshness === 'live'
+                ? 'This agent is not in the live agent roster.'
+                : `No live agent owns ${ref}`,
+              retryable: false,
+            })
           for (const id of ids) {
             const response = yield* Effect.tryPromise({
               try: () => client.runtimesGet(id),
               catch: (error) => error instanceof ClientError
-                ? new AttachFailure({ code: error.response.code, status: error.status, message: error.response.message })
-                : new AttachFailure({ message: String(error) }),
+                ? new AttachFailure({
+                    code: error.response.code, status: error.status, message: error.response.message,
+                    retryable: error.response.retryable,
+                  })
+                : new AttachFailure({
+                    message: error instanceof Error ? error.message : String(error),
+                    retryable: isTransient(error),
+                  }),
             })
             const row = yield* Effect.try({
               try: () => decodeUnknownSync(Runtime)(response.value),
               catch: (error) => new AttachFailure({ message: String(error) }),
             })
-            if (Option.isSome(row.terminal_id)) return { _tag: 'Terminal' as const, runtime: id }
+            if (Option.isSome(row.terminal_id)) return {
+              _tag: 'Terminal' as const,
+              runtime: id,
+              initialRuntime: { value: row, snapshotId: response.snapshot.id },
+            }
           }
-          return yield* new AttachFailure({ message: `${agentRef} has no terminal runtime` })
+          return yield* new AttachFailure({ code: 'no-terminal', message: 'This agent has no terminal.', retryable: false })
         })
       },
       follow: ({ st3, spec }) =>
@@ -900,6 +935,11 @@ export const liveSource = ({
       resources,
       terminal,
       terminalInterest: (ref) => retainTerminal(ref).interest,
+      retryTerminal: (ref) => {
+        const entry = terminalFamily(ref)
+        const feed = registry.get(entry.atom)
+        if (feed._tag === 'Unavailable' && feed.retryable === true) retainTerminal(ref).retry()
+      },
       terminalResize: gatewayTerminalResize(client),
       terminalHistory: unavailableTerminalHistory,
       events: Atom.make(

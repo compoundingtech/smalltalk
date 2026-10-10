@@ -1,6 +1,9 @@
 import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import { describe, expect, it, vi } from 'vitest'
+import { fixtureSource } from '../data/fixtureSource.ts'
+import { DataSourceProvider } from '../data/react.tsx'
 import { WorkspaceBody } from './LiveAgentWorkspace.tsx'
 import { retainPane, workspaceView, type RetainedPane } from './workspaceView.ts'
 
@@ -13,13 +16,16 @@ vi.mock('@stylexjs/stylex', () => ({
 }))
 
 describe('workspace body', () => {
-  it('renders the terminal surface instead of the transcript when a terminal pane is selected', () => {
+  it('renders the terminal as a drawer beside the shown thread', () => {
     const view = workspaceView({ ref: 'terminal/fixture/one' })
     expect(view).toEqual({ _tag: 'Terminal', ref: 'terminal/fixture/one' })
-    const html = renderToStaticMarkup(createElement(WorkspaceBody, { current: 'agent/fixture/one', rosterRefs: ['agent/fixture/one'], view, agentName: 'Fixture', onOpenTool: vi.fn() }))
-    expect(html).toMatch(/data-testid="terminal-pane"/)
+    const source = fixtureSource({ world: { now: 0, agents: [], missions: [], attention: [], events: [], conversations: {}, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' } } })
+    const html = renderToStaticMarkup(createElement(DataSourceProvider, { source, registry: AtomRegistry.make(), children: createElement(WorkspaceBody, { current: 'agent/fixture/one', rosterRefs: ['agent/fixture/one'], view, agentName: 'Fixture', onOpenTool: vi.fn() }) }))
+    expect(html).toMatch(/<section aria-label="Terminal drawer" data-testid="terminal-pane">/)
     expect(html).toMatch(/Loading terminal…/)
-    expect(html).not.toMatch(/conversation|transcript|Terminal unavailable/i)
+    expect(html).toMatch(/aria-label="Transcript"/)
+    expect(html).toMatch(/^<div><div><div style="display:contents" aria-hidden="false">/)
+    expect(html).not.toMatch(/Terminal unavailable/i)
   })
   it('states that any other non-thread view is unavailable', () => {
     const html = renderToStaticMarkup(createElement(WorkspaceBody, { current: 'agent/fixture/one', rosterRefs: ['agent/fixture/one'], view: workspaceView({ ref: 'monitor/quota' }), agentName: 'Fixture', onOpenTool: vi.fn() }))

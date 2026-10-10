@@ -37,6 +37,7 @@ import {
   type CollectionSocketFactory,
   type CollectionStream,
   isTransientCode,
+  isTransient,
   St3Client,
 } from '@smalltalk/st3-client'
 import {
@@ -153,6 +154,8 @@ export class Rejected extends Data.TaggedError('Rejected')<{
 export class AttachFailure extends Data.TaggedError('Attach')<{
   readonly code?: string
   readonly status?: number
+  /** Preserve the gateway retry policy, or a retry-helpful HTTP transport failure. */
+  readonly retryable?: boolean
   /** Local dependent-read authorization loss, not a fabricated daemon error code. */
   readonly authorizationRefused?: boolean
   readonly message: string
@@ -201,6 +204,12 @@ export type FollowEvent<A> =
   | { readonly _tag: 'Stale'; readonly code?: string; readonly message?: string }
   | { readonly _tag: 'Failed'; readonly error: FollowFailure }
 
+/** A runtime already read while resolving a terminal, with the snapshot that fenced that read. */
+export interface TerminalRuntimeObservation {
+  readonly value: Runtime
+  readonly snapshotId: string
+}
+
 /** What a follow follows; `followKey` is its admission identity. */
 export type FollowSpec =
   | {
@@ -210,7 +219,12 @@ export type FollowSpec =
       readonly filters?: CollectionFilters
     }
   | { readonly _tag: 'Conversation'; readonly ref: string }
-  | { readonly _tag: 'Terminal'; readonly runtime: string }
+  | {
+      readonly _tag: 'Terminal'
+      readonly runtime: string
+      /** Consumed by the first attach only; reconnects and resyncs read the runtime afresh. */
+      readonly initialRuntime?: TerminalRuntimeObservation
+    }
 
 /** Stable admission identity shared by a follow and its visibility updates. */
 export const followKey = (spec: FollowSpec): string => {
@@ -815,7 +829,11 @@ const make = (options: St3Options) =>
                   }
                   fail(
                     spec._tag === 'Terminal'
-                      ? new AttachFailure({ message: frame.message, ...(frame.code === undefined ? {} : { code: frame.code }) })
+                      ? new AttachFailure({
+                          message: frame.message,
+                          ...(frame.code === undefined ? {} : { code: frame.code }),
+                          ...(frame.retryable === undefined ? {} : { retryable: frame.retryable }),
+                        })
                       : new Rejected({ code: frame.code, message: frame.message }),
                   )
                   return
@@ -892,71 +910,104 @@ const make = (options: St3Options) =>
         }),
       })
 
-    /** `runtimesGet` → attach fenced on the runtime incarnation → subscribe with the capability. */
-    const attachTerminal = (runtimeRef: string) =>
-      Effect.gen(function* () {
-        const read = yield* Effect.tryPromise({
-          try: () => client.runtimesGet(runtimeRef),
-          catch: (error) => error instanceof ClientError
-            ? new AttachFailure({ code: error.response.code, status: error.status, message: error.response.message })
-            : new AttachFailure({ message: errorMessage(error) }),
-        })
-        const runtime = yield* Effect.try({
-          try: () => decodeRuntime(read.value),
-          catch: (error) => new DecodeFailure({ message: errorMessage(error) }),
-        })
-        if (Option.isNone(runtime.terminal_id) || Option.isNone(runtime.incarnation_id)) {
-          return yield* new AttachFailure({ message: `${runtimeRef} has no live terminal` })
-        }
-        const terminal = runtime.terminal_id.value
-        const incarnation = runtime.incarnation_id.value
-        const result = yield* Effect.tryPromise({
-          try: () =>
-            client.terminalAttach({
-              id: `action/wf-${crypto.randomUUID()}`,
-              idempotency_key: crypto.randomUUID(),
-              fence: {
-                snapshot_id: read.snapshot.id,
-                subject_revisions: {},
-                runtime_incarnation: incarnation,
-              },
-              parameters: { target_id: terminal },
-            }),
-          catch: (error) => error instanceof ClientError
-            ? new AttachFailure({ code: error.response.code, status: error.status, message: error.response.message })
-            : new AttachFailure({ message: errorMessage(error) }),
-        })
-        const attachment = result.value.terminal_attachment
-        if (attachment === undefined || attachment === null || !attachment.stream_capability) {
-          return yield* new AttachFailure({ message: 'the gateway returned no terminal stream' })
-        }
-        return {
-          terminal,
-          incarnation: attachment.runtime_incarnation,
-          capability: attachment.stream_capability,
-        }
+    const readTerminalRuntime = Effect.fn(function* (runtimeRef: string) {
+      const read = yield* Effect.tryPromise({
+        try: () => client.runtimesGet(runtimeRef),
+        catch: (error) => error instanceof ClientError
+          ? new AttachFailure({
+              code: error.response.code, status: error.status, message: error.response.message,
+              retryable: error.response.retryable,
+            })
+          : new AttachFailure({ message: errorMessage(error), retryable: isTransient(error) }),
       })
+      const runtime = yield* Effect.try({
+        try: () => decodeRuntime(read.value),
+        catch: (error) => new DecodeFailure({ message: errorMessage(error) }),
+      })
+      return { value: runtime, snapshotId: read.snapshot.id } satisfies TerminalRuntimeObservation
+    })
+
+    const submitTerminalAttach = Effect.fn(function* (
+      runtimeRef: string,
+      observation: TerminalRuntimeObservation,
+    ) {
+      const runtime = observation.value
+      if (Option.isNone(runtime.terminal_id) || Option.isNone(runtime.incarnation_id)) {
+        return yield* new AttachFailure({ message: `${runtimeRef} has no live terminal` })
+      }
+      const terminal = runtime.terminal_id.value
+      const incarnation = runtime.incarnation_id.value
+      const result = yield* Effect.tryPromise({
+        try: () =>
+          client.terminalAttach({
+            id: `action/wf-${crypto.randomUUID()}`,
+            idempotency_key: crypto.randomUUID(),
+            fence: {
+              snapshot_id: observation.snapshotId,
+              subject_revisions: {},
+              runtime_incarnation: incarnation,
+            },
+            parameters: { target_id: terminal },
+          }),
+        catch: (error) => error instanceof ClientError
+          ? new AttachFailure({
+              code: error.response.code, status: error.status, message: error.response.message,
+              retryable: error.response.retryable,
+            })
+          : new AttachFailure({ message: errorMessage(error), retryable: isTransient(error) }),
+      })
+      const attachment = result.value.terminal_attachment
+      if (attachment === undefined || attachment === null || !attachment.stream_capability) {
+        return yield* new AttachFailure({ message: 'the gateway returned no terminal stream' })
+      }
+      return {
+        terminal,
+        incarnation: attachment.runtime_incarnation,
+        capability: attachment.stream_capability,
+      }
+    })
+
+    /** Reuse resolution's observation, but never retry a refused fence without a fresh runtime read. */
+    const attachTerminal = Effect.fn(function* (
+      runtimeRef: string,
+      initialRuntime?: TerminalRuntimeObservation,
+    ) {
+      const observation = initialRuntime ?? (yield* readTerminalRuntime(runtimeRef))
+      return yield* submitTerminalAttach(runtimeRef, observation).pipe(
+        Effect.catchIf(
+          (error) => error.code === 'stale-fence',
+          () => Effect.flatMap(readTerminalRuntime(runtimeRef), (fresh) => submitTerminalAttach(runtimeRef, fresh)),
+        ),
+      )
+    })
 
     const followTerminal = (spec: Extract<FollowSpec, { _tag: 'Terminal' }>) =>
       follow<TerminalScreen>({
         spec,
-        makeProtocol: () => ({
-          subscribe: ({ stream, id }) =>
-            Effect.map(attachTerminal(spec.runtime), ({ terminal, incarnation, capability }) =>
-              stream.subscribeTerminal(id, terminal, incarnation, capability),
-            ),
-          onData: (frame) => {
-            if (frame.kind !== 'screen') return undefined
-            try {
-              return decodeScreen(frame.value)
-            } catch {
-              // The schema failure quotes the frame, which carries screen text: log fixed text only.
-              console.warn('st3 terminal screen did not decode')
-              return undefined
-            }
-          },
-          reset: () => {},
-        }),
+        makeProtocol: () => {
+          let initialRuntime = spec.initialRuntime
+          return {
+            subscribe: ({ stream, id }) =>
+              Effect.suspend(() => {
+                const observation = initialRuntime
+                initialRuntime = undefined
+                return Effect.map(attachTerminal(spec.runtime, observation), ({ terminal, incarnation, capability }) =>
+                  stream.subscribeTerminal(id, terminal, incarnation, capability),
+                )
+              }),
+            onData: (frame) => {
+              if (frame.kind !== 'screen') return undefined
+              try {
+                return decodeScreen(frame.value)
+              } catch {
+                // The schema failure quotes the frame, which carries screen text: log fixed text only.
+                console.warn('st3 terminal screen did not decode')
+                return undefined
+              }
+            },
+            reset: () => {},
+          }
+        },
       })
 
     return St3.of({
