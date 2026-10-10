@@ -23,9 +23,9 @@ fn append_fixture_claim(
 
 fn send_fixture_message(store: &Store, index: usize, seed: usize) -> String {
     let subject = format!("message/sql-{seed}-{index:05}");
-    let from = if index % 11 == 0 {
+    let from = if index.is_multiple_of(11) {
         "agent/sql-narrow"
-    } else if index % 3 == 0 {
+    } else if index.is_multiple_of(3) {
         "person/alex"
     } else {
         "agent/sql-sender"
@@ -42,20 +42,20 @@ fn send_fixture_message(store: &Store, index: usize, seed: usize) -> String {
         ("content".into(), json!(format!("body {seed}/{index}: λ\nsecond line"))),
         ("status".into(), json!("sent")),
     ]);
-    if index % 2 == 0 {
+    if index.is_multiple_of(2) {
         fields.insert("title".into(), json!(format!("title {index}")));
         fields.insert("session_id".into(), json!(format!("session/{seed}/{index}")));
     }
-    if index % 3 == 0 {
+    if index.is_multiple_of(3) {
         fields.insert("in_reply_to".into(), json!("message/sql-parent"));
     }
-    let tags = if index % 5 == 0 {
+    let tags = if index.is_multiple_of(5) {
         vec![format!("reminder:sql-{}", index % 3), format!("version:{}", index % 4)]
     } else {
         vec![format!("fixture:{seed}"), "unicode:λ".into()]
     };
     fields.insert("tags".into(), json!(tags));
-    if index % 7 == 0 {
+    if index.is_multiple_of(7) {
         fields.insert("attachments".into(), json!([{
             "sha256": "ab".repeat(32), "media_type": "text/plain",
             "name": "notes λ.txt", "size": 42, "origin": "host/sql-fixture"
@@ -230,7 +230,7 @@ async fn sql_message_cursors_reject_changed_filters_and_limits() {
     ] {
         let changed = ClientListQuery { cursor: Some(cursor.clone()), ..changed };
         let error = client_messages_sql_page(&state, snapshot.clone(), &changed)
-            .await.err().expect("changed query must not reuse a cursor");
+            .await.expect_err("changed query must not reuse a cursor");
         assert_eq!(error.status, StatusCode::GONE);
     }
     let malformed = ClientListQuery { cursor: Some("not-a-cursor".into()), ..query };
@@ -346,7 +346,7 @@ message "sql-removed-mail" {
     let before = collect_sql_pages(&state,ClientListQuery::default(),now).await;
     assert_eq!(before[0]["content"],"removed content");
     state.store.connection.batched(|tx| {
-        Ok::<_,rusqlite::Error>(tx.execute("DELETE FROM desired WHERE subject=?1",[subject])?)
+        tx.execute("DELETE FROM desired WHERE subject=?1",[subject])
     }).unwrap().unwrap();
     assert!(!state.store.claims_for(subject,Some("intent.desired")).unwrap().is_empty());
     for history in [false,true] {

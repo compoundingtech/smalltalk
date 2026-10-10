@@ -146,6 +146,14 @@ pub trait Runtime: Send + Sync {
     /// Reapply this node's local state that a projection replaced, once a projection ends.
     fn after_projection(&self, transaction: &Transaction<'_>) -> Result<(), Error>;
 
+    /// Once per managed outer transaction, after all batched jobs or lent helpers
+    /// and before source-adapter finalization and COMMIT. Bound maintenance for the
+    /// entire transaction here, not in append/projection helpers that may repeat.
+    /// Startup and checkpoint-copy raw transactions do not use this boundary.
+    fn before_commit(&self, _transaction: &Transaction<'_>) -> Result<()> {
+        Ok(())
+    }
+
     /// Projections changed beneath whatever the runtime keeps in memory about them.
     fn forget_views(&self);
 

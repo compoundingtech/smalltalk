@@ -18,6 +18,8 @@ pub struct SmalltalkRuntime {
     pub(crate) work_extension_roots_rebuilt: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) client_message_backfill_stats: Mutex<client_messages::BackfillStats>,
+    #[cfg(test)]
+    pub(crate) client_message_commit_budget: Mutex<client_messages::FoldBudget>,
     /// Simulate different build registries on isolated nodes in compatibility tests.
     #[cfg(test)]
     pub(crate) claim_registry: std::sync::OnceLock<st3_schema::Registry>,
@@ -344,9 +346,19 @@ impl Runtime for SmalltalkRuntime {
         resources::flush(transaction).map_err(internal)?;
         glass_heads::flush(transaction).map_err(internal)?;
         agent_messages::flush(transaction).map_err(internal)?;
-        client_messages::flush(transaction).map_err(internal)?;
         limits::flush_limits(transaction).map_err(internal)?;
         reapply_local_work_lease_renewals_tx(transaction)
+    }
+
+    fn before_commit(&self, transaction: &Transaction<'_>) -> Result<()> {
+        let budget = client_messages::finalize_commit(transaction)?;
+        #[cfg(test)]
+        {
+            *self.client_message_commit_budget.lock().unwrap_or_else(PoisonError::into_inner) = budget;
+        }
+        #[cfg(not(test))]
+        let _ = budget;
+        Ok(())
     }
 
     fn forget_views(&self) {
@@ -399,7 +411,6 @@ impl Runtime for SmalltalkRuntime {
 
     fn replay_checkpoint_projections(&self, transaction: &Transaction<'_>) -> Result<()> {
         checkpoint_rules::replay_from_nothing(transaction)?;
-        client_messages::flush(transaction)?;
         Ok(())
     }
 

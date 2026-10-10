@@ -1141,8 +1141,9 @@ declaration does not restore its recipient or content from retained `intent.desi
 The local body-free selector projection maintains ordered recipient/actor ranges and current
 eligibility before the page limit. Opening an older store transactionally backfills these
 headers; changed ordering or eligibility creates a temporal header, but body-only writes do
-not copy bodies or churn header versions. An unavailable or unreconciled selector projection
-fails explicitly rather than returning stale message membership.
+not copy bodies or churn header versions. Initial selector backfill completes before readers
+are exposed. While later selector maintenance lags, pages and issued cursors pin the last fully
+published frontier; pending rows are invisible rather than making message lists fail.
 Recipient delivery presence is live process evidence, not graph state: each page reassesses
 `recipient_delivery`, including its observation age, rather than retaining a stale report.
 

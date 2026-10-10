@@ -36,7 +36,7 @@ async fn assert_cursor_gone(
     now: u128,
 ) {
     let error = client_messages_sql_page_at(state, snapshot, query, now)
-        .await.err().expect("unissued or unavailable cut must be rejected");
+        .await.expect_err("unissued or unavailable cut must be rejected");
     assert_eq!(error.status, StatusCode::GONE);
     assert_eq!(error.code, "page-cursor-expired");
 }
@@ -169,7 +169,7 @@ async fn message_cursor_is_invalidated_by_claim_deletion() {
     let (snapshot, query, cursor) = first_page(&state, now).await;
     let epoch = state.store.client_messages_cut_epoch().unwrap();
     let removed = state.store.connection.batched(|tx| {
-        Ok::<_, rusqlite::Error>(tx.execute("DELETE FROM claims WHERE subject='message/cursor-binding-1'", [])?)
+        tx.execute("DELETE FROM claims WHERE subject='message/cursor-binding-1'", [])
     }).unwrap().unwrap();
     assert_eq!(removed, 1);
     assert!(state.store.client_messages_cut_epoch().unwrap() > epoch);
@@ -197,7 +197,7 @@ message "cursor-legacy-2" { from "requester"; to "cursor-legacy"; content "two" 
     let (snapshot, query, cursor) = first_page(&state, now).await;
     let epoch = state.store.client_messages_cut_epoch().unwrap();
     let removed = state.store.connection.batched(|tx| {
-        Ok::<_, rusqlite::Error>(tx.execute("DELETE FROM desired WHERE subject='message/cursor-legacy-1'", [])?)
+        tx.execute("DELETE FROM desired WHERE subject='message/cursor-legacy-1'", [])
     }).unwrap().unwrap();
     assert_eq!(removed, 1);
     assert!(state.store.client_messages_cut_epoch().unwrap() > epoch);

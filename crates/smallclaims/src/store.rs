@@ -967,8 +967,13 @@ impl Store {
             [index.to_string()],
         )?;
         let committed_index = Arc::new(AtomicU64::new(index));
+        let connection = WriterConnection::new(connection, committed_index.clone());
+        let finalizing_runtime = runtime.clone();
+        connection.install_runtime_finalizer(move |transaction| {
+            finalizing_runtime.before_commit(transaction)
+        })?;
         Ok(Self {
-            connection: WriterConnection::new(connection, committed_index.clone()),
+            connection,
             readers,
             committed_index,
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),

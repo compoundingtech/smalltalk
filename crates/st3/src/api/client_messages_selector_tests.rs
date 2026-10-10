@@ -682,6 +682,11 @@ async fn client_message_cursor_issued_during_projection_lag_pins_published_front
             &json!({"fields":{"from":ACTOR,"to":"person/robin","content":"new content waits for projection","status":"sent","tags":[]}}),&[],None).unwrap();
         append_claim_record_tx(&transaction,"node","message/selector-unpublished","message.sent",Some(ACTOR),
             &json!({"fields":{"from":ACTOR,"to":PERSON,"content":"new subject waits for projection","status":"sent","tags":[]}}),&[],None).unwrap();
+        // More subjects than one COMMIT allowance leave a real durable backlog.
+        for index in 0..32 {
+            append_claim_record_tx(&transaction,"node",&format!("message/selector-unpublished-{index:02}"),"message.sent",Some(ACTOR),
+                &json!({"fields":{"from":ACTOR,"to":PERSON,"content":"queued subject","status":"sent","tags":[]}}),&[],None).unwrap();
+        }
         transaction.commit().unwrap();
     }
     assert!(state.store.client_message_selectors_pending().unwrap());

@@ -244,11 +244,13 @@ mod tests {
         {
             let mut connection = store.connection.write();
             let transaction = connection.transaction().unwrap();
-            smallclaims::store::append_claim_record_tx(
-                &transaction,"node","message/maintenance","message.sent",Some("person/sender"),
-                &serde_json::json!({"fields":{"from":"person/sender","to":"person/recipient","content":"queued","status":"sent","tags":[]}}),
-                &[],None,
-            ).unwrap();
+            for index in 0..32 {
+                smallclaims::store::append_claim_record_tx(
+                    &transaction,"node",&format!("message/maintenance-{index:02}"),"message.sent",Some("person/sender"),
+                    &serde_json::json!({"fields":{"from":"person/sender","to":"person/recipient","content":"queued","status":"sent","tags":[]}}),
+                    &[],None,
+                ).unwrap();
+            }
             transaction.commit().unwrap();
         }
         assert!(store.client_message_selectors_pending().unwrap());
@@ -259,9 +261,9 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5),notify.notified()).await.unwrap();
         assert!(!store.client_message_selectors_pending().unwrap());
         assert_eq!(*observed.borrow(),1);
-        let rows = store.read_snapshot(|through|store.client_messages_page(None,None,true,through,None,10)).unwrap();
-        assert_eq!(rows.len(),1);
-        assert_eq!(rows[0].0.content,"queued");
+        let rows = store.read_snapshot(|through|store.client_messages_page(None,None,true,through,None,32)).unwrap();
+        assert_eq!(rows.len(),32);
+        assert!(rows.iter().all(|row|row.0.content=="queued"));
         drop(store);
         tokio::time::timeout(Duration::from_secs(3),worker).await.unwrap().unwrap();
         assert!(weak.upgrade().is_none(), "idle worker must not keep its store alive");

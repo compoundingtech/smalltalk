@@ -10119,7 +10119,6 @@ impl Store {
                 }
                 if receipt_attached { repair_operations_tx(transaction,&[opaque_cache_key(idempotency_key)]).map_err(internal)?; }
                 owned_sets::project_tx(transaction)?;
-                client_messages::flush(transaction).map_err(internal)?;
                 let store_index = current_index_tx(transaction).map_err(internal)?;
                 let response = ApplyResponse {
                     changed: true,
@@ -12538,7 +12537,6 @@ impl Store {
                 .query_map([run_id], |row| row.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        client_messages::flush(&transaction)?;
         transaction.commit()?;
         Ok(residue)
     }
@@ -12547,7 +12545,6 @@ impl Store {
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let removed = transaction.execute("DELETE FROM desired WHERE owner_run=?1", [owner_run])?;
-        client_messages::flush(&transaction)?;
         transaction.commit()?;
         Ok(removed)
     }
@@ -17130,7 +17127,6 @@ impl Store {
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('canonical_replay_settled', ?1)",
             [now_ms().to_string()],
         )?;
-        client_messages::flush(&transaction)?;
         transaction.commit()?;
         Ok(settled)
     }
@@ -21145,9 +21141,6 @@ pub(crate) fn append_claim_tx(
     }
     if kind == "message.sent" {
         agent_messages::flush(transaction)?;
-    }
-    if subject.starts_with("message/") {
-        client_messages::flush(transaction)?;
     }
     if kind == "harness.limits" {
         limits::flush_limits(transaction)?;
@@ -28729,7 +28722,6 @@ fn select_desired_repair_tx(
             desired.owner_step,
         ],
     )?;
-    client_messages::flush(transaction)?;
     Ok(())
 }
 
@@ -55104,7 +55096,6 @@ impl Store {
         project_replicated_mission_runs(&transaction)?;
         rebuild_planning_tx(&transaction).map_err(internal)?;
         custom::flush(&transaction).map_err(internal)?;
-        client_messages::flush(&transaction).map_err(internal)?;
         let accepted_heads = replica_heads(&transaction).map_err(internal)?;
         let accepted_through = accepted_heads.get(&input.peer).copied().unwrap_or(0);
         let missing_sequences = missing_ranges

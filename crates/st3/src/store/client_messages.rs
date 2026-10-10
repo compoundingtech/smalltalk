@@ -2,6 +2,9 @@
 use super::*;
 
 #[cfg(test)]
+mod reminder_deletion_tests;
+
+#[cfg(test)]
 const TABLE: &str = "local_client_message_selectors_v1";
 const MARKER: &str = "client_message_selectors_v1_cut";
 const BACKFILL_MARKER: &str = "client_message_selectors_v1_backfill";
@@ -124,7 +127,9 @@ CREATE TRIGGER IF NOT EXISTS client_selector_desired_delete AFTER DELETE ON desi
  VALUES(OLD.subject,-1,1,4,
   (SELECT reminder FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index>=0 AND retired_index IS NULL),
   COALESCE((SELECT recipient FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index>=0 AND retired_index IS NULL),''))
- ON CONFLICT(subject,born_index) DO UPDATE SET dirty_flags=dirty_flags|4,reminder=COALESCE(reminder,excluded.reminder),created_index=created_index+1;
+ ON CONFLICT(subject,born_index) DO UPDATE SET dirty_flags=dirty_flags|4,
+  recipient=CASE WHEN reminder IS NULL THEN excluded.recipient ELSE recipient END,
+  reminder=COALESCE(reminder,excluded.reminder),created_index=created_index+1;
  -- Deletion invalidates all old cuts. Updating live headers in-place is safe and
  -- preserves fresh-page parity even for direct projection deletion before flush.
  UPDATE local_client_message_selectors_v1 SET
@@ -134,6 +139,8 @@ CREATE TRIGGER IF NOT EXISTS client_selector_desired_delete AFTER DELETE ON desi
   version=CASE WHEN desired_mask&4!=0 THEN '00000000000000000000' ELSE version END,
   mailbox=native_mailbox,desired_mask=0
  WHERE subject=OLD.subject AND born_index>=0 AND retired_index IS NULL;
+ -- Only the affected header and old/new winners can change eligibility. Each
+ -- group lookup is a single indexed seek, regardless of superseded group size.
  UPDATE local_client_message_selectors_v1 SET
   global_current=(closed=0 AND (reminder IS NULL OR NOT EXISTS(
    SELECT 1 FROM local_client_message_selectors_v1 rival WHERE rival.born_index>=0 AND rival.retired_index IS NULL AND rival.closed=0
@@ -145,9 +152,39 @@ CREATE TRIGGER IF NOT EXISTS client_selector_desired_delete AFTER DELETE ON desi
   subject IN (
    SELECT OLD.subject
    UNION
-   SELECT subject FROM local_client_message_selectors_v1 INDEXED BY client_selector_reminder_candidates
+   SELECT (SELECT subject FROM local_client_message_selectors_v1 INDEXED BY client_selector_reminder_winner
+    WHERE born_index>=0 AND retired_index IS NULL AND global_current=1 AND reminder IS NOT NULL
+     AND reminder=(SELECT reminder FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index=-1)
+    LIMIT 1)
+   UNION
+   SELECT (SELECT subject FROM local_client_message_selectors_v1 INDEXED BY client_selector_reminder_candidates
     WHERE born_index>=0 AND retired_index IS NULL AND closed=0
-     AND reminder=(SELECT reminder FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index=-1));
+     AND reminder=(SELECT reminder FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index=-1)
+    ORDER BY version DESC,subject DESC LIMIT 1)
+   UNION
+   SELECT (SELECT subject FROM local_client_message_selectors_v1 INDEXED BY client_selector_recipient_reminder_winner
+    WHERE born_index>=0 AND retired_index IS NULL AND recipient_current=1 AND reminder IS NOT NULL
+     AND reminder=(SELECT reminder FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index=-1)
+     AND recipient=(SELECT recipient FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index=-1)
+    LIMIT 1)
+   UNION
+   SELECT (SELECT subject FROM local_client_message_selectors_v1 INDEXED BY client_selector_recipient_reminder_candidates
+    WHERE born_index>=0 AND retired_index IS NULL AND closed=0 AND mailbox=1
+     AND reminder=(SELECT reminder FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index=-1)
+     AND recipient=(SELECT recipient FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index=-1)
+    ORDER BY version DESC,subject DESC LIMIT 1)
+   UNION
+   SELECT (SELECT subject FROM local_client_message_selectors_v1 INDEXED BY client_selector_recipient_reminder_winner
+    WHERE born_index>=0 AND retired_index IS NULL AND recipient_current=1 AND reminder IS NOT NULL
+     AND reminder=(SELECT reminder FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index>=0 AND retired_index IS NULL)
+     AND recipient=(SELECT recipient FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index>=0 AND retired_index IS NULL)
+    LIMIT 1)
+   UNION
+   SELECT (SELECT subject FROM local_client_message_selectors_v1 INDEXED BY client_selector_recipient_reminder_candidates
+    WHERE born_index>=0 AND retired_index IS NULL AND closed=0 AND mailbox=1
+     AND reminder=(SELECT reminder FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index>=0 AND retired_index IS NULL)
+     AND recipient=(SELECT recipient FROM local_client_message_selectors_v1 WHERE subject=OLD.subject AND born_index>=0 AND retired_index IS NULL)
+    ORDER BY version DESC,subject DESC LIMIT 1));
 END;
 "#;
 
@@ -229,8 +266,8 @@ struct FoldWork {
     base: Option<Header>,
 }
 
-#[derive(Default, Debug)]
-struct FoldBudget {
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct FoldBudget {
     claims: usize,
     subjects: usize,
     scratch_rows: usize,
@@ -240,6 +277,10 @@ struct FoldBudget {
     work: std::time::Duration,
     #[cfg(test)]
     commit: std::time::Duration,
+    #[cfg(test)]
+    commit_started_at_unix_us: u128,
+    #[cfg(test)]
+    commit_finished_at_unix_us: u128,
 }
 
 enum DesiredSelection { Absent, Parsed(Value), Malformed }
@@ -277,10 +318,10 @@ fn folded_header(connection: &Connection, work: &mut FoldWork) -> Result<Option<
     let desired_child=|field|desired.as_ref().and_then(|value|canonical_child_string(value,field));
     let mut desired_mask=0;
     let sender=sender.unwrap_or_else(|| {
-        desired_child("from").map(|value|{desired_mask|=1;value}).unwrap_or_else(||"requester".into())
+        desired_child("from").inspect(|_|desired_mask|=1).unwrap_or_else(||"requester".into())
     });
     let recipient=recipient.unwrap_or_else(|| {
-        desired_child("to").map(|value|{desired_mask|=2;value}).unwrap_or_default()
+        desired_child("to").inspect(|_|desired_mask|=2).unwrap_or_default()
     });
     let tags=if let Some(tags)=tags {
         serde_json::from_str::<Vec<Value>>(&tags)?.into_iter().filter_map(|value|match value { Value::String(value)=>Some(value),_=>None }).collect::<Vec<_>>()
@@ -381,10 +422,9 @@ fn scan_selection(transaction: &Transaction<'_>, work: &mut FoldWork, budget: &m
         if work.base.is_none() {
             let key = (time,row.writer,row.sequence,row.batch,position,row.id);
             for (selected, value) in work.values.iter_mut().zip(row.values) {
-                if let Some(value) = value {
-                    if selected.as_ref().is_none_or(|(old, _)| &key > old) {
-                        *selected = Some((key.clone(), value));
-                    }
+                if let Some(value) = value
+                    && selected.as_ref().is_none_or(|(old, _)| &key > old) {
+                    *selected = Some((key.clone(), value));
                 }
             }
         }
@@ -464,12 +504,12 @@ fn reminder_winners(transaction: &Transaction<'_>,reminder: &str,recipient: Opti
     } else { ("client_selector_reminder_candidates","","global_current","client_selector_reminder_winner") };
     let winner: Option<String>=transaction.prepare_cached(&format!("SELECT subject FROM local_client_message_selectors_v1 INDEXED BY {index} WHERE born_index>=0 AND retired_index IS NULL AND closed=0 AND reminder=?1 {scope} AND (?2 IS NULL OR ?2 IS NOT NULL) ORDER BY version DESC,subject DESC LIMIT 1"))?
         .query_row(params![reminder,recipient],|row|row.get(0)).optional()?;
-    let old=transaction.prepare_cached(&format!("SELECT subject FROM local_client_message_selectors_v1 INDEXED BY {winner_index} WHERE born_index>=0 AND retired_index IS NULL AND {flag}=1 AND reminder IS NOT NULL AND reminder=?1 {scope} AND (?2 IS NULL OR ?2 IS NOT NULL)"))?
-        .query_map(params![reminder,recipient],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    for subject in old {
-        if winner.as_deref()!=Some(&subject) {
-            set_current(transaction,&subject,recipient.is_none().then_some(false),recipient.is_some().then_some(false),cut,now)?;
-        }
+    // Eligibility maintains one winner per scope; never inventory group members.
+    let old: Option<String>=transaction.prepare_cached(&format!("SELECT subject FROM local_client_message_selectors_v1 INDEXED BY {winner_index} WHERE born_index>=0 AND retired_index IS NULL AND {flag}=1 AND reminder IS NOT NULL AND reminder=?1 {scope} AND (?2 IS NULL OR ?2 IS NOT NULL) LIMIT 1"))?
+        .query_row(params![reminder,recipient],|row|row.get(0)).optional()?;
+    if let Some(subject)=old
+        && winner.as_deref()!=Some(&subject) {
+        set_current(transaction,&subject,recipient.is_none().then_some(false),recipient.is_some().then_some(false),cut,now)?;
     }
     if let Some(subject)=winner {
         set_current(transaction,&subject,recipient.is_none().then_some(true),recipient.is_some().then_some(true),cut,now)?;
@@ -505,6 +545,18 @@ pub(crate) struct BackfillStats {
     longest_transaction_work: std::time::Duration,
     #[cfg(test)]
     longest_transaction_commit: std::time::Duration,
+    #[cfg(test)]
+    longest_commit: std::time::Duration,
+    #[cfg(test)]
+    longest_commit_phase: &'static str,
+    #[cfg(test)]
+    longest_commit_work: std::time::Duration,
+    #[cfg(test)]
+    longest_commit_started_at_unix_us: u128,
+    #[cfg(test)]
+    longest_commit_finished_at_unix_us: u128,
+    #[cfg(test)]
+    longest_commit_wal_file_bytes: u64,
     pub(crate) checkpoint: std::time::Duration,
     pub(crate) total: std::time::Duration,
 }
@@ -522,6 +574,12 @@ impl BackfillStats {
             "longest_transaction_phase": self.longest_transaction_phase,
             "longest_transaction_work_ms": self.longest_transaction_work.as_secs_f64() * 1_000.0,
             "longest_transaction_commit_ms": self.longest_transaction_commit.as_secs_f64() * 1_000.0,
+            "longest_commit_ms": self.longest_commit.as_secs_f64() * 1_000.0,
+            "longest_commit_phase": self.longest_commit_phase,
+            "longest_commit_work_ms": self.longest_commit_work.as_secs_f64() * 1_000.0,
+            "longest_commit_started_at_unix_us": self.longest_commit_started_at_unix_us,
+            "longest_commit_finished_at_unix_us": self.longest_commit_finished_at_unix_us,
+            "wal_file_bytes_after_longest_commit": self.longest_commit_wal_file_bytes,
             "checkpoint_outside_transactions_ms": self.checkpoint.as_secs_f64() * 1_000.0,
             "total_ms": self.total.as_secs_f64() * 1_000.0,
         })
@@ -662,10 +720,15 @@ fn backfill_chunk(connection: &mut Connection, reset: bool) -> Result<Option<(us
     #[cfg(test)]
     { budget.work = started.elapsed(); }
     #[cfg(test)]
+    { budget.commit_started_at_unix_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_micros(); }
+    #[cfg(test)]
     let commit_started = std::time::Instant::now();
     transaction.commit()?;
     #[cfg(test)]
-    { budget.commit = commit_started.elapsed(); }
+    {
+        budget.commit = commit_started.elapsed();
+        budget.commit_finished_at_unix_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_micros();
+    }
     Ok(Some((processed, complete, budget)))
 }
 
@@ -698,6 +761,15 @@ fn run_open_chunks(connection: &mut Connection, mut reset: bool) -> Result<Backf
     let started = std::time::Instant::now();
     let mut stats = BackfillStats::default();
     let malformed_before = malformed_count(connection)?;
+    #[cfg(test)]
+    let wal_path = {
+        let database: String = connection.query_row("PRAGMA database_list", [], |row| row.get(2))?;
+        if database.is_empty() { None } else {
+            let mut path = std::ffi::OsString::from(database);
+            path.push("-wal");
+            Some(std::path::PathBuf::from(path))
+        }
+    };
     loop {
         let transaction_started = std::time::Instant::now();
         let chunk = backfill_chunk(connection, reset)?;
@@ -713,6 +785,15 @@ fn run_open_chunks(connection: &mut Connection, mut reset: bool) -> Result<Backf
             stats.longest_transaction_phase = budget.phase;
             stats.longest_transaction_work = budget.work;
             stats.longest_transaction_commit = budget.commit;
+        }
+        #[cfg(test)]
+        if budget.commit > stats.longest_commit {
+            stats.longest_commit = budget.commit;
+            stats.longest_commit_phase = budget.phase;
+            stats.longest_commit_work = budget.work;
+            stats.longest_commit_started_at_unix_us = budget.commit_started_at_unix_us;
+            stats.longest_commit_finished_at_unix_us = budget.commit_finished_at_unix_us;
+            stats.longest_commit_wal_file_bytes = wal_path.as_ref().map(std::fs::metadata).transpose()?.map_or(0, |metadata|metadata.len());
         }
         stats.longest_transaction = stats.longest_transaction.max(elapsed);
         if complete { break; }
@@ -738,19 +819,21 @@ pub(super) fn open(connection: &mut Connection) -> Result<BackfillStats> {
     open_chunks(connection, false)
 }
 
-pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
+/// The runtime's sole managed outer-COMMIT selector callback. Append, apply,
+/// replay and repair helpers only capture durable pending work through triggers.
+pub(super) fn finalize_commit(transaction: &Transaction<'_>) -> Result<FoldBudget> {
     #[cfg(test)]
-    if !transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",[TABLE],|row|row.get::<_,bool>(0))? { return Ok(()); }
+    if !transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name=?1)",[TABLE],|row|row.get::<_,bool>(0))? { return Ok(FoldBudget::default()); }
     // Startup/rebuild owns this queue until every header is available. Ordinary
     // replay hooks must not publish an incomplete selector projection.
     let ready: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)", [MARKER], |row| row.get(0))?;
-    if !ready { return Ok(()); }
-    flush_pending(transaction, true)?;
+    if !ready { return Ok(FoldBudget::default()); }
+    let budget = flush_pending(transaction, true)?;
     #[cfg(test)]
     if transaction.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='local_client_message_versions')",[],|row|row.get::<_,bool>(0))? {
         super::client_messages_version_benchmark::flush(transaction)?;
     }
-    Ok(())
+    Ok(budget)
 }
 
 fn malformed_count(connection: &Connection) -> Result<u64> {
@@ -758,8 +841,9 @@ fn malformed_count(connection: &Connection) -> Result<u64> {
         .optional()?.map(|value| value.parse()).transpose()?.unwrap_or(0))
 }
 
-/// Every caller, including replay and replication projection, shares these hard
-/// row/subject bounds. Unfinished work survives the commit for the next worker loan.
+/// One allowance per outer transaction: managed writers call only from their
+/// finalizer; startup calls once in each independently committed backfill chunk.
+/// Unfinished work survives COMMIT for the next worker loan.
 fn flush_pending(transaction: &Transaction<'_>, publish: bool) -> Result<FoldBudget> {
     let started = std::time::Instant::now();
     let mut budget = FoldBudget::default();
@@ -818,9 +902,8 @@ fn flush_pending(transaction: &Transaction<'_>, publish: bool) -> Result<FoldBud
         let value = folded_header(transaction, &mut work)?;
         let mut reminders = BTreeSet::new();
         if existing.as_ref().map(|(_,header)| header) != value.as_ref() {
-            if let Some((_,old)) = &existing {
-                if let Some(reminder) = &old.reminder { reminders.insert((reminder.clone(),old.recipient.clone())); }
-            }
+            if let Some((_,old)) = &existing
+                && let Some(reminder) = &old.reminder { reminders.insert((reminder.clone(),old.recipient.clone())); }
             if let Some(value) = &value {
                 if let Some(reminder) = &value.reminder { reminders.insert((reminder.clone(),value.recipient.clone())); }
                 put_header(transaction, &work.subject, value, work.cut, now)?;
@@ -967,10 +1050,8 @@ impl Store {
         let transaction = connection.transaction()?;
         let ready: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)", [MARKER], |row| row.get(0))?;
         if !ready { return Ok(false); }
-        flush_pending(&transaction, true)?;
-        let more = has_pending(&transaction)? || fold_incomplete(&transaction)? || has_selector_cleanup(&transaction)?;
         transaction.commit()?;
-        Ok(more)
+        Ok(has_pending(&connection)? || fold_incomplete(&connection)? || has_selector_cleanup(&connection)?)
     }
 
     pub(crate) fn client_messages_page(&self,person: Option<&str>,actor: Option<&str>,history: bool,through: u64,after: Option<&(u128,String)>,limit: usize) -> Result<Vec<(MessageView,Value,bool)>> {
@@ -1057,7 +1138,202 @@ FROM ends JOIN claims first ON first.id=ends.first_id JOIN claims last ON last.i
 
 #[cfg(test)]
 mod tests {
+
+    fn commit_budget(store: &Store) -> FoldBudget {
+        *store.smalltalk.client_message_commit_budget.lock().unwrap_or_else(PoisonError::into_inner)
+    }
     use super::*;
+
+    fn assert_commit_budget(store: &Store) -> FoldBudget {
+        let budget = commit_budget(store);
+        assert!(budget.subjects <= BACKFILL_SUBJECTS, "{budget:?}");
+        assert!(budget.claims <= FOLD_CLAIMS, "{budget:?}");
+        assert!(budget.scratch_rows <= BACKFILL_CLEAR_ROWS, "{budget:?}");
+        budget
+    }
+
+    fn append_message_batch(transaction: &Transaction<'_>, count: usize) -> Result<()> {
+        let runtime = SmalltalkRuntime::default();
+        for index in 0..count {
+            append_claim_tx(
+                transaction, "node", &format!("message/transaction-{index:04}"),
+                "message.sent", None,
+                &json!({"fields":{"from":"agent/sender","to":"person/recipient",
+                    "content":format!("body {index}"),"status":"sent","tags":[]}}),
+                &[], None,
+            )?;
+            // Projection helpers can repeat inside apply/replay and still must
+            // not borrow another selector allowance before the outer COMMIT.
+            smallclaims::Runtime::after_projection(&runtime, transaction)?;
+        }
+        let headers: usize = transaction.query_row(
+            "SELECT COUNT(*) FROM local_client_message_selectors_v1 WHERE born_index>=0",
+            [], |row| row.get(0),
+        )?;
+        assert_eq!(headers, 0, "append/projection helpers must not spend selector work");
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_apply_with_many_claimants_has_one_selector_commit_allowance() {
+        let store = Store::open_memory("node").unwrap();
+        let count = BACKFILL_SUBJECTS * 3 + 3;
+        let mut source = String::from(
+            "version 2\nagent \"worker\" { workspace \".\"; command \"true\" }\n\
+             mission \"cancel-batch\" state=\"ready\" {\n goal \"Cancel all leased steps.\"\n",
+        );
+        for index in 0..count {
+            source.push_str(&format!(
+                "step \"work-{index}\" {{ assigned-to \"agent/node.worker\" }}\n",
+            ));
+        }
+        source.push_str("}\n");
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let planned = store.mission(
+            &intent, IntentInput { kdl: source, source_name: None },
+        ).unwrap();
+        store.apply(&intent, &planned.subject_tokens, "publish-cancel-batch").unwrap();
+        let run = store.create_mission_run(&MissionRunRequest {
+            mission: "cancel-batch".into(), revision: None, workspace: ".".into(),
+            requester: Some("person/test".into()), mode: None, inputs: BTreeMap::new(),
+            idempotency_key: "run-cancel-batch".into(),
+        }).unwrap();
+        // The real cancellation helper consumes the persisted claimant on every
+        // open step; seed those leases together rather than involving a daemon.
+        {
+            let mut connection = store.connection.write();
+            let transaction = connection.transaction().unwrap();
+            for step in &run.steps {
+                transaction.execute(
+                    "UPDATE step_runs SET lease_owner='agent/node.worker' WHERE subject=?1",
+                    [&step.subject],
+                ).unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        while store.maintain_client_message_selectors().unwrap() {}
+        let baseline = paged_backfill_rows(&store, None, None, true);
+        let cancellation = format!(
+            "version 2\nmission-run {:?} {{ cancellation \"operator\" {{ reason \"cancel batch\" }} }}\n",
+            run.subject,
+        );
+        let intent = crate::graph::parse_test_intent(&cancellation, "node").unwrap();
+        let planned = store.mission(
+            &intent, IntentInput { kdl: cancellation, source_name: None },
+        ).unwrap();
+        store.apply(&intent, &planned.subject_tokens, "cancel-batch").unwrap();
+        assert_commit_budget(&store);
+        assert!(store.client_message_selectors_pending().unwrap());
+        assert_eq!(paged_backfill_rows(&store, None, None, true), baseline);
+        let cancellation_claims: usize = store.readers.get().query_row(
+            "SELECT COUNT(*) FROM claims WHERE kind='message.sent' AND subject LIKE 'message/mission-cancelled-%'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(cancellation_claims, count);
+        while store.client_message_selectors_pending().unwrap() {
+            store.maintain_client_message_selectors().unwrap();
+            assert_commit_budget(&store);
+        }
+        let rows = paged_backfill_rows(&store, Some("agent/node.worker"), None, true);
+        assert_eq!(rows.iter().filter(|row|
+            row["message"]["title"] == "Mission work cancelled").count(), count);
+    }
+
+    #[test]
+    fn multi_message_transactions_share_one_selector_allowance_at_outer_commit() {
+        for batched in [false, true] {
+            let store = Store::open_memory("node").unwrap();
+            let count = BACKFILL_SUBJECTS * 3 + 3;
+            if batched {
+                store.connection.batched(|transaction| append_message_batch(transaction, count))
+                    .unwrap().unwrap();
+            } else {
+                let mut connection = store.connection.write();
+                let transaction = connection.transaction().unwrap();
+                append_message_batch(&transaction, count).unwrap();
+                transaction.commit().unwrap();
+            }
+            let budget = assert_commit_budget(&store);
+            let headers: usize = store.readers.get().query_row(
+                "SELECT COUNT(*) FROM local_client_message_selectors_v1 WHERE born_index>=0",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(headers, budget.subjects);
+            assert!(headers <= BACKFILL_SUBJECTS);
+            assert!(store.client_message_selectors_pending().unwrap(),
+                "the outer commit must leave durable pending work");
+            assert!(paged_backfill_rows(&store, None, None, true).is_empty(),
+                "partial headers must remain behind the last published frontier");
+            let mut loans = 1;
+            while store.client_message_selectors_pending().unwrap() {
+                store.maintain_client_message_selectors().unwrap();
+                assert_commit_budget(&store);
+                loans += 1;
+            }
+            assert!(loans >= count.div_ceil(BACKFILL_SUBJECTS));
+            let rows = paged_backfill_rows(&store, Some("person/recipient"), None, false);
+            assert_eq!(rows.len(), count);
+            for index in 0..count {
+                assert!(rows.iter().any(|row|
+                    row["message"]["subject"] == format!("message/transaction-{index:04}") &&
+                    row["message"]["content"] == format!("body {index}")));
+            }
+        }
+    }
+
+    #[test]
+    fn multi_append_history_cannot_multiply_transaction_claim_row_allowance() {
+        let store = Store::open_memory("node").unwrap();
+        let count = FOLD_CLAIMS * 3 + 7;
+        {
+            let mut connection = store.connection.write();
+            let transaction = connection.transaction().unwrap();
+            let mut batch = None;
+            for index in 0..count {
+                let (kind, fields) = if index == 0 {
+                    ("message.sent", json!({"from":"agent/sender","to":"person/recipient","content":"body 0","status":"sent","tags":[]}))
+                } else {
+                    ("publication.operation", json!({"operation":format!("history/{index}"),"action":"fixture-history","status":"accepted"}))
+                };
+                let claim = append_claim_tx(
+                    &transaction, "node", "message/long-transaction", kind, None,
+                    &json!({"fields":fields}),
+                    &[], batch.as_deref(),
+                ).unwrap();
+                if batch.is_none() { batch = Some(claim.batch_id); }
+            }
+            transaction.commit().unwrap();
+        }
+        assert_commit_budget(&store);
+        assert!(store.client_message_selectors_pending().unwrap());
+        let saved: String = store.readers.get().query_row(
+            "SELECT value FROM meta WHERE key=?1", [FOLD_MARKER], |row| row.get(0),
+        ).unwrap();
+        let work: FoldWork = serde_json::from_str(&saved).unwrap();
+        assert!(work.after <= u64::try_from(FOLD_CLAIMS).unwrap(),
+            "the first transaction cannot scan more than its claim-row allowance");
+        let mut loans = 1;
+        while store.client_message_selectors_pending().unwrap() {
+            store.maintain_client_message_selectors().unwrap();
+            assert_commit_budget(&store);
+            loans += 1;
+        }
+        assert!(loans >= count.div_ceil(FOLD_CLAIMS));
+        let rows = paged_backfill_rows(&store, None, None, true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["message"]["content"], "body 0");
+    }
+
+    #[test]
+    fn single_send_selector_is_visible_immediately_after_commit() {
+        let store = Store::open_memory("node").unwrap();
+        send(&store, "message/immediate", "agent/sender", "1");
+        assert!(!store.client_message_selectors_pending().unwrap());
+        assert_eq!(assert_commit_budget(&store).subjects, 1);
+        let rows = paged_backfill_rows(&store, Some("person/recipient"), None, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["message"]["subject"], "message/immediate");
+    }
     fn send(store: &Store,subject: &str,sender: &str,version: &str) {
         store.append_claim(&ClaimInput {subject:subject.into(),kind:"message.sent".into(),actor:Some(sender.into()),fields:BTreeMap::from([
             ("from".into(),json!(sender)),("to".into(),json!("person/recipient")),("content".into(),json!("message body")),("status".into(),json!("sent")),
@@ -1290,9 +1566,8 @@ mod tests {
             let budget = {
                 let mut connection = store.connection.write();
                 let transaction = connection.transaction().unwrap();
-                let budget = flush_pending(&transaction, true).unwrap();
                 transaction.commit().unwrap();
-                budget
+                commit_budget(&store)
             };
             assert!(budget.claims <= FOLD_CLAIMS);
             assert!(budget.subjects <= BACKFILL_SUBJECTS);
@@ -1303,7 +1578,7 @@ mod tests {
                     "partially folded versions cannot leak before publication");
             }
         }
-        assert!(chunks >= (count + 1).div_ceil(BACKFILL_SUBJECTS));
+        assert!(chunks + 1 >= (count + 1).div_ceil(BACKFILL_SUBJECTS));
         let history = paged_backfill_rows(&store, None, None, true);
         assert_eq!(history.len(), count + 1);
         let open = paged_backfill_rows(&store, None, None, false);
@@ -1477,7 +1752,9 @@ mod tests {
         let mut publications: usize = connection.query_row("SELECT COUNT(*) FROM local_client_message_publications",[],|row|row.get(0)).unwrap();
         let mut chunks = 0;
         while remaining>0 {
-            let transaction = connection.transaction().unwrap();
+            // Exercise cleanup with an explicit clock without also invoking the
+            // managed runtime's real-clock COMMIT finalizer.
+            let transaction = Connection::transaction(&mut connection).unwrap();
             let deleted = prune_retired(&transaction,u64::try_from(crate::api::CLIENT_PAGE_TTL_MS).unwrap()+1000).unwrap();
             assert!(deleted>0 && deleted<=PRUNE_ROWS);
             transaction.commit().unwrap();
@@ -1524,9 +1801,8 @@ mod tests {
             }
             let mut connection = store.connection.write();
             let transaction = connection.transaction().unwrap();
-            let budget = flush_pending(&transaction,true).unwrap();
-            assert!(budget.claims<=FOLD_CLAIMS);
             transaction.commit().unwrap();
+            assert!(commit_budget(&store).claims<=FOLD_CLAIMS);
             chunks+=1;
         }
         assert!(chunks>1,"destructive reconciliation must span bounded loans");
@@ -1596,9 +1872,8 @@ mod tests {
             }
             let tail = deferred_claim(&transaction,"message/backfill-0000","message.sent",
                 json!({"from":"agent/filtered","to":"person/robin","content":"new tail","status":"sent","tags":[]}),None).store_index;
-            let budget = flush_pending(&transaction,true).unwrap();
-            assert!(budget.claims<=FOLD_CLAIMS);
             transaction.commit().unwrap();
+            assert!(commit_budget(&store).claims<=FOLD_CLAIMS);
             tail
         };
         let mut previous_after = 0;
@@ -1607,9 +1882,9 @@ mod tests {
             let mut connection = store.connection.write();
             let transaction = connection.transaction().unwrap();
             deferred_claim(&transaction,"message/backfill-0000","custom.test.recorded",json!({"touch":index}),None);
-            let budget = flush_pending(&transaction,true).unwrap();
-            assert!(budget.claims<=FOLD_CLAIMS);
-            let saved: Option<String> = transaction.query_row("SELECT value FROM meta WHERE key=?1",[FOLD_MARKER],|row|row.get(0)).optional().unwrap();
+            transaction.commit().unwrap();
+            assert!(commit_budget(&store).claims<=FOLD_CLAIMS);
+            let saved: Option<String> = connection.query_row("SELECT value FROM meta WHERE key=?1",[FOLD_MARKER],|row|row.get(0)).optional().unwrap();
             if let Some(saved) = saved {
                 let work: FoldWork = serde_json::from_str(&saved).unwrap();
                 assert!(work.after>=previous_after,"append-only touches must never reset the scanned prefix");
@@ -1618,7 +1893,6 @@ mod tests {
             } else {
                 reached_captured_tail = true;
             }
-            transaction.commit().unwrap();
             if reached_captured_tail { break; }
         }
         assert!(reached_captured_tail,"the captured tail must finish despite an append between every loan");
@@ -1641,7 +1915,6 @@ mod tests {
             for index in 0..FOLD_CLAIMS*4 {
                 deferred_claim(&transaction,"message/backfill-0001","custom.test.recorded",json!({"note":index}),None);
             }
-            flush_pending(&transaction,true).unwrap();
             transaction.commit().unwrap();
             assert!(has_pending(&connection).unwrap());
             connection.execute("UPDATE local_client_message_selectors_v1 SET retired_at_unix_ms=1 WHERE retired_index IS NOT NULL",[]).unwrap();
@@ -1659,7 +1932,7 @@ mod tests {
             "UPDATE local_client_message_publications SET published_at_unix_ms=?1 WHERE through_index=?2",
             params![publication_time,published],
         ).unwrap();
-        let transaction = connection.transaction().unwrap();
+        let transaction = Connection::transaction(&mut connection).unwrap();
         let ttl = u64::try_from(crate::api::CLIENT_PAGE_TTL_MS).unwrap();
         assert_eq!(prune_retired(&transaction,publication_time+ttl-1).unwrap(),0);
         transaction.commit().unwrap();
@@ -1668,7 +1941,7 @@ mod tests {
         assert_eq!(rows.len(),baseline.len(),"a still-valid lag cursor cannot silently lose a retired header");
         assert!(rows.iter().any(|(message,_,_)|message.subject=="message/backfill-0000"));
         let mut connection = store.connection.write();
-        let transaction = connection.transaction().unwrap();
+        let transaction = Connection::transaction(&mut connection).unwrap();
         assert!(prune_retired(&transaction,publication_time+ttl+1).unwrap()>0);
         transaction.commit().unwrap();
     }
@@ -1767,7 +2040,9 @@ mod tests {
             assert_eq!(checkpoint.0,0);
             assert_eq!(checkpoint.1,checkpoint.2);
         }
-        let transaction = connection.transaction().unwrap();
+        // Persist corruption through a raw test-only transaction; a managed COMMIT
+        // correctly rejects the malformed progress marker before it can be stored.
+        let transaction = Connection::transaction(&mut connection).unwrap();
         deferred_claim(&transaction,"message/backfill-0000","custom.test.recorded",json!({"note":"pending"}),None);
         transaction.execute("INSERT INTO meta(key,value) VALUES(?1,'{broken') ON CONFLICT(key) DO UPDATE SET value=excluded.value",[FOLD_MARKER]).unwrap();
         transaction.commit().unwrap();
