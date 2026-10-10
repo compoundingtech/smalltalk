@@ -5355,6 +5355,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .insert(crate::suspension::CONTINUE_PATH_ENV.into(), path);
             }
         }
+        crate::native_seed::omit_seed_for_native_resume(&mut launch_member);
         launch_member
             .environment
             .insert("ST3_ENDPOINT".into(), self.endpoint.clone());
@@ -16494,6 +16495,25 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             assert_eq!(reason(&store), reason(&replica));
             replica.import_replication("node", &batch).unwrap();
             assert_eq!(reason(&store), reason(&replica));
+            // Compare the dormant predicate with the independent Store oracle only in
+            // its narrower domain. These are supplied fixture facts, not an extractor
+            // or certification of runtime selection/dispatch coverage.
+            if restart == "never" && exit_code.is_some() {
+                let mut facts = crate::store::terminal_gate_evidence::tests::facts();
+                facts["gate"]["subject"] = serde_json::json!("exec/orchid/probe");
+                facts["gate"]["expected"] = serde_json::json!(expected);
+                facts["desired"]["subject"] = serde_json::json!("exec/orchid/probe");
+                facts["observed"]["status"] = serde_json::json!(status);
+                facts["observed"]["exit_code"] = serde_json::json!(exit_code);
+                let encoded = Value::String(facts.to_string());
+                assert_eq!(
+                    crate::store::terminal_gate_evidence::witness(&encoded)
+                        .unwrap()
+                        .into_witness(),
+                    reason(&store),
+                    "dormant predicate differs from selected-launch oracle"
+                );
+            }
             if let GateOutcome::Fail(reason) = outcome {
                 assert!(reason.contains("exec/orchid/probe"), "{reason}");
                 assert!(

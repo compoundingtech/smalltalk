@@ -130,6 +130,23 @@
     "id": "timeline-entry/noise-10",
     "sequence": 10,
     "revision": 1,
+    "timestamp": "2026-10-09T10:00:10.800Z",
+    "role": "system",
+    "final": true,
+    "type": "error",
+    "body": {
+      "code": "claude-channel-attached",
+      "message": "The current Claude channel is initialized and subscribed; durable mail delivery resumes.",
+      "retryable": false,
+      "details": {
+        "severity": "warning"
+      }
+    }
+  },
+  {
+    "id": "timeline-entry/noise-11",
+    "sequence": 11,
+    "revision": 1,
     "timestamp": "2026-10-09T10:00:11.000Z",
     "role": "system",
     "final": true,
@@ -140,8 +157,8 @@
     }
   },
   {
-    "id": "timeline-entry/noise-11",
-    "sequence": 11,
+    "id": "timeline-entry/noise-12",
+    "sequence": 12,
     "revision": 1,
     "timestamp": "2026-10-09T10:00:12.000Z",
     "role": "system",
@@ -155,8 +172,25 @@
     }
   },
   {
-    "id": "timeline-entry/noise-12",
-    "sequence": 12,
+    "id": "timeline-entry/noise-13",
+    "sequence": 13,
+    "revision": 1,
+    "timestamp": "2026-10-09T10:00:12.800Z",
+    "role": "system",
+    "final": true,
+    "type": "error",
+    "body": {
+      "code": "claude-channel-attached",
+      "message": "The current Claude channel is initialized and subscribed; durable mail delivery resumes.",
+      "retryable": false,
+      "details": {
+        "severity": "warning"
+      }
+    }
+  },
+  {
+    "id": "timeline-entry/noise-14",
+    "sequence": 14,
     "revision": 1,
     "timestamp": "2026-10-09T10:00:13.000Z",
     "role": "system",
@@ -168,8 +202,8 @@
     }
   },
   {
-    "id": "timeline-entry/noise-13",
-    "sequence": 13,
+    "id": "timeline-entry/noise-15",
+    "sequence": 15,
     "revision": 1,
     "timestamp": "2026-10-09T10:00:14.000Z",
     "role": "system",
@@ -183,8 +217,25 @@
     }
   },
   {
-    "id": "timeline-entry/noise-14",
-    "sequence": 14,
+    "id": "timeline-entry/noise-16",
+    "sequence": 16,
+    "revision": 1,
+    "timestamp": "2026-10-09T10:00:14.800Z",
+    "role": "system",
+    "final": true,
+    "type": "error",
+    "body": {
+      "code": "claude-channel-attached",
+      "message": "The current Claude channel is initialized and subscribed; durable mail delivery resumes.",
+      "retryable": false,
+      "details": {
+        "severity": "warning"
+      }
+    }
+  },
+  {
+    "id": "timeline-entry/noise-17",
+    "sequence": 17,
     "revision": 1,
     "timestamp": "2026-10-09T10:01:00.000Z",
     "role": "user",
@@ -196,8 +247,8 @@
     }
   },
   {
-    "id": "timeline-entry/noise-15",
-    "sequence": 15,
+    "id": "timeline-entry/noise-18",
+    "sequence": 18,
     "revision": 1,
     "timestamp": "2026-10-09T10:01:00.060Z",
     "role": "user",
@@ -209,8 +260,8 @@
     }
   },
   {
-    "id": "timeline-entry/noise-16",
-    "sequence": 16,
+    "id": "timeline-entry/noise-19",
+    "sequence": 19,
     "revision": 1,
     "timestamp": "2026-10-09T10:02:00.000Z",
     "role": "user",
@@ -222,8 +273,8 @@
     }
   },
   {
-    "id": "timeline-entry/noise-17",
-    "sequence": 17,
+    "id": "timeline-entry/noise-20",
+    "sequence": 20,
     "revision": 1,
     "timestamp": "2026-10-09T10:02:00.060Z",
     "role": "user",
@@ -235,8 +286,8 @@
     }
   },
   {
-    "id": "timeline-entry/noise-18",
-    "sequence": 18,
+    "id": "timeline-entry/noise-21",
+    "sequence": 21,
     "revision": 1,
     "timestamp": "2026-10-09T10:03:00.000Z",
     "role": "system",
@@ -248,8 +299,8 @@
     }
   },
   {
-    "id": "timeline-entry/noise-19",
-    "sequence": 19,
+    "id": "timeline-entry/noise-22",
+    "sequence": 22,
     "revision": 1,
     "timestamp": "2026-10-09T10:03:01.000Z",
     "role": "system",
@@ -262,8 +313,23 @@
     }
   },
   {
-    "id": "timeline-entry/noise-20",
-    "sequence": 20,
+    "id": "timeline-entry/noise-23",
+    "sequence": 23,
+    "revision": 1,
+    "timestamp": "2026-10-09T10:03:03.000Z",
+    "role": "system",
+    "final": true,
+    "type": "error",
+    "body": {
+      "code": "claude-channel-unattached",
+      "message": "claude-channel-unattached: attachment could not be verified; mail is held while the driver recovers",
+      "retryable": true,
+      "details": {}
+    }
+  },
+  {
+    "id": "timeline-entry/noise-24",
+    "sequence": 24,
     "revision": 1,
     "timestamp": "2026-10-09T10:03:02.000Z",
     "role": "system",

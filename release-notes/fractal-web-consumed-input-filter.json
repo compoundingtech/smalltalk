@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Fractal web CI detects the generated TypeScript client export graph and its compile inputs instead of Rust generator sources, client docs, or root flake-only changes. Committed fixtures now trigger web execution. The generated workflow embeds the same detector, with tests guarding consumed and excluded paths.",
+  "replay": {
+    "status": "none",
+    "detail": "CI scheduling only; no replay or rebuild of runtime state."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, claim, browser-state, or wire schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule or digest change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No runtime, protocol, harness, or CLI change. Rust and schema-source-only changes do not schedule web lanes; changed consumed generated TypeScript, build inputs, and fixtures still do."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployed service change or interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No installation or operator action required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No runtime recovery change; malformed detection inputs and failed Git operations still fail closed."
+  }
+}

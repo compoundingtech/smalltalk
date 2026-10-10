@@ -176,6 +176,22 @@ Kinds the rules do not name are never dropped: missions, runs, steps, work claim
 attention, membership, desired state, checkpoint claims themselves and every durable fact. The same
 goes for a person's claim of any kind.
 
+**First-native-launch history is durable.** `custom.agent.first-native-launch` receipts and
+`custom.agent.first-native-launch-acknowledged` recovery acknowledgements remain on the same
+`custom/agent/first-native-launch-<subject SHA256>` subject. Like `harness.session-file` bindings
+and `harness.diagnostic` notices with code `first-native-launch-incomplete`, these kinds have no
+drop rule, so the default keeps every claim. This is intentional: a receipt fences the one-time
+launch opportunity even when no native session was bound, an acknowledgement records explicit
+recovery rather than erasing that fence, and a binding preserves the native session to continue.
+A later claim is not a witness that makes these facts dispensable. No special retention rule or
+rule-version change is needed.
+
+The regression `first_native_launch_receipt_binding_and_acknowledgement_survive_checkpoint_trim`
+in `crates/st3/src/store/checkpoint_tests.rs` proves the plan and applies the real tombstone and
+row-deletion path: old observations are removed while the receipt, acknowledgement, binding and
+incomplete-launch notice retain their IDs and bodies, and native continuation still selects the
+bound session.
+
 **Why the "five days" rows.** These kinds are local observations that the owning node's own log
 already forgets after seven days. A claim is dropped from the replicated log only when it is at
 least five days older than the cut, and a checkpoint is due two days after its cut, so it is at

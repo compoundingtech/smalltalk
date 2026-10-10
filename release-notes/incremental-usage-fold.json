@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "An agent card's usage summary folds only the usage claims since the last read instead of the agent's whole usage history, so roster refreshes stop growing with usage history",
+  "replay": {"status": "none", "detail": "No claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, triggers or data rewrites. The incremental read uses the existing claims_subject_kind_index."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digests change. Checkpoint trims keep lifetime usage unchanged, which the kept fold relies on."},
+  "compatibility": {"status": "none", "detail": "Usage summaries are unchanged: a kept fold is resumed only when every new usage claim sorts after the last one it folded, and is folded afresh otherwise."},
+  "downtime": {"status": "none", "detail": "No startup work; folds are kept in memory as reads make them."},
+  "manual": {"status": "none", "detail": "No operator steps."},
+  "recovery": {"status": "none", "detail": "In-memory only; a restart or rollback folds afresh without changing durable state."}
+}

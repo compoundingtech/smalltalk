@@ -10,6 +10,7 @@ import {
   afterPickRunner,
   buildEnv,
   commonSetupSteps,
+  fractalWebJobs,
   nixCacheStep,
   linuxRunner,
   linuxStageJob as namespaceStageJob,
@@ -19,6 +20,7 @@ import {
   mailStageRunsOn,
   pickRunnerJob,
   pickRunnerJobId,
+  pnpmStoreEnv,
   supportingLinuxRunsOn,
   supportingStageRunsOn,
   secondaryStageRunsOn,
@@ -202,7 +204,8 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       'timeout-minutes': 20,
       steps: [
         ...commonSetupSteps.filter((step) => !('id' in step && step.id === 'cargo-cache')),
-        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-namespace-usage-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && genie --check'] }),
+        { name: 'Check frozen workspace dependency license coverage', run: 'python3 scripts/ci-fractal-web-licenses-test && python3 scripts/ci-fractal-web-licenses --check-lockfile' },
+        nixDevelopStep({ name: 'Check runner selection and generated files', flake: '.#genie', command: ['bash', '-c', 'python3 scripts/check-ci-runner-test && python3 scripts/ci-namespace-usage-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && python3 scripts/ci-fractal-web-test && genie --check'] }),
         { name: 'Save Nix outputs', if: `success() && env.CI_LOCAL_CACHES != '1' && ${optionalQueueCacheSave}`, run: 'bash scripts/ci-nix-cache save' },
         ...buildSnapshotSave,
       ],
@@ -216,6 +219,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
       'runs-on': supportingLinuxRunsOn,
       'timeout-minutes': 10,
       defaults: { run: { shell: 'bash' } },
+      env: { COREPACK_ENABLE_DOWNLOAD_PROMPT: '0' },
       steps: [
         { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
         // Node 24, as in the workspace shell; schema tests use its native TypeScript loading.
@@ -224,7 +228,7 @@ printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
           name: 'Fingerprint the locked dependencies',
           id: 'lockfiles',
           // ci1's Nix runner lacks the Node 20 helper used by GitHub's hashFiles expression.
-          run: `lockfiles_hash=$(sha256sum apps/ios/package-lock.json clients/typescript/st3-client/package-lock.json clients/typescript/st3-views/package-lock.json | sha256sum | cut -d ' ' -f1)
+          run: `lockfiles_hash=$(sha256sum pnpm-lock.yaml | cut -d ' ' -f1)
 printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
         },
         {
@@ -232,30 +236,13 @@ printf 'hash=%s\\n' "$lockfiles_hash" >> "$GITHUB_OUTPUT"`,
           id: 'typescript-cache',
           uses: 'actions/cache@v5',
           with: {
-            path: 'apps/ios/node_modules\nclients/typescript/st3-client/node_modules\nclients/typescript/st3-views/node_modules',
-            key: 'typescript-client-${{ runner.os }}-node24.18.0-${{ steps.lockfiles.outputs.hash }}',
+            path: pnpmStoreEnv.pnpm_config_store_dir,
+            key: 'typescript-client-${{ runner.os }}-node24.18.0-pnpm12.7.0-${{ steps.lockfiles.outputs.hash }}',
           },
         },
-        {
-          name: 'Install locked client dependencies',
-          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
-          run: 'npm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund',
-        },
-        {
-          name: 'Run client contracts, schemas and strict typechecks',
-          run: 'npm test --prefix clients/typescript/st3-client\nnpm run typecheck --prefix clients/typescript/st3-client',
-        },
-        {
-          name: 'Install locked view dependencies',
-          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
-          run: 'npm ci --prefix clients/typescript/st3-views --ignore-scripts --no-audit --no-fund',
-        },
-        {
-          name: 'Install locked iOS dependencies',
-          if: "steps.typescript-cache.outputs.cache-hit != 'true'",
-          run: 'npm ci --prefix apps/ios --ignore-scripts --no-audit --no-fund',
-        },
-        { name: 'Check shared views, fixtures and iOS consumers', run: 'npm test --prefix clients/typescript/st3-views\nnpm run typecheck --prefix clients/typescript/st3-views\napps/ios/node_modules/.bin/tsc --noEmit -p apps/ios\nnpm test --prefix apps/ios' },
+        // Corepack provisions the root manifest's pnpm@12.7.0; the workspace forbids install scripts.
+        { name: 'Install the frozen workspace', env: pnpmStoreEnv, run: 'corepack enable\npnpm install --frozen-lockfile' },
+        { name: 'Check the client, shared views and iOS consumers', run: 'bash scripts/ci-typescript-client' },
       ],
     },
     'linux-test-build': {
@@ -436,5 +423,9 @@ printf '| sekrets VM test | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SU
         { name: 'Save Nix outputs', if: `success() && env.CI_LOCAL_CACHES != '1' && ${optionalQueueCacheSave}`, run: 'bash scripts/ci-nix-cache save' },
       ],
     },
+    // Not yet a required check: the ruleset gains `fractal-web` after both PR and merge-group
+    // runs have emitted it successfully.
+    // workspace-ci embeds scripts/ci-fractal-web-changes; its consumed-input list is authoritative.
+    ...fractalWebJobs,
   },
-}, {"pick-runner": "Runner selection uses live API state and builds nothing.", "upgrade-impact": "Runs Python/Git classification checks without downloads or compilation.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing."}))
+}, {"pick-runner": "Runner selection uses live API state and builds nothing.", "upgrade-impact": "Runs Python/Git classification checks without downloads or compilation.", "namespace-capacity": "Capacity is live API state and builds nothing.", "linux-gate": "Collects completed checks and builds nothing.", "fractal-web-changes": "Diffs two fetched commits without blobs and builds nothing.", "fractal-web": "Collects the detection and execution results and builds nothing."}))

@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs'
 import { buildSnapshotPrepare, buildSnapshotRestore, buildSnapshotSave, optionalQueueCacheSave } from './build-snapshot.ts'
 import {
   defaultActionlintConfig,
@@ -424,3 +425,81 @@ export const perfStoresCache = (stage: string) => ({
     key: `perf-${stage}-stores-\${{ hashFiles('crates/st3/tests/daemon_bench.rs', 'docs/st3/schema.md') }}`,
   },
 })
+
+/** pnpm's store under the runner's temporary directory, which only step-level env can name. */
+export const pnpmStoreEnv = { pnpm_config_store_dir: '${{ runner.temp }}/pnpm-store' } as const
+
+/** The web lane's pnpm store, keyed by its lock and toolchain; only main upkeep fills it. */
+export const fractalWebStoreCache = {
+  path: pnpmStoreEnv.pnpm_config_store_dir,
+  key: "fractal-web-pnpm-${{ runner.os }}-pnpm12.7.0-node24.20.0-${{ hashFiles('pnpm-lock.yaml') }}",
+} as const
+
+const embeddedPython = (script: string) =>
+  `python3 - <<'PY'\n${readFileSync(new URL(`../../scripts/${script}`, import.meta.url), 'utf8')}\nPY`
+
+/**
+ * The path-sensitive fractal-web gate. Detection and the gate always run on GitHub-hosted
+ * capacity without a checkout; execution runs only for web-relevant changes, after generated
+ * files are fresh. Workflow-level path filters would leave a required check pending forever.
+ */
+export const fractalWebJobs = {
+  'fractal-web-changes': {
+    name: 'fractal-web-changes',
+    'runs-on': 'ubuntu-latest',
+    'timeout-minutes': 1,
+    permissions: { contents: 'read' },
+    outputs: { relevant: '${{ steps.detect.outputs.relevant }}' },
+    steps: [
+      {
+        name: 'Detect web-relevant changes',
+        id: 'detect',
+        env: {
+          EVENT: '${{ github.event_name }}',
+          REMOTE: '${{ github.server_url }}/${{ github.repository }}.git',
+          BASE_SHA: '${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}',
+          HEAD_SHA: '${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}',
+        },
+        run: embeddedPython('ci-fractal-web-changes'),
+      },
+    ],
+  },
+  'fractal-web-execution': {
+    name: 'fractal-web-execution',
+    needs: ['fractal-web-changes', 'genie-freshness'],
+    if: "${{ !cancelled() && needs.fractal-web-changes.result == 'success' && needs.fractal-web-changes.outputs.relevant == 'true' && needs.genie-freshness.result == 'success' }}",
+    'runs-on': 'ubuntu-latest',
+    'timeout-minutes': 25,
+    permissions: { contents: 'read' },
+    defaults: { run: { shell: 'bash' } },
+    steps: [
+      { uses: 'actions/checkout@v4', with: { 'persist-credentials': false } },
+      ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+      { name: 'Restore the pnpm store', id: 'pnpm-store', uses: 'actions/cache/restore@v4', with: fractalWebStoreCache },
+      {
+        ...nixDevelopStep({ name: 'Run the fractal-web lanes and dependency license check', flake: '.#web', command: ['bash', 'scripts/ci-fractal-web'] }),
+        env: pnpmStoreEnv,
+      },
+    ],
+  },
+  'fractal-web': {
+    name: 'fractal-web',
+    needs: ['fractal-web-changes', 'fractal-web-execution'],
+    // A failed, cancelled or unexpectedly skipped execution must fail this check.
+    if: 'always()',
+    'runs-on': 'ubuntu-latest',
+    'timeout-minutes': 1,
+    permissions: {},
+    steps: [
+      {
+        name: 'Require detection and, for web changes, execution',
+        env: {
+          CHANGES_RESULT: '${{ needs.fractal-web-changes.result }}',
+          RELEVANT: '${{ needs.fractal-web-changes.outputs.relevant }}',
+          EXECUTION_RESULT: '${{ needs.fractal-web-execution.result }}',
+        },
+        run: embeddedPython('ci-fractal-web-gate'),
+      },
+    ],
+  },
+} as const

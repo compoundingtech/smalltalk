@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add an OMP-only transcript seed fenced by one durable first native launch outcome per seat.",
+  "replay": {"status": "none", "detail": "Existing native binding claims win without rewriting history. One seat-scoped operation key fences first-launch outcomes; a unique invocation identity distinguishes the winning receipt from a cached response."},
+  "schema": {"status": "none", "detail": "No database migration. Adds typed custom.agent.first-native-launch receipts with fresh or seeded outcomes, plus custom.agent.first-native-launch-acknowledged recovery claims citing the original receipt."},
+  "rules": {"status": "none", "detail": "Existing claim admission and actor authority remain unchanged."},
+  "compatibility": {"status": "changed", "detail": "Only OMP harness declarations accept seed. The driver rejects seed conflicts with authored selectors and effective resume or continuation environment before any receipt. Reconciliation omits the wrapper seed for generated exact native selection. Every native first launch records a seat-scoped outcome, independent of path, revision, account and harness."},
+  "manual": {"status": "changed", "detail": "Declare an absolute owner-local OMP transcript as seed rather than permanent resume arguments. Validate every JSON line with an 8 MiB line and 64 MiB total byte cap before recording an outcome. Each seat receives its own transcript copy; staging never overwrites an existing provider copy. Invalid input fails without consuming the opportunity."},
+  "recovery": {"status": "changed", "detail": "Fresh receipts never block later launches, including restarts before the first message. An unbound seeded receipt always launches fresh with a visible durable incomplete warning, even while seed remains declared; it never validates, stages or reseeds that declaration again. st agents acknowledge-seed AGENT --reason REASON records acceptance of the incomplete attempt and suppresses later warnings, without deleting or rearming the receipt. Acknowledgement is never required to permit launch. Receipts, acknowledgements, notices and bindings survive checkpoint trim."},
+  "downtime": {"status": "unknown", "detail": "Normal daemon upgrade restart; interruption duration has not been measured."}
+}

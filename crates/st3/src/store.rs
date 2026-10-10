@@ -18,6 +18,8 @@ mod message_send_tests;
 pub mod owned_sets;
 #[cfg(test)]
 mod owned_sets_tests;
+#[cfg(test)]
+mod usage_fold_tests;
 mod resources;
 mod github_workflow_failures;
 pub(crate) mod message_subscriptions;
@@ -149,6 +151,8 @@ pub use subagents::{
 #[cfg(test)]
 mod checkpoint_agreement_tests;
 #[cfg(test)]
+pub(crate) mod terminal_gate_evidence;
+#[cfg(test)]
 mod checkpoint_tests;
 #[cfg(test)]
 mod checkpoint_capture_epoch_tests;
@@ -218,6 +222,246 @@ pub mod projection_digest {
 type StepStateRow = (String, bool, u32, String, String, String, String, String);
 type StepRetryRow = (String, u32, bool, String, String, String, String, String);
 type CumulativeUsage = (u64, u64, u64, u64, Option<f64>, Option<String>);
+
+/// One incarnation's spend as its usage claims fold, in canonical claim order.
+#[derive(Clone, Default)]
+struct UsageSpend {
+    cumulative: Option<CumulativeUsage>,
+    rollups: BTreeMap<String, (u64, u64, u64, u64, u64)>,
+    response_total: u64,
+    response_input: u64,
+    response_output: u64,
+    response_cached: u64,
+    response_cost: f64,
+    response_has_cost: bool,
+    response_currency: Option<String>,
+}
+
+/// An agent's usage summary as a fold over its `harness.usage` claims in canonical order, kept
+/// between reads so a later read folds only the claims that sort after it.
+#[derive(Clone, Default)]
+pub(crate) struct UsageFold {
+    spend: BTreeMap<String, UsageSpend>,
+    context: Option<(u64, ContextUsage)>,
+    saw: bool,
+}
+
+/// An agent's usage fold over every usage claim at or before `through`, with the accepted time
+/// of the last one it folded.
+pub(crate) struct CachedUsageFold {
+    through: u64,
+    last_accepted: String,
+    fold: UsageFold,
+}
+
+/// How many agents' usage folds a store keeps. Past it the cache starts over.
+const USAGE_FOLDS: usize = 4096;
+
+/// Canonical order's first components: accepted time as stored, shorter first.
+fn accepted_order(accepted: &str) -> (usize, &str) {
+    (accepted.len(), accepted)
+}
+
+impl UsageFold {
+    /// Fold the next usage claim in canonical order.
+    fn apply(&mut self, store_index: u64, body: &str, accepted_at: &str, incarnation: Option<&str>) -> Result<()> {
+        let body: Value = serde_json::from_str(body)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        let claim_incarnation = fields
+            .get("incarnation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if incarnation.is_some_and(|expected| expected != claim_incarnation) {
+            return Ok(());
+        }
+        self.saw = true;
+        match fields.get("semantics").and_then(Value::as_str) {
+            Some("context_occupancy") => {
+                self.context = Some((
+                    store_index,
+                    ContextUsage {
+                        used_tokens: fields.get("context_used_tokens").and_then(Value::as_u64),
+                        window_tokens: fields
+                            .get("context_window_tokens")
+                            .and_then(Value::as_u64),
+                        used_percent: fields
+                            .get("context_used_percent")
+                            .and_then(Value::as_f64),
+                        model: fields
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        compactions: fields
+                            .get("compactions")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        last_compaction_ms: fields
+                            .get("last_compaction_ms")
+                            .and_then(Value::as_u64),
+                        last_compaction_trigger: fields
+                            .get("last_compaction_trigger")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        observed_at_unix_ms: accepted_at.parse().unwrap_or_default(),
+                    },
+                ));
+            }
+            Some("session_cumulative") => {
+                let Some(total) = fields.get("total_tokens").and_then(Value::as_u64) else {
+                    return Ok(());
+                };
+                let candidate = (
+                    total,
+                    fields
+                        .get("input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    fields
+                        .get("output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    fields
+                        .get("cached_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                    fields.get("cost").and_then(Value::as_f64),
+                    fields
+                        .get("currency")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                );
+                let group = self.spend.entry(claim_incarnation.to_owned()).or_default();
+                if group
+                    .cumulative
+                    .as_ref()
+                    .is_none_or(|current| candidate.0 >= current.0)
+                {
+                    group.cumulative = Some(candidate);
+                }
+            }
+            Some("response_rollup") => {
+                let group = self.spend.entry(claim_incarnation.to_owned()).or_default();
+                let key = ["model", "account", "owner_run", "owner_step", "host"]
+                    .iter()
+                    .map(|key| fields.get(*key).and_then(Value::as_str).unwrap_or(""))
+                    .collect::<Vec<_>>()
+                    .join("\0");
+                group.rollups.insert(
+                    key,
+                    (
+                        fields
+                            .get("total_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        fields
+                            .get("input_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        fields
+                            .get("output_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        fields
+                            .get("cache_write_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        fields
+                            .get("cached_tokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    ),
+                );
+            }
+            Some("response") => {
+                let Some(total) = fields.get("total_tokens").and_then(Value::as_u64) else {
+                    return Ok(());
+                };
+                let group = self.spend.entry(claim_incarnation.to_owned()).or_default();
+                group.response_total = group.response_total.saturating_add(total);
+                group.response_input = group.response_input.saturating_add(
+                    fields
+                        .get("input_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                );
+                group.response_output = group.response_output.saturating_add(
+                    fields
+                        .get("output_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                );
+                group.response_cached = group.response_cached.saturating_add(
+                    fields
+                        .get("cached_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                );
+                if let Some(cost) = fields.get("cost").and_then(Value::as_f64) {
+                    group.response_cost += cost;
+                    group.response_has_cost = true;
+                }
+                if let Some(currency) = fields.get("currency").and_then(Value::as_str) {
+                    group.response_currency = Some(currency.to_owned());
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn summary(&self) -> Option<UsageSummary> {
+        if !self.saw {
+            return None;
+        }
+        let mut summary = UsageSummary {
+            aggregation: "cumulative-per-incarnation-else-response-deltas".into(),
+            context: self.context.clone().map(|(_, value)| value),
+            ..UsageSummary::default()
+        };
+        let mut cost = 0.0;
+        let mut has_cost = false;
+        for group in self.spend.values().cloned() {
+            summary.incarnation_count += 1;
+            let rollup_total = group.rollups.values().fold(0_u64, |total, row| total.saturating_add(row.0));
+            // These are two cumulative views of the same incarnation, never additive.
+            // Incomplete attributed rollups cannot lower a larger provider total; newer
+            // complete rollups may exceed a still-old provider reading.
+            let cumulative = group.cumulative.filter(|value| group.rollups.is_empty() || value.0 > rollup_total);
+            if let Some((total, input, output, cached, group_cost, currency)) = cumulative {
+                summary.total_tokens = summary.total_tokens.saturating_add(total);
+                summary.input_tokens = summary.input_tokens.saturating_add(input);
+                summary.output_tokens = summary.output_tokens.saturating_add(output);
+                summary.cached_tokens = summary.cached_tokens.saturating_add(cached);
+                if let Some(value) = group_cost {
+                    cost += value;
+                    has_cost = true;
+                }
+                summary.currency = summary.currency.or(currency);
+            } else if !group.rollups.is_empty() {
+                for (total, input, output, writes, reads) in group.rollups.into_values() {
+                    summary.total_tokens = summary.total_tokens.saturating_add(total);
+                    summary.input_tokens = summary.input_tokens.saturating_add(input);
+                    summary.output_tokens = summary.output_tokens.saturating_add(output);
+                    summary.cache_write_tokens = summary.cache_write_tokens.saturating_add(writes);
+                    summary.cached_tokens = summary.cached_tokens.saturating_add(reads);
+                }
+            } else {
+                summary.total_tokens = summary.total_tokens.saturating_add(group.response_total);
+                summary.input_tokens = summary.input_tokens.saturating_add(group.response_input);
+                summary.output_tokens = summary.output_tokens.saturating_add(group.response_output);
+                summary.cached_tokens = summary.cached_tokens.saturating_add(group.response_cached);
+                if group.response_has_cost {
+                    cost += group.response_cost;
+                    has_cost = true;
+                }
+                summary.currency = summary.currency.or(group.response_currency);
+            }
+        }
+        summary.cost = has_cost.then_some(cost);
+        Some(summary)
+    }
+}
+
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentWorkQueue {
@@ -16205,22 +16449,79 @@ impl Store {
         subjects: &[String],
         at_index: Option<u64>,
     ) -> Result<BTreeMap<String, UsageSummary>> {
-        self.read_snapshot(|_| self.usage_summaries_pinned(subjects, at_index))
+        self.read_snapshot(|snapshot| self.usage_summaries_pinned(subjects, at_index, snapshot))
+    }
+
+    /// Resume an agent's kept usage fold with only the usage claims after it, when every one of
+    /// them sorts after the last claim it folded. `None` when one does not, such as a replicated
+    /// claim accepted earlier, or two new claims tie on accepted time; the caller folds afresh.
+    fn usage_fold_after(
+        connection: &rusqlite::Connection,
+        subject: &str,
+        cached: &CachedUsageFold,
+        through: u64,
+    ) -> Result<Option<CachedUsageFold>> {
+        let mut statement = connection.prepare_cached(
+            "SELECT store_index, body, accepted_at_unix_ms
+             FROM claims INDEXED BY claims_subject_kind_index
+             WHERE subject=?1 AND kind='harness.usage' AND store_index>?2 AND store_index<=?3",
+        )?;
+        let mut rows = statement
+            .query_map(params![subject, cached.through, through], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.sort_by(|a, b| accepted_order(&a.2).cmp(&accepted_order(&b.2)));
+        let mut last = cached.last_accepted.as_str();
+        for row in &rows {
+            if accepted_order(&row.2) <= accepted_order(last) {
+                return Ok(None);
+            }
+            last = &row.2;
+        }
+        let mut fold = cached.fold.clone();
+        for (store_index, body, accepted) in &rows {
+            fold.apply(*store_index, body, accepted, None)?;
+        }
+        Ok(Some(CachedUsageFold { through, last_accepted: last.to_owned(), fold }))
     }
 
     fn usage_summaries_pinned(
         &self,
         subjects: &[String],
         at_index: Option<u64>,
+        snapshot: u64,
     ) -> Result<BTreeMap<String, UsageSummary>> {
+        let cache_epoch = self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let through = at_index.map_or(snapshot, |at| at.min(snapshot));
         let connection = self.readers.get();
-        let mut grouped = BTreeMap::<String, Vec<rusqlite::Result<(u64, String, String)>>>::new();
         let unique_subjects = subjects
             .iter()
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        for chunk in unique_subjects.chunks(500) {
+        let kept = {
+            let folds = self.smalltalk.usage_folds.lock().expect("usage folds poisoned");
+            unique_subjects.iter()
+                .filter_map(|subject| folds.get(subject.as_str())
+                    .filter(|cached| cached.through <= through)
+                    .map(|cached| (subject.as_str(), Arc::clone(cached))))
+                .collect::<HashMap<_, _>>()
+        };
+        let mut folded = BTreeMap::<String, CachedUsageFold>::new();
+        let mut unfolded = Vec::new();
+        for subject in unique_subjects {
+            let resumed = match kept.get(subject.as_str()) {
+                Some(cached) => Self::usage_fold_after(&connection, subject, cached, through)?,
+                None => None,
+            };
+            match resumed {
+                Some(resumed) => { folded.insert(subject.clone(), resumed); }
+                None => unfolded.push(subject),
+            }
+        }
+        let mut grouped = BTreeMap::<String, Vec<rusqlite::Result<(u64, String, String)>>>::new();
+        for chunk in unfolded.chunks(500) {
             if chunk.is_empty() {
                 continue;
             }
@@ -16235,7 +16536,7 @@ impl Store {
                  ORDER BY subject, length(accepted_at_unix_ms), accepted_at_unix_ms",
                 at_index.unwrap_or(i64::MAX as u64)
             );
-            let mut statement = connection.prepare(&current_sql(&sql))?;
+            let mut statement = connection.prepare(&sql)?;
             let rows = statement.query_map(rusqlite::params_from_iter(chunk), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -16275,11 +16576,49 @@ impl Store {
             }
             flush(&mut ties)?;
         }
-        let mut summaries = BTreeMap::new();
-        for (subject, rows) in grouped {
-            if let Some(summary) = Self::usage_summary_from_rows(rows, None)? {
-                summaries.insert(subject, summary);
+        for subject in unfolded {
+            let mut fold = UsageFold::default();
+            let mut last_accepted = String::new();
+            for row in grouped.remove(subject.as_str()).unwrap_or_default() {
+                let (store_index, body, accepted) = row?;
+                fold.apply(store_index, &body, &accepted, None)?;
+                last_accepted = accepted;
             }
+            folded.insert(subject.clone(), CachedUsageFold { through, last_accepted, fold });
+        }
+        // Cache only immutable history. A context register can change at the same graph
+        // cut, and its timestamp must not prevent a later numeric claim from resuming.
+        let mut summaries = BTreeMap::new();
+        let mut context = connection.prepare_cached(
+            "SELECT store_index,body,CAST(source_at AS TEXT) FROM latest_values
+             WHERE subject=?1 AND kind='harness.usage'",
+        )?;
+        for (subject, cached) in &folded {
+            let mut fold = cached.fold.clone();
+            if let Some((index, body, accepted)) = context.query_row([subject], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            }).optional()? {
+                let source_at = accepted.parse::<u128>().unwrap_or_default();
+                if fold.context.as_ref().is_none_or(|(_, value)| value.observed_at_unix_ms <= source_at) {
+                    fold.apply(index, &body, &accepted, None)?;
+                }
+            }
+            if let Some(summary) = fold.summary() { summaries.insert(subject.clone(), summary); }
+        }
+        let mut folds = self.smalltalk.usage_folds.lock().expect("usage folds poisoned");
+        // A replay or prefix reset can race this read; do not repopulate the new
+        // epoch with folds built against its predecessor.
+        if self.smalltalk.roster_cache_epoch.load(std::sync::atomic::Ordering::Acquire) != cache_epoch {
+            return Ok(summaries);
+        }
+        for (subject, cached) in folded {
+            if folds.get(&subject).is_some_and(|kept| kept.through > cached.through) {
+                continue;
+            }
+            if folds.len() >= USAGE_FOLDS && !folds.contains_key(&subject) {
+                folds.clear();
+            }
+            folds.insert(subject, Arc::new(cached));
         }
         Ok(summaries)
     }
@@ -16291,215 +16630,12 @@ impl Store {
     where
         I: IntoIterator<Item = rusqlite::Result<(u64, String, String)>>,
     {
-        #[derive(Default)]
-        struct Spend {
-            cumulative: Option<CumulativeUsage>,
-            rollups: BTreeMap<String, (u64, u64, u64, u64, u64)>,
-            response_total: u64,
-            response_input: u64,
-            response_output: u64,
-            response_cached: u64,
-            response_cost: f64,
-            response_has_cost: bool,
-            response_currency: Option<String>,
-        }
-
-        let mut spend = BTreeMap::<String, Spend>::new();
-        let mut context = None::<(u64, ContextUsage)>;
-        let mut saw = false;
+        let mut fold = UsageFold::default();
         for row in rows {
             let (store_index, body, accepted_at) = row?;
-            let body: Value = serde_json::from_str(&body)?;
-            let fields = body.get("fields").unwrap_or(&body);
-            let claim_incarnation = fields
-                .get("incarnation_id")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            if incarnation.is_some_and(|expected| expected != claim_incarnation) {
-                continue;
-            }
-            saw = true;
-            match fields.get("semantics").and_then(Value::as_str) {
-                Some("context_occupancy") => {
-                    context = Some((
-                        store_index,
-                        ContextUsage {
-                            used_tokens: fields.get("context_used_tokens").and_then(Value::as_u64),
-                            window_tokens: fields
-                                .get("context_window_tokens")
-                                .and_then(Value::as_u64),
-                            used_percent: fields
-                                .get("context_used_percent")
-                                .and_then(Value::as_f64),
-                            model: fields
-                                .get("model")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
-                            compactions: fields
-                                .get("compactions")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                            last_compaction_ms: fields
-                                .get("last_compaction_ms")
-                                .and_then(Value::as_u64),
-                            last_compaction_trigger: fields
-                                .get("last_compaction_trigger")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
-                            observed_at_unix_ms: accepted_at.parse().unwrap_or_default(),
-                        },
-                    ));
-                }
-                Some("session_cumulative") => {
-                    let Some(total) = fields.get("total_tokens").and_then(Value::as_u64) else {
-                        continue;
-                    };
-                    let candidate = (
-                        total,
-                        fields
-                            .get("input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                        fields
-                            .get("output_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                        fields
-                            .get("cached_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                        fields.get("cost").and_then(Value::as_f64),
-                        fields
-                            .get("currency")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                    );
-                    let group = spend.entry(claim_incarnation.to_owned()).or_default();
-                    if group
-                        .cumulative
-                        .as_ref()
-                        .is_none_or(|current| candidate.0 >= current.0)
-                    {
-                        group.cumulative = Some(candidate);
-                    }
-                }
-                Some("response_rollup") => {
-                    let group = spend.entry(claim_incarnation.to_owned()).or_default();
-                    let key = ["model", "account", "owner_run", "owner_step", "host"]
-                        .iter()
-                        .map(|key| fields.get(*key).and_then(Value::as_str).unwrap_or(""))
-                        .collect::<Vec<_>>()
-                        .join("\0");
-                    group.rollups.insert(
-                        key,
-                        (
-                            fields
-                                .get("total_tokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                            fields
-                                .get("input_tokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                            fields
-                                .get("output_tokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                            fields
-                                .get("cache_write_tokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                            fields
-                                .get("cached_tokens")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(0),
-                        ),
-                    );
-                }
-                Some("response") => {
-                    let Some(total) = fields.get("total_tokens").and_then(Value::as_u64) else {
-                        continue;
-                    };
-                    let group = spend.entry(claim_incarnation.to_owned()).or_default();
-                    group.response_total = group.response_total.saturating_add(total);
-                    group.response_input = group.response_input.saturating_add(
-                        fields
-                            .get("input_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                    );
-                    group.response_output = group.response_output.saturating_add(
-                        fields
-                            .get("output_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                    );
-                    group.response_cached = group.response_cached.saturating_add(
-                        fields
-                            .get("cached_tokens")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
-                    );
-                    if let Some(cost) = fields.get("cost").and_then(Value::as_f64) {
-                        group.response_cost += cost;
-                        group.response_has_cost = true;
-                    }
-                    if let Some(currency) = fields.get("currency").and_then(Value::as_str) {
-                        group.response_currency = Some(currency.to_owned());
-                    }
-                }
-                _ => {}
-            }
+            fold.apply(store_index, &body, &accepted_at, incarnation)?;
         }
-        if !saw {
-            return Ok(None);
-        }
-        let mut summary = UsageSummary {
-            aggregation: "cumulative-per-incarnation-else-response-deltas".into(),
-            context: context.map(|(_, value)| value),
-            ..UsageSummary::default()
-        };
-        let mut cost = 0.0;
-        let mut has_cost = false;
-        for group in spend.into_values() {
-            summary.incarnation_count += 1;
-            let rollup_total = group.rollups.values().fold(0_u64, |total, row| total.saturating_add(row.0));
-            // These are two cumulative views of the same incarnation, never additive.
-            // Incomplete attributed rollups cannot lower a larger provider total; newer
-            // complete rollups may exceed a still-old provider reading.
-            let cumulative = group.cumulative.filter(|value| group.rollups.is_empty() || value.0 > rollup_total);
-            if let Some((total, input, output, cached, group_cost, currency)) = cumulative {
-                summary.total_tokens = summary.total_tokens.saturating_add(total);
-                summary.input_tokens = summary.input_tokens.saturating_add(input);
-                summary.output_tokens = summary.output_tokens.saturating_add(output);
-                summary.cached_tokens = summary.cached_tokens.saturating_add(cached);
-                if let Some(value) = group_cost {
-                    cost += value;
-                    has_cost = true;
-                }
-                summary.currency = summary.currency.or(currency);
-            } else if !group.rollups.is_empty() {
-                for (total, input, output, writes, reads) in group.rollups.into_values() {
-                    summary.total_tokens = summary.total_tokens.saturating_add(total);
-                    summary.input_tokens = summary.input_tokens.saturating_add(input);
-                    summary.output_tokens = summary.output_tokens.saturating_add(output);
-                    summary.cache_write_tokens = summary.cache_write_tokens.saturating_add(writes);
-                    summary.cached_tokens = summary.cached_tokens.saturating_add(reads);
-                }
-            } else {
-                summary.total_tokens = summary.total_tokens.saturating_add(group.response_total);
-                summary.input_tokens = summary.input_tokens.saturating_add(group.response_input);
-                summary.output_tokens = summary.output_tokens.saturating_add(group.response_output);
-                summary.cached_tokens = summary.cached_tokens.saturating_add(group.response_cached);
-                if group.response_has_cost {
-                    cost += group.response_cost;
-                    has_cost = true;
-                }
-                summary.currency = summary.currency.or(group.response_currency);
-            }
-        }
-        summary.cost = has_cost.then_some(cost);
-        Ok(Some(summary))
+        Ok(fold.summary())
     }
 
     /// Period spend from replicated cumulative snapshots. The snapshot immediately before the
@@ -25020,7 +25156,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
                 "approve",
                 &[
                     "st",
-                    "attention",
+                    "alerts",
                     "approve",
                     &review.owner,
                     "--as",
@@ -25035,7 +25171,7 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
                 },
                 &[
                     "st",
-                    "attention",
+                    "alerts",
                     if review.mode == "feedback" {
                         "request-changes"
                     } else {

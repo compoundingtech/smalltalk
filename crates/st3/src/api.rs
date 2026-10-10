@@ -60,6 +60,8 @@ use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
+#[cfg(test)]
+mod terminal_gate_evidence;
 mod client_adapters;
 mod client_presence;
 mod client_v0;
@@ -6953,7 +6955,7 @@ fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -
         return DoctorCheck {
             name: "attention-age".into(),
             status: "pass".into(),
-            message: "no attention item has been open for more than a day".into(),
+            message: "no alert or fault has been open for more than a day".into(),
         };
     }
     stale.sort_by(|left, right| {
@@ -6982,7 +6984,7 @@ fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -
         name: "attention-age".into(),
         status: "warn".into(),
         message: format!(
-            "{} attention items have been open for more than a day; `st attention ls --as PERSON` shows how to close a person's item, and a fault closes at its source: {}",
+            "{} alerts and faults have been open for more than a day; `st alerts ls --as PERSON` shows how to close a person's alert, and a fault closes at its source: {}",
             stale.len(),
             listed.join("; ")
         ),
@@ -12272,7 +12274,7 @@ fn review_owner(state: &AppState, target: &str) -> Result<String, ApiError> {
     }
     Err(unknown(format!(
         "`{target}` names no step run, mission run, loop or attention card; \
-         `st attention ls --as PERSON` lists the reviews waiting"
+         `st alerts ls --as PERSON` lists the reviews waiting"
     )))
 }
 
@@ -18184,6 +18186,112 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_seed_first_launch_contract_survives_concurrency_and_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        let database = root.path().join("seed.sqlite3");
+        state.store = Arc::new(Store::open(&database, "node").unwrap());
+        let socket = root.path().join("seed.sock");
+        let server_socket = socket.clone();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move { serve_unix(&server_socket, router(server_state)).await });
+        while !socket.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+        let client = crate::client::Client::new(crate::client::Endpoint::Unix(socket));
+        let id = uuid::Uuid::now_v7().to_string();
+        let seed = root.path().join(format!("time_{id}.jsonl"));
+        let invalid = root.path().join("missing.jsonl");
+        std::fs::write(&seed, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n")).unwrap();
+        let launch = |seat: &'static str, incarnation: &'static str, driver: &'static str, seed: Option<PathBuf>, strict: bool| {
+            let client = client.clone();
+            let inventory = root.path().join(seat.replace('/', "-"));
+            async move { crate::native_seed::first_launch(&client, seat, incarnation, driver, seed.as_deref(), &inventory, strict).await }
+        };
+        assert!(launch("agent/invalid", "one", "omp", Some(invalid.clone()), false).await.is_err());
+        let corrupt = root.path().join(format!("corrupt_{id}.jsonl"));
+        std::fs::write(&corrupt, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\nbroken\n")).unwrap();
+        assert!(launch("agent/invalid", "corrupt", "omp", Some(corrupt), false).await.is_err());
+        assert_eq!(launch("agent/invalid", "two", "omp", Some(seed.clone()), false).await.unwrap(), Some(id.clone()), "invalid input must not consume the opportunity");
+        assert_eq!(launch("agent/invalid", "three", "omp", Some(seed.clone()), false).await.unwrap(), None, "an unbound seeded receipt starts fresh even while seed remains declared");
+
+        let (one, two) = tokio::join!(
+            launch("agent/concurrent", "one", "omp", Some(seed.clone()), false),
+            launch("agent/concurrent", "two", "omp", Some(seed.clone()), false)
+        );
+        let outcomes = [one.unwrap(), two.unwrap()];
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_some()).count(), 1, "only the receipt winner launches seeded; the other launch proceeds fresh");
+        let append = |seat: &str, kind: &str, fields: Value| {
+            state.store.append_claim(&ClaimInput { subject: seat.into(), kind: kind.into(), actor: Some(seat.into()), fields: serde_json::from_value(fields).unwrap(), evidence: vec![], expected_subject: None, idempotency_key: None }).unwrap();
+        };
+        append("agent/legacy-binding", "harness.session-file", json!({"harness":"omp","session_id":"legacy"}));
+        assert_eq!(launch("agent/legacy-binding", "adopt", "omp", Some(invalid.clone()), false).await.unwrap(), None, "an existing binding wins even without a first-launch receipt");
+        append("agent/concurrent", "harness.session-file", json!({"harness":"omp","session_id":id}));
+        assert_eq!(launch("agent/concurrent", "restart", "omp", Some(invalid.clone()), false).await.unwrap(), None, "bound history beats edits and invalid seeds");
+        assert_eq!(launch("agent/concurrent", "other-account", "claude", None, false).await.unwrap(), None, "history fence is not harness or account scoped");
+        let reopened = Store::open(&database, "node").unwrap();
+        assert_eq!(crate::suspension::continue_session(&reopened, "agent/concurrent", "omp", None, None).unwrap().unwrap().0, id, "a restarted daemon continues the bound session");
+        assert_eq!(reopened.claims_for("agent/concurrent", Some("harness.session-file")).unwrap().len(), 1);
+        append("agent/concurrent", "runtime.action.requested", json!({"action":"fresh-context"}));
+        append("agent/concurrent", "harness.diagnostic", json!({"code":crate::suspension::CONTINUE_UNAVAILABLE_CODE,"status":"transcript-missing"}));
+        assert_eq!(launch("agent/concurrent", "fresh", "omp", Some(seed.clone()), false).await.unwrap(), None);
+
+        assert_eq!(launch("agent/fresh", "one", "claude", None, false).await.unwrap(), None);
+        assert_eq!(launch("agent/fresh", "two", "omp", Some(seed.clone()), false).await.unwrap(), None, "a fresh receipt never blocks or re-arms, even if seed is later added");
+        for driver in crate::skill::HARNESSES {
+            assert_eq!(launch("agent/fresh", "seedless-second-launch", driver, None, false).await.unwrap(), None, "seedless restarts must work for every harness");
+        }
+        assert_eq!(launch("agent/invalid", "seedless-incomplete", "omp", None, false).await.unwrap(), None, "an incomplete seeded launch proceeds fresh when seed is removed");
+        let notice = state.store.latest_claim("agent/invalid", Some("harness.diagnostic")).unwrap().unwrap();
+        assert_eq!(notice.body["fields"]["code"], "first-native-launch-incomplete");
+        assert_eq!(notice.body["fields"]["severity"], "warning");
+        assert_eq!(launch("agent/invalid", "still-declared", "omp", Some(invalid.clone()), false).await.unwrap(), None, "even a missing still-declared seed is not validated or staged again");
+        let declared_notice = state.store.latest_claim("agent/invalid", Some("harness.diagnostic")).unwrap().unwrap();
+        assert_eq!(declared_notice.body["fields"]["code"], "first-native-launch-incomplete");
+        assert_eq!(declared_notice.body["fields"]["incarnation_id"], "still-declared");
+        assert!(declared_notice.body["fields"]["reason"].as_str().unwrap().contains("starting fresh"));
+        assert!(!declared_notice.body["fields"]["reason"].as_str().unwrap().contains("acknowledge-seed"), "launch notices do not prescribe recovery before starting");
+        assert!(crate::native_seed::acknowledge(&client, "agent/fresh", "person/operator", "fresh needs no recovery").await.is_err());
+        assert!(crate::native_seed::acknowledge(&client, "agent/invalid", "person/operator", " ").await.is_err());
+        let acknowledgement = crate::native_seed::acknowledge(&client, "agent/invalid", "person/operator", "accept fresh after interrupted import").await.unwrap();
+        assert_eq!(acknowledgement.kind, "custom.agent.first-native-launch-acknowledged");
+        assert_eq!(acknowledgement.actor.as_deref(), Some("person/operator"));
+        assert_eq!(acknowledgement.body["fields"]["reason"], "accept fresh after interrupted import");
+        assert_eq!(acknowledgement.body["evidence"][0], acknowledgement.body["fields"]["receipt"]);
+        assert_eq!(launch("agent/invalid", "recovered", "omp", Some(invalid.clone()), false).await.unwrap(), None, "acknowledgement records acceptance without reseeding or changing fresh launch behavior");
+        assert_eq!(state.store.latest_claim("agent/invalid", Some("harness.diagnostic")).unwrap().unwrap().id, declared_notice.id, "acknowledgement suppresses later incomplete notices, not launches");
+        append("agent/deliberately-fresh", "runtime.action.requested", json!({"action":"fresh-context"}));
+        assert_eq!(launch("agent/deliberately-fresh", "one", "omp", Some(invalid.clone()), false).await.unwrap(), None);
+        assert!(launch("agent/strict", "conflicting", "omp", Some(invalid), true).await.unwrap_err().to_string().contains("native seed cannot accompany resume environment"));
+        assert_eq!(launch("agent/strict", "one", "omp", None, true).await.unwrap(), None, "a rejected seed conflict must not consume the opportunity; strict resume proceeds without a seed");
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_seed_restart_before_first_message_never_wedges_fresh_seat() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("restart.sqlite3");
+        let inventory = root.path().join("inventory");
+        for attempt in 0..2 {
+            let mut state = state(root.path());
+            state.store = Arc::new(Store::open(&database, "node").unwrap());
+            let socket = root.path().join(format!("restart-{attempt}.sock"));
+            let client = crate::client::Client::new(crate::client::Endpoint::Unix(socket.clone()));
+            let server_socket = socket.clone();
+            let server = tokio::spawn(async move { serve_unix(&server_socket, router(state)).await });
+            while !socket.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+            assert_eq!(crate::native_seed::first_launch(
+                &client, "agent/before-message", &format!("incarnation-{attempt}"), "omp",
+                None, &inventory, false,
+            ).await.unwrap(), None);
+            server.abort();
+            let _ = server.await;
+        }
+        let reopened = Store::open(&database, "node").unwrap();
+        assert!(reopened.claims_for("agent/before-message", Some("harness.session-file")).unwrap().is_empty());
+        assert!(reopened.claims_for("agent/before-message", Some("custom.agent.initial-message")).unwrap().is_empty());
+        assert!(!inventory.exists(), "unseeded restarts require no seed inventory");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn isolated_daemon_answers_health_under_stalled_attaches() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -20168,7 +20276,7 @@ mission "orchid" state="ready" { goal "Expose a scheduler wait."; step "work" { 
         assert!(
             stale
                 .message
-                .starts_with("2 attention items have been open for more than a day"),
+                .starts_with("2 alerts and faults have been open for more than a day"),
             "{}",
             stale.message
         );
@@ -24242,6 +24350,78 @@ mission "wake" state="ready" {
         assert!(store.agent_resources_largest_fold_for_test() <= AGENT_ROSTER_WARM_CHUNK);
     }
 
+    /// What one roster refresh costs on a copy of a real or generated store: the first full
+    /// fold, a fold after a claim that changes one card, and one after a claim no card reads.
+    /// `ST_ROSTER_FOLD_STORE` names the store; the copy stays in `TMPDIR` and only timings print.
+    #[test]
+    #[ignore = "roster fold timing on a store copy; set ST_ROSTER_FOLD_STORE and run with --ignored --nocapture"]
+    fn agent_roster_fold_timing_on_a_store_copy() {
+        let Some(source) = std::env::var_os("ST_ROSTER_FOLD_STORE").map(PathBuf::from) else {
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("claims.sqlite3");
+        for suffix in ["", "-wal"] {
+            let from = PathBuf::from(format!("{}{suffix}", source.display()));
+            if from.exists() {
+                fs::copy(&from, format!("{}{suffix}", database.display())).unwrap();
+            }
+        }
+        // With ST3_PROFILE_DIR set, each fold's statements land in its slow.jsonl.
+        smallclaims::profile::init_from_env();
+        let store = Store::open(&database, "bench-host").unwrap();
+        let timed = |label: &str, samples: &mut Vec<f64>, work: &dyn Fn()| {
+            let before = smallclaims::sqlite::work::total();
+            let started = Instant::now();
+            smallclaims::profile::task("roster-fold-timing", work);
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            samples.push(ms);
+            println!("roster fold {label}: {ms:.1} ms; sqlite_work={:?}",
+                smallclaims::sqlite::work::total() - before);
+        };
+        let mut cold = Vec::new();
+        timed("cold", &mut cold, &|| refresh_agent_roster(&store, false).unwrap());
+        let agents = store.read_snapshot(|index| Ok(client_agent_page_refs(&store, false, index)?
+            .iter().filter_map(|card| card["id"].as_str().map(str::to_owned)).collect::<Vec<_>>()))
+            .unwrap();
+        println!("roster fold agents={}", agents.len());
+        assert!(!agents.is_empty());
+        let append = |subject: &str, kind: &str, fields: Value| {
+            store.append_claim(&ClaimInput {
+                subject: subject.into(), kind: kind.into(), actor: None,
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+            }).unwrap();
+        };
+        let mut changed = Vec::new();
+        let mut unrelated = Vec::new();
+        for turn in 0..30 {
+            let agent = &agents[turn % agents.len()];
+            append(agent, "harness.observed", json!({"state": if turn % 2 == 0 { "working" } else { "idle" },
+                "driver":"codex", "incarnation_id": format!("fold-timing-{turn}")}));
+            timed(&format!("one card changed (agent #{})", turn % agents.len()), &mut changed,
+                &|| refresh_agent_roster(&store, false).unwrap());
+            append(&format!("custom/fold-timing/{turn}"), "custom.test.marker", json!({}));
+            timed("no card changed", &mut unrelated, &|| refresh_agent_roster(&store, false).unwrap());
+        }
+        let summary = |label: &str, samples: &mut Vec<f64>| {
+            samples.sort_by(f64::total_cmp);
+            let at = |q: f64| samples[((samples.len() as f64 * q).ceil() as usize).saturating_sub(1)];
+            println!("roster fold summary {label}: n={} p50={:.1} p90={:.1} max={:.1} ms",
+                samples.len(), at(0.5), at(0.9), samples[samples.len() - 1]);
+        };
+        summary("cold", &mut cold);
+        summary("one card changed", &mut changed);
+        summary("no card changed", &mut unrelated);
+        let performance = smallclaims::performance::snapshot();
+        for row in performance["requests"].as_array().into_iter().flatten()
+            .filter(|row| row["kind"].as_str().is_some_and(|kind| kind.starts_with("roster/")))
+        {
+            println!("roster fold task {}: n={} total_ms={} max_ms={}",
+                row["kind"], row["count"], row["total_ms"], row["max_ms"]);
+        }
+    }
+
     #[test]
     #[ignore = "focused roster timing fixture; run explicitly with --ignored --nocapture"]
     fn agent_roster_snapshot_fixture_timing() {
@@ -26172,7 +26352,7 @@ version 2
                     .as_array()
                     .unwrap()
                     .iter()
-                    .all(|action| action["argv"][1] == "attention" && action["argv"][4] == "--as")
+                    .all(|action| action["argv"][1] == "alerts" && action["argv"][4] == "--as")
             }),
             "{attention}"
         );

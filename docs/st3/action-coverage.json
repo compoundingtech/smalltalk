@@ -416,6 +416,14 @@
       "verification": "real local CLI; environment guard, exact-build record, revoke, and no daemon or producer child"
     },
     {
+      "command": "st agents acknowledge-seed",
+      "description": "Acknowledge an interrupted seed attempt and its warning; never gate launch or rearm seed",
+      "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_seed_acknowledgement_survives_restart_without_rearming_seed"
+      ],
+      "verification": "real CLI over private Unix socket; seeded receipt and acknowledgement survive disk-store reopen, replay is idempotent, and fresh launches never restage or rearm seed"
+    },
+    {
       "command": "st agents apply",
       "description": "Preview and apply one KDL file containing durable agent seats",
       "tests": [
@@ -561,7 +569,7 @@
       "verification": "real CLI over isolated disk-backed Unix daemons; mixed-file atomic publication, dry-run side effects, gate checks, source fences, partition/heal and retirement confirmation"
     },
     {
-      "command": "st attention approve",
+      "command": "st alerts approve",
       "description": "Approve one person-owned gate or launch review",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_human_reviews_act_on_the_current_card_after_restart"
@@ -569,7 +577,7 @@
       "verification": "real CLI over private Unix socket; current source review and durable verdict"
     },
     {
-      "command": "st attention discuss",
+      "command": "st alerts discuss",
       "description": "Chat about an item: send a message to the agent involved, titled after the item, with a reference to what it is about. This is what \"Chat about this\" does in stui",
       "tests": [
         "crates/st3/tests/client_v0_cli.rs::attention_discuss_sends_the_message_stui_chat_about_this_sends"
@@ -577,7 +585,7 @@
       "verification": "real CLI over private Unix socket; the agent reads the message with the item named"
     },
     {
-      "command": "st attention ls",
+      "command": "st alerts ls",
       "description": "List all current human attention items",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
@@ -585,7 +593,7 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
-      "command": "st attention reject",
+      "command": "st alerts reject",
       "description": "Reject one person-owned gate or launch review",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_human_reviews_act_on_the_current_card_after_restart"
@@ -593,7 +601,7 @@
       "verification": "real CLI over private Unix socket; current source review and durable verdict"
     },
     {
-      "command": "st attention request",
+      "command": "st alerts request",
       "description": "Legacy mutation: returns attention-migrated. Use work ask or remedy the source",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"
@@ -601,7 +609,7 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
-      "command": "st attention request-changes",
+      "command": "st alerts request-changes",
       "description": "Ask a feedback-mode step to change its work and rerun",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_human_reviews_act_on_the_current_card_after_restart"
@@ -609,7 +617,7 @@
       "verification": "real CLI over private Unix socket; current source review and durable verdict"
     },
     {
-      "command": "st attention resolve",
+      "command": "st alerts resolve",
       "description": "Legacy mutation: returns attention-migrated. Complete a person step with work done",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"
@@ -617,7 +625,7 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
-      "command": "st attention show",
+      "command": "st alerts show",
       "description": "Explain one attention item and show the exact available actions",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"
@@ -625,7 +633,7 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
-      "command": "st attention withdraw",
+      "command": "st alerts withdraw",
       "description": "Legacy mutation: returns attention-migrated. Cancel your ask with work cancel-ask",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_person_asks_updates_done_cancel_and_retired_attention_survive_restart"

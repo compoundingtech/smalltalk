@@ -2608,6 +2608,17 @@ fn driver_member(
             property_string(message, "id")?.expect("validated message ID"),
         ]);
     }
+    if let Some(seed) = child_string(children, "seed")? {
+        if name != "omp" || !std::path::Path::new(&seed).is_absolute()
+            || seed.contains('\0') || seed.trim().is_empty()
+            || crate::native_resume::selector_scope(&name, &provider).is_some()
+            || [crate::suspension::RESUME_ENV, crate::suspension::CONTINUE_ENV, crate::suspension::CONTINUE_PATH_ENV]
+                .iter().any(|key| environment.contains_key(*key))
+        {
+            return Err(St3Error::new("invalid-native-seed", "seed requires an absolute OMP transcript path and cannot accompany session selectors or resume environment"));
+        }
+        wrapper.extend(["--seed".into(), seed]);
+    }
     wrapper.push("--".into());
     wrapper.extend(provider);
     Ok(MemberSpec {
@@ -3318,7 +3329,8 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
             "account",
             "account-pool",
         ],
-        "pi" | "omp" => &["model", "effort", "args", "message"],
+        "pi" => &["model", "effort", "args", "message"],
+        "omp" => &["model", "effort", "args", "message", "seed"],
         "opencode" => &["model", "args", "message"],
         _ => return Err(St3Error::new("unknown-driver", "unknown typed driver")),
     };
@@ -6160,6 +6172,27 @@ message "external" {
             canonical_child_value(&intent.subjects["message/external"].desired, "to"),
             Some(&Value::String("agent/other/run/peer".into()))
         );
+    }
+
+    #[test]
+    fn native_seed_parser_is_omp_only_and_rejects_selection_conflicts() {
+        let declaration = |driver: &str, seed: &str, args: &str, env: &str| format!(
+            "version 2\nagent \"worker\" {{ workspace \"/tmp\"; {env} harness {driver:?} {{ seed {seed:?}; {args} }} }}\n"
+        );
+        let intent = parse_test_intent(&declaration("omp", "/transcript.jsonl", "", ""), "node").unwrap();
+        let member = intent.subjects.values().find_map(|subject| subject.member.as_ref()).unwrap();
+        let LaunchSpec::Argv(argv) = &member.launch else { panic!("typed launch expected"); };
+        assert!(argv.windows(2).any(|args| args == ["--seed", "/transcript.jsonl"]));
+        for driver in ["pi", "claude", "codex", "opencode"] {
+            assert!(parse_test_intent(&declaration(driver, "/transcript.jsonl", "", ""), "node").is_err());
+        }
+        assert_eq!(parse_test_intent(&declaration("omp", "relative.jsonl", "", ""), "node").unwrap_err().code, "invalid-native-seed");
+        for args in ["args \"--resume\" \"/other\";", "args \"--continue\";", "args \"--resume=/other\";", "args \"-r\" \"/other\";", "args \"--session\" \"native\";"] {
+            assert_eq!(parse_test_intent(&declaration("omp", "/transcript.jsonl", args, ""), "node").unwrap_err().code, "invalid-native-seed");
+        }
+        for key in [crate::suspension::RESUME_ENV, crate::suspension::CONTINUE_ENV, crate::suspension::CONTINUE_PATH_ENV] {
+            assert_eq!(parse_test_intent(&declaration("omp", "/transcript.jsonl", "", &format!("env {{\n {key} \"native\"\n}}\n")), "node").unwrap_err().code, "invalid-native-seed");
+        }
     }
 
     #[test]

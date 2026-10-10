@@ -4,18 +4,17 @@ The Smalltalk iOS app is a client for your fleet: it shows Home, Agents, Mission
 
 Use a Mac with **full Xcode**, its command-line tools selected, and an installed iOS Simulator runtime. This walkthrough uses Xcode 27; [Expo's simulator setup](https://docs.expo.dev/workflow/ios-simulator/) shows where to select the tools and download a runtime. Open Xcode once and finish its first-run setup. The native Xcode, CocoaPods, simulator, and device steps are **not yet verified on a fresh Mac**.
 
-You also need Git, Node.js 24 with npm, and CocoaPods. Install them with your usual package manager. If you use Nix, enter this shell **on the Mac** before running this page's commands:
+You also need Git, Node.js 24 with Corepack, and CocoaPods. Install them with your usual package manager. Outside Nix, run `corepack enable`; the root manifest provisions pnpm 12.7.0. If you use Nix, enter the web shell from the repository root **on the Mac**:
 
 ```sh
-nix --extra-experimental-features 'nix-command flakes' shell \
-  nixpkgs#nodejs_24 nixpkgs#cocoapods --command bash
+nix develop .#web
 ```
 
-Nix supplies these tools; Xcode and the simulator runtime still come from Apple. Check the selected tools:
+The web shell supplies pnpm 12.7.0, Node 24.20, Bun 1.4.2 and Buck2. CocoaPods must also be installed; Xcode and the simulator runtime come from Apple. Check the selected tools from the repository root:
 
 ```sh
 node --version
-npm --version
+pnpm --version
 pod --version
 xcodebuild -version
 ```
@@ -27,16 +26,18 @@ Clone into a new directory, or use your existing checkout:
 ```sh
 mkdir -p ~/src
 git clone --depth 1 https://github.com/compoundingtech/smalltalk.git ~/src/smalltalk
-cd ~/src/smalltalk/apps/ios
-npm ci
-npm run typecheck
-npm test
-npx expo prebuild --platform ios --clean --no-install
-npm run pods
+cd ~/src/smalltalk
+corepack enable # Outside the Nix web shell
+pnpm install --frozen-lockfile
+cd apps/ios
+pnpm typecheck
+pnpm test
+pnpm exec expo prebuild --platform ios --clean --no-install
+pnpm run pods
 open ios/smalltalk.xcworkspace
 ```
 
-`prebuild --clean` regenerates the ignored `ios/` directory from app configuration. Keep native changes in the checked-in Expo modules or configuration before regenerating. `npm run pods` supplies the UTF-8 locale CocoaPods needs. Open the **workspace**, which includes the pods, rather than the Xcode project.
+The root frozen install covers the client, shared views and iOS packages. `prebuild --clean` regenerates the ignored `ios/` directory from app configuration. Keep native changes in the checked-in Expo modules or configuration before regenerating. `pnpm run pods` supplies the UTF-8 locale CocoaPods needs. Open the **workspace**, which includes the pods, rather than the Xcode project.
 
 ## Run in the simulator
 
@@ -46,7 +47,7 @@ In another terminal, start Metro from the app directory:
 
 ```sh
 cd ~/src/smalltalk/apps/ios
-npm run start
+pnpm start
 ```
 
 Keep Metro running while using the Debug app. If it opens before Metro is ready, reload it after the server starts. On Xcode 27, simulated devices appear in **Device Hub**; Xcode 26 uses **Simulator**. This is a local native build with the app's own modules. No Expo account, EAS service, or App Store upload is needed.
@@ -73,7 +74,7 @@ For an app that runs without Metro, export the iOS JavaScript first:
 
 ```sh
 cd ~/src/smalltalk/apps/ios
-npm run export:ios
+pnpm run export:ios
 ```
 
 Set the scheme's **Run → Build Configuration** to **Release**, choose your phone, and build/run with its Apple Development signing and provisioning. Release embeds the bundle and can run with Metro stopped. It still needs the gateway connection to read current work and send actions.
