@@ -85,7 +85,7 @@ pub(super) fn backfill(transaction: &Transaction<'_>) -> Result<()> {
          WHERE kind='message.sent' AND store_index>?1 AND store_index<=?2 ORDER BY store_index LIMIT 8",
     )?.query_map(params![cursor, ceiling], |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut processed = 0;
+    let mut processed: usize = 0;
     for (_, subject) in &batch {
         // Leave room for the rest of the FIFO writer batch under its 100 ms hold limit.
         if processed > 0 && started.elapsed() >= std::time::Duration::from_millis(10) {
