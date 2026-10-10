@@ -16589,15 +16589,28 @@ impl Store {
         // Cache only immutable history. A context register can change at the same graph
         // cut, and its timestamp must not prevent a later numeric claim from resuming.
         let mut summaries = BTreeMap::new();
-        let mut context = connection.prepare_cached(
-            "SELECT store_index,body,CAST(source_at AS TEXT) FROM latest_values
-             WHERE subject=?1 AND kind='harness.usage'",
-        )?;
+        let mut contexts = BTreeMap::new();
+        let context_subjects = folded.keys().collect::<Vec<_>>();
+        for chunk in context_subjects.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT subject,store_index,body,CAST(source_at AS TEXT)
+                 FROM latest_values INDEXED BY latest_values_kind_key_index
+                 WHERE kind='harness.usage' AND subject IN ({placeholders})",
+            );
+            let mut statement = connection.prepare_cached(&sql)?;
+            let rows = statement.query_map(rusqlite::params_from_iter(chunk.iter().copied()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+            })?;
+            for row in rows {
+                let (subject, index, body, accepted) = row?;
+                contexts.insert(subject, (index, body, accepted));
+            }
+        }
         for (subject, cached) in &folded {
             let mut fold = cached.fold.clone();
-            if let Some((index, body, accepted)) = context.query_row([subject], |row| {
-                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-            }).optional()? {
+            if let Some((index, body, accepted)) = contexts.remove(subject) {
                 let source_at = accepted.parse::<u128>().unwrap_or_default();
                 if fold.context.as_ref().is_none_or(|(_, value)| value.observed_at_unix_ms <= source_at) {
                     fold.apply(index, &body, &accepted, None)?;
