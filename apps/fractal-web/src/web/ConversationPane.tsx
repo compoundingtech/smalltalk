@@ -10,7 +10,7 @@ import { createConversationTranscript, openableImageUrl, transcriptObservedAt, t
 import { composerSendBinding, type SendRefusal } from './composerSend.ts'
 import { geometryVars, spaceVars } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
-import { composerHistoryAtom, submittedHistory } from './composerHistory.ts'
+import { composerHistoryAtom, recallAvailable, submittedHistory } from './composerHistory.ts'
 import type { UxTelemetry } from '../telemetry/ux.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
 import type * as Atom from 'effect/reactivity/Atom'
@@ -105,7 +105,8 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
   const historyNamespace = `${source.gateway ?? source.mode}:${agentRef}`
   const historySegments = useAtomValue(composerHistoryAtom(historyNamespace))
   const history = React.useMemo(() => submittedHistory(historyNamespace, registry), [historyNamespace, registry])
-  const historySource = React.useMemo(() => ({ available: historySegments.length > 0, get: history.get }), [historySegments, history])
+  const historyAvailable = recallAvailable(historySegments.length, state._tag === 'Observed' ? state.items : [])
+  const historySource = React.useMemo(() => ({ available: historyAvailable, get: history.get }), [historyAvailable, history])
   const binding = composerSendBinding({
     source, agentRef, grants,
     readable: state._tag === 'Observed',

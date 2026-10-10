@@ -24,3 +24,6 @@ export const submittedHistory = (namespace: string, registry: AtomRegistry.AtomR
     },
   }
 }
+/** History records only confirmed sends, so recall waits while an own send is still pending. */
+export const recallAvailable = <Item extends { readonly _tag: string; readonly role?: string; readonly sendState?: { readonly _tag: string } }>(historyLength: number, items: readonly Item[]): boolean =>
+  historyLength > 0 && !items.some(item => item._tag === 'Text' && item.role === 'user' && item.sendState?._tag === 'Pending')
