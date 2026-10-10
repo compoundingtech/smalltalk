@@ -260,6 +260,36 @@ fn signal_visible_change(state: &AppState) {
 
 #[cfg(test)]
 mod storage_contention_response_tests {
+    #[tokio::test]
+    async fn current_maintenance_notifications_preserve_the_minimum_interval() {
+        use super::{CURRENT_MAINTENANCE_MIN_PAUSE, current_maintenance_pause};
+        use std::{sync::Arc, time::Duration};
+        use tokio::sync::Notify;
+        let wake = Arc::new(Notify::new());
+        let sender = wake.clone();
+        let flood = tokio::spawn(async move {
+            loop {
+                sender.notify_one();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        let started = tokio::time::Instant::now();
+        for _ in 0..4 {
+            current_maintenance_pause(
+                &wake,
+                Duration::from_secs(1),
+                tokio::time::Instant::now() + CURRENT_MAINTENANCE_MIN_PAUSE,
+            )
+            .await;
+        }
+        flood.abort();
+        assert!(started.elapsed() >= CURRENT_MAINTENANCE_MIN_PAUSE * 4);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "notifications must still cut the idle pause"
+        );
+    }
+
     #[test]
     fn cached_agent_freshness_uses_register_stamps_and_keeps_incarnation_fences() {
         use serde_json::json;
@@ -5763,36 +5793,57 @@ fn current_fleet_hosts(state: &AppState) -> Result<BTreeSet<String>, St3Error> {
     )
 }
 
+const CURRENT_MAINTENANCE_MIN_PAUSE: Duration = Duration::from_millis(100);
+
+async fn current_maintenance_pause(wake: &Notify, pause: Duration, earliest: tokio::time::Instant) {
+    tokio::select! {
+        _ = tokio::time::sleep(pause) => {},
+        _ = wake.notified() => {},
+    }
+    // Notification pressure can shorten idle waiting, never the minimum pass interval.
+    tokio::time::sleep_until(earliest).await;
+}
+
 /// Retire obsolete register payloads and legacy history in bounded background passes.
 pub fn start_current_value_maintenance(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
         let mut after = String::new();
+        let mut recovery_kind = None;
+        let mut recovery_after = String::new();
         let mut last_warning = None;
-        let mut recovery_sweeps = 0;
-        let mut refusals = state.store.current_value_refusals();
         loop {
+            let earliest = tokio::time::Instant::now() + CURRENT_MAINTENANCE_MIN_PAUSE;
             let mut pause = Duration::from_secs(1);
-            let worker = state.clone();
-            let cursor = after.clone();
-            let next_refusals = state.store.current_value_refusals();
-            if next_refusals != refusals {
-                recovery_sweeps = 2;
-                refusals = next_refusals;
+            if recovery_kind.is_none() {
+                recovery_kind = state.store.take_current_capacity_kind();
             }
+            let worker = state.clone();
+            let kind = recovery_kind.clone();
+            let cursor = if kind.is_some() {
+                recovery_after.clone()
+            } else {
+                after.clone()
+            };
             match blocking_action(move || {
                 let hosts = current_fleet_hosts(&worker)?;
-                worker.store.maintain_current_values(&hosts, &cursor)
+                worker
+                    .store
+                    .maintain_current_values_of_kind(&hosts, &cursor, kind.as_deref())
             })
             .await
             {
                 Ok(batch) => {
-                    after = batch.after;
-                    if after.is_empty() && recovery_sweeps > 0 {
-                        recovery_sweeps -= 1;
+                    if recovery_kind.is_some() {
+                        recovery_after = batch.after;
+                        if recovery_after.is_empty() {
+                            recovery_kind = None;
+                        }
+                    } else {
+                        after = batch.after;
                     }
-                    if batch.history_visited != 0 || batch.removed != 0 || recovery_sweeps > 0 {
-                        pause = Duration::from_millis(100);
+                    if batch.history_visited != 0 || batch.removed != 0 || recovery_kind.is_some() {
+                        pause = CURRENT_MAINTENANCE_MIN_PAUSE;
                     }
                     if batch.removed != 0 {
                         signal_local_change(&state);
@@ -5807,10 +5858,12 @@ pub fn start_current_value_maintenance(state: &AppState) {
                     }
                 }
             }
-            tokio::select! {
-                _ = tokio::time::sleep(pause) => {},
-                _ = state.store.current_value_maintenance_wake().notified() => {},
-            }
+            current_maintenance_pause(
+                state.store.current_value_maintenance_wake(),
+                pause,
+                earliest,
+            )
+            .await;
         }
     });
 }

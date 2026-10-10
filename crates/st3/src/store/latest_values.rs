@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS latest_values (
     PRIMARY KEY(subject, kind, slot)
 );
 CREATE INDEX IF NOT EXISTS latest_values_kind_index ON latest_values(kind);
+CREATE INDEX IF NOT EXISTS latest_values_kind_key_index ON latest_values(kind,subject,slot);
 CREATE INDEX IF NOT EXISTS latest_values_local_index ON latest_values(local_id);
 CREATE INDEX IF NOT EXISTS latest_values_agent_local_index ON latest_values(local_id)
 WHERE subject LIKE 'agent/%';
@@ -302,6 +303,10 @@ thread_local! {
     static CURRENT_TRANSACTION_STEPS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
+// SQLite may retry a brief collision inside this same current attempt. Keep half of the
+// unchanged 100 ms deadline for schema work, validation, mutation and commit.
+const CURRENT_WRITER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Only this fresh connection's progress deadline can interrupt a current transaction.
 /// Preserve ownership/protocol errors; do not infer interruption from an error's text.
 fn current_transaction<T>(
@@ -317,7 +322,8 @@ fn current_transaction<T>(
     #[cfg(test)]
     let observed_steps = steps.clone();
     #[cfg(test)]
-    let interval = CURRENT_TRANSACTION_STEPS.with(|value| if value.get().is_some() { 1 } else { 100 });
+    let interval =
+        CURRENT_TRANSACTION_STEPS.with(|value| if value.get().is_some() { 1 } else { 100 });
     #[cfg(not(test))]
     let interval = 100;
     connection.progress_handler(
@@ -341,16 +347,42 @@ fn current_transaction<T>(
                 .prepare("SELECT local_id FROM latest_values LIMIT 0")
                 .map_err(internal)?,
         );
-        #[cfg(test)]
-        let started = std::time::Instant::now();
+        if std::time::Instant::now() >= deadline {
+            return Err(St3Error::new(
+                "current-value-deadline",
+                "the current value exceeded its write deadline",
+            ));
+        }
+        connection
+            .busy_timeout(
+                CURRENT_WRITER_WAIT
+                    .min(deadline.saturating_duration_since(std::time::Instant::now())),
+            )
+            .map_err(internal)?;
         let tx = connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(internal)?;
+        #[cfg(test)]
+        let started = std::time::Instant::now();
+        if std::time::Instant::now() >= deadline {
+            return Err(St3Error::new(
+                "current-value-deadline",
+                "the current value exceeded its write deadline",
+            ));
+        }
         let value = work(&tx)?;
+        if std::time::Instant::now() >= deadline {
+            return Err(St3Error::new(
+                "current-value-deadline",
+                "the current value exceeded its write deadline",
+            ));
+        }
         tx.commit().map_err(internal)?;
         #[cfg(test)]
         CURRENT_TRANSACTION_STEPS.with(|value| {
-            if value.get().is_some() { value.set(Some(steps.load(Ordering::Relaxed))); }
+            if value.get().is_some() {
+                value.set(Some(steps.load(Ordering::Relaxed)));
+            }
         });
         #[cfg(test)]
         CURRENT_TRANSACTION_ELAPSED.with(|elapsed| {
@@ -538,6 +570,7 @@ struct HistoryBatch {
     visited: usize,
     last: i64,
     delete: String,
+    parse_error: Option<String>,
 }
 
 // Payload inspection is bounded and read-only; the writer only rechecks the job and
@@ -567,12 +600,23 @@ fn prepare_history_batch(reader: &Connection) -> Result<Option<HistoryBatch>, St
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(internal)?;
     let mut delete = Vec::new();
+    let mut parse_error = None;
     for (id, body, live) in &rows {
-        if !live
-            && (kind != "harness.usage"
-                || serde_json::from_str::<Value>(body).map_err(internal)?["fields"]["semantics"]
-                    == "context_occupancy")
-        {
+        if *live {
+            continue;
+        }
+        let categorical = if kind != "harness.usage" {
+            true
+        } else {
+            match serde_json::from_str::<Value>(body) {
+                Ok(body) => body["fields"]["semantics"] == "context_occupancy",
+                Err(error) => {
+                    parse_error = Some(format!("row {id}: {error}"));
+                    break;
+                }
+            }
+        };
+        if categorical {
             delete.push(*id);
         }
     }
@@ -584,6 +628,7 @@ fn prepare_history_batch(reader: &Connection) -> Result<Option<HistoryBatch>, St
         visited: rows.len(),
         last: rows.last().map_or(cutoff, |r| r.0),
         delete: serde_json::to_string(&delete).map_err(internal)?,
+        parse_error,
     }))
 }
 
@@ -630,8 +675,8 @@ pub(super) fn append(
     event_runtime: Option<&str>,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_local_observation(input)?;
-    // This connection has no queue and never waits for SQLite's writer. Busy means dropped;
-    // the producer moves on and only a subsequent observation can replace this value.
+    // This connection waits only for bounded admission inside this current attempt. A
+    // longer collision drops it; only a subsequent observation can replace this value.
     let mut connection = Connection::open_with_flags(
         &graph.path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
@@ -639,7 +684,7 @@ pub(super) fn append(
     .map_err(internal)?;
     smallclaims::sqlite::observe(&mut connection);
     connection
-        .busy_timeout(std::time::Duration::ZERO)
+        .busy_timeout(CURRENT_WRITER_WAIT)
         .map_err(internal)?;
     let mut semantic_changed = false;
     let result = current_transaction(&mut connection, |tx| {
@@ -933,8 +978,12 @@ fn update_readiness(tx: &Transaction<'_>, input: &ClaimInput) -> Result<(), St3E
 }
 
 impl Store {
-    pub(crate) fn current_value_refusals(&self) -> u64 {
-        self.smalltalk.current_value_refusals.load(std::sync::atomic::Ordering::Relaxed)
+    pub(crate) fn take_current_capacity_kind(&self) -> Option<String> {
+        self.smalltalk
+            .current_value_capacity_kinds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()
     }
     pub(crate) fn current_value_maintenance_wake(&self) -> &tokio::sync::Notify {
         &self.smalltalk.current_value_maintenance_wake
@@ -970,7 +1019,7 @@ impl Store {
         last_success_at: Option<u128>,
     ) -> Result<()> {
         // Use the graph's observer-scoped refresh and clock-skew rules. Its runtime
-        // routes current observations to the same zero-wait register writer, so an
+        // routes current observations to the same bounded register writer, so an
         // unchanged success keeps its original source time and identity until refresh.
         // A busy daemon drops connectivity just like a driver drops status.
         let _ = self
@@ -1056,22 +1105,42 @@ impl Store {
 
     /// Housekeeping is off the request path: inspect at most 64 keys and retire at most
     /// 256 history rows. Empty passes never take SQLite's write lock.
+    #[cfg(test)]
     pub(crate) fn maintain_current_values(
         &self,
         hosts: &BTreeSet<String>,
         after: &str,
     ) -> Result<CurrentMaintenance, St3Error> {
+        self.maintain_current_values_of_kind(hosts, after, None)
+    }
+
+    pub(crate) fn maintain_current_values_of_kind(
+        &self,
+        hosts: &BTreeSet<String>,
+        after: &str,
+        only_kind: Option<&str>,
+    ) -> Result<CurrentMaintenance, St3Error> {
         let (subject, kind, slot): (String, String, String) =
             serde_json::from_str(after).unwrap_or_default();
         let reader = self.readers.get();
-        let keys = reader
-            .prepare_cached(
-                "SELECT subject,kind,slot,origin,local_id,source_id
-            FROM latest_values WHERE (subject,kind,slot)>(?1,?2,?3)
-            ORDER BY subject,kind,slot LIMIT 64",
-            )
-            .map_err(internal)?
-            .query_map(params![subject, kind, slot], |row| {
+        let sql = if only_kind.is_some() {
+            "SELECT subject,kind,slot,origin,local_id,source_id FROM latest_values
+             WHERE kind=?4 AND (subject,slot)>(?1,?3) ORDER BY subject,slot LIMIT 64"
+        } else {
+            "SELECT subject,kind,slot,origin,local_id,source_id FROM latest_values
+             WHERE (subject,kind,slot)>(?1,?2,?3) ORDER BY subject,kind,slot LIMIT 64"
+        };
+        let mut statement = reader.prepare_cached(sql).map_err(internal)?;
+        // The kind scan uses the same tuple cursor, seeking only that kind's index.
+        let values = [
+            Some(subject.as_str()),
+            Some(kind.as_str()),
+            Some(slot.as_str()),
+            only_kind,
+        ];
+        let count = if only_kind.is_some() { 4 } else { 3 };
+        let keys = statement
+            .query_map(rusqlite::params_from_iter(&values[..count]), |row| {
                 Ok(CurrentKey {
                     subject: row.get(0)?,
                     kind: row.get(1)?,
@@ -1084,6 +1153,7 @@ impl Store {
             .map_err(internal)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(internal)?;
+        drop(statement);
         let next = if keys.len() == 64 {
             let key = keys.last().unwrap();
             serde_json::to_string(&(&key.subject, &key.kind, &key.slot)).map_err(internal)?
@@ -1161,6 +1231,15 @@ impl Store {
         }
         // History retirement owns a separate transaction: a bad job cannot roll back
         // already committed collection or prevent its cursor from advancing.
+        let skipped_job = history_work
+            .as_ref()
+            .ok()
+            .and_then(|job| job.as_ref())
+            .and_then(|job| {
+                job.parse_error
+                    .as_ref()
+                    .map(|error| (job.subject.clone(), job.kind.clone(), error.clone()))
+            });
         let history = match history_work {
             Err(error) => Err(error),
             Ok(None) => Ok(0),
@@ -1180,6 +1259,17 @@ impl Store {
                 if cursor != job.cursor {
                     return Ok(0);
                 };
+                if job.parse_error.is_some() {
+                    if cutoff != job.cutoff {
+                        return Ok(0);
+                    }
+                    tx.execute(
+                        "DELETE FROM current_value_retirements WHERE subject=?1 AND kind=?2",
+                        params![job.subject, job.kind],
+                    )
+                    .map_err(internal)?;
+                    return Ok(job.visited);
+                }
                 let deleted=tx.prepare_cached("DELETE FROM local_observations
                     WHERE id IN (SELECT value FROM json_each(?1))
                     AND NOT EXISTS(SELECT 1 FROM latest_values v WHERE v.local_id=local_observations.id)
@@ -1203,7 +1293,16 @@ impl Store {
             }),
         };
         let history_visited = match history {
-            Ok(visited) => visited,
+            Ok(visited) => {
+                if visited != 0
+                    && let Some((subject, kind, error)) = skipped_job
+                {
+                    eprintln!(
+                        "st3: skipped malformed current history retirement {subject} {kind}: {error}; payloads retained"
+                    );
+                }
+                visited
+            }
             Err(error) => {
                 eprintln!("st3: current history retirement deferred: {error:?}");
                 0
@@ -1280,7 +1379,7 @@ impl Store {
         .map_err(internal)?;
         smallclaims::sqlite::observe(&mut connection);
         connection
-            .busy_timeout(std::time::Duration::ZERO)
+            .busy_timeout(CURRENT_WRITER_WAIT)
             .map_err(internal)?;
         let mut semantic_changed = false;
         let changed = current_transaction(&mut connection, |tx| {
@@ -1456,6 +1555,10 @@ impl Store {
         }).inspect_err(|error| {
             if error.code == "current-value-capacity" {
                 let count = self.smalltalk.current_value_refusals.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                {
+                    let mut kinds = self.smalltalk.current_value_capacity_kinds.lock().unwrap_or_else(PoisonError::into_inner);
+                    if !kinds.iter().any(|kind| kind == &record.kind) { kinds.push_back(record.kind.clone()); }
+                }
                 self.smalltalk.current_value_maintenance_wake.notify_one();
                 if count == 1 || count.is_multiple_of(100) {
                     eprintln!("st3: current register capacity refused {} {} (refusal {count}); collector will reclaim obsolete keys", record.subject, record.kind);
@@ -1974,7 +2077,7 @@ mod tests {
             .maintain_current_values(&BTreeSet::from(["owner".into()]), "")
             .unwrap();
         assert_eq!(batch.removed, 1);
-        assert_eq!(batch.history_visited, 0);
+        assert_eq!(batch.history_visited, 1);
         assert!(store.current_cache_revision().unwrap() > frontier);
         assert_eq!(
             store
@@ -1985,12 +2088,43 @@ mod tests {
                 .unwrap(),
             0
         );
+        let reader = store.readers.get();
+        assert_eq!(
+            reader
+                .query_row("SELECT count(*) FROM current_value_retirements", [], |r| {
+                    r.get::<_, u64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            reader
+                .query_row(
+                    "SELECT body FROM local_observations WHERE subject='agent/broken'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "invalid-json"
+        );
+        drop(reader);
+        store.connection.write().execute("INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+            VALUES(0,'agent/zz-history','harness.usage','{\"fields\":{\"semantics\":\"context_occupancy\"}}',1)",[]).unwrap();
+        let cutoff = store.current_observation_boundary().unwrap().local_cursor;
+        store.connection.write().execute("INSERT INTO current_value_retirements VALUES('agent/zz-history','harness.usage',0,?1)",[cutoff]).unwrap();
+        let next = store
+            .maintain_current_values(&BTreeSet::from(["owner".into()]), "")
+            .unwrap();
+        assert_eq!(next.history_visited, 1);
         assert_eq!(
             store
                 .readers
                 .get()
-                .query_row("SELECT cursor FROM current_value_retirements", [], |r| r
-                    .get::<_, u64>(0))
+                .query_row(
+                    "SELECT count(*) FROM local_observations WHERE subject='agent/zz-history'",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
                 .unwrap(),
             0
         );
@@ -2051,12 +2185,26 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut after = String::new();
-        for page in 0..3 {
-            let batch = peer.maintain_current_values(&hosts, &after).unwrap();
-            assert_eq!(batch.removed, if page < 2 { 0 } else { 64 });
-            after = batch.after;
-        }
+        let kind = peer.take_current_capacity_kind().unwrap();
+        assert_eq!(kind, "harness.observed");
+        let batch = peer
+            .maintain_current_values_of_kind(&hosts, "", Some(&kind))
+            .unwrap();
+        assert_eq!(
+            batch.removed, 64,
+            "a refused kind must skip unrelated live pages"
+        );
+        assert_eq!(
+            peer.readers
+                .get()
+                .query_row(
+                    "SELECT count(*) FROM latest_values WHERE kind='workspace.observed'",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            128
+        );
         assert!(
             peer.receive_current_value_for_hosts(&record, &hosts)
                 .unwrap()
@@ -3141,7 +3289,71 @@ mod tests {
     }
 
     #[test]
-    fn current_publication_drops_when_sqlite_is_busy_instead_of_queueing() {
+    fn current_publication_admits_a_brief_collision_without_a_later_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&root.path().join("graph.sqlite"), "owner").unwrap());
+        declare(&store, "owner");
+        let writer_store = store.clone();
+        let (locked, acquired) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut connection = writer_store.connection.write();
+            let tx = connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            tx.execute(
+                "INSERT INTO meta VALUES ('short-current-collision','1')",
+                [],
+            )
+            .unwrap();
+            locked.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            tx.commit().unwrap();
+        });
+        acquired.recv().unwrap();
+        let sample = store
+            .append_claim(&state("idle", "one", now_ms() as u64))
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            store
+                .latest_claim(&sample.subject, Some("harness.observed"))
+                .unwrap()
+                .unwrap()
+                .id,
+            sample.id
+        );
+        assert_eq!(store.readers.get().query_row("SELECT count(*) FROM local_observations WHERE subject=?1 AND kind='harness.observed'", [&sample.subject], |r| r.get::<_,u64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn current_write_deadline_also_rejects_short_sql_after_a_late_closure() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Store::open(&root.path().join("graph.sqlite"), "owner").unwrap();
+        let mut connection = Connection::open(&store.graph.path).unwrap();
+        let error = current_transaction(&mut connection, |tx| {
+            tx.execute("INSERT INTO meta VALUES ('late-current-test','1')", [])
+                .map_err(internal)?;
+            std::thread::sleep(
+                crate::client::LATEST_VALUE_TIMEOUT + std::time::Duration::from_millis(10),
+            );
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "current-value-deadline");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM meta WHERE key='late-current-test'",
+                    [],
+                    |r| r.get::<_, u64>(0)
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn current_publication_drops_when_writer_admission_exceeds_its_bound() {
         let root = tempfile::tempdir().unwrap();
         let store = Store::open(&root.path().join("graph.sqlite"), "node").unwrap();
         let mut writer = store.connection.write();

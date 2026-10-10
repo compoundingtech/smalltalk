@@ -20,10 +20,11 @@
 //! posts that second's driver output, then runs four reconcile passes, the daemon's least rate
 //! while it idles. The file observer polls every second instead of every minute, and the
 //! workload waits until it records each change. Only a changed observation writes claims, so
-//! both give the claims of the minute polls. The daemon keeps its store in memory: the diet
-//! counts claims, and on a disk shared with other builds each of the workload's thousand
-//! durable writes waited tens of milliseconds. The suite runs 90 simulated seconds. The
-//! measurement in `doc/fleet/smalltalk/claim-log-diet` is the ten-minute run:
+//! both give the claims of the minute polls. The daemon uses a private file database with the
+//! production WAL connection behavior. Shared-cache memory databases can reject concurrent
+//! readers/writers with SQLITE_LOCKED rather than wait for WAL write admission. The diet counts
+//! claims, and rejects caught incremental reconciliation panics too. The suite runs 90 simulated
+//! seconds. The measurement in `doc/fleet/smalltalk/claim-log-diet` is the ten-minute run:
 //!
 //! ```sh
 //! cargo test -p st3 --test integration log_diet:: -- --ignored --nocapture
@@ -149,7 +150,7 @@ struct Daemon {
 
 impl Daemon {
     async fn start(root: &Path) -> Self {
-        let store = Arc::new(Store::open_memory(NODE).unwrap());
+        let store = Arc::new(Store::open(&root.join("graph.sqlite"), NODE).unwrap());
         let notify = Arc::new(Notify::new());
         let state_dir = root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
@@ -638,6 +639,21 @@ async fn run_workload(seconds: u64) -> Report {
         .iter()
         .filter(|claim| claim.store_index > setup_index && claim.store_index <= workload_end)
         .collect::<Vec<_>>();
+    // A caught reconcile panic must not turn a workload failure into a passing diet count.
+    let faults = workload
+        .iter()
+        .filter(|claim| claim.kind == "reconcile.fault")
+        .collect::<Vec<_>>();
+    for fault in &faults {
+        println!("diet reconcile fault: {} {}", fault.subject, fault.body);
+    }
+    assert!(
+        faults.iter().all(|fault| !fault
+            .body
+            .to_string()
+            .contains("an incremental pass would have missed")),
+        "the workload caught an incremental reconciliation panic; inspect the fault bodies above"
+    );
     let local = store.local_observations_after(0, usize::MAX).unwrap();
     // Per kind: (what main would replicate, what this build replicated). Main replicates
     // every observation the local log holds and every other claim this build replicated.

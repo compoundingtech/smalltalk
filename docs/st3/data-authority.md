@@ -29,10 +29,24 @@ of the same node as evidence; a claim can cite only claims.
 
 Current categorical status, context occupancy, todo, workspace availability and peer connectivity
 are replaceable values in `latest_values`. There is one row per subject and kind (per observing
-host for connectivity). A separate SQLite connection uses a zero busy timeout and an immediate
-transaction with a 100 ms SQLite progress deadline; contention drops the attempt without entering the ordered graph writer. A new
+host for connectivity). A separate SQLite connection allows at most 50 ms for write admission
+inside the same 100 ms current attempt. The immediate transaction keeps its 100 ms SQLite
+progress deadline, with explicit deadline checks before beginning and committing. A longer
+collision drops the attempt without entering the ordered graph writer or retaining a later retry. A new
 sample replaces the previous value and its local feed row. Status keeps the current episode's
 start time and a current-incarnation readiness bit; it retains no transition history.
+
+New peer register keys have a separate 10,000-key admission cap for each observation kind;
+existing keys remain replaceable. Exhaustion returns HTTP 503 `current-value-capacity`, which
+current publishers drop once like other temporary publication failures. A refusal schedules a
+bounded scan of that kind through an index over kind, subject and slot, without walking unrelated
+kinds first. Notification floods cannot start maintenance passes more often than every 100 ms;
+each pass still inspects at most 64 keys. Withdrawn seats and obsolete fleet transport rows release
+capacity after a same-transaction lifecycle recheck. Failed membership reads skip collection.
+Legacy history retirement inspects at most 256 rows before its separate writer transaction. A
+malformed usage body removes only that exact retirement job after rechecking its cursor/cutoff;
+the original payloads remain for inspection and later jobs can proceed. Such a skip is logged
+after commit. Ordinary observation retention still applies to the retained local payloads.
 
 Native producers replace their local snapshots without creating publication jobs. Each fresh
 snapshot gets one HTTP attempt. All current snapshots in one wake share a 100 ms deadline.

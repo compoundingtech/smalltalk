@@ -34,6 +34,7 @@ pub struct SmalltalkRuntime {
     pub(super) current_harness_freshness: std::sync::atomic::AtomicU64,
     pub(crate) current_value_refusals: std::sync::atomic::AtomicU64,
     pub(crate) current_value_maintenance_wake: tokio::sync::Notify,
+    pub(crate) current_value_capacity_kinds: Mutex<VecDeque<String>>,
     pub(crate) actual_cache: Mutex<HashMap<String, (ActualCacheKey, Option<Value>)>>,
     /// Immutable placement ancestry, keyed by the selected declaration claim.
     pub(crate) placement_cache: Mutex<HashMap<String, Option<Arc<crate::placement::Fence>>>>,
