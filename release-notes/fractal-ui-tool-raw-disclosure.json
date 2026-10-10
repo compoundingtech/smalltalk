@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "fractal-ui tool details move raw input/output behind a second disclosure; failed-tool output stays visible",
+  "summary": "Tool previews show human summaries and status before raw input/output. Failed transcript tool previews add one compact reason line with path segments abbreviated; full diagnostics remain behind the raw disclosure.",
   "replay": {
     "status": "none",
     "detail": "No replay or rebuild."
