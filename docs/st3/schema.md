@@ -4,6 +4,8 @@ This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
 Digest: `4775b997d5e176318797704d87a4f730f574d1b10806710bbc950742f3247061`
+Storage version: `18`
+Storage digest: `d11a3e5db57db0a0bd6a9b27474cdd93958a401b3a6482b62aea3595530dbcef`
 
 ## Subject families
 
@@ -219,3 +221,41 @@ A `durable` claim is a fact in the replicated claim log. A `local` claim is an o
 Each phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Bound-driven shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.
 
 OMP's native `abandoned` tasks are omitted from phase tasks rather than relabeled as completed. Their enclosing phase is preserved when it fits. `totals.abandoned` counts these dropped tasks separately; it is optional on the wire and defaults to zero when absent. Totals for the four task statuses count the full source snapshot and exclude abandoned tasks from active progress. Dropping an abandoned task does not set `truncated`; that flag describes text/list/serialized-size bounds only. The OMP producer always emits the abandoned count and reserves 4 KiB of the serialized-fields budget for authenticated provenance.
+
+## Local checkpoint capture storage
+
+SQLite `user_version` is 18. The local checkpoint guard uses trigger version 3, independently of the unchanged claim/wire registry digest. Initialization adds the singleton, any missing guard columns, and its mutation triggers; it does not scan history, rewrite claim bodies, rebuild projections, or force replay.
+
+```sql
+CREATE TABLE IF NOT EXISTS checkpoint_capture_epoch (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    value INTEGER NOT NULL,
+    envelope_frontier INTEGER NOT NULL DEFAULT 0,
+    cut_unix_ms INTEGER NOT NULL DEFAULT 0,
+    trigger_version INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO checkpoint_capture_epoch(id, value, envelope_frontier) VALUES (1, 0, 0);
+```
+
+Before the first page, a short read snapshot chooses the sealed envelope rowid and checks the persisted guard bounds. If either bound needs to grow, one atomic autocommit writer statement registers `MAX(envelope_frontier, seal_rowid)` and `MAX(cut_unix_ms, requested_cut)`. Already-covered bounds require no writer loan or durable update. Each attempt reads `SELECT value FROM checkpoint_capture_epoch WHERE id=1`; all retries retain the original seal and cut without registering them again. Every metadata, body, protection, and tombstone page checks that value in its own short snapshot. A mismatch discards the whole attempt; three invalidations fail closed. The registered bounds only grow across concurrent captures and reconnects; registering them does not increment the epoch. A zero cut is inactive.
+
+An envelope is relevant when its rowid is at/below the registered frontier and its accepted time is below the registered cut. A protected or canonical-order target additionally requires the claim's own accepted time below the cut. Mutations audit both OLD and NEW identities and references. These retained highwaters can conservatively invalidate a smaller later capture, but ordinary above-cut history does not invalidate it merely because that history is already within the row frontier.
+
+Claim-to-envelope relevance seeks batch membership through `replica_envelopes_batch` and record membership through `replica_records_claim`, then performs an exact envelope-identity lookup. The two relationships use separate EXISTS branches; record membership is driven from records with CROSS JOIN, not from the envelope frontier. Mutation work therefore depends on the target's relationships rather than unrelated retained history. Guard version 3 replaces version 2's envelope-side OR predicate, which scanned the frontier for each deleted claim during trim, without changing invalidation semantics or adding indexes.
+
+| Captured source | Mutations that increment the epoch |
+|---|---|
+| `claims` | Relevant envelope-associated body, identity, canonical-key and membership changes, body backfills, and deletions. Late claims in a relevant envelope remain exclusion witnesses: changing their accepted time, identity or batch, or deleting them, can change whether that envelope qualifies. |
+| `batches` | Backfills, canonical writer/sequence changes, identity/rowid changes and deletions for claims associated with a relevant envelope. Hash and batch-time bookkeeping alone is not captured. |
+| `replica_records` | Backfills and captured identity, position, admission-state, claim-reference or replacement-reference changes in a relevant envelope. A newer duplicate naming a captured below-cut claim is also fenced on INSERT, UPDATE and DELETE: canonical `MIN(position)` reads every copy, not only the sealed envelope prefix. |
+| `replica_envelopes` | Relevant identity, accepted-time or rowid changes and deletions. Any successful below-cut INSERT conservatively invalidates, including explicit rowid backfill and identical REPLACE relocating an old identity beyond the frontier. Receipt state, relay, validation errors and received-time bookkeeping alone is not captured. |
+| `desired`, `mission_definitions`, `mission_revisions`, `documents` | INSERT/DELETE referencing a captured below-cut claim, and UPDATE moving either OLD or NEW reference to/from such a claim (or moving its scan rowid). Unchanged references and references confined to above-cut claims are ignored. Captured projection rebuilds and direct desired deletion remain fenced. |
+| Repair references | `record.repaired` receipt changes referencing a captured replacement or a record in a relevant envelope; `repair.applied` receipt changes referencing captured predecessor claims; record replacement references into captured below-cut claims. Repairs only concerning newer history are ignored. |
+| `checkpoint_claims`, `checkpoint_envelopes` | Below-cut tombstone INSERT/DELETE and captured metadata, identity, accepted-time or rowid changes; both sides of a cut crossing are checked. The checkpoint-label field alone is not captured. |
+| Identity collisions on INSERT | BEFORE INSERT compares the colliding existing row's capture-relevant content, covering REPLACE with recursive triggers disabled, including removal of captured protection or tombstones. Identical ignored duplicates do not invalidate. Successful relevant inserts still run their AFTER fence. |
+
+Capture does not read envelope signatures/holds, projection-health rows, peer/cursor state, blob bytes, operation caches, or checkpoint status as metadata, so mutations confined to those tables need no capture fence. Blob-backed document bindings and operation identity in claim bodies/tombstones are covered by their captured tables. Any future captured source must extend the trigger audit before pages may read it. Accepted-time parsing remains a prerequisite owned by #2106, not a separate compatibility change here.
+
+Triggers persist and increment the epoch in the mutation's own transaction on every connection, without connection-local hooks or SQL functions. Rollback rolls back the increment too. A trigger-version migration atomically drops/recreates the old predicates, increments `value`, and stores `trigger_version=3`; captures using the old guard must restart. Earlier version-18 PR-head stores receive `cut_unix_ms` and `trigger_version` columns with default zero while preserving their epoch and frontier. Version-2 stores retain their active cut/frontier through the version-3 predicate migration. Ordinary reopens preserve all bounds and do not repeat the migration.
+
+Upgrade requires the normal process restart, not a history migration; its restart duration has not been measured. Stable older binaries reject storage version 18. Earlier version-18 PR-head binaries are not rollback targets: guard version 1 cannot safely operate the cut-aware schema, and guard version 2 rejects trigger version 3 on open. Their copied stores can migrate forward only. Binary rollback requires restoring a pre-upgrade database snapshot; otherwise roll forward. No replicated claim, checkpoint rule, wire protocol, or response shape changes.

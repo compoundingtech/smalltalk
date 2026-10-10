@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "A top-level seat's ask survives its restarts and harness changes and ends only when the seat stops or retires or the requester cancels it; an ask cancelled because its owner ended tells the requester once and leaves the person one update (#2092)",
+  "replay": {
+    "status": "none",
+    "detail": "No replay. Asks are re-evaluated on read and by the existing person-ask reconcile pass."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database or client schema change."
+  },
+  "rules": {
+    "status": "changed",
+    "detail": "Ask liveness: a --new-run ask from a top-level seat is no longer fenced on the seat's exact declaration claim, only on stop or retirement; mission seats keep the declaration fence. Mixed builds can disagree about such an ask after a seat is re-declared until every member runs this build: an older member cancels it, which then replicates."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "New --new-run asks from a top-level seat derive their subject without the declaration claim, so asking again with the same idempotency key after a re-declaration returns the same ask. The daemon now writes one message.sent from daemon/runtime to the requester and one person update when it cancels an ask whose owner ended."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required. Asks already cancelled before this build stay cancelled."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swap back freely; an older build cancels re-declared seats' asks again on its next reconcile pass."
+  }
+}

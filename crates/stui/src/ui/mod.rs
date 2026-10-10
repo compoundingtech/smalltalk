@@ -2758,6 +2758,22 @@ impl Ui {
                 area.width as usize,
                 theme::dim(),
             );
+            if area.height > 3 {
+                let mut doc = Doc::new();
+                doc.buttons(&[("Ctrl+]", "Attach", Hit::Attach, theme::ACCENT)]);
+                let button = Rect::new(
+                    area.x + 1,
+                    area.y + 3,
+                    area.width.saturating_sub(1),
+                    1,
+                );
+                buf.set_line(button.x, button.y, &doc.lines[0], button.width);
+                let target = &doc.targets[0];
+                self.hit(
+                    Rect { width: target.width.min(button.width), ..button },
+                    target.hit.clone(),
+                );
+            }
             return;
         };
         if let Some(native) = view.native.as_ref() {
@@ -5548,6 +5564,7 @@ impl Ui {
                 self.confirm = Some('v');
                 self.flash("Revoke this device? y to confirm");
             }
+            Hit::Attach => self.open_terminal(),
             Hit::Detach => {
                 if self.live {
                     self.effects.push(Effect::CloseTerminal);

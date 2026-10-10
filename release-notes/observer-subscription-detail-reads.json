@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Observer and subscription details read only the requested item in one SQLite snapshot.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or initialization change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or index change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule or retention change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Raw-ID-first/prefixed fallback, scope admission, wrong-kind/missing 404 and stopped details are preserved. Item and envelope now use one pinned cut. Detail keys are limited to 4 KiB; cumulative selected source payload/metadata to 256 KiB; rendered item plus snapshot to 512 KiB. Oversize returns non-retryable projection-detail-too-large (HTTP 422), without truncation or list fallback. Invalid stored types, UTF-8, JSON or numeric timestamps return non-retryable projection-detail-invalid-source (HTTP 422), instead of silent null/default decoding. Lists and their cursor behavior are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart or interruption beyond ordinary deployment."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual migration or rebuild."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No writer, checkpoint or rollback changes; existing source data is preserved."
+  }
+}

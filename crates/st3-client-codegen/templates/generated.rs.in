@@ -69,6 +69,8 @@ pub enum ErrorCode {
     StaleFence,
     CursorGap,
     PageCursorExpired,
+    ProjectionDetailTooLarge,
+    ProjectionDetailInvalidSource,
     RateLimited,
     RuntimeNotLocal,
     RuntimeAuthorityIndeterminate,

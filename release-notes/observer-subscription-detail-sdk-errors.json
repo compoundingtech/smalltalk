@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Rust and Swift clients decode and encode the observer/subscription detail refusal codes as typed errors.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or initialization change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or index change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule or retention change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Adds ProjectionDetailTooLarge and ProjectionDetailInvalidSource Rust error variants and corresponding Swift typed variants with exact wire-code round trips, matching the two error codes already declared by this PR schema. Unknown future error handling remains unchanged. No new wire code, status, cap, retryability, admission or server behavior change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart or interruption beyond ordinary deployment."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual migration or rebuild."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No writer, checkpoint or rollback changes; existing source data is preserved."
+  }
+}
