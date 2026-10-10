@@ -816,6 +816,10 @@ pub struct Reconciler<R = NativeRuntime> {
     mission_declaration_parses: std::sync::atomic::AtomicUsize,
     file_watchers: Arc<Mutex<HashMap<String, notify::RecommendedWatcher>>>,
     file_watchers_used: Arc<Mutex<HashSet<String>>>,
+    /// The native prompt (the observation that opened it) whose dialog this node saw on each
+    /// Claude seat's screen. Claude's input box is on screen while it works too, so the box
+    /// says a prompt is gone only after its dialog was seen.
+    prompt_dialogs_seen: Arc<Mutex<HashMap<String, String>>>,
     file_observations: Arc<Mutex<HashMap<String, FileStamp>>>,
     resource_provider: Arc<dyn ResourceProvider>,
     /// Open faults by subject and scope, loaded from the graph on first use.
@@ -958,6 +962,7 @@ impl Reconciler<NativeRuntime> {
             mission_declaration_parses: std::sync::atomic::AtomicUsize::new(0),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
             file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
+            prompt_dialogs_seen: Arc::new(Mutex::new(HashMap::new())),
             file_observations: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
             faults: Mutex::new(None),
@@ -1033,6 +1038,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             mission_declaration_parses: std::sync::atomic::AtomicUsize::new(0),
             file_watchers: Arc::new(Mutex::new(HashMap::new())),
             file_watchers_used: Arc::new(Mutex::new(HashSet::new())),
+            prompt_dialogs_seen: Arc::new(Mutex::new(HashMap::new())),
             file_observations: Arc::new(Mutex::new(HashMap::new())),
             resource_provider: Arc::new(RegisteredResourceProvider),
             faults: Mutex::new(None),
@@ -3448,12 +3454,25 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         };
         let fields = blocked.body.get("fields").unwrap_or(&blocked.body);
-        if fields["blocked_on"] != "human"
-            || fields["incarnation_id"] != incarnation
-            || !st_drivers::blocking_screen::claude_input_ready(screen)
-        {
+        let mut seen = self
+            .prompt_dialogs_seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if fields["blocked_on"] != "human" || fields["incarnation_id"] != incarnation {
+            seen.remove(&subject.subject);
             return Ok(());
         }
+        if !st_drivers::blocking_screen::claude_input_ready(screen) {
+            // The prompt's dialog is up.
+            seen.insert(subject.subject.clone(), blocked.id.clone());
+            return Ok(());
+        }
+        // The box before the dialog was drawn, or while Claude works, says nothing.
+        if seen.get(&subject.subject) != Some(&blocked.id) {
+            return Ok(());
+        }
+        seen.remove(&subject.subject);
+        drop(seen);
         self.store.append_claim(&ClaimInput {
             subject: subject.subject.clone(),
             kind: "harness.diagnostic".into(),
@@ -34107,6 +34126,94 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
         reconciler.reconcile_once().unwrap();
         assert!(fenced());
         assert_eq!(store.fault_items(Some("person/alex")).unwrap().len(), 0);
+    }
+
+    /// Claude reports nothing when its prompt is refused in the terminal; its input box coming
+    /// back says so, but only after the prompt's dialog was seen: the box is also on screen
+    /// before the dialog is drawn and while Claude works.
+    #[test]
+    fn a_refused_claude_prompt_is_gone_only_after_its_dialog_was_seen() {
+        let fixture = |name: &str| {
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../st-drivers/tests/fixtures/blocking-screens")
+                    .join(name),
+            )
+            .unwrap()
+        };
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let workspace = tempfile::tempdir().unwrap();
+        apply_source(
+            &store,
+            &format!(
+                "version 2\nagent \"seat\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
+                workspace.path().display().to_string()
+            ),
+            "native-prompt-screen",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        *runtime.ptys.lock().unwrap() = vec![claude_seat_pty("seat", "running", "one")];
+        let show = |name: &str| {
+            runtime
+                .screens
+                .lock()
+                .unwrap()
+                .insert("node.seat".into(), fixture(name));
+        };
+        let ask = || {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "agent/node.seat".into(),
+                    kind: "harness.observed".into(),
+                    actor: Some("agent/node.seat".into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String("working".into())),
+                        ("driver".into(), Value::String("claude".into())),
+                        ("incarnation_id".into(), Value::String("one".into())),
+                        ("blocked_on".into(), Value::String("human".into())),
+                        ("ask".into(), Value::String("permission".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let gone = |observation: &str| {
+            store
+                .claims_for("agent/node.seat", Some("harness.diagnostic"))
+                .unwrap()
+                .iter()
+                .any(|claim| {
+                    claim.body.pointer("/fields/code") == Some(&json!("native-prompt-gone"))
+                        && claim.body.pointer("/_operation/id")
+                            == Some(&json!(smallclaims::store::operation_id_for_key(
+                                &crate::store::native_prompt_gone_key(observation)
+                            )))
+                })
+        };
+        let first = ask();
+        // The hook fired, but Claude has not drawn its dialog yet: its box is still up.
+        show("claude-working.txt");
+        reconciler.reconcile_once().unwrap();
+        assert!(!gone(&first.id), "the box before the dialog proves nothing");
+        show("claude-permission-dialog.txt");
+        reconciler.reconcile_once().unwrap();
+        assert!(!gone(&first.id));
+        show("claude-permission-refused.txt");
+        reconciler.reconcile_once().unwrap();
+        assert!(gone(&first.id), "the dialog was seen, then refused");
+        // A later prompt whose dialog this node never saw stays open.
+        let second = ask();
+        reconciler.reconcile_once().unwrap();
+        assert!(!gone(&second.id));
     }
 
     #[test]

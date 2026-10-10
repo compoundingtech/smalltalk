@@ -161,12 +161,20 @@ pub fn detect(driver: &str, screen: &str) -> Option<BlockingScreen> {
 }
 
 /// Whether Claude's own input box is on screen: a full-width rule, the `❯` prompt line and
-/// another rule, as at the end of every finished turn. Claude replaces the box with its dialog
-/// while a permission or question prompt is up, so the box being back means the prompt is gone,
-/// answered or dismissed in the terminal (measured on Claude Code 2.1.296: Esc or "No" ends the
-/// turn without any hook event, and the input box returns).
+/// another rule. Claude replaces the box with its dialog while a permission, question or plan
+/// prompt is up, and shows it again once the prompt is answered or dismissed (measured on Claude
+/// Code 2.1.296: Esc or "No" ends the turn without any hook event). The box is also on screen
+/// while Claude works, so it says a prompt is gone only after the prompt's dialog was seen.
 pub fn claude_input_ready(screen: &str) -> bool {
     let rule = |line: &str| line.chars().count() >= 20 && line.chars().all(|c| c == '─');
+    // A dialog's selected choice (`❯ 1. Yes`) is not the input prompt.
+    let prompt = |line: &str| {
+        line.strip_prefix('❯').is_some_and(|rest| {
+            let rest = rest.trim_start();
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            digits == 0 || !rest[digits..].starts_with('.')
+        })
+    };
     let lines = screen
         .lines()
         .map(str::trim)
@@ -174,19 +182,44 @@ pub fn claude_input_ready(screen: &str) -> bool {
         .collect::<Vec<_>>();
     lines
         .windows(3)
-        .any(|window| rule(window[0]) && window[1].starts_with('❯') && rule(window[2]))
+        .any(|window| rule(window[0]) && prompt(window[1]) && rule(window[2]))
 }
 
 #[cfg(test)]
 mod tests {
-    const PERMISSION_DIALOG: &str = "❯ Run it.\n  ⎿  $ touch probe-file\n────────────────────────────────────────\n Bash command\n touch probe-file\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend\n";
-    const DENIED: &str = "❯ Run it.\n  ⎿  Interrupted · What should Claude do instead?\n────────────────────────────────────────\n❯ \n────────────────────────────────────────\n  ⏸ manual mode on · ? for shortcuts · ← for agents\n";
-
     #[test]
-    fn claude_input_box_marks_a_prompt_gone_and_a_dialog_does_not() {
-        assert!(!super::claude_input_ready(PERMISSION_DIALOG));
-        assert!(super::claude_input_ready(DENIED));
+    fn claude_input_box_is_back_after_a_refusal_and_absent_in_every_dialog() {
+        let screen = |name: &str| {
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/blocking-screens")
+                    .join(name),
+            )
+            .unwrap()
+        };
+        for dialog in [
+            "claude-permission-dialog.txt",
+            "claude-edit-dialog.txt",
+            "claude-ask-question.txt",
+            "claude-plan-dialog.txt",
+            "claude-trust.txt",
+        ] {
+            assert!(!super::claude_input_ready(&screen(dialog)), "{dialog}");
+        }
+        // The box is back after a refusal, and also while Claude works: only a dialog seen
+        // first makes its return mean the prompt is gone.
+        for input in [
+            "claude-permission-refused.txt",
+            "claude-edit-refused.txt",
+            "claude-working.txt",
+        ] {
+            assert!(super::claude_input_ready(&screen(input)), "{input}");
+        }
         assert!(!super::claude_input_ready(""));
+        // A dialog's selected choice between two rules is not the input prompt.
+        assert!(!super::claude_input_ready(
+            "────────────────────────────────────────\n❯ 1. Yes\n────────────────────────────────────────\n"
+        ));
     }
 
     #[test]

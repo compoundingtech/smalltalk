@@ -104,7 +104,8 @@ impl Store {
             let gone: bool = connection
                 .prepare_cached(
                     "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_operation_index
-                       WHERE json_extract(body, '$._operation.id')=?1)",
+                       WHERE json_extract(body, '$._operation.id') IS NOT NULL
+                         AND json_extract(body, '$._operation.id')=?1)",
                 )?
                 .query_row([native_prompt_gone_operation(&claim)], |row| row.get(0))?;
             if gone {
