@@ -77,7 +77,7 @@ usage: `agent_to_agent`, its held `fyi` subset, and `to_person`. Each message su
 once, including messages already read. Daemon and person senders do not count. The covering
 metadata index is maintained by writers; historical bootstrap advances at most eight subjects per
 writer batch, stopping between subjects once it has spent ten milliseconds. One daemon task
-awaits each bootstrap job on the existing FIFO writer, pauses one second between jobs, and stops
+awaits each bootstrap job on the existing FIFO writer, pauses 100 milliseconds between jobs, and stops
 when complete; per-claim projections cannot multiply the historical budget. `complete: false` means bootstrap is unfinished, so collectors publish no ratio.
 Reads never advance bootstrap. The factory SLO timer divides each count by merges in the
 rolling day and publishes informational values; zero merges gives no ratio.

@@ -24490,7 +24490,7 @@ async fn catch_up_coordination_counts(store: Arc<Store>) {
         }).await;
         match result {
             Ok(Ok(true)) => return,
-            Ok(Ok(false)) => tokio::time::sleep(Duration::from_secs(1)).await,
+            Ok(Ok(false)) => tokio::time::sleep(Duration::from_millis(100)).await,
             error => {
                 eprintln!("st3: coordination count bootstrap failed: {error:?}");
                 tokio::time::sleep(Duration::from_secs(60)).await;

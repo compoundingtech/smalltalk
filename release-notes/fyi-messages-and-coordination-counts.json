@@ -3,7 +3,7 @@
   "summary": "Hold FYI mail until the next wake, allow question-only seats, and expose coordination counts",
   "replay": {
     "status": "changed",
-    "detail": "No graph replay or projection invalidation. Local coordination metadata backfills at most eight historical message subjects per paced job on the existing FIFO writer, with a one-second pause between jobs; count reads return complete=false until caught up and never advance the backfill."
+    "detail": "No graph replay or projection invalidation. Local coordination metadata backfills at most eight historical message subjects per paced job on the existing FIFO writer, with a 100-millisecond pause between jobs; count reads return complete=false until caught up and never advance the backfill."
   },
   "schema": {
     "status": "changed",

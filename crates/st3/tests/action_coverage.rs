@@ -2412,7 +2412,7 @@ async fn cli_fyi_settings_and_count_reads_survive_restart() {
     ]).await);
     assert!(st3::fyi::is_held(&daemon.store().message(reply["subject"].as_str().unwrap()).unwrap().unwrap()));
     let fence = daemon.fence(PEER).await;
-    let api = dispatch(&daemon.client(PEER), "message.send", "copper-api-fyi", fence,
+    let api = dispatch(&daemon.client(PEER), "message.send", "coverage-copper-api-fyi", fence,
         json!({"to": WORKER, "content":"A client FYI.", "fyi":true})).await.unwrap();
     let api = serde_json::to_value(api).unwrap();
     let api_id = api["value"]["affected_ids"][0].as_str().unwrap();
