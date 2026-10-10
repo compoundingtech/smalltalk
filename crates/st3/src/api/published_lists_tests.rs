@@ -1266,8 +1266,11 @@ mission "garden/proposed" state="ready" revisions="human-only" revision-reviewer
             assert!(store.last_seats_read().contains(ash), "ash was read again through R1");
             fold_work_checked(&store);
         }
-        // The source refuses this handoff: this named input cannot change this way.
-        Err(error) => assert!(!error.code.is_empty(), "{error:?}"),
+        // `Store::work_action_with_handoff` follows a revision's carried claim to its successor
+        // step; with no successor carrying it, a step of a superseded generation is refused as
+        // `stale-run-generation`, and this named input cannot change this way. Any other error
+        // is a mistake in this fixture, not that refusal.
+        Err(error) => assert_eq!(error.code, "stale-run-generation", "{error:?}"),
     }
 }
 
