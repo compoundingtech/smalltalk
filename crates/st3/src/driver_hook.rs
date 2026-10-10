@@ -326,7 +326,7 @@ fn claude_observe(
         eprintln!("st: Claude {event} was not recorded: {error:#}");
     }
     if event == "PermissionRequest" {
-        answer_permission_from_st(env, &identity, &raw);
+        answer_permission_from_st(env, &identity, &paths.agent_dir, &raw);
         return 0;
     }
     if !session_start {
@@ -347,14 +347,21 @@ const PROMPT_ANSWER_POLL: std::time::Duration = std::time::Duration::from_secs(1
 /// shows its dialog; if the person answers in st first, the hook returns that decision, which
 /// closes the dialog (measured on Claude Code 2.1.296). A question prompt is answered in the
 /// terminal only.
-fn answer_permission_from_st(env: &dyn HookEnv, identity: &str, raw: &str) {
+fn answer_permission_from_st(env: &dyn HookEnv, identity: &str, agent_dir: &Path, raw: &str) {
     let payload: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
     if payload.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") {
         return;
     }
-    let since = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis());
+    // This hook's own observation, as its state record names it: only an answer to that exact
+    // prompt is this hook's, never one to an earlier prompt or a parallel hook's.
+    let Some((ownership, transition)) = st_drivers::harness_state::read(
+        &st_drivers::harness_state::harness_state_path(agent_dir),
+        None,
+    )
+    .filter(|observed| observed.blocked_on == st_drivers::harness_state::BlockedOn::Human)
+    .and_then(|observed| observed.ownership_sequence.zip(observed.transition_sequence)) else {
+        return;
+    };
     let endpoint = match env.var("ST3_ENDPOINT") {
         Some(endpoint) => crate::client::Endpoint::parse(endpoint),
         None => match crate::config::Config::load_unvalidated(None) {
@@ -374,7 +381,7 @@ fn answer_permission_from_st(env: &dyn HookEnv, identity: &str, raw: &str) {
     };
     let client = crate::client::Client::new(endpoint);
     let path = format!(
-        "/v1/harness-prompts/state?agent={}&since={since}",
+        "/v1/harness-prompts/state?agent={}&ownership={ownership}&transition={transition}",
         urlencoding::encode(&subject)
     );
     let answer = wait_for_prompt_answer(

@@ -55157,9 +55157,9 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
                 })
                 .unwrap()
         };
-        let hook_started = now_ms();
+        // The hook waits on its own observation, named by its state record's sequences.
         assert_eq!(
-            store.native_prompt_state(seat, hook_started).unwrap(),
+            store.native_prompt_state(seat, 1, 3).unwrap(),
             NativePromptState::Open,
             "the hook's observation is not published yet"
         );
@@ -55167,7 +55167,8 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         let asked = append(
             "harness.observed",
             json!({"state":"working", "driver":"claude", "incarnation_id":"one",
-                "blocked_on":"human", "ask":"permission", "reason":"Run the migration?"}),
+                "blocked_on":"human", "ask":"permission", "reason":"Bash: ./migrate --apply",
+                "ownership_sequence":1, "transition_sequence":3}),
         );
         let prompt = || {
             store
@@ -55195,14 +55196,14 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             "stale-fence"
         );
         assert_eq!(
-            store.native_prompt_state(seat, hook_started).unwrap(),
+            store.native_prompt_state(seat, 1, 3).unwrap(),
             NativePromptState::Open
         );
         store
             .answer_native_prompt(seat, &asked.id, "deny", "person/avery")
             .unwrap();
         assert_eq!(
-            store.native_prompt_state(seat, hook_started).unwrap(),
+            store.native_prompt_state(seat, 1, 3).unwrap(),
             NativePromptState::Answered {
                 answer: "deny".into()
             }
@@ -55218,12 +55219,35 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         append(
             "harness.observed",
             json!({"state":"working", "driver":"claude", "incarnation_id":"one",
-                "blocked_on":null, "ask":null}),
+                "blocked_on":null, "ask":null, "ownership_sequence":1, "transition_sequence":4}),
         );
         assert_eq!(
-            store.native_prompt_state(seat, hook_started).unwrap(),
+            store.native_prompt_state(seat, 1, 3).unwrap(),
             NativePromptState::Gone
         );
+        // The next prompt is its own: the earlier prompt's answer never answers it.
+        let next = append(
+            "harness.observed",
+            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"Bash: rm -r build",
+                "ownership_sequence":1, "transition_sequence":5}),
+        );
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 5).unwrap(),
+            NativePromptState::Open
+        );
+        assert_eq!(prompt().unwrap().detail.lines().next(), Some("Bash: rm -r build"));
+        store
+            .answer_native_prompt(seat, &next.id, "allow", "person/avery")
+            .unwrap();
+        // A prompt that does not say what it would run can only be answered in the terminal.
+        append(
+            "harness.observed",
+            json!({"state":"working", "driver":"claude", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"permissionRequest",
+                "ownership_sequence":1, "transition_sequence":7}),
+        );
+        assert!(prompt().unwrap().answers.is_empty());
         // A question is answered in the terminal: it is an alert without answers.
         let question = append(
             "harness.observed",

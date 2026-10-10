@@ -1404,9 +1404,15 @@ fn native_prompt_gone_operation(observation: &str) -> String {
 }
 
 /// Whether st can answer the prompt `harness` reports from a client: a Claude permission prompt,
-/// whose hook waits for the answer. Other prompts are answered in the seat's terminal.
+/// whose hook waits for the answer, that says what it asks to run, so a person sees what an allow
+/// allows. Other prompts are answered in the seat's terminal.
 fn answerable(harness: &Value) -> bool {
-    harness["blocked_on"] == "human" && harness["ask"] == "permission" && harness["driver"] == "claude"
+    harness["blocked_on"] == "human"
+        && harness["ask"] == "permission"
+        && harness["driver"] == "claude"
+        && harness["reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty() && reason != "permissionRequest")
 }
 
 /// The idempotency key of the person's answer to the native prompt `observation` opened.
@@ -1467,21 +1473,51 @@ impl Store {
         .transpose()
     }
 
-    /// The prompt a hook that started at `since` waits on: the seat's newest observation, once it
-    /// is no older than the hook. Claude shows one prompt at a time, so it is the hook's own.
-    pub fn native_prompt_state(&self, seat: &str, since: u128) -> Result<NativePromptState> {
-        let Some((claim, at, harness)) = self.newest_harness_observation(seat)? else {
-            return Ok(NativePromptState::Open);
+    /// The prompt a hook waits on: the very observation it published, named by the state
+    /// record's ownership and transition sequences. Open until that observation is published and
+    /// while it is the seat's newest; gone once the seat has moved on.
+    pub fn native_prompt_state(
+        &self,
+        seat: &str,
+        ownership: u64,
+        transition: u64,
+    ) -> Result<NativePromptState> {
+        let connection = self.readers.get();
+        // The hook's observation is among the seat's last few: it is published moments after the
+        // hook writes it, and a hook that waited past a few later observations has nothing left.
+        let recent = connection
+            .prepare_cached(&format!(
+                "{} LIMIT 16",
+                newest_claims_of_kind_query("claims.id, claims.body", "harness.observed")
+            ))?
+            .query_map(params![seat, i64::MAX], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let own = recent.iter().position(|(_, body)| {
+            serde_json::from_str::<Value>(body).is_ok_and(|body| {
+                let fields = body.get("fields").unwrap_or(&body);
+                fields["ownership_sequence"] == ownership && fields["transition_sequence"] == transition
+            })
+        });
+        let Some(own) = own else {
+            // Not published yet, or long gone: only the first can be answered, so keep waiting.
+            return Ok(if recent.len() == 16 {
+                NativePromptState::Gone
+            } else {
+                NativePromptState::Open
+            });
         };
-        // The hook's own observation reaches the store after the hook starts; allow for the
-        // clock reading the hook took first.
-        if at.saturating_add(2_000) < since {
-            return Ok(NativePromptState::Open);
-        }
-        if !answerable(&harness) {
+        if own != 0 {
             return Ok(NativePromptState::Gone);
         }
-        let connection = self.readers.get();
+        let (claim, body) = &recent[own];
+        let body: Value = serde_json::from_str(body)?;
+        let harness = body.get("fields").unwrap_or(&body);
+        if !answerable(harness) {
+            return Ok(NativePromptState::Gone);
+        }
+        let claim = claim.clone();
         // Refused in the terminal, which only the screen showed.
         let refused: bool = connection
             .prepare_cached(

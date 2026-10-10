@@ -31,7 +31,9 @@ pub(super) async fn publish(
 #[derive(Debug, Deserialize)]
 pub(super) struct PromptStateQuery {
     agent: String,
-    since: u128,
+    /// The hook's own observation: its state record's ownership and transition sequences.
+    ownership: u64,
+    transition: u64,
 }
 
 /// Where a waiting prompt hook's prompt stands: open, answered by a person (and how), or gone.
@@ -43,7 +45,7 @@ pub(super) async fn prompt_state(
     let store = state.store.clone();
     let prompt = blocking_action(move || {
         store
-            .native_prompt_state(&query.agent, query.since)
+            .native_prompt_state(&query.agent, query.ownership, query.transition)
             .map_err(|error| St3Error::new("internal", format!("{error:#}")))
     })
     .await?;
