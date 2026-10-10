@@ -8,7 +8,7 @@ import { accentTokens, tokens, geometry, density } from './embrace-tokens.stylex
 import { EmbraceDiffPreview, EmbraceMarkdownPreview } from './EmbraceToolPreview'
 import { embraceToolKind as toolKind, embraceToolNeedsAttention, type EmbraceToolKind as ToolKind } from './embrace-tool-attention'
 export { embraceToolNeedsAttention } from './embrace-tool-attention'
-import { toolDiffs, toolFields, toolOutput, toolString } from './embrace-tool-preview'
+import { toolDiffs, toolFields, toolHumanSummary, toolOutput, toolString } from './embrace-tool-preview'
 
 export type ToolVariant = 'rows' | 'grouped' | 'cards'
 export type EmbraceToolCallItem = Extract<ConversationItem, { _tag: 'ToolCall' }>
@@ -159,6 +159,7 @@ const ToolDetails = ({ name, input, output, mediaType, status, variant }: {
   const question = toolString(input, ['question', 'prompt', 'message'])
   const options = toolFields(input).options
   return <div {...stylex.props(styles.details)}>
+    <p {...stylex.props(styles.caption)}>{toolHumanSummary(input, name)} · {status}</p>
     {kind === 'question' ? <section aria-label="Agent question">
       <p {...stylex.props(styles.question)}>{question || 'Agent needs your answer'}</p>
       {Array.isArray(options) ? <ul {...stylex.props(styles.options)}>{options.map((option, index) => <li key={index}>
@@ -170,15 +171,12 @@ const ToolDetails = ({ name, input, output, mediaType, status, variant }: {
       <p {...stylex.props(styles.caption)}>{status === 'success' ? 'Recorded changes' : status === 'running' ? 'Proposed changes · tool running' : 'Proposed changes · not confirmed applied'}</p>
       <EmbraceDiffPreview diffs={diffs} />
     </> : markdown !== '' ? <EmbraceMarkdownPreview markdown={markdown} /> : null}
-    {outputText !== '' && (diffs.length === 0 && markdown === '' || status === 'error') ? (
-      <pre {...stylex.props(styles.output, status === 'error' && styles.error)}>{outputText}</pre>
-    ) : null}
-    {kind === 'run' ? <pre {...stylex.props(styles.output)}>{toolString(input, ['command', 'cmd'])}</pre> : null}
+    {status === 'error' && outputText !== '' ? <pre {...stylex.props(styles.output, styles.error)}>{outputText}</pre> : null}
     {output === undefined && kind !== 'question' ? <p {...stylex.props(styles.caption)}>
       {status === 'running' ? 'Tool is running; no result yet.' : status === 'interrupted' ? 'Interrupted before a result was recorded.' : 'No result was recorded.'}
     </p> : null}
     <details {...stylex.props(styles.rawDetails)}>
-      <summary {...stylex.props(styles.rawSummary)}>Inspect raw input and result</summary>
+      <summary {...stylex.props(styles.rawSummary)}>Show raw input/output</summary>
       <pre {...stylex.props(styles.output)}>{JSON.stringify({ input, result: output }, null, 2)}</pre>
     </details>
   </div>

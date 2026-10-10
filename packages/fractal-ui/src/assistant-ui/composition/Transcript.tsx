@@ -80,12 +80,24 @@ export function AgentMessage({ item, senderLine }: { readonly item: (TextItem & 
     {!streaming && <div data-testid="answer-meta" {...stylex.props(styles.answerMeta)}><ActionBarPrimitive.Copy aria-label="Copy answer" {...stylex.props(styles.copy)}><Icon name="copy" size={14} /></ActionBarPrimitive.Copy>{Number.isFinite(completed) && <time dateTime={new Date(completed).toISOString()}>{new Date(completed).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>}</div>}
   </MessagePrimitive.Root>
 }
-/** F3: four observed output lines, remaining count and a host-owned Open action. */
+/** Human intent first; failures stay visible, routine diagnostics require a second disclosure. */
 export function ToolDetailPreview({ call, onOpen }: { readonly call: WorkLogCall; readonly onOpen?: (call: WorkLogCall) => void }) {
+  const [rawOpen, setRawOpen] = React.useState(false)
   const output = call.detail ?? (call.status === 'running' ? 'No output received yet.' : 'No output recorded.')
   const lines = output.split('\n')
   const remaining = Math.max(0, lines.length - Number(output.endsWith('\n')) - 4)
-  return <div data-testid="tool-detail-preview" {...stylex.props(styles.preview)}><pre {...stylex.props(styles.output)}><code {...stylex.props(styles.outputCode)}><HighlightedSource code={onOpen === undefined ? output : lines.slice(0, 4).join('\n')} language={workLogOutputLanguage(call)} /></code></pre>{onOpen !== undefined && <div data-testid="tool-preview-actions" {...stylex.props(styles.previewActions)}>{remaining > 0 && <><span data-testid="tool-preview-remaining">+{remaining} {remaining === 1 ? 'line' : 'lines'}</span><span aria-hidden="true">·</span></>}<Button aria-label={`Open ${call.title} tool detail`} onPress={() => onOpen(call)} {...stylex.props(styles.previewOpen)}>Open</Button></div>}</div>
+  return <div data-testid="tool-detail-preview" {...stylex.props(styles.preview)}>
+    <p>{call.summary ?? call.title} · {call.status}</p>
+    {call.status === 'error' && call.detail !== undefined && <pre {...stylex.props(styles.output)}>{call.detail}</pre>}
+    <Disclosure isExpanded={rawOpen} onExpandedChange={setRawOpen}>
+      <Button slot="trigger" {...stylex.props(styles.previewOpen)}>Show raw input/output</Button>
+      <DisclosurePanel>{rawOpen && <>
+        {call.argsSummary !== undefined && <pre {...stylex.props(styles.output)}>{call.argsSummary}</pre>}
+        <pre {...stylex.props(styles.output)}><code {...stylex.props(styles.outputCode)}><HighlightedSource code={onOpen === undefined ? output : lines.slice(0, 4).join('\n')} language={workLogOutputLanguage(call)} /></code></pre>
+        {onOpen !== undefined && <div data-testid="tool-preview-actions" {...stylex.props(styles.previewActions)}>{remaining > 0 && <><span data-testid="tool-preview-remaining">+{remaining} {remaining === 1 ? 'line' : 'lines'}</span><span aria-hidden="true">·</span></>}<Button aria-label={`Open ${call.title} tool detail`} onPress={() => onOpen(call)} {...stylex.props(styles.previewOpen)}>Open</Button></div>}
+      </>}</DisclosurePanel>
+    </Disclosure>
+  </div>
 }
 /** Source text an unadopted item can show without the runtime; absent when the item carries none. */
 const strandedText = (item: ConversationItem): string | undefined => {

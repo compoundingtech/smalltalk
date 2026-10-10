@@ -1,12 +1,13 @@
 /** Controlled presentation types for the work log. */
 import type { ConversationItem } from '../embrace-data/model'
-import { toolOutput } from '../embrace-tool-preview'
+import { toolHumanSummary, toolOutput } from '../embrace-tool-preview'
 export type WorkKind = 'read' | 'run' | 'edit'
 export interface WorkLogCall {
   readonly id: string
   readonly kind: WorkKind
   readonly title: string
   readonly argsSummary?: string
+  readonly summary?: string
   readonly status: 'running' | 'success' | 'error' | 'interrupted'
   readonly startedAt: string
   readonly endedAt?: string
@@ -66,7 +67,7 @@ export function workLogTurnFromItems(items: readonly ConversationItem[], facts: 
     const dot = filename.lastIndexOf('.')
     const extension = dot > 0 ? filename.slice(dot + 1).toLowerCase() : undefined
     return [{
-      id: call.id, kind, title: call.name, argsSummary: summarizeArgs(call.input),
+      id: call.id, kind, title: call.name, summary: toolHumanSummary(call.input, call.name), argsSummary: summarizeArgs(call.input),
       status: call.status, startedAt: call.at, endedAt: call.result?.at,
       detail: toolOutput(call.result?.content) || undefined,
       outputLanguage: (media === undefined ? undefined : outputMediaLanguages[media]) ?? (kind === 'run' ? 'bash' : kind === 'read' ? extension : undefined),
