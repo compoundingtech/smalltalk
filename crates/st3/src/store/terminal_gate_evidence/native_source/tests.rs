@@ -349,15 +349,33 @@ fn native_gate_malformed_deep_and_wrong_type_source_is_visible_unknown() {
     let tx = writer.transaction().unwrap();
     let capture = f.source.state(&tx).unwrap();
     let root = f.source.installer.root(&tx, VIEW).unwrap();
-    for sql in [
+    assert!(tx.execute(
         "UPDATE claims SET body='{broken' WHERE subject='exec/one/probe' AND kind='runtime.observed'",
+        [],
+    ).is_err());
+    assert_eq!(f.source.state(&tx).unwrap(), capture);
+    assert_eq!(f.source.installer.root(&tx, VIEW).unwrap(), root);
+    assert_eq!(f.source.doctor_line(&tx)["status"], "warn");
+
+    // Bundled SQLite accepts x'00' as JSONB. That native admission does not make it
+    // a supported TEXT source: capture stays pending until the header guard fences it.
+    tx.execute(
         "UPDATE claims SET body=x'00' WHERE subject='exec/one/probe' AND kind='runtime.observed'",
-    ] {
-        assert!(tx.execute(sql, []).is_err());
-        assert_eq!(f.source.state(&tx).unwrap(), capture);
-        assert_eq!(f.source.installer.root(&tx, VIEW).unwrap(), root);
-        assert_eq!(f.source.doctor_line(&tx)["status"], "warn");
-    }
+        [],
+    )
+    .unwrap();
+    let kind: String = tx.query_row(
+        "SELECT typeof(body) FROM claims WHERE subject='exec/one/probe' AND kind='runtime.observed'",
+        [], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(kind, "blob");
+    assert!(f.source.state(&tx).unwrap().1);
+    assert!(f.source.installer.root(&tx, VIEW).is_err());
+    assert_eq!(f.source.doctor_line(&tx)["status"], "unknown");
+    f.source.finish(&tx).unwrap();
+    let line = f.source.doctor_line(&tx);
+    assert_eq!(line["status"], "unknown");
+    assert!(line["message"].as_str().unwrap().contains("type"));
     drop(tx);
     drop(writer);
 
@@ -385,8 +403,8 @@ fn native_gate_malformed_deep_and_wrong_type_source_is_visible_unknown() {
         );
     }
 
-    // Wrong-type retained payload is fixture metadata, not a claim body whose native
-    // indexes would reject the write. Header inspection must refuse it before decode.
+    // Wrong-type retained payload also remains unavailable. Header inspection must
+    // refuse fixture metadata before decoding the previous witness.
     let f = Fixture::seeded();
     f.edit(|tx| {
         tx.execute(

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Verify native JSONB admission stays uncertified and expose fixture work tuples.",
+  "replay": {
+    "status": "none",
+    "detail": "Correct a private native fixture oracle: bundled SQLite admits x00 as JSONB, while this adapter accepts only TEXT. Keep malformed TEXT write refusal, assert admitted BLOB type and pending cut, and require text-only header refusal to stay unknown. Expose successful stderr for exactly the existing native work-budget control through one anchored nextest ci visibility override; no selection, retry, thread, ceiling or production behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Correct a private native fixture oracle: bundled SQLite admits x00 as JSONB, while this adapter accepts only TEXT. Keep malformed TEXT write refusal, assert admitted BLOB type and pending cut, and require text-only header refusal to stay unknown. Expose successful stderr for exactly the existing native work-budget control through one anchored nextest ci visibility override; no selection, retry, thread, ceiling or production behavior changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Correct a private native fixture oracle: bundled SQLite admits x00 as JSONB, while this adapter accepts only TEXT. Keep malformed TEXT write refusal, assert admitted BLOB type and pending cut, and require text-only header refusal to stay unknown. Expose successful stderr for exactly the existing native work-budget control through one anchored nextest ci visibility override; no selection, retry, thread, ceiling or production behavior changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Correct a private native fixture oracle: bundled SQLite admits x00 as JSONB, while this adapter accepts only TEXT. Keep malformed TEXT write refusal, assert admitted BLOB type and pending cut, and require text-only header refusal to stay unknown. Expose successful stderr for exactly the existing native work-budget control through one anchored nextest ci visibility override; no selection, retry, thread, ceiling or production behavior changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Correct a private native fixture oracle: bundled SQLite admits x00 as JSONB, while this adapter accepts only TEXT. Keep malformed TEXT write refusal, assert admitted BLOB type and pending cut, and require text-only header refusal to stay unknown. Expose successful stderr for exactly the existing native work-budget control through one anchored nextest ci visibility override; no selection, retry, thread, ceiling or production behavior changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Correct a private native fixture oracle: bundled SQLite admits x00 as JSONB, while this adapter accepts only TEXT. Keep malformed TEXT write refusal, assert admitted BLOB type and pending cut, and require text-only header refusal to stay unknown. Expose successful stderr for exactly the existing native work-budget control through one anchored nextest ci visibility override; no selection, retry, thread, ceiling or production behavior changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Correct a private native fixture oracle: bundled SQLite admits x00 as JSONB, while this adapter accepts only TEXT. Keep malformed TEXT write refusal, assert admitted BLOB type and pending cut, and require text-only header refusal to stay unknown. Expose successful stderr for exactly the existing native work-budget control through one anchored nextest ci visibility override; no selection, retry, thread, ceiling or production behavior changes."
+  }
+}

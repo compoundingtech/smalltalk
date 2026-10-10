@@ -51,7 +51,8 @@ The fourteen native controls are named `native_gate_*` in tests.rs. They cover n
 selection against the canonical oracle (including later arrival with older time),
 all six non-selecting runtime kinds, refusal/recovery, changed declaration/generation,
 complete subject/batch caps, header/body guards, native malformed-claim refusal,
-malformed/deep mission metadata and wrong-type retained fixture payload,
+admitted JSONB header refusal, malformed/deep mission metadata and wrong-type
+retained fixture payload,
 replacement capture, replacement after extraction, rollback, explicit lifecycle gaps,
 0/1024/100000 unrelated rows, raw reopen/nonempty refusal, guard replacement and
 default-Store inventory. Registration/setup is separate from measured mutation work.
@@ -70,7 +71,14 @@ At each 0/1024/100000 prior-row size, the control also separately reports one un
 claim INSERT (insert_count=1), including native and fixture trigger predicates, and
 the following idle finish. Batch setup is excluded. Expected statement counts are one
 for the INSERT and one for finish; the per-INSERT, larger-source and full no-op
-VM/fullscan numbers remain unmeasured until corrected hosted execution. INSERT retains the 20000-VM/zero-fullscan
+VM/fullscan tuples were suppressed on successful nextest output at `2388fb188`,
+although that control passed its assertions at all three sizes (6.414 seconds, initial
+PASS). The successor has an anchored, visibility-only CI override for this one test.
+At `2388fb188`, thirteen controls initially passed and one failed three attempts:
+the assumption that native SQLite refuses `x'00'` was wrong because it accepts JSONB.
+The correction keeps malformed TEXT write refusal and tests the admitted BLOB as
+pending, then unavailable through the text-only header guard. No old result is
+transferred to the successor. INSERT retains the 20000-VM/zero-fullscan
 refusal target and finish the 40-VM/zero-fullscan target. The output also reports the
 unrelated point UPDATE and complete bound-key semantic no-op path separately.
 
