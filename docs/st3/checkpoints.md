@@ -7,8 +7,10 @@ that history together, without changing the graph, what any reader returns, or w
 each other holds.
 
 This document explains how a checkpoint works and what trimming drops, with examples. It describes
-the code in `crates/smallclaims/src/store/checkpoint*.rs` (agreement, proof, trim) and
-`crates/st3/src/store/checkpoint_rules.rs` (the rules for st's own claim kinds). Operating commands
+the code in `crates/smallclaims/src/store/checkpoint*.rs` (agreement, proof, trim),
+`crates/st3-schema/retention.toml` (the retention policy, which names the rules for st's own claim
+kinds; see [Retention](retention.md)) and `crates/st3/src/store/checkpoint_rules.rs` (the planner
+functions those rules name). Operating commands
 are in [Fleet replication](replication.md#checkpoints). Read this before changing a rule, the
 agreement, or the trim.
 
@@ -104,7 +106,7 @@ sealing, and since every participant must seal, that stops trimming for the whol
 
 ## What a rule may drop
 
-A checkpoint does not decide what is old. The rules in `checkpoint_rules.rs` do, and a rule exists
+A checkpoint does not decide what is old. The rules in the retention policy do, and a rule exists
 only for a kind that was audited against every reader of that kind. Everything else is kept.
 
 ### Slots and witnesses
@@ -153,9 +155,10 @@ what lets every node compute the same plan.
 
 ### The rules
 
-`RULES_DESCRIPTION` in `checkpoint_rules.rs` is the canonical list. Its hash, with the rule engine
-version, is the `rules_digest` in every seal, so nodes agree on a checkpoint only when they run the
-same rules. In summary:
+The `[[rules]]` of `crates/st3-schema/retention.toml` are the canonical list. Each renders one line
+of the rules description (`rules_description` in `checkpoint_rules.rs`), followed by the engine's
+own terms. Its hash, with the rule engine version, is the `rules_digest` in every seal, so nodes
+agree on a checkpoint only when they run the same rules. In summary:
 
 | Kind | Slot | Kept |
 |---|---|---|
@@ -167,7 +170,8 @@ same rules. In summary:
 | `resource.observed` written by an observer | subject | the newest |
 | `runtime.action.*` with no actor, `render.applied`, `runtime.readiness-deadline-reached` | subject (and action, incarnation, status) | the newest; only claims dated at least five days before the cut go |
 | `sekret.called`, `sekret.exited`, `sekret.refused`, `sekret.changed` written before they became local observations | subject | the newest; only claims dated at least five days before the cut go |
-| `harness.limits` | subject | the newest |
+| `harness.limits` | none | every claim: the account fold compares readings across seats and reset windows, so a later reading does not replace an earlier one (since rules version 8) |
+| `harness.todo.observed` | subject | the newest (a rule that predates its description line) |
 | `harness.usage`, response rollups | subject, incarnation, model, account, run, step, host | the last snapshot of each UTC hour in the seven days before the cut, the newest snapshot before that window, and the newest of all |
 | `harness.usage`, session cumulative | subject, incarnation | the newest and the last claim of the largest total |
 | `harness.usage`, context occupancy | subject, incarnation | the newest |
@@ -385,7 +389,8 @@ setup's write-syscall bytes, without reducing the production-sized trim proof.
 | Due time, names, the dry-run plan | `crates/smallclaims/src/store/checkpoint.rs` |
 | Participants, seals, verifications, stability, excusal, attention timing | `crates/smallclaims/src/store/checkpoint_agreement.rs` |
 | Tombstones, trim, manifest adoption | `crates/smallclaims/src/store/checkpoint_trim.rs` |
-| The rules, the guards, the planner, the reader digest | `crates/st3/src/store/checkpoint_rules.rs` |
+| The rules, each kind's class and window | `crates/st3-schema/retention.toml` |
+| The guards, the planner, the reader digest | `crates/st3/src/store/checkpoint_rules.rs` |
 | Rule examples as tests | `crates/st3/src/store/checkpoint_tests.rs` |
 | Trim, tombstone and replication tests | `crates/st3/src/store/tombstones_tests.rs` |
 | Agreement and convergence tests | `crates/st3/src/store/checkpoint_agreement_tests.rs` |

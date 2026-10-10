@@ -56,4 +56,14 @@ For screenshots without a real st, `node demoGateway.mjs 8791` serves invented d
 
 Generated `ios/`, build output, signing material, local configuration, and proof screenshots are ignored by Git. Do not commit Apple team/device IDs, credentials, machine paths, or private network addresses. Expo SDK 57 needs the `expo-build-properties` scene-lifecycle opt-in for Xcode 27/iOS 27.
 
-An opt-in Debug fabric carrier has its own [build and isolated proof instructions](modules/st-fabric/README.md). Default builds do not link it. Its temporary client uses only a native-created loopback listener and leaves the saved Tailscale or LAN gateway unchanged.
+## Fabric, an opt-in carrier
+
+The app reaches its member over its saved gateway (Tailscale, the local network or HTTPS) unless the person turns on **Fabric** under Fleet › carrier. Fabric needs a build that links the native bridge: build with `ST3_FABRIC=1 pnpm run pods` after building the Rust framework (see [the module's README](modules/st-fabric/README.md)). A build without it is the ordinary app and shows no carrier setting.
+
+With Fabric on, each foreground opens a fresh native listener on the loopback address the bridge returns (the only loopback address the app accepts; it is never saved), the client talks to it, and the background stops it. The paired bearer and the enrolled signing key are the same ones the saved gateway uses, so a device already paired to the member needs only the setting and a grant, not a new pairing. A new pairing made while the bridge is open goes over fabric. The member exposes its paired-only client socket as one fabric service and grants this phone's node ID (shown in Fleet › carrier) that one service.
+
+The target is `node=NODE_ID&service=NAME` (and an optional `addr=` hint): paste it under Fleet › carrier. A build can carry one: put `EXPO_PUBLIC_ST3_FABRIC_DEFAULT='node=…&service=…'` in an ignored `.env` on the build host and that build opens on Fabric with the target preset, until the person chooses otherwise. A build from the repository carries none and stays on its saved gateway. Never commit a target, a node ID or a link.
+
+If fabric cannot connect (no grant, member out of reach, no answer within four seconds) the app falls back to the saved gateway and names the route and the reason in Fleet › this connection; a member that refuses the grant is named as a refusal. Turn the fallback off under Fleet › carrier to see fabric fail instead. Fabric is not tried again for thirty seconds after it fails, and a lost connection is redialed three times before the app falls back. Nothing is queued while the bridge is down, and a mutation is never retried over a new connection.
+
+The Debug-only fabric proof (`fabric-proof` links, the separate offline Debug app and its isolated member helper) is unchanged; see [the module](modules/st-fabric/README.md).

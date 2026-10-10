@@ -18438,8 +18438,9 @@ async fn drive_st2_native(
     let mut replacement = DriverReplacement::new();
     let mut binding_watch = ClaudeBindingWatch::default();
     let mut reported_session = None;
-    // Claude's hooks keep the subagent ledger; this driver records it on the seat.
-    let mut subagents = (driver == "claude").then(|| {
+    // Claude's hooks and omp's extension keep the subagent ledger; this driver records it on the
+    // seat.
+    let mut subagents = matches!(driver, "claude" | "omp").then(|| {
         st3::subagents::Publisher::start(
             subject,
             driver,
@@ -20120,7 +20121,7 @@ fn accept_managed_channel_frame(
         let frame_type = frame.get("type").and_then(Value::as_str).unwrap_or("unknown");
         let handled = match frame_type {
             "state" | "session" | "ready" | "delivered" | "read" | "failed" | "todo" => true,
-            "timeline" | "context" | "turn" => observer.is_some(),
+            "timeline" | "context" | "turn" | "subagent" => observer.is_some(),
             // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge — DELETE at contraction — https://app.notion.com/p/OMP-interrupted-ask-resume-bridge-st3-3ede3d41f4a3818a9e37ec160c006bbf
             "delivery_ready" | "retry_pending_ask" | "diagnostic" => true,
             // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
@@ -21411,12 +21412,41 @@ fn codex_continued_thread(argv: &[String]) -> Option<String> {
         .filter(|thread| st3::native_resume::codex_check(argv, thread).is_ok())
 }
 
+/// How the Codex driver learns its person's answer to the approval it waits on: this daemon's
+/// prompt state for the seat, read from the driver's blocking control thread.
+fn codex_prompt_answers(
+    client: &Client,
+    subject: &str,
+) -> st_drivers::session_control::PromptAnswers {
+    let client = client.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let agent = urlencoding::encode(subject).into_owned();
+    st_drivers::session_control::PromptAnswers::new(move |ownership, transition| {
+        let path = format!(
+            "/v1/harness-prompts/state?agent={agent}&ownership={ownership}&transition={transition}"
+        );
+        runtime.block_on(async {
+            // Bounded: the control thread reads Codex's socket between these reads.
+            tokio::time::timeout(
+                Duration::from_millis(500),
+                client.get::<st_drivers::session_control::PromptAnswer>(&path),
+            )
+            .await
+            .ok()?
+            .ok()
+        })
+    })
+}
+
 fn spawn_codex_provider(
+    client: &Client,
+    subject: &str,
     paths: &NativePaths,
     state_dir: &Path,
     argv: &[String],
     start: ProviderStart,
 ) -> tokio::task::JoinHandle<Result<()>> {
+    let prompt_answers = codex_prompt_answers(client, subject);
     let paths = paths.clone();
     let state_dir = state_dir.to_path_buf();
     let argv = argv.to_vec();
@@ -21439,6 +21469,7 @@ fn spawn_codex_provider(
                     paths.runtime_id,
                     argv,
                     paths.delivery_gate,
+                    Some(prompt_answers),
                     thread,
                 )
             }
@@ -21463,6 +21494,7 @@ fn spawn_codex_provider(
                 socket_path,
                 safe_fallback,
                 paths.delivery_gate,
+                Some(prompt_answers),
             ),
             ProviderStart::Adopt(session) => {
                 anyhow::bail!("a Codex driver cannot adopt this provider session: {session:?}")
@@ -21546,7 +21578,7 @@ async fn drive_codex_native(
     ))
         .then(|| codex_continued_thread(&argv))
         .flatten();
-    let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
+    let mut task = spawn_codex_provider(client, subject, &paths, &state_dir, &argv, start);
     let mut reported_session = None;
     // The Codex control pump keeps the subagent ledger; this driver records it on the seat.
     let mut subagents = st3::subagents::Publisher::start(
@@ -21612,7 +21644,7 @@ async fn drive_codex_native(
                     };
                     let _ = replacement.exec(subject, &root, &resume);
                     loop_state = resume.loop_state;
-                    task = spawn_codex_provider(&paths, &state_dir, &argv, ProviderStart::Adopt(session));
+                    task = spawn_codex_provider(client, subject, &paths, &state_dir, &argv, ProviderStart::Adopt(session));
                     completion_announced = false;
                     continue;
                 }
@@ -24907,6 +24939,13 @@ async fn trim_local_observations(store: Arc<Store>, observations: st3::config::O
             Ok(Ok(count)) => eprintln!("st3: trimmed {count} local observations"),
             Ok(Err(error)) => eprintln!("st3: local observation trim failed: {error:#}"),
             Err(error) => eprintln!("st3: local observation trim stopped: {error}"),
+        }
+        // The database target's sample: after the trims, so it counts what they freed.
+        let size_store = store.clone();
+        match tokio::task::spawn_blocking(move || size_store.record_database_size(now_ms())).await {
+            Ok(Ok(size)) => st3::slo::note_database_size(&size),
+            Ok(Err(error)) => eprintln!("st3: database size sample failed: {error:#}"),
+            Err(error) => eprintln!("st3: database size sample stopped: {error}"),
         }
         tokio::time::sleep(LOCAL_OBSERVATION_TRIM_INTERVAL).await;
     }

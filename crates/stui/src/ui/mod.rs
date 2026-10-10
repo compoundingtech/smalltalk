@@ -2292,7 +2292,18 @@ impl Ui {
             }
             Some(Load::Ready(entries)) if entries.is_empty() => {
                 let mut doc = Doc::new();
-                doc.line(Line::from(Span::styled(" No messages yet.", theme::dim())));
+                // A seat still starting has said nothing yet: one calm line, not an empty box.
+                doc.line(Line::from(Span::styled(
+                    if agent.state == AgentState::Starting {
+                        format!(
+                            " {} Starting · the conversation appears as soon as the seat says something.",
+                            self.spinner()
+                        )
+                    } else {
+                        " No messages yet.".to_owned()
+                    },
+                    theme::dim(),
+                )));
                 doc
             }
             Some(Load::Ready(entries)) => {

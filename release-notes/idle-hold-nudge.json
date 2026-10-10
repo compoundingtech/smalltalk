@@ -11,7 +11,7 @@
   },
   "rules": {
     "status": "none",
-    "detail": "Checkpoint rules and their digests are unchanged. The claim registry digest changes with the new kind, as with any vocabulary addition: members on different builds keep replicating claims and skip comparing projection maps until all are upgraded."
+    "detail": "work.nudged is explicitly classified as a durable, replicated work receipt in retention.toml and has no checkpoint drop rule: its history, step presentation and back-off evidence stay in the graph. Checkpoint rules and their digests are unchanged. The claim registry digest changes with the new kind, as with any vocabulary addition: members on different builds keep replicating claims and skip comparing projection maps until all are upgraded."
   },
   "compatibility": {
     "status": "changed",
