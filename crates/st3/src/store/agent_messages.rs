@@ -70,7 +70,18 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
              SELECT DISTINCT subject FROM claims WHERE kind='message.sent';",
         )?;
     }
-    flush(transaction)?;
+    // The older allowance cache can prime all history. New coordination metadata must
+    // still bootstrap in bounded pages rather than piggyback on that legacy rebuild.
+    flush_with_coordination(transaction, filled)?;
+    coordination::initialize(transaction)?;
+    // A corrupt historical body must leave counts incomplete without preventing startup.
+    // Roll back this entire bounded page, including any counts preceding the bad body.
+    transaction.execute_batch("SAVEPOINT coordination_startup")?;
+    if let Err(error) = coordination::backfill(transaction) {
+        transaction.execute_batch("ROLLBACK TO coordination_startup")?;
+        eprintln!("st3: WARN coordination bootstrap remains incomplete: {error}");
+    }
+    transaction.execute_batch("RELEASE coordination_startup")?;
     if !filled {
         transaction.execute(
             "INSERT INTO meta(key,value) VALUES('agent_message_days_v1','1')",
@@ -83,14 +94,17 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
 fn eligible(fields: &Value) -> bool {
     let from = fields["from"].as_str().unwrap_or_default();
     let to = fields["to"].as_str().unwrap_or_default();
-    if !from.starts_with("agent/") || !to.starts_with("agent/") {
-        return false;
-    }
+    from.starts_with("agent/") && to.starts_with("agent/") && !synthetic(fields)
+}
+
+pub(super) fn synthetic(fields: &Value) -> bool {
+    let from = fields["from"].as_str().unwrap_or_default();
+    let to = fields["to"].as_str().unwrap_or_default();
     if [from, to]
         .iter()
         .any(|seat| seat.contains("delivery-probe/") || seat.contains("delivery-soak"))
     {
-        return false;
+        return true;
     }
     if fields["tags"].as_array().is_some_and(|tags| {
         tags.iter().any(|tag| {
@@ -107,7 +121,7 @@ fn eligible(fields: &Value) -> bool {
             )
         })
     }) {
-        return false;
+        return true;
     }
     let title = fields["title"]
         .as_str()
@@ -117,7 +131,7 @@ fn eligible(fields: &Value) -> bool {
     while let Some(rest) = title.strip_prefix("re:") {
         title = rest.trim_start();
     }
-    ![
+    [
         "soak request",
         "soak reply",
         "channel check",
@@ -134,6 +148,10 @@ fn eligible(fields: &Value) -> bool {
 }
 
 pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
+    flush_with_coordination(transaction, true)
+}
+
+fn flush_with_coordination(transaction: &Transaction<'_>, coordination_live: bool) -> Result<()> {
     let pending = transaction
         .prepare_cached("SELECT subject FROM local_agent_message_pending")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -149,9 +167,15 @@ pub(super) fn flush(transaction: &Transaction<'_>) -> Result<()> {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
+        if coordination_live && sent.is_none() {
+            coordination::sync(transaction, &subject, None)?;
+        }
         let desired = sent
             .map(|(at, body)| -> Result<_> {
                 let body: Value = serde_json::from_str(&body)?;
+                if coordination_live {
+                    coordination::sync(transaction, &subject, Some((at, &body["fields"])))?;
+                }
                 Ok(eligible(&body["fields"])
                     .then(|| (at, body["fields"]["to"].as_str().unwrap().to_owned())))
             })

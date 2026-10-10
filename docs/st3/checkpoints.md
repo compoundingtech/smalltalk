@@ -170,8 +170,9 @@ agree on a checkpoint only when they run the same rules. In summary:
 | `resource.observed` written by an observer | subject | the newest |
 | `runtime.action.*` with no actor, `render.applied`, `runtime.readiness-deadline-reached` | subject (and action, incarnation, status) | the newest; only claims dated at least five days before the cut go |
 | `sekret.called`, `sekret.exited`, `sekret.refused`, `sekret.changed` written before they became local observations | subject | the newest; only claims dated at least five days before the cut go |
-| `harness.limits` | none | every claim: the account fold compares readings across seats and reset windows, so a later reading does not replace an earlier one (since rules version 8) |
+| `harness.limits` | subject | the newest; the newest reading the account fold accepts, and any accepted at the same time; every reading measured within an hour of the newest reading of its account group (driver, account, declared account, weekly or five-hour only) across every seat |
 | `harness.todo.observed` | subject | the newest (a rule that predates its description line) |
+| `runtime.reconcile-decision` | subject, decision key | the newest of each key; the reconciler asks whether a key was recorded, reads the newest member-reconcile decision and the subject's newest |
 | `harness.usage`, response rollups | subject, incarnation, model, account, run, step, host | the last snapshot of each UTC hour in the seven days before the cut, the newest snapshot before that window, and the newest of all |
 | `harness.usage`, session cumulative | subject, incarnation | the newest and the last claim of the largest total |
 | `harness.usage`, context occupancy | subject, incarnation | the newest |
@@ -200,6 +201,15 @@ bound session.
 already forgets after seven days. A claim is dropped from the replicated log only when it is at
 least five days older than the cut, and a checkpoint is due two days after its cut, so it is at
 least seven days old by then.
+
+**Why `harness.limits` keeps an hour per account.** The account fold reads, for each account
+group, every reading measured within an hour of the group's newest, and picks the highest weekly
+percentage in the newest reset window among them; it also reads each seat's newest reading to know
+which seats use the account. A group's newest measurement only moves forward, so a reading more
+than an hour older than the newest the sealed set holds is never read again, whatever arrives
+later. Seats report limits every few minutes and repeat them unchanged, so this drops almost all
+of them. Because the answer folds every seat's readings, the proof also compares the account
+limits across the whole fleet, refolded from the copy's claims before and after the drop.
 
 **Why `work.renewed` is not in the table.** It is the case that taught the rules what "witness"
 costs. A late step claim can land between any two lease renewals, so no renewal has a witness that
@@ -282,16 +292,22 @@ second as evidence, the evidence guard would keep that one too.
 
 A stable checkpoint is trimmed in two steps, and a crash between them is safe.
 
-1. **Tombstones, in one transaction.** For every dropped envelope and claim the node records a
-   tombstone: writer, sequence, hash and, for a claim, its ID, subject, kind, actor, predecessors,
-   operation and request digest. It marks the checkpoint `trimming`. The tombstones, not the
-   deleted rows, are now what the node's replication inventory lists for those envelopes.
+1. **Tombstones, in chunks.** The node marks the checkpoint `recording`, then for every dropped
+   envelope and claim records a tombstone: writer, sequence, hash and, for a claim, its ID,
+   subject, kind, actor, predecessors, operation and request digest. Each transaction stops
+   recording after 20 ms (`TRIM_CHUNK_BUDGET`). When every tombstone is recorded it marks the
+   checkpoint `trimming`. The tombstones, not the deleted rows, are now what the node's
+   replication inventory lists for those envelopes; a tombstone and the envelope it stands for
+   have one identity, so the inventory is the same while both exist.
 2. **Deletions, in chunks.** For each dropped envelope the node deletes its claims, their events,
    records, signatures, operations and the envelope row. After the last chunk it marks the
    checkpoint `trimmed`.
 
-A crash leaves either nothing recorded, in which case the next pass starts again, or every
-tombstone recorded with some rows still present, in which case the next pass deletes what is left.
+A crash while the checkpoint is `recording` leaves some tombstones recorded and every row still
+present. A sealed set never reads the tombstones of a checkpoint that is `recording`, so the next
+pass plans exactly the drop it verified, records what is missing (recording a tombstone again
+changes nothing) and goes on. A crash after that leaves every tombstone recorded with some rows
+still present, and the next pass deletes what is left.
 At every point the node's inventory, authority digest and graph are the same, so peers cannot tell a
 node mid-trim from one that has not started.
 
@@ -381,6 +397,22 @@ transaction repeatedly spilled SQLite statement journals and sustained 42–51 M
 writes before the trim even started (#1145). The Linux regression
 `production_history_has_bounded_journal_writes` forces spill with a small cache and bounds the
 setup's write-syscall bytes, without reducing the production-sized trim proof.
+
+## The 2026-10-10 lesson: tombstones in one transaction
+
+The deletions were chunked, but the tombstones still went in one transaction: every dropped
+envelope and claim, recorded while holding the writer. A daily checkpoint drops 100,000 to
+180,000 claims, so that transaction held the writer for seconds every day. Measured on a copy of a
+production member, a rules-15 checkpoint that drops 468,134 claims and 462,689 envelopes held it
+for 53 seconds. Tombstones are now recorded in chunks of 20 ms, like the deletions, under a
+`recording` state that sealed sets ignore, so a crash part way through plans the same drop and
+records the rest. The deletion budget is 20 ms as well: a chunk's commit writes and syncs the
+pages it changed, and on a busy disk that costs more than the chunk. The same trim on the same
+copy then held the writer at a median of 41 ms and a 99th percentile of 229 ms over 33,660
+transactions, with the disk's own sync time included. On that host, at that load, a one-row
+commit took a median of 28 ms and a 99th percentile of 311 ms. The test
+`a_trim_that_stops_anywhere_finishes_the_same_after_a_restart` now also stops part way through
+recording.
 
 ## Where the proof lives
 

@@ -170,7 +170,7 @@ pub async fn run(
                             }
                             let body = body(client, message).await?;
                             let attachments = crate::blobs::materialize_for_seat(client, subject, &agent_dir.join("attachments"), message).await?;
-                            Ok::<_, anyhow::Error>(Some(st_drivers::ding::with_dictation_notice(
+                            Ok::<_, anyhow::Error>(Some(st_drivers::ding::with_tag_notices(
                                 st_drivers::ding::st3_notification_with_attachments(&message.subject, &message.from, &message.to,
                                     message.title.as_deref(), &body, &st_drivers::ding::st3_body_sha256(&body), &attachments), &message.tags)))
                         }.await;

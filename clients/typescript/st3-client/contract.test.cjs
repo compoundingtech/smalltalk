@@ -606,3 +606,23 @@ test('owner content chunk route encodes session identities and retains continuat
     assert.equal(calls.at(-1).init.headers['x-st3-features'], 'custom-subjects.v1, conversation-blocks.v1');
     assert.deepEqual(result.value, chunk);
 });
+
+test('phone observation command retries identical tagged intervals and accepts without snapshot', async () => {
+    const calls = [];
+    const report = {report_id:'019a1234-0000-7000-8000-000000000001',samples:[
+        {kind:'live-share',target:'ios-live-share',carrier:'lan',interval_start:'2026-10-10T15:00:00Z',interval_end:'2026-10-10T15:01:00Z',foreground_ms:10000,live_ms:9900},
+    ]};
+    const client = new St3Client({baseUrl:'https://example.test',credential:()=> 'paired',fetchImpl:async (url,init)=>{
+        calls.push({url,init});
+        return response({api_version:'st3.client.v0',request_id:'request/test',value:{accepted:true}});
+    }});
+    for (let n=0;n<2;n++) {
+        const accepted = await client.observationsReport(report);
+        assert.equal(accepted.value.accepted,true);
+        assert.equal(Object.hasOwn(accepted,'snapshot'),false);
+    }
+    assert.equal(calls[0].url,'https://example.test/v1/client/observations');
+    assert.equal(calls[0].init.headers.Authorization,'Bearer paired');
+    assert.equal(calls[0].init.body,calls[1].init.body);
+    assert.deepEqual(JSON.parse(calls[0].init.body),report);
+});

@@ -26,7 +26,11 @@ pub(super) async fn preview(
             .map_err(ApiError::internal)?;
         let incarnation = actual.as_ref().and_then(|a| a["incarnation_id"].as_str());
         let blocking = match incarnation {
-            _ if manual => Vec::new(),
+            _ if manual => intent.subjects.get(subject)
+                .and_then(|desired| desired.member.as_ref())
+                .and_then(|member| crate::native_resume::rollout_support(member).err())
+                .map(|refusal| vec![refusal.reason])
+                .unwrap_or_default(),
             Some(incarnation) => crate::suspension::blockers(&state.store, subject, incarnation)
                 .map_err(ApiError::internal)?,
             None => vec!["runtime-unknown".into()],

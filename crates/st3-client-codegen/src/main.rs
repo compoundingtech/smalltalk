@@ -678,6 +678,9 @@ fn validate_surfaces(
         "TimelineEntry",
         "TimelinePage",
         "ConversationChanges",
+        "ObservationReport",
+        "ObservationAccepted",
+        "ObservationResponse",
         "PairingBegin",
         "PairingChallenge",
         "PairingComplete",
@@ -710,6 +713,7 @@ fn validate_surfaces(
         validate_model(schema, definition, definition, definition, rust, swift)?;
     }
     for token in [
+        "pub async fn observations_report",
         "pub async fn pairing_begin",
         "pub async fn pairing_complete",
         "pub async fn terminal_stream",
@@ -726,6 +730,7 @@ fn validate_surfaces(
         "func timeline(",
         "cursor: String?",
         "func events(",
+        "func observationsReport(",
         "func beginPairing(",
         "func completePairing(",
         "func terminalScreen(",
@@ -999,6 +1004,7 @@ fn ts_type(value: &Value) -> Result<String> {
         Some("integer" | "number") => "number".into(),
         Some("boolean") => "boolean".into(),
         Some("null") => "null".into(),
+        Some("array") if value.get("prefixItems").is_some() => format!("[{}]", value["prefixItems"].as_array().context("tuple items")?.iter().map(ts_type).collect::<Result<Vec<_>>>()?.join(", ")),
         Some("array") => format!("Array<{}>", ts_type(&value["items"])?),
         Some("object") => ts_object(value)?,
         Some(other) => bail!("unsupported TypeScript schema type `{other}`"),

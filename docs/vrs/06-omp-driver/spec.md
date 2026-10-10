@@ -119,9 +119,16 @@ message / delivered / failed / state / context frames, PROTOCOL constant). Diffe
   acts on an event whose `ctx.agent.kind` is `"sub"`, so a subagent opens no channel, closes none,
   and never receives the seat's mail; the channel stays bound to the top-level session. The one
   frame a subagent sends is `subagent`, on the seat's channel: `start` at `agent_start`,
-  `progress` at `turn_end`, at its messages and tool calls (at most every ten seconds) and every
-  minute while `ctx.isIdle()` is false, and `end` with an outcome at the `agent_end` that does
-  not continue, or at `session_shutdown` before that. st records these as the seat's subagents
+  `progress` at `turn_end` while the run is open, at its messages and tool calls (at most every
+  ten seconds) and every minute while that subagent's live `ctx.isIdle()` is false. Foreground
+  asks and tool approvals keep the run busy. At each heartbeat an idle or unreadable session
+  clears cached waits and stops reporting, even if a matching result or approval resolution
+  was lost. There is no live proof for a detached idle wait, so it follows the silence bound.
+  A late `turn_end` after the end sends nothing. It sends `end` with an outcome at the
+  `agent_end` that does not continue or wait for a person within a busy run, or at
+  `session_shutdown` before that.
+  IDs are limited to 256 UTF-8 bytes (oversized IDs are rejected); names to 128 UTF-8 bytes
+  (oversized names are omitted). st records these as the seat's subagents
   and ends one that has not reported for five minutes (`docs/st3/subagents.md`). omp exposes
   `ctx.agent` from 18.3.2; an earlier build reads as
   top-level.

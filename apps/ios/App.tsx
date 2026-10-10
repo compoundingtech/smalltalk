@@ -10,7 +10,7 @@ import { IBMPlexMono_400Regular } from '@expo-google-fonts/ibm-plex-mono/400Regu
 import { IBMPlexMono_400Regular_Italic } from '@expo-google-fonts/ibm-plex-mono/400Regular_Italic';
 import { IBMPlexMono_600SemiBold } from '@expo-google-fonts/ibm-plex-mono/600SemiBold';
 import { IBMPlexMono_700Bold } from '@expo-google-fonts/ibm-plex-mono/700Bold';
-import { homeRows } from '@smalltalk/st3-views';
+import { openAlerts } from '@smalltalk/st3-views';
 import { FULL_SCREEN, navigationRef, ROOTS, type StackParams, type TabParams } from './navigation';
 import { StoreProvider, useStore } from './store';
 import { parseDevLink, tabLabel, tabNamed, type Tab } from './tabs';
@@ -24,6 +24,7 @@ import { LaunchScreen, MissionScreen, MissionsScreen, NewMissionScreen } from '.
 import { SelectTextScreen } from './screens/SelectText';
 import { TerminalScreen } from './screens/Terminal';
 import { GlassesScreen, SpaceScreen } from './screens/Glasses';
+import { SidebarScreen } from './screens/Sidebar';
 import { FabricProofScreen } from './screens/FabricProof';
 import { parseFabricProofLink, type FabricProofInput } from './fabricProof';
 
@@ -58,12 +59,13 @@ function TabStack({ tab }: { tab: Tab | 'Glasses' }) {
     {tab === 'Glasses'
       ? <Stack.Screen name="GlassesRoot" component={GlassesScreen} options={{ title: 'Spaces' }} />
       : <Stack.Screen name={ROOTS[tab] as keyof typeof ROOT_SCREENS} component={ROOT_SCREENS[ROOTS[tab] as keyof typeof ROOT_SCREENS]} options={{ title: tabLabel(tab) }} />}
+    <Stack.Screen name="Sidebar" component={SidebarScreen} options={{ title: 'Resources' }} />
     <Stack.Screen name="Space" component={SpaceScreen} options={{ title: 'Space' }} />
     <Stack.Screen name="Conversation" component={ConversationScreen} options={{ title: 'Conversation' }} />
     <Stack.Screen name="SelectText" component={SelectTextScreen} options={{ title: 'Select text', presentation: 'formSheet', sheetAllowedDetents: [0.6, 1], sheetGrabberVisible: true }} />
     <Stack.Screen name="Terminal" component={TerminalScreen} options={{ title: 'Terminal', contentStyle: { backgroundColor: theme.crust } }} />
     <Stack.Screen name="Mission" component={MissionScreen} options={{ title: 'Mission' }} />
-    <Stack.Screen name="Attention" component={AttentionScreen} options={{ title: 'Needs you' }} />
+    <Stack.Screen name="Attention" component={AttentionScreen} options={{ title: 'Alert' }} />
     <Stack.Screen name="Launch" component={LaunchScreen} options={{ title: 'Launch' }} />
     <Stack.Screen name="History" component={HistoryScreen} options={{ title: 'Past sessions' }} />
     <Stack.Screen name="NewMission" component={NewMissionScreen} options={{ title: 'New mission', presentation: 'modal' }} />
@@ -86,7 +88,7 @@ function tabBarHidden(route: RouteProp<TabParams>): boolean {
 
 function Main({ proofSession = false }: { proofSession?: boolean }) {
   const { pairDraft, credential, url, order, data, caps, actions, setTreeView, requestScroll, glassesOn } = useStore();
-  const homeCount = homeRows(data.attention, caps?.session_actor).filter(row => !row.item.closedElsewhere).length;
+  const homeCount = openAlerts(data.attention, caps?.session_actor).length;
   const paired = !!url && !!credential;
 
   // Debug-only deep links for simulator checks; disabled in Release.

@@ -2449,6 +2449,9 @@ impl UsageBy {
 
 #[derive(Args)]
 struct UsageArgs {
+    /// Count coordination messages only, without token usage or message bodies (JSON output).
+    #[arg(long)]
+    messages_only: bool,
     /// Length of the period ending now.
     #[arg(long, default_value_t = 24)]
     hours: u64,
@@ -4201,8 +4204,11 @@ enum MessageCommand {
     /// Send one durable normalized message to an agent.
     ///
     /// A message is a direct connection: it wakes the recipient agent for a full turn,
-    /// which rereads its context. People have no inbox: a send or reply to a person fails.
-    /// To reach a person, print in the chat.
+    /// which rereads its context. Use `--kind wake` (the default) for a question, answer or conversational handoff, `st work handoff` for work, and `--kind silent` for anything
+    /// else, which wakes nobody and reaches the recipient at its next turn. Status goes to
+    /// `work progress` (it lands in the graph and wakes nobody), run events to report-to.
+    /// People have no inbox: a send or reply to a person fails. To reach a person, print in
+    /// the chat.
     Send(MessageSendArgs),
     /// List the current mailbox for one explicit identity.
     Ls(MessageListArgs),
@@ -4214,7 +4220,7 @@ enum MessageCommand {
     /// Reply to one canonical message ID while preserving its thread.
     ///
     /// A message is a direct connection: it wakes the recipient agent for a full turn,
-    /// which rereads its context.
+    /// which rereads its context. A reply that only acknowledges or reports is `--kind silent`.
     Reply(MessageReplyArgs),
     /// Close exact messages after their related action is complete.
     Archive(MessageArchiveArgs),
@@ -4298,6 +4304,8 @@ struct MessageSendArgs {
     /// member and fetched by the machine that reads or delivers the message.
     #[arg(long = "attach", value_name = "FILE")]
     attach: Vec<PathBuf>,
+    #[command(flatten)]
+    wake: MessageWakeArgs,
     /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
@@ -4306,6 +4314,31 @@ struct MessageSendArgs {
     /// the message already sent instead of sending it twice.
     #[arg(long)]
     idempotency_key: Option<String>,
+}
+
+/// Whether a message wakes its recipient. A person's message, a handoff, a fault, a ready step
+/// and a gh watch event always wake it.
+#[derive(Args)]
+struct MessageWakeArgs {
+    /// Wake the recipient (default), or hold unread mail for its next real turn.
+    #[arg(long, value_parser = ["silent", "wake"], default_value = "wake")]
+    kind: String,
+}
+
+impl Default for MessageWakeArgs {
+    fn default() -> Self {
+        Self {
+            kind: "wake".into(),
+        }
+    }
+}
+
+impl MessageWakeArgs {
+    fn tags(&self) -> impl Iterator<Item = String> {
+        (self.kind == "silent")
+            .then(|| st3::silent::SILENT_TAG.to_owned())
+            .into_iter()
+    }
 }
 
 #[derive(Args)]
@@ -4354,6 +4387,8 @@ struct MessageReplyArgs {
     /// Attach an image (PNG, JPEG, GIF or WebP, at most 10 MiB, up to 4).
     #[arg(long = "attach", value_name = "FILE")]
     attach: Vec<PathBuf>,
+    #[command(flatten)]
+    wake: MessageWakeArgs,
     /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
@@ -4660,6 +4695,17 @@ fn main() -> ExitCode {
         st_drivers::reexec::unblock_stop_signals();
     }
     let arguments = std::env::args_os().collect::<Vec<_>>();
+    if let Some(stui) = bare_st_opens(
+        arguments.len(),
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        std::env::var_os("ST_AGENT").is_some(),
+        std::env::var_os("PATH").as_deref(),
+    ) {
+        use std::os::unix::process::CommandExt as _;
+        // Only returns when stui could not start; the help below is the fallback.
+        let error = std::process::Command::new(stui).exec();
+        eprintln!("st: stui did not start ({error}); here is the help instead");
+    }
     if cli_help::all_help_requested(&arguments) {
         print!("{}", cli_help::root_help(true));
         return ExitCode::SUCCESS;
@@ -4699,6 +4745,22 @@ fn main() -> ExitCode {
         cli,
         matches.subcommand_name().expect("a subcommand was parsed"),
     )
+}
+
+/// Bare `st` on a person's terminal opens stui, found on PATH; scripts, pipes and agent seats
+/// keep the help. `None` means print the help.
+fn bare_st_opens(
+    argument_count: usize,
+    interactive: bool,
+    in_seat: bool,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if argument_count != 1 || !interactive || in_seat {
+        return None;
+    }
+    std::env::split_paths(path?)
+        .map(|directory| directory.join("stui"))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Export the runtime fence before any provider or runtime worker thread starts. Fresh
@@ -5801,6 +5863,30 @@ fn select_private_gateway(
 }
 
 #[cfg(test)]
+mod bare_st_tests {
+    use super::*;
+
+    #[test]
+    fn bare_st_opens_stui_only_for_a_person_on_a_terminal_with_stui_on_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let stui = directory.path().join("stui");
+        std::fs::write(&stui, "").unwrap();
+        let path = std::env::join_paths([directory.path()]).unwrap();
+        let path = Some(path.as_os_str());
+        assert_eq!(bare_st_opens(1, true, false, path), Some(stui));
+        // A subcommand or flag, a pipe or script, and an agent seat keep their behavior.
+        assert_eq!(bare_st_opens(2, true, false, path), None);
+        assert_eq!(bare_st_opens(1, false, false, path), None);
+        assert_eq!(bare_st_opens(1, true, true, path), None);
+        // Without stui on PATH the help is printed.
+        let empty = tempfile::tempdir().unwrap();
+        let none = std::env::join_paths([empty.path()]).unwrap();
+        assert_eq!(bare_st_opens(1, true, false, Some(none.as_os_str())), None);
+        assert_eq!(bare_st_opens(1, true, false, None), None);
+    }
+}
+
+#[cfg(test)]
 mod private_gateway_tests {
     use super::*;
 
@@ -6120,6 +6206,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let _contention_retry = retry_projection_contention(Arc::downgrade(&store), notify.clone(), event_notify.clone(), config.state_dir.clone());
     tokio::spawn(convert_envelope_payloads(store.clone()));
     tokio::spawn(migrate_event_payloads(store.clone()));
+    tokio::spawn(catch_up_coordination_counts(store.clone()));
     spawn_response_expiry(store.clone());
     tokio::spawn(trim_local_observations(
         store.clone(),
@@ -9646,10 +9733,15 @@ async fn run_usage(client: &Client, args: UsageArgs, json_output: bool) -> Resul
     anyhow::ensure!(args.hours > 0, "usage hours must be positive");
     let until = current_unix_ms()? as u64;
     let since = until.saturating_sub(args.hours.saturating_mul(3_600_000));
+    let path = if args.messages_only {
+        "/v1/usage/messages"
+    } else {
+        "/v1/usage"
+    };
     let report: Value = client
-        .get(&format!("/v1/usage?since_ms={since}&until_ms={until}"))
+        .get(&format!("{path}?since_ms={since}&until_ms={until}"))
         .await?;
-    if json_output {
+    if json_output || args.messages_only {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
@@ -15329,6 +15421,7 @@ async fn run_attention(
                     tags: Vec::new(),
                     from: actor,
                     attach: Vec::new(),
+                    wake: MessageWakeArgs::default(),
                     print_kdl: false,
                     idempotency_key: args.idempotency_key,
                 },
@@ -16566,6 +16659,7 @@ async fn run_message(
                     in_reply_to: Some(original.subject),
                     tags: Vec::new(),
                     from: args.from,
+                    wake: args.wake,
                     print_kdl: args.print_kdl,
                     idempotency_key: args.idempotency_key,
                 },
@@ -16811,6 +16905,15 @@ async fn send_message(
     st3::model::refuse_person_recipient(&to).map_err(|error| anyhow::anyhow!(error.message))?;
     reject_foreign_agent_actor(&args.from)?;
     let from = normalize_message_subject(&args.from);
+    let mut args = args;
+    if args.wake.kind == "wake" && args.tags.iter().any(|tag| tag == st3::silent::SILENT_TAG) {
+        anyhow::bail!("wake messages cannot carry the silent delivery tag; use --kind silent");
+    }
+    for tag in args.wake.tags() {
+        if !args.tags.contains(&tag) {
+            args.tags.push(tag);
+        }
+    }
     let kdl = message_mission_intent(
         &mission_id,
         &id,
@@ -16848,7 +16951,10 @@ async fn send_message(
             if let Some(previous) = hour.checked_sub(1) {
                 let previous = derived_message_key(&request, incarnation.as_deref(), previous);
                 match client.sent_message(&previous).await {
-                    Ok(Some(receipt)) => return Ok(Some(receipt)),
+                    Ok(Some(receipt)) => {
+                        warn_unconfirmed_silent(&request, &receipt);
+                        return Ok(Some(receipt));
+                    }
                     Ok(None) => {}
                     // A daemon from before the lookup has no such route. Its sends still repeat
                     // only within the hour.
@@ -16865,8 +16971,25 @@ async fn send_message(
         }
     };
     match client.send_message(&request).await {
-        Ok(receipt) => Ok(Some(receipt)),
+        Ok(receipt) => {
+            warn_unconfirmed_silent(&request, &receipt);
+            Ok(Some(receipt))
+        }
         Err(error) => Err(message_send_error(error, &request.idempotency_key)),
+    }
+}
+
+fn warn_unconfirmed_silent(request: &MessageSendRequest, receipt: &MessageSendReceipt) {
+    if request.from.starts_with("agent/")
+        && request
+            .tags
+            .iter()
+            .any(|tag| tag == st3::silent::SILENT_TAG)
+        && receipt.kind.as_deref() != Some("silent")
+    {
+        eprintln!(
+            "st: daemon did not confirm silent holding; this message may wake its recipient. Upgrade the sender and recipient owner daemons."
+        );
     }
 }
 
@@ -20085,7 +20208,7 @@ fn pi_family_message_frame(
     json!({
         "type": "message",
         "deliverAs": "steer",
-        "content": st_drivers::ding::with_dictation_notice(st_drivers::ding::st3_notification_with_attachments(
+        "content": st_drivers::ding::with_tag_notices(st_drivers::ding::st3_notification_with_attachments(
             &message.subject,
             &message.from,
             &message.to,
@@ -20093,7 +20216,7 @@ fn pi_family_message_frame(
             body,
             &st_drivers::ding::st3_body_sha256(body),
             attachments,
-        ), &message.tags),
+        ), &message.tags.iter().filter(|tag| tag.as_str() != st3::silent::SILENT_TAG || st3::silent::is_held(message)).cloned().collect::<Vec<_>>()),
         "meta": {
             "from": message.from,
             "messageId": message.subject,
@@ -20556,6 +20679,7 @@ async fn run_pi_channel(
                     subscription.report(serde_json::from_str(&report)?);
                 }
                 let mut cursor = None;
+                let mut pending_silent = Vec::new();
                 loop {
                     let page = if subscription.is_some() {
                         MessagePage { items: pushed_messages.clone(), has_more: false, next_cursor: None, limit: pushed_messages.len() }
@@ -20578,7 +20702,9 @@ async fn run_pi_channel(
                     }
                     // A prior incarnation's handoff is not proof that the model consumed mail.
                     // The incarnation-local set survives channel reexec and prevents repeats here.
-                    for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered")) {
+                    let mut items = page.items;
+                    st3::silent::release_page(&mut items, &mut pending_silent);
+                    for message in items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered")) {
                     if state.retry_after_ms.get(&message.subject).is_some_and(|after|
                         current_unix_ms().unwrap_or_default() < u128::from(*after)) {
                         continue;
@@ -23182,6 +23308,16 @@ fn native_queued_message(
         ),
     ];
     tags.extend(
+        view.tags
+            .iter()
+            .filter(|tag| {
+                (tag.as_str() == st3::silent::SILENT_TAG && st3::silent::is_held(view))
+                    || tag.as_str() == "dictated"
+                    || tag.starts_with(st3::silent::REMAINING_PREFIX)
+            })
+            .cloned(),
+    );
+    tags.extend(
         attachments
             .iter()
             .map(st_drivers::ding::AttachmentNotice::to_tag),
@@ -23420,6 +23556,7 @@ async fn forward_projected_messages_reporting(
     }?;
     let mut cursor = None;
     let mut failures = Vec::new();
+    let mut pending_silent = Vec::new();
     loop {
         let page = message_page_reporting(
             client,
@@ -23429,7 +23566,10 @@ async fn forward_projected_messages_reporting(
             if cursor.is_none() { report } else { None },
         )
         .await?;
-        for message in page.items {
+        let mut items = page.items;
+        // Held mail goes to the seat only beside a message that wakes it.
+        st3::silent::release_page(&mut items, &mut pending_silent);
+        for message in items {
             active_subjects.insert(message.subject.clone());
             if matches!(message.status.as_str(), "read" | "closed") {
                 consumed_by_recipient.insert(message.subject);
@@ -24419,6 +24559,27 @@ async fn convert_envelope_payloads(store: Arc<Store>) {
             Ok(Ok(_)) => tokio::time::sleep(Duration::from_millis(50)).await,
             error => {
                 eprintln!("st3: binary envelope conversion failed: {error:?}");
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    }
+}
+
+/// Exactly one awaited bootstrap job, then a pause longer than the writer's batch window.
+/// This never wakes a seat and stops once historical count metadata is complete.
+async fn catch_up_coordination_counts(store: Arc<Store>) {
+    loop {
+        let page_store = store.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            st3::profile::task("task coordination-counts-catch-up", || {
+                page_store.advance_coordination_counts()
+            })
+        }).await;
+        match result {
+            Ok(Ok(true)) => return,
+            Ok(Ok(false)) => tokio::time::sleep(Duration::from_millis(100)).await,
+            error => {
+                eprintln!("st3: coordination count bootstrap failed: {error:?}");
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
         }
@@ -25760,6 +25921,39 @@ mod tests {
             )
         );
         assert_eq!(omp["meta"]["messageId"], "message/0123456789abcdef");
+    }
+
+    #[test]
+    fn native_push_preserves_delivery_notices_and_person_signatures() {
+        let mut view = MessageView {
+            subject: "message/notice".into(),
+            from: "agent/example/writer".into(),
+            to: "agent/example/reader".into(),
+            content: "body".into(),
+            status: "sent".into(),
+            title: None,
+            in_reply_to: None,
+            tags: vec![
+                st3::silent::SILENT_TAG.into(),
+                "dictated".into(),
+                format!("{}12", st3::silent::REMAINING_PREFIX),
+            ],
+            attachments: vec![],
+            created_index: 1,
+        };
+        let queued = native_queued_message(&view, "body".into(), &[]);
+        let rendered = st_drivers::ding::with_tag_notices("body".into(), &queued.tags);
+        assert!(rendered.contains("silent: held"));
+        assert!(rendered.contains("12 older silent held; st conversations ls"));
+        assert!(rendered.contains("dictated by voice"));
+        assert_eq!(queued.body, "body");
+        view.from = "person/operator".into();
+        let queued = native_queued_message(&view, "body".into(), &[]);
+        assert!(!queued.tags.iter().any(|tag| tag == st3::silent::SILENT_TAG));
+        assert!(
+            view.tags.iter().any(|tag| tag == st3::silent::SILENT_TAG),
+            "signed durable tags are unchanged"
+        );
     }
 
     #[test]
@@ -28094,6 +28288,7 @@ mod tests {
             tags: Vec::new(),
             from: "agent/example/worker".into(),
             attach: Vec::new(),
+            wake: MessageWakeArgs::default(),
             print_kdl: false,
             idempotency_key: Some("refuse-a-person".into()),
         };

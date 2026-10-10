@@ -74,6 +74,7 @@
     {"id": "glasses.get", "method": "GET", "path": "/v1/client/glasses/{id}", "response": "Glass", "scope": "read.glasses"}
   ],
   "commands": [
+    {"id": "observations.report", "method": "POST", "path": "/v1/client/observations", "request": "ObservationReport", "response": "ObservationResponse", "authentication": "paired-session", "max_request_bytes": 65536, "durable_receipt": false, "replicated": false, "snapshot_fence": false},
     { "id": "action.submit", "method": "POST", "path": "/v1/client/actions", "request": "ActionRequest", "response": "ActionResult" },
     { "id": "pairing.begin", "method": "POST", "path": "/v1/client/pairings", "request": "PairingBegin", "response": "PairingChallenge", "local_only": true },
     { "id": "pairing.complete", "method": "POST", "path": "/v1/client/pairings/{id}/complete", "request": "PairingComplete", "response": "PairedSession" },
@@ -90,7 +91,7 @@
     "review.reject": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.request-changes": { "capability": "control.attention", "parameters": "TargetParameters" },
     "attention.resolve": { "capability": "control.attention", "parameters": "AttentionResolveParameters" },
-    "message.send": { "capability": "control.messages", "parameters": "MessageSendParameters" },
+    "message.send": { "capability": "control.messages", "parameters": "MessageSendParameters", "description": "Message kind is silent or wake (default). Silent stays unread and is offered in capped batches at the next wake. Replies default to wake independently of their parent. Person and system wake events always wake. Signed silent messages carry st3-silent in signed tags. Old daemons ignore the kind field and do not hold silent mail; upgrade all owner daemons before relying on silent delivery. Raw send/by-key receipts confirm the accepted kind; unfamiliar tags alone do not confirm holding." },
     "message.read": { "capability": "control.messages", "parameters": "TargetParameters" },
     "message.close": { "capability": "control.messages", "parameters": "TargetParameters" },
     "launch.create": { "capability": "control.launches", "parameters": "LaunchCreateParameters" },

@@ -188,6 +188,7 @@ impl Runtime for SmalltalkRuntime {
         resources::create_schema(connection)?;
         custom::create_schema(connection)?;
         agent_messages::create_schema(connection)?;
+        coordination::create_schema(connection)?;
         glass_heads::create_schema(connection)?;
         directive_notes::create_schema(connection)?;
         limits::create_limits_schema(connection)?;
@@ -423,6 +424,10 @@ impl Runtime for SmalltalkRuntime {
         cut: u128,
     ) -> Result<Value> {
         checkpoint_rules::subject_answers(connection, subject, cut)
+    }
+
+    fn checkpoint_global_answers(&self, transaction: &Transaction<'_>) -> Result<Option<Value>> {
+        checkpoint_rules::global_answers(transaction).map(Some)
     }
 
     fn checkpoint_subject_answers_with_sources(

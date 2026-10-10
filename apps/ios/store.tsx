@@ -3,8 +3,9 @@ import { AppState } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, notApplied, outcomeUnknown, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
-import { keepClosed, personAnswer, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
+import { submitAnswer } from './answer';
+import { API_VERSION, ClientError, St3Client, isTransient, notApplied, outcomeUnknown, plainError, retryTransient, type Arrangement, type Runtime, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { keepClosed, personAnswer, promptAnswers, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
 import app from './app.json';
 import { canVerifyPairing, createDeviceKey, removeDeviceKey, signWithDeviceKey, verifyGrantSignature } from './modules/st-device-key';
 import { REPAIR_WARNING, validatePairingTrust, verifyPairing } from './pairingProof';
@@ -23,6 +24,7 @@ import type { FabricProfile } from './fabricProof';
 import { gatewayFetch } from './gatewayFetch';
 import { normalizeGatewayUrl } from './gatewayUrl';
 import { tabOrder, type Tab } from './tabs';
+import type { SidebarResource } from './sidebarView';
 import { fetch as expoFetch } from 'expo/fetch';
 import { decodeBase64, encodeBase64, type Picked } from './images';
 
@@ -125,8 +127,11 @@ function useAppStore(proof?: FabricProfile) {
   // Spaces are how stui works, so the tab is on unless this phone turned it off.
   const [glassesOn, setGlassesOn] = useState(true);
   const [simpleOn, setSimpleOn] = useState(true);
+  const [arrangements, setArrangements] = useState<Arrangement[]>([]), [arrangementsIssue, setArrangementsIssue] = useState('');
+  const [sidebarTerminals, setSidebarTerminals] = useState<Runtime[]>([]), [sidebarTerminalsIssue, setSidebarTerminalsIssue] = useState('');
   const [glasses, setGlasses] = useState<Glass[]>([]), [glassesIssue, setGlassesIssue] = useState('');
   const [scrollRequest, setScrollRequest] = useState<{ y: number; at: number } | null>(null);
+  const sidebarSeen = useRef(new Map<string, SidebarResource>());
   const cachedActor = useRef(''), cacheSavedAt = useRef(0), cacheGeneration = useRef(0);
   const conversationCache = useRef(new Map<string, Conversation<TimelineEntry>>()), draftCache = useRef(new Map<string, string>());
   // Images messages carry, as data URIs, so a conversation scrolled back to does not read them again.
@@ -258,8 +263,10 @@ function useAppStore(proof?: FabricProfile) {
   }, [proof?.url, proof?.credential]);
 
   function clearCaches() {
+    sidebarSeen.current.clear();
     cachedActor.current = ''; cacheSavedAt.current = 0;
     conversationCache.current.clear(); draftCache.current.clear(); missionDetailCache.current.clear();
+    setArrangements([]); setArrangementsIssue(''); setSidebarTerminals([]);
     setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null);
   }
   async function clearCachedProjection() { cacheGeneration.current++; clearCaches(); if (!proof) await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
@@ -352,6 +359,23 @@ function useAppStore(proof?: FabricProfile) {
   // Glasses: followed on the feed's socket while the experiment is on and the gateway grants them.
   useEffect(() => { void AsyncStorage.getItem(GLASSES_KEY).then(value => setGlassesOn(value !== '0')).catch(() => {}); }, []);
   useEffect(() => { void AsyncStorage.getItem(SIMPLE_KEY).then(value => setSimpleOn(value !== '0')).catch(() => {}); }, []);
+  const arrangementPerson = caps?.session_actor.match(/^person\/[^/]+/)?.[0];
+  const arrangementsGranted = caps?.capabilities.some(capability => capability.id === 'arrangements' && capability.version >= 1 && capability.state === 'granted') ?? false;
+  useEffect(() => {
+    if (!feed || !arrangementsGranted || !arrangementPerson) { setArrangements([]); setArrangementsIssue(''); return; }
+    const follow = feed.followArrangements(arrangementPerson, { onArrangements: setArrangements, onIssue: setArrangementsIssue });
+    return () => follow.close();
+  }, [feed, arrangementPerson, arrangementsGranted]);
+  const loadSidebarTerminals = useCallback(async () => {
+    if (!client) return;
+    const generation = cacheGeneration.current;
+    try {
+      const result = await listCollectionPages(options => client.terminalsList({ ...options, history: false }), 200);
+      if (generation !== cacheGeneration.current) return;
+      setSidebarTerminals(result.pages.flatMap(page => page.value.items.filter((item): item is Runtime => item.kind === 'runtime' && !!item.terminal_id)));
+      setSidebarTerminalsIssue(result.truncated ? 'More terminals exist beyond this window.' : '');
+    } catch (error) { if (generation === cacheGeneration.current) setSidebarTerminalsIssue(errorText(error)); }
+  }, [client]);
   // Version 1 glasses are splits of tab groups; an earlier member's glasses are a shape this app no longer reads.
   const glassesGranted = caps?.capabilities.some(capability => capability.id === 'glasses' && capability.version >= 1 && capability.state === 'granted') ?? false;
   useEffect(() => {
@@ -525,7 +549,25 @@ function useAppStore(proof?: FabricProfile) {
       acted.current.add(item.id);
       const typed = personAnswer(item.request, answer, summary);
       if (typeof typed === 'string') { setError(typed); return false; }
-      return runAction(async () => { const id = actionId(); return client.workDone({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }); });
+      if (status !== 'online' || (proof && !proof.ready)) { setError('Still connecting; try again in a moment.'); return false; }
+      setBusy(true);
+      try {
+        // An answer that landed is an answer, however the reply came back (Cos, 2026-10-10: the app
+        // said it failed for a decision that was recorded, and Nathan answered it again).
+        const outcome = await submitAnswer({
+          build: async () => { const id = actionId(); return { id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id, episode: item.episode || item.revision, summary, ...(typed ? { answer: typed } : {}) } }; },
+          send: request => client.workDone(request),
+          stillWaiting: async () => {
+            try { const current = (await client.attentionGet(item.id)).value; return current.kind !== 'attention' || current.state === 'open'; }
+            catch (e) { if (e instanceof ClientError && e.response.code === 'not-found') return false; throw e; }
+          },
+          wait: ms => new Promise(resolve => setTimeout(resolve, ms)),
+        });
+        if (!outcome.ok) { setError(errorText(outcome.error)); return false; }
+        setError('');
+        await loadLists([]);
+        return true;
+      } finally { setBusy(false); }
     },
     /** Clear an item st closed: only the person's own word removes it from Home. */
     clearClosed(id: string) {
@@ -537,6 +579,14 @@ function useAppStore(proof?: FabricProfile) {
       if (!client) return false;
       acted.current.add(item.id);
       return runAction(async () => { const id = actionId(); return client.messageRead({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id } }); });
+    },
+    /** Answer a Claude permission prompt from its alert. Only the prompt still waiting is answered, once; an answer in the terminal wins. */
+    async respondPrompt(item: Attention, answer: 'allow' | 'deny') {
+      if (!client) return false;
+      const prompt = promptAnswers(item);
+      if (!prompt || !prompt.answers.includes(answer)) { setError('This prompt cannot be answered here. Answer it in the terminal.'); return false; }
+      acted.current.add(item.id);
+      return runAction(async () => { const id = actionId(); return client.promptRespond({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: prompt.target_id, episode: prompt.episode, answer } }); });
     },
     /** An image a message carries, as a data URI; st reads it from the member that has it. */
     image(image: { sha256: string; message: string; mediaType: string }): Promise<string> {
@@ -725,6 +775,7 @@ function useAppStore(proof?: FabricProfile) {
     treeView, setTreeView, scrollRequest, requestScroll: (y: number) => setScrollRequest({ y, at: Date.now() }),
     glassesOn, glassesGranted, glasses, glassesIssue, simpleOn,
     carrierInfo: { choice: carrierChoice, built: fabricBuilt, target: fabricTarget, fallback: fallbackOn, route: selected.route, routeText: routeLabel(selected.route), pending: selected.pending, issue: selected.issue, fabric: fabricSnapshot, node: fabricNode, path: fabricPath },
+    sidebarSeen, arrangements, arrangementsIssue, sidebarTerminals, sidebarTerminalsIssue, loadSidebarTerminals,
   };
 }
 

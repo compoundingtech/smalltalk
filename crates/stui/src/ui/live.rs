@@ -204,6 +204,7 @@ enum Fetched {
     Sessions(Collection),
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
+    Terminals(Vec<super::resource_sidebar::ResourceRow>, bool),
     /// Token spend over a period of this many hours, or why st could not say.
     Usage(u64, Result<st3_client::UsagePeriod, String>),
     /// The clients connected to this member, or why they could not be read.
@@ -323,6 +324,8 @@ pub fn run(context: Context) -> Result<()> {
     let mut pending: Vec<Pending> = Vec::new();
     let mut ui = Ui::new(adapt::world(&model, &person, &extras));
     ui.load_prefs();
+    if glass.is_some() { ui.resource_sidebar.load(&person); }
+    ui.resource_sidebar.observe(&ui.world);
     ui.build = true;
     ui.live = true;
     ui.glasses = glass.map(|name| {
@@ -440,6 +443,18 @@ pub fn run(context: Context) -> Result<()> {
                     body_requested.clear();
                     changed = true;
                 }
+                feed::Update::Window { window: Window::Arrangements, items, .. } => {
+                    ui.resource_sidebar.arrangements = items.into_iter().filter_map(|item| match item {
+                        Resource::Arrangement(arrangement) if arrangement.owner == person && !arrangement.deleted => Some(arrangement),
+                        _ => None,
+                    }).collect();
+                    if ui.resource_sidebar.arrangements.iter().any(|a| a.body.folders.values().any(|folder| folder.tombstone.is_none()))
+                        && let Some(glasses) = ui.glasses.as_mut()
+                        && !glasses.sidebar.configured {
+                        glasses.sidebar.shown = true;
+                    }
+                    changed = true;
+                }
                 feed::Update::Window {
                     window: Window::Glasses,
                     items,
@@ -495,7 +510,7 @@ pub fn run(context: Context) -> Result<()> {
                             extras.missions_followed = true;
                         }
                         Window::Agents => model.agents = collection,
-                        Window::Glasses | Window::Summary => {}
+                        Window::Glasses | Window::Summary | Window::Arrangements => {}
                     }
                     extras.live = true;
                     extras.offline = None;
@@ -681,6 +696,10 @@ pub fn run(context: Context) -> Result<()> {
                     machines_reading = false;
                     ui.flash(format!("Could not load machines: {why}"));
                 }
+                Fetched::Terminals(rows, has_more) => {
+                    ui.resource_sidebar.terminals = rows;
+                    ui.resource_sidebar.terminals_has_more = has_more;
+                }
                 Fetched::Older {
                     target,
                     session_id,
@@ -817,6 +836,20 @@ pub fn run(context: Context) -> Result<()> {
                 }
             }
             shown_tab = tab;
+            let terminal_client = client.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                if let Ok(reply) = terminal_client.terminals_list(None, Some(200), false).await {
+                    let has_more = reply.value.page.has_more;
+                    let rows = reply.value.items.into_iter().filter_map(|item| match item {
+                        Resource::Runtime(runtime) => runtime.terminal_id.map(|terminal| super::resource_sidebar::ResourceRow {
+                            id: runtime.header.id, kind: "Terminals".into(), title: runtime.owner_id, open: terminal, missing: false,
+                        }),
+                        _ => None,
+                    }).collect();
+                    let _ = tx.send(Fetched::Terminals(rows, has_more));
+                }
+            });
             if tab == 1 || model.sessions.snapshot.is_none() {
                 let client = client.clone();
                 let tx = fetched_tx.clone();
@@ -1366,6 +1399,7 @@ pub fn run(context: Context) -> Result<()> {
         ui.step_voice();
         ui.step_terminal_hold();
         ui.step_default_view();
+        ui.step_terminal_tabs();
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         let mut links = Vec::new();
         terminal.draw(|frame| {
@@ -2270,6 +2304,7 @@ async fn send_message(
         in_reply_to,
         session_id,
         tags,
+        kind: st3_client::MessageKind::Wake,
         attachments,
         signature: None,
     };

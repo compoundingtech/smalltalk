@@ -21,6 +21,9 @@
 //! list that answers ten times more rows may read ten times more, and a request that answers the
 //! same must read about the same. Small differences under [`SLACK`] steps pass.
 //!
+//! Additive work/mission `progress_at` serialization uses timestamps already hydrated by these
+//! routes; lightweight mission cards return null and do not add summary reads.
+//!
 //! It covers every route the daemon serves: each is measured or listed in [`NOT_MEASURED`] with
 //! the reason, and a new route fails the check until it is one or the other. Beyond the routes it
 //! measures replication receive and export as the replication worker calls them, and the deletes
@@ -90,6 +93,7 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
 /// Routes the check does not measure, and why. Keep this list short: a route here can grow with
 /// the store unnoticed.
 const NOT_MEASURED: &[(&str, &str)] = &[
+    ("POST /v1/client/observations", "requires a current paired session; bounded diagnostic memory and blocking JSONL, no Store mutation; real paired transport/unchanged-index controls in api/client_observations.rs"),
     // A Claude permission hook's or Codex driver's approval poll: one indexed newest-claim read
     // and one operation lookup.
     (
@@ -718,6 +722,7 @@ const PROBES: &[Probe] = &[
     get("GET /v1/claims", "/v1/claims?limit=100"),
     get("GET /v1/claims/by-id/{id}", "/v1/claims/by-id/{claim}"),
     get("GET /v1/usage", "/v1/usage"),
+    get("GET /v1/usage/messages", "/v1/usage/messages"),
     get("GET /v1/reviews", "/v1/reviews"),
     get("GET /v1/attention", "/v1/attention"),
     get(
@@ -1559,6 +1564,57 @@ fn the_cost_check_covers_every_route() {
         "add a probe to PROBES in tests/daemon_cost.rs, or a reason to NOT_MEASURED, for each \
          of {uncovered:?}"
     );
+}
+
+#[test]
+fn coordination_bootstrap_work_is_bounded_independently_of_history_size() {
+    let mut samples = Vec::new();
+    for retained in [100, 1000] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("graph.db");
+        let store = Store::open(&path, "cost-node").unwrap();
+        for n in 0..retained {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/history-{n}"),
+                    kind: "message.sent".into(),
+                    actor: Some("agent/example/writer".into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), json!("sent")),
+                        ("from".into(), json!("agent/example/writer")),
+                        ("to".into(), json!("agent/example/reader")),
+                        ("content".into(), json!("metadata fixture")),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let setup = rusqlite::Connection::open(&path).unwrap();
+        setup.execute("DELETE FROM coordination_sends", []).unwrap();
+        setup
+            .execute(
+                "UPDATE local_coordination_backfill SET cursor=0,ceiling=?1,complete=0",
+                [store.index().unwrap()],
+            )
+            .unwrap();
+        drop(setup);
+        let before = work::total();
+        assert!(!store.advance_coordination_counts().unwrap());
+        let spent = work::total() - before;
+        let (cursor, ceiling, complete, _) = store.coordination_backfill_status().unwrap();
+        assert!((1..=8).contains(&cursor), "bounded cursor: {cursor}");
+        assert_eq!(ceiling, retained as u64);
+        assert!(!complete);
+        samples.push(spent);
+    }
+    println!(
+        "coordination bootstrap 100 -> 1000 sends: {:?} -> {:?}",
+        samples[0], samples[1]
+    );
+    assert!(samples[1].vm_steps <= samples[0].vm_steps * 2 + SLACK);
+    assert!(samples[1].fullscan_steps <= samples[0].fullscan_steps + 8);
 }
 
 /// `METHOD /path` for every `.route(...)` in the router's source.

@@ -27,7 +27,11 @@ use smallclaims::store::checkpoint::*;
 /// Version 12 ages out the sekrets claims written before they became local observations.
 /// Version 13 retains status transitions selected by the reader after filtering stamped heartbeats.
 /// Version 14 retains the predecessor of each incarnation's first visible status transition.
-pub const RULES_VERSION: u32 = 14;
+/// Version 15 drops `harness.limits` readings the account fold can no longer read: those more
+/// than an hour older than their account group's newest, other than each seat's newest. The
+/// proof compares the account fold across every seat. It also keeps only the newest
+/// `runtime.reconcile-decision` of each decision key.
+pub const RULES_VERSION: u32 = 15;
 
 /// Usage rollups keep their hourly history for this long before the cut, so a usage period that
 /// ends within it is exact to the hour. Before it, each rollup series keeps only its newest
@@ -97,6 +101,7 @@ pub(crate) enum Rule {
     Deferral,
     UsageSeries,
     UsageCumulative,
+    AccountLimits,
 }
 
 pub(crate) fn fields(claim: &ClaimRecord) -> Option<&serde_json::Map<String, Value>> {
@@ -137,7 +142,9 @@ fn planner_rule(rule: &st3_schema::retention::RulePolicy) -> Option<Rule> {
             Rule::UsageSeries
         }
         "newest,largest-total_tokens" => Rule::UsageCumulative,
-        "all-source-observations" => return None,
+        "newest,newest-reading,every-reading-within-1h-of-its-account-group-newest-measured_at" => {
+            Rule::AccountLimits
+        }
         _ if rule.kind == "seat.status-history" => return None,
         other => panic!("retention.toml: no planner keeps `{other}` for {}", rule.kind),
     };
@@ -354,6 +361,52 @@ pub(crate) fn usage_cumulative_keep(claims: &[&ClaimRecord]) -> BTreeSet<usize> 
     keep
 }
 
+/// The account group of a `harness.limits` reading, as the account fold groups it, and when it
+/// was measured. `None` for a claim the fold skips.
+pub(crate) fn limits_reading(claim: &ClaimRecord) -> Option<((String, String, String, bool), u64)> {
+    let (limit, _) = super::limits::reading(&claim.origin, &claim.body)?;
+    let group = (
+        limit.driver,
+        limit.account,
+        limit.account_ref.unwrap_or_default(),
+        limit.weekly_percent.is_some(),
+    );
+    Some((group, limit.measured_at_unix_ms))
+}
+
+/// A seat's `harness.limits` claims to keep: its newest; its newest reading the fold accepts, and
+/// any accepted at the same time, since the fold breaks that tie by arrival; and every reading
+/// measured within an hour of the newest in its account group (`newest_measured`, across every
+/// seat). A group's newest only moves forward, so a reading below that floor is never read again.
+pub(crate) fn limits_keep(
+    claims: &[&ClaimRecord],
+    newest_measured: &BTreeMap<(String, String, String, bool), u64>,
+) -> BTreeSet<usize> {
+    let mut keep = BTreeSet::from_iter(claims.len().checked_sub(1));
+    let readings = claims.iter().map(|claim| limits_reading(claim)).collect::<Vec<_>>();
+    if let Some(newest) = claims
+        .iter()
+        .zip(&readings)
+        .filter(|(_, reading)| reading.is_some())
+        .map(|(claim, _)| claim.accepted_at_unix_ms)
+        .max()
+    {
+        keep.extend(
+            claims.iter().zip(&readings).enumerate()
+                .filter(|(_, (claim, reading))| reading.is_some() && claim.accepted_at_unix_ms == newest)
+                .map(|(position, _)| position),
+        );
+    }
+    for (position, reading) in readings.iter().enumerate() {
+        if let Some((group, measured)) = reading
+            && *measured >= newest_measured[group].saturating_sub(super::limits::ACCOUNT_READING_WINDOW_MS)
+        {
+            keep.insert(position);
+        }
+    }
+    keep
+}
+
 pub(crate) fn loop_keep(claims: &[&ClaimRecord]) -> BTreeSet<usize> {
     let run_key = |claim: &ClaimRecord| (field_text(claim, "status"), field_text(claim, "round"));
     let mut keep = BTreeSet::new();
@@ -477,6 +530,17 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
                 }) { status_keep.insert(members[dependency]); }
         }
     }
+    // The newest measurement of each account group, across every seat, for the limits rule.
+    let mut limits_newest = BTreeMap::new();
+    for index in first.iter().copied() {
+        let claim = &claims[index].claim;
+        if claim.kind == "harness.limits"
+            && let Some((group, measured)) = limits_reading(claim)
+        {
+            let newest = limits_newest.entry(group).or_insert(measured);
+            *newest = (*newest).max(measured);
+        }
+    }
     let closed_requests = claims
         .iter()
         .filter(|sealed_claim| REQUEST_CLOSERS.contains(&sealed_claim.claim.kind.as_str()))
@@ -496,6 +560,7 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
             Rule::HarnessObserved => harness_keep(&slot_claims),
             Rule::UsageSeries => usage_series_keep(&slot_claims, cut),
             Rule::UsageCumulative => usage_cumulative_keep(&slot_claims),
+            Rule::AccountLimits => limits_keep(&slot_claims, &limits_newest),
             Rule::LoopState => loop_keep(&slot_claims),
             Rule::Deferral => {
                 let request = slot.last().cloned().unwrap_or_default();
@@ -762,6 +827,13 @@ pub(crate) fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The answers no one subject holds: the account limits, which fold every seat's readings. The
+/// proof's copy refolds them from its claims, as a node that never trimmed would.
+pub(crate) fn global_answers(transaction: &Transaction<'_>) -> Result<Value> {
+    super::limits::refold_limits_tx(transaction)?;
+    Ok(json!({"account_limits": super::limits::account_limits_at(transaction)?}))
+}
+
 /// Every answer about `subject` that a checkpoint must leave unchanged, as of the cut.
 pub(crate) fn subject_answers(connection: &Connection, subject: &str, cut: u128) -> Result<Value> {
     subject_answers_inner(connection, subject, cut, None)
@@ -864,6 +936,14 @@ fn subject_answers_inner(connection: &Connection, subject: &str, cut: u128, sour
                     );
                 }
                 answers.insert("incarnations".into(), Value::Object(harness));
+            }
+            // The reconciler reads whether each decision key was recorded and its newest.
+            "runtime.reconcile-decision" => {
+                let mut keys = serde_json::Map::new();
+                for claim in &claims {
+                    keys.insert(field_text(claim, "key"), json!(claim.id));
+                }
+                answers.insert("reconcile_decisions".into(), Value::Object(keys));
             }
             // A rollup trim keeps every series' total, so lifetime usage must not change.
             "harness.usage" => {

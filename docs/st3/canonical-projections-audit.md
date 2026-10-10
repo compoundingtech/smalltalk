@@ -58,6 +58,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `local_mailbox_leases` | Local | Authenticated native custody for each subject/component, including exact runtime/provider/session/sequence, process birth, token/epoch and revocation. Retained across daemon restart; excluded from replicated projection digests. |
 | `unread_mail`, `unread_mail_prefixes`, `unread_mail_pending` | Local cache | Rebuildable unread-message timestamp and prefix-count indexes, plus a deduplicated queue of changed messages, over this node's retained sent/read/closed claims. They accelerate current age counts, are not replicated, and do not add shared identities to projection digests. |
 | `agent_message_sends`, `agent_message_days`, `local_agent_message_pending` | Local cache | Rebuildable eligible-message timestamps and daily recipient counts, plus a deduplicated queue of changed messages, over this node's retained send claims. They accelerate the daily usage estimate, are not replicated, and do not add shared identities to projection digests. |
+| `coordination_sends`, `local_coordination_backfill` | Local cache | Writer-maintained count and held metadata, bounded historical cursor/ceiling/progress. No new conversation payload; excluded from shared projection digests. |
 | `local_observations` | Local | Local-retention observations and their local frontier/id; never replicated. |
 | `local_subscription_mission_deferrals` | Local | Local reconciler capacity backoff/retry scheduling. |
 | `local_usage_spend` | Local | Local provider usage and cost accumulation before publication. |
@@ -281,3 +282,15 @@ The fix step must extend this foundation with non-empty fixtures for currently e
 1. Shared canonical helper + exhaustive local exceptions + behavioral coverage for shared winner selection independent of local arrival. Retain deterministic ancestry/operation selection and local cursor semantics.
 2. One incremental digest per logical shared table/source covering all shared columns, with insert/update/delete maintenance in the same transaction, stable serialization/PK order, full-rebuild validation and migration. Cheap cache invalidation alone is not incremental hashing. Physical indexes, receipt metadata, local clocks and live overlays stay outside. Extend replication status, heal diagnostics and doctor with named mismatches, and keep format/version compatibility explicit.
 3. Expand shuffle/restart/checkpoint CI coverage to every source and derived attention view. The audit commit intentionally contains the failing regression; it is not a green merge candidate. Only the completed fix PR with st/ci green on its own head may join the smalltalk merge train.
+
+Coordination cost metadata is also local: `coordination_sends` holds only a message subject,
+send time, three integer category flags and an unoffered-held flag; `local_coordination_backfill` holds its local
+arrival cursor, ceiling, progress time and completion marker. Writers derive them from sent claims in batches of at most eight subjects, stopping between
+subjects after ten milliseconds to leave room for the rest of the writer transaction.
+They are outside the shared logical rows and checkpoint digests, contain no message body, and
+are not replicated. Count readers query the metadata without advancing the backfill.
+
+The local `coordination_offer` trigger runs after lifecycle claims are inserted into `claims`:
+for staged, delivered, read and closed receipts it clears `coordination_sends.held` with one
+guarded primary-key update in the existing writer transaction. It adds no reader write or
+conversation payload and is outside shared projection digests.
