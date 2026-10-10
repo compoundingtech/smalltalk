@@ -591,6 +591,8 @@ impl WorkPlan {
         }
         // The rows the chunks did not refold run on to the plan's time too.
         retime_work(&mut rows, self.time);
+        // Rows refolded at several cuts: the next fold reads every shown seat's order again.
+        rows.orders_cut = 0;
         // Leases are rechecked from the plan's time, the earliest any row now holds at.
         rows.time_unix_ms = self.time;
         rows.frontier = self.frontier;
@@ -729,12 +731,39 @@ fn work_since(store: &Store, base: &Publication<WorkRows>) -> anyhow::Result<Adv
             return Ok(Advance::TooMany(WorkPlan { cut, frontier, time, steps }));
         }
         let mut rows = rows.clone();
+        // A seat's queue order follows its queue moves and the runs it is assigned steps in,
+        // whose claims refold those steps: so only the seats refolded steps are assigned to (in
+        // any state), seats a refolded row names before or after, and seats whose queue moved,
+        // can have a new order. Rows refolded at other cuts, from nothing or in chunks, read
+        // every shown seat's.
+        let complete = rows.orders_cut != 0;
+        let mut affected = if complete { rows.seats_of(&steps) } else { BTreeSet::new() };
         refold_work(store, &mut rows, &steps, time, cut)?;
-        // Every shown seat's queue order at this same cut: an actor's ready work is ordered by
-        // its queue as it stood at the rows' own cut, never a newer one.
-        let orders = store.seat_orders_of(&rows.seats_shown())?;
-        let reordered = orders != rows.seat_orders;
-        rows.seat_orders = orders;
+        // Every affected seat's queue order at this same cut: an actor's ready work is ordered
+        // by its queue as it stood at the rows' own cut, never a newer one.
+        let reordered = if complete {
+            affected.extend(rows.seats_of(&steps));
+            affected.extend(store.step_assignees(&steps)?);
+            affected.extend(changes.moved_seats.iter().cloned());
+            let mut orders = store.seat_orders_of(&affected)?;
+            let mut reordered = false;
+            for seat in &affected {
+                let order = orders.remove(seat);
+                if rows.seat_orders.get(seat) != order.as_ref() {
+                    reordered = true;
+                    match order {
+                        Some(order) => rows.seat_orders.insert(seat.clone(), order),
+                        None => rows.seat_orders.remove(seat),
+                    };
+                }
+            }
+            reordered
+        } else {
+            let orders = store.seat_orders_of(&rows.seats_shown())?;
+            let reordered = orders != rows.seat_orders;
+            rows.seat_orders = orders;
+            reordered
+        };
         rows.orders_cut = cut;
         let changed = retime_work(&mut rows, time) || !steps.is_empty() || changes.reorder || reordered;
         rows.time_unix_ms = time;

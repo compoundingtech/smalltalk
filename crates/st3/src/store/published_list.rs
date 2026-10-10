@@ -106,6 +106,11 @@ impl<R> PublishedList<R> {
         (!self.started.swap(true, Ordering::AcqRel)).then(|| Arc::clone(&self.wake))
     }
 
+    /// This list's number in the process, as its publications' [`PublicationId::list`] names it.
+    pub(crate) fn instance(&self) -> u64 {
+        self.instance
+    }
+
     /// Whether a refresher was started for this list.
     pub(crate) fn is_started(&self) -> bool {
         self.started.load(Ordering::Acquire)

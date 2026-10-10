@@ -903,57 +903,213 @@ fn an_actors_order_is_built_once_per_publication_by_its_first_read() {
     assert_eq!((count(&rows.actors.builds), count(&rows.actors.hits)), (1, 7), "concurrent reads wait for one build");
     assert_eq!(count(&rows.actors.scanned), rows.order.len(), "the build scans the current rows once");
     let (indexes, _) = rows.actor_rows("agent/garden/ash");
-    assert_eq!(rows.actors.retained_bytes(), indexes.len() * 4);
+    // One kept actor: its allocated indexes, its name, and its entry and cell.
+    assert!(rows.actors.retained_bytes() >= indexes.capacity() * 4 + "agent/garden/ash".len());
     // Past the cap, the least recently read actor is dropped and built again when read.
     for n in 0..crate::store::work_list::ACTOR_ORDERS {
         rows.actor_rows(&format!("agent/garden/other-{n}"));
     }
     assert!(rows.actor_rows("agent/garden/ash").1, "evicted, so built again");
-    assert!(rows.actors.retained_bytes() <= crate::store::work_list::ACTOR_ORDERS * rows.order.len() * 4);
+    let (kept, in_flight) = rows.actors.kept();
+    assert_eq!((kept, in_flight), (crate::store::work_list::ACTOR_ORDERS, 0));
+    // Each kept actor holds at most four bytes a row of this publication, besides its name and
+    // its entry's fixed size.
+    assert!(rows.actors.retained_bytes() <= kept * (rows.order.len() * 4 + 256));
+}
+
+/// A mission whose one step is assigned to `seat`.
+fn seat_mission(store: &Store, name: &str, seat: &str) {
+    publish(
+        store,
+        &format!(
+            r#"version 2
+mission "{name}" state="ready" {{
+  goal "Tend one seat."
+  concurrent-runs max=32
+  step "plant" {{ assigned-to "{seat}" }}
+}}"#
+        ),
+        &format!("publish-{name}"),
+    );
+}
+
+/// Start a run of `name` and make its steps ready.
+fn ready_run(store: &Store, name: &str, key: &str) -> crate::model::MissionRunView {
+    let run = start(store, name, key);
+    for step in &run.steps {
+        store.set_step_state(&step.subject, "ready", None).unwrap();
+    }
+    run
 }
 
 #[test]
-fn a_work_page_reads_only_its_rows_as_unrelated_and_finished_work_grows() {
+fn a_work_page_clones_only_its_rows_along_each_growing_inventory() {
     let _clock = Clock::at(start_time());
     let store = Store::open_memory("cedar").unwrap();
     let count = |counter: &std::sync::atomic::AtomicUsize| counter.load(std::sync::atomic::Ordering::Relaxed);
-    let grow = |store: &Store, n: usize| {
-        let name = format!("garden/more-{n}");
-        mission(store, &name);
-        let run = start(store, &name, &format!("more-{n}"));
-        // Birch's work is unrelated to ash; ash's own off-page work grows too.
-        for path in ["plant", "water"] {
-            store.set_step_state(&step(&run, path).0, "ready", None).unwrap();
-        }
-        // And finished work, which the current list never holds.
-        let (plant, ash) = step(&run, "plant");
-        if n % 2 == 0 {
-            act(store, &plant, &ash, "claim", &format!("claim-{n}"));
-            act(store, &plant, &ash, "complete", &format!("complete-{n}"));
-        }
-        plant
-    };
-    let mut finished = Vec::new();
-    for size in [2, 12] {
-        while finished.len() < size {
-            finished.push(grow(&store, finished.len()));
-        }
-        let (publication, _) = fold_work(&store, None).unwrap().unwrap();
+    mission(&store, "garden/alpha");
+    for n in 0..2 {
+        ready_run(&store, "garden/alpha", &format!("alpha-{n}"));
+    }
+    seat_mission(&store, "garden/birch-more", "agent/garden/birch");
+    seat_mission(&store, "garden/ash-more", "agent/garden/ash");
+    /// What a fresh publication's first pages cost: the fleet page's clones and serialized
+    /// bytes and rows scanned, and ash's first build's scans, page clones and bytes.
+    struct Cost {
+        rows: usize,
+        fleet: (usize, usize, usize),
+        ash: (usize, usize, usize),
+    }
+    let measure = |store: &Store| {
+        let (publication, _) = fold_work(store, None).unwrap().unwrap();
         let rows = &publication.rows;
-        // The fleet's first page clones its rows and scans none.
-        let (page, has_more) = rows.page_of(None, 0, 2);
-        assert_eq!((page.len(), has_more), (2, true));
-        assert_eq!(count(&rows.actors.scanned), 0);
-        // An actor's first read scans the current rows once: the residual, which grows with
-        // current work and never with finished work. Later reads scan nothing.
+        let (fleet, _) = rows.page_of(None, 0, 2);
+        let fleet = (fleet.len(), serde_json::to_vec(&fleet).unwrap().len(), count(&rows.actors.scanned));
         let (indexes, built) = rows.actor_rows("agent/garden/ash");
         assert!(built);
-        assert_eq!(count(&rows.actors.scanned), rows.order.len());
-        assert!(finished.iter().step_by(2).all(|done| !rows.order.contains(done)), "finished work is not held");
-        rows.actor_rows("agent/garden/ash");
-        assert_eq!(count(&rows.actors.scanned), rows.order.len());
-        let (page, _) = rows.page_of(Some(&indexes), 0, 2);
-        assert_eq!(page.len(), 2, "a page is its rows, however many ash has off the page");
-        assert!(serde_json::to_vec(&page).unwrap().len() < 2 * 64 * 1024);
+        let (ash, _) = rows.page_of(Some(&indexes), 0, 2);
+        let ash = (count(&rows.actors.scanned), ash.len(), serde_json::to_vec(&ash).unwrap().len());
+        Cost { rows: rows.order.len(), fleet, ash }
+    };
+    let base = measure(&store);
+    assert_eq!((base.fleet.0, base.fleet.2), (2, 0), "a fleet page clones its two rows and scans none");
+    assert_eq!(base.ash.0, base.rows, "ash's first read scans the current rows once: the residual");
+    let grows = |store: &Store, axis: &str, before: &Cost| {
+        let after = measure(store);
+        assert_eq!((after.fleet.0, after.fleet.2), (2, 0), "{axis}: still two clones, no scan");
+        assert!(after.fleet.1 <= before.fleet.1 + 256, "{axis}: the fleet page's bytes do not grow");
+        assert_eq!(after.ash.1, 2, "{axis}");
+        assert!(after.ash.2 <= before.ash.2 + 256, "{axis}: ash's page bytes do not grow");
+        assert_eq!(after.ash.0, after.rows, "{axis}: ash's build scans exactly the current rows");
+        after
+    };
+    // Unrelated current work: another seat's rows.
+    for n in 0..8 {
+        ready_run(&store, "garden/birch-more", &format!("birch-{n}"));
     }
+    let unrelated = grows(&store, "unrelated current", &base);
+    assert_eq!(unrelated.rows, base.rows + 8);
+    // Ash's own work past its first page.
+    for n in 0..8 {
+        ready_run(&store, "garden/ash-more", &format!("ash-{n}"));
+    }
+    let off_page = grows(&store, "ash off-page", &unrelated);
+    assert_eq!(off_page.rows, unrelated.rows + 8);
+    // Finished work: never held, so nothing a page or build reads grows.
+    for n in 0..8 {
+        let run = start(&store, "garden/ash-more", &format!("done-{n}"));
+        let (plant, ash) = step(&run, "plant");
+        store.set_step_state(&plant, "ready", None).unwrap();
+        act(&store, &plant, &ash, "claim", &format!("claim-done-{n}"));
+        act(&store, &plant, &ash, "complete", &format!("complete-done-{n}"));
+    }
+    let history = grows(&store, "history", &off_page);
+    assert_eq!(history.rows, off_page.rows, "finished work is not held");
+}
+
+#[test]
+fn an_incremental_fold_reads_only_the_seats_it_can_reorder() {
+    let _clock = Clock::at(start_time());
+    let store = Store::open_memory("cedar").unwrap();
+    let mut runs = BTreeMap::new();
+    for n in 0..12 {
+        let (name, seat) = (format!("garden/seat-{n}"), format!("agent/garden/seat-{n}"));
+        seat_mission(&store, &name, &seat);
+        runs.insert(n, ready_run(&store, &name, &format!("seat-{n}-1")));
+    }
+    let second = ready_run(&store, "garden/seat-5", "seat-5-2");
+    store.published_work_list().start();
+    // From nothing: every shown seat once, charged as the cold fold.
+    refresh_work_once(&store);
+    let cold = store.seat_order_reads();
+    assert_eq!(cold, 12);
+    // A commit no row or queue reads: no seat.
+    mission(&store, "garden/unrelated");
+    refresh_work_once(&store);
+    assert_eq!(store.seat_order_reads(), cold, "an unrelated commit rereads no seat");
+    // One seat's step changes: that seat alone.
+    let (plant, seat) = step(&runs[&3], "plant");
+    act(&store, &plant, &seat, "claim", "claim-seat-3");
+    refresh_work_once(&store);
+    assert_eq!(store.seat_order_reads(), cold + 1, "only seat 3");
+    // One seat's queue moves: that seat alone.
+    store
+        .move_seat_queue_run(&crate::model::SeatQueueMoveRequest {
+            agent: "agent/garden/seat-5".into(),
+            run: second.id.clone(),
+            placement: "top".into(),
+            anchor: None,
+            reason: Some("second first".into()),
+            actor: "person/operator".into(),
+            idempotency_key: "move-seat-5".into(),
+        })
+        .unwrap();
+    refresh_work_once(&store);
+    assert_eq!(store.seat_order_reads(), cold + 2, "only seat 5");
+    // And the list is still the direct read for each actor.
+    fold_work_checked(&store);
+}
+
+#[tokio::test]
+async fn an_edited_or_foreign_published_work_cursor_expires() {
+    let root = tempfile::tempdir().unwrap();
+    let state = app_state(root.path());
+    let store = &state.store;
+    mission(store, "garden/alpha");
+    for n in 0..2 {
+        ready_run(store, "garden/alpha", &format!("alpha-{n}"));
+    }
+    store.published_work_list().start();
+    let (publication, _) = fold_work_checked(store);
+    let first = |actor: Option<&'static str>| {
+        let state = state.clone();
+        async move { work_page(&state, work_query(actor, 1)).await.unwrap().page.next_cursor.unwrap() }
+    };
+    let edit = |cursor: &str, change: &dyn Fn(&mut ClientPageCursor)| {
+        let mut decoded = decode_client_cursor(cursor).unwrap();
+        change(&mut decoded);
+        encode_client_cursor(&decoded).unwrap()
+    };
+    let continue_with = |state: &AppState, cursor: String, actor: Option<&str>| {
+        let query = ClientListQuery { cursor: Some(cursor), actor: actor.map(str::to_owned), ..Default::default() };
+        let state = state.clone();
+        async move { work_page(&state, query).await }
+    };
+    let expired = |result: Result<crate::model::ClientResourcePage, ApiError>, case: &str| {
+        let error = result.expect_err(case);
+        assert_eq!((error.status, error.code.as_str()), (StatusCode::GONE, "page-cursor-expired"), "{case}");
+    };
+    let cursor = first(None).await;
+    // An unedited continuation is the next slice of the same publication.
+    let next = continue_with(&state, cursor.clone(), None).await.unwrap();
+    assert_eq!(next.items, publication.rows.page_of(None, 1, 1).0);
+    // 1. An edited limit, with no limit asked: above the maximum, or another in range.
+    for limit in [CLIENT_MAX_PAGE_ITEMS + 1, usize::MAX, 0, 2] {
+        let edited = edit(&cursor, &|cursor| cursor.limit = limit);
+        expired(continue_with(&state, edited, None).await, &format!("limit {limit}"));
+    }
+    // 2. Ash's cursor carrying birch's page's digest.
+    let ash = first(Some("agent/garden/ash")).await;
+    let birch = decode_client_cursor(&first(Some("agent/garden/birch")).await).unwrap();
+    let forged = edit(&ash, &|cursor| {
+        cursor.items_digest = birch.items_digest.clone();
+        cursor.expires_at_unix_ms = birch.expires_at_unix_ms;
+    });
+    expired(continue_with(&state, forged, Some("agent/garden/ash")).await, "another actor's digest");
+    // 3. Another store's list in the same process, at the same generation.
+    let other_root = tempfile::tempdir().unwrap();
+    let other = app_state(other_root.path());
+    mission(&other.store, "garden/alpha");
+    other.store.published_work_list().start();
+    fold_work_checked(&other.store);
+    assert_eq!(other.store.published_work_list().generation(), store.published_work_list().generation());
+    expired(continue_with(&other, cursor.clone(), None).await, "another store's list");
+    // 5. The snapshot edited: its id, or its index alone.
+    let edited = edit(&cursor, &|cursor| cursor.snapshot.id.push('x'));
+    expired(continue_with(&state, edited, None).await, "snapshot id");
+    let edited = edit(&cursor, &|cursor| cursor.snapshot.store_index += 1);
+    expired(continue_with(&state, edited, None).await, "snapshot index");
+    // 4. A forget since the first page.
+    store.published_work_list().forget();
+    expired(continue_with(&state, cursor, None).await, "forgotten");
 }

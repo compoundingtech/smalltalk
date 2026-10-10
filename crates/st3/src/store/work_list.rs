@@ -49,6 +49,10 @@ pub(crate) struct WorkRows {
 pub(crate) const WORK_LEASES: &str = "SELECT subject, CAST(lease_expires_at_unix_ms AS INTEGER) FROM step_runs
  INDEXED BY step_runs_lease_index
  WHERE lease_owner IS NOT NULL AND lease_expires_at_unix_ms IS NOT NULL";
+/// The seats steps `?1`, a JSON array, are assigned to, whatever their state, by the primary
+/// key: a seat's queue order follows the runs it holds steps in.
+pub(crate) const STEP_ASSIGNEES: &str = "SELECT DISTINCT assignee FROM step_runs
+ WHERE subject IN (SELECT value FROM json_each(?1)) AND assignee IS NOT NULL";
 /// The earliest claim about step `?1` accepted after `?2`, by the subject index.
 pub(crate) const NEXT_CLAIM_AFTER: &str = "SELECT MIN(CAST(accepted_at_unix_ms AS INTEGER)) FROM claims
  WHERE subject=?1 AND CAST(accepted_at_unix_ms AS INTEGER)>?2";
@@ -60,6 +64,8 @@ pub(crate) struct WorkChanges {
     pub(crate) steps: BTreeSet<String>,
     /// Whether a seat's queue moved, which reorders that seat's windows with no row changing.
     pub(crate) reorder: bool,
+    /// The seats whose queue moved.
+    pub(crate) moved_seats: BTreeSet<String>,
 }
 
 /// How many actors' orders one publication keeps. Each holds at most one `u32` per row, so a
@@ -69,7 +75,10 @@ pub(crate) const ACTOR_ORDERS: usize = 64;
 /// The rows each actor sees of one publication, as indexes into its `order`, in the order the
 /// direct read gives that actor. An actor's order is built once per publication, by its first
 /// read; concurrent reads of the same actor wait for that one build, and no lock is held across
-/// it. The least recently read actor is dropped past [`ACTOR_ORDERS`].
+/// it. Past [`ACTOR_ORDERS`] the least recently read actor whose order is built is dropped; one
+/// still being built is never dropped, so a second read of it never builds it again. When every
+/// kept actor is still being built, a new actor's order is built for its read alone and not
+/// kept. A dropped order lives on only while a read or a page cursor still holds it.
 #[derive(Default)]
 pub(crate) struct ActorOrders {
     entries: Mutex<std::collections::VecDeque<(String, Arc<std::sync::OnceLock<Arc<Vec<u32>>>>)>>,
@@ -80,6 +89,8 @@ pub(crate) struct ActorOrders {
     pub(crate) builds: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     pub(crate) hits: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) unkept: std::sync::atomic::AtomicUsize,
 }
 
 // A clone for the next fold's rows starts with no actor's order: they are of these rows only.
@@ -104,7 +115,19 @@ impl ActorOrders {
                 }
                 None => {
                     if entries.len() >= ACTOR_ORDERS {
-                        entries.pop_front();
+                        match entries.iter().position(|(_, cell)| cell.get().is_some()) {
+                            Some(built) => drop(entries.remove(built)),
+                            // Every kept actor is mid-build: build this one unkept.
+                            None => {
+                                drop(entries);
+                                #[cfg(test)]
+                                {
+                                    self.builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    self.unkept.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                return (Arc::new(build()), true);
+                            }
+                        }
                     }
                     let cell = Arc::new(std::sync::OnceLock::new());
                     entries.push_back((viewer.to_owned(), Arc::clone(&cell)));
@@ -125,11 +148,28 @@ impl ActorOrders {
         (order, built)
     }
 
-    /// The bytes the kept orders hold: four per row index.
+    /// The bytes the kept actors hold: each order's allocated row indexes, its actor's name, and
+    /// its entry and cell. Orders dropped while a read or cursor still holds them are not here.
     #[cfg(test)]
     pub(crate) fn retained_bytes(&self) -> usize {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        entries.iter().filter_map(|(_, cell)| cell.get()).map(|order| order.len() * 4).sum()
+        entries
+            .iter()
+            .map(|(actor, cell)| {
+                let order = cell.get().map_or(0, |order| order.capacity() * 4 + std::mem::size_of::<Vec<u32>>());
+                actor.capacity()
+                    + std::mem::size_of::<(String, Arc<std::sync::OnceLock<Arc<Vec<u32>>>>)>()
+                    + std::mem::size_of::<std::sync::OnceLock<Arc<Vec<u32>>>>()
+                    + order
+            })
+            .sum()
+    }
+
+    /// How many actors are kept, and how many of them are still being built.
+    #[cfg(test)]
+    pub(crate) fn kept(&self) -> (usize, usize) {
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        (entries.len(), entries.iter().filter(|(_, cell)| cell.get().is_none()).count())
     }
 }
 
@@ -175,10 +215,15 @@ impl WorkRows {
     }
 
     /// The agent seats the rows name, each of which may read its own list: whose queue order
-    /// the publication keeps.
+    /// the publication keeps. Every row's, for a fold from nothing or in chunks.
     pub(crate) fn seats_shown(&self) -> BTreeSet<String> {
+        self.seats_of(self.rows.keys())
+    }
+
+    /// The agent seats the rows of `steps` name, of the steps this list holds.
+    pub(crate) fn seats_of<'a>(&self, steps: impl IntoIterator<Item = &'a String>) -> BTreeSet<String> {
         let mut seats = BTreeSet::new();
-        for row in self.rows.values().filter(|row| !row.view.agentless) {
+        for row in steps.into_iter().filter_map(|step| self.rows.get(step)).filter(|row| !row.view.agentless) {
             let view = &row.view;
             let named = view.assigned_to.iter().chain(view.claimant.iter()).chain(view.available_to.iter());
             seats.extend(named.filter(|seat| seat.starts_with("agent/")).map(|seat| viewer_seat(seat)));
@@ -215,7 +260,9 @@ impl WorkRows {
             .into_iter()
             .map(str::to_owned)
             .collect::<Vec<_>>();
-        let rank = |subject: &str| ready.iter().position(|step| step == subject).unwrap_or(usize::MAX);
+        // Ranks looked up once each, not searched for in every comparison.
+        let ranks = ready.iter().enumerate().map(|(rank, step)| (step.as_str(), rank)).collect::<HashMap<_, _>>();
+        let rank = |subject: &str| ranks.get(subject).copied().unwrap_or(usize::MAX);
         shown.sort_by(|(_, left), (_, right)| {
             work_state_rank(&left.status)
                 .cmp(&work_state_rank(&right.status))
@@ -258,6 +305,7 @@ impl Store {
         let connection = self.readers.get();
         let mut steps = BTreeSet::new();
         let mut reorder = false;
+        let mut moved_seats = BTreeSet::new();
         let mut runs = BTreeSet::new();
         let mut requesters = BTreeSet::new();
         let mut every_ask = false;
@@ -315,7 +363,10 @@ impl Store {
                     requesters.insert(subject);
                 }
                 // A seat's queue order moves its ready work in its own windows.
-                reorder |= kind == crate::seat_queue::MOVED_CLAIM;
+                if kind == crate::seat_queue::MOVED_CLAIM {
+                    reorder = true;
+                    moved_seats.insert(viewer_seat(&subject));
+                }
             }
         }
         runs.extend(self.runs_under(&tree_roots)?);
@@ -338,7 +389,7 @@ impl Store {
                 }
             }
         }
-        Ok(WorkChanges { steps, reorder })
+        Ok(WorkChanges { steps, reorder, moved_seats })
     }
 
     /// The steps whose worker lease ended after `after` and by `through`: their rows show them
@@ -407,9 +458,24 @@ impl Store {
         self.smalltalk.published_work.newest()
     }
 
+    /// The seats `steps` are assigned to, whatever their state, read in the caller's snapshot.
+    pub(crate) fn step_assignees(&self, steps: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+        if steps.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let connection = self.readers.get();
+        let seats = connection
+            .prepare_cached(STEP_ASSIGNEES)?
+            .query_map([serde_json::to_string(steps)?], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(seats.iter().filter(|seat| seat.starts_with("agent/")).map(|seat| viewer_seat(seat)).collect())
+    }
+
     /// Each of `seats`' queue order, read in the caller's snapshot. A seat with no queued run
     /// is left out, as reading it gives no order.
     pub(crate) fn seat_orders_of(&self, seats: &BTreeSet<String>) -> Result<HashMap<String, Arc<Vec<String>>>> {
+        #[cfg(test)]
+        self.smalltalk.seat_order_reads.fetch_add(seats.len(), std::sync::atomic::Ordering::Relaxed);
         let mut orders = HashMap::new();
         for seat in seats {
             let order = self.seat_run_order(seat)?;
@@ -425,6 +491,12 @@ impl Store {
     pub(crate) fn count_direct_work_read(&self) {
         #[cfg(test)]
         self.smalltalk.direct_work_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many seats' queue orders folds have read, for tests.
+    #[cfg(test)]
+    pub(crate) fn seat_order_reads(&self) -> usize {
+        self.smalltalk.seat_order_reads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -454,6 +526,7 @@ mod tests {
             ("child runs", published_list::CHILD_RUNS.to_owned()),
             ("work leases", WORK_LEASES.to_owned()),
             ("next claim", NEXT_CLAIM_AFTER.to_owned()),
+            ("step assignees", STEP_ASSIGNEES.to_owned()),
             ("selected work", selected_work_at_snapshot_query(false)),
             ("selected mission keys", super::super::mission_list::mission_keys_sql(true)),
         ] {
@@ -476,6 +549,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_actor_mid_build_is_never_evicted_so_a_second_read_waits_for_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let orders = ActorOrders::default();
+        let orders = &orders;
+        let (started, building) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                orders.get_or_build("agent/a", move || {
+                    started.send(()).unwrap();
+                    held.recv().unwrap();
+                    vec![3, 1, 2]
+                })
+            });
+            building.recv().unwrap();
+            // Churn every other slot while a's build is under way: a stays kept.
+            for n in 0..ACTOR_ORDERS {
+                orders.get_or_build(&format!("agent/other-{n}"), || vec![n as u32]);
+            }
+            let (kept, in_flight) = orders.kept();
+            assert_eq!((kept, in_flight), (ACTOR_ORDERS, 1), "a, mid-build, was not evicted");
+            // A second read of a waits for the one build rather than building again.
+            let second = scope.spawn(|| orders.get_or_build("agent/a", || panic!("a second build of agent/a")));
+            release.send(()).unwrap();
+            assert_eq!((*first.join().unwrap().0).clone(), vec![3, 1, 2]);
+            let (order, built) = second.join().unwrap();
+            assert!(!built);
+            assert_eq!(*order, vec![3, 1, 2]);
+        });
+        assert_eq!(orders.builds.load(Relaxed), ACTOR_ORDERS + 1);
+        assert_eq!(orders.unkept.load(Relaxed), 0);
+        // With every slot mid-build, a new actor is built for its read alone, never kept.
+        let full = ActorOrders::default();
+        let full = &full;
+        let (started, building) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Arc::new(std::sync::Mutex::new(held));
+        std::thread::scope(|scope| {
+            let builders = (0..ACTOR_ORDERS)
+                .map(|n| {
+                    let (started, held) = (started.clone(), std::sync::Arc::clone(&held));
+                    scope.spawn(move || {
+                        full.get_or_build(&format!("agent/slow-{n}"), move || {
+                            started.send(()).unwrap();
+                            held.lock().unwrap().recv().unwrap();
+                            vec![n as u32]
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+            for _ in 0..ACTOR_ORDERS {
+                building.recv().unwrap();
+            }
+            assert_eq!(full.kept(), (ACTOR_ORDERS, ACTOR_ORDERS));
+            let (order, built) = full.get_or_build("agent/late", || vec![7]);
+            assert!(built && *order == vec![7]);
+            assert_eq!(full.unkept.load(Relaxed), 1);
+            assert_eq!(full.kept().0, ACTOR_ORDERS, "the late actor was not kept");
+            for _ in 0..ACTOR_ORDERS {
+                release.send(()).unwrap();
+            }
+            for builder in builders {
+                assert!(builder.join().unwrap().1);
+            }
+        });
     }
 
     #[test]
