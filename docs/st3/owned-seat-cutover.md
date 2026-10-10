@@ -19,8 +19,10 @@ keep their original launch lineage. Missions and schedules keep their existing s
 preserving active runs after omission.
 
 The initial supported cutover is a top-level native PTY seat on its existing host, harness family and native login account.
-Authored session selectors and unsupported native launches are refused before publication. Every
-active admitted daemon must advertise seat-rollout support before the policy can be activated.
+Automatic cutovers refuse authored session selectors and unsupported native launches before
+publication. Manual publication and adoption can retain the seat's authored `--resume` or
+`--continue` selector; they do not request a cutover or prove that the launch can resume.
+Every active admitted daemon must advertise seat-rollout support before the policy can be activated.
 Manual seats additionally require every active admitted daemon to advertise `seat_rollout_manual`.
 
 ## Manual seats
@@ -44,6 +46,11 @@ receipt digest, survives retries and subsequent complete publications, and chang
 same review and fencing as any other declaration field. Omission of the property restores the
 set's automatic policy. Adding or removing only the property does not itself change the launch.
 
+Manual owned-set adoption and publication accept a seat's own authored `--resume` or `--continue`
+selector without replacing it. Adoption establishes ownership; publication stores the desired
+declaration. Neither operation requires cutover resumability merely because the seat is manual.
+The other ownership, declaration and publication checks still apply.
+
 When the launch changes, publication leaves the manual seat on its current incarnation and
 preserves its live rendered files. Its messages and work intake continue normally; it has no
 drain deadline until an explicit rollout is requested. Agent reads show
@@ -57,8 +64,12 @@ explicit cutovers still prevent satisfaction. Existing response fields retain th
 st agents rollout agent/garden/orchard --deadline 30m --as person/operator
 ```
 
-The explicit command captures fresh declaration and incarnation fences and uses the existing
-native drain, resume and session verification flow. It works even when the set was published
+The explicit command captures fresh declaration and incarnation fences and validates cutover
+resumability before recording a durable cutover action or changing intake. The rollout API applies
+the same validation. An authored `--resume` or `--continue` selector, or another unsupported
+resumption condition, causes refusal at this boundary: the incumbent stays running, its intake
+stays open and the published manual change stays pending. Successful validation uses the existing
+native drain, resume and session verification flow. The command works even when the set was published
 without `--rollout`; its default deadline is thirty minutes. `--force-after-deadline` is an
 explicit choice at that command. Ordinary restart, suspend and resume cannot bypass a pending
 manual cutover. If the incumbent exits before an explicit rollout, the changed declaration
