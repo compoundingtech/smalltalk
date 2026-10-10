@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smalltalk.dev/schema/metric-panel/1",
+  "$ref": "#/$defs/PanelDocument",
+  "$defs": {
+    "Contract": {
+      "type": "string",
+      "enum": [
+        "metric-panel/1"
+      ]
+    },
+    "MetricId": {
+      "type": "string",
+      "enum": [
+        "agent-records",
+        "memory-used-ratio"
+      ]
+    },
+    "Source": {
+      "type": "string",
+      "enum": [
+        "smalltalk",
+        "mimir"
+      ]
+    },
+    "Unit": {
+      "type": "string",
+      "enum": [
+        "count",
+        "ratio"
+      ]
+    },
+    "Freshness": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "stale"
+      ]
+    },
+    "Failure": {
+      "type": "string",
+      "enum": [
+        "source-unavailable",
+        "missing-series",
+        "invalid-response",
+        "incomplete-source"
+      ]
+    },
+    "Sample": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "value",
+            "observed_at",
+            "age_seconds",
+            "freshness"
+          ],
+          "properties": {
+            "state": {
+              "const": "available"
+            },
+            "value": {
+              "type": "number"
+            },
+            "observed_at": {
+              "type": "number"
+            },
+            "age_seconds": {
+              "type": "number"
+            },
+            "freshness": {
+              "$ref": "#/$defs/Freshness"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "state",
+            "reason",
+            "detail"
+          ],
+          "properties": {
+            "state": {
+              "const": "unavailable"
+            },
+            "reason": {
+              "$ref": "#/$defs/Failure"
+            },
+            "detail": {
+              "type": "string"
+            }
+          }
+        }
+      ]
+    },
+    "Panel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "subject",
+        "unit",
+        "source",
+        "sample"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/MetricId"
+        },
+        "title": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "unit": {
+          "$ref": "#/$defs/Unit"
+        },
+        "source": {
+          "$ref": "#/$defs/Source"
+        },
+        "sample": {
+          "$ref": "#/$defs/Sample"
+        }
+      }
+    },
+    "PanelDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "generated_at",
+        "panels"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/Contract"
+        },
+        "generated_at": {
+          "type": "number"
+        },
+        "panels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Panel"
+          }
+        }
+      }
+    }
+  }
+}

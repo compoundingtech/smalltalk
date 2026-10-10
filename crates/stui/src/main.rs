@@ -664,6 +664,9 @@ async fn send_terminal_key(
 }
 
 fn main() -> Result<()> {
+    if metric_panels::run_mode("stui")? {
+        return Ok(());
+    }
     // What `st clients` lists for this stui: its name and build, as reported.
     st3_client::set_client_name(version::client_name());
     ui::lastrun_log_panics(&version::short(version::now()));

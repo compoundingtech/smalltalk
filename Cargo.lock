@@ -2383,6 +2383,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "metric-panels"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "st3-client",
+ "tokio",
+]
+
+[[package]]
 name = "miette"
 version = "7.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4658,6 +4672,7 @@ dependencies = [
  "flate2",
  "image",
  "libc",
+ "metric-panels",
  "portable-pty",
  "pty-client",
  "pty-core",

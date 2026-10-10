@@ -42,6 +42,30 @@ their own keys; `y` confirms what a card asks, and Enter never does.
 The [terminal tab input reference](../../docs/stui-terminal-tab.md) records the measured
 input modes, query replies, and remaining gaps, including the headless PTY probe.
 
+## Observability-centric metrics bakeoff
+
+This prototype branch adds `--metric-panels` (interactive, `r` refresh / `q` quit),
+`--metric-panels-json` (the canonical document), and `--metric-panels-text`
+(the same ratatui widget captured without a terminal). Fractal consumes the same
+`metric-panels` crate; neither client calculates metrics or embeds PromQL.
+The opt-in mode is separate from product tabs and sends no mutations to st.
+
+`METRIC_HOST` selects the host (default `dev3`); `ST3_ENDPOINT` overrides the
+normal discovered local st socket. `METRIC_MIMIR_URL` selects a Prometheus-compatible
+query base (default `http://127.0.0.1:42030/prometheus`), and
+`METRIC_MIMIR_TENANT` defaults to `anonymous`. The defaults are for a read-only dev3
+prototype, not browser access or fleet deployment. Current agent records come from
+the complete paginated st projection; Linux memory utilization and its exporter
+timestamp come from the existing node-exporter/Alloy/Mimir path.
+
+`crates/metric-panels/schema.json` is the single wire-contract source.
+Run `python3 crates/metric-panels/generate.py` after changing it to regenerate
+Rust and TypeScript. Missing/incomplete sources are explicit, never zero;
+source age over 90 seconds is stale. Captures are point-in-time snapshots, and
+the interactive prototype refreshes only on `r`. It is not the resource-drawer
+or general interactive-concept implementation.
+
+
 Verification:
 
 ```sh

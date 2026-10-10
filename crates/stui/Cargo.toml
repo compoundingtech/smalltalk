@@ -9,6 +9,7 @@ build = "../../build.rs"
 
 [dependencies]
 anyhow = "1"
+metric-panels = { path = "../metric-panels" }
 crossterm = "0.29"
 ratatui = { workspace = true }
 smallclaims = { path = "../smallclaims" }

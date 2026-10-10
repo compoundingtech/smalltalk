@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Prototype observability-centric reusable metric panels in stui and Fractal; opt-in only.",
+  "replay": {
+    "status": "none",
+    "detail": "No services, seats, stored claims or fleet configuration are changed by this prototype."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No durable state or st API schema changes. A new generated metric-panel/1 document is emitted only by opt-in client modes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No services, seats, stored claims or fleet configuration are changed by this prototype."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Existing tabs, resource drawers, CLI behavior and daemon protocols are unchanged. This is a bakeoff branch, not a rollout."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No services, seats, stored claims or fleet configuration are changed by this prototype."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Use --metric-panels, --metric-panels-json or --metric-panels-text; configure METRIC_HOST and the existing st/Mimir endpoints as described in crates/stui/README.md."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No services, seats, stored claims or fleet configuration are changed by this prototype."
+  }
+}

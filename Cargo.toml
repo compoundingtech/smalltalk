@@ -10,6 +10,7 @@ members = [
   "components/vista",
   "crates/agent-spec",
   "crates/demo-resolver-wasm",
+  "crates/metric-panels",
   "crates/smallclaims",
   "crates/st-decision-fold",
   "crates/st-drivers",
