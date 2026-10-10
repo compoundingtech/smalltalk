@@ -67,6 +67,7 @@ pub fn agent_glyph(state: AgentState, spinner: &'static str) -> (&'static str, C
         AgentState::NeedsLogin => ("⚿", theme::PERSON),
         AgentState::Fault => ("✕", theme::FAULT),
         AgentState::Working => (spinner, theme::WORKING),
+        AgentState::Compacting => ("◐", theme::SAPPHIRE),
         AgentState::Idle => ("●", theme::IDLE),
         AgentState::Starting => ("◌", theme::WAITING),
         AgentState::Stopped => ("○", theme::QUIET),
@@ -80,6 +81,7 @@ pub fn agent_word(state: AgentState) -> &'static str {
         AgentState::NeedsLogin => "needs login",
         AgentState::Fault => "broken",
         AgentState::Working => "working",
+        AgentState::Compacting => "compacting",
         AgentState::Idle => "idle",
         AgentState::Starting => "starting",
         AgentState::Stopped => "stopped",
@@ -124,7 +126,9 @@ pub fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
         | AttentionKind::Feedback { .. }
         | AttentionKind::Launch { .. }
         | AttentionKind::Revision { .. }
-        | AttentionKind::Request { .. } => ("◆", theme::PERSON),
+        | AttentionKind::Request { .. }
+        | AttentionKind::Prompt { .. } => ("◆", theme::PERSON),
+        AttentionKind::Login { .. } => ("⚿", theme::PERSON),
         AttentionKind::Fault { .. } => ("✕", theme::FAULT),
         AttentionKind::Message { .. } => ("✉", theme::SAPPHIRE),
         AttentionKind::Update { .. } => ("✦", theme::GREEN),
@@ -242,8 +246,8 @@ pub fn home_list(
         ids,
         state: state_of(
             &world.attention,
-            "Checking what needs you…",
-            "Nothing needs you.",
+            "Checking for alerts…",
+            "No alerts.",
         ),
         legend: legend(&[
             ("◆", theme::PERSON, "decide"),
@@ -665,10 +669,10 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
     let Some(item) = id.and_then(|id| world.attention.items().iter().find(|item| item.id == id))
     else {
         match &world.attention {
-            Load::Loading => doc.line(Line::from(span("Checking what needs you…", theme::dim()))),
+            Load::Loading => doc.line(Line::from(span("Checking for alerts…", theme::dim()))),
             Load::Failed(error) => doc.wrap(
                 &[run(
-                    format!("Could not read what needs you: {error}"),
+                    format!("Could not read your alerts: {error}"),
                     theme::fg(theme::RED),
                 )],
                 width,
@@ -677,7 +681,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 doc.blank();
                 doc.line(Line::from(vec![
                     span("✓ ", theme::strong(theme::GREEN)),
-                    span("Nothing needs you right now.", theme::bold()),
+                    span("No alerts right now.", theme::bold()),
                 ]));
                 doc.blank();
                 doc.wrap(
@@ -1169,6 +1173,55 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 inner,
             );
         }
+        AttentionKind::Prompt {
+            seat,
+            text: prompt,
+            answers,
+            ..
+        } => {
+            card.line(Line::from(vec![
+                span("waits  ", theme::dim()),
+                span(seat.clone(), theme::strong(theme::PERSON)),
+            ]));
+            card.blank();
+            card.lines(text::markdown(&spaced(prompt), inner, theme::text()));
+            card.blank();
+            if answers.is_empty() {
+                card.wrap(
+                    &text::inline(
+                        "Answer it in the seat's terminal (Ctrl+]). This clears when the prompt is gone, however it was answered.",
+                        theme::dim(),
+                    ),
+                    inner,
+                );
+            } else {
+                card.wrap(
+                    &text::inline(
+                        "The call it would make is the pending one in the seat's conversation: open the conversation to read it in full, then allow or deny it there. This clears when the prompt is gone, however it was answered.",
+                        theme::dim(),
+                    ),
+                    inner,
+                );
+            }
+        }
+        AttentionKind::Login { text: login, seats } => {
+            card.lines(text::markdown(&spaced(login), inner, theme::text()));
+            if seats.len() > 1 {
+                card.blank();
+                card.section("seats that share this sign-in", Some(seats.len()), inner);
+                for seat in seats {
+                    link(&mut card, "         ", seat, seat);
+                }
+            }
+            card.blank();
+            card.wrap(
+                &text::inline(
+                    "One sign-in in the seat's terminal (Ctrl+]) fixes every seat; this clears when the next authenticated turn succeeds.",
+                    theme::dim(),
+                ),
+                inner,
+            );
+        }
         AttentionKind::Update {
             from,
             body,
@@ -1405,7 +1458,7 @@ fn agent_group(agent: &Agent) -> &'static str {
         AgentState::NeedsYou => "waiting on you",
         AgentState::NeedsLogin => "needs login",
         AgentState::Fault => "broken",
-        AgentState::Working => "working",
+        AgentState::Working | AgentState::Compacting => "working",
         AgentState::Idle | AgentState::Starting => "idle",
         AgentState::Stopped | AgentState::Unknown => "stopped",
     }

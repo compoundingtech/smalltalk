@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Keep suspended seats stopped when an owned set publishes a manual pending launch change.",
+  "replay": {"status": "none", "detail": "Existing suspension and owned-set records are read without replay."},
+  "schema": {"status": "none", "detail": "No claim schema or database migration changes."},
+  "rules": {"status": "none", "detail": "Claim admission and actor authority are unchanged."},
+  "compatibility": {"status": "changed", "detail": "Manual pending publication preserves an existing or in-flight suspension. Same-host resume runs the incumbent declaration and leaves the new declaration pending. Immediate non-manual launch changes still end suspension."},
+  "manual": {"status": "changed", "detail": "Explicit rollout refuses with rollout-suspended while suspension holds the seat. Resume the seat first, then request rollout to apply the pending declaration through strict native resume."},
+  "recovery": {"status": "changed", "detail": "Manual pending publication does not launch a suspended seat or discard its saved native session. Resume retains exact native-session verification."},
+  "downtime": {"status": "unknown", "detail": "Normal daemon upgrade restart; interruption duration has not been measured."}
+}
