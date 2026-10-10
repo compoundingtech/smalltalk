@@ -715,10 +715,10 @@ impl NativeSource {
     fn doctor_line(&self, tx: &Transaction<'_>) -> Value {
         let evidence = (|| {
             let (_, pending, gap) = self.state(tx)?;
-            ensure!(
-                !pending && gap.is_none(),
-                "native evidence incomplete/pending"
-            );
+            if let Some(gap) = gap {
+                anyhow::bail!("native evidence incomplete: {gap}");
+            }
+            ensure!(!pending, "native evidence incomplete/pending");
             let root = self.installer.root(tx, VIEW)?;
             let body:Option<String>=tx.query_row("SELECT body FROM test_terminal_members WHERE namespace=?1 AND key='gate/native'",
                 [root.namespace.as_str()],|r|r.get(0)).optional()?;

@@ -30,7 +30,9 @@ before replacement, and their control isolates capture without restoring readine
 Changing guard binding fields leaves a sticky gap; replacing the guard row is refused.
 The explicit fixture finish supplies old/new facts only after the native writes, and
 clears pending after successful Installer publication. Native rows, pending metadata,
-Installer root and witness all roll back together. Raw-connection writes leave the
+Installer root and witness all roll back together. A plain raw connection is refused
+by the native projection SQL function requirement; registering the existing native
+writer functions permits mutation without the fixture finish. Those writes leave the
 reader unavailable until an explicit eligible writer finish; no reader recomputes.
 
 The `INDEXED BY claims_subject_index` clause is exclusive to the private fixture.
@@ -48,7 +50,8 @@ need a separate bridge review.
 The fourteen native controls are named `native_gate_*` in tests.rs. They cover native
 selection against the canonical oracle (including later arrival with older time),
 all six non-selecting runtime kinds, refusal/recovery, changed declaration/generation,
-complete subject/batch caps, header/body guards, malformed/deep/wrong-type bodies,
+complete subject/batch caps, header/body guards, native malformed-claim refusal,
+malformed/deep mission metadata and wrong-type retained fixture payload,
 replacement capture, replacement after extraction, rollback, explicit lifecycle gaps,
 0/1024/100000 unrelated rows, raw reopen/nonempty refusal, guard replacement and
 default-Store inventory. Registration/setup is separate from measured mutation work.
@@ -56,14 +59,18 @@ Work scopes count traced statements and VM/full-scan steps from native DML throu
 finish, excluding BEGIN/COMMIT and setup/verification. The idle guard assertion is one
 statement, zero full scans and at most 40 VM steps. The semantic no-op assertion keeps
 the proposed 96-statement/20000-VM/zero-full-scan target, without changing generation
-or output rows. These are unexecuted test assertions until hosted controls run; they
-are not an enforced production deadline or a feasibility, latency or cost claim.
+or output rows. These are test assertions, not an enforced production deadline or a feasibility,
+latency or cost claim. The first corrected fixture head `8af510cc` executed fourteen
+controls: nine initial passes and five failures after three attempts each. It observed
+only the size-zero idle finish (one statement, 22 VM steps, zero fullscan steps); the
+other measured paths were blocked by fixture failures. Successor outcomes must come
+from their own hosted source archive.
 
 At each 0/1024/100000 prior-row size, the control also separately reports one unrelated
 claim INSERT (insert_count=1), including native and fixture trigger predicates, and
 the following idle finish. Batch setup is excluded. Expected statement counts are one
-for the INSERT and one for finish; the exact VM/fullscan numbers are currently UNRUN,
-and will be recorded from hosted output. INSERT retains the 20000-VM/zero-fullscan
+for the INSERT and one for finish; the per-INSERT, larger-source and full no-op
+VM/fullscan numbers remain unmeasured until corrected hosted execution. INSERT retains the 20000-VM/zero-fullscan
 refusal target and finish the 40-VM/zero-fullscan target. The output also reports the
 unrelated point UPDATE and complete bound-key semantic no-op path separately.
 

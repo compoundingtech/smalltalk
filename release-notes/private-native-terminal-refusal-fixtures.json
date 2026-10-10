@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Correct private native source refusal fixtures and retain unavailable reasons.",
+  "replay": {
+    "status": "none",
+    "detail": "Correct private native controls without changing production: retain native malformed-claim and unconfigured-writer refusals, inject malformed/deep TEXT through captured mission metadata and wrong-type retained payload through the fixture guard, use valid oversized JSON and required foreign-batch hashes, configure raw fixture writers with the existing native function registration, and expose bounded retained gap reasons as unknown. SQL/VM/fullscan targets and fourteen control names are unchanged; hosted successor execution remains required."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Correct private native controls without changing production: retain native malformed-claim and unconfigured-writer refusals, inject malformed/deep TEXT through captured mission metadata and wrong-type retained payload through the fixture guard, use valid oversized JSON and required foreign-batch hashes, configure raw fixture writers with the existing native function registration, and expose bounded retained gap reasons as unknown. SQL/VM/fullscan targets and fourteen control names are unchanged; hosted successor execution remains required."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Correct private native controls without changing production: retain native malformed-claim and unconfigured-writer refusals, inject malformed/deep TEXT through captured mission metadata and wrong-type retained payload through the fixture guard, use valid oversized JSON and required foreign-batch hashes, configure raw fixture writers with the existing native function registration, and expose bounded retained gap reasons as unknown. SQL/VM/fullscan targets and fourteen control names are unchanged; hosted successor execution remains required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Correct private native controls without changing production: retain native malformed-claim and unconfigured-writer refusals, inject malformed/deep TEXT through captured mission metadata and wrong-type retained payload through the fixture guard, use valid oversized JSON and required foreign-batch hashes, configure raw fixture writers with the existing native function registration, and expose bounded retained gap reasons as unknown. SQL/VM/fullscan targets and fourteen control names are unchanged; hosted successor execution remains required."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Correct private native controls without changing production: retain native malformed-claim and unconfigured-writer refusals, inject malformed/deep TEXT through captured mission metadata and wrong-type retained payload through the fixture guard, use valid oversized JSON and required foreign-batch hashes, configure raw fixture writers with the existing native function registration, and expose bounded retained gap reasons as unknown. SQL/VM/fullscan targets and fourteen control names are unchanged; hosted successor execution remains required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Correct private native controls without changing production: retain native malformed-claim and unconfigured-writer refusals, inject malformed/deep TEXT through captured mission metadata and wrong-type retained payload through the fixture guard, use valid oversized JSON and required foreign-batch hashes, configure raw fixture writers with the existing native function registration, and expose bounded retained gap reasons as unknown. SQL/VM/fullscan targets and fourteen control names are unchanged; hosted successor execution remains required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Correct private native controls without changing production: retain native malformed-claim and unconfigured-writer refusals, inject malformed/deep TEXT through captured mission metadata and wrong-type retained payload through the fixture guard, use valid oversized JSON and required foreign-batch hashes, configure raw fixture writers with the existing native function registration, and expose bounded retained gap reasons as unknown. SQL/VM/fullscan targets and fourteen control names are unchanged; hosted successor execution remains required."
+  }
+}

@@ -160,7 +160,7 @@ mission "one" state="ready" {
     fn populate_foreign(&self, n: usize) {
         let mut writer = self.store.connection.write();
         let tx = writer.transaction().unwrap();
-        tx.execute("INSERT INTO batches(id,origin,replica_sequence,accepted_at_unix_ms) VALUES('foreign','node',999,'1')",[]).unwrap();
+        tx.execute("INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms) VALUES('foreign','node',999,'fixture-foreign','1')",[]).unwrap();
         tx.execute("WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<?1)
             INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
             SELECT 'foreign/'||n,'foreign','exec/unrelated/'||n,'runtime.observed','node','{}','[]','1' FROM rows WHERE n<=?1",
@@ -316,7 +316,7 @@ fn native_gate_octet_header_guard_refuses_oversize_and_proves_bundled_opcodes() 
     );
     tx.execute(
         "UPDATE claims SET body=?1 WHERE subject='exec/one/probe' AND kind='runtime.observed'",
-        ["x".repeat(RAW_BYTES + 1)],
+        [json!({"padding": "x".repeat(RAW_BYTES + 1)}).to_string()],
     )
     .unwrap();
     let scope = SqliteWorkScope::start();
@@ -342,22 +342,62 @@ fn native_gate_octet_header_guard_refuses_oversize_and_proves_bundled_opcodes() 
 
 #[test]
 fn native_gate_malformed_deep_and_wrong_type_source_is_visible_unknown() {
-    for body in [
-        Value::String("{broken".into()),
-        Value::String(format!("{}0{}", "[".repeat(17), "]".repeat(17))),
-        Value::Null,
+    // Native expression indexes refuse malformed claim JSON before any source mutation.
+    // Keep that protection; do not drop indexes to inject an impossible claim state.
+    let f = Fixture::seeded();
+    let mut writer = f.store.connection.write();
+    let tx = writer.transaction().unwrap();
+    let capture = f.source.state(&tx).unwrap();
+    let root = f.source.installer.root(&tx, VIEW).unwrap();
+    for sql in [
+        "UPDATE claims SET body='{broken' WHERE subject='exec/one/probe' AND kind='runtime.observed'",
+        "UPDATE claims SET body=x'00' WHERE subject='exec/one/probe' AND kind='runtime.observed'",
+    ] {
+        assert!(tx.execute(sql, []).is_err());
+        assert_eq!(f.source.state(&tx).unwrap(), capture);
+        assert_eq!(f.source.installer.root(&tx, VIEW).unwrap(), root);
+        assert_eq!(f.source.doctor_line(&tx)["status"], "warn");
+    }
+    drop(tx);
+    drop(writer);
+
+    // Mission metadata has no claim JSON expression index. Its admitted corrupt TEXT
+    // reaches the adapter's predecode guard, and must retain a visible unavailable gap.
+    for raw in [
+        "{broken".to_owned(),
+        format!("{}0{}", "[".repeat(17), "]".repeat(17)),
     ] {
         let f = Fixture::seeded();
         f.edit(|tx| {
-            if let Some(raw)=body.as_str() {
-                tx.execute("UPDATE claims SET body=?1 WHERE subject='exec/one/probe' AND kind='runtime.observed'",[raw]).unwrap();
-            } else {
-                tx.execute("UPDATE claims SET body=x'00' WHERE subject='exec/one/probe' AND kind='runtime.observed'",[]).unwrap();
-            }
+            tx.execute(
+                "UPDATE mission_revisions SET body=?1 WHERE mission_id='one'",
+                [raw],
+            )
+            .unwrap();
         });
-        assert_eq!(f.line()["status"], "unknown");
-        assert_ne!(f.line()["status"], "pass");
+        let line = f.line();
+        assert_eq!(line["status"], "unknown");
+        assert!(
+            line["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("native evidence incomplete:")
+        );
     }
+
+    // Wrong-type retained payload is fixture metadata, not a claim body whose native
+    // indexes would reject the write. Header inspection must refuse it before decode.
+    let f = Fixture::seeded();
+    f.edit(|tx| {
+        tx.execute(
+            "UPDATE test_native_terminal_guard SET payload=x'00',pending=1 WHERE id=1",
+            [],
+        )
+        .unwrap();
+    });
+    let line = f.line();
+    assert_eq!(line["status"], "unknown");
+    assert!(line["message"].as_str().unwrap().contains("type"));
 }
 
 #[test]
@@ -548,7 +588,7 @@ fn native_gate_unrelated_and_noop_work_at_zero_1024_and_100000_rows() {
         // Establish the unrelated batch outside the measured INSERT. Report one claim
         // admission itself, including every native and fixture trigger WHEN predicate.
         f.store.connection.write().execute(
-            "INSERT OR IGNORE INTO batches(id,origin,replica_sequence,accepted_at_unix_ms) VALUES('foreign','node',999,'1')",
+            "INSERT OR IGNORE INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms) VALUES('foreign','node',999,'fixture-foreign','1')",
             [],
         ).unwrap();
         let mut writer = f.store.connection.write();
@@ -624,11 +664,18 @@ fn native_gate_unrelated_and_noop_work_at_zero_1024_and_100000_rows() {
 fn native_gate_raw_reopen_mutation_and_nonempty_attachment_refuse() {
     let f = Fixture::seeded();
     let raw = Connection::open(f.dir.path().join("claims.sqlite3")).unwrap();
-    raw.execute(
-        "UPDATE step_runs SET status='cancelled' WHERE subject='step-run/one/prepare'",
-        [],
-    )
-    .unwrap();
+    let mutation = "UPDATE step_runs SET status='cancelled' WHERE subject='step-run/one/prepare'";
+    // Plain SQLite connections cannot bypass the native projection writer functions.
+    let error = raw.execute(mutation, []).unwrap_err();
+    assert!(
+        error.to_string().contains("st_projection_change"),
+        "{error}"
+    );
+    assert_eq!(f.line()["status"], "warn");
+    // Register the existing native writer functions, without the private source wrapper
+    // or finish. The committed mutation must still leave its diagnostic cut pending.
+    smallclaims::store::configure_projection_writer(&raw).unwrap();
+    raw.execute(mutation, []).unwrap();
     assert_eq!(f.line()["status"], "unknown");
     let mut writer = f.store.connection.write();
     let tx = writer.transaction().unwrap();
