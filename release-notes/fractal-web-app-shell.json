@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "fractal-web app shell: read-only agent sidebar, data layer and st3 SDK; gateway JSON streams negotiated Brotli/gzip representations with Accept-Encoding variation",
+  "summary": "fractal-web app shell: read-only agent sidebar, data layer and st3 SDK; gateway JSON streams negotiated Brotli/gzip representations with Accept-Encoding variation. Sidebar rows never show an unknown raw status value; it reads as Not observed, including in hover cards, and navigating dismisses only the active sidebar hover card without replacing roster rows",
   "replay": {"status": "none", "detail": "Read-only shell and data projections; no runtime replay change."},
   "schema": {"status": "none", "detail": "No database schema change."},
   "rules": {"status": "none", "detail": "No checkpoint rules change."},
