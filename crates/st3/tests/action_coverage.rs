@@ -456,7 +456,7 @@ async fn dispatch(
         "agent.create" => agent_create, "agent.queue-move" => agent_queue_move,
         "agent.resume" => agent_resume, "agent.start" => agent_start,
         "agent.stop" => agent_stop, "agent.suspend" => agent_suspend,
-        "custom.reply" => custom_reply,
+        "custom.reply" => custom_reply, "prompt.respond" => prompt_respond,
         "arrangement.edit" => arrangement_edit,
         "attention.resolve" => attention_resolve,
         "lane.approve" => lane_approve, "lane.join" => lane_join, "lane.leave" => lane_leave,

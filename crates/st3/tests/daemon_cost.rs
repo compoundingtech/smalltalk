@@ -90,6 +90,11 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
 /// Routes the check does not measure, and why. Keep this list short: a route here can grow with
 /// the store unnoticed.
 const NOT_MEASURED: &[(&str, &str)] = &[
+    // A Claude permission hook's poll: one indexed newest-claim read and one operation lookup.
+    (
+        "GET /v1/harness-prompts/state",
+        "one newest harness.observed read by its subject index and one answer read by its operation index",
+    ),
     // Aliases: the same handler as a measured route under the name a person reads.
     (
         "GET /v1/client/alerts",

@@ -214,6 +214,10 @@ struct Report {
     collection_subscribers: BTreeMap<String, usize>,
     #[serde(default)]
     collection_change_frames: BTreeMap<String, usize>,
+    /// Retryable resyncs each collection's windows received, roster included. The server keeps
+    /// such a window and reads it again, so a subscriber waits through them.
+    #[serde(default)]
+    collection_resyncs: BTreeMap<String, usize>,
     #[serde(default)]
     regime: String,
     #[serde(default)]
@@ -1045,6 +1049,9 @@ fn print(report: &Report) {
             report.collection_change_frames.get(collection).copied().unwrap_or(0),
         );
     }
+    if !report.collection_resyncs.is_empty() {
+        println!("retryable resyncs waited through: {:?}", report.collection_resyncs);
+    }
     println!(
         "{:<28} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8}",
         "request", "n", "p50 ms", "p99 ms", "max ms", "budget", "target"
@@ -1441,6 +1448,7 @@ fn run(
     let roster_change_frames = Arc::new(AtomicUsize::new(0));
     let mut collection_subscribers = BTreeMap::<String, usize>::new();
     let collection_change_frames = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
+    let collection_resyncs = Arc::new(Mutex::new(BTreeMap::<String, usize>::new()));
     let migration_pending_at_load_start = context.store.event_payload_migration_pending().unwrap();
     if matches!(regime, LoadRegime::Steady) {
         assert!(!migration_pending_at_load_start);
@@ -1584,18 +1592,19 @@ fn run(
         let mut subscribers = Vec::new();
         for subscriber in 0..ROSTER_SUBSCRIBERS {
             let client = st3_client::Client::unix_as(&socket, OPERATOR);
-            let (barrier, stopped, snapshots, failed, changes, collection_changes) = (
+            let (barrier, stopped, snapshots, failed, changes, collection_changes, resyncs) = (
                 barrier.clone(),
                 stopped.clone(),
                 snapshots.clone(),
                 failed.clone(),
                 roster_change_frames.clone(),
                 collection_change_frames.clone(),
+                collection_resyncs.clone(),
             );
             subscribers.push(tokio::spawn(async move {
                 if let Err(error) = roster_subscriber(
                     client, subscriber, barrier, stopped, snapshots, changes,
-                    collection_changes, profile,
+                    collection_changes, resyncs, profile,
                 )
                 .await
                 {
@@ -1745,6 +1754,7 @@ fn run(
     load.shutdown_timeout(Duration::from_secs(5));
     let failed = std::mem::take(&mut *failed.lock().unwrap());
     let collection_change_frames = std::mem::take(&mut *collection_change_frames.lock().unwrap());
+    let collection_resyncs = std::mem::take(&mut *collection_resyncs.lock().unwrap());
     Report {
         profile,
         scale,
@@ -1757,6 +1767,7 @@ fn run(
         roster_full_folds,
         collection_subscribers,
         collection_change_frames,
+        collection_resyncs,
         regime: regime.name().into(),
         actual_ci_checkout: std::env::var("GITHUB_SHA").ok(),
         event_migration,
@@ -1779,12 +1790,14 @@ struct WindowSnapshot {
     connection: Duration,
 }
 
-/// One subscriber's window: what it holds, its fence, and when it subscribed.
+/// One subscriber's window: what it holds, its fence, when it subscribed, and whether its last
+/// frame was a retryable resync.
 struct HeldWindow {
     collection: &'static str,
     rows: BTreeSet<String>,
     index: Option<u64>,
     subscribed: Instant,
+    resynced: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1796,6 +1809,7 @@ async fn roster_subscriber(
     snapshots: mpsc::Sender<WindowSnapshot>,
     changes: Arc<AtomicUsize>,
     collection_changes: Arc<Mutex<BTreeMap<String, usize>>>,
+    resyncs: Arc<Mutex<BTreeMap<String, usize>>>,
     profile: LoadProfile,
 ) -> Result<(), String> {
     // Start handshakes together, then send subscriptions together once every handshake has
@@ -1830,7 +1844,9 @@ async fn roster_subscriber(
             sent.map_err(|error| format!("{collection}: {error}"))?;
             windows.insert(
                 id,
-                HeldWindow { collection, rows: BTreeSet::new(), index: None, subscribed },
+                HeldWindow {
+                    collection, rows: BTreeSet::new(), index: None, subscribed, resynced: false,
+                },
             );
         }
         let mut awaiting = windows.len();
@@ -1857,13 +1873,23 @@ async fn roster_subscriber(
                     let id = frame["id"].as_str().unwrap_or_default().to_owned();
                     let window = windows.get_mut(&id)
                         .ok_or_else(|| format!("frame for no held window: {frame}"))?;
-                    let initial = window.index.is_none();
+                    // A retryable resync keeps the window: the server reads it again, and its
+                    // first snapshot stays timed from the subscribe, preparation included.
+                    if retryable_resync(window.collection, &frame, &id)? {
+                        window.resynced = true;
+                        *resyncs.lock().unwrap().entry(window.collection.into()).or_default() += 1;
+                        continue;
+                    }
+                    let first = window.index.is_none();
+                    // After a resync a held window may get a fresh snapshot or its changes.
+                    let initial = first || (window.resynced && frame["kind"] == "snapshot");
+                    window.resynced = false;
                     let next = apply_window_frame(window.collection, &frame, &id, initial, &mut window.rows)?;
                     if window.index.is_some_and(|index| next < index) {
                         return Err(format!("{} snapshot index moved backward", window.collection));
                     }
                     window.index = Some(next);
-                    if initial {
+                    if first {
                         let sender = snapshots.as_ref().expect("a first snapshot still awaited");
                         sender
                             .send(WindowSnapshot {
@@ -1955,6 +1981,18 @@ fn apply_roster_frame(
     rows: &mut BTreeSet<String>,
 ) -> Result<u64, String> {
     apply_window_frame("agents", frame, id, initial, rows)
+}
+
+/// Whether `frame` is a retryable resync of window `id`. A resync that is not retryable, or one
+/// for another window, is a failure.
+fn retryable_resync(collection: &str, frame: &Value, id: &str) -> Result<bool, String> {
+    if frame["kind"] != "resync" {
+        return Ok(false);
+    }
+    if frame["id"] != id || frame["retryable"] != true {
+        return Err(format!("{collection} window {id} received {frame}"));
+    }
+    Ok(true)
 }
 
 fn apply_window_frame(
@@ -2083,6 +2121,28 @@ fn roster_frames_require_correct_cards_membership_and_snapshot_before_changes() 
     assert!(rows.is_empty());
     change["removes"] = json!(["agent/bench/not-in-window"]);
     assert!(apply_roster_frame(&change, "load-roster-0", false, &mut rows).is_err());
+}
+
+#[test]
+fn a_window_waits_through_a_retryable_resync_and_fails_on_any_other() {
+    let resync = json!({
+        "kind": "resync", "id": "load-summary-0", "code": "internal",
+        "message": "the summary view is still being prepared; retry shortly", "retryable": true
+    });
+    assert_eq!(retryable_resync("summary", &resync, "load-summary-0"), Ok(true));
+    let mut permanent = resync.clone();
+    permanent["retryable"] = json!(false);
+    assert!(retryable_resync("summary", &permanent, "load-summary-0").is_err());
+    let mut unmarked = resync.clone();
+    unmarked.as_object_mut().unwrap().remove("retryable");
+    assert!(retryable_resync("summary", &unmarked, "load-summary-0").is_err());
+    assert!(retryable_resync("summary", &resync, "load-summary-1").is_err());
+    let snapshot = json!({"kind": "snapshot", "id": "load-summary-0", "collection": "summary"});
+    assert_eq!(retryable_resync("summary", &snapshot, "load-summary-0"), Ok(false));
+    // An error frame is neither: the window's frame check refuses it.
+    let error = json!({"kind": "error", "id": "load-summary-0", "retryable": false});
+    assert_eq!(retryable_resync("summary", &error, "load-summary-0"), Ok(false));
+    assert!(apply_window_frame("summary", &error, "load-summary-0", true, &mut BTreeSet::new()).is_err());
 }
 
 #[test]

@@ -325,6 +325,10 @@ fn claude_observe(
         }
         eprintln!("st: Claude {event} was not recorded: {error:#}");
     }
+    if event == "PermissionRequest" {
+        answer_permission_from_st(env, &identity, &paths.agent_dir, &raw);
+        return 0;
+    }
     if !session_start {
         return 0;
     }
@@ -332,6 +336,117 @@ fn claude_observe(
         Ok(()) => 0,
         Err(reason) => unbound(env, report, &reason),
     }
+}
+
+/// How long a permission hook waits for a person's answer from a client. Claude shows its own
+/// dialog meanwhile, and an answer there wins at once, so the wait only bounds the hook.
+const PROMPT_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+const PROMPT_ANSWER_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Let a person answer a Claude permission prompt from a client. The hook waits while Claude
+/// shows its dialog; if the person answers in st first, the hook returns that decision, which
+/// closes the dialog (measured on Claude Code 2.1.296). A question prompt is answered in the
+/// terminal only.
+fn answer_permission_from_st(env: &dyn HookEnv, identity: &str, agent_dir: &Path, raw: &str) {
+    let payload: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+    if payload.get("tool_name").and_then(Value::as_str) == Some("AskUserQuestion") {
+        return;
+    }
+    // A subagent's prompt never moves the seat's state, so no alert names it: answer it in the
+    // terminal. The seat's own prompts come one at a time: Claude serializes tool execution
+    // around an open permission prompt, even for a parallel batch (see
+    // `claude_session::observe_hook_event`), so one waiting hook stands for one prompt.
+    if payload
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.is_empty())
+    {
+        return;
+    }
+    // This hook's own observation, as its state record names it: only an answer to that exact
+    // prompt is this hook's, never one to an earlier prompt or a parallel hook's.
+    let Some((ownership, transition)) = st_drivers::harness_state::read(
+        &st_drivers::harness_state::harness_state_path(agent_dir),
+        None,
+    )
+    .filter(|observed| observed.blocked_on == st_drivers::harness_state::BlockedOn::Human)
+    .and_then(|observed| observed.ownership_sequence.zip(observed.transition_sequence)) else {
+        return;
+    };
+    let endpoint = match env.var("ST3_ENDPOINT") {
+        Some(endpoint) => crate::client::Endpoint::parse(endpoint),
+        None => match crate::config::Config::load_unvalidated(None) {
+            Ok(config) => crate::client::Endpoint::Unix(config.socket),
+            Err(_) => return,
+        },
+    };
+    let subject = env
+        .var("ST3_SUBJECT")
+        .or_else(|| env.var("ST_AGENT"))
+        .unwrap_or_else(|| format!("agent/{identity}"));
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return;
+    };
+    let client = crate::client::Client::new(endpoint);
+    let path = format!(
+        "/v1/harness-prompts/state?agent={}&ownership={ownership}&transition={transition}",
+        urlencoding::encode(&subject)
+    );
+    let answer = wait_for_prompt_answer(
+        || {
+            runtime.block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.get::<crate::store::NativePromptState>(&path),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+            })
+        },
+        PROMPT_ANSWER_WAIT,
+        PROMPT_ANSWER_POLL,
+    );
+    if let Some(output) = answer.as_deref().and_then(permission_decision) {
+        println!("{output}");
+    }
+}
+
+/// Poll `state` until the prompt is answered (its answer), gone, or `wait` runs out (none).
+fn wait_for_prompt_answer(
+    mut state: impl FnMut() -> Option<crate::store::NativePromptState>,
+    wait: std::time::Duration,
+    poll: std::time::Duration,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match state() {
+            Some(crate::store::NativePromptState::Answered { answer }) => return Some(answer),
+            Some(crate::store::NativePromptState::Gone) => return None,
+            Some(crate::store::NativePromptState::Open) | None => {}
+        }
+        if std::time::Instant::now() + poll > deadline {
+            return None;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Claude's `PermissionRequest` hook output for a person's answer.
+fn permission_decision(answer: &str) -> Option<String> {
+    let decision = match answer {
+        "allow" => serde_json::json!({"behavior": "allow"}),
+        "deny" => serde_json::json!({"behavior": "deny", "message": "The person denied this from st."}),
+        _ => return None,
+    };
+    Some(
+        serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "PermissionRequest", "decision": decision}})
+        .to_string(),
+    )
 }
 
 /// Check that the SessionStart just applied bound this wrapper session to Claude's session.
@@ -707,6 +822,47 @@ mod tests {
             env.clear();
         }
         assert_eq!(hook("st2-boot", &[], &env, "").0, 1);
+    }
+
+    #[test]
+    fn a_permission_hook_returns_the_persons_answer_and_nothing_else() {
+        use crate::store::NativePromptState;
+        let tick = std::time::Duration::from_millis(1);
+        let wait = std::time::Duration::from_secs(5);
+        let mut states = vec![
+            None,
+            Some(NativePromptState::Open),
+            Some(NativePromptState::Answered {
+                answer: "allow".into(),
+            }),
+        ]
+        .into_iter();
+        assert_eq!(
+            super::wait_for_prompt_answer(|| states.next().flatten(), wait, tick),
+            Some("allow".into())
+        );
+        // Answered in the terminal: nothing to say, and the hook stops waiting.
+        assert_eq!(
+            super::wait_for_prompt_answer(|| Some(NativePromptState::Gone), wait, tick),
+            None
+        );
+        // Nobody answers in time: the hook says nothing and Claude's dialog stays.
+        assert_eq!(
+            super::wait_for_prompt_answer(
+                || Some(NativePromptState::Open),
+                std::time::Duration::from_millis(5),
+                tick
+            ),
+            None
+        );
+        let allow: Value = serde_json::from_str(&super::permission_decision("allow").unwrap())
+            .unwrap();
+        assert_eq!(allow["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
+        assert_eq!(allow["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        let deny: Value =
+            serde_json::from_str(&super::permission_decision("deny").unwrap()).unwrap();
+        assert_eq!(deny["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert!(super::permission_decision("maybe").is_none());
     }
 
     #[test]

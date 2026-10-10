@@ -1108,6 +1108,14 @@ pub(super) fn append_with_connections(
             .map_err(internal)?;
         local.body["_source_epoch"] = json!(epoch);
         local.body["_semantic_transition"] = json!(semantic_changed);
+        if input.kind == "harness.observed" && super::attention_snapshot::answerable(&local.body["fields"]) {
+            let old = previous.as_ref().filter(|(_, _, origin, actor, _)| origin == &graph.origin && actor == &input.actor)
+                .map(|(_, body, _, _, _)| serde_json::from_str::<Value>(body)).transpose().map_err(internal)?;
+            if let Some((start, chain)) = super::attention_snapshot::next_prompt_transition_witnesses(&local.body, old.as_ref()) {
+                local.body["_native_prompt_start"] = json!(start);
+                local.body["_native_prompt_transitions"] = json!(chain);
+            }
+        }
         let sequence = local_observation_position(&local).unwrap();
         local.id = format!(
             "{LOCAL_OBSERVATION_ID_PREFIX}{}/{epoch}/{sequence}",
@@ -1597,6 +1605,10 @@ impl Store {
                 "invalid-current-value",
                 "this kind is not a current value",
             ));
+        }
+        if (record.body.get("_native_prompt_transitions").is_some() || record.body.get("_native_prompt_start").is_some())
+            && (record.kind != "harness.observed" || super::attention_snapshot::prompt_transition_witnesses(&record.body).is_none()) {
+            return Err(St3Error::new("invalid-current-value", "invalid native prompt continuity metadata"));
         }
         let fields = schema_fields_for_body(&record.kind, &record.body).map_err(internal)?;
         st3_schema::registry()
