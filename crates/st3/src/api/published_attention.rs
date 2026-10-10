@@ -7,7 +7,8 @@ use crate::store::attention_list::{AttentionDelta, AttentionPublication};
 use crate::store::owner_lists::OwnerView;
 
 /// The shortest pause between two refreshes. A refresh also pauses as long as it took, so the
-/// refresher never takes more than about half a core. Windows never wait for it.
+/// refresher never takes more than about half a core. Windows never wait for it: a summary
+/// selection a window waits for is computed during the pause, once.
 const ATTENTION_LIST_REFRESH_PAUSE: Duration = Duration::from_secs(1);
 
 /// How often the rows are evaluated again with no claim: eligibility and grace periods read the
@@ -56,31 +57,42 @@ pub fn start_attention_list(state: &AppState) {
             let attention = store.attention_list_read_within(idle)
                 || store.newest_attention_list().1.is_none();
             // One view at a time: attention, every person's glasses and arrangements, then the
-            // summary rows windows read. One view's failure leaves the others refreshing.
+            // summary rows windows read. One view's failure leaves the others refreshing. A
+            // summary selection a window waits for is computed before each view, so the window
+            // waits for at most one other view's refresh.
             let refreshed = tokio::task::spawn_blocking(move || {
                 // A pairing completed or revoked since the last pass changes which windows a
                 // session may hold; their windows reread to recheck it, as before.
                 if let Err(error) = reader.recheck_pairings() {
                     eprintln!("st3: pairing recheck for published views failed: {error:#}");
                 }
-                [
-                    ("attention", crate::performance::task("attention/refresh", || {
-                        if attention { refresh_attention_list(&reader) } else { Ok(()) }
-                    })),
-                    ("glasses", crate::performance::task("person-views/refresh", || {
-                        refresh_owner_list(&reader, OwnerView::Glasses)
-                    })),
-                    ("arrangements", crate::performance::task("person-views/refresh", || {
-                        refresh_owner_list(&reader, OwnerView::Arrangements)
-                    })),
-                    ("summary", crate::performance::task("summary/refresh", || {
-                        super::client_v0::summary::refresh_published(
-                            &summary_state,
-                            ATTENTION_LIST_IDLE.as_millis() as u64,
-                        )
-                        .map(|_| ())
-                    })),
-                ]
+                let mut results = Vec::new();
+                let waiting = |results: &mut Vec<_>| {
+                    if let Some(result) = refresh_waiting_summary(&summary_state) {
+                        results.push(("summary", result.map(|_| ())));
+                    }
+                };
+                waiting(&mut results);
+                results.push(("attention", crate::performance::task("attention/refresh", || {
+                    if attention { refresh_attention_list(&reader) } else { Ok(()) }
+                })));
+                waiting(&mut results);
+                results.push(("glasses", crate::performance::task("person-views/refresh", || {
+                    refresh_owner_list(&reader, OwnerView::Glasses)
+                })));
+                waiting(&mut results);
+                results.push(("arrangements", crate::performance::task("person-views/refresh", || {
+                    refresh_owner_list(&reader, OwnerView::Arrangements)
+                })));
+                results.push(("summary", crate::performance::task("summary/refresh", || {
+                    super::client_v0::summary::refresh_published(
+                        &summary_state,
+                        ATTENTION_LIST_IDLE.as_millis() as u64,
+                        false,
+                    )
+                    .map(|_| ())
+                })));
+                results
             })
             .await;
             match refreshed {
@@ -99,27 +111,39 @@ pub fn start_attention_list(state: &AppState) {
                     }
                 }
             }
-            // A summary selection a window is waiting for is computed at once, without the
-            // pause; it is computed only once its selection is registered.
-            if store.summary_selection_waiting() {
+            // The pause bounds this task's work, but a window waiting for a summary selection
+            // does not wait through it: each wake computes the selections waiting then.
+            let pause = tokio::time::Instant::now() + started.elapsed().max(ATTENTION_LIST_REFRESH_PAUSE);
+            let mut woken = false;
+            loop {
                 let summary_state = state.clone();
-                let refreshed = tokio::task::spawn_blocking(move || {
-                    crate::performance::task("summary/refresh", || {
-                        super::client_v0::summary::refresh_published(
-                            &summary_state,
-                            ATTENTION_LIST_IDLE.as_millis() as u64,
-                        )
-                    })
-                })
-                .await;
-                if let Ok(result) = &refreshed
-                    && let Err(error) = result
-                {
-                    eprintln!("st3: summary view refresh failed: {error:#}");
+                let refreshed = if store.summary_selection_waiting() {
+                    tokio::task::spawn_blocking(move || refresh_waiting_summary(&summary_state)).await
+                } else {
+                    Ok(None)
+                };
+                match refreshed {
+                    Ok(None) => {}
+                    Ok(Some(result)) => {
+                        if let Err(error) = &result {
+                            eprintln!("st3: summary view refresh failed: {error:#}");
+                        }
+                        store.note_view_refreshed("summary", result.is_ok());
+                    }
+                    Err(error) => {
+                        eprintln!("st3: summary view refresh stopped: {error}");
+                        store.note_view_refreshed("summary", false);
+                    }
                 }
-                store.note_view_refreshed("summary", matches!(refreshed, Ok(Ok(_))));
+                tokio::select! {
+                    () = tokio::time::sleep_until(pause) => break,
+                    () = wake.notified() => woken = true,
+                }
             }
-            tokio::time::sleep(started.elapsed().max(ATTENTION_LIST_REFRESH_PAUSE)).await;
+            // A window asked during the pause: refresh again at once.
+            if woken {
+                continue;
+            }
             // Attention is evaluated again when its clock period ends or a claim it read
             // becomes eligible, counted from when it was evaluated, not from this wait.
             let due = store
@@ -146,6 +170,20 @@ pub fn start_attention_list(state: &AppState) {
             }
         }
     });
+}
+
+/// Compute the summary selections windows are waiting for, if any: a window that opens a new
+/// selection gets its row without waiting for a whole refresh.
+fn refresh_waiting_summary(state: &AppState) -> Option<anyhow::Result<bool>> {
+    state.store.summary_selection_waiting().then(|| {
+        crate::performance::task("summary/refresh", || {
+            super::client_v0::summary::refresh_published(
+                state,
+                ATTENTION_LIST_IDLE.as_millis() as u64,
+                true,
+            )
+        })
+    })
 }
 
 /// Publish the list at the current cut in one short snapshot: the same rows when nothing

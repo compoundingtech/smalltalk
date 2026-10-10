@@ -185,7 +185,7 @@ async fn summary_windows_serve_the_published_row_of_their_selection() {
         assert_eq!(refused.code, "summary-not-ready");
         assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
     }
-    assert!(summary::refresh_published(&state, 60_000).unwrap());
+    assert!(summary::refresh_published(&state, 60_000, false).unwrap());
     let cut = state.store.index().unwrap();
     let counts = |row: &Value| {
         json!([row["person_id"], row["needs_you"], row["working_agents"],
@@ -204,12 +204,26 @@ async fn summary_windows_serve_the_published_row_of_their_selection() {
     let (_, items, _) = summary_window(&state, &agent).await.unwrap();
     assert_eq!(items[0]["needs_you"], 2, "every person's");
     // Equal counts publish nothing new; a new request for Ada does.
-    assert!(!summary::refresh_published(&state, 60_000).unwrap());
+    assert!(!summary::refresh_published(&state, 60_000, false).unwrap());
     custom(&state, "custom/garden/review/v1/ada-two", "person/ada");
-    assert!(summary::refresh_published(&state, 60_000).unwrap());
+    assert!(summary::refresh_published(&state, 60_000, false).unwrap());
     let (_, items, _) = summary_window(&state, &ada).await.unwrap();
     assert_eq!(items[0]["needs_you"], 2);
     assert_eq!(counts(&items[0]), counts(&computed_summary(&state, &ada)));
+    // A selection a window waits for is computed alone, without the others' changes.
+    let robin = ClientSession::local(Some("person/robin")).unwrap();
+    assert_eq!(summary_window(&state, &robin).await.unwrap_err().code, "summary-not-ready");
+    custom(&state, "custom/garden/review/v1/ada-three", "person/ada");
+    assert!(state.store.summary_selection_waiting());
+    assert!(summary::refresh_published(&state, 60_000, true).unwrap());
+    assert!(!state.store.summary_selection_waiting());
+    let (_, items, _) = summary_window(&state, &robin).await.unwrap();
+    assert_eq!(counts(&items[0]), counts(&computed_summary(&state, &robin)));
+    let (_, items, _) = summary_window(&state, &ada).await.unwrap();
+    assert_eq!(items[0]["needs_you"], 2, "computed again only by a full refresh");
+    assert!(summary::refresh_published(&state, 60_000, false).unwrap());
+    let (_, items, _) = summary_window(&state, &ada).await.unwrap();
+    assert_eq!(items[0]["needs_you"], 3);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -227,14 +241,14 @@ async fn odd_and_surplus_summary_selections_never_stop_the_others() {
     for person in ["not-a-person", "person/ada"] {
         assert!(summary_window_for(&state, &agent, Some(person)).await.is_err());
     }
-    summary::refresh_published(&state, 60_000).unwrap();
+    summary::refresh_published(&state, 60_000, false).unwrap();
     for person in ["not-a-person", "person/ada"] {
         let (snapshot, items, _) = summary_window_for(&state, &agent, Some(person)).await.unwrap();
         assert!(snapshot.published_at.is_some(), "{person} is published");
         assert_eq!(counts(&items[0]), counts(&computed_summary_for(&state, &agent, Some(person))));
     }
     // Unchanged inputs compute nothing again.
-    assert!(!summary::refresh_published(&state, 60_000).unwrap());
+    assert!(!summary::refresh_published(&state, 60_000, false).unwrap());
     // Past the selections it keeps, a window reads its own summary at once.
     for number in 0..64 {
         let _ = state.store.published_summary(Some(&format!("person/{number}")));
