@@ -1448,15 +1448,12 @@ async fn sustained_fresh_requests_fold_no_faster_than_the_fresh_floor() {
     assert!(folds >= 2, "fresh requests did cut the pause: {folds} folds in {span:?}");
 }
 
-/// Bring every cached page of `list` to expire `ms` from now, as if its TTL were that short.
-/// Returns the new expiry.
-fn expire_published_work_pages_in(list: u64, ms: u128) -> u128 {
-    let expires_at = client_now_ms() + ms;
+/// Set every cached page of `list` to expire at `expires_at`: an expiry state, not aging.
+fn set_published_work_pages_expiry(list: u64, expires_at: u128) {
     let mut pages = published_work_pages().lock().unwrap();
     for page in pages.iter_mut().filter(|page| page.id.list == list) {
         page.expires_at_unix_ms = expires_at;
     }
-    expires_at
 }
 
 #[tokio::test]
@@ -1472,23 +1469,27 @@ async fn a_cached_work_page_keeps_its_expiry_on_reuse_and_is_released_once_it_pa
     list.start();
     fold_work_checked(store);
     let instance = list.instance();
-    work_page(&state, work_query(None, 1)).await.unwrap();
+    // A cached page, its expiry minutes away: asked again, the entry and its expiry are reused.
+    let first = work_page(&state, work_query(None, 1)).await.unwrap();
     assert_eq!(published_work_pages_of(instance), 1);
-    // Shortly before its expiry, the same page asked again reuses the entry and its expiry.
-    let expires_at = expire_published_work_pages_in(instance, 200);
     let reused = work_page(&state, work_query(None, 1)).await.unwrap();
-    assert_eq!(reused.page.cursor_expires_at, Some(client_timestamp(expires_at)), "not extended");
+    assert_eq!(reused.page.cursor_expires_at, first.page.cursor_expires_at, "not extended");
+    assert_eq!(reused.page.next_cursor, first.page.next_cursor);
     assert_eq!(published_work_pages_of(instance), 1);
-    let cursor = reused.page.next_cursor.unwrap();
-    // Past it, the continuation expires: its own expiry is checked before the cache is.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Expiry state, not measured aging: the entry, and the cursor issued for it, are past their
+    // expiry. The continuation expires: its own expiry is checked before the cache is.
+    let past = client_now_ms() - 1_000;
+    set_published_work_pages_expiry(instance, past);
+    let mut issued = decode_client_cursor(first.page.next_cursor.as_deref().unwrap()).unwrap();
+    issued.expires_at_unix_ms = past;
+    let cursor = encode_client_cursor(&issued).unwrap();
     let expired = work_page(&state, ClientListQuery { cursor: Some(cursor), ..work_query(None, 1) }).await.unwrap_err();
     assert_eq!((expired.status, expired.code.as_str()), (StatusCode::GONE, "page-cursor-expired"));
-    // The next cache access releases the expired entry, and that first page makes a new one,
-    // with a new expiry: one entry, not two.
+    assert_eq!(published_work_pages_of(instance), 1, "released lazily, at the next cache access");
+    // The next first page releases the expired entry and makes one new one, expiring later.
     let renewed = work_page(&state, work_query(None, 1)).await.unwrap();
     assert_eq!(published_work_pages_of(instance), 1, "the expired entry was released");
-    assert_ne!(renewed.page.cursor_expires_at, Some(client_timestamp(expires_at)));
+    assert_ne!(renewed.page.cursor_expires_at, Some(client_timestamp(past)));
     // A continuation outlives a withdrawal and the refresher's end until its expiry, while new
     // first pages refuse; only a forget expires it.
     let cursor = renewed.page.next_cursor.unwrap();
