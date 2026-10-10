@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Bound client message-send confirmation waits and reserve one automatic heal replay at a time",
+  "replay": {"status":"changed","detail":"No new replay trigger. Existing heal replay and its graph/health commit remain; an in-progress reservation prevents simultaneous callers queueing duplicate full rebuilds. One admitted replay is still unbounded."},
+  "schema": {"status":"none","detail":"No database tables, indexes, triggers or schema version changes."},
+  "rules": {"status":"none","detail":"No checkpoint, admission, retention or drop-rule changes."},
+  "compatibility": {"status":"changed","detail":"Client-v0 message.send may return HTTP503 message-send-unconfirmed with retryable:false and applied:unknown, action_id and idempotency_key. Existing safe unknown-code handling preserves the message; clients must retain the identical request/key. At the pending-worker limit it returns existing rate-limited before submission. No schema/client generator shape changes."},
+  "downtime": {"status":"none","detail":"Standard daemon restart only; no additional measured downtime claim."},
+  "manual": {"status":"none","detail":"No data repair or configuration conversion. An unconfirmed send must be retried with its original request/key, not treated as rejected."},
+  "recovery": {"status":"none","detail":"Queued sends may still complete after confirmation timeout. Existing deterministic message identity, action gate and durable action receipt retain same-key dedupe; this does not certify binary downgrade or cure full-replay cost."}
+}
