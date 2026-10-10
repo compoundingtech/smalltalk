@@ -6,6 +6,7 @@
 //! same `World`.
 
 pub mod adapt;
+mod alerts;
 mod attach;
 mod clickable;
 mod context;
@@ -52,7 +53,7 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode,
     },
 };
-use doc::{Doc, DocExt, Hit};
+use doc::{AlertTap, Doc, DocExt, Hit};
 use pane::Pane;
 use ratatui::{
     Terminal,
@@ -2367,9 +2368,23 @@ impl Ui {
         } else {
             composer.len() as u16 + 2 + strip
         };
+        // What waits on the person in this conversation sits above the box, never pushing the
+        // conversation below a few lines.
+        let mut band = if agent.unmanaged || find.is_some() {
+            Vec::new()
+        } else {
+            self.alert_band(&agent.id, area.width as usize)
+        };
+        let room = area
+            .height
+            .saturating_sub(header_height + composer_height + 4) as usize;
+        band.truncate(room);
+        let band_height = band.len() as u16;
         let body = Rect {
             y: area.y + header_height,
-            height: area.height.saturating_sub(header_height + composer_height),
+            height: area
+                .height
+                .saturating_sub(header_height + composer_height + band_height),
             ..area
         };
         if let Some(find) = find {
@@ -2387,6 +2402,21 @@ impl Ui {
             }
         }
         self.pane(buf, &key, body, doc, true);
+        for (offset, row) in band.iter().enumerate() {
+            let y = body.y + body.height + offset as u16;
+            buf.set_line(area.x, y, &row.line, area.width);
+            for (column, width, hit) in &row.hits {
+                self.hit(
+                    Rect {
+                        x: area.x + column,
+                        y,
+                        width: (*width).min(area.width.saturating_sub(*column)),
+                        height: 1,
+                    },
+                    hit.clone(),
+                );
+            }
+        }
         // Every match on screen is marked; the current one stands out.
         if let Some(find) = find {
             let top = self
@@ -2719,7 +2749,7 @@ impl Ui {
             _ if menu_for.is_some() => "actions",
             "agent" | "session" => "agent",
             "mission" => "mission",
-            "attention" => "needs you",
+            "attention" => "alert",
             _ => "details",
         };
         doc.card(
@@ -5560,6 +5590,8 @@ impl Ui {
             }
             Hit::Help => self.help = !self.help,
             Hit::Answer(index) => self.answering = Some(index),
+            Hit::Alert(id, AlertTap::Open) => self.open_alert(&id),
+            Hit::Alert(id, AlertTap::Answer(answer)) => self.answer_alert(&id, &answer),
             Hit::Voice => {
                 self.editing = true;
                 self.start_voice();
@@ -6133,6 +6165,7 @@ mod tests {
     fn a_custom_request_sends_the_generic_reply_and_has_no_yes_no_shortcut() {
         let mut world = demo::world();
         world.attention = Load::Ready(vec![Attention {
+            conversations: vec![],
             id: "attention/garden".into(),
             tier: Tier::Today,
             title: "Retain the seed history?".into(),
@@ -6349,6 +6382,7 @@ mod tests {
     fn answering_a_request_leaves_the_next_one_closed() {
         let mut world = demo::world();
         let asks = |id: &str| Attention {
+            conversations: vec![],
             id: id.into(),
             tier: Tier::Stopped,
             title: "Merge the three PRs?".into(),
@@ -6495,6 +6529,7 @@ mod tests {
                 custom: false,
             };
             let item = Attention {
+                conversations: vec![],
                 id: "attention/feedback".into(),
                 tier: Tier::Stopped,
                 title: "What went wrong?".into(),
@@ -6620,6 +6655,7 @@ mod tests {
             custom: true,
         };
         let item = Attention {
+            conversations: vec![],
             id: "attention/shipped".into(),
             tier: Tier::Stopped,
             title: "Shipped today".into(),
@@ -6701,6 +6737,7 @@ mod tests {
             custom: false,
         };
         let item = Attention {
+            conversations: vec![],
             id: "attention/choose".into(),
             tier: Tier::Stopped,
             title: "What should change?".into(),
@@ -6790,6 +6827,7 @@ mod tests {
             custom: false,
         };
         let item = Attention {
+            conversations: vec![],
             id: "attention/decide".into(),
             tier: Tier::Stopped,
             title: "Decide".into(),
@@ -6842,6 +6880,7 @@ mod tests {
         let mut world = demo::world();
         let mission = "mission/release-proof";
         let item = Attention {
+            conversations: vec![],
             id: "attention/capacity".into(),
             tier: Tier::Stopped,
             title: "Allocate capacity?".into(),
@@ -6891,6 +6930,7 @@ mod tests {
     fn an_update_shows_what_was_asked_for_and_clears_once_read() {
         let mut world = demo::world();
         let item = Attention {
+            conversations: vec![],
             id: "attention/update".into(),
             tier: Tier::Later,
             title: "The audit you asked for".into(),
@@ -7085,6 +7125,7 @@ mod tests {
             items.insert(
                 0,
                 Attention {
+                    conversations: vec![],
                     id: "attention/request".into(),
                     tier: Tier::Stopped,
                     title: "Which runner should take the release?".into(),
