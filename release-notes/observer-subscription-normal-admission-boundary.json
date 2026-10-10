@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Pin normal-admission compatibility at the observer/subscription detail source budget.",
+  "replay": {
+    "status": "none",
+    "detail": "Adds a fixture only; no replay or initialization change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No production database schema, index or trigger change. Fixture declarations use the existing admission writer without projection mutations."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No rules, checkpoint or retention change."
+  },
+  "compatibility": {
+    "status": "unknown",
+    "detail": "No additional production behavior changes in this test-only delta. Authored controls cover normally admitted observer and subscription declaration bodies of 240 KiB, 256 KiB and 256 KiB plus one byte. The proposed cumulative 256 KiB detail budget also includes metadata and snapshot inputs, so some normally admitted declarations return the existing proposed non-retryable 422 projection-detail-too-large code with no partial item. The complete KDL source has a 16 MiB admission limit, not a serialized declaration-body limit; no largest-body readability guarantee is made. Public acceptance remains with the existing decision request; neither admission nor detail caps change here. Controls are unexecuted at authoring."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No new production path or restart requirement in this fixture delta."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual migration, data rewrite or rebuild."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Tests do not change production writer or rollback behavior; existing data and admitted declarations are preserved."
+  }
+}

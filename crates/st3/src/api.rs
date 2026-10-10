@@ -967,6 +967,15 @@ async fn response_envelope_unbounded(
         Some(caller.clone()),
     );
     let client_request = request.uri().path().starts_with("/v1/client/");
+    // These point readers admit snapshot metadata inside their pinned read before
+    // formatting it. Authentication still runs here; their response extension
+    // supplies the envelope snapshot. All other routes keep admission snapshots.
+    let defer_detail_snapshot = (request_method == axum::http::Method::GET
+        || request_method == axum::http::Method::HEAD)
+        && matches!(
+            request_route.as_str(),
+            "/v1/client/observers/{*id}" | "/v1/client/subscriptions/{*id}"
+        );
     let fabric_boundary_error = (matches!(transport, ClientTransportBoundary::FabricLoopback)
         && !client_request
         && request.uri().path() != "/v1/health")
@@ -1012,16 +1021,19 @@ async fn response_envelope_unbounded(
                     client_v0::authenticate(&auth_state, &auth_request, transport)
                 });
             drop(authentication_span);
-            let snapshot_span = crate::profile::span("admission/snapshot");
-            let snapshot = crate::relay_trace::work(crate::relay_trace::Phase::Snapshot, || {
-                client_request_snapshot(&auth_state, cursor_snapshot.flatten())
+            let snapshot = (!defer_detail_snapshot).then(|| {
+                let snapshot_span = crate::profile::span("admission/snapshot");
+                let snapshot = crate::relay_trace::work(crate::relay_trace::Phase::Snapshot, || {
+                    client_request_snapshot(&auth_state, cursor_snapshot.flatten())
+                });
+                drop(snapshot_span);
+                snapshot
             });
-            drop(snapshot_span);
             (authentication, snapshot)
         })
         .await;
         match admitted {
-            Ok((authentication, snapshot)) => (authentication.map(Some), Some(snapshot)),
+            Ok((authentication, snapshot)) => (authentication.map(Some), snapshot),
             Err(error) => (Err(ApiError::internal(error)), None),
         }
     } else {
@@ -1303,6 +1315,8 @@ fn client_request_snapshot(
 }
 
 fn client_snapshot_at(state: &AppState, store_index: u64) -> ClientSnapshot {
+    #[cfg(test)]
+    client_v0::observer_subscription_detail_tests::note_snapshot_construction(state);
     client_snapshot_with_time(
         state,
         store_index,
@@ -1410,6 +1424,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "invalid-subject-reference"
         | "stale-fence"
         | "timeline-history-incomplete"
+        | "projection-detail-too-large"
+        | "projection-detail-invalid-source"
         | "cursor-gap"
         | "page-cursor-expired"
         | "rate-limited"

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Observer and subscription detail admission checks snapshot metadata and declaration kinds before decoding.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or initialization change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema or index change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule or retention change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Only matched observer/subscription detail GET and HEAD routes defer middleware snapshot creation until the guarded same-cut reader; authentication and response-extension envelopes remain in place. Keys and host metadata retain their 4 KiB cap, cumulative source/metadata including kind eligibility and raw/fallback candidates retains 256 KiB, and rendered item plus snapshot retains 512 KiB. Oversized wrong-kind declarations return non-retryable projection-detail-too-large (HTTP 422) without candidate/list fallback; malformed kind types/UTF-8 and invalid latest snapshot timestamps return projection-detail-invalid-source (HTTP 422) before formatting. Ordinary raw-ID-first/prefixed fallback, wrong-kind/missing 404, stop and scope behavior are preserved. Other routes retain their admission snapshots."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart or interruption beyond ordinary deployment."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual migration or rebuild."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No writer, checkpoint or rollback changes; existing source data is preserved."
+  }
+}
