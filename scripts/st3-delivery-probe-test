@@ -542,8 +542,9 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("attention", self.monitor.state["routes"][self.target])
 
     def set_route(self, status, message, **fields):
+        fields.setdefault("started_at_unix_ms", probe.now_ms())
         self.monitor.state["routes"][self.target] = {"target": "cobalt", "to": self.target, "status": status,
-                                                     "message": message, "started_at_unix_ms": 1, **fields}
+                                                     "message": message, **fields}
 
     async def test_an_ordinary_probe_cycle_publishes_no_new_report(self):
         self.set_route("read", "message/one", read_at_unix_ms=2, latency_ms=40)
@@ -574,7 +575,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         heartbeat, deadline = self.monitor.heartbeat, self.monitor.deadline
         self.assertFalse(self.monitor.publish_due(start + heartbeat - 1))
         self.assertTrue(self.monitor.publish_due(start + heartbeat))
-        self.set_route("pending", "message/two")
+        self.set_route("pending", "message/two", started_at_unix_ms=start + heartbeat - 1)
         self.assertFalse(self.monitor.publish_due(start + heartbeat))
         self.assertTrue(self.monitor.publish_due(start + heartbeat + deadline))
 
@@ -587,6 +588,36 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.monitor.publish_due(start + 2))
         await self.monitor.publish()
         self.assertFalse(self.monitor.publish_due(self.monitor.last_publish + 1))
+
+    async def test_a_failing_send_past_its_deadline_publishes_its_alert_and_then_recovery(self):
+        self.set_route("read", "message/one", read_at_unix_ms=2, latency_ms=40, late=False, next_at_unix_ms=0)
+        await self.monitor.publish()
+        # The next send is not accepted; it keeps its key and retries.
+        self.monitor.api.fail_send = True
+        await self.monitor.route(self.target)
+        route = self.monitor.state["routes"][self.target]
+        self.assertEqual(route["status"], "sending")
+        self.assertFalse(self.monitor.publish_due(probe.now_ms()), "within its deadline it is in flight")
+        # Past its deadline the retrying send raises the alert, still as `sending`.
+        route["started_at_unix_ms"] -= self.monitor.deadline + 1
+        self.monitor.measuring.pop(self.target, None)
+        self.assertTrue(self.monitor.publish_due(probe.now_ms()), "a send past its deadline is overdue")
+        await self.monitor.route(self.target)
+        route = self.monitor.state["routes"][self.target]
+        self.assertEqual(route["status"], "sending")
+        self.assertTrue(route.get("attention"))
+        self.assertTrue(self.monitor.publish_due(probe.now_ms()))
+        await self.monitor.publish()
+        self.assertFalse(self.monitor.publish_due(probe.now_ms()))
+        report = json.loads(bytes(self.monitor.api.posts[-1][1]["bytes"]))
+        published = next(item for item in report["routes"] if item["to"] == self.target)
+        self.assertEqual((published["status"], published["message"]), ("sending", route["message"]))
+        # The send goes through and its read arrives: the recovery publishes at once.
+        self.monitor.api.fail_send = False
+        self.monitor.api.records = [{"kind": "message.read", "actor": self.target, "accepted_at_unix_ms": probe.now_ms()}]
+        await self.monitor.route(self.target)
+        self.assertEqual(self.monitor.state["routes"][self.target]["status"], "read")
+        self.assertTrue(self.monitor.publish_due(probe.now_ms()))
 
     async def test_routes_share_one_replication_status_read_while_it_is_fresh(self):
         reads = []

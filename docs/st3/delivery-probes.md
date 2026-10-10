@@ -43,10 +43,11 @@ under `doc/delivery-probes/NODE`. Every version is kept on every member, so the 
 publishes one only when a route's outcome changes (overdue, a late read, an alert, a
 recovery) and as a heartbeat every five minutes with the newest latencies. An ordinary
 cycle, a read followed by a new send and its read, publishes nothing new: each latency
-is a point of a series and stays in the probe's local `events.jsonl`. A heartbeat
-waits, for at most one deadline, until no send is in flight, and a report that showed
-a send in flight is replaced as soon as it resolves, so doctor never sees a stale wait
-as overdue. On one production fleet the probe published about 2,700 versions a day per
+is a point of a series and stays in the probe's local `events.jsonl`. A send stops being
+in flight once its deadline passes or it raises an alert, even while it keeps retrying,
+and that publishes at once. A heartbeat waits, for at most one deadline, until no send
+is in flight, and a report that showed a send in flight is replaced as soon as it
+resolves, so doctor never sees a stale wait as overdue. On one production fleet the probe published about 2,700 versions a day per
 node (one every 32 seconds); this bounds it at 288 heartbeats plus outcome changes.
 `st doctor`
 shows each direction's latest message, measured latency or pending age, overdue

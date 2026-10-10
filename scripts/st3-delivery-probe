@@ -608,37 +608,48 @@ class Probe:
                 "routes": [dict(self.state["routes"][target], status="last-seen") if self.state["routes"].get(target, {}).get("waiting_for_member") else self.state["routes"].get(target, {"target": host, "to": target, "status": "unstarted"})
                            for target, host in sorted(self.peers.items())]}
 
-    def outcomes(self):
+    def coalesced(self, route, now):
+        """Whether a route's result is still in flight: a send within its deadline that raised no
+        alert. Past its deadline, or once alerted, a send that is still retrying is an outcome
+        doctor must see at once."""
+        alerted = route.get("attention") or route.get("agent_alert") or route.get("reviewer_alert")
+        return (route.get("status") in ("sending", "pending") and not alerted
+                and now - route.get("started_at_unix_ms", now) < self.deadline)
+
+    def outcomes(self, now):
         """What doctor reports from each route, apart from which message it was and its latency.
-        A result still in flight keeps the outcome last published, so an ordinary probe cycle
-        (read, a new send, read again) changes nothing."""
+        A result in flight keeps the outcome last published, so an ordinary probe cycle (read, a
+        new send, read again) changes nothing."""
         published = self.published or {}
         outcomes = {}
         for route in self.report()["routes"]:
             target = route.get("to") or route.get("target")
-            if route.get("status") in ("sending", "pending"):
+            if self.coalesced(route, now):
                 if target in published:
                     outcomes[target] = published[target]
                 continue
-            outcomes[target] = [route.get("status"), bool(route.get("late")),
+            status = route.get("status")
+            if status in ("sending", "pending") and now - route.get("started_at_unix_ms", now) >= self.deadline:
+                status = "overdue"
+            outcomes[target] = [status, bool(route.get("late")),
                                 bool((route.get("previous_read") or {}).get("late")),
                                 bool(route.get("attention") or route.get("agent_alert") or route.get("reviewer_alert"))]
         return outcomes
 
-    def in_flight(self):
+    def in_flight(self, now):
         return {route.get("to") or route.get("target") for route in self.report()["routes"]
-                if route.get("status") in ("sending", "pending")}
+                if self.coalesced(route, now)}
 
     def publish_due(self, now):
-        if self.published is None or self.outcomes() != self.published:
+        if self.published is None or self.outcomes(now) != self.published:
             return True
         # Doctor counts a published send that is still waiting as overdue once its deadline
         # passes, so a report that showed one is replaced as soon as it resolves.
-        if self.published_in_flight - self.in_flight():
+        if self.published_in_flight - self.in_flight(now):
             return True
         since = now - self.last_publish
         # A heartbeat waits, for at most one deadline, until nothing is in flight.
-        return since >= self.heartbeat and (not self.in_flight() or since >= self.heartbeat + self.deadline)
+        return since >= self.heartbeat and (not self.in_flight(now) or since >= self.heartbeat + self.deadline)
 
     async def publish(self):
         report = self.report()
@@ -652,8 +663,8 @@ class Probe:
                             "bytes": list(data), "idempotency_key": "delivery-probe-report:" + hashlib.sha256(data).hexdigest()})
         save(self.directory / "latest.json", report)
         self.last_publish = now_ms()
-        self.published = self.outcomes()
-        self.published_in_flight = self.in_flight()
+        self.published = self.outcomes(self.last_publish)
+        self.published_in_flight = self.in_flight(self.last_publish)
 
     async def monitor(self):
         async def safely(operation):
