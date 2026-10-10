@@ -11603,12 +11603,62 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_schedules(&self, desired: &[DesiredSubject]) -> Result<()> {
+        self.incremental.observe(&self.store)?;
+        let full = !self.skip_unneeded || self.incremental.take_full_pass("schedule", now_ms());
+        let mut active = BTreeSet::new();
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
-            self.isolate("schedule", &schedule.subject, || {
-                self.reconcile_schedule(schedule)
-            });
+            let item = format!("schedule:{}", schedule.subject);
+            active.insert(item.clone());
+            let context = self.incremental.observe_context(&item, schedule);
+            self.reconcile_selected_intake(
+                "schedule",
+                &item,
+                &schedule.subject,
+                !full && context,
+                || self.reconcile_schedule(schedule),
+            );
         }
+        self.incremental.retain("schedule:", &active);
         Ok(())
+    }
+
+    /// Skip before fault/recovery reporting and before any evaluation SQL. A selected item
+    /// retains the existing effect checks. Failed full evaluations must retry even when the
+    /// preceding cached evaluation was clean; clean skips never clear a retained fault.
+    fn reconcile_selected_intake(
+        &self,
+        section: &'static str,
+        item: &str,
+        subject: &str,
+        skip: bool,
+        work: impl FnOnce() -> Result<()>,
+    ) {
+        if skip && !self.incremental.needs(item, now_ms()) {
+            return;
+        }
+        let completion = self.incremental.intake_completion_token(item);
+        if self
+            .isolate(section, subject, || {
+                self.reconcile_item(section, item, skip, || {
+                    smallclaims::touched::note_read(|| item.to_owned());
+                    smallclaims::touched::note_read(|| subject.to_owned());
+                    // Repair and owned-set receipts may change a previously selected declaration or
+                    // an absent dependency. Until full old/new closure exists these stay broad.
+                    smallclaims::touched::note_read(|| "kind:record.repaired".into());
+                    smallclaims::touched::note_read(|| "kind:owned-set.revised".into());
+                    if section.starts_with("schedule") {
+                        // The active-started-run join has negative as well as positive run deps.
+                        smallclaims::touched::note_read(|| "kind:mission-run.state".into());
+                        smallclaims::touched::note_read(|| "kind:mission-run.created".into());
+                    }
+                    work()
+                })
+            })
+            .is_none()
+        {
+            self.incremental.touch(item);
+        }
+        self.incremental.retain_intake_completion(item, completion);
     }
 
     fn schedules_caught_up(&self) -> Result<bool> {
@@ -11733,14 +11783,22 @@ impl<R: RuntimeControl> Reconciler<R> {
             scheduled_at
         };
         let operation = format!("{}:{revision}:{occurrence}", schedule.subject);
+        let timer_due = scheduled_at.max(0) as u128;
         if !self
             .armed_schedules
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(operation.clone())
         {
+            // A sleeping arm still needs deadline discovery. Once its instant is reached,
+            // that arm owns progress and signals completion/rejection; do not keep selecting
+            // no-op evaluations while it waits to run or finish its existing work.
+            if timer_due > now_ms() {
+                smallclaims::touched::note_due(timer_due);
+            }
             return Ok(());
         }
+        smallclaims::touched::note_due(timer_due);
         let request = self.store.append_claim(&ClaimInput {
             subject: schedule.subject.clone(),
             kind: "schedule.occurrence-scheduled".into(),
@@ -11770,6 +11828,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let store = self.store.clone();
         let notify = self.notify.clone();
         let event_notify = self.event_notify.clone();
+        let incremental = self.incremental.clone();
         let armed = self.armed_schedules.clone();
         let schedule_subject = schedule.subject.clone();
         let schedule_declaration = schedule.clone();
@@ -11807,6 +11866,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&operation);
+                    incremental.intake_completed(&format!("schedule:{schedule_subject}"));
+                    incremental.intake_completed(&format!("schedule-work:{schedule_subject}"));
                     signal_changed(&notify, &event_notify);
                     return;
                 }
@@ -11833,6 +11894,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&operation);
+                    incremental.intake_completed(&format!("schedule:{schedule_subject}"));
+                    incremental.intake_completed(&format!("schedule-work:{schedule_subject}"));
                     signal_changed(&notify, &event_notify);
                     return;
                 }
@@ -11896,6 +11959,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .remove(&operation);
+                        incremental.intake_completed(&format!("schedule:{schedule_subject}"));
+                        incremental.intake_completed(&format!("schedule-work:{schedule_subject}"));
                         signal_changed(&notify, &event_notify);
                         return;
                     };
@@ -11926,6 +11991,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .remove(&operation);
+                incremental.intake_completed(&format!("schedule:{schedule_subject}"));
+                incremental.intake_completed(&format!("schedule-work:{schedule_subject}"));
                 signal_changed(&notify, &event_notify);
             });
         } else {
@@ -11946,6 +12013,9 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn reconcile_scheduled_work(&self, desired: &[DesiredSubject]) -> Result<()> {
+        self.incremental.observe(&self.store)?;
+        let full =
+            !self.skip_unneeded || self.incremental.take_full_pass("schedule-work", now_ms());
         let schedules = desired
             .iter()
             .filter(|item| item.kind == "schedule")
@@ -11955,11 +12025,30 @@ impl<R: RuntimeControl> Reconciler<R> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|subject, _| schedules.contains(subject.as_str()));
+        let mut active = BTreeSet::new();
         for schedule in desired.iter().filter(|item| item.kind == "schedule") {
-            self.isolate("schedule-work", &schedule.subject, || {
-                self.reconcile_schedule_work(schedule)
-            });
+            let item = format!("schedule-work:{}", schedule.subject);
+            active.insert(item.clone());
+            let context = {
+                // Retry state can change without an append record. Fingerprint its current
+                // request/deadline alongside the declaration, releasing this lock before
+                // evaluation. Unchanged retries still rely on their recorded due time.
+                let retries = self
+                    .schedule_workspace_retries
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                self.incremental
+                    .observe_context(&item, &(schedule, retries.get(&schedule.subject)))
+            };
+            self.reconcile_selected_intake(
+                "schedule-work",
+                &item,
+                &schedule.subject,
+                !full && context,
+                || self.reconcile_schedule_work(schedule),
+            );
         }
+        self.incremental.retain("schedule-work:", &active);
         Ok(())
     }
 
@@ -12142,7 +12231,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             };
             let run = match created {
                 Ok(run) => run,
-                Err(error) if error.code == "mission-run-capacity" => continue,
+                Err(error) if error.code == "mission-run-capacity" => {
+                    // Capacity policy can reload without an append-feed record. Keep the
+                    // existing run-state dependency and a clock retry for that case too.
+                    smallclaims::touched::note_due(now_ms().saturating_add(DEADLINE_SOURCE_RETRY_MS));
+                    continue;
+                }
                 Err(error) if start_waits_for_replication(&error) => {
                     waiting.push(format!("request {}: {error}", request.id));
                     continue;
@@ -12739,6 +12833,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         desired: &[DesiredSubject],
         agents: &[DesiredSubject],
     ) -> Result<()> {
+        self.incremental.observe(&self.store)?;
+        let full = !self.skip_unneeded || self.incremental.take_full_pass("observer", now_ms());
         let observer_resources = desired
             .iter()
             .filter(|item| item.kind == "observer")
@@ -12784,15 +12880,36 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })
                 .collect::<Vec<_>>(),
         );
+        let workspaces_known = self
+            .incremental
+            .observe_context("observer-workspaces", agent_workspaces.as_ref());
+        let mut active = BTreeSet::new();
         for observer in desired.iter().filter(|item| item.kind == "observer") {
-            self.isolate("observer", &observer.subject, || {
-                self.reconcile_resource_observer(
-                    observer,
-                    &subscriptions_by_resource,
-                    &agent_workspaces,
-                )
-            });
+            let item = format!("observer:{}", observer.subject);
+            active.insert(item.clone());
+            let resource = crate::graph::observer_spec(&observer.desired).map(|spec| spec.resource);
+            let selected = resource
+                .as_ref()
+                .and_then(|resource| subscriptions_by_resource.get(resource));
+            let context = self
+                .incremental
+                .observe_context(&item, &(observer, selected));
+            self.reconcile_selected_intake(
+                "observer",
+                &item,
+                &observer.subject,
+                !full && context && workspaces_known,
+                || {
+                    smallclaims::touched::note_read(|| "observer-workspaces".into());
+                    self.reconcile_resource_observer(
+                        observer,
+                        &subscriptions_by_resource,
+                        &agent_workspaces,
+                    )
+                },
+            );
         }
+        self.incremental.retain("observer:", &active);
         Ok(())
     }
 
@@ -12914,13 +13031,23 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             let mut armed = self.armed_observers.lock().unwrap_or_else(PoisonError::into_inner);
             armed.retain(|key| !key.starts_with(&operation_prefix) || key.starts_with(&cadence_prefix));
-            if armed.iter().any(|key| key.starts_with(&cadence_prefix)) { return Ok(()); }
+            if armed.iter().any(|key| key.starts_with(&cadence_prefix)) {
+                // Preserve future timer discovery, but consume an elapsed deadline while the
+                // existing arm/provider owns progress. Its completion signals a fresh pass
+                // and records the next cadence or retry deadline.
+                if next_check > now_ms() {
+                    smallclaims::touched::note_due(next_check);
+                }
+                return Ok(());
+            }
             armed.insert(operation.clone());
         }
+        smallclaims::touched::note_due(next_check);
         let store = self.store.clone();
         let provider = self.resource_provider.clone();
         let notify = self.notify.clone();
         let event_notify = self.event_notify.clone();
+        let incremental = self.incremental.clone();
         let armed = self.armed_observers.clone();
         #[cfg(test)]
         let completion_fault = self.fault_injection.clone();
@@ -12969,6 +13096,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&operation);
+                    incremental.intake_completed(&format!("observer:{observer_subject}"));
                     signal_changed(&notify, &event_notify);
                     return;
                 }
@@ -12997,6 +13125,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if !current()
                     || store.selected_desired_revision(&observer_subject).ok().flatten().as_deref() != Some(revision.as_str()) {
                     armed.lock().unwrap_or_else(PoisonError::into_inner).remove(&operation);
+                    incremental.intake_completed(&format!("observer:{observer_subject}"));
                     signal_changed(&notify, &event_notify);
                     return;
                 }
@@ -13158,6 +13287,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if let Some(injection) = &completion_fault {
                     injection.fault("observer-completion-finished", &observer_subject);
                 }
+                incremental.intake_completed(&format!("observer:{observer_subject}"));
                 signal_changed(&notify, &event_notify);
             });
         } else {
@@ -15924,6 +16054,7 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     mod channel_recovery;
+    mod changed_intake;
     mod differential;
     mod first_readiness_tests;
     mod github_watch_selection;
@@ -23815,6 +23946,15 @@ schedule "{name}" {{
 
     #[tokio::test]
     async fn scheduled_work_waits_for_an_available_workspace() {
+        scheduled_work_workspace_recovery(false).await;
+    }
+
+    #[tokio::test]
+    async fn scheduled_work_workspace_retry_changes_select_skipped_items() {
+        scheduled_work_workspace_recovery(true).await;
+    }
+
+    async fn scheduled_work_workspace_recovery(skip_unneeded: bool) {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let revision = scheduled_mission_revision(&store);
         let root = tempfile::tempdir().unwrap();
@@ -23835,7 +23975,8 @@ schedule "{name}" {{
             Arc::new(FakeRuntime::default()),
             "node".into(),
             Arc::new(Notify::new()),
-        );
+        )
+        .skipping_unneeded(skip_unneeded);
         reconciler.reconcile_once().unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         reconciler.reconcile_once().unwrap();

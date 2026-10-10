@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Select observer and schedule reconciliation by fresh context, dependencies and deadlines",
+  "replay": {
+    "status": "none",
+    "detail": "No claim or projection replay. Change-feed rows are dependency hints, not ordered transition replay or a mutation certificate."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Uses existing claim/local-observation indexes; no DDL, schema, migration or durable cursor change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Admission, canonical ordering, checkpoint rules, source capture and effect authority are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Clean observer and schedule items skip evaluation SQL and do not publish fault recovery. New/changed declaration contexts, recorded dependencies and clock deadlines select work; actual evaluated results retain existing reporting and effect checks. Schedule capacity refusal records a retry for policy reloads without claim writes. Future armed timer deadlines remain discoverable; elapsed deadlines are consumed while an existing observer/schedule arm owns progress, and its completion notification retains cadence/retry progress. Observer/schedule arm completions mark their own intake items even without an appended claim; overlapping completion marks survive selected evaluation recording."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional interruption beyond a normal binary swap; no deployment is implied by this source change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Existing incremental-off behavior and 60-second full safety passes remain. No new configuration, rate or performance-budget relaxation."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Restart, decreasing append frontiers, invalid JSON, SQL errors, oversized discovery or dependency fanout conservatively require reevaluation. Nonempty append hints are read at one snapshot. Copied hints are capped at 256 rows and 1 MiB of SQLite-encoded payload, with at most 257 metadata rows per stream; Direct-column octet_length/typeof probes admit text identities/body and text-or-null actors before payload copying, without a cast that loads overflow content. Metadata header/page I/O and historical work still have cost limits. Key production passes borrowed prefix/value parts and charges before formatting/cloning: at most4096 keys,4096 UTF-8 bytes per key and1MiB cumulative key/affected-item-name bytes per discovery; fanout stops at1024 reader visits before global invalidation; each fresh context fingerprint caps serialization at 1 MiB, stored keys at 4096 bytes and contexts at 4096 entries. No new dirty queue or writer work is introduced. Complete roster reads, raw desired membership sensors, complete active-run cache membership and fresh effect fences remain independent. These hints have no epoch, deletion or OLD-image certificate: physical mutations at unchanged frontiers outside fresh roster/context inputs retain the periodic full fallback. Inventory traversal, historical authority folds, broad invalidations and full fallback remain expensive; no under-500 full-pass or production savings result is established. Context fingerprints cover freshly supplied pass-start slices, not refreshed inputs inside each evaluation; subsequent pass contexts and conservative repeat/full fallback remain necessary. Completion versions occupy one integer per retained item with no completion queue; missing or exhausted state conservatively invalidates retained work. Schedule-work context includes the current workspace retry request/deadline, so a cache-only retry change selects its item while unchanged retries retain their clock deadline; this introduces no new retry timer or filesystem polling."
+  }
+}

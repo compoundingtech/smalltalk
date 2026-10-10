@@ -14,6 +14,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use serde_json::Value;
+use sha2::Digest as _;
 
 use crate::store::{Change, Store};
 
@@ -27,6 +28,8 @@ pub struct Incremental {
 struct State {
     /// The change feed's watermark; `None` until the first pass, which evaluates every item.
     watermark: Option<(u64, i64)>,
+    /// Constant-time conservative invalidation when discovery or fanout exceeds its budget.
+    generation: u64,
     items: HashMap<String, Item>,
     /// Which items read each key.
     readers: HashMap<String, BTreeSet<String>>,
@@ -38,71 +41,175 @@ struct State {
     ptys: Option<HashMap<String, String>>,
     /// The last value seen for each key observed by value, such as `live-workspaces`.
     values: HashMap<String, String>,
+    /// Bounded fingerprints of fresh declaration/context inputs, never authority answers.
+    contexts: HashMap<String, [u8; 32]>,
     /// When each polled key (such as a terminal's screen) was last looked at.
     polled_at: HashMap<String, u128>,
 }
 
 /// How often a pass evaluates every item even when nothing marked them, counting what it corrects.
 pub const FULL_PASS_INTERVAL_MS: u128 = 60_000;
+const CONTEXT_KEYS: usize = 4096;
+const CONTEXT_KEY_BYTES: usize = 4096;
+const CONTEXT_BYTES: usize = 1024 * 1024;
+
+struct ContextDigest {
+    hash: sha2::Sha256,
+    remaining: usize,
+}
+
+impl std::io::Write for ContextDigest {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(std::io::Error::other(
+                "reconcile context exceeds byte budget",
+            ));
+        }
+        self.hash.update(bytes);
+        self.remaining -= bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 struct Item {
     reads: BTreeSet<String>,
     due: Option<u128>,
     dirty: bool,
+    generation: u64,
+    /// Async intake completion can arrive while a selected evaluation records its reads.
+    completion: u64,
 }
 
 /// The keys a change can affect: its subject, its actor's work, its kind, and for some kinds a
 /// key a read notes for subjects it cannot name in advance.
 pub fn change_keys(change: &Change) -> Vec<String> {
-    let mut keys = vec![change.subject.clone(), format!("kind:{}", change.kind)];
-    if let Some(actor) = &change.actor {
-        keys.push(format!("actor:{actor}"));
+    let body = serde_json::from_str::<Value>(&change.body).ok();
+    let mut keys = Vec::new();
+    visit_change_keys(change, body.as_ref(), |prefix, value| {
+        keys.push(format!("{prefix}{value}"));
+        true
+    });
+    keys
+}
+
+const CHANGE_KEYS: usize = 4096;
+const CHANGE_KEY_BYTES: usize = 1024 * 1024;
+const CHANGE_KEY_MAX_BYTES: usize = 4096;
+
+struct KeyBudget {
+    remaining_keys: usize,
+    remaining_bytes: usize,
+}
+impl KeyBudget {
+    fn admit(&mut self, prefix: &str, value: &str) -> bool {
+        let Some(bytes) = prefix.len().checked_add(value.len()) else {
+            return false;
+        };
+        if self.remaining_keys == 0 || bytes > CHANGE_KEY_MAX_BYTES || bytes > self.remaining_bytes
+        {
+            return false;
+        }
+        self.remaining_keys -= 1;
+        self.remaining_bytes -= bytes;
+        true
     }
-    let field = |name: &str| -> Option<String> {
-        let body: Value = serde_json::from_str(&change.body).ok()?;
+}
+
+/// The visitor passes borrowed parts, so refusal precedes ALL key formatting/cloning. Parsed
+/// JSON remains separately covered by the feed byte cap. An incomplete expansion may only
+/// trigger conservative global invalidation, never application of its partial keys.
+fn bounded_change_keys(change: &Change, budget: &mut KeyBudget) -> Result<(Vec<String>, bool)> {
+    if budget.remaining_keys == 0
+        || change.subject.len() > CHANGE_KEY_MAX_BYTES
+        || change.subject.len() > budget.remaining_bytes
+    {
+        return Ok((Vec::new(), false));
+    }
+    let body: Value = serde_json::from_str(&change.body)?;
+    let mut keys = Vec::new();
+    let complete = visit_change_keys(change, Some(&body), |prefix, value| {
+        if !budget.admit(prefix, value) {
+            return false;
+        }
+        keys.push(format!("{prefix}{value}"));
+        true
+    });
+    Ok((keys, complete))
+}
+
+fn visit_change_keys(
+    change: &Change,
+    body: Option<&Value>,
+    mut visit: impl FnMut(&str, &str) -> bool,
+) -> bool {
+    let mut agent = false;
+    let mut emit = |prefix: &str, value: &str| {
+        agent |= prefix.is_empty() && value.starts_with("agent/");
+        visit(prefix, value)
+    };
+    if !emit("", &change.subject) || !emit("kind:", &change.kind) {
+        return false;
+    }
+    if let Some(actor) = &change.actor
+        && !emit("actor:", actor)
+    {
+        return false;
+    }
+    let field = |name: &str| -> Option<&str> {
+        let body = body?;
         body.get("fields")
-            .unwrap_or(&body)
+            .unwrap_or(body)
             .get(name)
             .and_then(Value::as_str)
-            .map(str::to_owned)
     };
-    match change.kind.as_str() {
-        "message.sent" => keys.extend(field("to").map(|to| format!("mailbox:{to}"))),
-        "mission-run.created" => {
-            keys.extend(field("root_mission_run").map(|root| format!("children:{root}")));
-            keys.extend(field("parent_step_run").map(|step| format!("children-of-step:{step}")));
+    let fields: &[(&str, &str)] = match change.kind.as_str() {
+        "message.sent" => &[("to", "mailbox:")],
+        "mission-run.created" => &[
+            ("root_mission_run", "children:"),
+            ("parent_step_run", "children-of-step:"),
+        ],
+        "intent.desired" => &[
+            ("owner_run", "owned:"),
+            ("owner_step", "owned-step:"),
+            ("previous_owner_step", "owned-step:"),
+            ("previous_owner_generation", ""),
+            ("owner_generation", ""),
+        ],
+        "run-generation.created" => &[("run", "generations:")],
+        "subscription.mission-started" => &[("mission_run", "subscription-run:")],
+        _ => &[],
+    };
+    for (name, prefix) in fields {
+        if let Some(value) = field(name)
+            && !emit(prefix, value)
+        {
+            return false;
         }
-        "owned-set.revised" => {
-            keys.push("kind:intent.desired".into());
-            if let Ok(body) = serde_json::from_str::<Value>(&change.body) {
-                for map in ["members", "retired"] {
-                    if let Some(members) = body["fields"]["body"][map].as_object() {
-                        keys.extend(members.keys().cloned());
+    }
+    if change.kind == "owned-set.revised" {
+        if !emit("", "kind:intent.desired") {
+            return false;
+        }
+        if let Some(body) = body {
+            for map in ["members", "retired"] {
+                if let Some(members) = body["fields"]["body"][map].as_object() {
+                    for key in members.keys() {
+                        if !emit("", key) {
+                            return false;
+                        }
                     }
                 }
             }
         }
-        "intent.desired" => {
-            keys.extend(field("owner_run").map(|run| format!("owned:{run}")));
-            keys.extend(field("owner_step").map(|step| format!("owned-step:{step}")));
-            keys.extend(field("previous_owner_step").map(|step| format!("owned-step:{step}")));
-            keys.extend(field("previous_owner_generation"));
-            keys.extend(field("owner_generation"));
-        }
-        "run-generation.created" => {
-            keys.extend(field("run").map(|run| format!("generations:{run}")));
-        }
-        "subscription.mission-started" => {
-            keys.extend(field("mission_run").map(|run| format!("subscription-run:{run}")));
-        }
-        _ => {}
     }
-    if matches!(change.kind.as_str(), "intent.desired" | "owned-set.revised")
-        && keys.iter().any(|key| key.starts_with("agent/"))
-    {
-        keys.push("desired-kind:agent".into());
+    if matches!(change.kind.as_str(), "intent.desired" | "owned-set.revised") && agent {
+        return visit("", "desired-kind:agent");
     }
-    keys
+    true
 }
 
 impl Incremental {
@@ -113,23 +220,94 @@ impl Incremental {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some((index, local)) = state.watermark else {
-            let feed = store.changes_since(i64::MAX as u64, i64::MAX)?;
+            let feed = match store.reconcile_changes_since(i64::MAX as u64, i64::MAX) {
+                Ok(observed) => observed.feed,
+                Err(error) => {
+                    Self::invalidate_locked(&mut state);
+                    return Err(error);
+                }
+            };
             state.watermark = Some((feed.index, feed.local));
             return Ok(());
         };
-        let feed = store.changes_since(index, local)?;
+        let observed = match store.reconcile_changes_since(index, local) {
+            Ok(observed) => observed,
+            Err(error) => {
+                Self::invalidate_locked(&mut state);
+                return Err(error);
+            }
+        };
+        let feed = observed.feed;
         state.watermark = Some((feed.index, feed.local));
-        let State { items, readers, .. } = &mut *state;
-        for change in &feed.changes {
-            for key in change_keys(change) {
-                for item in readers.get(&key).into_iter().flatten() {
-                    if let Some(item) = items.get_mut(item) {
-                        item.dirty = true;
+        if observed.invalidate_all {
+            Self::invalidate_locked(&mut state);
+            return Ok(());
+        }
+        // Bound discovery expansion, including a single owned-set receipt's large membership
+        // and a widely shared dependency. No partial fanout is allowed to stand as clean.
+        let mut key_budget = KeyBudget {
+            remaining_keys: CHANGE_KEYS,
+            remaining_bytes: CHANGE_KEY_BYTES,
+        };
+        let mut readers_seen = 0_usize;
+        let mut affected = BTreeSet::new();
+        let mut overflow = false;
+        'changes: for change in &feed.changes {
+            let (keys, complete) = match bounded_change_keys(change, &mut key_budget) {
+                Ok(expanded) => expanded,
+                Err(_) => {
+                    overflow = true;
+                    break;
+                }
+            };
+            if !complete {
+                overflow = true;
+                break;
+            }
+            for key in keys {
+                for item in state.readers.get(&key).into_iter().flatten() {
+                    readers_seen += 1;
+                    if readers_seen > 1024 {
+                        overflow = true;
+                        break 'changes;
+                    }
+                    if !affected.contains(item) {
+                        // Share the byte allowance with copied affected item names. A large
+                        // retained reader key cannot bypass the bounded discovery allocation.
+                        if item.len() > key_budget.remaining_bytes {
+                            overflow = true;
+                            break 'changes;
+                        }
+                        key_budget.remaining_bytes -= item.len();
+                        affected.insert(item.clone());
                     }
                 }
             }
         }
+        if overflow {
+            Self::invalidate_locked(&mut state);
+        } else {
+            for item in affected {
+                if let Some(item) = state.items.get_mut(&item) {
+                    item.dirty = true;
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn invalidate_locked(state: &mut State) {
+        // A wrapped generation could equal an ancient item's generation. Clearing only at
+        // that impossible-in-practice boundary preserves the conservative contract too.
+        if let Some(next) = state.generation.checked_add(1) {
+            state.generation = next;
+        } else {
+            state.items.clear();
+            state.readers.clear();
+            state.generation = 0;
+        }
+        // Generation mismatch already selects every retained item. Keep the periodic safety
+        // clock: after those reads succeed, there is no second forced inventory evaluation.
     }
 
     /// Mark the items that read `key`, for a change that is not a claim, such as a watched file.
@@ -139,6 +317,55 @@ impl Incremental {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         Self::mark_locked(&mut state, key);
+    }
+
+    /// Mark only this retained intake item when an arm completes, including completion with
+    /// no claim write. No completion queue is allocated. Missing/overflowed state conservatively
+    /// invalidates retained work, including a first arm that finishes before its first evaluation.
+    pub(crate) fn intake_completed(&self, item: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = state.items.get_mut(item)
+            && let Some(next) = cached.completion.checked_add(1)
+        {
+            cached.completion = next;
+            cached.dirty = true;
+            return;
+        }
+        Self::invalidate_locked(&mut state);
+    }
+
+    pub(crate) fn intake_completion_token(&self, item: &str) -> (u64, Option<u64>) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            state.generation,
+            state.items.get(item).map(|item| item.completion),
+        )
+    }
+
+    /// A successful generic evaluation clears dirty. Preserve a completion that overlapped
+    /// this consumer's evaluation instead of silently consuming its notification/retry progress.
+    /// Other item/effect evaluators keep their existing behavior.
+    pub(crate) fn retain_intake_completion(&self, item: &str, before: (u64, Option<u64>)) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let changed = state.generation != before.0
+            || before.1.is_some_and(|version| {
+                state
+                    .items
+                    .get(item)
+                    .is_none_or(|item| item.completion != version)
+            });
+        if changed && let Some(cached) = state.items.get_mut(item) {
+            cached.dirty = true;
+        }
     }
 
     /// Whether this pass must evaluate every item of `section`: the first since a start, or the
@@ -207,6 +434,34 @@ impl Incremental {
         }
     }
 
+    /// Fingerprint fresh inputs without building a serialized copy. Oversized, unencodable,
+    /// or unretained contexts always select their readers; no partial fingerprint is cached.
+    /// This catches old/new declaration and auxiliary-input changes, not hidden DB mutations.
+    pub(crate) fn observe_context(&self, key: &str, value: &impl serde::Serialize) -> bool {
+        let mut digest = ContextDigest {
+            hash: sha2::Sha256::new(),
+            remaining: CONTEXT_BYTES,
+        };
+        let encoded = serde_json::to_writer(&mut digest, value).is_ok();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !encoded
+            || key.len() > CONTEXT_KEY_BYTES
+            || (!state.contexts.contains_key(key) && state.contexts.len() >= CONTEXT_KEYS)
+        {
+            Self::mark_locked(&mut state, key);
+            return false;
+        }
+        let digest: [u8; 32] = digest.hash.finalize().into();
+        if state.contexts.get(key) != Some(&digest) {
+            state.contexts.insert(key.to_owned(), digest);
+            Self::mark_locked(&mut state, key);
+        }
+        true
+    }
+
     /// Remember what an evaluation saw for a polled key, so a later poll marks its readers only
     /// when the value changes from that.
     pub fn saw_value(&self, key: &str, value: String, now: u128) {
@@ -260,6 +515,14 @@ impl Incremental {
     }
 
     fn mark_locked(state: &mut State, key: &str) {
+        if state
+            .readers
+            .get(key)
+            .is_some_and(|items| items.len() > 1024)
+        {
+            Self::invalidate_locked(state);
+            return;
+        }
         let State { items, readers, .. } = state;
         for item in readers.get(key).into_iter().flatten() {
             if let Some(item) = items.get_mut(item) {
@@ -350,10 +613,11 @@ impl Incremental {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
-            .items
-            .get(item)
-            .is_none_or(|item| item.dirty || item.due.is_some_and(|due| due <= now))
+        state.items.get(item).is_none_or(|item| {
+            item.generation != state.generation
+                || item.dirty
+                || item.due.is_some_and(|due| due <= now)
+        })
     }
 
     /// Remember what `item`'s evaluation read and when its result could next change with time.
@@ -362,6 +626,8 @@ impl Incremental {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = state.generation;
+        let completion = state.items.get(item).map_or(0, |item| item.completion);
         let State { items, readers, .. } = &mut *state;
         if let Some(previous) = items.get(item) {
             for key in &previous.reads {
@@ -385,6 +651,8 @@ impl Incremental {
                 reads,
                 due,
                 dirty: false,
+                generation,
+                completion,
             },
         );
     }
@@ -395,6 +663,9 @@ impl Incremental {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .contexts
+            .retain(|key, _| !key.starts_with(prefix) || active.contains(key));
         let gone = state
             .items
             .keys()
@@ -468,6 +739,427 @@ pub fn step_due(step: &crate::model::StepRunView, now: u128) -> Option<u128> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fresh_contexts_select_both_old_and_new_dependencies_and_rebirth_is_new() {
+        let incremental = Incremental::default();
+        for name in ["observer:a", "observer:b"] {
+            assert!(incremental.observe_context(name, &"initial"));
+            incremental.evaluated(name, BTreeSet::from([name.to_owned()]), None);
+        }
+        assert!(incremental.observe_context("observer:a", &"initial"));
+        assert!(!incremental.needs("observer:a", 0));
+        for name in ["observer:a", "observer:b"] {
+            assert!(incremental.observe_context(name, &"subscription moved"));
+            assert!(
+                incremental.needs(name, 0),
+                "old and new contexts both change"
+            );
+        }
+        incremental.retain("observer:", &BTreeSet::from(["observer:b".into()]));
+        assert!(incremental.observe_context("observer:a", &"initial"));
+        assert!(
+            incremental.needs("observer:a", 0),
+            "removed item cannot reuse a prior evaluation"
+        );
+        assert!(
+            !incremental.reads_of("observer:b").is_empty(),
+            "complete membership retains untouched item"
+        );
+    }
+
+    #[test]
+    fn unknown_contexts_are_never_retained_as_clean_and_storage_is_bounded() {
+        let incremental = Incremental::default();
+        incremental.evaluated("observer:a", BTreeSet::from(["observer:a".into()]), None);
+        assert!(!incremental.observe_context("observer:a", &"x".repeat(CONTEXT_BYTES + 1)));
+        assert!(incremental.needs("observer:a", 0));
+        assert!(incremental.state.lock().unwrap().contexts.is_empty());
+        assert!(!incremental.observe_context(&"k".repeat(CONTEXT_KEY_BYTES + 1), &1));
+        assert!(incremental.state.lock().unwrap().contexts.is_empty());
+        for n in 0..CONTEXT_KEYS {
+            assert!(incremental.observe_context(&format!("context:{n}"), &n));
+        }
+        incremental.evaluated("overflow", BTreeSet::from(["overflow".into()]), None);
+        assert!(!incremental.observe_context("overflow", &1));
+        assert!(incremental.needs("overflow", 0));
+        assert_eq!(
+            incremental.state.lock().unwrap().contexts.len(),
+            CONTEXT_KEYS
+        );
+        incremental.retain("context:", &BTreeSet::new());
+        assert!(incremental.observe_context("overflow", &1));
+    }
+
+    #[test]
+    fn shared_dependency_overflow_invalidates_even_unvisited_items_without_a_second_full_pass() {
+        let incremental = Incremental::default();
+        assert!(incremental.take_full_pass("observer", 0));
+        for n in 0..1025 {
+            incremental.evaluated(
+                &format!("observer:{n}"),
+                BTreeSet::from(["shared".into()]),
+                None,
+            );
+        }
+        incremental.evaluated("otherwise-unrelated", BTreeSet::new(), None);
+        incremental.touch("shared");
+        for name in ["observer:0", "observer:1024", "otherwise-unrelated"] {
+            assert!(incremental.needs(name, 0));
+        }
+        assert!(!incremental.take_full_pass("observer", 1));
+        incremental.evaluated("otherwise-unrelated", BTreeSet::new(), Some(10));
+        assert!(!incremental.needs("otherwise-unrelated", 9));
+        assert!(incremental.needs("otherwise-unrelated", 10));
+    }
+
+    #[test]
+    fn append_discovery_fanout_overflow_selects_items_beyond_the_traversal_budget() {
+        let store = Store::open_memory("node").unwrap();
+        let incremental = Incremental::default();
+        incremental.observe(&store).unwrap();
+        for n in 0..1025 {
+            incremental.evaluated(
+                &format!("reader:{n}"),
+                BTreeSet::from(["kind:resource.observed".into()]),
+                None,
+            );
+        }
+        incremental.evaluated("otherwise-unrelated", BTreeSet::new(), None);
+        observe(&store, "changed");
+        incremental.observe(&store).unwrap();
+        for name in ["reader:0", "reader:1024", "otherwise-unrelated"] {
+            assert!(incremental.needs(name, 0));
+        }
+    }
+
+    #[test]
+    fn one_large_membership_receipt_stops_materialization_and_invalidates_all_readers() {
+        let members = (0..4200)
+            .map(|n| {
+                (
+                    format!("agent/{n:04}"),
+                    serde_json::json!({
+                        "kind":"agent", "claim":"a".repeat(64), "revision":"b".repeat(64)
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<String, Value>>();
+        let mut receipt = serde_json::json!({"fields":{"revision":"c".repeat(64), "body":{
+            "previous":null, "source":{"repository":"acme/repo", "ref":"refs/heads/main",
+                "sha":"d".repeat(40), "sequence":1},
+            "bundle_digest":"e".repeat(64), "members":members, "retired":{}, "adoptions":{}
+        }}});
+        let revision: crate::store::owned_sets::Revision =
+            serde_json::from_value(receipt["fields"]["body"].clone()).unwrap();
+        receipt["fields"]["revision"] =
+            Value::String(smallclaims::hash::canonical_hash(&revision).unwrap());
+        let large = change(
+            "owned-set/large",
+            "owned-set.revised",
+            None,
+            &receipt.to_string(),
+        );
+        assert!(large.body.len() + large.subject.len() + large.kind.len() < 1024 * 1024);
+        let (keys, complete) =
+            bounded_change_keys(&large, &mut budget(4096, CHANGE_KEY_BYTES)).unwrap();
+        assert!(!complete);
+        assert_eq!(
+            keys.len(),
+            4096,
+            "no cloned membership suffix beyond the budget"
+        );
+        assert!(!keys.contains(&"agent/4199".to_owned()));
+        let (empty, complete) =
+            bounded_change_keys(&large, &mut budget(0, CHANGE_KEY_BYTES)).unwrap();
+        assert!(!complete && empty.is_empty());
+        // The same producer retains every old key for a small, fully expanded receipt, and
+        // the boundary is inclusive rather than silently truncating the final agent-kind key.
+        let small = change_keys(&change(
+            "owned-set/small",
+            "owned-set.revised",
+            None,
+            r#"{"fields":{"body":{"members":{"agent/a":{}},"retired":{"agent/b":{}}}}}"#,
+        ));
+        let small_change = change(
+            "owned-set/small",
+            "owned-set.revised",
+            None,
+            r#"{"fields":{"body":{"members":{"agent/a":{}},"retired":{"agent/b":{}}}}}"#,
+        );
+        assert_eq!(
+            small,
+            [
+                "owned-set/small",
+                "kind:owned-set.revised",
+                "kind:intent.desired",
+                "agent/a",
+                "agent/b",
+                "desired-kind:agent"
+            ]
+            .map(str::to_owned)
+        );
+        assert_eq!(
+            bounded_change_keys(&small_change, &mut budget(small.len(), CHANGE_KEY_BYTES)).unwrap(),
+            (small.clone(), true)
+        );
+        assert!(
+            !bounded_change_keys(
+                &small_change,
+                &mut budget(small.len() - 1, CHANGE_KEY_BYTES)
+            )
+            .unwrap()
+            .1
+        );
+
+        let store = Store::open_memory("node").unwrap();
+        let incremental = Incremental::default();
+        incremental.observe(&store).unwrap();
+        for (name, dependency) in [
+            ("visited", "agent/0000"),
+            ("unvisited", "agent/4199"),
+            ("unrelated", "doc/elsewhere"),
+        ] {
+            incremental.evaluated(name, BTreeSet::from([dependency.into()]), None);
+        }
+        // Reader-only injection of a receipt-shaped hint. This exercises the actual bounded
+        // discovery path, not admission, member-reference eligibility or replication proof.
+        store.connection.write().execute(
+            "INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+                VALUES(0,?1,?2,?3,1)",
+            rusqlite::params![large.subject, large.kind, large.body],
+        ).unwrap();
+        let observed = store.reconcile_changes_since(0, 0).unwrap();
+        assert!(
+            !observed.invalidate_all && observed.feed.changes.len() == 1,
+            "the key cap, not the row/byte cap, must select the fallback"
+        );
+        incremental.observe(&store).unwrap();
+        for name in ["visited", "unvisited", "unrelated"] {
+            assert!(incremental.needs(name, 0));
+        }
+    }
+
+    #[test]
+    fn key_admission_is_before_prefix_construction_and_cumulative_across_changes() {
+        let huge = "x".repeat(32_768);
+        let first = change(
+            "agent/a",
+            "intent.desired",
+            Some(&huge),
+            &serde_json::json!({"fields":{"owner_step":huge}}).to_string(),
+        );
+        let mut emitted = Vec::new();
+        let body: Value = serde_json::from_str(&first.body).unwrap();
+        assert!(!visit_change_keys(&first, Some(&body), |prefix, value| {
+            // Exactly one borrowed subject is allowed. The next borrowed kind is refused;
+            // neither the huge actor nor the huge prefixed field can be reached/constructed.
+            if !emitted.is_empty() {
+                return false;
+            }
+            assert!(prefix.is_empty());
+            assert_eq!(value.as_ptr(), first.subject.as_ptr());
+            emitted.push(value.to_owned());
+            true
+        }));
+        assert_eq!(emitted, ["agent/a"]);
+        let (keys, complete) =
+            bounded_change_keys(&first, &mut budget(2, CHANGE_KEY_BYTES)).unwrap();
+        assert!(!complete);
+        assert_eq!(keys, ["agent/a", "kind:intent.desired"]);
+
+        let a = change(
+            "message/a",
+            "message.sent",
+            None,
+            r#"{"fields":{"to":"agent/a"}}"#,
+        );
+        let b = change(
+            "message/b",
+            "message.sent",
+            None,
+            r#"{"fields":{"to":"agent/b"}}"#,
+        );
+        let expected = ["message/a", "kind:message.sent", "mailbox:agent/a"];
+        let bytes = expected.iter().map(|key| key.len()).sum::<usize>();
+        let mut allowance = budget(6, bytes);
+        let (keys, complete) = bounded_change_keys(&a, &mut allowance).unwrap();
+        assert!(complete);
+        assert_eq!(keys, expected);
+        assert_eq!(allowance.remaining_bytes, 0);
+        let (keys, complete) = bounded_change_keys(&b, &mut allowance).unwrap();
+        assert!(
+            !complete && keys.is_empty(),
+            "no formatting after cumulative byte exhaustion"
+        );
+        let mut allowance = budget(3, CHANGE_KEY_BYTES);
+        assert!(bounded_change_keys(&a, &mut allowance).unwrap().1);
+        let (keys, complete) = bounded_change_keys(&b, &mut allowance).unwrap();
+        assert!(
+            !complete && keys.is_empty(),
+            "no cloning after cumulative count exhaustion"
+        );
+        let mut allowance = budget(6, bytes * 2);
+        assert!(bounded_change_keys(&a, &mut allowance).unwrap().1);
+        assert!(bounded_change_keys(&b, &mut allowance).unwrap().1);
+        assert_eq!(
+            (allowance.remaining_keys, allowance.remaining_bytes),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn cumulative_key_exhaustion_discards_the_partial_affected_set() {
+        let store = Store::open_memory("node").unwrap();
+        let incremental = Incremental::default();
+        incremental.observe(&store).unwrap();
+        for (item, key) in [
+            ("visited", "agent/0000"),
+            ("unvisited", "agent/9999"),
+            ("unrelated", "doc/unrelated"),
+        ] {
+            incremental.evaluated(item, BTreeSet::from([key.into()]), None);
+        }
+        let members = (0..300)
+            .map(|n| (format!("agent/{n:04}"), Value::Object(Default::default())))
+            .collect::<serde_json::Map<String, Value>>();
+        let body = serde_json::json!({"fields":{"body":{"members":members}}}).to_string();
+        assert!(body.len() * 14 < CHANGE_KEY_BYTES);
+        for _ in 0..14 {
+            store.connection.write().execute(
+                "INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+                    VALUES(0,'owned-set/cumulative','owned-set.revised',?1,1)", [&body],
+            ).unwrap();
+        }
+        assert!(
+            !store.reconcile_changes_since(0, 0).unwrap().invalidate_all,
+            "metadata admission must allow these small hints"
+        );
+        incremental.observe(&store).unwrap();
+        for item in ["visited", "unvisited", "unrelated"] {
+            assert!(incremental.needs(item, 0));
+        }
+        let state = incremental.state.lock().unwrap();
+        assert!(
+            state.items.values().all(|item| !item.dirty),
+            "global generation invalidation, not application of a partial affected set"
+        );
+        assert!(
+            state
+                .items
+                .values()
+                .all(|item| item.generation != state.generation)
+        );
+    }
+
+    #[test]
+    fn oversized_key_under_the_feed_cap_invalidates_all_before_key_allocation() {
+        let store = Store::open_memory("node").unwrap();
+        let incremental = Incremental::default();
+        incremental.observe(&store).unwrap();
+        let large = "agent/".to_owned() + &"x".repeat(CHANGE_KEY_MAX_BYTES);
+        let hint = change(
+            "owned-set/large-key",
+            "owned-set.revised",
+            None,
+            &serde_json::json!({"fields":{"body":{"members":{large.clone():{}}}}}).to_string(),
+        );
+        let (keys, complete) =
+            bounded_change_keys(&hint, &mut budget(CHANGE_KEYS, CHANGE_KEY_BYTES)).unwrap();
+        assert!(!complete);
+        assert_eq!(
+            keys,
+            [
+                "owned-set/large-key",
+                "kind:owned-set.revised",
+                "kind:intent.desired"
+            ]
+        );
+        for item in ["visited", "unvisited", "unrelated"] {
+            incremental.evaluated(item, BTreeSet::from([item.into()]), None);
+        }
+        store.connection.write().execute(
+            "INSERT INTO local_observations(after_store_index,subject,kind,body,observed_at_unix_ms)
+                VALUES(0,?1,?2,?3,1)", rusqlite::params![hint.subject,hint.kind,hint.body],
+        ).unwrap();
+        assert!(!store.reconcile_changes_since(0, 0).unwrap().invalidate_all);
+        incremental.observe(&store).unwrap();
+        for item in ["visited", "unvisited", "unrelated"] {
+            assert!(incremental.needs(item, 0));
+        }
+        // A too-large retained item name is refused before its affected-set clone as well.
+        incremental.evaluated(
+            &"z".repeat(CHANGE_KEY_BYTES + 1),
+            BTreeSet::from(["resource/tiny".into()]),
+            None,
+        );
+        incremental.evaluated("otherwise-clean", BTreeSet::new(), None);
+        observe(&store, "tiny");
+        incremental.observe(&store).unwrap();
+        assert!(incremental.needs("otherwise-clean", 0));
+    }
+
+    #[test]
+    fn appended_local_and_replicated_changes_use_the_same_conservative_selection() {
+        let store = Store::open_memory("node").unwrap();
+        let foreign = Store::open_memory("foreign").unwrap();
+        let incremental = Incremental::default();
+        incremental.observe(&store).unwrap();
+        for subject in ["resource/foreign", "resource/local", "resource/unrelated"] {
+            incremental.evaluated(subject, BTreeSet::from([subject.into()]), None);
+        }
+        observe(&foreign, "foreign");
+        store
+            .import_replication("foreign", &foreign.export_replication(0).unwrap())
+            .unwrap();
+        observe(&store, "local");
+        incremental.observe(&store).unwrap();
+        assert!(incremental.needs("resource/foreign", 0));
+        assert!(incremental.needs("resource/local", 0));
+        assert!(!incremental.needs("resource/unrelated", 0));
+    }
+
+    #[test]
+    fn byte_overflow_and_read_error_invalidate_all_without_advancing_an_error_cursor() {
+        let store = Store::open_memory("node").unwrap();
+        let incremental = Incremental::default();
+        incremental.observe(&store).unwrap();
+        incremental.evaluated("unrelated", BTreeSet::new(), None);
+        // Admitted, individually small observations cross only the combined byte cap.
+        for n in 0..130 {
+            store
+                .append_claim(&crate::model::ClaimInput {
+                    subject: format!("resource/large-{n}"),
+                    kind: "resource.observed".into(),
+                    actor: None,
+                    fields: std::collections::BTreeMap::from([
+                        ("kind".into(), Value::String("custom.st3.test".into())),
+                        (
+                            "facts".into(),
+                            serde_json::json!({"large":"x".repeat(8192)}),
+                        ),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        incremental.observe(&store).unwrap();
+        assert!(incremental.needs("unrelated", 0));
+        incremental.evaluated("unrelated", BTreeSet::new(), None);
+        let before = incremental.state.lock().unwrap().watermark;
+        store
+            .connection
+            .write()
+            .execute(
+                "ALTER TABLE local_observations RENAME TO unavailable_local",
+                [],
+            )
+            .unwrap();
+        assert!(incremental.observe(&store).is_err());
+        assert_eq!(incremental.state.lock().unwrap().watermark, before);
+        assert!(incremental.needs("unrelated", 0));
+    }
+    #[test]
     fn agent_collection_keys_ignore_message_declarations_and_cover_owned_set_members() {
         assert!(
             !super::change_keys(&change("message/m", "intent.desired", None, "{}"))
@@ -493,6 +1185,13 @@ mod tests {
     }
 
     use super::*;
+
+    fn budget(keys: usize, bytes: usize) -> KeyBudget {
+        KeyBudget {
+            remaining_keys: keys,
+            remaining_bytes: bytes,
+        }
+    }
 
     fn change(subject: &str, kind: &str, actor: Option<&str>, body: &str) -> Change {
         Change {
