@@ -60,6 +60,8 @@ use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_blobs;
+#[cfg(test)]
+mod terminal_gate_evidence;
 mod client_adapters;
 mod client_presence;
 mod client_v0;

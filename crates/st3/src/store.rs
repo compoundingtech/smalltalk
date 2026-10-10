@@ -142,6 +142,8 @@ pub use subagents::{
 #[cfg(test)]
 mod checkpoint_agreement_tests;
 #[cfg(test)]
+pub(crate) mod terminal_gate_evidence;
+#[cfg(test)]
 mod checkpoint_tests;
 #[cfg(test)]
 mod checkpoint_capture_epoch_tests;
