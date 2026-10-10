@@ -103,9 +103,10 @@ export const SameRowsDuringPress: Story = { play: async ({ canvasElement }) => {
 } }
 export const SameRowsDuringPressLight: Story = { ...SameRowsDuringPress, args: { scheme: 'light' } }
 
-/** A genuinely new row during the press still lets Retry take the click; the pill appears only after release. */
+/** A detached reader inside the pill band presses Retry; a new row reveals the pill only after release. */
 export const NewRowDuringPress: Story = { play: async ({ canvasElement }) => {
-  const { canvas, jump, retries } = await ready(canvasElement)
+  const { viewport, canvas, jump, retries } = await ready(canvasElement)
+  await readerScrollsUp(viewport, 20)
   await pressAcross(canvas.getByRole('button', { name: 'Retry' }), async () => {
     canvas.getByRole('button', { name: 'Append agent reply' }).click()
     await settleFrames()
@@ -133,16 +134,18 @@ export const SameRowsScrolledUp: Story = { play: async ({ canvasElement }) => {
 } }
 export const SameRowsScrolledUpLight: Story = { ...SameRowsScrolledUp, args: { scheme: 'light' } }
 
-async function readerScrollsUp(viewport: HTMLElement) {
-  viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -viewport.scrollHeight }))
-  viewport.scrollTop = 0
+async function readerScrollsUp(viewport: HTMLElement, by?: number) {
+  viewport.dispatchEvent(new WheelEvent('wheel', { deltaY: -(by ?? viewport.scrollHeight) }))
+  viewport.scrollTop = by === undefined ? 0 : viewport.scrollTop - by
+  viewport.dispatchEvent(new Event('scroll'))
   await settleFrames()
 }
 const pointer = (target: Element, type: 'pointerdown' | 'pointerup', pointerId: number, pointerType: 'mouse' | 'touch') => target.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, composed: true, pointerId, pointerType, isPrimary: pointerType === 'mouse', button: 0, buttons: type === 'pointerdown' ? 1 : 0, width: 1, height: 1, pressure: type === 'pointerdown' ? 0.5 : 0 }))
 
 /** A press whose release the page never sees (the window blurs) does not keep the pill hidden. */
 export const BlurEndsPress: Story = { play: async ({ canvasElement }) => {
-  const { canvas, jump } = await ready(canvasElement)
+  const { viewport, canvas, jump } = await ready(canvasElement)
+  await readerScrollsUp(viewport, 20)
   pointer(canvas.getByRole('button', { name: 'Retry' }), 'pointerdown', 1, 'mouse')
   window.dispatchEvent(new Event('blur'))
   canvas.getByRole('button', { name: 'Append agent reply' }).click()
@@ -153,6 +156,7 @@ export const BlurEndsPressLight: Story = { ...BlurEndsPress, args: { scheme: 'li
 /** With two pointers down, releasing one keeps the pill still; the reveal waits for the last release. */
 export const SecondPointerHoldsDock: Story = { play: async ({ canvasElement }) => {
   const { viewport, canvas, jump } = await ready(canvasElement)
+  await readerScrollsUp(viewport, 20)
   const retry = canvas.getByRole('button', { name: 'Retry' })
   pointer(retry, 'pointerdown', 1, 'mouse')
   pointer(viewport, 'pointerdown', 2, 'touch')
