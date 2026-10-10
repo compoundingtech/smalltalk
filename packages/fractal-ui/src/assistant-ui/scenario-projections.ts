@@ -7,12 +7,20 @@ import { statuses, type AgentStatus, type SidebarAgentRow } from './sidebar/mode
 
 const decodeAgent = Native.decodeUnknownSync(Native.Agent, 'strict')
 const decodeAttention = Native.decodeUnknownSync(Native.Attention, 'strict')
+const decodeMessage = Native.decodeUnknownSync(Native.Message, 'strict')
 const decodeEntry = Native.decodeUnknownSync(Native.TimelineEntry, 'strict')
 const decodeCapabilities = Native.decodeUnknownSync(Native.Capabilities, 'strict')
 const unknown = { _tag: 'Unknown' } as const
 
 export const projectRoster = (slice: WireSlice<'roster'>) => ({ loading: slice.loading, agents: slice.state.agents.map(agent => decodeAgent(agent)) })
-export const projectAttention = (slice: WireSlice<'attention'>) => ({ loading: slice.loading, cards: slice.state.attention.map(card => decodeAttention(card)) })
+export const projectAttention = (slice: WireSlice<'attention'>) => ({
+  loading: slice.loading,
+  cards: slice.state.attention.map(card => decodeAttention(card)),
+  messages: slice.state.messages.map(wire => {
+    const message = decodeMessage(wire)
+    return { id: message.id, title: Option.getOrUndefined(message.title), content: message.content }
+  }),
+})
 
 export function projectAgentRow(agent: Native.Agent, attention: readonly Native.Attention[]): SidebarAgentRow {
   const harnessState = Option.getOrUndefined(agent.harness_state)

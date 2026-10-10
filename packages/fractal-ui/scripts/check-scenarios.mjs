@@ -38,3 +38,5 @@ try {
 } finally {
   await server.close()
 }
+// Terminate this one-shot CLI after its awaited receipt and Vite cleanup, with the actual verdict.
+process.exit(process.exitCode ?? 0)

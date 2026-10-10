@@ -16,6 +16,10 @@ function ScenarioRoster({ scheme, now }: { readonly scheme: 'light' | 'dark'; re
     </div>
     <h2>Attention</h2>
     {attention.loading ? <p role="status">Loading attention</p> : attention.cards.length === 0 ? <p>No attention requests</p> : <ul>{attention.cards.map(card => <li key={card.id}>{card.title} · {card.state}</li>)}</ul>}
+    {attention.messages.map(message => <section key={message.id}>
+      {message.title !== undefined && <h3>{message.title}</h3>}
+      <p>{message.content}</p>
+    </section>)}
   </ScenarioPresentation>
 }
 
