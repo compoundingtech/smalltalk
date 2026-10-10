@@ -262,13 +262,13 @@ mod tests {
                 })
                 .unwrap();
         }
-        for _ in 0..2 {
+        for status in ["staged", "delivered", "read", "read", "closed"] {
             store
                 .append_claim(&ClaimInput {
                     subject: "message/fyi".into(),
-                    kind: "message.read".into(),
+                    kind: format!("message.{status}"),
                     actor: Some("agent/example/reader".into()),
-                    fields: BTreeMap::from([("status".into(), json!("read"))]),
+                    fields: BTreeMap::from([("status".into(), json!(status))]),
                     evidence: vec![],
                     expected_subject: None,
                     idempotency_key: None,
