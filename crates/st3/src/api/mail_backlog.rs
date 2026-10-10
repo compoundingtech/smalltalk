@@ -14,6 +14,9 @@ fn overdue(
     // Include retained mail for retired seats: those are precisely the messages a current
     // agents projection would hide. Inspection never changes their lifecycle.
     for message in store.messages(to, false)? {
+        if crate::fyi::waits_for_turn(&message) {
+            continue;
+        }
         if !matches!(message.status.as_str(), "sent" | "staged" | "delivered")
             && !(resume_archives && unfinished_archive(store, &message)?)
         {
@@ -56,8 +59,21 @@ fn unfinished_archive(store: &Store, message: &MessageView) -> anyhow::Result<bo
 }
 
 pub(super) fn report(store: &Store, now: u128) -> anyhow::Result<st3_client::MailBacklog> {
+    // Historical held flags are incomplete during bounded bootstrap. Suppress the cleanup
+    // banner until its exclusion count is authoritative; cleanup itself always checks tags.
+    if !store.coordination_backfill_status()?.2 {
+        return Ok(st3_client::MailBacklog {
+            count: 0,
+            threshold_ms: THRESHOLD_MS,
+            cleanup_command: CLEANUP_COMMAND.into(),
+        });
+    }
     Ok(st3_client::MailBacklog {
-        count: store.unread_mail_count_before(now.saturating_sub(u128::from(THRESHOLD_MS)))?,
+        count: store
+            .unread_mail_count_before(now.saturating_sub(u128::from(THRESHOLD_MS)))?
+            .saturating_sub(
+                store.held_mail_count_before(now.saturating_sub(u128::from(THRESHOLD_MS)))?,
+            ),
         threshold_ms: THRESHOLD_MS,
         cleanup_command: CLEANUP_COMMAND.into(),
     })
@@ -119,6 +135,9 @@ pub(super) async fn cleanup(
                     .message(&message.subject)
                     .map_err(ApiError::internal)?
                     .unwrap();
+                if crate::fyi::waits_for_turn(&current) {
+                    continue;
+                }
                 if !matches!(current.status.as_str(), "sent" | "staged" | "delivered")
                     && !unfinished_archive(&store, &current).map_err(ApiError::internal)?
                 {
@@ -166,6 +185,61 @@ pub(super) async fn cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn backlog_cleanup_never_archives_an_unoffered_fyi() {
+        let root = tempfile::tempdir().unwrap();
+        let state = super::super::tests::state(root.path());
+        let now = client_now_ms();
+        state
+            .store
+            .set_write_clock_at(now - 2 * 86_400_000)
+            .unwrap();
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/old-held".into(),
+                kind: "message.sent".into(),
+                actor: Some("agent/example/writer".into()),
+                fields: BTreeMap::from([
+                    ("status".into(), json!("sent")),
+                    ("from".into(), json!("agent/example/writer")),
+                    ("to".into(), json!("agent/example/reader")),
+                    ("content".into(), json!("Held update")),
+                    ("tags".into(), json!([crate::fyi::FYI_TAG])),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert_eq!(report(&state.store, now).unwrap().count, 0);
+        let Json(result) = cleanup(
+            State(state.clone()),
+            Json(CleanupRequest {
+                older_than_ms: THRESHOLD_MS,
+                to: None,
+                all: true,
+                dry_run: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["count"], 0);
+        assert_eq!(
+            state
+                .store
+                .message("message/old-held")
+                .unwrap()
+                .unwrap()
+                .status,
+            "sent"
+        );
+        assert_eq!(
+            state.store.held_mail_before(now - 86_400_000).unwrap()[0].1,
+            1
+        );
+    }
 
     #[tokio::test]
     async fn backlog_counts_unread_retired_mail_and_cleanup_keeps_fresh_and_read_mail() {

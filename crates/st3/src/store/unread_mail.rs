@@ -146,9 +146,8 @@ pub(super) fn count_in_snapshot(connection: &Connection, before_unix_ms: u128) -
     Ok(u64::try_from(base + delta)?)
 }
 
-/// Unread messages sent before the cutoff, with their recipient, sender and tags. The queued
-/// subjects are read as they stand, without folding the queue: a read never writes. This
-/// diagnostic visits unread metadata, avoiding a new startup index build over retained mail.
+/// At most 128 oldest unoffered held subjects, selected from indexed metadata.
+/// Only these bounded subjects have their sender/recipient/tags read; a reader never writes.
 pub(super) struct UnreadSent {
     pub to: String,
     pub from: String,
@@ -159,18 +158,14 @@ pub(super) struct UnreadSent {
 pub(super) fn sent_before(connection: &Connection, before_unix_ms: u128) -> Result<Vec<UnreadSent>> {
     let before = i64::try_from(before_unix_ms).unwrap_or(i64::MAX);
     let mut statement = connection.prepare_cached(
-        "WITH candidates(subject) AS (
-             SELECT subject FROM unread_mail WHERE sent_time < ?1
-             UNION SELECT subject FROM unread_mail_pending)
-         SELECT json_extract(sent.body,'$.fields.to'), json_extract(sent.body,'$.fields.from'),
-                json_extract(sent.body,'$.fields.tags'),
-                MAX(CAST(sent.accepted_at_unix_ms AS INTEGER)) AS sent_time
-         FROM candidates JOIN claims sent
-           ON sent.subject=candidates.subject AND sent.kind='message.sent'
-         WHERE NOT EXISTS (
-             SELECT 1 FROM claims terminal WHERE terminal.subject=candidates.subject
-             AND terminal.kind IN ('message.read','message.closed'))
-         GROUP BY candidates.subject HAVING sent_time < ?1",
+        "SELECT json_extract(sent.body,'$.fields.to'), json_extract(sent.body,'$.fields.from'),
+                json_extract(sent.body,'$.fields.tags'), held.sent_ms
+         FROM coordination_sends held INDEXED BY coordination_sends_held
+         JOIN claims sent ON sent.id=(SELECT id FROM claims
+             WHERE subject=held.subject AND kind='message.sent'
+             ORDER BY CAST(accepted_at_unix_ms AS INTEGER),id LIMIT 1)
+         WHERE held.held=1 AND held.sent_ms < ?1
+         ORDER BY held.sent_ms,held.subject LIMIT 128",
     )?;
     let rows = statement.query_map([before], |row| {
         Ok((

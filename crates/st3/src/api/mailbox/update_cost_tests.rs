@@ -212,8 +212,8 @@ fn incremental_updates_with_kept_order_match_a_full_read_at_every_step() {
         assert!(!updated, "round {round}: an idle update must not produce a frame");
     }
     assert!(
-        mailbox.order.len() == mailbox.previous.as_ref().unwrap().1.1.len()
-            || mailbox.order.is_empty(),
+        mailbox.order.keys.len() == mailbox.previous.as_ref().unwrap().1.1.len()
+            || mailbox.order.keys.is_empty(),
         "kept keys describe only the current mailbox"
     );
 }

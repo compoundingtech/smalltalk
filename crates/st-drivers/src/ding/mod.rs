@@ -269,6 +269,13 @@ pub fn with_tag_notices(notification: String, tags: &[String]) -> String {
     if tags.iter().any(|tag| tag == "st3-fyi") {
         notification = format!("(FYI: held without waking you until this turn)\n{notification}");
     }
+    if let Some(count) = tags.iter().find_map(|tag| {
+        tag.strip_prefix("st3-fyi-remaining:")?
+            .parse::<usize>()
+            .ok()
+    }) {
+        notification = format!("({count} older FYI held; st conversations ls)\n{notification}");
+    }
     if tags.iter().any(|tag| tag == "dictated") {
         notification =
             format!("(dictated by voice; it may contain transcription mistakes)\n{notification}");

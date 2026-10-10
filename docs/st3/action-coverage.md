@@ -2,7 +2,7 @@
 
 The inventory covers every offered CLI command, every typed client action, every stui daemon effect, and the palette and local controls. It distinguishes real CLI/Unix transport tests, the live stui adapter, local reducer tests, and shared implementations. A test reference describes its actual layer; a shared implementation test alone is not a claim that the entire interactive UI was driven.
 
-`action-coverage.json` is the machine-readable source. Tests compare its 222 CLI rows with Clap's offered command tree, its 55 typed actions with the generated client contract and real dispatch builders, and its 19 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
+`action-coverage.json` is the machine-readable source. Tests compare its 223 CLI rows with Clap's offered command tree, its 55 typed actions with the generated client contract and real dispatch builders, and its 18 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
 
 ## Restart and stale-state model
 
@@ -124,6 +124,7 @@ edits and removes retired subjects without changing unfiltered reads.
 | `st agents new` | real CLI over private Unix socket; disk store reopened between actions | [`cli_agent_and_shell_declarations_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st agents queue` | real CLI over private Unix socket; disk store reopened between actions | [`cli_reads_preserve_operational_views_after_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st agents queue move` | existing CLI integration | [`agents_queue_cli_shows_seat_order_and_records_person_and_agent_moves`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/client_v0_cli.rs) |
+| `st agents wake-on` | supervised CLI, policy survives restart without new launch | [`cli_fyi_settings_and_count_reads_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st agents rename` | real CLI over private Unix socket; disk store reopened between actions | [`cli_metadata_documents_blobs_and_rules_survive_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `st agents restart` | existing CLI integration | [`restarts_top_level_seat_on_a_new_incarnation`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/agents_restart.rs) |
 | `st agents resume` | real CLI request/wait across restart; fixture runtime-owner acknowledgements | [`cli_seat_suspension_and_resume_wait_for_durable_owner_acknowledgements`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |

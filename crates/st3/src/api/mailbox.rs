@@ -206,7 +206,63 @@ type Snapshot = (
 
 type MaintenanceIds = std::collections::BTreeSet<String>;
 /// Canonical order keys of a stream's admitted mail, kept across its updates.
-type MailboxOrder = std::collections::BTreeMap<String, smallclaims::store::canonical::ClaimKey>;
+#[derive(Default)]
+struct MailboxOrder {
+    keys: std::collections::BTreeMap<String, smallclaims::store::canonical::ClaimKey>,
+    remaining: usize,
+}
+impl MailboxOrder {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn clear(&mut self) {
+        self.keys.clear();
+    }
+    fn remove(&mut self, subject: &str) {
+        self.keys.remove(subject);
+    }
+    fn bound_held(&mut self, messages: &mut Vec<MessageView>, refreshed: bool) {
+        if refreshed {
+            self.remaining = messages
+                .iter()
+                .flat_map(|m| &m.tags)
+                .filter_map(|tag| {
+                    tag.strip_prefix(crate::fyi::REMAINING_PREFIX)?
+                        .parse::<usize>()
+                        .ok()
+                })
+                .max()
+                .unwrap_or(0);
+        }
+        let mut held = messages
+            .iter()
+            .filter(|m| crate::fyi::waits_for_turn(m))
+            .map(|m| (m.created_index, m.subject.clone()))
+            .collect::<Vec<_>>();
+        held.sort();
+        self.remaining += held.len().saturating_sub(crate::fyi::BATCH_LIMIT);
+        let selected = held
+            .into_iter()
+            .rev()
+            .take(crate::fyi::BATCH_LIMIT)
+            .map(|(_, subject)| subject)
+            .collect::<std::collections::BTreeSet<_>>();
+        messages.retain(|m| !crate::fyi::waits_for_turn(m) || selected.contains(&m.subject));
+        for m in messages.iter_mut() {
+            m.tags
+                .retain(|tag| !tag.starts_with(crate::fyi::REMAINING_PREFIX));
+        }
+        if self.remaining > 0
+            && let Some(m) = messages.iter_mut().find(|m| m.status == "sent")
+        {
+            m.tags.push(format!(
+                "{}{remaining}",
+                crate::fyi::REMAINING_PREFIX,
+                remaining = self.remaining
+            ));
+        }
+    }
+}
 /// The seat's rollout intake hold, read at most once per update; `None` until first needed.
 type IntakeHold = Option<Option<crate::rollout::Operation>>;
 type SnapshotUpdate = (crate::store::MailboxWatermark, Snapshot, bool, MaintenanceIds);
@@ -267,13 +323,18 @@ pub(super) fn hold_pre_boot_mail(
     };
     let Some((since, through)) = store.native_mail_boot_floor(&peer.agent)? else {
         for message in messages {
-            message.status = "closed".into();
+            if !crate::fyi::waits_for_turn(message) {
+                message.status = "closed".into();
+            }
         }
         return Ok(());
     };
     // A closed projection only removes old native inbox files. Explicit conversation
     // reads still see the original graph status, with no synthetic receipt or close.
     for message in messages {
+        if crate::fyi::waits_for_turn(message) {
+            continue;
+        }
         let Some(sent) = store.latest_claim(&message.subject, Some("message.sent"))? else {
             message.status = "closed".into();
             continue;
@@ -304,7 +365,7 @@ fn raw_snapshot(store: &Store, binding: &Fence) -> anyhow::Result<Snapshot> {
             .into_iter()
             .next();
         let messages = if binding.component == "delivery" {
-            store.messages_through(Some(&binding.subject), false, through)?
+            store.messages_for_delivery_through(&binding.subject, through)?
         } else {
             Vec::new()
         };
@@ -417,6 +478,7 @@ where
                     .chain(policy_rechecks.iter().cloned())
                     .collect::<std::collections::BTreeSet<_>>();
                 let mut reorder = false;
+                let mut waking_added = false;
                 for subject in subjects {
                     policy_rechecks.remove(&subject);
                     let old = messages.iter().find(|message| message.subject == subject);
@@ -437,6 +499,10 @@ where
                         &mut hold,
                     )?);
                     retain_live_mail(store, &mut changed, since, Some(through), admitted)?;
+                    waking_added |= old.is_none()
+                        && changed
+                            .first()
+                            .is_some_and(|m| m.status == "sent" && !crate::fyi::is_held(m));
                     if serde_json::to_value(old)? != serde_json::to_value(changed.first())? {
                         messages.retain(|message| message.subject != subject);
                         messages.extend(changed);
@@ -444,8 +510,25 @@ where
                         updated = true;
                     }
                 }
+                // A waking change refills the bounded held batch from durable metadata.
+                // This is one bulk read per real turn, never an extra seek per delivery.
+                if waking_added && order.remaining > 0 {
+                    let (_, refreshed) = read(store, binding)?;
+                    messages = refreshed;
+                    close_own.extend(filter_messages(
+                        store,
+                        binding,
+                        &mut messages,
+                        policy_rechecks,
+                        &mut hold,
+                    )?);
+                    retain_live_mail(store, &mut messages, since, Some(through), admitted)?;
+                    order.clear();
+                    order.bound_held(&mut messages, true);
+                }
+                order.bound_held(&mut messages, false);
                 if reorder {
-                    store.order_mailbox_messages(&mut messages, order)?;
+                    store.order_mailbox_messages(&mut messages, &mut order.keys)?;
                 }
                 return Ok((changes.mark, (seat, messages), updated));
             }
@@ -480,6 +563,7 @@ where
         )?);
         policy_rechecks.retain(|subject| eligible.contains(subject));
         retain_live_mail(store, &mut messages, since, Some(through), admitted)?;
+        order.bound_held(&mut messages, true);
         Ok((mark, (seat, messages), true))
     });
     // Reading never commits a closure or builds persistent derived state. The background
@@ -1528,6 +1612,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(messages.len(), 1);
+        let peer = NativeDeliveryPeer {
+            agent: "agent/example/reader".into(),
+            transport: "codex",
+            pid: 123,
+            archives_inbox: true,
+        };
+        // No boot floor: legacy polling must not synthesize closed for held mail.
+        hold_pre_boot_mail(&store, Some(&peer), Some(&peer.agent), &mut messages).unwrap();
+        assert_eq!(messages[0].status, "sent");
         let mut offered = messages.clone();
         crate::fyi::release(&mut offered);
         assert!(offered.is_empty(), "reconnect alone cannot wake the seat");
@@ -2008,6 +2101,41 @@ mod tests {
         read_all(&client, &fence, &batch).await;
         drained(&mut socket).await;
 
+        // A large backlog is bounded on this connection and refilled on later real turns.
+        for n in 0..20 {
+            send(
+                &format!("backlog-{n}"),
+                "agent/eval.peer",
+                &[crate::fyi::FYI_TAG],
+                None,
+            );
+        }
+        signal_changed(&state);
+        no_mail(&mut socket).await;
+        for (turn, offered, remaining) in [(0, 8, 12), (1, 8, 4), (2, 4, 0)] {
+            send(
+                &format!("wake-backlog-{turn}"),
+                "agent/eval.peer",
+                &[crate::fyi::QUESTION_TAG],
+                None,
+            );
+            signal_changed(&state);
+            let batch = next_mail(&mut socket).await;
+            assert_eq!(batch.len(), offered + 1, "turn {turn}");
+            let notices = batch
+                .iter()
+                .flat_map(|m| &m.tags)
+                .filter_map(|tag| tag.strip_prefix(crate::fyi::REMAINING_PREFIX))
+                .collect::<Vec<_>>();
+            if remaining > 0 {
+                assert_eq!(notices, vec![remaining.to_string()]);
+            } else {
+                assert!(notices.is_empty());
+            }
+            read_all(&client, &fence, &batch).await;
+            drained(&mut socket).await;
+        }
+
         // An answer in a thread the seat started with a question wakes it.
         let asked = super::super::accept_message(
             &state,
@@ -2035,12 +2163,23 @@ mod tests {
         drained(&mut socket).await;
 
         // Each kind that always wakes still wakes a seat that wakes only on questions.
-        let kinds: [(&str, &str, &[&str]); 5] = [
+        let kinds: [(&str, &str, &[&str]); 8] = [
             ("person", "person/eval", &[]),
-            ("handoff", "agent/eval.peer", &["st3-work-handoff:step-run/r/s"]),
+            (
+                "handoff",
+                "daemon/runtime",
+                &["st3-work-handoff:step-run/r/s"],
+            ),
             ("fault", "daemon/runtime", &["st3-fault:episode"]),
             ("ready-step", "daemon/runtime", &["st3-work:step-run/r/s@1@1@x"]),
             ("gh-watch", "daemon/node", &[crate::github_watch::WATCH_TAG]),
+            ("run-report", "daemon/runtime", &["st3-run-report:failed"]),
+            ("retry", "daemon/runtime", &["st3-provider-capacity-retry"]),
+            (
+                "product-wait",
+                "daemon/runtime",
+                &["st3-product-wait:step-run/r/s"],
+            ),
         ];
         for (kind, from, tags) in kinds {
             let held = send(&format!("held-before-{kind}"), "agent/eval.peer", &[crate::fyi::FYI_TAG], None);

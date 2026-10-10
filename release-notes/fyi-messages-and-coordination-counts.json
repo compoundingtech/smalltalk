@@ -7,7 +7,7 @@
   },
   "schema": {
     "status": "changed",
-    "detail": "Adds coordination_sends, its covering sent_ms/count-flags index, local_coordination_backfill. Numeric schema version is unchanged. These are derived count metadata, not new conversation payload storage."
+    "detail": "Adds derived coordination_sends timestamp/count flags and held flag, covering time/held indexes, a guarded receipt trigger, and local_coordination_backfill cursor/ceiling/progress. Numeric schema version is unchanged. No conversation payload is newly stored."
   },
   "rules": {
     "status": "none",
@@ -15,11 +15,11 @@
   },
   "compatibility": {
     "status": "changed",
-    "detail": "Adds optional fyi/question booleans to message.send, sender tags, wake-on all/questions in agent KDL, and agents wake-on and usage --messages-only commands. Old daemons accepting a message's FYI tag do not hold it: they deliver and wake as before. Old CLIs reject the new flags, and old daemons do not provide the new endpoints or accept wake-on KDL. Upgrade recipient owner daemons before relying on no-wake delivery; mixed versions do not guarantee it. Device signatures continue to cover exactly the signed tags; person messages always wake."
+    "detail": "Adds optional fyi/question message.send booleans and wake-on KDL/commands. Old daemons silently ignore typed flags and deliver FYI-tagged messages normally; old CLIs reject flags. Upgrade all owner daemons before setting wake-on: an old owner or downgrade can restart a seat on this declaration change and removes no-wake guarantees. CLI warns on an agent FYI receipt missing the FYI tag; SDK receipt warnings are deferred, so mixed-version callers must inspect tags. Person signatures retain signed tags and always wake. External Rust struct literals need the two boolean fields."
   },
   "downtime": {
     "status": "unknown",
-    "detail": "Requires the normal daemon binary swap and restart. New tables are empty at creation and coordination backfill is bounded. Held-mail diagnostics read existing unread metadata without a new startup index build. Restart-to-API and restart-to-health times for populated installations have not been measured."
+    "detail": "Normal binary swap/restart; no numeric schema migration. Empty derived tables and indexes are created, then bounded background jobs fill metadata. Held diagnostics select at most 128 indexed rows, delivery hydrates at most eight held subjects. Populated restart-to-health timings have not been measured."
   },
   "manual": {
     "status": "changed",
@@ -27,6 +27,6 @@
   },
   "recovery": {
     "status": "changed",
-    "detail": "Unstaged FYI mail stays unread and survives reconnects regardless of age; doctor lists held unread mail older than a day. Installing an older daemon retains additive tables but removes the no-wake guarantee: existing FYI tags can wake recipients. Prefer roll-forward if held delivery semantics must be preserved; no numeric schema migration is undone by a binary swap."
+    "detail": "Unstaged FYIs remain unread, excluded from backlog cleanup, and survive polling/reconnect. Each real wake offers at most eight newest FYIs with an older-held notice; on-demand reads see all. Downgrade removes no-wake guarantees and can restart wake-on seats. Roll-forward reopens uncovered sends after an old binary. Corrupt source fails closed (never falsely complete); usage exposes cursor/ceiling/progress and doctor warns after 15 minutes stalled. Repair source with existing recovery procedures."
   }
 }

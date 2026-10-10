@@ -13,6 +13,9 @@ use crate::model::MessageView;
 
 /// The sender declared, or the recipient's setting decided, that this message wakes nobody.
 pub const FYI_TAG: &str = "st3-fyi";
+pub const BATCH_LIMIT: usize = 8;
+/// Delivery-only metadata, never stored in a message claim.
+pub const REMAINING_PREFIX: &str = "st3-fyi-remaining:";
 /// The recipient's `wake-on "questions"` setting held this message, not its sender.
 pub const HELD_BY_SETTING_TAG: &str = "st3-fyi-held-by-setting";
 /// The sender declared that this message asks the recipient something.
@@ -65,7 +68,8 @@ pub fn declared_wake_on(desired: Option<&Value>) -> WakeOn {
 
 /// A person's message (including one an adapter imports, such as from a chat bridge), anything
 /// ready step, a fault, a gh watch event, and a work handoff always wake the recipient,
-/// whatever it chose. Other daemon mail has no blanket exception.
+/// whatever it chose. Daemon run reports, retry nudges, product-wait and planning notices
+/// also always wake; ordinary daemon conversations have no blanket exception.
 pub fn always_wakes(from: &str, tags: &[String]) -> bool {
     from.starts_with("person/")
         || from.starts_with("external/")
@@ -74,6 +78,10 @@ pub fn always_wakes(from: &str, tags: &[String]) -> bool {
                 || tag.starts_with("st3-work-handoff:")
                 || tag.starts_with("st3-fault:")
                 || tag == crate::github_watch::WATCH_TAG
+                || tag.starts_with("st3-run-report:")
+                || tag == "st3-provider-capacity-retry"
+                || tag.starts_with("st3-product-wait:")
+                || tag == "launch"
         })
 }
 
@@ -110,7 +118,10 @@ pub fn stored_tags(
     };
     for tag in requested {
         // A sender declares a question or an FYI; the thread and the setting tags are st's.
-        if tag.starts_with(QUESTION_THREAD_PREFIX) || tag == HELD_BY_SETTING_TAG {
+        if tag.starts_with(QUESTION_THREAD_PREFIX)
+            || tag == HELD_BY_SETTING_TAG
+            || tag.starts_with(REMAINING_PREFIX)
+        {
             continue;
         }
         push(tag.clone(), &mut tags);
@@ -144,11 +155,70 @@ pub fn stored_tags(
 /// The mail a seat's delivery offers now. A held message that has not been offered stays back
 /// until a message that wakes the seat is offered, then goes with it; one already offered stays.
 pub fn release(messages: &mut Vec<MessageView>) {
-    let waking = messages
+    let waking = messages.iter().any(|m| m.status == "sent" && !is_held(m));
+    let mut held = messages
         .iter()
-        .any(|message| message.status == "sent" && !is_held(message));
-    if !waking {
-        messages.retain(|message| message.status != "sent" || !is_held(message));
+        .filter(|m| waits_for_turn(m))
+        .map(|m| (m.created_index, m.subject.clone()))
+        .collect::<Vec<_>>();
+    held.sort();
+    let omitted = held.len().saturating_sub(BATCH_LIMIT);
+    let selected = held
+        .into_iter()
+        .rev()
+        .take(BATCH_LIMIT)
+        .map(|(_, subject)| subject)
+        .collect::<std::collections::BTreeSet<_>>();
+    messages.retain(|m| !waits_for_turn(m) || (waking && selected.contains(&m.subject)));
+    if waking {
+        let previous = messages
+            .iter()
+            .flat_map(|m| &m.tags)
+            .filter_map(|tag| tag.strip_prefix(REMAINING_PREFIX)?.parse::<usize>().ok())
+            .max()
+            .unwrap_or(0);
+        for m in messages.iter_mut() {
+            m.tags.retain(|tag| !tag.starts_with(REMAINING_PREFIX));
+        }
+        if let Some(m) = messages
+            .iter_mut()
+            .find(|m| m.status == "sent" && !is_held(m))
+        {
+            let remaining = previous + omitted;
+            if remaining > 0 {
+                m.tags.push(format!("{REMAINING_PREFIX}{remaining}"));
+            }
+        }
+    }
+}
+
+/// Carry a bounded held batch across legacy polling pages; the wake may be on a later page.
+pub fn release_page(messages: &mut Vec<MessageView>, pending: &mut Vec<MessageView>) {
+    pending.extend(messages.iter().filter(|m| waits_for_turn(m)).cloned());
+    messages.retain(|m| !waits_for_turn(m));
+    if messages.iter().any(|m| m.status == "sent" && !is_held(m)) {
+        pending.append(messages);
+        std::mem::swap(messages, pending);
+        release(messages);
+    } else {
+        let previous = pending
+            .iter()
+            .flat_map(|m| &m.tags)
+            .filter_map(|tag| tag.strip_prefix(REMAINING_PREFIX)?.parse::<usize>().ok())
+            .max()
+            .unwrap_or(0);
+        pending.sort_by_key(|m| (m.created_index, m.subject.clone()));
+        let omitted = pending.len().saturating_sub(BATCH_LIMIT);
+        pending.drain(..omitted);
+        for m in pending.iter_mut() {
+            m.tags.retain(|tag| !tag.starts_with(REMAINING_PREFIX));
+        }
+        if previous + omitted > 0
+            && let Some(m) = pending.first_mut()
+        {
+            m.tags
+                .push(format!("{REMAINING_PREFIX}{}", previous + omitted));
+        }
     }
 }
 
@@ -205,6 +275,64 @@ mod tests {
     }
 
     #[test]
+    fn a_large_held_batch_offers_only_the_newest_eight_and_keeps_the_rest_durable() {
+        let mut held = (0..700)
+            .map(|i| {
+                let mut m = message(
+                    &format!("message/{i}"),
+                    "agent/example/writer",
+                    "sent",
+                    &[FYI_TAG],
+                );
+                m.created_index = i;
+                m
+            })
+            .collect::<Vec<_>>();
+        held.push(message("message/wake", "person/operator", "sent", &[]));
+        release(&mut held);
+        assert_eq!(held.len(), BATCH_LIMIT + 1);
+        assert_eq!(held[0].subject, "message/692");
+        assert!(
+            held.last()
+                .unwrap()
+                .tags
+                .contains(&format!("{REMAINING_PREFIX}692"))
+        );
+    }
+
+    #[test]
+    fn polling_keeps_a_bounded_batch_across_pages_until_the_wake() {
+        let mut pending = Vec::new();
+        for page in 0..2 {
+            let mut items = (0..200)
+                .map(|i| {
+                    let mut m = message(
+                        &format!("message/{}", page * 200 + i),
+                        "agent/example/writer",
+                        "sent",
+                        &[FYI_TAG],
+                    );
+                    m.created_index = page * 200 + i;
+                    m
+                })
+                .collect();
+            release_page(&mut items, &mut pending);
+            assert!(items.is_empty());
+            assert_eq!(pending.len(), 8);
+        }
+        let mut wake = vec![message("message/wake", "person/operator", "sent", &[])];
+        release_page(&mut wake, &mut pending);
+        assert_eq!(wake.len(), 9);
+        assert!(pending.is_empty());
+        assert!(
+            wake.last()
+                .unwrap()
+                .tags
+                .contains(&format!("{REMAINING_PREFIX}392"))
+        );
+    }
+
+    #[test]
     fn always_waking_kinds_are_never_held() {
         for (from, tag) in [
             ("person/operator", FYI_TAG),
@@ -212,6 +340,10 @@ mod tests {
             ("daemon/runtime", "st3-work:step-run/a/b@1@1@x"),
             ("daemon/runtime", "st3-fault:episode"),
             ("daemon/example", crate::github_watch::WATCH_TAG),
+            ("daemon/runtime", "st3-run-report:failed"),
+            ("daemon/runtime", "st3-provider-capacity-retry"),
+            ("daemon/runtime", "st3-product-wait:step-run/example/work"),
+            ("daemon/runtime", "launch"),
             ("agent/example/writer", "st3-work-handoff:step-run/a/b"),
         ] {
             let stored = stored_tags(

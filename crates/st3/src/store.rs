@@ -12553,6 +12553,7 @@ impl Store {
             subject,
             json!({ "agent": subject, "display_name": name }),
             idempotency_key,
+            None,
             |desired| desired.set_display_name(name),
         )
     }
@@ -12564,12 +12565,25 @@ impl Store {
         subject: &str,
         wake_on: crate::fyi::WakeOn,
         idempotency_key: &str,
+        actor: &str,
     ) -> Result<ApplyResponse, St3Error> {
+        if actor != subject && !actor.starts_with("person/") {
+            return Err(St3Error::new(
+                "foreign-wake-on",
+                "only the seat itself or a person can change its wake-on policy",
+            ));
+        }
         self.revise_agent_in_place(
             subject,
-            json!({ "agent": subject, "wake_on": wake_on.as_str() }),
+            json!({ "agent": subject, "wake_on": wake_on.as_str(), "actor": actor }),
             idempotency_key,
-            |desired| desired.set_wake_on(wake_on),
+            Some(actor),
+            |desired| {
+                if crate::fyi::declared_wake_on(Some(&desired.desired)) == wake_on {
+                    return Ok(());
+                }
+                desired.set_wake_on(wake_on)
+            },
         )
     }
 
@@ -12579,6 +12593,7 @@ impl Store {
         subject: &str,
         normalized: Value,
         idempotency_key: &str,
+        actor_override: Option<&str>,
         revise: impl FnOnce(&mut DesiredSubject) -> Result<(), St3Error>,
     ) -> Result<ApplyResponse, St3Error> {
         let (mut desired, heads, writer) = {
@@ -12610,7 +12625,20 @@ impl Store {
             let heads = intent_leaves_tx(&transaction, subject).map_err(internal)?;
             (desired.0, heads, desired.1)
         };
+        let previous = desired.clone();
         revise(&mut desired)?;
+        if actor_override.is_some() && desired == previous {
+            return Ok(ApplyResponse {
+                changed: false,
+                store_index: self.index().map_err(internal)?,
+                batch_id: None,
+                claim_ids: Vec::new(),
+                subject_tokens: BTreeMap::from([(subject.to_owned(), heads)]),
+                reconcile_subjects: Vec::new(),
+                resolved_kdl: String::new(),
+                operations: Vec::new(),
+            });
+        }
         let intent = NormalizedIntent {
             direct_message_registrations: BTreeSet::new(),
             schema: "st3.v1".into(),
@@ -12630,7 +12658,7 @@ impl Store {
             &intent,
             &BTreeMap::from([(subject.to_owned(), heads)]),
             idempotency_key,
-            writer.as_deref(),
+            actor_override.or(writer.as_deref()),
         )
     }
 
@@ -13395,6 +13423,12 @@ impl Store {
         Ok(count)
     }
 
+    pub fn held_mail_count_before(&self, before: u128) -> Result<u64> {
+        Ok(self.readers.get().query_row(
+            "SELECT COUNT(*) FROM coordination_sends INDEXED BY coordination_sends_held WHERE held=1 AND sent_ms<?1",
+            [i64::try_from(before).unwrap_or(i64::MAX)], |row| row.get(0))?)
+    }
+
     /// Each seat's unread held mail sent before the cutoff: its count and oldest send time.
     /// A read: it never folds the unread queue, and reads the queued subjects as they stand.
     pub fn held_mail_before(&self, before_unix_ms: u128) -> Result<Vec<(String, u64, u128)>> {
@@ -13430,6 +13464,24 @@ impl Store {
         include_closed: bool,
         through: u64,
     ) -> Result<Vec<MessageView>> {
+        self.messages_through_inner(recipient, include_closed, through, false)
+    }
+
+    pub(crate) fn messages_for_delivery_through(
+        &self,
+        recipient: &str,
+        through: u64,
+    ) -> Result<Vec<MessageView>> {
+        self.messages_through_inner(Some(recipient), false, through, true)
+    }
+
+    fn messages_through_inner(
+        &self,
+        recipient: Option<&str>,
+        include_closed: bool,
+        through: u64,
+        delivery: bool,
+    ) -> Result<Vec<MessageView>> {
         smallclaims::touched::note_read(|| match recipient {
             Some(recipient) => format!("mailbox:{recipient}"),
             None => "kind:message.sent".to_owned(),
@@ -13438,7 +13490,7 @@ impl Store {
         let mut all = Vec::new();
         loop {
             let (items, next) =
-                self.messages_page(recipient, include_closed, after, through, 200)?;
+                self.messages_page_inner(recipient, include_closed, after, through, 200, delivery)?;
             all.extend(items);
             match next {
                 Some(cursor) => after = Some(cursor),
@@ -13606,6 +13658,28 @@ impl Store {
         through: u64,
         limit: usize,
     ) -> Result<(Vec<MessageView>, Option<u64>)> {
+        self.messages_page_inner(recipient, include_closed, after, through, limit, false)
+    }
+
+    pub(crate) fn messages_page_for_delivery(
+        &self,
+        recipient: &str,
+        after: Option<u64>,
+        through: u64,
+        limit: usize,
+    ) -> Result<(Vec<MessageView>, Option<u64>)> {
+        self.messages_page_inner(Some(recipient), false, after, through, limit, true)
+    }
+
+    fn messages_page_inner(
+        &self,
+        recipient: Option<&str>,
+        include_closed: bool,
+        after: Option<u64>,
+        through: u64,
+        limit: usize,
+        delivery: bool,
+    ) -> Result<(Vec<MessageView>, Option<u64>)> {
         let recipient = recipient.map(normalize_message_party);
         let connection = self.readers.get();
         // Native harnesses repeatedly ask for their complete durable mailbox so
@@ -13619,7 +13693,7 @@ impl Store {
                 .unwrap_or(value)
         });
         if let (Some(recipient), Some(bare_recipient)) = (fast_recipient, bare_recipient) {
-            let mut statement = connection.prepare(
+            let mut statement = connection.prepare(if delivery {
                 "WITH candidates(subject) AS (
                      SELECT subject FROM claims INDEXED BY claims_message_to_index
                      WHERE kind='message.sent'
@@ -13636,14 +13710,46 @@ impl Store {
                              WHERE claims.subject=candidates.subject) created_index
                      FROM candidates
                  )
-                 SELECT subject, created_index FROM created
+                 , ranked AS (
+                     SELECT created.*, COALESCE(meta.held,0) held,
+                            ROW_NUMBER() OVER (PARTITION BY COALESCE(meta.held,0) ORDER BY created_index DESC,created.subject DESC) held_rank,
+                            SUM(COALESCE(meta.held,0)) OVER () held_total
+                     FROM created LEFT JOIN coordination_sends meta ON meta.subject=created.subject
+                     WHERE created_index<=?4
+                 )
+                 SELECT subject, created_index, CASE WHEN ?7 THEN MAX(held_total-8,0) ELSE 0 END FROM ranked
                  WHERE created_index>?3 AND created_index<=?4
+                   AND (NOT ?7 OR held=0 OR held_rank<=8)
+                   AND (?6 OR NOT EXISTS (
+                     SELECT 1 FROM claims closed
+                     WHERE closed.subject=ranked.subject AND closed.kind='message.closed'
+                   ))
+                 ORDER BY created_index, subject LIMIT ?5"
+            } else {
+                "WITH candidates(subject) AS (
+                     SELECT subject FROM claims INDEXED BY claims_message_to_index
+                     WHERE kind='message.sent'
+                       AND json_extract(body, '$.fields.to') IN (?1, ?2)
+                     UNION
+                     SELECT desired.subject FROM desired,
+                            json_each(desired.body, '$.children') child
+                     WHERE desired.kind='message'
+                       AND json_extract(child.value, '$.name')='to'
+                       AND json_extract(child.value, '$.arguments[0]') IN (?1, ?2)
+                 ), created AS (
+                     SELECT subject,
+                            (SELECT MIN(store_index) FROM claims
+                             WHERE claims.subject=candidates.subject) created_index
+                     FROM candidates
+                 )
+                 SELECT subject, created_index, 0 FROM created
+                 WHERE (?7 OR NOT ?7) AND created_index>?3 AND created_index<=?4
                    AND (?6 OR NOT EXISTS (
                      SELECT 1 FROM claims closed
                      WHERE closed.subject=created.subject AND closed.kind='message.closed'
                    ))
-                 ORDER BY created_index, subject LIMIT ?5",
-            )?;
+                 ORDER BY created_index, subject LIMIT ?5"
+            })?;
             let mut subjects = statement
                 .query_map(
                     params![
@@ -13653,19 +13759,31 @@ impl Store {
                         through,
                         limit.saturating_add(1),
                         include_closed,
+                        delivery,
                     ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, usize>(2)?,
+                        ))
+                    },
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
             let has_more = subjects.len() > limit;
             subjects.truncate(limit);
             let next_after = has_more
-                .then(|| subjects.last().map(|(_, index)| *index))
+                .then(|| subjects.last().map(|(_, index, _)| *index))
                 .flatten();
             let mut output = Vec::new();
-            for (subject, created_index) in subjects {
-                let message = self.message_view_cached(&connection, &subject, created_index)?;
+            for (subject, created_index, remaining) in subjects {
+                let mut message = self.message_view_cached(&connection, &subject, created_index)?;
                 if message.to == recipient && (include_closed || message.status != "closed") {
+                    if remaining > 0 && message.status == "sent" {
+                        message
+                            .tags
+                            .push(format!("{}{remaining}", crate::fyi::REMAINING_PREFIX));
+                    }
                     output.push(message);
                 }
             }
@@ -34227,11 +34345,64 @@ agent "test/worker" { command "true"; wake-on "questions" }
             declared_wake_on(seat.first().map(|seat| &seat.desired))
         };
         assert_eq!(wake_on(&store), WakeOn::Questions);
-        let launch = store.selected_desired_token("agent/test/worker").unwrap().unwrap();
-        store.set_agent_wake_on("agent/test/worker", WakeOn::All, "all").unwrap();
+        let launch = store
+            .selected_desired_token("agent/test/worker")
+            .unwrap()
+            .unwrap();
+        store
+            .set_agent_wake_on("agent/test/worker", WakeOn::All, "all", "agent/test/worker")
+            .unwrap();
         assert_eq!(wake_on(&store), WakeOn::All);
-        store.set_agent_wake_on("agent/test/worker", WakeOn::Questions, "questions").unwrap();
+        store
+            .set_agent_wake_on(
+                "agent/test/worker",
+                WakeOn::Questions,
+                "questions",
+                "person/operator",
+            )
+            .unwrap();
         assert_eq!(wake_on(&store), WakeOn::Questions);
+        let changed = store
+            .latest_claim("agent/test/worker", Some("desired"))
+            .unwrap();
+        let desired_claim = store
+            .claims_for("agent/test/worker", None)
+            .unwrap()
+            .into_iter()
+            .find(|claim| claim.actor.as_deref() == Some("person/operator"));
+        assert!(
+            desired_claim.is_some(),
+            "the operator is recorded: {changed:?}"
+        );
+        let index = store.index().unwrap();
+        assert!(
+            !store
+                .set_agent_wake_on(
+                    "agent/test/worker",
+                    WakeOn::Questions,
+                    "noop",
+                    "agent/test/worker"
+                )
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            store.index().unwrap(),
+            index,
+            "same policy adds no replicated claim"
+        );
+        assert_eq!(
+            store
+                .set_agent_wake_on(
+                    "agent/test/worker",
+                    WakeOn::All,
+                    "foreign",
+                    "agent/test/other"
+                )
+                .unwrap_err()
+                .code,
+            "foreign-wake-on"
+        );
         // The setting changes what wakes the seat, never its launch: no restart.
         let lineage = store.launch_lineage("agent/test/worker").unwrap();
         assert_eq!(lineage.last(), Some(&launch), "{lineage:?}");

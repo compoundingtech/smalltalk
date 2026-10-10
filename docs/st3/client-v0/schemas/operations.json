@@ -89,7 +89,7 @@
     "review.reject": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.request-changes": { "capability": "control.attention", "parameters": "TargetParameters" },
     "attention.resolve": { "capability": "control.attention", "parameters": "AttentionResolveParameters" },
-    "message.send": { "capability": "control.messages", "parameters": "MessageSendParameters", "description": "Optional fyi holds unread mail until the next wake; question declares an ask. They are mutually exclusive. Replies carry question-thread metadata. Person messages and system wake events always wake. Signed messages carry these flags in their signed tags." },
+    "message.send": { "capability": "control.messages", "parameters": "MessageSendParameters", "description": "Optional fyi holds unread mail until the next wake; question declares an ask. They are mutually exclusive. Replies carry question-thread metadata. Person messages and system wake events always wake. Signed messages carry these flags in their signed tags. Old daemons silently ignore typed fyi/question parameters and wake as before; inspect returned tags before relying on FYI holding." },
     "message.read": { "capability": "control.messages", "parameters": "TargetParameters" },
     "message.close": { "capability": "control.messages", "parameters": "TargetParameters" },
     "launch.create": { "capability": "control.launches", "parameters": "LaunchCreateParameters" },

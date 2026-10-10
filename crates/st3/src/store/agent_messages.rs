@@ -73,6 +73,7 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
     // The older allowance cache can prime all history. New coordination metadata must
     // still bootstrap in bounded pages rather than piggyback on that legacy rebuild.
     flush_with_coordination(transaction, filled)?;
+    coordination::initialize(transaction)?;
     coordination::backfill(transaction)?;
     if !filled {
         transaction.execute(
@@ -86,14 +87,17 @@ pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
 fn eligible(fields: &Value) -> bool {
     let from = fields["from"].as_str().unwrap_or_default();
     let to = fields["to"].as_str().unwrap_or_default();
-    if !from.starts_with("agent/") || !to.starts_with("agent/") {
-        return false;
-    }
+    from.starts_with("agent/") && to.starts_with("agent/") && !synthetic(fields)
+}
+
+pub(super) fn synthetic(fields: &Value) -> bool {
+    let from = fields["from"].as_str().unwrap_or_default();
+    let to = fields["to"].as_str().unwrap_or_default();
     if [from, to]
         .iter()
         .any(|seat| seat.contains("delivery-probe/") || seat.contains("delivery-soak"))
     {
-        return false;
+        return true;
     }
     if fields["tags"].as_array().is_some_and(|tags| {
         tags.iter().any(|tag| {
@@ -110,7 +114,7 @@ fn eligible(fields: &Value) -> bool {
             )
         })
     }) {
-        return false;
+        return true;
     }
     let title = fields["title"]
         .as_str()
@@ -120,7 +124,7 @@ fn eligible(fields: &Value) -> bool {
     while let Some(rest) = title.strip_prefix("re:") {
         title = rest.trim_start();
     }
-    ![
+    [
         "soak request",
         "soak reply",
         "channel check",

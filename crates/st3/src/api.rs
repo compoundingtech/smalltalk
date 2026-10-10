@@ -6934,17 +6934,45 @@ fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
 
 /// Held FYI mail is never lost: unread past a day, it is listed for its seat.
 fn held_mail_check(store: &Store, now: u128) -> DoctorCheck {
+    match store.coordination_backfill_status() {
+        Ok((cursor, ceiling, false, progress))
+            if now.saturating_sub(u128::from(progress)) > 15 * 60 * 1000 =>
+        {
+            return DoctorCheck {
+                name: "held-mail".into(),
+                status: "warn".into(),
+                message: format!(
+                    "held-mail metadata bootstrap stalled for over 15 minutes at {cursor}/{ceiling}; inspect daemon bootstrap errors and repair the source before publishing counts"
+                ),
+            };
+        }
+        Err(error) => {
+            return DoctorCheck {
+                name: "held-mail".into(),
+                status: "warn".into(),
+                message: error.to_string(),
+            };
+        }
+        _ => {}
+    }
     match store.held_mail_before(now.saturating_sub(crate::fyi::HELD_TOO_LONG_MS)) {
         Ok(seats) if seats.is_empty() => DoctorCheck {
             name: "held-mail".into(),
             status: "pass".into(),
-            message: "no seat holds FYI mail unread for over a day".into(),
+            message: if store
+                .coordination_backfill_status()
+                .is_ok_and(|state| !state.2)
+            {
+                "held-mail metadata bootstrap is progressing; this diagnostic is partial until complete".into()
+            } else {
+                "no seat holds FYI mail unread for over a day".into()
+            },
         },
         Ok(seats) => DoctorCheck {
             name: "held-mail".into(),
             status: "warn".into(),
             message: format!(
-                "FYI mail unread for over a day: {}; read it with `st conversations ls --as SEAT`",
+                "FYI mail unread for over a day (at most 128 oldest subjects per check): {}; read it with `st conversations ls --as SEAT`",
                 seats
                     .iter()
                     .map(|(seat, count, oldest)| format!(
@@ -11035,7 +11063,7 @@ async fn set_agent_wake_on(
     let response = blocking_api(move || {
         state
             .store
-            .set_agent_wake_on(&subject, wake_on, &request.idempotency_key)
+            .set_agent_wake_on(&subject, wake_on, &request.idempotency_key, &request.actor)
             .map_err(ApiError::bad)
             .inspect(|_| signal_changed(&state))
     })
@@ -12435,9 +12463,39 @@ fn accept_message_receipt_with_upload_owner(
     }
     let from = normalize_message_party(&request.from);
     let to = normalize_message_party(&request.to);
-    let attachments = client_blobs::resolve_attachments(state, upload_owner.unwrap_or(&from), &request.attachments)?;
+    if request.tags.iter().any(|tag| tag == crate::fyi::FYI_TAG)
+        && request
+            .tags
+            .iter()
+            .any(|tag| tag == crate::fyi::QUESTION_TAG)
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "conflicting-message-wake",
+            "a message cannot be both FYI and a question",
+        )));
+    }
+    if !from.starts_with("daemon/")
+        && request
+            .tags
+            .iter()
+            .any(|tag| crate::fyi::always_wakes("agent/example", std::slice::from_ref(tag)))
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "reserved-message-tag",
+            "daemon event tags cannot be asserted by conversation senders",
+        )));
+    }
+    let attachments = client_blobs::resolve_attachments(
+        state,
+        upload_owner.unwrap_or(&from),
+        &request.attachments,
+    )?;
     let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()))[..16].to_owned();
     let subject = format!("message/{id}");
+    let previous = state
+        .store
+        .operation_claim(&request.idempotency_key)
+        .map_err(ApiError::internal)?;
     let parent = request
         .in_reply_to
         .as_deref()
@@ -12447,7 +12505,18 @@ fn accept_message_receipt_with_upload_owner(
         .flatten();
     // A signed message stores exactly the tags its device signed; only a person signs, and a
     // person's message always wakes.
-    let tags = if device_signature.is_some() {
+    let tags = if let Some(previous) = previous
+        .as_ref()
+        .filter(|claim| claim.kind == "message.sent" && claim.subject == subject)
+    {
+        serde_json::from_value(
+            previous.body["fields"]
+                .get("tags")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        )
+        .map_err(ApiError::internal)?
+    } else if device_signature.is_some() {
         request.tags.clone()
     } else {
         crate::fyi::stored_tags(&from, &to, &request.tags, parent.as_ref(), || {
@@ -12664,8 +12733,15 @@ async fn list_messages_page(
     let after = cursor.as_ref().map(|cursor| cursor.after);
     let store = state.store.clone();
     let (items, next_after) = blocking_store(move || {
-        let (mut items, next_after) =
-            store.messages_page(to.as_deref(), query.include_closed, after, through, limit)?;
+        let native = !query.include_closed
+            && peer
+                .as_ref()
+                .is_some_and(|peer| to.as_deref() == Some(peer.0.agent.as_str()));
+        let (mut items, next_after) = if native {
+            store.messages_page_for_delivery(to.as_deref().unwrap(), after, through, limit)?
+        } else {
+            store.messages_page(to.as_deref(), query.include_closed, after, through, limit)?
+        };
         mailbox::hold_pre_boot_mail(
             &store, peer.as_ref().map(|peer| &peer.0), to.as_deref(), &mut items,
         )?;
@@ -12711,7 +12787,15 @@ async fn list_messages(
     );
     let store = state.store.clone();
     blocking_store(move || {
-        let mut messages = store.messages(recipient.as_deref(), query.include_closed)?;
+        let native = !query.include_closed
+            && peer
+                .as_ref()
+                .is_some_and(|peer| recipient.as_deref() == Some(peer.0.agent.as_str()));
+        let mut messages = if native {
+            store.messages_for_delivery_through(recipient.as_deref().unwrap(), store.index()?)?
+        } else {
+            store.messages(recipient.as_deref(), query.include_closed)?
+        };
         mailbox::hold_pre_boot_mail(
             &store, peer.as_ref().map(|peer| &peer.0), recipient.as_deref(), &mut messages,
         )?;
@@ -25645,6 +25729,69 @@ version 2
             .expect("attempt-bound mission output");
         assert_eq!(bound.revision, revision);
         assert_eq!(bound.claim_id, output["claim_id"]);
+    }
+
+    #[test]
+    fn fyi_send_retry_keeps_original_tags_when_the_recipient_policy_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let kdl =
+            "version 2\nagent \"example/reader\" { command \"true\"; wake-on \"questions\"; }\n";
+        let intent = crate::graph::parse_test_intent(kdl, "node").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "seat-retry")
+            .unwrap();
+        let request = || MessageSendRequest {
+            idempotency_key: "fyi-retry".into(),
+            from: "agent/example/writer".into(),
+            to: "agent/example/reader".into(),
+            content: "An update".into(),
+            title: None,
+            in_reply_to: None,
+            tags: vec![],
+            attachments: vec![],
+        };
+        let first = accept_message(&state, request(), None, None).unwrap().0;
+        assert!(crate::fyi::is_held(&first));
+        state
+            .store
+            .set_agent_wake_on(
+                "agent/example/reader",
+                crate::fyi::WakeOn::All,
+                "all-after-send",
+                "agent/example/reader",
+            )
+            .unwrap();
+        let retry = accept_message(&state, request(), None, None).unwrap().0;
+        assert_eq!(first.tags, retry.tags);
+        assert_eq!(first.subject, retry.subject);
+        assert_eq!(
+            state
+                .store
+                .claims_for(&first.subject, Some("message.sent"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let mut forged = request();
+        forged.idempotency_key = "forged-tag".into();
+        forged.tags = vec!["st3-fault:fake".into()];
+        assert!(accept_message(&state, forged, None, None).is_err());
+        let mut contradictory = request();
+        contradictory.idempotency_key = "contradictory".into();
+        contradictory.tags = vec![crate::fyi::FYI_TAG.into(), crate::fyi::QUESTION_TAG.into()];
+        assert!(accept_message(&state, contradictory, None, None).is_err());
     }
 
     #[tokio::test]

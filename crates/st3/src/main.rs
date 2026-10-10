@@ -4219,7 +4219,7 @@ enum MessageCommand {
     /// Send one durable normalized message to an agent.
     ///
     /// A message is a direct connection: it wakes the recipient agent for a full turn,
-    /// which rereads its context. Send one for a question or a handoff; `--fyi` for anything
+    /// which rereads its context. Use `--question` for a question or conversational handoff, `st work handoff` for work, and `--fyi` for anything
     /// else, which wakes nobody and reaches the recipient at its next turn. Status goes to
     /// `work progress` (it lands in the graph and wakes nobody), run events to report-to.
     /// People have no inbox: a send or reply to a person fails. To reach a person, print in
@@ -16945,7 +16945,21 @@ async fn send_message(
         }
     };
     match client.send_message(&request).await {
-        Ok(receipt) => Ok(Some(receipt)),
+        Ok(receipt) => {
+            if request.from.starts_with("agent/")
+                && request.tags.iter().any(|tag| tag == st3::fyi::FYI_TAG)
+                && !receipt
+                    .message
+                    .tags
+                    .iter()
+                    .any(|tag| tag == st3::fyi::FYI_TAG)
+            {
+                eprintln!(
+                    "st: daemon did not confirm FYI holding; this message may wake its recipient. Upgrade the sender and recipient owner daemons."
+                );
+            }
+            Ok(Some(receipt))
+        }
         Err(error) => Err(message_send_error(error, &request.idempotency_key)),
     }
 }
@@ -20173,7 +20187,7 @@ fn pi_family_message_frame(
             body,
             &st_drivers::ding::st3_body_sha256(body),
             attachments,
-        ), &message.tags),
+        ), &message.tags.iter().filter(|tag| tag.as_str() != st3::fyi::FYI_TAG || st3::fyi::is_held(message)).cloned().collect::<Vec<_>>()),
         "meta": {
             "from": message.from,
             "messageId": message.subject,
@@ -20636,6 +20650,7 @@ async fn run_pi_channel(
                     subscription.report(serde_json::from_str(&report)?);
                 }
                 let mut cursor = None;
+                let mut pending_fyi = Vec::new();
                 loop {
                     let page = if subscription.is_some() {
                         MessagePage { items: pushed_messages.clone(), has_more: false, next_cursor: None, limit: pushed_messages.len() }
@@ -20659,7 +20674,7 @@ async fn run_pi_channel(
                     // A prior incarnation's handoff is not proof that the model consumed mail.
                     // The incarnation-local set survives channel reexec and prevents repeats here.
                     let mut items = page.items;
-                    st3::fyi::release(&mut items);
+                    st3::fyi::release_page(&mut items, &mut pending_fyi);
                     for message in items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged" | "delivered")) {
                     if state.retry_after_ms.get(&message.subject).is_some_and(|after|
                         current_unix_ms().unwrap_or_default() < u128::from(*after)) {
@@ -23233,6 +23248,16 @@ fn native_queued_message(
         ),
     ];
     tags.extend(
+        view.tags
+            .iter()
+            .filter(|tag| {
+                (tag.as_str() == st3::fyi::FYI_TAG && st3::fyi::is_held(view))
+                    || tag.as_str() == "dictated"
+                    || tag.starts_with(st3::fyi::REMAINING_PREFIX)
+            })
+            .cloned(),
+    );
+    tags.extend(
         attachments
             .iter()
             .map(st_drivers::ding::AttachmentNotice::to_tag),
@@ -23471,6 +23496,7 @@ async fn forward_projected_messages_reporting(
     }?;
     let mut cursor = None;
     let mut failures = Vec::new();
+    let mut pending_fyi = Vec::new();
     loop {
         let page = message_page_reporting(
             client,
@@ -23482,7 +23508,7 @@ async fn forward_projected_messages_reporting(
         .await?;
         let mut items = page.items;
         // Held mail goes to the seat only beside a message that wakes it.
-        st3::fyi::release(&mut items);
+        st3::fyi::release_page(&mut items, &mut pending_fyi);
         for message in items {
             active_subjects.insert(message.subject.clone());
             if matches!(message.status.as_str(), "read" | "closed") {
@@ -25828,6 +25854,39 @@ mod tests {
             )
         );
         assert_eq!(omp["meta"]["messageId"], "message/0123456789abcdef");
+    }
+
+    #[test]
+    fn native_push_preserves_delivery_notices_and_person_signatures() {
+        let mut view = MessageView {
+            subject: "message/notice".into(),
+            from: "agent/example/writer".into(),
+            to: "agent/example/reader".into(),
+            content: "body".into(),
+            status: "sent".into(),
+            title: None,
+            in_reply_to: None,
+            tags: vec![
+                st3::fyi::FYI_TAG.into(),
+                "dictated".into(),
+                format!("{}12", st3::fyi::REMAINING_PREFIX),
+            ],
+            attachments: vec![],
+            created_index: 1,
+        };
+        let queued = native_queued_message(&view, "body".into(), &[]);
+        let rendered = st_drivers::ding::with_tag_notices("body".into(), &queued.tags);
+        assert!(rendered.contains("FYI: held"));
+        assert!(rendered.contains("12 older FYI held; st conversations ls"));
+        assert!(rendered.contains("dictated by voice"));
+        assert_eq!(queued.body, "body");
+        view.from = "person/operator".into();
+        let queued = native_queued_message(&view, "body".into(), &[]);
+        assert!(!queued.tags.iter().any(|tag| tag == st3::fyi::FYI_TAG));
+        assert!(
+            view.tags.iter().any(|tag| tag == st3::fyi::FYI_TAG),
+            "signed durable tags are unchanged"
+        );
     }
 
     #[test]
