@@ -548,6 +548,8 @@ await subHandlers.get("message_end")(messageEvent, subCtx);
 await subHandlers.get("turn_end")(messageEvent, subCtx);
 await subHandlers.get("agent_end")({ ...successfulEnd, willContinue: true }, subCtx);
 await subHandlers.get("agent_end")(successfulEnd, subCtx);
+// Delayed completion of a turn is not a new run after the run has ended.
+await subHandlers.get("turn_end")(messageEvent, subCtx);
 await subHandlers.get("session_shutdown")({}, subCtx);
 // A second run fails; a third is cut short when its session shuts down first.
 await subHandlers.get("agent_start")({}, subCtx);
@@ -600,6 +602,67 @@ assert.deepStrictEqual(
       quiet("end", "interrupted")]
     : [],
   "a heartbeat reports only the subagents whose sessions are busy",
+);
+
+// Human waits keep an idle subagent listed beyond the silence bound. The matching answer or
+// approval clears only that subagent's wait; an unrelated result must not clear an ask.
+globalThis.setInterval = (callback, ms) => {
+  heartbeats.push({ callback, ms });
+  return realSetInterval(() => {}, 2 ** 30);
+};
+const framesBeforeWait = readFrames().length;
+await subHandlers.get("agent_start")({}, quietCtx);
+globalThis.setInterval = realSetInterval;
+await subHandlers.get("tool_execution_start")({ toolName: "ask", toolCallId: "ask-child" }, quietCtx);
+await subHandlers.get("agent_end")(successfulEnd, quietCtx);
+await subHandlers.get("tool_result")({ toolCallId: "unrelated" }, quietCtx);
+const realNow = Date.now;
+let waitNow = realNow();
+Date.now = () => waitNow;
+for (let minute = 0; minute < 6; minute += 1) {
+  waitNow += 60_000;
+  heartbeats.at(-1)?.callback();
+}
+await subHandlers.get("tool_result")({ toolCallId: "ask-child" }, quietCtx);
+heartbeats.at(-1)?.callback();
+await subHandlers.get("tool_approval_requested")({ toolName: "bash" }, quietCtx);
+heartbeats.at(-1)?.callback();
+await subHandlers.get("tool_approval_resolved")({}, quietCtx);
+heartbeats.at(-1)?.callback();
+Date.now = realNow;
+await subHandlers.get("session_shutdown")({}, quietCtx);
+await pause(300);
+assert.deepStrictEqual(
+  readFrames().slice(framesBeforeWait).filter((frame) => frame.type === "subagent"),
+  process.argv[2]?.includes("st-omp-channel")
+    ? [quiet("start"), ...Array.from({ length: 7 }, () => quiet("progress")), quiet("end", "interrupted")]
+    : [],
+  "an idle subagent waiting for a person reports until the matching answer or approval",
+);
+
+// Bounds are UTF-8 bytes, not characters. Oversized IDs are rejected, not truncated into an
+// existing identity; oversized names are omitted. Exact-limit values still work.
+const framesBeforeBounds = readFrames().length;
+const boundedCtx = { ...subCtx, agent: { ...subCtx.agent, id: "é".repeat(128), name: "é".repeat(64) } };
+await subHandlers.get("agent_start")({}, boundedCtx);
+await subHandlers.get("agent_end")(successfulEnd, boundedCtx);
+const oversizedIdCtx = { ...boundedCtx, agent: { ...boundedCtx.agent, id: `${boundedCtx.agent.id}x` } };
+await subHandlers.get("agent_start")({}, oversizedIdCtx);
+await subHandlers.get("agent_end")(successfulEnd, oversizedIdCtx);
+const oversizedNameCtx = { ...subCtx, agent: { ...subCtx.agent, name: `${boundedCtx.agent.name}x` } };
+await subHandlers.get("agent_start")({}, oversizedNameCtx);
+await subHandlers.get("agent_end")(successfulEnd, oversizedNameCtx);
+await pause(300);
+const boundedRun = (event) => ({ type: "subagent", id: boundedCtx.agent.id, name: boundedCtx.agent.name, event,
+  ...(event === "end" ? { outcome: "completed" } : {}) });
+const unnamedRun = (event) => ({ type: "subagent", id: subCtx.agent.id, event,
+  ...(event === "end" ? { outcome: "completed" } : {}) });
+assert.deepStrictEqual(
+  readFrames().slice(framesBeforeBounds).filter((frame) => frame.type === "subagent"),
+  process.argv[2]?.includes("st-omp-channel")
+    ? [boundedRun("start"), boundedRun("end"), unnamedRun("start"), unnamedRun("end")]
+    : [],
+  "subagent identity and name are bounded without merging identities",
 );
 // Still mid-turn from the subagent's point of view; the seat's session is idle, so mail goes now.
 fs.appendFileSync(outboxPath, JSON.stringify({

@@ -52,15 +52,20 @@ interrupted, or when a collab call reports it errored, shut down or gone.
 **omp.** omp loads the seat's extension into each subagent session and names the subagent in
 `ctx.agent` (`id`, `name`). The extension reports that session's runs to the seat's channel, and
 the channel writes them into the same ledger, for the bound native session only. A run starts at
-`agent_start`, a `turn_end` starts a run the ledger missed, and the run ends at the `agent_end`
-that does not continue: `failed` after a provider error, `interrupted` after an abort, otherwise
-`completed`. A subagent session that shuts down first ends its run as `interrupted`. A subagent
-that runs again is a new run, `ID#2` and so on, as in Codex. The type is omp's agent name. omp
-reports no tokens for a subagent, so its end carries none.
+`agent_start`, and the run ends at the `agent_end` that does not continue or wait for a person:
+`failed` after a provider error, `interrupted` after an abort, otherwise `completed`. A subagent
+session that shuts down first ends its run as `interrupted`. A late `turn_end` never starts a run
+after its end; only a new `agent_start` does. That new run is `ID#2` and so on, as in Codex.
+The type is omp's agent name. IDs longer than 256 UTF-8 bytes are rejected rather than truncated,
+and names longer than 128 UTF-8 bytes are omitted. Both the extension and channel enforce these
+bounds. omp reports no tokens for a subagent, so its end carries none.
 
 An omp subagent also reports `progress` at each `turn_end`, at most every ten seconds at its
 messages and tool calls, and every minute while omp says its session is busy, as in a long tool
-call or a nested subagent. The driver ends a run that has not reported for five minutes as
+call or a nested subagent, or while it waits for an `ask` answer or tool approval. A matching tool
+result or execution end clears the ask; an approval resolution clears the approval. These waits
+belong to the subagent, not to its seat or siblings. The driver ends a run that has not reported
+for five minutes as
 `interrupted`, while the seat keeps running. This ends a subagent whose session stopped without
 its end. `ST3_SUBAGENT_SILENCE_MS` can only shorten the five minutes. The ledger forgets the run
 count of a subagent only after all of its runs have ended and been recorded, so a running

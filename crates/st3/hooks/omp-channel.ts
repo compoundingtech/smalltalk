@@ -145,6 +145,9 @@ type OpenSubagent = {
   /** The subagent session's newest context, asked whether the session is still busy. */
   ctx: ExtensionContext;
   reportedAt: number;
+  /** Human waits belong to this subagent, never to the top-level seat. */
+  pendingAsks: Set<string>;
+  pendingApproval: boolean;
 };
 
 /**
@@ -231,6 +234,13 @@ const SUBAGENT_PROGRESS_MS = 10_000;
 const SUBAGENT_HEARTBEAT_MS = 60_000;
 const SUBAGENT_SILENT_MS = 5 * 60_000;
 const SUBAGENT_ACTIVITY = new Set(["message_end", "tool_execution_start", "tool_execution_end"]);
+
+/** Reject rather than truncate identities: truncation would merge distinct subagents. */
+const subagentText = (value: unknown, maxBytes: number) => {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  return text && Buffer.byteLength(text, "utf8") <= maxBytes ? text : undefined;
+};
 
 /**
  * Compile-time coupling to the pinned pi declarations for the surfaces the context producer reads.
@@ -1164,33 +1174,47 @@ export default function (pi: ExtensionAPI) {
   const heartbeat = () => {
     const now = Date.now();
     for (const [id, open] of state.subagents ?? []) {
-      if (subagentBusy(open.ctx)) reportSubagent(open, now);
+      if (open.pendingAsks.size || open.pendingApproval || subagentBusy(open.ctx)) {
+        reportSubagent(open, now);
+      }
       // st has ended a run this quiet; forget it so the heartbeat stops with the last run.
       else if (now - open.reportedAt >= SUBAGENT_SILENT_MS) closeSubagent(id);
     }
   };
   const observeSubagent = (event: string, payload: unknown, ctx: ExtensionContext) => {
     const agent = record(record(ctx)?.agent);
-    const id = typeof agent?.id === "string" ? agent.id.trim() : "";
+    const id = subagentText(agent?.id, 256);
     if (!id) return;
-    const name = typeof agent?.name === "string" ? agent.name.trim() : "";
+    const name = subagentText(agent?.name, 128);
     const frame = { type: "subagent", id, ...(name ? { name } : {}) };
     const running = (state.subagents ??= new Map<string, OpenSubagent>());
     const open = running.get(id);
     if (open) open.ctx = ctx;
     const now = Date.now();
+    const tool = record(payload);
+    const callId = subagentText(tool?.toolCallId, 256);
+    if (open) {
+      if ((event === "tool_call" || event === "tool_execution_start") &&
+        tool?.toolName === "ask" && callId) open.pendingAsks.add(callId);
+      if ((event === "tool_result" || event === "tool_execution_end") && callId) {
+        open.pendingAsks.delete(callId);
+      }
+      if (event === "tool_approval_requested") open.pendingApproval = true;
+      if (event === "tool_approval_resolved") open.pendingApproval = false;
+    }
     if (event === "agent_start") {
-      running.set(id, { frame, ctx, reportedAt: now });
+      running.set(id, { frame, ctx, reportedAt: now, pendingAsks: new Set(), pendingApproval: false });
       sendFrame({ ...frame, event: "start" });
       state.subagentHeartbeat ??= setInterval(heartbeat, SUBAGENT_HEARTBEAT_MS).unref();
-    } else if (event === "turn_end") {
-      if (open) open.reportedAt = now;
-      sendFrame({ ...frame, event: "progress" });
+    } else if (event === "turn_end" && open) {
+      reportSubagent(open, now);
     } else if (SUBAGENT_ACTIVITY.has(event)) {
       if (open && now - open.reportedAt >= SUBAGENT_PROGRESS_MS) reportSubagent(open, now);
     } else if (event === "agent_end") {
       const end = record(payload) ?? {};
       if (end.willContinue === true) return;
+      if (open && (open.pendingAsks.size || open.pendingApproval) &&
+        subagentOutcome(end) === "completed") return;
       closeSubagent(id);
       sendFrame({ ...frame, event: "end", outcome: subagentOutcome(end) });
     } else if (event === "session_shutdown" && closeSubagent(id)) {
