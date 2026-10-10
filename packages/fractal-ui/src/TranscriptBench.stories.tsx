@@ -170,8 +170,9 @@ function centerTurn(scroll: HTMLElement): { readonly element: Element; readonly 
 async function anchorDrift(root: ParentNode, scroll: HTMLElement, total: number): Promise<number> {
   const anchor = centerTurn(scroll)
   let drift = 0
+  let samples = 0
   window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true }))
-  while (completeTurnCount(root) < total) {
+  while (completeTurnCount(root) < total || samples++ < 2) {
     await frame()
     drift = Math.max(drift, Math.abs(anchor.element.getBoundingClientRect().top - scroll.getBoundingClientRect().top - anchor.offset))
   }
@@ -196,10 +197,14 @@ export const NewestPageFirst: Story = { play: async ({ canvasElement }) => {
 export const BackfillKeepsReaderAnchor: Story = { play: async ({ canvasElement }) => {
   await expect(await reopen(canvasElement)).toBeLessThan(200)
   const scroll = scroller(canvasElement)
-  while (completeTurnCount(canvasElement) === 0) await frame()
-  await frame()
+  while (completeTurnCount(canvasElement) < 6) {
+    await frame()
+    scroll.dispatchEvent(new WheelEvent('wheel', { deltaY: -scroll.scrollHeight }))
+    scroll.scrollTop = 0
+    scroll.dispatchEvent(new Event('scroll'))
+  }
   scroll.dispatchEvent(new WheelEvent('wheel', { deltaY: -scroll.clientHeight / 2 }))
-  scroll.scrollTop -= scroll.clientHeight / 2
+  scroll.scrollTop = scroll.scrollHeight - scroll.clientHeight * 1.5
   await frame()
   await expect(turnCount(canvasElement)).toBeLessThan(200)
   await expect(scroll.scrollTop).toBeGreaterThanOrEqual(scroll.clientHeight)
