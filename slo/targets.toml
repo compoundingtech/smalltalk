@@ -89,3 +89,8 @@ max_ms = 100
 [cpu]
 about = "Daemon CPU: near zero when idle, at most 2 cores under daemon_load"
 max_cores = 2.0
+
+[database]
+about = "This member's store: the pages in use, and how much they grow a day once checkpoints and retention have run"
+max_live_gb = 8.0
+max_growth_mb_per_day = 300
