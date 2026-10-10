@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep a runtime-created mission definition source canonical for the same revision, including affected-tree rebuilds.",
+  "replay": {
+    "status": "changed",
+    "detail": "The retained mission definition source uses the existing canonical claim order when its revision matches the projected minimal run. Definition revision and state are not elected or changed; existing affected-tree and full-replay paths remain."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, index, trigger or storage-version change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Claim admission, person authority, idempotency keys, run state and managed transaction guards are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client schema or API change. Identical runtime-created revisions use the same canonical claim order already used for published mission revisions."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No restart or startup migration is required by the change. Existing full replays retain their work and writer lifetime."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual database repair or new operational command is required."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "A definition retaining the later duplicate source can be repaired even when revision history already points to the canonical source. The pointer update shares the projection transaction; other revision history and run state are retained."
+  }
+}
