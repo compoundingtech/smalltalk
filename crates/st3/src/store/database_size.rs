@@ -77,7 +77,7 @@ pub struct DatabaseSize {
 
 /// The daily physical growth at `now` for `physical` bytes, from the sample with a measured WAL
 /// nearest exactly a day ago and within half an hour of it, and the span it was measured over.
-pub(crate) fn physical_growth(samples: &[Sample], now: u128, physical: u64) -> Option<(i64, u128)> {
+fn physical_growth(samples: &[Sample], now: u128, physical: u64) -> Option<(i64, u128)> {
     let day_ago = now.checked_sub(DAY_MS)?;
     let (span, then) = samples
         .iter()
