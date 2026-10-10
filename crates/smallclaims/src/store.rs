@@ -6440,12 +6440,12 @@ impl Store {
             self.runtime.replay_from_nothing(&transaction)?;
             self.runtime.after_projection(&transaction)?;
             transaction.execute(
-            "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
+                "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
              VALUES ('graph', 'healthy', ?1, ?2)
              ON CONFLICT(aggregate) DO UPDATE SET status='healthy', last_good_store_index=excluded.last_good_store_index,
                 error_code=NULL, error_message=NULL, updated_at_unix_ms=excluded.updated_at_unix_ms",
-            params![current_index_tx(&transaction)?, now_ms().to_string()],
-        )?;
+                params![current_index_tx(&transaction)?, now_ms().to_string()],
+            )?;
             transaction.commit()?;
             Ok::<_, anyhow::Error>(())
         })();

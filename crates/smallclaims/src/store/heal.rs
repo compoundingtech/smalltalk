@@ -621,7 +621,8 @@ impl Store {
         };
         self.replay_replication_graph()?;
         let mut state = self.heal.lock().unwrap_or_else(PoisonError::into_inner);
-        state.replayed_at_unix_ms = Some(now);
+        // Queueing and reconstruction must not consume the completed replay's backoff.
+        state.replayed_at_unix_ms = Some(now_ms());
         state.replay_backoff_ms = (state.replay_backoff_ms.max(self.heal_replay_backoff_ms) * 2)
             .clamp(self.heal_replay_backoff_ms, HEAL_REPLAY_BACKOFF_MAX_MS);
         Ok(true)
@@ -1071,6 +1072,14 @@ mod replay_reservation_tests {
             done.send((result, work.finish())).unwrap();
         });
         let refused = outcome.recv_timeout(std::time::Duration::from_secs(2));
+        // Observe a later real clock tick while the first replay is still waiting.
+        // The old admission-time timestamp must not count as completed backoff.
+        let waiting_at = now_ms();
+        let clock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while now_ms() <= waiting_at && std::time::Instant::now() < clock_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let released_at = now_ms();
         // Always release the real loan before checking failures or joining workers.
         drop(writer);
         let first = first.join().unwrap().unwrap();
@@ -1080,6 +1089,8 @@ mod replay_reservation_tests {
             refused.expect("a second replay must not queue behind the held writer");
         assert!(!result.unwrap());
         assert_eq!(work, crate::sqlite::work::SqliteWork::default());
+        assert!(released_at > waiting_at, "the clock witness must advance");
+        assert!(store.heal.lock().unwrap().replayed_at_unix_ms.unwrap() >= released_at);
         assert!(!store.heal.lock().unwrap().replay_in_progress);
         assert!(
             !store.replay_graph_for_heal().unwrap(),

@@ -10666,6 +10666,46 @@ fn action_request_digest(request: &ActionRequest) -> Result<String, ApiError> {
     )))
 }
 
+fn validate_action_admission(
+    session: &ClientSession,
+    request: &ActionRequest,
+) -> Result<(), ApiError> {
+    if request.api_version != CLIENT_API_VERSION
+        || !request.id.starts_with("action/")
+        || !(16..=256).contains(&request.idempotency_key.len())
+    {
+        return Err(validation(
+            "the action version, ID, or idempotency key is invalid",
+        ));
+    }
+    if contains_identity_selector(&request.parameters) {
+        return Err(validation(
+            "client actions cannot select an actor, credential, or fleet secret",
+        ));
+    }
+    if request.action_type == "attention.resolve" {
+        return Err(ApiError::bad(St3Error::new(
+            "attention-migrated",
+            "attention is a view; complete or remedy its source",
+        )));
+    }
+    let scope = action_scope(&request.action_type)
+        .ok_or_else(|| validation("the action type is unknown"))?;
+    require_scope(session, scope)?;
+    // Snapshot provenance is checked, while freshness belongs to the action's own
+    // revision, generation, incarnation, or screen checks.
+    let read_only_terminal_lifecycle = matches!(
+        request.action_type.as_str(),
+        "terminal.attach" | "terminal.detach"
+    );
+    if !read_only_terminal_lifecycle && !acting_party(session) {
+        return Err(forbidden(
+            "client mutations require a concrete person or a local agent",
+        ));
+    }
+    Ok(())
+}
+
 pub(super) async fn action(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
@@ -10702,9 +10742,19 @@ async fn action_with_send_wait(
             Extension(snapshot),
             Extension(session),
             Json(request),
+            None,
         )
         .await;
     }
+    validate_action_admission(&session, &request)?;
+    let action_id = request.id.clone();
+    let key = request.idempotency_key.clone();
+    // Reserve the same gate the dispatch holds through receipt persistence BEFORE
+    // taking capacity. A retry cannot create another worker or race the first send.
+    let gate = action_gate(&state, &session, &key);
+    let reserved_gate = gate
+        .try_lock_owned()
+        .map_err(|_| send_unconfirmed(&action_id, &key))?;
     let permit = pending.try_acquire_owned().map_err(|_| ApiError {
         status: StatusCode::TOO_MANY_REQUESTS,
         code: "rate-limited".into(),
@@ -10715,37 +10765,43 @@ async fn action_with_send_wait(
             ("retry_after_ms".into(), json!(1000)),
         ])),
     })?;
-    let action_id = request.id.clone();
-    let key = request.idempotency_key.clone();
     let runtime = tokio::runtime::Handle::current();
     let profile = crate::profile::current();
     let cpu = crate::performance::current();
+    let trace = crate::relay_trace::current();
     // Always use a separate blocking worker: the action includes synchronous writer
     // waits, which cannot be preempted by a timeout around the action future itself.
     let task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu, || {
-            runtime.block_on(action_inner(
-                State(state),
-                Extension(snapshot),
-                Extension(session),
-                Json(request),
-            ))
+            crate::relay_trace::blocking(trace, || {
+                runtime.block_on(action_inner(
+                    State(state),
+                    Extension(snapshot),
+                    Extension(session),
+                    Json(request),
+                    Some(reserved_gate),
+                ))
+            })
         })
     });
     match tokio::time::timeout(wait, task).await {
         Ok(result) => result.map_err(ApiError::internal)?,
-        Err(_) => Err(ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "message-send-unconfirmed".into(),
-            message: "the database has not confirmed this send yet; it may still complete. Retry the identical request with the same idempotency key".into(),
-            details: Box::new(serde_json::Map::from_iter([
-                ("applied".into(), json!("unknown")),
-                ("action_id".into(), json!(action_id)),
-                ("idempotency_key".into(), json!(key)),
-            ])),
-        }),
+        Err(_) => Err(send_unconfirmed(&action_id, &key)),
+    }
+}
+
+fn send_unconfirmed(action_id: &str, key: &str) -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "message-send-unconfirmed".into(),
+        message: "the database has not confirmed this send yet; it may still complete. Retry the identical request with the same idempotency key".into(),
+        details: Box::new(serde_json::Map::from_iter([
+            ("applied".into(), json!("unknown")),
+            ("action_id".into(), json!(action_id)),
+            ("idempotency_key".into(), json!(key)),
+        ])),
     }
 }
 
@@ -10754,42 +10810,18 @@ async fn action_inner(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Json(request): Json<ActionRequest>,
+    reserved_gate: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<Json<Value>, ApiError> {
-    if request.api_version != CLIENT_API_VERSION
-        || !request.id.starts_with("action/")
-        || !(16..=256).contains(&request.idempotency_key.len())
-    {
-        return Err(validation(
-            "the action version, ID, or idempotency key is invalid",
-        ));
-    }
-    if contains_identity_selector(&request.parameters) {
-        return Err(validation(
-            "client actions cannot select an actor, credential, or fleet secret",
-        ));
-    }
-    if request.action_type == "attention.resolve" {
-        return Err(ApiError::bad(St3Error::new(
-            "attention-migrated",
-            "attention is a view; complete or remedy its source",
-        )));
-    }
-    let scope = action_scope(&request.action_type)
-        .ok_or_else(|| validation("the action type is unknown"))?;
-    require_scope(&session, scope)?;
-    // Snapshot provenance is checked, while freshness belongs to the action's own
-    // revision, generation, incarnation, or screen checks.
-    let read_only_terminal_lifecycle = matches!(
-        request.action_type.as_str(),
-        "terminal.attach" | "terminal.detach"
-    );
-    if !read_only_terminal_lifecycle && !acting_party(&session) {
-        return Err(forbidden(
-            "client mutations require a concrete person or a local agent",
-        ));
+    // The message-send wrapper validates before reserving its gate and capacity.
+    // Other actions retain their original admission order here.
+    if reserved_gate.is_none() {
+        validate_action_admission(&session, &request)?;
     }
     let gate = action_gate(&state, &session, &request.idempotency_key);
-    let _guard = gate.lock().await;
+    let _guard = match reserved_gate {
+        Some(guard) => guard,
+        None => gate.lock_owned().await,
+    };
     let request_digest = action_request_digest(&request)?;
     let receipt_digest = hex::encode(Sha256::digest(
         format!("{}:{}", session.actor, request.idempotency_key).as_bytes(),
@@ -15547,6 +15579,91 @@ subscription "watch/source" {
             .code,
             "idempotency-conflict"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_key_unconfirmed_retries_keep_capacity_for_other_senders() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/one-held-key".into(),
+            action_type: "message.send".into(),
+            idempotency_key: "one-held-key-many-retries".into(),
+            fence: Fence {
+                snapshot_id: snapshot.id.clone(),
+                ..Default::default()
+            },
+            parameters: json!({"to":"agent/blair","content":"Only one retained worker."}),
+        };
+        let pending = Arc::new(tokio::sync::Semaphore::new(16));
+        let writer = state.store.connection.write();
+        let first = action_with_send_wait(
+            state.clone(),
+            snapshot.clone(),
+            session.clone(),
+            request.clone(),
+            std::time::Duration::from_millis(25),
+            pending.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(first.code, "message-send-unconfirmed");
+        for _ in 0..32 {
+            let retry = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                action_with_send_wait(
+                    state.clone(),
+                    snapshot.clone(),
+                    session.clone(),
+                    request.clone(),
+                    std::time::Duration::from_secs(10),
+                    pending.clone(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(retry.code, "message-send-unconfirmed");
+            assert_eq!(retry.details["applied"], "unknown");
+            assert_eq!(retry.details["action_id"], request.id);
+            assert_eq!(retry.details["idempotency_key"], request.idempotency_key);
+            assert_eq!(pending.available_permits(), 15);
+        }
+        drop(writer);
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pending.clone().acquire_many_owned(16),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(finished);
+        let receipt = action_with_send_wait(
+            state.clone(),
+            snapshot,
+            session,
+            request,
+            std::time::Duration::from_secs(10),
+            pending,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(!receipt["affected_ids"].as_array().unwrap().is_empty());
+        for kind in ["message.sent", "custom.client.action-result"] {
+            assert_eq!(
+                state
+                    .store
+                    .claims_for_kind_at(kind, None, true, 100)
+                    .unwrap()
+                    .claims
+                    .len(),
+                1
+            );
+        }
     }
 
     #[test]
