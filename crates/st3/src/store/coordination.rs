@@ -146,6 +146,7 @@ mod tests {
                     kind: "message.sent".into(),
                     actor: Some("agent/example/writer".into()),
                     fields: BTreeMap::from([
+                        ("status".into(), json!("sent")),
                         ("from".into(), json!("agent/example/writer")),
                         ("to".into(), json!("agent/example/reader")),
                         ("tags".into(), json!([crate::fyi::FYI_TAG])),
@@ -214,6 +215,7 @@ mod tests {
                     kind: "message.sent".into(),
                     actor: Some("agent/example/writer".into()),
                     fields: BTreeMap::from([
+                        ("status".into(), json!("sent")),
                         ("from".into(), json!("agent/example/writer")),
                         ("to".into(), json!(to)),
                         ("content".into(), json!("metadata count fixture")),
