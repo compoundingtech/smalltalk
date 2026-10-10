@@ -301,6 +301,7 @@ pub(super) fn harness_sql(connection: &Connection, subject: &str, sql: &str) -> 
 thread_local! {
     static CURRENT_TRANSACTION_ELAPSED: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
     static CURRENT_TRANSACTION_STEPS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static CURRENT_BEFORE_WRITER_ADMISSION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -468,6 +469,26 @@ fn pooled_current_transaction<T>(
     result
 }
 
+fn reserve_current_writer(
+    writer: &smallclaims::sqlite::WriterConnection,
+    background: bool,
+    deadline: std::time::Instant,
+) -> Result<smallclaims::sqlite::WriterReservation<'_>, St3Error> {
+    #[cfg(test)]
+    CURRENT_BEFORE_WRITER_ADMISSION.with(|slot| {
+        let hook = slot.borrow_mut().take();
+        if let Some(hook) = hook { hook(); }
+    });
+    let result = if background { writer.reserve_background_writer_until(deadline) }
+        else { writer.reserve_writer_until(deadline) };
+    result.map_err(|error| match error {
+        std::sync::mpsc::RecvTimeoutError::Timeout =>
+            St3Error::new("database-busy", "current writer admission exceeded its remaining bound"),
+        std::sync::mpsc::RecvTimeoutError::Disconnected =>
+            St3Error::new("internal", "the managed writer stopped during current admission"),
+    })
+}
+
 /// Only this exclusively loaned connection's progress deadline can interrupt a current transaction.
 /// Preserve ownership/protocol errors; do not infer interruption from an error's text.
 #[cfg(test)]
@@ -545,16 +566,7 @@ fn current_transaction_until<T>(
         // traffic stays FIFO and maintenance keeps the existing background lane. Schema
         // preparation precedes admission, and every validation still runs inside the fresh tx.
         let _reservation = if !native_control {
-            writer.map(|(writer, background)| {
-                let result = if background { writer.reserve_background_writer_until(admission_deadline) }
-                    else { writer.reserve_writer_until(admission_deadline) };
-                result.map_err(|error| match error {
-                    std::sync::mpsc::RecvTimeoutError::Timeout =>
-                        St3Error::new("database-busy", "current writer admission exceeded its remaining bound"),
-                    std::sync::mpsc::RecvTimeoutError::Disconnected =>
-                        St3Error::new("internal", "the managed writer stopped during current admission"),
-                })
-            }).transpose()?
+            writer.map(|(writer, background)| reserve_current_writer(writer, background, admission_deadline)).transpose()?
         } else { None };
         let tx = if native_control {
             connection.busy_timeout(admission_deadline.saturating_duration_since(std::time::Instant::now())).map_err(internal)?;
@@ -1868,6 +1880,37 @@ mod tests {
         drop(loan);
         assert!(pool.state.lock().unwrap().idle.is_none());
         assert_eq!(store.readers.get().query_row("SELECT COUNT(*) FROM changed_during_loan", [], |row| row.get::<_, usize>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn waiting_current_maintenance_does_not_block_foreground_connection_admission() {
+        let store = Arc::new(Store::open_memory("owner").unwrap());
+        declare(&store, "owner");
+        let pool = &store.smalltalk.current_connections;
+        pooled_current_transaction(&store.graph, pool, false, |_| Ok(())).unwrap();
+        let (waiting, wait) = std::sync::mpsc::sync_channel(1);
+        let (release, released) = std::sync::mpsc::sync_channel(1);
+        let maintenance = store.clone();
+        let background = std::thread::spawn(move || {
+            // A task may be descheduled before managed admission. No transaction is open.
+            CURRENT_BEFORE_WRITER_ADMISSION.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    waiting.send(()).unwrap();
+                    released.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+                }));
+            });
+            pooled_current_transaction(&maintenance.graph, &maintenance.smalltalk.current_connections,
+                true, |_| Ok(()))
+        });
+        wait.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let foreground = append_with_connections(&store.graph, &state("idle", "one", 1),
+            1, None, Some(pool));
+        // Always release/join the paused task before reporting a negative result.
+        release.send(()).unwrap();
+        let background_result = background.join().unwrap();
+        assert!(foreground.is_ok(), "maintenance waiting for its turn must not strand a foreground sample: {foreground:?}");
+        assert!(background_result.is_ok(), "{background_result:?}");
+        assert_eq!(pool.state.lock().unwrap().opened, 1);
     }
 
     #[test]
