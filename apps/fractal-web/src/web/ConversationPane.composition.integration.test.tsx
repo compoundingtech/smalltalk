@@ -605,11 +605,12 @@ describe('ConversationPane composition activation', () => {
     const tool = turn.querySelector('[data-tool-status]')!
     const thinking = turn.querySelector('[data-testid="thinking-entry"]')!
     expect(tool.getAttribute('data-item-id')).toBe('read')
-    expect(thinking.getAttribute('data-item-id')).toBe('reasoning')
+    expect(thinking.getAttribute('data-scroll-anchor-id')).toBe('["thinking-summary","p1"]')
     expect(tool.querySelector('[data-testid="tool-detail-preview"]')?.closest('[data-item-id]')).toBe(tool)
     await act(async () => { thinking.querySelector<HTMLButtonElement>('button')!.click() })
     expect(thinking.textContent).toContain('Compare the observed selection')
-    expect(thinking.querySelector('p')?.closest('[data-item-id]')).toBe(thinking)
+    const reasoning = thinking.querySelector('[data-item-id="reasoning"]')!
+    expect(thinking.querySelector('p')?.closest('[data-item-id]')).toBe(reasoning)
 
     // Older source turns can land above the work log without changing any nested row's identity.
     const older: readonly ConversationItem[] = [
@@ -618,7 +619,8 @@ describe('ConversationPane composition activation', () => {
     ]
     await show([...older, ...scenario.slice(0, 5)])
     expect(container.querySelector('[data-item-id="read"][data-tool-status]')).toBe(tool)
-    expect(container.querySelector('[data-item-id="reasoning"][data-testid="thinking-entry"]')).toBe(thinking)
+    expect(container.querySelector('[data-testid="thinking-entry"][data-scroll-anchor-id]')).toBe(thinking)
+    expect(container.querySelector('[data-item-id="reasoning"][data-conversation-entry-id]')).toBe(reasoning)
     expect(summary.getAttribute('data-scroll-anchor-id')).toBe('["work-summary","p1"]')
     if (presentation === 'interactive') {
       await act(async () => { summary.click() })
@@ -670,7 +672,7 @@ describe('ConversationPane composition activation', () => {
     expect(new Set(bounded.anchorHistory.ids)).toEqual(expectedIds)
     expect(bounded.anchorHistory.ids).not.toContain('missing/source-row')
     expect(container.querySelector('[data-tool-status][data-item-id="suffix/tool"]')).not.toBeNull()
-    expect(container.querySelector('[data-testid="thinking-entry"][data-item-id="suffix/thinking"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="thinking-entry"][data-scroll-anchor-id]')).not.toBeNull()
     expect(container.querySelector('[data-testid="agent-message"][data-item-id="suffix/answer"]')).not.toBeNull()
 
     await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true })) })
