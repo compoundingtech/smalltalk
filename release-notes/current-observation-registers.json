@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "Publish categorical agent observations as replaceable current registers while retaining durable numeric accounting and diagnostics.",
+  "summary": "Publish categorical agent observations as replaceable current registers while retaining durable numeric accounting and diagnostics. Native prompt alerts read current registers; terminal refusals record an opaque prompt reference instead of using an ephemeral register ID as durable claim evidence. Modern driver ownership and transition counters keep a cleared prompt stable across heartbeat restamps; a new transition or register epoch opens a new episode.",
   "replay": {
     "status": "none",
     "detail": "Durable graph replay is unchanged. Current registers are outside graph replay and are refreshed by their live owners."

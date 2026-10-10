@@ -56261,20 +56261,7 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             json!({"state":"working", "incarnation_id":"one", "blocked_on":"human", "ask":"question"}),
         );
         assert_eq!(prompts()[0].episode, again.id);
-        store
-            .append_claim(&ClaimInput {
-                subject: "agent/node.worker".into(),
-                kind: "harness.diagnostic".into(),
-                actor: Some("agent/node.worker".into()),
-                fields: serde_json::from_value(
-                    json!({"code":"native-prompt-gone", "incarnation_id":"one"}),
-                )
-                .unwrap(),
-                evidence: vec![again.id.clone()],
-                expected_subject: None,
-                idempotency_key: Some(attention_snapshot::native_prompt_gone_key(&again.id)),
-            })
-            .unwrap();
+        store.record_native_prompt_gone(&again, "one").unwrap();
         assert!(prompts().is_empty());
         // A prompt from an incarnation that is no longer running waits on nobody.
         append(
@@ -56284,6 +56271,68 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
         assert_eq!(prompts().len(), 1);
         append("runtime.observed", json!({"status":"running", "incarnation_id":"two"}));
         assert!(prompts().is_empty());
+    }
+
+    #[test]
+    fn native_prompt_clear_preserves_legacy_graph_evidence() {
+        let store = Store::open_memory("node").unwrap();
+        let observation = store.append_legacy_claim(&ClaimInput {
+            subject: "agent/node.worker".into(), kind: "harness.observed".into(),
+            actor: Some("agent/node.worker".into()),
+            fields: serde_json::from_value(json!({"state":"working", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission"})).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        assert!(checkpoint::claim_or_tombstone_exists(&store.readers.get(), &observation.id).unwrap());
+        let clear = store.record_native_prompt_gone(&observation, "one").unwrap();
+        assert_eq!(clear.body["evidence"], json!([observation.id]));
+    }
+
+    #[test]
+    fn native_prompt_register_heartbeats_keep_the_clear_and_a_new_transition_reopens() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!("version 2\nagent \"worker\" {{ workspace {:?}; harness \"claude\" {{}} }}\n", workspace.path().display().to_string());
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store.mission(&intent, IntentInput { kdl: source, source_name: None }).unwrap();
+        store.apply_as(&intent, &preview.subject_tokens, "prompt-heartbeat", Some("person/avery")).unwrap();
+        let input = |kind: &str, fields: Value| ClaimInput {
+            subject: "agent/node.worker".into(), kind: kind.into(),
+            actor: Some("agent/node.worker".into()), fields: serde_json::from_value(fields).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        };
+        store.append_claim(&input("runtime.observed", json!({"status":"running", "incarnation_id":"one"}))).unwrap();
+        let sample = |transition: u64| store.append_claim(&input("harness.observed", json!({
+            "state":"working", "incarnation_id":"one", "blocked_on":"human", "ask":"permission",
+            "ownership_sequence":7, "transition_sequence":transition
+        }))).unwrap();
+        let prompts = || store.attention_items(Some("person/avery")).unwrap().into_iter()
+            .filter(|item| item.kind == "harness-prompt").collect::<Vec<_>>();
+        let first = sample(10);
+        let episode = Store::native_prompt_episode(&first);
+        assert_eq!(prompts()[0].episode, episode);
+        let mut restored = first.clone();
+        restored.id = "local-observation/node/different-epoch/1".into();
+        assert_ne!(Store::native_prompt_episode(&restored), episode);
+        let heartbeat = sample(10);
+        assert_ne!(heartbeat.id, first.id);
+        assert_eq!(Store::native_prompt_episode(&heartbeat), episode);
+        assert_eq!(prompts()[0].episode, episode);
+        assert!(store.record_native_prompt_gone(&heartbeat, "other").is_err());
+        let clear = store.record_native_prompt_gone(&heartbeat, "one").unwrap();
+        assert_eq!(clear.body["fields"]["prompt_observation"], episode);
+        assert_eq!(clear.body["evidence"], json!([]));
+        assert!(prompts().is_empty());
+        let later = sample(10);
+        assert_eq!(store.record_native_prompt_gone(&later, "one").unwrap().id, clear.id);
+        assert!(prompts().is_empty(), "a heartbeat must not reopen a refused prompt");
+        let next = sample(11);
+        assert_ne!(Store::native_prompt_episode(&next), episode);
+        assert_eq!(prompts()[0].episode, Store::native_prompt_episode(&next));
+        // Local snapshot references remain inadmissible as arbitrary durable claim evidence.
+        let mut arbitrary = input("harness.diagnostic", json!({"code":"unrelated"}));
+        arbitrary.evidence = vec![next.id];
+        assert_eq!(store.append_claim(&arbitrary).unwrap_err().code, "missing-evidence");
     }
 
     #[test]

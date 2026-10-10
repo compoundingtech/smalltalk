@@ -3462,31 +3462,19 @@ impl<R: RuntimeControl> Reconciler<R> {
             seen.remove(&subject.subject);
             return Ok(());
         }
+        let episode = Store::native_prompt_episode(&blocked);
         if !st_drivers::blocking_screen::claude_input_ready(screen) {
             // The prompt's dialog is up.
-            seen.insert(subject.subject.clone(), blocked.id.clone());
+            seen.insert(subject.subject.clone(), episode.clone());
             return Ok(());
         }
         // The box before the dialog was drawn, or while Claude works, says nothing.
-        if seen.get(&subject.subject) != Some(&blocked.id) {
+        if seen.get(&subject.subject) != Some(&episode) {
             return Ok(());
         }
         seen.remove(&subject.subject);
         drop(seen);
-        self.store.append_claim(&ClaimInput {
-            subject: subject.subject.clone(),
-            kind: "harness.diagnostic".into(),
-            actor: Some(subject.subject.clone()),
-            fields: BTreeMap::from([
-                ("code".into(), Value::String("native-prompt-gone".into())),
-                ("status".into(), Value::String("resolved".into())),
-                ("driver".into(), Value::String("claude".into())),
-                ("incarnation_id".into(), Value::String(incarnation.into())),
-            ]),
-            evidence: vec![blocked.id.clone()],
-            expected_subject: None,
-            idempotency_key: Some(crate::store::native_prompt_gone_key(&blocked.id)),
-        })?;
+        self.store.record_native_prompt_gone(&blocked, incarnation)?;
         self.signal_changed();
         Ok(())
     }
@@ -34235,6 +34223,35 @@ agent "plain" {{ workspace {:?}; harness "claude" {{}} }}
         let second = ask();
         reconciler.reconcile_once().unwrap();
         assert!(!gone(&second.id));
+        // Modern heartbeat snapshots replace their IDs between seeing and refusing the dialog.
+        // Their ownership/transition axes name the same prompt throughout that interval.
+        let modern = |transition: u64| {
+            store.append_claim(&ClaimInput {
+                subject: "agent/node.seat".into(), kind: "harness.observed".into(),
+                actor: Some("agent/node.seat".into()),
+                fields: serde_json::from_value(serde_json::json!({
+                    "state":"working", "driver":"claude", "incarnation_id":"one",
+                    "blocked_on":"human", "ask":"permission",
+                    "ownership_sequence":4, "transition_sequence":transition
+                })).unwrap(),
+                evidence: vec![], expected_subject: None, idempotency_key: None,
+            }).unwrap()
+        };
+        let third = modern(12);
+        let episode = Store::native_prompt_episode(&third);
+        show("claude-permission-dialog.txt");
+        reconciler.reconcile_once().unwrap();
+        let heartbeat = modern(12);
+        assert_ne!(third.id, heartbeat.id);
+        show("claude-permission-refused.txt");
+        reconciler.reconcile_once().unwrap();
+        assert!(gone(&episode));
+        modern(12);
+        reconciler.reconcile_once().unwrap();
+        let next = modern(13);
+        reconciler.reconcile_once().unwrap();
+        assert!(!gone(&Store::native_prompt_episode(&next)), "a new transition still needs its own dialog proof");
+
     }
 
     #[test]

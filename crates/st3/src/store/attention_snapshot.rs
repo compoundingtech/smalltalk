@@ -53,6 +53,47 @@ impl Store {
         })))
     }
 
+    /// Record a terminal refusal without treating an ephemeral register reference as a
+    /// durable graph claim. Legacy graph observations still carry ordinary claim evidence.
+    pub(crate) fn record_native_prompt_gone(
+        &self,
+        observation: &ClaimRecord,
+        incarnation: &str,
+    ) -> Result<ClaimRecord, St3Error> {
+        let fields = observation.body.get("fields").unwrap_or(&observation.body);
+        if observation.kind != "harness.observed"
+            || fields["blocked_on"] != "human"
+            || fields["incarnation_id"] != incarnation
+        {
+            return Err(St3Error::new("invalid-harness-prompt", "the prompt does not belong to this incarnation"));
+        }
+        let durable = checkpoint::claim_or_tombstone_exists(&self.readers.get(), &observation.id)
+            .map_err(internal)?;
+        if !durable && !observation.id.starts_with("local-observation/") {
+            return Err(St3Error::new("missing-evidence", "the prompt observation is not stored"));
+        }
+        self.append_claim(&ClaimInput {
+            subject: observation.subject.clone(),
+            kind: "harness.diagnostic".into(),
+            actor: Some(observation.subject.clone()),
+            fields: BTreeMap::from([
+                ("code".into(), json!("native-prompt-gone")),
+                ("status".into(), json!("resolved")),
+                ("driver".into(), json!("claude")),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("prompt_observation".into(), json!(Self::native_prompt_episode(observation))),
+            ]),
+            evidence: if durable { vec![observation.id.clone()] } else { vec![] },
+            expected_subject: None,
+            idempotency_key: Some(native_prompt_gone_key(&Self::native_prompt_episode(observation))),
+        })
+    }
+
+    pub(crate) fn native_prompt_episode(observation: &ClaimRecord) -> String {
+        let fields = observation.body.get("fields").unwrap_or(&observation.body);
+        native_prompt_episode(&observation.id, &observation.subject, fields)
+    }
+
     /// One alert per seat whose harness waits on a person at a native prompt: a permission, a
     /// question or a review it shows in its terminal. It lives in the seat's conversation and
     /// clears when the harness reports the prompt gone, however it was answered, or when the
@@ -68,14 +109,20 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let newest = |subject: &str, kind: &str| -> Result<Option<(String, u128, Value)>> {
+            let query = format!(
+                "{} LIMIT 1",
+                newest_claims_of_kind_query(
+                    "claims.id, claims.accepted_at_unix_ms, claims.body",
+                    kind
+                )
+            );
+            let query = if kind == "harness.observed" {
+                harness_sql(&connection, subject, &query)?
+            } else {
+                query
+            };
             let row = connection
-                .prepare_cached(&format!(
-                    "{} LIMIT 1",
-                    newest_claims_of_kind_query(
-                        "claims.id, claims.accepted_at_unix_ms, claims.body",
-                        kind
-                    )
-                ))?
+                .prepare_cached(&query)?
                 .query_row(params![subject, i64::MAX], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -101,13 +148,14 @@ impl Store {
             }
             // The prompt was refused in the terminal, which its harness did not report: the
             // reconciler recorded that once, keyed by this observation.
+            let episode = native_prompt_episode(&claim, &seat, &harness);
             let gone: bool = connection
                 .prepare_cached(
                     "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_operation_index
                        WHERE json_extract(body, '$._operation.id') IS NOT NULL
                          AND json_extract(body, '$._operation.id')=?1)",
                 )?
-                .query_row([native_prompt_gone_operation(&claim)], |row| row.get(0))?;
+                .query_row([native_prompt_gone_operation(&episode)], |row| row.get(0))?;
             if gone {
                 continue;
             }
@@ -139,7 +187,7 @@ impl Store {
                 .filter(|reason| !reason.is_empty())
                 .unwrap_or("its terminal shows a prompt");
             items.push(AttentionItemView {
-                episode: claim,
+                episode,
                 priority: "high".into(),
                 kind: "harness-prompt".into(),
                 review_mode: None,
@@ -1387,6 +1435,22 @@ pub(super) fn conversation_agent(
             .optional()?
             .and_then(|header| agent(&header.requester)),
     )
+}
+
+// Modern driver ownership and transition counters survive heartbeat re-stamps. Include
+// the register epoch so a restored database cannot suppress a new prompt with an old clear.
+// Unsequenced legacy publishers retain their original per-observation identity.
+fn native_prompt_episode(observation: &str, subject: &str, fields: &Value) -> String {
+    let (Some(incarnation), Some(owner), Some(transition)) = (
+        fields["incarnation_id"].as_str(),
+        fields["ownership_sequence"].as_u64(),
+        fields["transition_sequence"].as_u64(),
+    ) else { return observation.into(); };
+    let epoch = observation.strip_prefix("local-observation/")
+        .and_then(|rest| rest.rsplit_once('/').map(|(prefix, _)| prefix));
+    let identity = serde_json::to_vec(&(subject, incarnation, owner, transition, epoch))
+        .expect("prompt identity contains only scalar values");
+    format!("native-prompt-episode/{}", hex::encode(sha2::Sha256::digest(identity)))
 }
 
 /// The idempotency key of the record that a native prompt opened by `observation` is gone.
