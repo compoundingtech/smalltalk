@@ -141,6 +141,7 @@ pub(crate) struct Evaluator {
     probe: Box<dyn Probe>,
     trackers: BTreeMap<(String, String), Tracker>,
     restored: bool,
+    last_tick: Option<u128>,
     /// Transitions whose state claim is not written yet.
     unrecorded: BTreeMap<(String, String), Transition>,
     cost: Option<(u128, f64)>,
@@ -164,6 +165,7 @@ impl Evaluator {
             probe,
             trackers: BTreeMap::new(),
             restored: false,
+            last_tick: None,
             unrecorded: BTreeMap::new(),
             cost: None,
         }
@@ -172,15 +174,30 @@ impl Evaluator {
     pub fn tick(&mut self, store: &Store, now: u128) -> Result<TickReport> {
         let mut report = TickReport::default();
         // Bring the heads up to date first: they are what readers and a restart read.
+        let mut caught_up = false;
         for _ in 0..4 {
             if store.fold_condition_heads()? < 500 {
+                caught_up = true;
                 break;
             }
+        }
+        if !caught_up {
+            report.messages = store.flush_condition_notifications()?;
+            return Ok(report);
         }
         if !self.restored {
             self.trackers = store.condition_trackers(&self.host)?;
             self.restored = true;
         }
+        if self
+            .last_tick
+            .is_some_and(|at| now < at || now.saturating_sub(at) > 75_000)
+        {
+            for tracker in self.trackers.values_mut() {
+                tracker.interrupt_hold(now);
+            }
+        }
+        self.last_tick = Some(now);
         let decls = store
             .declared_conditions()?
             .into_iter()
@@ -214,7 +231,9 @@ impl Evaluator {
                 live.insert(key.clone());
                 report.evaluated += 1;
                 let tracker = self.trackers.entry(key.clone()).or_default();
-                if let Some(transition) = tracker.observe(decl, value, now) {
+                if !self.unrecorded.contains_key(&key)
+                    && let Some(transition) = tracker.observe(decl, value, now)
+                {
                     report
                         .transitions
                         .push((key.0.clone(), instance.clone(), transition));
@@ -666,6 +685,9 @@ condition "fleet/elsewhere" {
                 .transitions
                 .is_empty()
         );
+        for offset in [150_000, 180_000, 210_000] {
+            evaluator.tick(&store, start + offset).unwrap();
+        }
         assert_eq!(
             evaluator.tick(&store, start + 240_000).unwrap().transitions[0].2,
             Transition::Enter
@@ -685,6 +707,37 @@ condition "fleet/elsewhere" {
         assert_eq!(
             evaluator.tick(&store, start + 390_000).unwrap().transitions[0].2,
             Transition::Recover
+        );
+    }
+
+    #[test]
+    fn a_daemon_sampling_gap_does_not_count_toward_the_hold() {
+        let (_directory, store) = store();
+        let fake = Fake::default();
+        fake.free.lock().unwrap().insert("/".into(), (10, 100));
+        let mut evaluator = Evaluator::new("alder", Box::new(fake));
+        let start = 1_760_000_000_000u128;
+        evaluator.tick(&store, start).unwrap();
+        // The daemon or machine was asleep longer than a normal sampling interval.
+        assert!(
+            evaluator
+                .tick(&store, start + 180_000)
+                .unwrap()
+                .transitions
+                .is_empty()
+        );
+        for offset in [210_000, 240_000, 270_000] {
+            assert!(
+                evaluator
+                    .tick(&store, start + offset)
+                    .unwrap()
+                    .transitions
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            evaluator.tick(&store, start + 300_000).unwrap().transitions[0].2,
+            Transition::Enter
         );
     }
 

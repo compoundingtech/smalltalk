@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Declare metric thresholds in KDL; the daemon evaluates conditions in the background and notifies owners once on breach and recovery.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay is required. The background evaluator builds local condition heads and a retry queue from condition.state claims in bounded pages."
+  },
+  "schema": {
+    "status": "changed",
+    "detail": "Adds the condition subject, root declaration and system-only durable condition.state claim. Registry digest expands. Storage version stays 18; three local condition cache/counter/notification tables and a desired-condition index are created on store open."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule changes; condition.state has no trimming rule and remains durable. Public claim writes cannot publish condition.state."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Additive /v1/conditions read and st conditions ls/show commands. Older daemons cannot parse condition declarations or interpret condition.state claims. Upgrade every member before publishing conditions, daemon before CLI."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary daemon restart; existing breaches resume silently and pending holds start again. Kernel probes and evaluation run only on the background task every 30 seconds."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Operations must deploy all fleet daemons before publishing the first conditions. Keep existing watches until real-host breach/recovery verification and operations approval."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Roll forward after conditions have been published; an older daemon cannot evaluate the new declarations. Notification retries use durable recorded transition details and deterministic message identities."
+  }
+}

@@ -23,7 +23,7 @@ restrict evaluation to that member, or several `host` children for several
 members. Add `path "/srv/data"` to check the filesystem containing one absolute
 path. A process condition needs `process "collector"`; a route condition needs
 `route "person-read"` (a target name from `slo/targets.toml`) or a measured path.
-Route and daemon CPU metrics accept `window "1m"`, `"5m"` (default), or `"1h"`.
+Route and daemon CPU metrics accept `window "1m"`, `"5m"`, or `"1h"`. Routes default to `"1h"`; daemon CPU defaults to `"5m"`.
 
 | Scope | Metrics | Units |
 | --- | --- | --- |
@@ -42,7 +42,8 @@ Use exactly one of `above NUMBER` and `below NUMBER`. Crossing is strict;
 equality does not enter breach. `recover NUMBER` supplies hysteresis, defaulting
 to the breach threshold. `for` is required and is the continuous hold before
 entry. `recover-for` defaults to the entry hold. A missing reading interrupts a
-hold and keeps an established breach. After a daemon restart, holds begin again
+hold and keeps an established breach. A sampling gap over 75 seconds or a clock
+reversal also interrupts holds; machine sleep does not count. After a daemon restart, holds begin again
 and an established breach continues without sending another entry message.
 
 Disk, process and available-memory probes use kernel facts on Linux. macOS reads cached mount facts with `getfsstat`; other hosts
