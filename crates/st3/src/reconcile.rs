@@ -11629,6 +11629,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         if skip && !self.incremental.needs(item, now_ms()) {
             return;
         }
+        // Register from the selected active consumer, never from an async callback. This
+        // retains a first/failed evaluation's completion without invalidating unrelated work.
+        self.incremental.register_intake_completion(item);
         let completion = self.incremental.intake_completion_token(item);
         if self
             .isolate(section, subject, || {

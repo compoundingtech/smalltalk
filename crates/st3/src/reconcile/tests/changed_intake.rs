@@ -813,8 +813,11 @@ fn an_overlapping_timer_completion_survives_selected_evaluation_recording() {
     });
     assert!(
         reconciler.incremental.needs(new, START),
-        "first-arm completion before registration"
+        "first-arm completion during its registered initial evaluation"
     );
+    for unchanged in ["observer:observer/repo-0", "observer:observer/repo-1"] {
+        assert!(!reconciler.incremental.needs(unchanged, START));
+    }
 }
 
 #[tokio::test(start_paused = true)]
