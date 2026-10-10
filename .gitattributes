@@ -8,3 +8,7 @@ clients/typescript/st3-client/*.generated.ts linguist-generated=true
 clients/swift/St3Client/Sources/St3Client/*.generated.swift linguist-generated=true
 clients/swift/St3Client/Sources/St3Client/Models.swift linguist-generated=true
 clients/swift/St3Client/Sources/St3Client/Client.swift linguist-generated=true
+# Written by `pnpm --filter @smalltalk/st3-scenarios emit`; after a merge conflict, take either
+# side and re-emit (clients/typescript/st3-scenarios/spec.md).
+fixtures/scenarios/** linguist-generated=true
+fixtures/scenarios/huge/** -diff

@@ -29,6 +29,7 @@ PATTERNS = (
     "clients/typescript/st3-client/types.test.ts",
     "clients/typescript/st3-client/BUCK*",
     "clients/typescript/st3-views/**",
+    "clients/typescript/st3-scenarios/**",
     # Views tests and scenario lanes read committed client/scenario fixtures.
     "fixtures/**",
     "package.json*",
