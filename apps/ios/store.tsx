@@ -4,7 +4,7 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SecureStore from 'expo-secure-store';
 import * as Crypto from 'expo-crypto';
 import { API_VERSION, ClientError, St3Client, notApplied, outcomeUnknown, plainError, retryTransient, type Attention, type AttachmentInput, type Capabilities, type ConversationSearch, type Glass, type Launch, type LaunchVariant, type Mission, type Resource, type Snapshot, type TimelineEntry } from '../../clients/typescript/st3-client';
-import { keepClosed, personAnswer, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
+import { keepClosed, personAnswer, promptAnswers, clientName, isSnapshotChurn, listSessionPages, OLDER_PAGE, readOlder, type Conversation, type Older, type SessionView, base64url, messageSubject, signatureParameter, signatureRefusal, signedBytes, type DeviceKey, type Unsigned } from '@smalltalk/st3-views';
 import app from './app.json';
 import { canVerifyPairing, createDeviceKey, removeDeviceKey, signWithDeviceKey, verifyGrantSignature } from './modules/st-device-key';
 import { REPAIR_WARNING, validatePairingTrust, verifyPairing } from './pairingProof';
@@ -380,6 +380,14 @@ function useAppStore(proof?: FabricProfile) {
       if (!client) return false;
       acted.current.add(item.id);
       return runAction(async () => { const id = actionId(); return client.messageRead({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: item.source_id } }); });
+    },
+    /** Answer a Claude permission prompt from its alert. Only the prompt still waiting is answered, once; an answer in the terminal wins. */
+    async respondPrompt(item: Attention, answer: 'allow' | 'deny') {
+      if (!client) return false;
+      const prompt = promptAnswers(item);
+      if (!prompt || !prompt.answers.includes(answer)) { setError('This prompt cannot be answered here. Answer it in the terminal.'); return false; }
+      acted.current.add(item.id);
+      return runAction(async () => { const id = actionId(); return client.promptRespond({ id, idempotency_key: id, fence: await fence({ [item.id]: item.revision }), parameters: { target_id: prompt.target_id, episode: prompt.episode, answer } }); });
     },
     /** An image a message carries, as a data URI; st reads it from the member that has it. */
     image(image: { sha256: string; message: string; mediaType: string }): Promise<string> {
