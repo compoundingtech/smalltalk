@@ -655,6 +655,13 @@ mod tests {
         write(11, "collector", 30, 60);
         let third = sampler.sample(&["collector"], 20_000);
         assert_eq!(third["collector"].cpu_cores, Some(0.03));
+        // Undeclaring every process must drop its baseline without another sample.
+        sampler.retain_names(&std::collections::HashSet::new());
+        write(10, "collector", 500, 5);
+        assert_eq!(
+            sampler.sample(&["collector"], 30_000)["collector"].cpu_cores,
+            None
+        );
     }
 
     #[test]

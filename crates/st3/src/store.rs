@@ -118,6 +118,7 @@ mod accounts;
 mod adhoc_work;
 mod conditions;
 pub use conditions::{ConditionInstanceView, ConditionRecord, ConditionView, DeclaredCondition};
+pub(crate) use conditions::{HEADS_PAGE, HEADS_PAGES_PER_TICK};
 mod attention_snapshot;
 pub(crate) use attention_snapshot::{NativePromptState, native_prompt_gone_key};
 // Registration stays opt-in until the shared installer certifies every source family.
@@ -26266,7 +26267,11 @@ mod fleet_admission_tests {
     #[test]
     fn departed_members_condition_heads_are_pruned_and_not_refolded() {
         let member_key = key();
-        let (_anchor, a, members) = fleet(&[("laptop", &member_key)]);
+        let names = (0..34).map(|number| format!("alpha-{number:02}")).collect::<Vec<_>>();
+        let keys = (0..34).map(|_| key()).collect::<Vec<_>>();
+        let mut admitted = vec![("laptop", &member_key)];
+        admitted.extend(names.iter().zip(&keys).map(|(name,key)| (name.as_str(),key)));
+        let (_anchor, a, members) = fleet(&admitted);
         let laptop = &members[0];
         let source = "version 2\ncondition \"fleet/disk\" { metric \"disk.free-percent\"; scope \"host\"; below 15; for \"1m\"; owner \"person/ada\" }";
         let intent = crate::graph::parse_test_intent(source, "a").unwrap();
@@ -26282,6 +26287,8 @@ mod fleet_admission_tests {
         }).unwrap();
         sync(laptop, &a);
         a.seed_condition_heads(true).unwrap();
+        while a.condition_heads_seed_pending().unwrap() { a.seed_condition_heads(false).unwrap(); }
+        // Alphabetically last laptop must be discovered after more than32 keyed origins.
         assert_eq!(a.conditions().unwrap()[0].instances.len(), 1);
         laptop.leave_fleet("person/test").unwrap();
         sync(laptop, &a);

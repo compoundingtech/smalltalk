@@ -78,3 +78,7 @@ assert.deepEqual(withUpdate.map(row => row.color), ['person', 'green']);
   assert.deepEqual(rows.map(row => [row.kind,row.tier,row.item.actions]), [['condition','today',[]],['condition','today',[]]]);
   assert.equal(rows[1].title, 'Condition breached');
 }
+
+const blankCondition = homeRows([item('blank-condition', 'condition', { title: '   ' })], 'person/alex')[0];
+assert.equal(blankCondition.title, 'Condition breached');
+assert.equal(blankCondition.glyph, '!');

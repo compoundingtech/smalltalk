@@ -74,6 +74,14 @@ PY
       -- --nocapture --test-threads 1 2>&1 | tee "$out/cost.log" || status=$?
     if [ -s "$out/cost.json" ]; then
       summarize_cost "$out/cost.json"
+      if [ -s "$out/cost.conditions.json" ]; then
+        {
+          printf '\nConditions capacity: four declarations x 256 heads, tenfold history.\n\n'
+          jq -r '.small as $s | .large | to_entries[] | "- \(.key): VM \($s[.key].vm_steps) -> \(.value.vm_steps), scans \($s[.key].fullscan_steps) -> \(.value.fullscan_steps)"' "$out/cost.conditions.json"
+          jq -r '"\n500 new heads in \(.fold.rows_per_page|length) pages; writer-hold upper bounds p99 \(.fold.writer_hold_upper_bound_p99_ms) ms, max \(.fold.writer_hold_upper_bound_max_ms) ms (100 ms gate)."' "$out/cost.conditions.json"
+          jq -r '.failures[]?' "$out/cost.conditions.json"
+        } >> "$GITHUB_STEP_SUMMARY"
+      fi
     else
       echo "::error::cost check produced no measurement report"
       status=1

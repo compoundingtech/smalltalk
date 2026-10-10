@@ -1053,7 +1053,7 @@ const ARRANGEMENT_FOLDER: &str = "019a0000-0000-7000-8000-000000000010";
 const ARRANGEMENT_PLACEMENT: &str = "agent/fleet/fixture-cost-arrangements/seat";
 
 /// Keep 256 remote breached instances per condition while eight histories grow tenfold.
-fn seed_condition(store: &Store, scale: f64, dense: bool) {
+fn seed_condition(store: &Store, scale: f64) {
     let mut source = "version 2\n".to_owned();
     for number in 0..4 {
         source.push_str(&format!(r#"condition "bench/cost/disk-{number}" {{
@@ -1072,8 +1072,8 @@ fn seed_condition(store: &Store, scale: f64, dense: bool) {
     let declarations = store.declared_conditions().unwrap().into_iter().map(|condition| condition.decl.unwrap()).collect::<Vec<_>>();
     // 32 authenticated remote origins x eight breached instances per declaration.
     // History for eight instances grows tenfold; all other live heads stay fixed.
-    let origins = if dense { 32 } else { 2 };
-    let volumes = if dense { 8 } else { 1 };
+    let origins = 32;
+    let volumes = 8;
     for host_number in 0..origins {
         let origin = format!("cost-remote-{host_number:02}");
         let remote = Store::open_memory(&origin).unwrap();
@@ -1117,7 +1117,7 @@ async fn condition_capacity_and_five_hundred_new_heads_stay_bounded() {
         let root=tempfile::tempdir().unwrap();
         let store=Arc::new(Store::open(&root.path().join("claims.sqlite3"),NODE).unwrap());
         store.bind_fleet(FLEET).unwrap();
-        seed_condition(&store,scale,true);
+        seed_condition(&store,scale);
         let app=st3::api::router(AppState {
             store:store.clone(),notify:Arc::new(Notify::new()),event_notify:watch::channel(0_u64).0,
             node:NODE.into(),state_dir:root.path().join("state"),pty_root:root.path().join("pty"),pty_binary:stub_pty(root.path()),
@@ -1181,6 +1181,8 @@ async fn condition_capacity_and_five_hundred_new_heads_stay_bounded() {
     }
     assert_eq!(counts.iter().sum::<usize>(),500);
     assert!(counts.iter().all(|count|*count<=50));
+    assert_eq!(target.conditions().unwrap()[0].instances.len(), 256);
+    assert!(target.condition_evaluator_status().unwrap().1.unwrap().contains("standing breach"), "global cross-origin breach eviction must remain diagnostic");
     let mut sorted=times.clone();sorted.sort_by(f64::total_cmp);
     let max=*sorted.last().unwrap();let p99=sorted[((sorted.len() as f64*0.99).ceil() as usize-1).min(sorted.len()-1)];
     println!("condition fold 500 distinct instances: pages={}, p99={p99:.3}ms max={max:.3}ms (complete calls, upper bounds on writer holds)",times.len());

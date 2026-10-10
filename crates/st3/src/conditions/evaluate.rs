@@ -197,7 +197,7 @@ pub(crate) struct Evaluator {
     host: String,
     probe: Box<dyn Probe>,
     trackers: BTreeMap<(String, String), Tracker>,
-    restored: bool,
+    seed_started: bool,
     last_tick: Option<u128>,
     /// Transitions whose state claim is not written yet.
     unrecorded: BTreeMap<(String, String), Transition>,
@@ -222,7 +222,7 @@ impl Evaluator {
             host: host.into(),
             probe,
             trackers: BTreeMap::new(),
-            restored: false,
+            seed_started: false,
             last_tick: None,
             unrecorded: BTreeMap::new(),
             cost: None,
@@ -234,7 +234,7 @@ impl Evaluator {
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tick(store, now)))
                 .unwrap_or_else(|_| {
-                    self.restored = false;
+                    self.seed_started = false;
                     self.trackers.clear();
                     self.unrecorded.clear();
                     Err(anyhow::anyhow!(
@@ -253,13 +253,15 @@ impl Evaluator {
     pub fn tick(&mut self, store: &Store, now: u128) -> Result<TickReport> {
         let mut report = TickReport::default();
         // Bring the heads up to date first: they are what readers and a restart read.
-        if let Err(error) = store.seed_condition_heads(!self.restored) {
+        let refresh = !self.seed_started;
+        self.seed_started = true;
+        if let Err(error) = store.seed_condition_heads(refresh) {
             report.errors.push(format!("condition heads: {error:#}"));
         }
         // Folding other members' new transitions does not gate local evaluation.
-        for _ in 0..40 {
+        for _ in 0..crate::store::HEADS_PAGES_PER_TICK {
             match store.fold_condition_heads() {
-                Ok(count) if count < 50 => break,
+                Ok(count) if count < crate::store::HEADS_PAGE as usize => break,
                 Ok(_) => {}
                 Err(error) => {
                     report.errors.push(format!("condition fold: {error:#}"));
@@ -267,15 +269,8 @@ impl Evaluator {
                 }
             }
         }
-        if !self.restored {
-            match store.condition_trackers_at(&self.host, now) {
-                Ok(trackers) => {
-                    self.trackers = trackers;
-                    self.restored = true;
-                }
-                Err(error) => report.errors.push(format!("condition restore: {error:#}")),
-            }
-        }
+        // Discovery can span ticks. Restore each local instance directly from its indexed
+        // state subject below; a partial remote head cache cannot restart a breach episode.
         if self
             .last_tick
             .is_some_and(|at| now < at || now.saturating_sub(at) > 75_000)
@@ -465,9 +460,9 @@ impl Evaluator {
             }
         }
         // Fold freshly written claims before draining the durable notification queue.
-        for _ in 0..40 {
+        for _ in 0..crate::store::HEADS_PAGES_PER_TICK {
             match store.fold_condition_heads() {
-                Ok(count) if count < 50 => break,
+                Ok(count) if count < crate::store::HEADS_PAGE as usize => break,
                 Ok(_) => {}
                 Err(error) => {
                     report.errors.push(format!("condition fold: {error:#}"));
