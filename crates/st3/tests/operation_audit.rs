@@ -395,12 +395,14 @@ fn the_bounded_audit_matches_the_hydrated_audit_on_every_edge() {
     assert_eq!(store.operation_projection_drift().unwrap(), Vec::<String>::new());
 
     let existing = operation_row(&store, "op/active").unwrap().1;
+    let duplicate_canonical = operation_row(&store, "op/duplicate").unwrap().1;
+    let noncanonical_duplicate = duplicate.iter().find(|id| *id != &duplicate_canonical).unwrap();
     execute(&store, "UPDATE operations SET state='active' WHERE id='op/conflict'", []);
     execute(&store, "UPDATE operations SET request_digest='d/1' WHERE id='op/empty-digest'", []);
     execute(
         &store,
         "UPDATE operations SET canonical_claim_id=?1 WHERE id='op/duplicate'",
-        [&duplicate[1]],
+        [noncanonical_duplicate],
     );
     execute(&store, "DELETE FROM operations WHERE id='op/huge'", []);
     execute(&store, "DELETE FROM operations WHERE id=''", []);
