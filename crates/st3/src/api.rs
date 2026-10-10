@@ -18702,11 +18702,13 @@ agent "fixture" { workspace "/tmp"; harness "opencode" {} }
                 "a no-op {lifecycle} woke readers"
             );
         }
-        // A work wake does.
+        // A daemon's work wake does; ordinary senders cannot assert reserved event tags.
+        let mut work_wake = send("wake", &["st3-work:step-run/example/work"]);
+        work_wake["from"] = json!("daemon/node");
         let (status, sent) = json_request(
             app.clone(),
             "/v1/messages",
-            send("wake", &["st3-work:step-run/example/work"]),
+            work_wake,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{sent}");
