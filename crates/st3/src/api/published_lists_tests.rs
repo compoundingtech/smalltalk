@@ -325,16 +325,16 @@ fn fold_work_checked(store: &Store) -> (Arc<Publication<WorkRows>>, bool) {
     assert_eq!(publication.rows.orders_cut, publication.cut, "seat orders read at the rows' own cut");
     // Each shown seat's queue order, kept incrementally, is the order a fold from nothing reads
     // at the same cut: a stale order shows here even for a seat no fixture actor reads.
-    if fresh.cut == publication.cut {
-        let shown = publication.rows.seats_shown();
-        assert_eq!(shown, fresh.rows.seats_shown());
-        for seat in &shown {
-            assert_eq!(
-                publication.rows.seat_orders.get(seat),
-                fresh.rows.seat_orders.get(seat),
-                "{seat}'s queue order"
-            );
-        }
+    // Nothing writes meanwhile, so both folds read the same cut; a skipped check would hide.
+    assert_eq!(fresh.cut, publication.cut, "the fold from nothing reads the same cut");
+    let shown = publication.rows.seats_shown();
+    assert_eq!(shown, fresh.rows.seats_shown());
+    for seat in &shown {
+        assert_eq!(
+            publication.rows.seat_orders.get(seat),
+            fresh.rows.seat_orders.get(seat),
+            "{seat}'s queue order"
+        );
     }
     for actor in ACTORS {
         // Every page the HTTP list slices from the publication, in turn, is the direct read.
