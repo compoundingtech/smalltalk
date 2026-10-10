@@ -14,10 +14,10 @@ import time
 
 BASE = '352c4f8fc205c76d5a37cf1125dbab23bebe51e9'
 BASE_TREE = 'beded621d3ef087c1a149797796e5dff6814a212'
-CANDIDATE = '446c4f4c4a83a3fd47d2ee2a93d61deeeea2c177'
-CANDIDATE_TREE = 'b3d7b11a6b3cdf8312b9088afc16e5e1dec96b4d'
+CANDIDATE = '7e27abb83c24c25b45d1b276ffc6405d59897105'
+CANDIDATE_TREE = '11f7955d4f47df0cb3b748dec889f81eac8217af'
 ASSIGNMENT = 'doc/fleet/smalltalk/speed/2026-10-09/shared-collections-v1-pair-assignment@2d25669da2d9b694cf702f61654abdfb2e11404b8c9ee74ef93b23a7cf6da60a'
-COMPOSITION = 'doc/fleet/smalltalk/ivm-lists/2026-10-09/collections-v1-composition@d7e9397acbaf1a53322fdfa4e7a9ae7bba7778448328312c44df5fb695f8231b'
+COMPOSITION = 'doc/fleet/smalltalk/ivm-lists/2026-10-09/collections-v1-composition@98a12102fdc1f0c5c997bb42d46be465b71c023ea3feaf30f545ee5377c57898'
 TRACKING_RUN = 'mission-run/fleet/smalltalk/ci-speed/shared-collections-v1-study-2026-10-09/1'
 ORDER = ('B1', 'C1', 'C2', 'B2')
 TEST = 'daemon_load::the_daemon_keeps_its_budgets_under_a_busy_hosts_load'
@@ -109,10 +109,15 @@ def validate_report(report, regime, source):
     stamps = [cpu.get(field) for field in clocks]
     if any(type(x) is not int or x < 0 for x in stamps) or stamps != sorted(stamps):
         raise ValueError('missing/reversed monotonic CPU/workload/drain bounds')
+    if any(type(value) is not int or value < 0 for value in report['failed'].values()):
+        raise ValueError('invalid request failure counts')
     for collection in ('agents roster',) + COLLECTIONS:
+        subscribers = report.get('roster_subscribers') if collection == 'agents roster' else report['collection_subscribers'].get(collection)
+        if type(subscribers) is not int or subscribers < 0:
+            raise ValueError('missing/invalid subscriber evidence: ' + collection)
         for suffix in (' snapshot', ' connect+snapshot'):
             path = report.get('paths', {}).get(collection + suffix)
-            if not isinstance(path, dict) or any(not number(path.get(key)) for key in ('count', 'p99_ms', 'p50_ms', 'max_ms', 'budget_ms')):
+            if not isinstance(path, dict) or any(not number(path.get(key)) for key in ('p99_ms', 'p50_ms', 'max_ms', 'budget_ms')) or type(path.get('count')) is not int or path['count'] < 0:
                 raise ValueError('missing/invalid collection samples: ' + collection + suffix)
     # Correctness failures/counts are retained, never changed into a pass here.
     return report
@@ -129,10 +134,19 @@ def selection(log, status):
         raise ValueError('interrupted/setup/indeterminate or inconsistent workload status')
 
 
+def collection_correct(report, prefix):
+    subscribers = report.get('roster_subscribers') if prefix == 'agents roster' else report['collection_subscribers'].get(prefix)
+    return (type(subscribers) is int and subscribers == 22
+            and all(type(report['paths'][prefix + suffix]['count']) is int
+                    and report['paths'][prefix + suffix]['count'] == 22
+                    for suffix in (' snapshot', ' connect+snapshot'))
+            and not any(report['failed'].values()))
+
+
 def aggregate(executions):
     output = {'reconcile_mode_rule': 'UNKNOWN in every regime: no qualified in-window reconcile seam; no favorable mode selection',
               'within_mode_comparison': 'UNKNOWN', 'adjusted_cores': None,
-              'raw_no_worse_observations': [], 'collections': {}}
+              'raw_no_worse_observations': [], 'collections': {}, 'descriptive_context': {}}
     by_label = {row['label']: row for row in executions}
     if set(by_label) != set(ORDER):
         output['partial'] = True
@@ -140,10 +154,24 @@ def aggregate(executions):
     for regime in ('upgrade-under-load', 'steady-after-migration'):
         pairs = [(by_label[b]['reports'][regime], by_label[c]['reports'][regime])
                  for b, c in (('B1', 'C1'), ('B2', 'C2'))]
+        bcores = [b['daemon_cores'] for b, _ in pairs]
+        ccores = [c['daemon_cores'] for _, c in pairs]
         output['raw_no_worse_observations'].append(dict(regime=regime, comparisons=[
-            dict(baseline=b['daemon_cores'], candidate=c['daemon_cores'], no_worse=c['daemon_cores'] <= b['daemon_cores']) for b, c in pairs]))
+            dict(baseline=b, candidate=c, no_worse=c <= b) for b, c in zip(bcores, ccores)],
+            baseline_mean_cores=sum(bcores) / 2, candidate_mean_cores=sum(ccores) / 2,
+            baseline_spread_cores=max(bcores) - min(bcores), candidate_spread_cores=max(ccores) - min(ccores)))
+        # Retain whatever the original harness observed, including absent rows. These
+        # rolling/drop-charged span and route observations cannot classify CPU modes.
+        output['descriptive_context'][regime] = [dict(label=label,
+            paths={name: row for name, row in by_label[label]['reports'][regime]['paths'].items()
+                   if 'reconcile' in name.lower() or 'invalidat' in name.lower()},
+            legacy_charged_cpu_ms=by_label[label]['reports'][regime]['study_cpu_observation'].get('legacy_charged_cpu_ms'),
+            coverage='original reported rows only; missing is UNKNOWN; no in-window attribution or mode qualification')
+            for label in ORDER]
         paths = {}
-        for collection, prefix in [('agents', 'agents roster')] + [(c, c) for c in COLLECTIONS]:
+        for prefix in ('agents roster',) + COLLECTIONS:
+            correctness = [dict(baseline=collection_correct(b, prefix), candidate=collection_correct(c, prefix),
+                                baseline_failures=b['failed'], candidate_failures=c['failed']) for b, c in pairs]
             for suffix in (' snapshot', ' connect+snapshot'):
                 name = prefix + suffix
                 bvalues = [b['paths'][name]['p99_ms'] for b, _ in pairs]
@@ -152,11 +180,11 @@ def aggregate(executions):
                     paired_delta_ms=[c - b for b, c in zip(bvalues, cvalues)],
                     baseline_mean_ms=sum(bvalues) / 2, candidate_mean_ms=sum(cvalues) / 2,
                     baseline_spread_ms=max(bvalues) - min(bvalues), candidate_spread_ms=max(cvalues) - min(cvalues),
-                    requested_candidate_strict_under_300_ms=all(c < 300 for c in cvalues),
+                    raw_candidate_p99_observed_under_300_ms=all(c < 300 for c in cvalues),
+                    requested_candidate_strict_under_300_ms=all(c < 300 and evidence['candidate']
+                        for c, evidence in zip(cvalues, correctness)),
                     counts=[dict(baseline=b['paths'][name]['count'], candidate=c['paths'][name]['count']) for b, c in pairs],
-                    correctness=[dict(baseline=(b.get('roster_subscribers') if collection == 'agents' else b['collection_subscribers'].get(collection)) == 22 and b['paths'][name]['count'] == 22 and not any(b['failed'].values()),
-                                      candidate=(c.get('roster_subscribers') if collection == 'agents' else c['collection_subscribers'].get(collection)) == 22 and c['paths'][name]['count'] == 22 and not any(c['failed'].values()),
-                                      baseline_failures=b['failed'], candidate_failures=c['failed']) for b, c in pairs])
+                    correctness=correctness)
         output['collections'][regime] = paths
     output['partial'] = False
     output['qualified_combined_cpu_conclusion'] = 'UNKNOWN; raw observations cannot be rescued by adjusted/historical 2x policy'

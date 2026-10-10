@@ -75,7 +75,7 @@ printf 'CARGO_HOME=%s\\nSCCACHE_DIR=%s\\nSCCACHE_CACHE_SIZE=1G\\n' "$RUNNER_TEMP
         {
           name: 'Retain all study source, raw reports, input hashes and failures',
           uses: 'actions/upload-artifact@v4', if: 'always()',
-          with: { name: 'shared-collections-v1-evidence', path: '${{ runner.temp }}/collections-study/\n!${{ runner.temp }}/collections-study/target-*/\n!${{ runner.temp }}/collections-study/B/\n!${{ runner.temp }}/collections-study/C/\n!${{ runner.temp }}/collections-study/standard-generated-inputs/',
+          with: { name: 'shared-collections-v1-evidence', path: '${{ runner.temp }}/collections-study/\n!${{ runner.temp }}/collections-study/binaries/\n!${{ runner.temp }}/collections-study/target-*/\n!${{ runner.temp }}/collections-study/B/\n!${{ runner.temp }}/collections-study/C/\n!${{ runner.temp }}/collections-study/standard-generated-inputs/',
             'retention-days': 30, 'if-no-files-found': 'error' },
         },
       ],

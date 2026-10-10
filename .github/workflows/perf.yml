@@ -114,6 +114,7 @@ jobs:
           name: shared-collections-v1-evidence
           path: |
             ${{ runner.temp }}/collections-study/
+            !${{ runner.temp }}/collections-study/binaries/
             !${{ runner.temp }}/collections-study/target-*/
             !${{ runner.temp }}/collections-study/B/
             !${{ runner.temp }}/collections-study/C/

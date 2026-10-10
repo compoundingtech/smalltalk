@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Finite offline orchestration controls; stand-ins only, no Rust/native/load/API."""
-import copy
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -63,6 +64,60 @@ class Study(unittest.TestCase):
         self.assertIsNone(summary['adjusted_cores'])
         self.assertTrue(s.aggregate(rows[:2])['partial'])
 
+    def test_missing_and_invalid_sample_identity_is_partial(self):
+        for target, key, value in [('subscribers', 'missions', None), ('subscribers', 'missions', 22.0),
+                                   ('samples', 'count', None), ('samples', 'count', 22.0)]:
+            row = report()
+            obj = row['collection_subscribers'] if target == 'subscribers' else row['paths']['missions snapshot']
+            if value is None:
+                obj.pop(key)
+            else:
+                obj[key] = value
+            with self.assertRaises(ValueError): s.validate_report(row, 'steady-after-migration', s.BASE)
+
+    def test_zero_partial_or_failed_correctness_never_meets_latency_goal(self):
+        for subscribers, snapshot_count, connect_count, failures in [(0, 0, 0, {}), (21, 22, 22, {}),
+                (22, 21, 22, {}), (22, 22, 21, {}), (22, 22, 22, {'missions': 1})]:
+            rows = [dict(label=label, reports={regime: report(regime=regime)
+                    for regime in ('upgrade-under-load', 'steady-after-migration')}) for label in s.ORDER]
+            for index in (1, 2):
+                row = rows[index]['reports']['steady-after-migration']
+                row['collection_subscribers']['missions'] = subscribers
+                row['paths']['missions snapshot'].update(count=snapshot_count, p99_ms=0)
+                row['paths']['missions connect+snapshot'].update(count=connect_count, p99_ms=0)
+                row['failed'] = failures
+                # Negative correctness is retained as measured evidence, not omitted.
+                s.validate_report(row, 'steady-after-migration', s.BASE)
+            summary = s.aggregate(rows)
+            for name in ('missions snapshot', 'missions connect+snapshot'):
+                observation = summary['collections']['steady-after-migration'][name]
+                self.assertTrue(observation['raw_candidate_p99_observed_under_300_ms'])
+                self.assertFalse(observation['requested_candidate_strict_under_300_ms'])
+                self.assertEqual(observation['candidate_p99_ms'], [0, 0])
+                self.assertFalse(any(x['candidate'] for x in observation['correctness']))
+
+    def test_cpu_replicate_summary_and_original_context(self):
+        rows = [dict(label=label, reports={regime: report(regime=regime, cores=cores)
+                for regime in ('upgrade-under-load', 'steady-after-migration')})
+                for label, cores in zip(s.ORDER, (1.0, 1.2, 1.6, 2.0))]
+        first = rows[0]['reports']['upgrade-under-load']
+        first['paths']['reconcile pass'] = dict(count=1, p99_ms=6000)
+        first['paths']['view invalidation'] = dict(count=2, p99_ms=10)
+        first['study_cpu_observation']['legacy_charged_cpu_ms'] = {'reconcile pass': 1000}
+        summary = s.aggregate(rows)
+        cpu = summary['raw_no_worse_observations'][0]
+        self.assertEqual(cpu['baseline_mean_cores'], 1.5)
+        self.assertAlmostEqual(cpu['candidate_mean_cores'], 1.4)
+        self.assertEqual(cpu['baseline_spread_cores'], 1.0)
+        self.assertAlmostEqual(cpu['candidate_spread_cores'], 0.4)
+        self.assertEqual([x['no_worse'] for x in cpu['comparisons']], [False, True])
+        context = summary['descriptive_context']['upgrade-under-load']
+        self.assertEqual(context[0]['paths']['reconcile pass']['p99_ms'], 6000)
+        self.assertEqual(context[0]['paths']['view invalidation']['count'], 2)
+        self.assertEqual(context[0]['legacy_charged_cpu_ms'], {'reconcile pass': 1000})
+        self.assertIsNone(context[1]['legacy_charged_cpu_ms'])
+        self.assertEqual(summary['within_mode_comparison'], 'UNKNOWN')
+
     def exercise(self, changes=None):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp); out = root / 'out'; out.mkdir()
@@ -83,6 +138,9 @@ if label==os.environ.get('MUTATE_LABEL'): (fixture/'generated-1.sqlite3').write_
 for regime,path in [('steady-after-migration',p),('upgrade-under-load',p.parent/'upgrade/load.json')]:
  row=json.loads(Path(os.environ['TEMPLATE']).read_text());row['regime']=regime;row['actual_ci_checkout']=os.environ['GITHUB_SHA']
  if label==os.environ.get('BAD_PROFILE'): row['profile']='agents-v1'
+ if label==os.environ.get('ZERO_SAMPLES'):
+  row['collection_subscribers']['missions']=0
+  for suffix in [' snapshot',' connect+snapshot']: row['paths']['missions'+suffix].update(count=0,p99_ms=0)
  path.parent.mkdir(parents=True,exist_ok=True);path.write_text(json.dumps(row))
 status=101 if label==os.environ.get('FAIL_LABEL') else 0
 print('running 1 test')
@@ -120,6 +178,16 @@ print(json.dumps({'reason':'compiler-artifact','target':{'name':'perf_load'},'pr
             self.assertEqual(result['comparison']['within_mode_comparison'], 'UNKNOWN')
             self.assertEqual(result['executions'][0]['inputs_after'], result['executions'][-1]['inputs_after'])
 
+    def test_negative_samples_retained_in_four_execution_result(self):
+        status, result, calls = self.exercise({'ZERO_SAMPLES':'C1', 'FAIL_LABEL':'C1'})
+        self.assertEqual(status, 1)
+        self.assertTrue(result['complete']); self.assertTrue(result['data_complete'])
+        self.assertEqual(calls, ['build-B','build-C','B1','C1','C2','B2'])
+        observation = result['comparison']['collections']['steady-after-migration']['missions snapshot']
+        self.assertEqual(observation['candidate_p99_ms'], [0, 100])
+        self.assertFalse(observation['requested_candidate_strict_under_300_ms'])
+        self.assertEqual(result['executions'][1]['reports']['steady-after-migration']['collection_subscribers']['missions'], 0)
+
     def test_build_failure_never_measures_or_retries(self):
         status, result, calls = self.exercise({'BUILD_FAIL':'B'})
         self.assertEqual(status, 1); self.assertEqual(calls, ['build-B','build-C'])
@@ -136,6 +204,30 @@ print(json.dumps({'reason':'compiler-artifact','target':{'name':'perf_load'},'pr
         self.assertEqual(status, 1); self.assertTrue(result['complete']); self.assertFalse(result['data_complete'])
         self.assertEqual(calls, ['build-B','build-C','B1','C1','C2','B2'])
         self.assertTrue(result['comparison']['partial'])
+
+    def test_terminal_receipt_requires_identity_complete_data_and_hash(self):
+        gate = Path(__file__).with_name('ci-collections-study-terminal')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp); terminal = root / 'terminal.json'; result = root / 'result.json'
+            args = [os.sys.executable, str(gate), str(terminal), s.TRACKING_RUN]
+            self.assertEqual(subprocess.run(args, capture_output=True).returncode, 1)
+            data = dict(manifest=dict(control_source='exact-control', tracking_run=s.TRACKING_RUN),
+                        complete=True, data_complete=True,
+                        executions=[dict(label=label, returncode=101) for label in s.ORDER])
+            result.write_text(json.dumps(data))
+            receipt = dict(assignment=s.ASSIGNMENT, tracking_run=s.TRACKING_RUN, result_path=str(result),
+                           control_source='exact-control', hosted_terminal=True,
+                           result_sha256=hashlib.sha256(result.read_bytes()).hexdigest())
+            terminal.write_text(json.dumps(receipt))
+            # A receipt for complete adverse outcomes does not hide their 101 statuses.
+            self.assertEqual(subprocess.run(args, capture_output=True).returncode, 0)
+            for key, value in [('tracking_run','other-run'), ('result_sha256','wrong-hash'), ('hosted_terminal',False)]:
+                wrong = dict(receipt); wrong[key] = value; terminal.write_text(json.dumps(wrong))
+                self.assertEqual(subprocess.run(args, capture_output=True).returncode, 2)
+            data['data_complete'] = False; result.write_text(json.dumps(data))
+            receipt['result_sha256'] = hashlib.sha256(result.read_bytes()).hexdigest()
+            terminal.write_text(json.dumps(receipt))
+            self.assertEqual(subprocess.run(args, capture_output=True).returncode, 2)
 
     def test_local_and_retry_prepare_refused_before_allocation(self):
         with tempfile.TemporaryDirectory() as temp:
