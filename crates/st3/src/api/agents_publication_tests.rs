@@ -474,10 +474,23 @@ fn publication_bench_target(agent: usize) -> usize {
 }
 
 fn publication_process_memory_kib() -> (u64, u64) {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let status = std::fs::read_to_string("/proc/self/status").expect("read this measurement process's RSS");
     let field = |name: &str| status.lines().find_map(|line| line.strip_prefix(name))
-        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok()).unwrap_or(0);
+        .and_then(|value| value.trim().trim_end_matches("kB").trim().parse().ok())
+        .expect("the measurement requires kernel RSS and peak fields");
     (field("VmRSS:"), field("VmHWM:"))
+}
+
+fn publication_allocated_bytes() -> usize {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: glibc's allocator statistics take no pointer and support concurrent callers.
+        // This is a live-allocated-byte delta, not RSS; allocator caches can retain freed pages.
+        let info = unsafe { libc::mallinfo2() };
+        info.uordblks.saturating_add(info.hblkhd)
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    panic!("publication retention measurement requires glibc allocator statistics");
 }
 
 fn publication_row_bytes(publication: &PublicationArc) -> std::collections::HashMap<String, usize> {
@@ -652,6 +665,11 @@ async fn agents_publication_rate_and_rss_realistic_200_and_400() {
     assert_eq!(calibrated.order(), publication_expected_order(&store).as_slice());
     println!("agents publication setup: seconds={:.1}", setup.elapsed().as_secs_f64());
     publication_report_distribution("200 current agents", &calibrated);
+    let (rss_200, peak_200) = publication_process_memory_kib();
+    println!("agents publication 200 calibrated: rss_kib_before={rss_empty} \
+        rss_kib_after={rss_200} process_peak_kib={peak_200}");
+    drop(first);
+    drop(calibrated);
 
     let revision = || store.agents_publication().map_or(0, |latest| latest.metadata().revision);
     let mut phases = Vec::new();
@@ -749,6 +767,10 @@ async fn agents_publication_rate_and_rss_realistic_200_and_400() {
     assert!(snapshot.iter().all(|(_, _, rows, _)| *rows == 200),
         "every publication at 200 agents must be complete");
 
+    let old_subscription = store.subscribe_agents_publications();
+    let held_200 = old_subscription.borrow().clone().unwrap();
+    let weak_200 = Arc::downgrade(&held_200);
+    let rss_before_400 = publication_process_memory_kib().0;
     // 400 current agents: 200 more with the same row-size distribution.
     let mut more = publication_bench_seed(&store, 200..400);
     let expanded = publication_bench_calibrate(&store, &mut more, 200).await;
@@ -756,8 +778,40 @@ async fn agents_publication_rate_and_rss_realistic_200_and_400() {
     assert_eq!(expanded.order(), publication_expected_order(&store).as_slice());
     publication_report_distribution("400 current agents", &expanded);
     let (rss, peak) = publication_process_memory_kib();
-    println!("agents publication 400 setup: seconds={:.1} rss_kib={rss} process_peak_kib={peak}",
+    println!("agents publication 400 setup: seconds={:.1} rss_kib_before={rss_before_400} \
+        rss_kib_with_old_200={rss} process_peak_kib={peak}",
         expanded_at.elapsed().as_secs_f64());
+    drop(old_subscription);
+    let admission = store.admit_agent_resources().await;
+    let heap_before = publication_allocated_bytes();
+    let retained_200_body = held_200.encoded().len();
+    drop(held_200);
+    let heap_after = publication_allocated_bytes();
+    assert!(weak_200.upgrade().is_none(), "only the subscriber retained its old publication");
+    println!("agents publication retained old 200: encoded_bytes={retained_200_body} \
+        allocated_bytes_released={} rss_kib_after_release={}",
+        heap_before.saturating_sub(heap_after), publication_process_memory_kib().0);
+    drop(admission);
+
+    let old_subscription = store.subscribe_agents_publications();
+    let held_400 = old_subscription.borrow().clone().unwrap();
+    let weak_400 = Arc::downgrade(&held_400);
+    drop(expanded);
+    let written = change();
+    let expanded = publication_await_cut(&store, written).await;
+    assert_eq!(expanded.rows().len(), 400);
+    drop(old_subscription);
+    let admission = store.admit_agent_resources().await;
+    let heap_before = publication_allocated_bytes();
+    let retained_400_body = held_400.encoded().len();
+    let rss_held = publication_process_memory_kib().0;
+    drop(held_400);
+    let heap_after = publication_allocated_bytes();
+    assert!(weak_400.upgrade().is_none(), "the old 400-row publication must be released");
+    println!("agents publication retained old 400: encoded_bytes={retained_400_body} \
+        allocated_bytes_released={} rss_kib_with_old={rss_held} rss_kib_after_release={}",
+        heap_before.saturating_sub(heap_after), publication_process_memory_kib().0);
+    drop(admission);
 
     tracker.abort();
     let observed = observed.lock().clone();

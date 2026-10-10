@@ -1731,8 +1731,13 @@ encoded body belong to the same publication. Startup chunks and history rosters 
 a current publication revision. A failed refresh retains the previous publication and its
 original metadata. The failed-only `fresh=true` fallback described above is unchanged.
 
+An active revisioned subscription or a recent agents list read keeps source, presence and
+presentation-deadline refreshes active. A new revisioned subscription requests a complete view.
+Without that demand, inputs remain dirty but catch-up and trim do not refold the roster.
+Full projection reset clears the current publication and changes its epoch even while idle.
+
 `AgentsPublicationMetadata` identifies the publication with an opaque UUID `node_epoch` and
-an increasing epoch-local `revision`. Restart or a full projection reset starts a new epoch;
+an increasing epoch-local `revision`. Restart, full projection reset or revision exhaustion starts a new epoch;
 no current publication is available until a complete roster is ready. Revisions can skip
 numbers. They are not history positions or replay cursors and cannot be compared across epochs.
 The `status_watermark` contains the node-local graph `store_index` and the roster-relevant
