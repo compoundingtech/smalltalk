@@ -1,3 +1,5 @@
+import { sidebarAttention } from './sidebarAttention.ts'
+import { selectedFaviconState, tabTitle, useTabMetadata } from './useTabMetadata.ts'
 import { sidebarRow } from './sidebarRow.ts'
 import { ConversationPaneFallback } from './ConversationPaneFallback.tsx'
 import type * as ConversationPaneModule from './ConversationPane.tsx'
@@ -146,6 +148,12 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   const rosterCommit = React.useCallback((node: HTMLElement | null) => node === null || !rosterObserved ? undefined : ux?.rosterCommitted(), [ux, rosterObserved])
   const current = initialAgentFromUrl() ?? (storedAgent || agents[0]?.ref || '')
   const agent = agents.find((row) => row.ref === current)
+  const needsYou = React.useMemo(() => sidebarAttention({ agents, subjects }), [agents, subjects])
+  const offline = connection._tag !== 'Live'
+  useTabMetadata({
+    title: tabTitle({ agentName: agent?.name, needsYouCount: needsYou.size, offline }),
+    faviconState: selectedFaviconState({ agent, needsYou: agent !== undefined && needsYou.has(agent.ref), offline }),
+  })
   // A canonical subject address is not proof of a terminal. Keep the control disabled
   // from its first render until the roster can establish the selected agent's runtime.
   const terminalDisabledReason = terminalSubjectForAgent(current) === undefined ? undefined
