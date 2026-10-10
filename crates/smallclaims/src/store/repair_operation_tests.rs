@@ -528,13 +528,43 @@ fn complete_operation_reconciliation_refuses_malformed_source_before_receipt_dml
     let store = node();
     operation_claim(&store, "op/live", "c", "live");
     let dropped = operation_claim(&store, "op/live", "a", "dropped");
+    operation_claim(&store, "unrelated/stable", "z", "stable");
     let mut connection = store.connection.write();
     let tx = connection.transaction().unwrap();
     tombstone(&tx, &dropped);
     tx.execute("DELETE FROM operations WHERE id='op/live'", []).unwrap();
     tx.execute("DELETE FROM claims WHERE id=?1", [&dropped.id]).unwrap();
+    // Construct raw source damage explicitly: normal checkpoint UPDATE runs the
+    // operation-cache refresh, whose typed JSON argument rejects invalid UTF-8.
+    // Suspend only those derived UPDATE hooks in this isolated fixture, then restore
+    // their exact SQL before either reader/oracle. Identity/time/source guards stay on.
+    let refresh_triggers: Vec<(String, String)> = {
+        let mut statement = tx.prepare(
+            "SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name='checkpoint_claims'
+             AND name IN ('projection_digest_operation_checkpoint_claims_UPDATE_OLD',
+                          'projection_digest_operation_checkpoint_claims_UPDATE_NEW') ORDER BY name",
+        ).unwrap();
+        statement.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap()
+            .collect::<rusqlite::Result<_>>().unwrap()
+    };
+    assert_eq!(refresh_triggers.len(), 2);
+    for (name, _) in &refresh_triggers {
+        tx.execute_batch(&format!("DROP TRIGGER \"{}\"", name.replace('"', "\"\""))).unwrap();
+    }
     tx.execute("UPDATE checkpoint_claims SET request_digest=CAST(x'80' AS TEXT) WHERE id=?1", [&dropped.id]).unwrap();
+    for (name, sql) in &refresh_triggers {
+        tx.execute_batch(sql).unwrap();
+        let restored: String = tx.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1", [name], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(&restored, sql);
+    }
+    assert_eq!(tx.query_row(
+        "SELECT typeof(request_digest),hex(request_digest) FROM checkpoint_claims WHERE id=?1",
+        [&dropped.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    ).unwrap(), ("text".into(), "80".into()));
     let before = raw_operation_rows_at(&tx);
+    assert!(!before.is_empty()); // Refusal must also preserve an unrelated stored receipt.
     tx.execute_batch("SAVEPOINT malformed_source_oracle").unwrap();
     assert!(complete_rebuild_oracle(&tx).is_err());
     tx.execute_batch("ROLLBACK TO malformed_source_oracle; RELEASE malformed_source_oracle").unwrap();
