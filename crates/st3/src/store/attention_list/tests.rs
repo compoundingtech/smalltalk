@@ -582,7 +582,9 @@ fn a_prompt_blocked_on_a_person_and_its_clearing_fold() {
             "agent/alder.asker",
             "harness.observed",
             Some("agent/alder.asker"),
-            json!({"state":"working","incarnation_id":"one","driver":"claude"}),
+            // A driver clears the prompt explicitly: an absent `blocked_on` would carry the
+            // previous observation's forward, and that one still folds.
+            json!({"state":"working","blocked_on":null,"incarnation_id":"one","driver":"claude"}),
         ))
         .unwrap();
     let mut prompted = (*published.rows).clone();
