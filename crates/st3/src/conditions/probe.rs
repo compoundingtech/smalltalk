@@ -180,6 +180,8 @@ pub struct ProcessReading {
     pub rss_bytes: f64,
 }
 
+type ProcessTicks = HashMap<(u32, u64), u64>;
+
 /// Samples processes by name, keeping each process's CPU from the last sample so the next can
 /// tell how much it used in between.
 pub struct ProcessSampler {
@@ -187,7 +189,7 @@ pub struct ProcessSampler {
     ticks_per_second: f64,
     page_size: f64,
     /// Per name: when it was last read and each process's CPU ticks then.
-    last: HashMap<String, (u128, HashMap<(u32, u64), u64>)>,
+    last: HashMap<String, (u128, ProcessTicks)>,
 }
 
 impl Default for ProcessSampler {
