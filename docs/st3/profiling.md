@@ -20,7 +20,10 @@ its own target rather than leaving it out: the route total still includes it.
 
 `scope: "agents-roster"` rows (also under route `/v1/client/agents`) time where that wait goes,
 each in its own last-512 sample, `duration_scope: "roster-stage"`. Stage `refresh` is one refresher
-fold and `refresh-admission` its wait for roster admission (`population: "refresher-folds"`).
+fold from the previous publication, `refresh-cold` one with no publication to start from, which
+refolds every card from the log (the daemon's first complete roster, or after a chunked
+replication projection, a trim or a repair forgot every kept reduction), and `refresh-admission`
+its wait for roster admission (`population: "refresher-folds"`).
 Stage `fresh-wait` is a fresh read's wait for a publication at its cut (2 s at most), and
 `fresh-page` the page it then builds (`population: "fresh-reads"`). Stages are not requests: they
 add no route or path rows.

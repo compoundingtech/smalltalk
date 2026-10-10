@@ -172,11 +172,13 @@ impl Sample {
     }
 }
 
-/// Where an agents roster read's time goes: the refresher's fold and its wait for roster
-/// admission, and a fresh read's wait for a publication at its cut and the page it then builds.
+/// Where an agents roster read's time goes: the refresher's fold, from a previous publication
+/// or from the log when none was kept, and its wait for roster admission; and a fresh read's
+/// wait for a publication at its cut and the page it then builds.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum RosterStage {
     Refresh,
+    RefreshCold,
     RefreshAdmission,
     FreshWait,
     FreshPage,
@@ -186,6 +188,7 @@ impl RosterStage {
     fn name(self) -> &'static str {
         match self {
             Self::Refresh => "refresh",
+            Self::RefreshCold => "refresh-cold",
             Self::RefreshAdmission => "refresh-admission",
             Self::FreshWait => "fresh-wait",
             Self::FreshPage => "fresh-page",
@@ -194,7 +197,7 @@ impl RosterStage {
 
     fn population(self) -> &'static str {
         match self {
-            Self::Refresh | Self::RefreshAdmission => "refresher-folds",
+            Self::Refresh | Self::RefreshCold | Self::RefreshAdmission => "refresher-folds",
             Self::FreshWait | Self::FreshPage => "fresh-reads",
         }
     }
@@ -562,7 +565,8 @@ mod tests {
     fn roster_stages_report_their_own_samples_beside_the_route() {
         let mut meter = Meter::default();
         for (stage, ms) in [
-            (RosterStage::Refresh, 40), (RosterStage::Refresh, 60), (RosterStage::RefreshAdmission, 2),
+            (RosterStage::Refresh, 40), (RosterStage::Refresh, 60), (RosterStage::RefreshCold, 1700),
+            (RosterStage::RefreshAdmission, 2),
             (RosterStage::FreshWait, 90), (RosterStage::FreshPage, 4),
         ] {
             meter.record_roster_stage(stage, Duration::from_millis(ms));
@@ -572,6 +576,8 @@ mod tests {
         assert_eq!(stage("refresh")["count"], 2);
         assert_eq!(stage("refresh")["max_ms"], 60);
         assert_eq!(stage("refresh")["population"], "refresher-folds");
+        assert_eq!(stage("refresh-cold")["count"], 1);
+        assert_eq!(stage("refresh-cold")["population"], "refresher-folds");
         assert_eq!(stage("refresh-admission")["p99_ms"], 2);
         assert_eq!(stage("fresh-wait")["p99_ms"], 90);
         assert_eq!(stage("fresh-wait")["population"], "fresh-reads");

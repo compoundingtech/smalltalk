@@ -371,6 +371,15 @@ impl Runtime for SmalltalkRuntime {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        // Nothing is published now, and a refold from the log takes seconds on a large store.
+        // Start it here rather than when the next agents read finds no roster and waits for it.
+        if let Some(wake) = self.agent_roster_refresh.get() {
+            let _ = self.agent_roster_requested_at.compare_exchange(
+                0, now_ms() as u64, std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            wake.notify_one();
+        }
     }
 
     fn digest_tables(&self) -> &'static [(&'static str, &'static [&'static str])] {
