@@ -12,13 +12,13 @@ import subprocess
 import sys
 import time
 
-BASE = '352c4f8fc205c76d5a37cf1125dbab23bebe51e9'
-BASE_TREE = 'beded621d3ef087c1a149797796e5dff6814a212'
-CANDIDATE = '7e27abb83c24c25b45d1b276ffc6405d59897105'
-CANDIDATE_TREE = '11f7955d4f47df0cb3b748dec889f81eac8217af'
+BASE = 'feb905cddf84113458cec510cd76e22b813ba771'
+BASE_TREE = '13fec0ebc0827b6a5fcb86616a6413f5a0dd57a3'
+CANDIDATE = 'a7d27029ddb20ef6fae8889ceb443d5728011861'
+CANDIDATE_TREE = 'a0f13d646748196f909602206d32ab23ecffd768'
 ASSIGNMENT = 'doc/fleet/smalltalk/speed/2026-10-09/shared-collections-v1-pair-assignment@2d25669da2d9b694cf702f61654abdfb2e11404b8c9ee74ef93b23a7cf6da60a'
-COMPOSITION = 'doc/fleet/smalltalk/ivm-lists/2026-10-09/collections-v1-composition@98a12102fdc1f0c5c997bb42d46be465b71c023ea3feaf30f545ee5377c57898'
-TRACKING_RUN = 'mission-run/fleet/smalltalk/ci-speed/shared-collections-v1-study-2026-10-09/1'
+COMPOSITION = 'compoundingtech/smalltalk#2116@a7d27029ddb20ef6fae8889ceb443d5728011861'
+TRACKING_RUN = 'step-run/01a11fa49f4a752084e9a188dd6aba85/row-deltas'
 ORDER = ('B1', 'C1', 'C2', 'B2')
 TEST = 'daemon_load::the_daemon_keeps_its_budgets_under_a_busy_hosts_load'
 COLLECTIONS = ('missions', 'work', 'attention', 'summary', 'glasses', 'arrangements')

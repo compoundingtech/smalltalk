@@ -3,17 +3,16 @@
 This manual Performance dispatch implements only the 2026-10-09 shared assignment
 `doc/fleet/smalltalk/speed/2026-10-09/shared-collections-v1-pair-assignment@2d25669da2d9b694cf702f61654abdfb2e11404b8c9ee74ef93b23a7cf6da60a`.
 The governor is CI-speed. Work-builder owns the isolated composition, draft #2116,
-which must not merge. Its final v4 manifest is
-`doc/fleet/smalltalk/ivm-lists/2026-10-09/collections-v1-composition@98a12102fdc1f0c5c997bb42d46be465b71c023ea3feaf30f545ee5377c57898`.
+which must not merge.
 
-Baseline is `352c4f8fc205c76d5a37cf1125dbab23bebe51e9` / tree
-`beded621d3ef087c1a149797796e5dff6814a212`. Candidate is
-`7e27abb83c24c25b45d1b276ffc6405d59897105` / tree
-`11f7955d4f47df0cb3b748dec889f81eac8217af`: the same baseline plus the
-nonduplicated #2051 686072484, #2055 a4a94249e and #2053 owner-chosen
-8c7226e6f deltas, with the final correctness fixes in composition v4.
-No per-PR effect is inferred. Candidate normal CI and exact composition/command
-source review must finish before the governor dispatches. A SHA correction before
+Rerun after #2188 (load subscribers wait through a retryable resync), which voided
+the first run (38037971326). Baseline is `feb905cddf84113458cec510cd76e22b813ba771` / tree
+`13fec0ebc0827b6a5fcb86616a6413f5a0dd57a3`: main with #2188, #2051, #2052 and #2186.
+Candidate is `a7d27029ddb20ef6fae8889ceb443d5728011861` / tree
+`a0f13d646748196f909602206d32ab23ecffd768`, draft #2116: the same baseline plus #2053
+at `ba6c2e9bd` and #2055 at `fb9c38cf2`. The study run is the row-deltas step
+`step-run/01a11fa49f4a752084e9a188dd6aba85/row-deltas`.
+No per-PR effect is inferred. A SHA correction before
 execution requires updating and reviewing these pins, never an edit inside the job.
 
 Dispatch the existing `perf.yml` at the reviewed study control commit with
