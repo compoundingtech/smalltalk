@@ -1104,6 +1104,28 @@ const ACTUAL_STATE_CLAIM: &str = "(claims.kind<'harness.' OR claims.kind>='harne
      AND claims.kind NOT IN ('intent.desired', 'runtime.readiness-deadline-reached',
                              'reconcile.fault')";
 
+// Both discovery and index installation share the actual fold's open-ended kind predicate.
+// Custom actual-state kinds can also supply a runtime id; a fixed kind allowlist is incomplete.
+const RUNTIME_ID_FIELD: &str = "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+    THEN '$.runtime_id' ELSE '$.fields.runtime_id' END)";
+static RUNTIME_ID_INDEX: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(
+    "CREATE INDEX IF NOT EXISTS claims_runtime_id_subject_index
+     ON claims({RUNTIME_ID_FIELD}, subject, store_index)
+     WHERE {ACTUAL_STATE_CLAIM} AND typeof({RUNTIME_ID_FIELD})='text'"
+));
+static RUNTIME_ID_SUBJECTS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| format!(
+    "SELECT subject FROM claims INDEXED BY claims_runtime_id_subject_index
+     WHERE {ACTUAL_STATE_CLAIM} AND typeof({RUNTIME_ID_FIELD})='text'
+       AND {RUNTIME_ID_FIELD}=?1 AND store_index<=?2
+       AND EXISTS (SELECT 1 FROM claims observed INDEXED BY claims_runtime_subject_index
+                   WHERE observed.kind='runtime.observed' AND observed.subject=claims.subject
+                     AND observed.store_index<=?2)
+     UNION
+     SELECT subject FROM claims INDEXED BY claims_runtime_subject_index
+     WHERE kind='runtime.observed' AND subject=?3 AND store_index<=?2
+     ORDER BY subject"
+));
+
 /// The predicate of `claims_current_view_index`, word for word, so SQLite can use the index.
 const CURRENT_VIEW_CLAIM: &str = "(kind='intent.desired'
    OR json_extract(body, '$.fields.status') NOT IN ('stopped', 'absent', 'exited')
@@ -12002,6 +12024,21 @@ impl Store {
         };
         drop(connection);
         self.status_for_subject_names_at(subjects, store_index, include_history)
+    }
+
+    /// Candidate owners of a runtime resource at a snapshot. Retain historical observations:
+    /// the canonical status fold, not the latest ingested claim, selects the current id.
+    pub(crate) fn runtime_subjects_for_id_at(
+        &self,
+        runtime_id: Option<&str>,
+        owner: Option<&str>,
+        store_index: u64,
+    ) -> Result<BTreeSet<String>> {
+        let connection = self.readers.get();
+        let subjects = connection.prepare_cached(&RUNTIME_ID_SUBJECTS)?
+            .query_map(params![runtime_id, store_index, owner], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        Ok(subjects)
     }
 
     /// Of `subjects`, those a current view can show at `store_index`. A runtime that nothing
