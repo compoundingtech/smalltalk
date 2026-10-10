@@ -63,6 +63,10 @@ pub struct SmalltalkRuntime {
     pub(crate) arrangement_list: super::owner_lists::OwnerList,
     /// Each selected person's summary row, published by the same refresher.
     pub(crate) summary_list: super::summary_list::SummaryList,
+    /// The current missions list, while a refresher keeps it published.
+    pub(crate) published_missions: published_list::PublishedList<mission_list::MissionRows>,
+    /// The current work list, while a refresher keeps it published.
+    pub(crate) published_work: published_list::PublishedList<work_list::WorkRows>,
     #[cfg(test)]
     pub(crate) agent_resources_builds: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
@@ -377,6 +381,10 @@ impl Runtime for SmalltalkRuntime {
         self.glass_list.forget();
         self.arrangement_list.forget();
         self.summary_list.forget();
+        // Projections replaced without a new claim: the lists fold from nothing, dropping any
+        // fold under way, before the windows that read them are told to reread.
+        self.published_missions.forget();
+        self.published_work.forget();
         self.published_views.invalidate();
         self.agent_page_refs_cache
             .lock()

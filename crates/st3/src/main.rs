@@ -6198,6 +6198,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::api::start_agent_roster(&state);
     // Nor does an attention window fold every person's attention.
     st3::api::start_attention_list(&state);
+    // Nor does a missions window fold the missions it shows.
+    st3::api::start_published_lists(&state);
     startup.phase("bind-listeners");
     let bound = std::sync::atomic::AtomicUsize::new(0);
     let ready = || {
