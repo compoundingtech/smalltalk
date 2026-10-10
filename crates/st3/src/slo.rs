@@ -358,6 +358,11 @@ mod tests {
             let write = targets.for_path(path).unwrap();
             assert_eq!((write.name.as_str(), write.p99_ms), ("write-ack", 100), "{path}");
         }
+        let fresh = targets.for_path("GET /v1/client/agents (fresh)").unwrap();
+        assert_eq!((fresh.name.as_str(), fresh.p99_ms), ("person-read-fresh", 300));
+        assert_eq!(fresh.remote_p99_ms, None);
+        // A fresh list counts toward its own target only, never the first page's.
+        assert_eq!(targets.for_path("GET /v1/client/agents").unwrap().name, "person-read");
         let attach = targets.for_path("stream terminal").unwrap();
         assert_eq!(attach.p99_ms, 200);
         assert_eq!((targets.statement.p99_ms, targets.statement.max_ms), (10, 100));
@@ -374,6 +379,8 @@ mod tests {
                 let Some(route) = path.strip_prefix("GET ").or(path.strip_prefix("POST ")) else {
                     continue;
                 };
+                // `(fresh)` names the fresh form of a route the daemon serves.
+                let route = route.strip_suffix(" (fresh)").unwrap_or(route);
                 assert!(
                     source.contains(&format!("\"{route}\"")),
                     "{path} is not routed in api.rs"
