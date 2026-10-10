@@ -19,7 +19,7 @@
     "@react-navigation/elements": "^2.9.44",
     "@react-navigation/native": "^7.5.0",
     "@react-navigation/native-stack": "^7.20.0",
-    "@smalltalk/st3-views": "file:../../clients/typescript/st3-views",
+    "@smalltalk/st3-views": "workspace:*",
     "expo": "~57.0.0",
     "expo-build-properties": "~57.0.21",
     "expo-clipboard": "~57.0.2",

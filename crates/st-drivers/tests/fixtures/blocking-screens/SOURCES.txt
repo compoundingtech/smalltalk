@@ -18,3 +18,12 @@ matcher missed this layout. No production terminal input was sent.
 claude-authenticating.txt, claude-code-prompt.txt: isolated Claude /login flow,
 browser opening disabled and no credentials entered. The OAuth URL (including
 state and challenge) is replaced with https://example.invalid/oauth/authorize.
+
+claude-permission-dialog.txt, claude-permission-refused.txt, claude-working.txt,
+claude-edit-dialog.txt, claude-edit-refused.txt, claude-ask-question.txt,
+claude-plan-dialog.txt, claude-trust.txt: Claude Code 2.1.296 in a 100- or
+120-column PTY on 2026-10-10, manual permission mode: a Bash permission dialog,
+the screen after refusing it with Esc, a Bash command running (the input box
+stays on screen while Claude works), the Write tool's create-file dialog and the
+screen after refusing it, an AskUserQuestion prompt, the plan-mode approval
+dialog, and the folder trust dialog.

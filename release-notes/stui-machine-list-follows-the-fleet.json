@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "stui re-reads its machine list when a connection goes live and when st's live summary counts a different number of machines, so a list cached before a machine joined no longer hides it",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, stored data or transcript change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Published schema, operations and contract digest are unchanged. The existing machines read is used."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "stui-local behavior only; the daemon, the Swift and TypeScript clients and the wire are unchanged. The machines read stui already made when the Fleet tab opens is now also made on a live connection and when the summary's machine count changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Ordinary rolling deployment; no data conversion or extra startup work. One extra machines page read per connection and per change in the count."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, durable payload or initialization changes."
+  }
+}

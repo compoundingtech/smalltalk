@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "summary": "Add the standalone st-decision-fold library crate (decision record grammar, validation and state fold); nothing consumes it yet.",
+  "commits": ["6fa00f16a58486434cdb545da5ab1336668dec47"],
+  "replay": {"status": "none", "detail": "A pure in-memory library: no storage, CLI, daemon or replay integration. No other crate depends on it."},
+  "schema": {"status": "none", "detail": "No database schema, claim kind or persisted format; the crate reads and writes no files."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and fleet coordination are unchanged."},
+  "compatibility": {"status": "none", "detail": "No shipped binary, route, command or protocol links the crate. It is a new workspace member only (Cargo.toml, Cargo.lock) and is excluded from the default workspace test run in flake.nix because it has its own hermetic gate."},
+  "downtime": {"status": "none", "detail": "No runtime component was added or changed."},
+  "manual": {"status": "none", "detail": "No operator action; the README states that an adapter must supply authority, kind and same-tree checks before any consumer relies on it."},
+  "recovery": {"status": "none", "detail": "Nothing is persisted; reverting the commit removes an unused crate."}
+}

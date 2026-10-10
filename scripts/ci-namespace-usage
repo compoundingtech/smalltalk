@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Observed Namespace job execution minutes by UTC day, not invoice/billable minutes."""
+import argparse
+from datetime import datetime, timedelta, timezone
+import json
+import os
+from pathlib import Path
+import subprocess
+from urllib.parse import quote
+
+UTC = timezone.utc
+LOOKBACK_DAYS = 7
+API_REQUEST_LIMIT = 4000
+API_REMAINING_RESERVE = 500
+api_requests = 0
+rate_limit = None
+lowest_remaining = None
+
+
+def timestamp(value):
+    return datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone(UTC)
+
+
+def summarize(jobs, start, end):
+    rows, unknown, ambiguous, seen = [], [], [], set()
+    for job in jobs:
+        if job['id'] in seen:
+            continue
+        seen.add(job['id'])
+        # A skipped/queued job did not execute. A planned label cannot prove its
+        # actual runner; preserve executed Namespace candidates with unknown identity.
+        if job.get('status') in ('queued', 'waiting') or job.get('conclusion') == 'skipped':
+            continue
+        name = job.get('runner_name') or ''
+        planned = any(label.startswith(('namespace-profile-', 'nscloud-'))
+                      for label in job.get('labels', []))
+        known_local = name.startswith(('ci1-', 'hetz2-ci-', 'GitHub Actions '))
+        if not name.startswith('nsc-runner-'):
+            if planned and not known_local:
+                # Only flag this day's possible execution, not unrelated old attempts.
+                firsts = [timestamp(step['started_at']) for step in job.get('steps', [])
+                          if step.get('started_at')]
+                if not firsts:
+                    # No started step means no execution under this report method,
+                    # including completed/cancelled jobs removed from the queue.
+                    continue
+                terminal = job.get('completed_at')
+                if min(firsts) >= end or (terminal and timestamp(terminal) <= start):
+                    continue
+                if terminal and timestamp(terminal) < min(firsts):
+                    raise ValueError(f"job {job['id']}: terminal before first step")
+                ambiguous.append(dict(id=job['id'], runner_name=job.get('runner_name'),
+                                      reason='Namespace planned; actual runner identity missing or unrecognized'))
+            continue
+        starts = [timestamp(s['started_at']) for s in job.get('steps', []) if s.get('started_at')]
+        terminal = job.get('completed_at')
+        if (starts and min(starts) >= end) or (terminal and timestamp(terminal) <= start):
+            continue
+        if not starts:
+            unknown.append(job['id'])
+            continue
+        first = min(starts)
+        if job.get('status') == 'completed' and not terminal:
+            unknown.append(job['id'])
+            continue
+        last = timestamp(terminal) if terminal else min(datetime.now(UTC), end)
+        if last < first:
+            raise ValueError(f"job {job['id']}: terminal before first step")
+        seconds = (min(last, end) - max(first, start)).total_seconds()
+        if seconds <= 0:
+            continue
+        rows.append(dict(id=job['id'], run_id=job['run_id'], run_attempt=job.get('run_attempt'),
+                         event=job['event'], name=job['name'], runner=name,
+                         labels=job.get('labels', []), conclusion=job.get('conclusion'),
+                         first_step=first.isoformat(), completed_at=terminal,
+                         seconds=seconds, execution_minutes=seconds / 60,
+                         url=job.get('html_url')))
+    totals = {}
+    for row in rows:
+        totals[row['event']] = totals.get(row['event'], 0) + row['execution_minutes']
+    return dict(jobs=rows, execution_minutes=sum(r['execution_minutes'] for r in rows),
+                minutes_by_event=totals, missing_execution_timestamp_job_ids=unknown,
+                ambiguous_runner_identity_jobs=ambiguous,
+                complete=not (unknown or ambiguous))
+
+
+def render(report):
+    qualifier = "COMPLETE WINDOW EVIDENCE — DAILY LOWER BOUND" if report["complete"] else "PARTIAL LOWER BOUND"
+    summary = f"## Namespace execution minutes: {report['date']} UTC — {qualifier}\n\n"
+    summary += '| Event | Job minutes |\n| --- | ---: |\n'
+    summary += ''.join(f'| {event} | {minutes:.2f} |\n' for event, minutes in sorted(report['minutes_by_event'].items()))
+    summary += f"| Total observed ({qualifier}) | {report['execution_minutes']:.2f} |\n\n{report['limits']}\n"
+    return summary
+
+
+def api(path):
+    global api_requests, rate_limit, lowest_remaining
+    if api_requests >= API_REQUEST_LIMIT:
+        raise RuntimeError(f'API request budget exhausted ({API_REQUEST_LIMIT}); remaining evidence unknown')
+    if lowest_remaining is not None and lowest_remaining <= API_REMAINING_RESERVE:
+        raise RuntimeError('credential request reserve reached; preserve quota for runner admission')
+    api_requests += 1
+    result = subprocess.run(['gh', 'api', '--include', path], capture_output=True, text=True, timeout=30)
+    header, separator, body = result.stdout.partition('\n\n')
+    if result.returncode:
+        raise RuntimeError(f"GitHub API failed for {path}: {result.stderr.strip()}")
+    if not separator:
+        raise RuntimeError('GitHub rate-limit headers absent; API capacity unknown')
+    headers = dict(line.lower().split(': ', 1) for line in header.splitlines() if ': ' in line)
+    try:
+        current_limit = int(headers['x-ratelimit-limit'])
+        current_remaining = int(headers['x-ratelimit-remaining'])
+    except (KeyError, ValueError) as error:
+        raise RuntimeError('fresh valid rate-limit and remaining headers required; API capacity unknown') from error
+    if current_limit <= 0 or not 0 <= current_remaining <= current_limit:
+        raise RuntimeError('invalid current rate-limit/remaining bounds; API capacity unknown')
+    # Prior observations remain report evidence, never substitutes for absent
+    # headers on this response. Count even the rejected request.
+    rate_limit = current_limit
+    lowest_remaining = current_remaining if lowest_remaining is None else min(lowest_remaining, current_remaining)
+    if rate_limit < API_REQUEST_LIMIT:
+        raise RuntimeError(f'credential API limit {rate_limit} is below the {API_REQUEST_LIMIT}-request budget; need existing higher-limit read token')
+    return json.loads(body)
+
+
+def pages(path, field, filtered=False):
+    for page in range(1, 1001):
+        response = api(f'{path}&page={page}')
+        # GitHub caps created-filter searches at 1,000 results. Refuse a
+        # truncated day rather than treating pagination exhaustion as complete.
+        if filtered and response.get('total_count', 0) >= 1000:
+            raise RuntimeError('created-day search reached the 1000-result limit; coverage unknown')
+        entries = response[field]
+        yield from entries
+        if len(entries) < 100:
+            return
+    raise RuntimeError('usage pagination exceeded 1000 pages; refuse a complete total')
+
+
+def created_runs(repo, low, high):
+    """Split saturated filtered searches; intervals are half-open UTC seconds."""
+    left = low.strftime('%Y-%m-%dT%H:%M:%SZ')
+    right = (high - timedelta(seconds=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    path = f'repos/{repo}/actions/runs?per_page=100&created={quote(left + ".." + right, safe="")}'
+    response = api(path + '&page=1')
+    if response['total_count'] >= 1000:
+        seconds = int((high - low).total_seconds())
+        if seconds <= 1:
+            raise RuntimeError('created-second search saturated; remaining coverage unknown')
+        middle = low + timedelta(seconds=seconds // 2)
+        yield from created_runs(repo, low, middle)
+        yield from created_runs(repo, middle, high)
+        return
+    for page in range(1, 11):
+        if page > 1:
+            response = api(path + f'&page={page}')
+        if response['total_count'] >= 1000:
+            raise RuntimeError('created-window search saturated during pagination; remaining coverage unknown')
+        entries = response['workflow_runs']
+        yield from entries
+        if len(entries) < 100:
+            return
+    raise RuntimeError('created-window search pagination saturated; remaining coverage unknown')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--date', default=(datetime.now(UTC) - timedelta(days=1)).date().isoformat())
+    parser.add_argument('--repo', default=os.environ.get('GITHUB_REPOSITORY', 'compoundingtech/smalltalk'))
+    parser.add_argument('--output', required=True)
+    args = parser.parse_args()
+    start = timestamp(args.date + 'T00:00:00Z')
+    end = start + timedelta(days=1)
+    # Bounded scope: reporting day plus seven prior creation days. Older runs
+    # rerun during the day are outside coverage, so every total is a lower bound.
+    jobs, relevant_runs, all_runs, collection_errors, seen_runs = [], 0, 0, [], set()
+    coverage_start = start - timedelta(days=LOOKBACK_DAYS)
+    try:
+        for offset in range(LOOKBACK_DAYS + 1):
+            # Reporting day first: if a budget binds, keep the most useful evidence.
+            day = start - timedelta(days=offset)
+            for run in created_runs(args.repo, day, day + timedelta(days=1)):
+                if run['id'] in seen_runs:
+                    continue
+                seen_runs.add(run['id'])
+                all_runs += 1
+                if timestamp(run['created_at']) >= end:
+                    continue
+                if run['status'] == 'completed' and timestamp(run['updated_at']) < start:
+                    continue
+                relevant_runs += 1
+                # filter=all includes cancelled/failing attempts, not only latest reruns.
+                for job in pages(f"repos/{args.repo}/actions/runs/{run['id']}/jobs?filter=all&per_page=100", 'jobs'):
+                    jobs.append({**job, 'run_id': run['id'], 'event': run['event']})
+    except (RuntimeError, subprocess.TimeoutExpired, ValueError, KeyError) as error:
+        collection_errors.append(str(error))
+    try:
+        report = summarize(jobs, start, end)
+    except (ValueError, KeyError, TypeError) as error:
+        collection_errors.append(f'invalid execution evidence: {error}')
+        # Refuse malformed intervals without publishing an unqualified zero or
+        # losing request/window/error evidence. No execution is inferred.
+        report = summarize([], start, end)
+    report['complete'] = report['complete'] and not collection_errors
+    report.update(date=args.date, repository=args.repo, generated_at=datetime.now(UTC).isoformat(),
+                  retained_run_metadata_scanned=all_runs, relevant_runs=relevant_runs,
+                  api_requests=api_requests, api_request_limit=API_REQUEST_LIMIT,
+                  observed_primary_rate_limit=rate_limit, lowest_remaining_requests=lowest_remaining,
+                  remaining_request_reserve=API_REMAINING_RESERVE,
+                  credential_source=os.environ.get('USAGE_TOKEN_SOURCE', 'local-gh-auth'),
+                  collection_errors=collection_errors, full_day_complete=False,
+                  creation_window_start=coverage_start.isoformat(), creation_window_end=end.isoformat(),
+                  rerun_creation_lookback_days=LOOKBACK_DAYS,
+                  method='UTC-clipped first job step to terminal; all attempts within creation window; actual nsc-runner identity',
+                  limits='Daily lower bound, not a full-day total or Namespace invoice/unit minutes. Coverage is runs created on the reporting day or seven prior UTC days; older-run reruns, provisioning before first step and deleted history are excluded. Complete means evidence within this window only. Missing identity/timestamps or failed/budget-limited collection makes the window partial. Pagination is not an atomic snapshot.')
+    Path(args.output).write_text(json.dumps(report, indent=2) + '\n')
+    summary = render(report)
+    print(summary)
+    if os.environ.get('GITHUB_STEP_SUMMARY'):
+        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+            out.write(summary)
+    if not report['complete']:
+        raise SystemExit('partial Namespace evidence: unknown identity/timestamps or incomplete collection; see retained JSON')
+
+
+if __name__ == '__main__':
+    main()

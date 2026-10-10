@@ -1082,6 +1082,25 @@ completed event. Only an agent can be named. A person is reached through their o
 choice is recorded on the run's creation claim, so a later revision of the mission does not
 change who a running run reports to. A run with neither writes nothing extra and is never reported.
 
+A running run can be opted in, moved to another agent, or cleared without restarting it:
+
+```sh
+st missions report-to RUN --agent agent/ops/watcher --stalled-after 1h --as agent/ops/owner
+st missions report-to RUN --clear --as person/operator
+```
+
+Only a person or the agent that requested the run may change it, and only to an agent. Each
+call states the whole report, as `missions start --report-to` would: `--stalled-after` defaults
+to the mission's `stalled-after`, else 30 minutes, and the completed event is reported with
+`--report-completed` or when the mission asks for it. `--clear` reports the run to nobody, even
+when its mission names a reporter. The change is a `mission-run.report-to` claim on the run. Its
+latest one replaces what the creation claim recorded, and the creation claim itself is left
+alone, so declaring the run again as it was started is still a retry. A request that changes
+nothing writes nothing. The run reads it at its next evaluation. A stall is still measured from
+the run's last sign of life, so turning reports on for a run that is already quiet past its
+limit sends one `stalled` message, not one per pass. An event already reported to an earlier
+reporter is not sent again to a new one.
+
 The reporter gets one message from `daemon/runtime` for each of these events:
 
 | Event | When |
@@ -1106,7 +1125,7 @@ can contain anything a step printed.
 A reporter that is also assigned a step in the run is told like any other. A reporter that is
 not a running agent, because it is undeclared, stopped or retired, is not messaged. The run gets
 a `report-to` fault that says so, once, and st looks again only when the run is next evaluated,
-so nothing loops. The fault is closed when the reporter is told or the run ends.
+so nothing loops. The fault is closed when the reporter is told, the run's report is cleared, or the run ends.
 
 A nested run reports only if its own mission asks. A run that is terminated because the run above
 it ended is reported through the run above it.
@@ -1318,6 +1337,46 @@ receipt commits but before the provider starts can consume the message without d
 changing the launch ID explicitly requests a fresh attempt. No automatic boot instruction is added.
 Pi treats an `@`-prefixed argument as a file even after `--`; such text gets a leading newline to
 keep it a literal message.
+
+An OMP harness can declare `seed "/absolute/path/time_UUID.jsonl"` to migrate an owner-local
+native transcript on its first native launch only. The transcript's filename and header must
+name the same UUID, every transcript line must be valid JSON, and the file must belong to the
+launch owner. Validation is bounded to 8 MiB per line and 64 MiB total, with typed
+`SeedValidationLimitError` refusals before consuming the opportunity. The driver copies only
+that transcript into a seat-private managed inventory, then atomically records a typed `seeded`
+outcome before spawning the provider. Different seats never share a mutable transcript, and a
+repeat staging attempt never overwrites a provider's existing copy. Missing or corrupt input records
+no outcome. Other harnesses do not accept `seed`; authored session selectors and effective resume
+or continuation environment cannot be combined with it. The driver rejects these conflicts
+before accessing the daemon, staging inventory, or recording a first-launch outcome.
+
+Every first native launch, including one without a seed or deliberately fresh, records one
+seat-scoped `seeded` or `fresh` outcome. Its identity does not depend on the declaration,
+transcript path, account, or harness. An existing native binding always wins. Later edits,
+restarts, fresh-context actions, account changes, and refused continuations never re-arm the
+opportunity. Strict suspension resume keeps its exact session selection.
+When reconciliation supplies an exact native resume or continuation, it omits the declaration's
+wrapper seed argument and preserves the native selection environment. This gives generated
+continuation precedence without allowing an explicit seed/environment combination at the driver
+boundary.
+
+A `fresh` outcome never blocks later launches, including a restart before the first message
+or native binding; a later seed declaration is ignored and never rearms the opportunity.
+An unbound `seeded` outcome is explicitly incomplete: the driver records a durable
+`harness.diagnostic` warning with code `first-native-launch-incomplete` and prints the notice.
+It always proceeds fresh, whether seed is absent, still declared, or now points to an invalid
+file. It never validates, stages, or reseeds that declaration again. A person may acknowledge
+the incomplete attempt after inspecting it:
+
+```sh
+st agents acknowledge-seed AGENT --reason "Accept fresh after inspecting the interrupted import" --as ACTOR
+```
+
+The actor may default to the configured person, as for other seat controls. The command records
+`custom.agent.first-native-launch-acknowledged` with the receipt as evidence; it never deletes the
+receipt, restores the first-launch opportunity, or reseeds. Acknowledgement records acceptance
+and suppresses later incomplete notices; it is never required to permit a launch. Receipts,
+acknowledgements, notices, and native bindings survive checkpoint trim.
 
 A harness block cannot declare `prompt`. Parsing refuses it with `harness-prompt-removed`. Put the instruction in a step goal or send the seat a message.
 

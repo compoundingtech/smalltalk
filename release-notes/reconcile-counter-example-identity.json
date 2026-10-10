@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Use the approved example identity in the cost-counter endpoint control",
+  "replay": {
+    "status": "none",
+    "detail": "Fixture-only identity correction; no production, API, database or operational change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Fixture-only identity correction; no production, API, database or operational change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Fixture-only identity correction; no production, API, database or operational change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Fixture-only identity correction; no production, API, database or operational change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Fixture-only identity correction; no production, API, database or operational change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Fixture-only identity correction; no production, API, database or operational change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Fixture-only identity correction; no production, API, database or operational change."
+  }
+}

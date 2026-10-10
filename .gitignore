@@ -23,9 +23,15 @@ __pycache__/
 # Assembled by the `pi-extension-types` check from pinned tarballs; never committed.
 crates/st-drivers/hooks/typecheck/node_modules/
 
-# Local TypeScript client test dependencies.
+# The root pnpm workspace's installation, including members' nested node_modules.
+/node_modules/
 clients/typescript/st3-client/node_modules/
 clients/typescript/st3-views/node_modules/
+clients/typescript/st3-scenarios/node_modules/
 
 # Pinned flake input made available to the CI generators by the devShell.
 /repos/
+
+# Buck2: the web devShell links the rules and capabilities cells; build output.
+/.buck2/
+/buck-out/

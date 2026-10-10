@@ -251,7 +251,24 @@ pub(super) fn message_allowed(
     connection: &Connection,
     message: &MessageView,
 ) -> Result<bool, St3Error> {
-    let Some(operation) = operation(connection, &message.to)?.filter(|o| o.holds_intake()) else {
+    if message.status != "sent" {
+        return Ok(true);
+    }
+    let hold = intake_hold(connection, &message.to)?;
+    message_allowed_under(connection, hold.as_ref(), message)
+}
+
+fn intake_hold(connection: &Connection, subject: &str) -> Result<Option<Operation>, St3Error> {
+    Ok(operation(connection, subject)?.filter(|o| o.holds_intake()))
+}
+
+/// `hold` is the recipient's `intake_hold`, read once by a caller checking many messages.
+fn message_allowed_under(
+    connection: &Connection,
+    hold: Option<&Operation>,
+    message: &MessageView,
+) -> Result<bool, St3Error> {
+    let Some(operation) = hold else {
         return Ok(true);
     };
     if message.status != "sent" {
@@ -310,6 +327,18 @@ pub(super) fn message_allowed(
 impl Store {
     pub fn rollout_message_allowed(&self, message: &MessageView) -> Result<bool, St3Error> {
         message_allowed(&self.readers.get(), message)
+    }
+    /// The seat's current intake hold, if a rollout holds its independent mail.
+    pub(crate) fn rollout_intake_hold(&self, subject: &str) -> Result<Option<Operation>, St3Error> {
+        intake_hold(&self.readers.get(), subject)
+    }
+    /// `rollout_message_allowed` for a message to the seat whose `rollout_intake_hold` is `hold`.
+    pub(crate) fn rollout_message_allowed_under(
+        &self,
+        hold: Option<&Operation>,
+        message: &MessageView,
+    ) -> Result<bool, St3Error> {
+        message_allowed_under(&self.readers.get(), hold, message)
     }
     pub fn rollout_selection(&self, subject: &str) -> Result<Option<Selection>, St3Error> {
         selection(&self.readers.get(), subject)

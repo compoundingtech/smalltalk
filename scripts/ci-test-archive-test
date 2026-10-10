@@ -130,3 +130,181 @@ else:
     commands_after = calls.read_text()[len(before):]
     assert 'archive' not in commands_after and 'list' not in commands_after, 'reject before extracting or rebuilding'
 print('Archive entry-point controls passed: original two groups, exact manifest, extraction/env export, tamper rejection before extraction; fake nextest only')
+
+# A completed, hash-bound ZIP is published atomically; transport/CRC/setup failures
+# cannot become successful test inputs. All fixtures here are tiny text files.
+import hashlib
+import io
+import json
+import stat
+import unittest
+from unittest.mock import patch
+import zipfile
+
+
+class DownloadControls(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.destination = self.root / 'ci-test-archives'
+        self.files = {name: name.encode() for name in module.FILES}
+        self.manifest = json.dumps({'files': {name: hashlib.sha256(data).hexdigest()
+                                             for name, data in self.files.items()}}).encode()
+        self.manifest_hash = hashlib.sha256(self.manifest).hexdigest()
+        self.zip_bytes = self.make_zip()
+        self.environment = dict(GITHUB_REPOSITORY='owner/repo', GITHUB_RUN_ID='123',
+                                GITHUB_RUN_ATTEMPT='2', GITHUB_SHA='a' * 40,
+                                CI_TEST_ARCHIVE_ARTIFACT_ID='456',
+                                CI_TEST_ARCHIVE_PRODUCER_ATTEMPT='1',
+                                CI_TEST_ARCHIVE_MANIFEST_SHA256=self.manifest_hash,
+                                GH_TOKEN='test-token-never-in-argv')
+        self.metadata = dict(id=456, expired=False, name='linux-test-archives-1',
+                             size_in_bytes=len(self.zip_bytes),
+                             digest='sha256:' + hashlib.sha256(self.zip_bytes).hexdigest(),
+                             workflow_run=dict(id=123, head_sha='a' * 40))
+        self.calls = []
+
+    def make_zip(self, extra=None, duplicate=False, symlink=False):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, 'w', compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr('manifest.json', self.manifest)
+            for name, data in self.files.items():
+                if symlink and name == module.FILES[0]:
+                    info = zipfile.ZipInfo(name)
+                    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    archive.writestr(info, data)
+                else:
+                    archive.writestr(name, data)
+            if extra:
+                archive.writestr(extra, b'unexpected')
+            if duplicate:
+                archive.writestr('manifest.json', self.manifest)
+        return stream.getvalue()
+
+    def extract(self, data=None, expected_hash=None, manifest_hash=None):
+        blob = self.root / 'artifact.zip'
+        data = self.zip_bytes if data is None else data
+        blob.write_bytes(data)
+        module.extract_verified_zip(blob, self.destination, len(data),
+                                    expected_hash or hashlib.sha256(data).hexdigest(),
+                                    manifest_hash or self.manifest_hash)
+
+    def fake_gh(self, blobs, codes=None, timeout=False):
+        codes = [] if codes is None else codes.copy()
+        blobs = list(blobs)
+        def run(argv, **kwargs):
+            self.calls.append(argv)
+            self.assertNotIn(self.environment['GH_TOKEN'], ' '.join(argv))
+            self.assertEqual(argv[:2], ['gh', 'api'])
+            if not argv[-1].endswith('/zip'):
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(self.metadata).encode())
+            if timeout:
+                raise subprocess.TimeoutExpired(argv, kwargs['timeout'])
+            kwargs['stdout'].write(blobs.pop(0) if blobs else self.zip_bytes)
+            return subprocess.CompletedProcess(argv, codes.pop(0) if codes else 0)
+        return run
+
+    def download(self, fake):
+        with patch.dict(os.environ, self.environment, clear=True), patch.object(module.subprocess, 'run', fake):
+            module.download(self.destination)
+
+    def test_complete_zip_and_producer_hashes(self):
+        self.download(self.fake_gh([self.zip_bytes]))
+        self.assertEqual(len(self.calls), 2)
+        for name, data in self.files.items():
+            self.assertEqual((self.destination / name).read_bytes(), data)
+        self.assertFalse(list(self.root.glob('ci-test-transfer-*')))
+
+    def test_truncated_transfer_recovers_before_any_consumer(self):
+        self.download(self.fake_gh([self.zip_bytes[:80], self.zip_bytes]))
+        self.assertEqual(len(self.calls), 3)
+        self.assertTrue((self.destination / 'manifest.json').is_file())
+        self.assertFalse(list(self.root.glob('ci-test-transfer-*')))
+
+    def test_two_incomplete_transfers_fail_without_publishing(self):
+        with self.assertRaises(RuntimeError):
+            self.download(self.fake_gh([b'partial', b'partial']))
+        self.assertEqual(len(self.calls), 3)
+        self.assertFalse(self.destination.exists())
+        self.assertFalse(list(self.root.glob('ci-test-transfer-*')))
+
+    def test_cli_nonzero_then_complete_transfer(self):
+        self.download(self.fake_gh([b'partial', self.zip_bytes], codes=[7, 0]))
+        self.assertEqual(len(self.calls), 3)
+
+    def test_timeout_is_bounded_and_partial_removed(self):
+        with self.assertRaises(RuntimeError):
+            self.download(self.fake_gh([], timeout=True))
+        self.assertEqual(len(self.calls), 3)
+        self.assertFalse(self.destination.exists())
+        self.assertFalse(list(self.root.glob('ci-test-transfer-*')))
+
+    def test_interruption_never_retries(self):
+        for status in [143, 137, -15]:
+            self.calls.clear()
+            with self.assertRaises(SystemExit) as raised:
+                self.download(self.fake_gh([b'partial'], codes=[status]))
+            self.assertEqual(raised.exception.code, status if status > 0 else 143)
+            self.assertEqual(len(self.calls), 2)
+            self.assertFalse(self.destination.exists())
+
+    def test_stale_destination_is_refused_without_gh(self):
+        self.destination.mkdir()
+        with self.assertRaises(ValueError):
+            self.download(self.fake_gh([]))
+        self.assertEqual(self.calls, [])
+
+    def test_metadata_mismatch_refuses_download(self):
+        variants = [dict(id=999), dict(name='linux-test-archives-2'), dict(expired=True),
+                    dict(size_in_bytes=0), dict(digest=None),
+                    dict(workflow_run=dict(id=999, head_sha='a' * 40))]
+        for variant in variants:
+            with self.subTest(variant=variant), self.assertRaises((ValueError, TypeError)):
+                module.artifact_metadata({**self.metadata, **variant}, '456', self.environment)
+
+    def test_pr_author_head_does_not_masquerade_as_tested_merge(self):
+        # GitHub run metadata exposes the author SHA; downstream producer manifest
+        # still verifies the effective merge SHA using the unchanged consume path.
+        size, digest = module.artifact_metadata(
+            {**self.metadata, 'workflow_run': dict(id=123, head_sha='b' * 40)},
+            '456', self.environment)
+        self.assertEqual(size, len(self.zip_bytes))
+        self.assertEqual(digest, self.metadata['digest'].split(':')[1])
+
+    def test_malformed_or_future_attempt_refuses_metadata(self):
+        for attempt in ['0', '3', 'x']:
+            with self.assertRaises(ValueError):
+                module.artifact_metadata(self.metadata, '456',
+                                         {**self.environment, 'CI_TEST_ARCHIVE_PRODUCER_ATTEMPT': attempt})
+
+    def test_zip_digest_and_manifest_output_are_mandatory(self):
+        for kwargs in [dict(expected_hash='0' * 64), dict(manifest_hash='0' * 64)]:
+            with self.assertRaises(ValueError):
+                self.extract(**kwargs)
+            self.assertFalse(self.destination.exists())
+
+    def test_entry_set_and_type(self):
+        for data in [self.make_zip(extra='../escape'), self.make_zip(duplicate=True),
+                     self.make_zip(symlink=True)]:
+            with self.assertRaises(ValueError):
+                self.extract(data)
+            self.assertFalse(self.destination.exists())
+
+    def test_correct_zip_hash_does_not_override_producer_file_hash(self):
+        self.files[module.FILES[0]] = b'wrong producer file'
+        with self.assertRaises(ValueError):
+            self.extract(self.make_zip())
+
+    def test_crc_failure_refuses_even_with_whole_zip_digest(self):
+        data = bytearray(self.zip_bytes)
+        position = data.index(self.files[module.FILES[0]])
+        data[position] ^= 1
+        with self.assertRaises(zipfile.BadZipFile):
+            self.extract(bytes(data))
+
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(DownloadControls)
+result = unittest.TextTestRunner(verbosity=2).run(suite)
+if not result.wasSuccessful():
+    sys.exit(1)

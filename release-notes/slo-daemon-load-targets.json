@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "daemon_load reads its CPU budget from slo/targets.toml and reports each path's descriptive SLO target without gating on it",
+  "replay": {"status": "none", "detail": "Test and CI reporting only; no daemon change."},
+  "schema": {"status": "none", "detail": "No table, index or migration change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests unchanged."},
+  "compatibility": {"status": "none", "detail": "Load reports gain two optional fields; older baselines without them still load. Budgets, WORSE and slack are unchanged."},
+  "downtime": {"status": "none", "detail": "No daemon change."},
+  "manual": {"status": "none", "detail": "Nothing to configure."},
+  "recovery": {"status": "none", "detail": "Reverting drops the reported target columns; the CPU budget stays 2 cores."}
+}

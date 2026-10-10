@@ -44,6 +44,8 @@ let
     ++ lib.optionals (cfg.ptyRoot != null) [ "--pty-root" cfg.ptyRoot ]
     ++ lib.optionals (cfg.socket != null) [ "--socket" cfg.socket ]
     ++ lib.optionals (cfg.clientGatewaySocket != null) [ "--client-gateway-socket" cfg.clientGatewaySocket ]
+    ++ lib.optionals (cfg.clientGatewaySocket == null && pkgs.stdenv.hostPlatform.isDarwin)
+      [ "--client-gateway-socket" "${cfg.stateDir}/run/st3-client.sock" ]
     ++ lib.optionals (cfg.ptyPackage != null) [ "--pty-binary" "${cfg.ptyPackage}/bin/pty" ]
     ++ cfg.extraArgs;
   # systemd's command line parser is not a shell; escape its own substitutions too.
@@ -84,7 +86,7 @@ in
     };
     ptyRoot = mkOption { type = types.nullOr types.str; default = null; description = "PTY registry root; null uses the daemon default."; };
     socket = mkOption { type = types.nullOr types.str; default = null; description = "API socket; null uses the daemon default."; };
-    clientGatewaySocket = mkOption { type = types.nullOr types.str; default = null; description = "Client gateway socket; null uses the daemon default."; };
+    clientGatewaySocket = mkOption { type = types.nullOr types.str; default = null; description = "Client gateway socket; null uses the shared runtime socket (%t/st3-client.sock on Linux, stateDir/run/st3-client.sock on Darwin)."; };
     ptyPackage = mkOption {
       type = types.nullOr types.package;
       default = null;
@@ -171,7 +173,10 @@ in
         };
         Service = {
           Type = "simple";
-          ExecStart = lib.concatStringsSep " " (map systemdArg ([ executable ] ++ upArgs));
+          ExecStart = lib.concatStringsSep " " (map systemdArg ([ executable ] ++ upArgs))
+            # Preserve systemd's runtime-directory specifier; systemdArg escapes literal percent signs.
+            + lib.optionalString (cfg.clientGatewaySocket == null)
+              '' "--client-gateway-socket" "%t/st3-client.sock"'';
           Environment = lib.mapAttrsToList (name: value: "${name}=${value}") (environment // { MALLOC_ARENA_MAX = "2"; });
           Restart = "on-failure";
           RestartSec = "5s";

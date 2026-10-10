@@ -112,7 +112,7 @@ st agents queue agent/garden/worker
 | --- | --- |
 | One step must follow another in the same run | `depends-on`; the order of steps in the file does not set the order they run. `queue {}` is a shorter way to write a series of steps. |
 | A whole run must wait for another run | `--after RUN`; if the earlier run fails or is cancelled, the waiting run also fails. |
-| Someone must hear that a run failed, was cancelled or stalled | `report-to="agent/NAME"` on the mission, or `--report-to AGENT` when starting. The agent gets one message for each event. See [run reports](st3/mission-graph-runtime.md#run-reports). |
+| Someone must hear that a run failed, was cancelled or stalled | `report-to="agent/NAME"` on the mission, or `--report-to AGENT` when starting, or `st missions report-to RUN --agent AGENT` on a run already going. The agent gets one message for each event. See [run reports](st3/mission-graph-runtime.md#run-reports). |
 | Several independent runs share one durable seat | Its seat queue. Runs enter in the order they start. The queue skips a blocked run until it has work ready. |
 | New external events should create work | An observer watches for events. A subscription starts a separate run for each matching event. Each run finishes, and the seat queue handles them. See [repository intake](github-integration.md). |
 
@@ -127,13 +127,13 @@ Moving a run does not finish the work it must wait for. Use a **seat** to keep a
 
 ## Approve a planned human gate
 
-When `check-links` finishes, the approval appears in Ada's Home and attention inbox. Read it and paste the exact `step-run/.../approve` ID when asked:
+When `check-links` finishes, the approval appears in Ada's Home as an alert. Read it and paste the exact `step-run/.../approve` ID when asked:
 
 ```sh
-st attention ls --as person/ada
+st alerts ls --as person/ada
 printf 'Step-run ID of the garden README approval: '
 read -r approval_step
-st attention approve "$approval_step" --as person/ada --reason 'The README and its links are ready.'
+st alerts approve "$approval_step" --as person/ada --reason 'The README and its links are ready.'
 st missions show mission-run/garden/readme/one
 st missions show mission-run/garden/summary/one
 ```
@@ -185,16 +185,16 @@ See [KDL lifecycle](st3/kdl-lifecycle.md) and [worked examples](../examples/st3/
 ## Inspect work from the CLI
 
 ```sh
-st now                  # what needs you right now
+st now                  # your alerts right now
 st agents ls            # seats and other running agents
 st missions ls          # missions with current runs
 st work ls              # steps that are ready or in progress
-st attention ls         # decisions and requests waiting for you
+st alerts ls            # decisions and requests waiting for you
 st conversations ls person/ada
 ```
 
-`st attention approve ID --as person/ada` answers a gate using the ID from
-`st attention ls`. `reject` and `request-changes` also take `--reason TEXT`.
+`st alerts approve ID --as person/ada` answers a gate using the ID from
+`st alerts ls`. `reject` and `request-changes` also take `--reason TEXT`.
 If the gate is no longer waiting, it says who answered it or what changed since it asked.
 
 `st --help` and `st help` show the main uses first. They then group commands for everyday use,

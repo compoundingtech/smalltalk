@@ -192,6 +192,32 @@ pub(crate) fn render_mission_run(
     output
 }
 
+/// A seek page can start after a parent run, so render each returned run directly instead of
+/// building a partial parent-to-child map that would hide disconnected continuation rows.
+pub(crate) fn render_mission_run_page(
+    selected: &MissionRunView,
+    runs: &[MissionRunView],
+    style: OutputStyle,
+    now_unix_ms: u128,
+) -> String {
+    let mut output = String::from(
+        "TREE SCOPE  Each PROGRESS line counts its named run only; this page omits other descendants.\n\n",
+    );
+    output.push_str(&render_mission_run(selected, &[], style, now_unix_ms));
+    let _ = writeln!(output, "\nTREE PAGE  {} · {} runs", selected.root_mission_run, runs.len());
+    for run in runs {
+        if run.subject == selected.subject {
+            continue;
+        }
+        output.push('\n');
+        if let Some(parent) = &run.parent_step_run {
+            let _ = writeln!(output, "PARENT    {parent}");
+        }
+        output.push_str(&render_mission_run(run, &[], style, now_unix_ms));
+    }
+    output
+}
+
 #[cfg(test)]
 pub(crate) fn render_work_list(
     actor: Option<&str>,
@@ -510,12 +536,12 @@ pub(crate) fn render_attention_list(
 ) -> String {
     let mut output = String::new();
     let title = person.map_or_else(
-        || "HUMAN ATTENTION".to_owned(),
-        |person| format!("HUMAN ATTENTION FOR {person}"),
+        || "ALERTS".to_owned(),
+        |person| format!("ALERTS FOR {person}"),
     );
     let _ = writeln!(output, "{}", style.heading(title));
     if items.is_empty() {
-        let _ = writeln!(output, "{}", style.muted("No human attention is waiting."));
+        let _ = writeln!(output, "{}", style.muted("No alert is waiting."));
         return output;
     }
     let _ = writeln!(output, "{} waiting · oldest first", items.len());
@@ -552,7 +578,7 @@ pub(crate) fn render_attention_list(
         let _ = writeln!(output, "    subject: {}", item.subject);
         let _ = writeln!(
             output,
-            "    inspect: st attention show {} --as {}",
+            "    inspect: st alerts show {} --as {}",
             item.subject, item.person
         );
         for action in &item.actions {
@@ -574,12 +600,21 @@ pub(crate) fn render_attention_show(
     now_unix_ms: u128,
 ) -> String {
     let mut output = String::new();
-    let _ = writeln!(output, "{}  {}", style.heading("ATTENTION"), item.title);
+    let heading = if item.is_update() { "UPDATE" } else { "ALERT" };
+    let _ = writeln!(output, "{}  {}", style.heading(heading), item.title);
     let _ = writeln!(output, "SUBJECT   {}", item.subject);
     let _ = writeln!(output, "KIND      {}", item.kind);
     let _ = writeln!(output, "PERSON    {}", item.person);
     if let Some(requester) = &item.requester_id {
         let _ = writeln!(output, "FROM      {requester}");
+    }
+    // The agent whose conversation it belongs to, when that is not who asked.
+    if let Some(conversation) = item
+        .conversation
+        .as_ref()
+        .filter(|conversation| item.requester_id.as_ref() != Some(*conversation))
+    {
+        let _ = writeln!(output, "AGENT     {conversation}");
     }
     let _ = writeln!(
         output,
@@ -1599,7 +1634,7 @@ mod tests {
             requester_id: None,
             launch_id: None,
             variant_id: None,
-            message_id: None,
+            message_id: None, conversation: None,
             title: "Fabric needs review".into(),
             detail: "The queue did not recover.".into(),
             mission: Some("mission/fabric".into()),
@@ -1626,7 +1661,7 @@ mod tests {
             OutputStyle::plain(),
             180_000,
         );
-        assert!(rendered.contains("HUMAN ATTENTION FOR person/alex"));
+        assert!(rendered.contains("ALERTS FOR person/alex"));
         assert!(rendered.contains("1 waiting · oldest first"));
         assert!(rendered.contains("[fault] Fabric needs review"));
         assert!(rendered.contains("requested 2m ago"));
@@ -1634,11 +1669,11 @@ mod tests {
         assert!(rendered.contains("--reason 'It is fixed'"));
         assert!(!rendered.contains("The queue did not recover."));
         assert!(
-            rendered.contains("inspect: st attention show attention/fabric --as person/alex")
+            rendered.contains("inspect: st alerts show attention/fabric --as person/alex")
         );
 
         let shown = render_attention_show(&item, OutputStyle::plain(), 180_000);
-        assert!(shown.contains("ATTENTION  Fabric needs review"));
+        assert!(shown.contains("ALERT  Fabric needs review"));
         assert!(shown.contains("The queue did not recover."));
         assert!(shown.contains("TARGETS\n  doc/fabric/report@abc"));
     }
@@ -1648,7 +1683,7 @@ mod tests {
         let rendered = render_attention_list(None, &[], OutputStyle::plain(), 180_000);
         assert_eq!(
             rendered,
-            "HUMAN ATTENTION\nNo human attention is waiting.\n"
+            "ALERTS\nNo alert is waiting.\n"
         );
     }
 
@@ -1688,6 +1723,30 @@ mod tests {
         assert!(rendered.contains("queue issues #1"));
         assert!(rendered.contains("↳ demo · completed · 1/1 completed"));
         assert!(!rendered.contains("publish — publish"));
+    }
+
+    #[test]
+    fn mission_tree_continuation_shows_a_child_without_its_parent_on_the_page() {
+        let root = run("mission-run/demo/run", None, vec![]);
+        let child = run(
+            "mission-run/demo/child",
+            Some("step-run/demo-generation/release"),
+            vec![step("step-run/child-generation/publish", "publish", "ready")],
+        );
+        let rendered = render_mission_run_page(
+            &root,
+            std::slice::from_ref(&child),
+            OutputStyle::plain(),
+            3_000,
+        );
+        assert!(rendered.contains("RUN       mission-run/demo/run"));
+        assert!(rendered.contains("PARENT    step-run/demo-generation/release"));
+        assert!(rendered.contains("RUN       mission-run/demo/child"));
+        assert!(rendered.contains("publish — publish"));
+        let selected_child = render_mission_run_page(&child, &[root], OutputStyle::plain(), 3_000);
+        assert!(selected_child.contains("RUN       mission-run/demo/child"));
+        assert!(selected_child.contains("publish — publish"));
+        assert!(selected_child.contains("RUN       mission-run/demo/run"));
     }
 
     #[test]

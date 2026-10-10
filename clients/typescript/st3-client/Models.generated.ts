@@ -29,6 +29,7 @@ export type ActorRef = string;
 
 export type Agent = ResourceHeader & {
   active_work_count?: number;
+  activity?: string | null;
   ask?: string | null;
   blocked_on?: string | null;
   checkout?: (AgentCheckout | null);
@@ -46,6 +47,7 @@ export type Agent = ResourceHeader & {
   incarnation_id?: string | null;
   kind: "agent";
   last_activity_at?: (Timestamp | null);
+  lifecycle?: AgentLifecycle;
   name: string;
   next_work?: (WorkLabel | null);
   next_work_id?: (Id | null);
@@ -119,6 +121,8 @@ export type AgentHandoff = {
 };
 
 export type AgentId = string;
+
+export type AgentLifecycle = ("standing" | "owner" | "bounded" | string);
 
 export type AgentMessageDay = {
   calibrated_messages: number;
@@ -399,9 +403,12 @@ export type Attention = ResourceHeader & {
 
 };
   actions: Array<"custom.reply" | "work.done" | "review.approve" | "review.reject" | "review.request-changes" | "launch.approve" | "launch.cancel" | "mission.approve-revision" | "mission.cancel-revision" | "message.read">;
-  attention_kind: ("human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault" | string);
+  alert?: boolean;
+  attention_kind: ("human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault" | "harness-login" | "harness-prompt" | string);
   because?: string;
   blocked?: AttentionBlocked;
+  conversation_id?: Id;
+  conversation_ids?: Array<Id>;
   custom_form?: {
 
 };
@@ -723,7 +730,7 @@ export type Envelope = {
   value: (Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
-export type ErrorCode = ("attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "issuer-required" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
+export type ErrorCode = ("attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "issuer-required" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "projection-detail-too-large" | "projection-detail-invalid-source" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
 
 export type ErrorEnvelope = {
   api_version: "st3.client.v0";
@@ -1065,8 +1072,8 @@ export type MissionRunSummary = {
 
 } | null;
   current_steps: Array<{
-  assignee?: (AgentId | null);
-  claimant?: (AgentId | null);
+  assignee?: (ActorRef | null);
+  claimant?: (ActorRef | null);
   id: StepRunId;
   since: Timestamp;
   state: WorkState;
@@ -1093,12 +1100,12 @@ export type MissionState = ("draft" | "ready" | "retired" | "running" | "standin
 
 export type MissionStep = {
   agentless?: boolean;
-  assignee?: (AgentId | null);
+  assignee?: (ActorRef | null);
   attempt: number;
   blocked_reason?: string | null;
   blockers?: Array<Id>;
   claim_expires_at?: (Timestamp | null);
-  claimant?: (AgentId | null);
+  claimant?: (ActorRef | null);
   constraints?: Array<string>;
   goals?: Array<string>;
   id: Id;
@@ -1117,7 +1124,7 @@ export type MissionStep = {
 
 export type MissionWake = {
   acknowledged_by?: string | null;
-  assignee: AgentId;
+  assignee: ActorRef;
   assignee_state: string;
   attempts: number;
   failure?: string | null;
@@ -1524,6 +1531,7 @@ export type Summary = ResourceHeader & {
   published_at: Timestamp;
   store_index: number;
 };
+  alerts?: number;
   kind: "summary";
   machines: SummaryMachines;
   needs_you: number;

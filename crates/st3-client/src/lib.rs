@@ -268,6 +268,16 @@ pub struct RawTerminalAttachmentRequest {
     pub mode: RawTerminalMode,
 }
 
+/// The PTY session a daemon's own host runs for a terminal: what a client connects to itself.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LocalTerminalLocation {
+    pub subject: String,
+    pub runtime_id: String,
+    /// The graph's incarnation, `PTY_DAEMON_PID:CREATED_AT`, which the PTY itself must prove.
+    pub incarnation_id: String,
+    pub pty_root: std::path::PathBuf,
+}
+
 /// A single-use raw PTY stream capability, extracted from the client-v0 response envelope.
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RawTerminalAttachment {
@@ -825,6 +835,8 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
             "this image was removed after its retention window; the message text remains".into()
         }
         ErrorCode::ValidationFailed
+        | ErrorCode::ProjectionDetailTooLarge
+        | ErrorCode::ProjectionDetailInvalidSource
         | ErrorCode::AttentionMigrated
         | ErrorCode::IssuerRequired
         | ErrorCode::RuntimeNotLocal
@@ -2642,6 +2654,48 @@ impl Client {
         .await
     }
 
+    /// Whether this client talks to a daemon on this machine over its Unix socket, as opposed to
+    /// a paired device's remote gateway.
+    pub fn is_local_socket(&self) -> bool {
+        matches!(self.endpoint, Endpoint::Unix(_))
+    }
+
+    /// The fleet's membership as this host's daemon holds it, for finding a host's Fabric node.
+    /// A read of the local store; only a Unix socket serves it.
+    pub async fn fleet_membership(&self) -> Result<serde_json::Value, ClientError> {
+        self.get("/v1/internal/fleet/membership").await
+    }
+
+    /// Where `subject`'s running terminal lives, read from this host's daemon without any graph
+    /// write: `Some` names the PTY session this host owns, which the caller connects to itself,
+    /// and `None` means another host owns it (or this endpoint is not a local socket, or a
+    /// daemon from before direct attachment lacks the route). The daemon only says where; it
+    /// never carries a byte.
+    pub async fn local_terminal(
+        &self,
+        subject: &str,
+    ) -> Result<Option<LocalTerminalLocation>, ClientError> {
+        if !matches!(self.endpoint, Endpoint::Unix(_)) {
+            return Ok(None);
+        }
+        // Sessions routes answer in the daemon's own envelope, with the value under `value`.
+        #[derive(Deserialize)]
+        struct Answer {
+            value: LocalTerminalLocation,
+        }
+        match self
+            .get::<Answer>(&format!(
+                "/v1/sessions/local-terminal/{}",
+                percent_encode_segment(subject)
+            ))
+            .await
+        {
+            Ok(answer) => Ok(Some(answer.value)),
+            Err(ClientError::Api(ErrorCode::RuntimeNotLocal | ErrorCode::NotFound, ..)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Acquire a fresh, single-use capability for a fenced raw PTY connection.
     /// Reconnecting consumers must call this again rather than replaying a capability.
     pub async fn raw_terminal_attachment(
@@ -3236,6 +3290,7 @@ impl Client {
                 ));
             }
             let error: ErrorEnvelope = serde_json::from_slice(&bytes)
+                .or_else(|decode| core_api_error(&bytes).ok_or(decode))
                 .map_err(|decode| ClientError::Protocol(format!("HTTP {status}: {decode}")))?;
             return Err(ClientError::Api(
                 error.code.clone(),
@@ -3245,6 +3300,31 @@ impl Client {
         }
         serde_json::from_slice(&bytes).map_err(|error| ClientError::Protocol(error.to_string()))
     }
+}
+
+/// The error a daemon's own `/v1/` routes (outside `/v1/client/`) answer with: a code and a
+/// message, without the client-v0 error version. A code this client does not know stays unread.
+fn core_api_error(bytes: &[u8]) -> Option<ErrorEnvelope> {
+    #[derive(Deserialize)]
+    struct Core {
+        code: ErrorCode,
+        message: String,
+        #[serde(default)]
+        request_id: String,
+        #[serde(default)]
+        details: std::collections::BTreeMap<String, serde_json::Value>,
+    }
+    let core: Core = serde_json::from_slice(bytes).ok()?;
+    Some(ErrorEnvelope {
+        api_version: "st3.v1".into(),
+        error_version: String::new(),
+        request_id: core.request_id,
+        code: core.code,
+        message: core.message,
+        retryable: false,
+        retry_after_ms: None,
+        details: core.details,
+    })
 }
 
 fn unreachable_error(endpoint: &str, error: &(dyn std::error::Error + 'static)) -> ClientError {
@@ -3764,6 +3844,14 @@ mod tests {
         assert_eq!(gone.plain(), "it is gone: agent `agent/x` does not exist");
         assert!(!gone.is_transient());
         assert!(!api(ErrorCode::Forbidden, "no").is_transient());
+        for code in [
+            ErrorCode::ProjectionDetailTooLarge,
+            ErrorCode::ProjectionDetailInvalidSource,
+        ] {
+            let refusal = api(code, "the requested detail was refused");
+            assert_eq!(refusal.plain(), "the requested detail was refused");
+            assert!(!refusal.is_transient());
+        }
         // A terminal out of reach comes back; one whose process exited does not.
         let away = api(
             ErrorCode::TerminalUnavailable,

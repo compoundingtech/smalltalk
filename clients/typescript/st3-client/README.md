@@ -12,17 +12,53 @@ The client uses standard `fetch`, so callers can supply a fetch implementation a
 
 The default transport binds `globalThis.fetch` to `globalThis`, preserving the receiver required by browser implementations. Supplying `fetchImpl` overrides that default without rebinding the custom implementation.
 
-Run the client checks from the repository root with Node 24 or newer:
+Run the client checks from the repository root with Node 24 and Corepack:
 
 ```sh
-npm ci --prefix clients/typescript/st3-client --ignore-scripts --no-audit --no-fund
-npm test --prefix clients/typescript/st3-client
-npm run typecheck --prefix clients/typescript/st3-client
+corepack enable
+pnpm install --frozen-lockfile
+pnpm --filter @smalltalk/st3-client test
+pnpm --filter @smalltalk/st3-client typecheck
 ```
 
-The client package pins TypeScript 6.0.3 and Effect 4.0.0-rc.118 in its own development dependencies and lockfile. These commands need only the client installation. `npm test` runs the contract and schema tests; `npm run typecheck` checks the raw client, its type fixtures and the rich schemas with the strict compiler options declared in `package.json`.
+The root manifest pins pnpm 12.7.0, provisioned by Corepack. The workspace shares one root `pnpm-lock.yaml` across the client, views and iOS packages. The client pins TypeScript 6.0.3 and Effect 4.0.0-rc.118 in its development dependencies. `pnpm --filter @smalltalk/st3-client test` runs the contract and schema tests; `typecheck` runs `typecheck:client` (`tsc -p tsconfig.json`) and `typecheck:schema` (`tsc -p tsconfig.schema.json`) for the raw client, type fixtures and rich schemas.
 
-To verify generated files against the Rust generator, also run `cargo run -p st3-client-codegen -- --check`. The sibling [`st3-views`](../st3-views/README.md) package shares the phone's view models with other TypeScript clients. CI checks the generated client, shared views and iOS consumers together. To run these checks locally, install the locked dependencies in this package, `clients/typescript/st3-views` and `apps/ios`, then run `bash scripts/ci-typescript-client`.
+To verify generated files against the Rust generator, also run `cargo run -p st3-client-codegen -- --check`. The sibling [`st3-views`](../st3-views/README.md) package shares the phone's view models with other TypeScript clients. After the root frozen install, `bash scripts/ci-typescript-client` checks the generated client, shared views and iOS consumers together. Alternatively, `nix develop .#web` supplies pnpm 12.7.0, Node 24.20, Bun 1.4.2 and Buck2.
+
+## Active span propagation
+
+Fractal, web, and React Native callers can pass their active span context without
+adding a runtime dependency to this SDK. For example, an app already using
+`@opentelemetry/api` can configure:
+
+```ts
+import { context, trace } from '@opentelemetry/api'
+import { St3Client } from '@smalltalk/st3-client'
+
+const client = new St3Client({
+  baseUrl: daemonUrl,
+  traceContext: () => {
+    const span = trace.getSpan(context.active())?.spanContext()
+    if (!span) return undefined
+    return {
+      traceparent: `00-${span.traceId}-${span.spanId}-${span.traceFlags.toString(16).padStart(2, '0')}`,
+      tracestate: span.traceState?.serialize(),
+    }
+  },
+})
+```
+
+The synchronous callback is read once per HTTP request or WebSocket open, not at
+client construction, so each call continues the currently active span. An absent
+callback or `undefined` result sends no trace headers. Invalid `traceparent`
+values (non-lowercase W3C format, version `ff`, or zero trace/span IDs) suppress
+both headers. `tracestate` is forwarded verbatim; the SDK never adds `st=c`.
+A daemon with trace propagation records `st.parent.sampled` for a sampled
+incoming parent without an `st` tracestate entry, so the collector can honour
+external app sampling decisions. Daemons without trace propagation ignore both
+headers.
+Web streams require a header-capable `socket` factory: the browser's native
+WebSocket API cannot set these headers.
 
 ## Rich Effect schemas
 
@@ -40,9 +76,9 @@ The synchronous and effectful decode helpers default to tolerant mode: unknown e
 
 Inline semantic keywords provide branded strings and subject references, UTC instants, durations, and redacted credentials. Integer codecs reject unsafe JavaScript integers on decode and encode. Duration codecs round to whole wire units on encode; second durations preserve exact safe-integer units without overflowing millisecond precision. Recursive Glass layouts remain validated through suspended schemas.
 
-After installing the client development dependencies, run the focused rich checks with:
+After the root frozen install, run the focused rich checks with:
 
 ```sh
-npm run test:schema --prefix clients/typescript/st3-client
-npm run typecheck:schema --prefix clients/typescript/st3-client
+pnpm --filter @smalltalk/st3-client run test:schema
+pnpm --filter @smalltalk/st3-client run typecheck:schema
 ```

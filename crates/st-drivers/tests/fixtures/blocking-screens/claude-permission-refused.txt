@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.296
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /…/example
+
+
+❯ Use the Bash tool to run exactly: date. Do nothing else.
+
+  Ran 1 shell command
+
+● The current date and time is Sat Oct 10 2026, 05:33:37 UTC.
+
+✻ Cogitated for 3s · done 5:33 AM
+
+❯ Use the Bash tool to run exactly: touch probe-file. Do nothing else.
+
+  Ran 1 shell command
+  ⎿  Interrupted · What should Claude do instead?
+
+✻ Brewed for 2s · done 5:34 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents

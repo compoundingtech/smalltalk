@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Expose the serving build's source commit in GET /v1/health.",
+  "replay": {"status": "none", "detail": "No claim replay or history changes."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No admission or checkpoint rule changes."},
+  "compatibility": {"status": "changed", "detail": "The public health payload adds build.commit without changing existing fields. It uses the same compile-time build stamp as the CLI version, preferring the full source commit and falling back to the short revision for older stamps or unknown for unstamped builds."},
+  "downtime": {"status": "none", "detail": "No additional downtime requirement."},
+  "manual": {"status": "none", "detail": "No manual migration required."},
+  "recovery": {"status": "none", "detail": "No recovery procedure changes."}
+}

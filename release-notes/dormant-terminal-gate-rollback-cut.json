@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Correct the dormant rollback fixture source-cut baseline.",
+  "replay": {
+    "status": "none",
+    "detail": "Test-only correction: capture the rollback baseline after a committed duplicate, assert its source revision advances without semantic generation change, and retain exact root equality after rollback. No production code or public contract changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Test-only correction: capture the rollback baseline after a committed duplicate, assert its source revision advances without semantic generation change, and retain exact root equality after rollback. No production code or public contract changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Test-only correction: capture the rollback baseline after a committed duplicate, assert its source revision advances without semantic generation change, and retain exact root equality after rollback. No production code or public contract changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test-only correction: capture the rollback baseline after a committed duplicate, assert its source revision advances without semantic generation change, and retain exact root equality after rollback. No production code or public contract changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Test-only correction: capture the rollback baseline after a committed duplicate, assert its source revision advances without semantic generation change, and retain exact root equality after rollback. No production code or public contract changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Test-only correction: capture the rollback baseline after a committed duplicate, assert its source revision advances without semantic generation change, and retain exact root equality after rollback. No production code or public contract changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Test-only correction: capture the rollback baseline after a committed duplicate, assert its source revision advances without semantic generation change, and retain exact root equality after rollback. No production code or public contract changes."
+  }
+}

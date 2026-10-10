@@ -22,6 +22,67 @@ const capabilityFixture = require('../../../docs/st3/client-v0/fixtures/capabili
 const cursorGapFixture = require('../../../docs/st3/client-v0/fixtures/cursor-gap-error.json');
 const capabilities = { ...capabilityFixture.value, limits: { ...capabilityFixture.value.limits, max_page_items: 2, max_event_items: 3, max_wait_ms: 10 } };
 
+const validTraceparent = '00-0123456789abcdef0123456789abcdef-0123456789abcdef-01';
+const traceCases = [
+    ['absent callback', undefined, undefined],
+    ['undefined context', () => undefined, undefined],
+    ['valid context', () => ({ traceparent: validTraceparent }), { traceparent: validTraceparent }],
+    ['verbatim tracestate', () => ({ traceparent: validTraceparent, tracestate: 'vendor=value,other=opaque' }), { traceparent: validTraceparent, tracestate: 'vendor=value,other=opaque' }],
+    ['empty tracestate', () => ({ traceparent: validTraceparent, tracestate: '' }), { traceparent: validTraceparent, tracestate: '' }],
+    ...[
+        'not-a-traceparent',
+        validTraceparent.toUpperCase(),
+        validTraceparent + '\n',
+        'ff' + validTraceparent.slice(2),
+        '00-00000000000000000000000000000000-0123456789abcdef-01',
+        '00-0123456789abcdef0123456789abcdef-0000000000000000-01',
+    ].map(parent => [`invalid ${JSON.stringify(parent)}`, () => ({ traceparent: parent, tracestate: 'vendor=must-not-leak' }), undefined]),
+];
+
+for (const [name, callback, expected] of traceCases) {
+    test(`trace context: ${name} on HTTP and every WebSocket open`, async () => {
+        let reads = 0;
+        const headers = [];
+        const client = new St3Client({
+            baseUrl: 'https://example.test',
+            ...(callback === undefined ? {} : { traceContext: () => { reads++; return callback(); } }),
+            fetchImpl: async (_url, init) => { headers.push(init.headers); return response(envelope(capabilities)); },
+        });
+        const socket = (_url, _protocols, fields) => {
+            headers.push(fields);
+            return { onopen: null, onmessage: null, onclose: null, onerror: null, send() {}, close() {} };
+        };
+        await client.capabilities();
+        const terminal = await client.terminalStream('terminal/test', { streamCapability: 'proof', onScreen() {}, socket });
+        const conversation = await client.conversationStream('session/test', { onChange() {}, socket });
+        const collection = await client.collectionStream({ onFrame() {}, socket });
+        terminal.close();
+        conversation.close();
+        collection.close();
+        assert.equal(headers.length, 4);
+        assert.equal(reads, callback === undefined ? 0 : 4);
+        for (const fields of headers) {
+            assert.equal(fields.traceparent, expected?.traceparent);
+            assert.equal(fields.tracestate, expected?.tracestate);
+            assert.equal(Object.hasOwn(fields, 'traceparent'), expected !== undefined);
+            assert.equal(Object.hasOwn(fields, 'tracestate'), expected?.tracestate !== undefined);
+        }
+    });
+}
+
+test('trace context is read afresh for each HTTP request', async () => {
+    let active;
+    const headers = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', traceContext: () => active,
+        fetchImpl: async (_url, init) => { headers.push(init.headers); return response(envelope(capabilities)); } });
+    await client.capabilities();
+    active = { traceparent: validTraceparent };
+    await client.capabilities();
+    active = undefined;
+    await client.capabilities();
+    assert.deepEqual(headers.map(fields => fields.traceparent), [undefined, validTraceparent, undefined]);
+});
+
 test('discovers capabilities, bounds pages, and encodes opaque cursors', async () => {
     const calls = [];
     const client = new St3Client({ baseUrl: 'https://example.test/', credential: () => 'secret', fetchImpl: async (url, init) => {
@@ -147,18 +208,22 @@ const mission = (id, title) => ({ kind: 'mission', id, revision: `${id}@1`, upda
 test('collection stream holds commands until the socket opens and passes frames through', async () => {
     const socket = collectionSocket();
     const opened = [];
+    const lifecycle = [];
     const frames = [];
     const ends = [];
     const client = new St3Client({ baseUrl: 'https://example.test/', credential: () => 'secret', fetchImpl: async () => { throw new Error('no HTTP'); } });
-    const stream = await client.collectionStream({ onFrame: frame => frames.push(frame), onEnd: error => ends.push(error), socket: (url, protocols, headers) => { opened.push({ url, protocols, headers }); return socket; } });
+    const stream = await client.collectionStream({ onFrame: frame => frames.push(frame), onEnd: error => ends.push(error), onOpen: () => lifecycle.push(['open']), onCommandSent: command => lifecycle.push([command.kind, command.id]), socket: (url, protocols, headers) => { opened.push({ url, protocols, headers }); return socket; } });
     assert.deepEqual(opened, [{ url: 'wss://example.test/v1/client/collections/stream', protocols: ['st3.client.collections.v0'], headers: { Authorization: 'Bearer secret', 'x-st3-features': 'custom-subjects.v1, conversation-blocks.v1' } }]);
     stream.subscribe('missions', 'missions', 200);
     stream.subscribe('mine', 'attention', 50, { person: 'person/example' });
     assert.deepEqual(socket.sent, []);
+    assert.deepEqual(lifecycle, []);
     socket.onopen();
+    assert.deepEqual(lifecycle, [['open'], ['subscribe', 'missions'], ['subscribe', 'mine']]);
     stream.subscribeTerminal('term', 'terminal/example', 'pty-1:2026-09-20T00:00:00Z', 'capability-proof');
     stream.subscribeConversation('talk', 'agent/example');
     stream.unsubscribe('talk');
+    assert.deepEqual(lifecycle.slice(-3), [['subscribe', 'term'], ['subscribe', 'talk'], ['unsubscribe', 'talk']]);
     assert.deepEqual(socket.sent, [
         { kind: 'subscribe', id: 'missions', collection: 'missions', limit: 200 },
         { kind: 'subscribe', id: 'mine', collection: 'attention', limit: 50, person: 'person/example' },
@@ -174,6 +239,138 @@ test('collection stream holds commands until the socket opens and passes frames 
     assert.deepEqual(ends, []);
     socket.onmessage({ data: 'not json' });
     assert.equal(ends.length, 1);
+    assert.deepEqual(socket.closed, [1000]);
+});
+
+test('command observers see queued and direct commands only after socket.send', async () => {
+    const socket = collectionSocket();
+    const observed = [];
+    const ends = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const stream = await client.collectionStream({
+        onFrame: () => {},
+        onEnd: error => ends.push(error),
+        onCommandSent: command => {
+            assert.equal(socket.sent.length, observed.length + 1);
+            assert.deepEqual({ kind: socket.sent.at(-1).kind, id: socket.sent.at(-1).id }, command);
+            observed.push(command);
+        },
+        socket: () => socket,
+    });
+    stream.subscribe('queued', 'agents');
+    assert.deepEqual(observed, []);
+    socket.onopen();
+    stream.subscribe('direct', 'missions');
+    stream.unsubscribe('direct');
+    assert.deepEqual(observed, [
+        { kind: 'subscribe', id: 'queued' },
+        { kind: 'subscribe', id: 'direct' },
+        { kind: 'unsubscribe', id: 'direct' },
+    ]);
+    assert.deepEqual(ends, []);
+    stream.close();
+});
+
+test('a replacement stream opens and reports resubscription sends afresh after an end', async () => {
+    const sockets = [collectionSocket(), collectionSocket()];
+    const lifecycle = [];
+    const ends = [];
+    let created = 0;
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const createStream = index => client.collectionStream({
+        onFrame: () => {},
+        onEnd: error => ends.push([index, error]),
+        onOpen: () => lifecycle.push([index, 'open']),
+        onCommandSent: command => {
+            const socket = sockets[index];
+            const sent = lifecycle.filter(event => event[0] === index && event[1] !== 'open');
+            assert.equal(socket.sent.length, sent.length + 1);
+            assert.deepEqual({ kind: socket.sent.at(-1).kind, id: socket.sent.at(-1).id }, command);
+            lifecycle.push([index, command.kind, command.id]);
+        },
+        socket: () => { created += 1; return sockets[index]; },
+    });
+    const first = await createStream(0);
+    first.subscribe('agents', 'agents');
+    first.subscribe('missions', 'missions');
+    sockets[0].onopen();
+    sockets[0].onclose({ code: 1000 });
+    assert.equal(created, 1); // Reconnection requires a new collectionStream call.
+    assert.deepEqual(ends, [[0, undefined]]);
+    assert.equal(sockets[0].onopen, null);
+    assert.equal(sockets[0].onclose, null);
+    const replacement = await createStream(1);
+    replacement.subscribe('agents', 'agents');
+    replacement.subscribe('missions', 'missions');
+    assert.deepEqual(sockets[1].sent, []);
+    sockets[1].onopen();
+    first.subscribe('ignored', 'agents');
+    first.unsubscribe('agents');
+    first.close();
+    assert.equal(created, 2);
+    assert.deepEqual(lifecycle, [
+        [0, 'open'], [0, 'subscribe', 'agents'], [0, 'subscribe', 'missions'],
+        [1, 'open'], [1, 'subscribe', 'agents'], [1, 'subscribe', 'missions'],
+    ]);
+    assert.deepEqual(sockets[0].sent.map(command => command.id), ['agents', 'missions']);
+    assert.deepEqual(sockets[1].sent.map(command => command.id), ['agents', 'missions']);
+    assert.deepEqual(ends, [[0, undefined]]);
+    replacement.close();
+});
+
+test('closing from onOpen cancels all queued commands', async () => {
+    const socket = collectionSocket();
+    const lifecycle = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    let stream;
+    stream = await client.collectionStream({ onFrame: () => {}, onOpen: () => { lifecycle.push('open'); stream.close(); }, onCommandSent: command => lifecycle.push(command), socket: () => socket });
+    stream.subscribe('agents', 'agents');
+    stream.subscribe('missions', 'missions');
+    socket.onopen();
+    assert.deepEqual(socket.sent, []);
+    assert.deepEqual(lifecycle, ['open']);
+    assert.deepEqual(socket.closed, [1000]);
+});
+
+test('an onOpen observer error ends the stream before queued commands are sent', async () => {
+    const socket = collectionSocket();
+    const ends = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const observerError = new Error('open observer failed');
+    const stream = await client.collectionStream({ onFrame: () => {}, onEnd: error => ends.push(error), onOpen: () => { throw observerError; }, socket: () => socket });
+    stream.subscribe('agents', 'agents');
+    stream.subscribe('missions', 'missions');
+    socket.onopen();
+    assert.deepEqual(socket.sent, []);
+    assert.deepEqual(ends, [observerError]);
+    assert.deepEqual(socket.closed, [1000]);
+});
+
+test('an onCommandSent observer error ends the stream after the sent command', async () => {
+    const socket = collectionSocket();
+    const ends = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const observerError = new Error('send observer failed');
+    const stream = await client.collectionStream({ onFrame: () => {}, onEnd: error => ends.push(error), onCommandSent: command => { if (command.id === 'agents') throw observerError; }, socket: () => socket });
+    stream.subscribe('agents', 'agents');
+    stream.subscribe('missions', 'missions');
+    socket.onopen();
+    assert.deepEqual(socket.sent.map(command => command.id), ['agents']);
+    assert.deepEqual(ends, [observerError]);
+    assert.deepEqual(socket.closed, [1000]);
+});
+
+test('closing from the first command observer stops later queued sends', async () => {
+    const socket = collectionSocket();
+    const sent = [];
+    const client = new St3Client({ baseUrl: 'https://example.test', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    let stream;
+    stream = await client.collectionStream({ onFrame: () => {}, onCommandSent: command => { sent.push(command.id); stream.close(); }, socket: () => socket });
+    stream.subscribe('agents', 'agents');
+    stream.subscribe('missions', 'missions');
+    socket.onopen();
+    assert.deepEqual(socket.sent.map(command => command.id), ['agents']);
+    assert.deepEqual(sent, ['agents']);
     assert.deepEqual(socket.closed, [1000]);
 });
 

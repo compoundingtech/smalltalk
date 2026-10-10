@@ -53,6 +53,122 @@ impl Store {
         })))
     }
 
+    /// One alert per seat whose harness waits on a person at a native prompt: a permission, a
+    /// question or a review it shows in its terminal. It lives in the seat's conversation and
+    /// clears when the harness reports the prompt gone, however it was answered, or when the
+    /// seat's runtime ends. Each seat costs one indexed read of its newest harness observation,
+    /// and only a blocked seat reads its runtime and owner.
+    pub(super) fn harness_prompt_attention_items(
+        &self,
+        person: Option<&str>,
+    ) -> Result<Vec<AttentionItemView>> {
+        let connection = self.readers.get();
+        let seats = connection
+            .prepare_cached("SELECT subject FROM desired WHERE kind='agent' ORDER BY subject")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let newest = |subject: &str, kind: &str| -> Result<Option<(String, u128, Value)>> {
+            let row = connection
+                .prepare_cached(&format!(
+                    "{} LIMIT 1",
+                    newest_claims_of_kind_query(
+                        "claims.id, claims.accepted_at_unix_ms, claims.body",
+                        kind
+                    )
+                ))?
+                .query_row(params![subject, i64::MAX], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .optional()?;
+            row.map(|(id, at, body)| -> Result<(String, u128, Value)> {
+                let body: Value = serde_json::from_str(&body)?;
+                let fields = body.get("fields").cloned().unwrap_or(body);
+                Ok((id, at.parse()?, fields))
+            })
+            .transpose()
+        };
+        let mut items = Vec::new();
+        for seat in seats {
+            let Some((claim, at, harness)) = newest(&seat, "harness.observed")? else {
+                continue;
+            };
+            if harness["blocked_on"] != "human" {
+                continue;
+            }
+            // The prompt was refused in the terminal, which its harness did not report: the
+            // reconciler recorded that once, keyed by this observation.
+            let gone: bool = connection
+                .prepare_cached(
+                    "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_operation_index
+                       WHERE json_extract(body, '$._operation.id') IS NOT NULL
+                         AND json_extract(body, '$._operation.id')=?1)",
+                )?
+                .query_row([native_prompt_gone_operation(&claim)], |row| row.get(0))?;
+            if gone {
+                continue;
+            }
+            // Only the running incarnation's prompt waits: a restarted seat's old prompt is gone.
+            let Some((_, _, runtime)) = newest(&seat, "runtime.observed")? else {
+                continue;
+            };
+            if runtime["status"] != "running"
+                || runtime["incarnation_id"] != harness["incarnation_id"]
+                || !person_work::declaration_live(&connection, &seat)?
+            {
+                continue;
+            }
+            let Some(owner) = self.agent_person(&seat)? else {
+                continue;
+            };
+            if person.is_some_and(|person| person != owner) {
+                continue;
+            }
+            let ask = harness["ask"].as_str().unwrap_or("unknown");
+            let what = match ask {
+                "permission" => "permission",
+                "question" => "an answer",
+                "review" => "a review",
+                _ => "you",
+            };
+            let prompt = harness["reason"]
+                .as_str()
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or("its terminal shows a prompt");
+            items.push(AttentionItemView {
+                episode: claim,
+                priority: "high".into(),
+                kind: "harness-prompt".into(),
+                review_mode: None,
+                subject: seat.clone(),
+                person: owner,
+                requester_id: None,
+                launch_id: None,
+                variant_id: None,
+                message_id: None,
+                conversation: Some(seat.clone()),
+                title: format!("{seat} is waiting for {what}"),
+                detail: format!(
+                    "{prompt}\n\nAnswer it in the seat's terminal (Ctrl+] in stui). This alert clears when the prompt is gone, however it was answered."
+                ),
+                request: None,
+                mission: None,
+                mission_run: None,
+                step: None,
+                targets: vec![seat.clone()],
+                requested_at_unix_ms: at,
+                actions: vec![attention_action(
+                    "Attach to answer",
+                    &["st", "terminals", "attach", &seat],
+                )],
+            });
+        }
+        Ok(items)
+    }
+
     pub(super) fn person_attention_items(
         &self,
         person: Option<&str>,
@@ -427,7 +543,7 @@ impl Store {
                 requester_id: None,
                 launch_id: None,
                 variant_id: None,
-                message_id: None,
+                message_id: None, conversation: None,
                 title: format!("st cannot reconcile {source}"),
                 detail: format!(
                     "{scope}: {}. Inspect with `st subject {source}`.",
@@ -546,7 +662,7 @@ impl Store {
             requester_id: None,
             launch_id: None,
             variant_id: None,
-            message_id: None,
+            message_id: None, conversation: None,
             title,
             detail,
             mission: Some(run.mission.clone()),
@@ -607,7 +723,7 @@ impl Store {
             let diagnostic = self.last_driver_diagnostic(&source)?;
             items.push(AttentionItemView {
                 episode: decision.id.clone(), priority: "high".into(), kind: "fault".into(), review_mode: None,
-                subject: source.clone(), person: reviewer.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None,
+                subject: source.clone(), person: reviewer.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None, conversation: None,
                 title: if codex { "A Codex agent stopped after repeated failures" } else { "An agent stopped after repeated runtime failures" }.into(),
                 detail: format!("{source}: {}.{} Inspect the seat and revise its desired declaration before restarting.", decision.body["fields"]["reason"].as_str().unwrap_or("the runtime is parked"), diagnostic.map(|diagnostic| format!(" The driver's last diagnostic: {diagnostic}.")).unwrap_or_default()),
                 mission: None, mission_run: desired.owner_run, step: None, targets: vec![source.clone()], requested_at_unix_ms: decision.accepted_at_unix_ms,
@@ -685,7 +801,7 @@ impl Store {
             };
             items.push(AttentionItemView {
                 episode: token.clone(), priority: "high".into(), kind: "fault".into(), review_mode: None,
-                subject: source.clone(), person: REVIEWER.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None,
+                subject: source.clone(), person: REVIEWER.into(), requester_id: None, launch_id: None, variant_id: None, message_id: None, conversation: None,
                 title: "An agent seat has not started".into(),
                 detail: format!("{source} has been declared to run on {host} for over {} minutes and no runtime has ever been observed for it, so it is still `desired`.{diagnostic} Check that the host is up and its daemon can start the seat.", SEAT_NOT_STARTED_MS / 60_000),
                 mission: None, mission_run: desired.owner_run, step: None, targets: vec![source.clone()], requested_at_unix_ms: due,
@@ -836,7 +952,7 @@ impl Store {
                 requester_id: None,
                 launch_id: None,
                 variant_id: None,
-                message_id: None,
+                message_id: None, conversation: None,
                 title: condition.title().into(),
                 detail: condition.reason(&source, &latest.origin),
                 mission: None,
@@ -1206,6 +1322,14 @@ pub(super) fn person_attention_item(
         review_mode: None,
         subject: subject.to_owned(),
         person: person.into(),
+        conversation: match ask
+            .as_ref()
+            .and_then(|ask| ask.actor.as_deref())
+            .and_then(agent)
+        {
+            Some(actor) => Some(actor),
+            None => conversation_agent(connection, None, Some(&view.run))?,
+        },
         requester_id: ask.and_then(|ask| ask.actor),
         launch_id: None,
         variant_id: None,
@@ -1234,4 +1358,42 @@ pub(super) fn person_attention_item(
         )],
         request,
     }))
+}
+
+/// `subject` when it names an agent: only an agent has a conversation an item can belong to.
+pub(super) fn agent(subject: &str) -> Option<String> {
+    subject.starts_with("agent/").then(|| subject.to_owned())
+}
+
+/// The agent whose conversation an item about `step` or `run` belongs to: the agent assigned to
+/// the step, else the agent that requested its run, else none. A person's run has no agent.
+pub(super) fn conversation_agent(
+    connection: &Connection,
+    step: Option<&str>,
+    run: Option<&str>,
+) -> Result<Option<String>> {
+    let mut run = run.map(str::to_owned);
+    if let Some(step) = step
+        && let Some(view) = person_work::step(connection, step)?
+    {
+        if let Some(agent) = view.assigned_to.as_deref().and_then(agent) {
+            return Ok(Some(agent));
+        }
+        run.get_or_insert(view.run);
+    }
+    let Some(run) = run else { return Ok(None) };
+    Ok(
+        mission_run_header_tx(connection, run.strip_prefix("mission-run/").unwrap_or(&run))
+            .optional()?
+            .and_then(|header| agent(&header.requester)),
+    )
+}
+
+/// The idempotency key of the record that a native prompt opened by `observation` is gone.
+pub(crate) fn native_prompt_gone_key(observation: &str) -> String {
+    format!("native-prompt-gone:{observation}")
+}
+
+fn native_prompt_gone_operation(observation: &str) -> String {
+    smallclaims::store::operation_id_for_key(&native_prompt_gone_key(observation))
 }

@@ -65,6 +65,7 @@ conversation_model() {
 }
 
 # Guard current products before any stage can report success.
+python3 scripts/ci-rustc-wrapper-test
 python3 scripts/check-st-boundary-test
 python3 scripts/check-st-boundary
 

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Rename the internal native provider spawn helper to match the st3 provider it launches.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection recovery changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema or index changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint or digest rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Internal rename only; launcher, CLI flags and user-visible strings are unchanged."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No setting or store repair required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persisted cache or migration; normal binary rollback drops nothing."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No runtime or upgrade impact; no restart required beyond a normal deploy."
+  }
+}

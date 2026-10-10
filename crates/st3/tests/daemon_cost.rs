@@ -70,7 +70,6 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
     ("GET /v1/checkpoint/status", 15.0),
     // Runtimes read every runtime observation (3.8x for the list, 9.0x for one runtime).
     ("GET /v1/client/runtimes", 6.0),
-    ("GET /v1/client/runtimes/{*id}", 14.0),
     // Doctor checks the whole store, as it must (11.4x full-scan steps).
     ("GET /v1/doctor", 17.0),
     // Fleet and replication status count every replica record (9.7x).
@@ -91,6 +90,15 @@ const KNOWN_GROWTH: &[(&str, f64)] = &[
 /// Routes the check does not measure, and why. Keep this list short: a route here can grow with
 /// the store unnoticed.
 const NOT_MEASURED: &[(&str, &str)] = &[
+    // Aliases: the same handler as a measured route under the name a person reads.
+    (
+        "GET /v1/client/alerts",
+        "the GET /v1/client/attention handler, which is measured",
+    ),
+    (
+        "GET /v1/client/alerts/{*id}",
+        "the GET /v1/client/attention/{*id} handler, which is measured",
+    ),
     // Sekrets: neither reads the claim store beyond one primary-key lookup.
     (
         "POST /v1/sekrets/attest",
@@ -312,6 +320,10 @@ const NOT_MEASURED: &[(&str, &str)] = &[
     (
         "POST /v1/mission-runs/{run}/outcome",
         "sets a run's outcome",
+    ),
+    (
+        "POST /v1/mission-runs/{run}/report-to",
+        "sets who a run reports to: one run row, two latest claims and one mission revision by key",
     ),
     (
         "POST /v1/revision-proposals/{proposal}/approve",
@@ -763,6 +775,10 @@ const PROBES: &[Probe] = &[
     get(
         "GET /v1/mission-runs",
         "/v1/mission-runs?mission={mission_name}",
+    ),
+    get(
+        "GET /v1/mission-runs/tree",
+        "/v1/mission-runs/tree?root={run}&limit=50",
     ),
     get(
         "GET /v1/mission-overview",

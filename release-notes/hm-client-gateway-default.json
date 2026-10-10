@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Home Manager daemons keep the shared client gateway when no socket override is configured",
+  "replay": { "status": "none", "detail": "No runtime replay change." },
+  "schema": { "status": "none", "detail": "No database schema change." },
+  "rules": { "status": "none", "detail": "No checkpoint rules change." },
+  "compatibility": { "status": "none", "detail": "Restores the shared runtime client socket on Linux and the state-directory runtime socket on Darwin; explicit socket overrides remain unchanged." },
+  "downtime": { "status": "none", "detail": "No additional service interruption introduced." },
+  "manual": { "status": "none", "detail": "No manual upgrade step." },
+  "recovery": { "status": "none", "detail": "No database or runtime recovery change." }
+}
