@@ -5,6 +5,28 @@ use proptest::prelude::*;
 
 const CUT: u128 = 20 * DAY_MS;
 
+#[test]
+fn compact_capture_metadata_rejects_malformed_claim_times() {
+    for malformed in ["not-a-time", "-1", "340282366920938463463374607431768211456"] {
+        let store = Store::open_memory("alder").unwrap();
+        store.set_write_clock_at(100).unwrap();
+        let claim = store.append_claim(&input(
+            AGENT, "harness.observed", Some(AGENT),
+            json!({"state":"idle", "incarnation_id":"compact"}), "compact",
+        )).unwrap();
+        store.seal_local_batches().unwrap();
+        store.connection.write().execute(
+            "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+            params![malformed, claim.id],
+        ).unwrap();
+        let error = store.checkpoint_sealed_set_paged(150, None, 1, 1).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("invalid accepted time for checkpoint claim {}", claim.id)),
+            "compact metadata must reject {malformed:?}: {error:#}",
+        );
+    }
+}
+
 /// Builds a sealed set by hand: each claim in its own envelope unless grouped, in canonical
 /// order. Every writer also gets a newest envelope that no rule drops, so the newest-envelope
 /// guard stays out of the way unless a test wants it.
@@ -344,8 +366,8 @@ fn limits_keep_source_observations_even_when_the_same_seat_publishes_again() {
 
 #[test]
 fn a_sealed_set_read_in_pages_is_the_same_set_whatever_the_page() {
-    // Each page of the read is a read of its own, so the WAL is free between pages. The set must
-    // not depend on how the pages fall: one row to a page, a few, and one page for everything.
+    // Epoch checks keep the capture coherent across bounded page snapshots. The set must not
+    // depend on how the pages fall: one row to a page, a few, or the maximum bounded page.
     let store = Store::open_memory("alder").unwrap();
     store
         .append_claim_outcome(&input(
@@ -402,12 +424,16 @@ fn a_sealed_set_read_in_pages_is_the_same_set_whatever_the_page() {
         .unwrap();
     let paged_order: Vec<String> = whole.claims.iter().map(|sealed| sealed.claim.id.clone()).collect();
     assert_eq!(paged_order, sql_order, "the pages sort as ORDER BY canonical sorts");
+    assert!(
+        !sealed_records_page_sql().contains("body"),
+        "record windows must not decode JSON bodies before the cut and canonical sort"
+    );
     // The record page query is driven from replica_records by its rowid range. A plan that
     // drove from claims would read every claim for every window.
     let plan: Vec<String> = connection
         .prepare(&format!("EXPLAIN QUERY PLAN {}", sealed_records_page_sql()))
         .unwrap()
-        .query_map([0_i64, 1_000_i64], |row| row.get::<_, String>(3))
+        .query_map(params![0_i64, 1_000_i64, i64::try_from(cut).unwrap(), whole.seal_rowid], |row| row.get::<_, String>(3))
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
@@ -428,6 +454,43 @@ fn a_sealed_set_read_in_pages_is_the_same_set_whatever_the_page() {
     assert_eq!(
         store.checkpoint_sealed_identities(cut, None).unwrap(),
         SealedIdentities::of(&whole)
+    );
+}
+
+#[test]
+fn sealed_record_windows_leave_later_envelopes_out_before_reading_bodies() {
+    let store = Store::open_memory("alder").unwrap();
+    let append = |at, incarnation: &str| {
+        store.set_write_clock_at(at).unwrap();
+        let claim = store.append_claim(&input(
+            AGENT,
+            "harness.observed",
+            Some(AGENT),
+            json!({"state":"idle", "incarnation_id":incarnation}),
+            incarnation,
+        )).unwrap();
+        store.seal_local_batches().unwrap();
+        claim.id
+    };
+    let older = append(100, "older");
+    let through = store.checkpoint_sealed_set(150).unwrap().seal_rowid;
+    let later = append(200, "later");
+    let sealed = store.checkpoint_sealed_set_paged(150, None, 1, 1).unwrap();
+    assert_eq!(
+        sealed.claims.iter().map(|claim| claim.claim.id.as_str()).collect::<Vec<_>>(),
+        vec![older.as_str()]
+    );
+    let connection = store.readers.get();
+    let record_ids = connection.prepare(&sealed_records_page_sql()).unwrap()
+        .query_map(params![0_i64, i64::MAX, 150_i64, sealed.seal_rowid], |row| row.get::<_, String>(6))
+        .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    assert_eq!(record_ids, vec![older.clone()], "the later body is not part of the metadata window");
+    drop(connection);
+    let through_set = store.checkpoint_sealed_set_paged(250, Some(through), 1, 1).unwrap();
+    assert!(through_set.claims.iter().all(|claim| claim.claim.id != later));
+    assert_eq!(
+        SealedIdentities::of(&sealed),
+        store.checkpoint_sealed_identities_paged(150, None, 1).unwrap()
     );
 }
 
@@ -554,6 +617,181 @@ fn a_usage_trim_keeps_lifetime_usage_and_the_proof_guards_it() {
         !proof.passed,
         "dropping a series total changes lifetime usage"
     );
+}
+
+#[test]
+fn sealed_capture_restarts_when_trim_commits_between_metadata_and_bodies() {
+    use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}, mpsc};
+    struct Pause {
+        fired: AtomicBool,
+        reached: mpsc::SyncSender<()>,
+        resume: Mutex<mpsc::Receiver<()>>,
+    }
+    unsafe extern "C" fn pause_before_body(
+        _: std::ffi::c_uint,
+        context: *mut std::ffi::c_void,
+        statement: *mut std::ffi::c_void,
+        _: *mut std::ffi::c_void,
+    ) -> std::ffi::c_int {
+        let pause = unsafe { &*context.cast::<Pause>() };
+        let sql = unsafe {
+            std::ffi::CStr::from_ptr(rusqlite::ffi::sqlite3_sql(statement.cast()))
+        };
+        if sql.to_bytes().ends_with(b"FROM claims WHERE id=?1")
+            && !pause.fired.swap(true, Ordering::AcqRel)
+        {
+            let _ = pause.reached.send(());
+            if let Ok(resume) = pause.resume.lock() {
+                let _ = resume.recv();
+            }
+        }
+        0
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    // WAL lets the trim commit while one bounded body page holds its read snapshot.
+    let store = Arc::new(Store::open(&scratch.path().join("claims.sqlite3"), "alder").unwrap());
+    store.append_claim(&input(
+        AGENT, "harness.observed", Some(AGENT),
+        json!({"state":"idle","incarnation_id":"one"}), "harness",
+    )).unwrap();
+    let old = now_ms() - 9 * DAY_MS;
+    for n in 0..3 {
+        store.append_claim(&input(
+            AGENT, "harness.usage", Some(AGENT),
+            rollup("claude/aaaa", old + n * DAY_MS / 4, 100 * (n as u64 + 1)),
+            &format!("rollup-{n}"),
+        )).unwrap();
+    }
+    let cut = now_ms() + 1_000;
+    let expected = store.checkpoint_sealed_set(cut).unwrap();
+    let plan = plan_drops(&expected);
+    assert_eq!(plan.claims.len(), 2);
+    let (reached, at_body) = mpsc::sync_channel(1);
+    let (resume, continue_body) = mpsc::sync_channel(1);
+    let pause = Arc::new(Pause {
+        fired: AtomicBool::new(false),
+        reached,
+        resume: Mutex::new(continue_body),
+    });
+    for connection in store.readers.idle.lock().unwrap().iter() {
+        // The Arc outlives the installed callback and the joined capture worker.
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(
+                connection.handle(), rusqlite::ffi::SQLITE_TRACE_STMT as u32,
+                Some(pause_before_body), Arc::as_ptr(&pause).cast_mut().cast(),
+            );
+        }
+    }
+    let reader = store.clone();
+    let reader_pause = pause.clone();
+    let capture = std::thread::spawn(move || {
+        let _pause = reader_pause;
+        reader.checkpoint_sealed_set_paged(cut, None, 1, 1)
+    });
+    at_body.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+    {
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        record_checkpoint_tombstones_tx(
+            &transaction, &checkpoint_name(cut), &plan.envelopes, &plan.claims,
+        ).unwrap();
+        delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+        transaction.commit().unwrap();
+    }
+    resume.send(()).unwrap();
+    let captured = capture.join().unwrap();
+    for connection in store.readers.idle.lock().unwrap().iter() {
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(connection.handle(), 0, None, std::ptr::null_mut());
+        }
+    }
+    let captured = captured.expect("capture must restart after a concurrent trim");
+    let current = store.checkpoint_sealed_set(cut).unwrap();
+    assert_eq!(format!("{:?}", captured.claims), format!("{:?}", current.claims));
+    assert_eq!(SealedIdentities::of(&captured), SealedIdentities::of(&current));
+    assert!(captured.claims.len() < expected.claims.len(), "capture must not return the stale bodies");
+    assert_eq!(
+        store.claims_for(AGENT, Some("harness.usage")).unwrap().len(),
+        1,
+        "the trim really committed while capture was paused"
+    );
+}
+
+#[test]
+fn sealed_capture_fails_closed_after_three_consecutive_invalidations() {
+    use std::cell::Cell;
+    struct Mutate {
+        connection: rusqlite::Connection,
+        changes: Cell<usize>,
+    }
+    unsafe extern "C" fn invalidate_page(
+        _: std::ffi::c_uint,
+        context: *mut std::ffi::c_void,
+        statement: *mut std::ffi::c_void,
+        _: *mut std::ffi::c_void,
+    ) -> std::ffi::c_int {
+        let mutation = unsafe { &*context.cast::<Mutate>() };
+        let sql = unsafe {
+            std::ffi::CStr::from_ptr(rusqlite::ffi::sqlite3_sql(statement.cast()))
+        };
+        if sql.to_bytes() == b"SELECT value FROM checkpoint_capture_epoch WHERE id=1" {
+            mutation.connection.execute(
+                "UPDATE checkpoint_capture_epoch SET value=value+1 WHERE id=1", [],
+            ).unwrap();
+            mutation.changes.set(mutation.changes.get() + 1);
+        }
+        0
+    }
+    let scratch = tempfile::tempdir().unwrap();
+    let path = scratch.path().join("claims.sqlite3");
+    let store = Store::open(&path, "alder").unwrap();
+    store.append_claim(&input(
+        AGENT, "harness.observed", Some(AGENT),
+        json!({"state":"idle", "incarnation_id":"one"}), "harness",
+    )).unwrap();
+    let cut = now_ms() + 1_000;
+    store.connection.write().execute_batch(
+        "CREATE TABLE capture_registration_count(value INTEGER NOT NULL);
+         INSERT INTO capture_registration_count VALUES (0);
+         CREATE TRIGGER capture_registration_count AFTER UPDATE OF envelope_frontier, cut_unix_ms
+         ON checkpoint_capture_epoch BEGIN
+             UPDATE capture_registration_count SET value=value+1;
+         END;",
+    ).unwrap();
+    store.checkpoint_sealed_set(cut).unwrap();
+    assert_eq!(store.readers.get().query_row(
+        "SELECT value FROM capture_registration_count", [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 1);
+    store.connection.write().execute(
+        "UPDATE capture_registration_count SET value=0", [],
+    ).unwrap();
+    let mutation = Mutate {
+        connection: rusqlite::Connection::open(&path).unwrap(),
+        changes: Cell::new(0),
+    };
+    for connection in store.readers.idle.lock().unwrap().iter() {
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(
+                connection.handle(), rusqlite::ffi::SQLITE_TRACE_STMT as u32,
+                Some(invalidate_page), (&raw const mutation).cast_mut().cast(),
+            );
+        }
+    }
+    let captured = store.checkpoint_sealed_set_paged(cut, None, 1, 1);
+    for connection in store.readers.idle.lock().unwrap().iter() {
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(connection.handle(), 0, None, std::ptr::null_mut());
+        }
+    }
+    assert!(captured.unwrap_err().to_string().contains("after 3 attempts"));
+    assert!(mutation.changes.get() >= 3);
+    assert_eq!(store.readers.get().query_row(
+        "SELECT value FROM capture_registration_count", [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 0, "retries must not durably rewrite unchanged capture bounds");
+    store.checkpoint_sealed_set(cut).unwrap();
+    assert_eq!(store.readers.get().query_row(
+        "SELECT value FROM capture_registration_count", [], |row| row.get::<_, i64>(0),
+    ).unwrap(), 0, "a repeated capture with covered bounds needs no frontier write");
 }
 
 #[test]
@@ -1704,7 +1942,7 @@ fn an_observed_item_keeps_its_latest_state_and_every_version_still_read_by_id() 
 }
 
 #[test]
-fn checkpoint_reads_of_sealed_batches_do_not_wait_for_the_writer() {
+fn checkpoint_identity_reads_of_sealed_batches_do_not_wait_for_the_writer() {
     let store = Arc::new(Store::open_memory("checkpoint-writer-test").unwrap());
     store
         .append_claim(&input(
@@ -1722,22 +1960,19 @@ fn checkpoint_reads_of_sealed_batches_do_not_wait_for_the_writer() {
     let (sent, received) = std::sync::mpsc::channel();
     let reader = store.clone();
     let task = std::thread::spawn(move || {
-        let result = reader
-            .checkpoint_sealed_identities(cut, None)
-            .and_then(|identities| {
-                reader
-                    .checkpoint_sealed_set_through(cut, None)
-                    .map(|sealed| (identities.digest, sealed_digest(&sealed)))
-            });
+        let result = reader.checkpoint_sealed_identities(cut, None);
         sent.send(result).unwrap();
     });
     let result = received.recv_timeout(std::time::Duration::from_secs(2));
     drop(writer);
     task.join().unwrap();
-    let (identities, sealed) = result
-        .expect("an already sealed checkpoint must not take the writer")
+    let identities = result
+        .expect("an already sealed identity read must not take the writer")
         .unwrap();
-    assert_eq!(identities, sealed);
+    // Full capture takes a brief writer transaction to advance the persisted frontier,
+    // then releases it before reading any pages.
+    let sealed = store.checkpoint_sealed_set_through(cut, None).unwrap();
+    assert_eq!(identities.digest, sealed_digest(&sealed));
 }
 
 #[test]
