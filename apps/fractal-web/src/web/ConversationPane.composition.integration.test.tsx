@@ -263,11 +263,12 @@ describe('ConversationPane composition activation', () => {
     const items = separated ? [...reasoning.slice(0, 5), scenario[1]!, ...reasoning.slice(5)] : reasoning
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [scenario[0]!, ...items, scenario[3]!], hasOlder: false, observation: { empty: false } } }
     source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
-    // The bounded transcript backfills older rows after a painted frame; let frames run for this case.
+    // Native find exposes the complete history before asserting the full-turn grouping.
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => setTimeout(() => callback(0), 0))
     await mount()
+    await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true })) })
     await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')!.click() })
-    // Grouping is asserted on the complete turn, after idle backfill; frames are timers here, so a loaded worker needs more than the 1 s default.
+    // Grouping is asserted on the complete turn, including the older reasoning prefix.
     await vi.waitFor(() => expect(container.querySelectorAll('[data-testid="thinking-entry"] button')).toHaveLength(1), { timeout: 5000 })
     const disclosures = [...container.querySelectorAll<HTMLButtonElement>('[data-testid="thinking-entry"] button')]
     expect(disclosures).toHaveLength(1)
