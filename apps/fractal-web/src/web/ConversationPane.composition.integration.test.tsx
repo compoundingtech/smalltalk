@@ -496,6 +496,48 @@ describe('ConversationPane composition activation', () => {
     expect(log.querySelector('[data-testid="tool-detail-preview"]')?.textContent).toContain('export const rows = []')
   })
 
+  it('keeps failed command diagnostics behind the banner raw disclosure', async () => {
+    const diagnostic = '/tmp/example/ready-step-test.fixture\nTraceback (most recent call last):\n  File "/tmp/example/check.py", line 4\nAssertionError: expected ready state'
+    source.feed = { _tag: 'Observed', freshness: 'live', value: {
+      items: [scenario[0]!, { _tag: 'ToolCall', id: 'failed-run', callId: 'failed-call', name: 'run',
+        input: { command: 'python check.py', summary: 'Checking ready state' }, status: 'error', callSeen: true, at: at(1),
+        result: { content: diagnostic, isError: true, at: at(3) } }],
+      hasOlder: false, observation: { empty: false },
+    } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    const banner = container.querySelector<HTMLElement>('[data-error-overlay]')!
+    expect(banner.textContent).toContain('Command did not complete')
+    expect(banner.textContent).toContain('AssertionError: expected ready state')
+    expect(banner.textContent).not.toContain('/tmp/example')
+    expect(banner.textContent).not.toContain('Traceback')
+    const raw = [...banner.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Show raw input/output')!
+    expect(raw.getAttribute('aria-expanded')).toBe('false')
+    await act(async () => { raw.click() })
+    expect(banner.textContent).toContain(diagnostic)
+  })
+
+  it.each([
+    ['/tmp/example/ready-step-test.fixture\nPermissionError: cannot read /tmp/example/check.py', 'PermissionError: cannot read …/check.py'],
+    ['/tmp/example/ready-step-test.fixture', 'Tool failed; no readable reason was recorded.'],
+  ])('uses a readable failed tool reason instead of a path tail: %s', async (diagnostic, reason) => {
+    source.feed = { _tag: 'Observed', freshness: 'live', value: {
+      items: [scenario[0]!, { _tag: 'ToolCall', id: 'failed-run', callId: 'failed-call', name: 'run',
+        input: { command: 'check' }, status: 'error', callSeen: true, at: at(1),
+        result: { content: diagnostic, isError: true, at: at(3) } }],
+      hasOlder: false, observation: { empty: false },
+    } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    const fold = container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')!
+    await act(async () => { fold.click() })
+    const row = container.querySelector<HTMLElement>('[data-tool-status="error"]')!
+    const open = row.querySelector<HTMLButtonElement>('button')
+    if (open !== null) await act(async () => { open.click() })
+    expect(row.querySelector('[data-testid="tool-error-reason"]')?.textContent).toBe(reason)
+    expect(row.querySelector('pre')).toBeNull()
+  })
+
   it('keeps optimistic send state visible on its prompt', async () => {
     const pending: ConversationItem = { _tag: 'Text', id: 'p2', role: 'user', text: 'And verify the fix.', attachments: [], streaming: false, at: at(10), sendState: { _tag: 'Pending' } }
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [...scenario, pending], hasOlder: false, observation: { empty: false } } }

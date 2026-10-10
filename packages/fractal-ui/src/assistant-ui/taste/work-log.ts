@@ -46,6 +46,18 @@ const summarizeArgs = (input: unknown): string | undefined => {
   }
   return undefined
 }
+/** Prefer a named error over trace frames or path dumps; keep diagnostics out of the reason line. */
+export function errorReason(detail: string): string {
+  const lines = detail.split('\n').map(line => line.trim()).filter(line =>
+    line !== '' &&
+    !/^(?:Traceback\b|File ["']|at\s+\S+|[\^~]+$)/.test(line) &&
+    !/^["']?(?:[A-Za-z]:[\\/]|[~/\\]|\.{1,2}[\\/]|…[\\/])\S*["']?$/.test(line),
+  )
+  const reason = lines.find(line => /^(?:[\w.]+(?:Error|Exception)|error|fatal|failed|failure)\b/i.test(line)) ?? lines[0]
+  return reason === undefined ? 'Tool failed; no readable reason was recorded.' :
+    reason.replace(/(?:~|[A-Za-z]:)?(?:[\\/][^\s\\/:'"`]+){2,}[\\/]([^\s\\/:'"`]+)/g, '…/$1')
+}
+
 /** Selected workshop call projection; the host owns classification, lifecycle and timing. */
 export function workLogTurnFromItems(items: readonly ConversationItem[], facts: {
   readonly kindFor: (name: string) => WorkKind
