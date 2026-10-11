@@ -32,6 +32,8 @@ export type SidebarAgentRowProps = SidebarClock & {
   readonly onToggleChildren?: (ref: string) => void
   readonly inTree?: boolean
   readonly treeExpanded?: boolean
+  /** Nested navigation can spend its first line on the title without discarding time. */
+  readonly timePlacement?: 'column' | 'subtitle'
 }
 /** Fuzzy highlighting uses the upstream matcher, not a second search implementation. */
 export function Highlight({ value, query = '' }: { readonly value: string; readonly query?: string }) {
@@ -114,7 +116,7 @@ export function AgentHoverCard({ row, ...clock }: { readonly row: Row } & Sideba
     </dl>
   </div>
 }
-export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, variant = 'SR-2', layout = 'SR2-A', glyph = 'SG-1', extraSignals = defaultExtraSignals, discRefinement = 'G1', active = false, query = '', now, actions, onOpen, onMarkRead, onToggleChildren, inTree = false, treeExpanded }: SidebarAgentRowProps) {
+export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, variant = 'SR-2', layout = 'SR2-A', glyph = 'SG-1', extraSignals = defaultExtraSignals, discRefinement = 'G1', active = false, query = '', now, actions, onOpen, onMarkRead, onToggleChildren, inTree = false, treeExpanded, timePlacement = 'column' }: SidebarAgentRowProps) {
   const title = sidebarRowTitle(item)
   const host = item.host
   const metadata = React.useMemo(() => sidebarRowDescription(item), [item])
@@ -148,10 +150,13 @@ export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, varia
   const spendFields = item.usage._tag === 'Unknown' ? null : <span {...stylex.props(styles.metric)}><span data-row-field="total-usd" title={`${usageScope}: $${usd}`} aria-label={`${usageScope}: $${usd}`}>{spendCount.format(item.usage.usd)}</span><span data-row-field="total-tokens" data-line1-drop="tokens" title={`${usageScope}: ${tokens} tokens`} aria-label={`${usageScope}: ${tokens} tokens`}>{tokenCount.format(item.usage.tokens)}</span></span>
   const durationField = item.duration._tag === 'Unknown' ? null : <span data-row-field="total-duration"><SidebarDuration duration={item.duration} /></span>
   const lastTurnField = item.lastTurn._tag === 'Unknown' ? null : <span data-row-field="last-turn"><SidebarTime at={item.lastTurn.at} {...clock} kind={item.lastTurn.kind === 'turn-completed' ? 'turn' : 'activity'} compact /></span>
+  const subtitleTime = timePlacement === 'subtitle' && variant !== 'SR-1'
   const content = <>
     <span data-row-column="title" {...stylex.props(styles.title, variant === 'SR-2' && item.children.length > 0 && styles.hasChildren)} title={metadata}>{rowGlyph === 'SG-2' && <span {...stylex.props(styles.statusWord)}>{item.statusLabel}</span>}<span data-row-column="title-text" {...stylex.props(styles.name)}><Highlight value={title} query={query} /></span></span>
     {variant !== 'SR-1' && <SidebarRowSignals>
       {rowLayout === 'SR2-C' && <span data-row-field="status-label" data-row-retention="7" title={item.statusLabel}>{item.statusLabel}</span>}
+      {subtitleTime && rowLayout === 'SR2-A' && <span data-row-retention="6">{lastTurnField}</span>}
+      {subtitleTime && rowLayout === 'SR2-C' && <span data-row-retention="5">{spendFields}</span>}
       {extraSignals.includes('X-work') && item.description !== undefined && <span data-row-field="current-work" data-row-signal="X-work" data-row-retention="2" title={item.description}>{item.description}</span>}
       <span data-row-field="host" data-row-retention="3" title={`Host: ${host}`} aria-label={`Host ${host}`} aria-description={metadata}>{host}</span>
       {rowLayout === 'SR2-A' && <span data-row-retention="5">{spendFields}</span>}
@@ -164,10 +169,10 @@ export const SidebarAgentRow = React.memo(function SidebarAgentRow({ item, varia
   </>
   const rowStyle = stylex.props(styles.row)
   return <div ref={hoverLifetime} data-observation-freshness={item.freshness} data-wf-agent-ref={inTree ? undefined : item.ref} {...stylex.props(styles.wrapper)} onMouseEnter={() => { setRowHovered(true); prefetch(); hoverIntent(true) }} onMouseLeave={() => { setRowHovered(false); hoverIntent(false) } } onFocusCapture={() => { setRowHovered(true); prefetch(); hoverIntent(true) }} onBlurCapture={event => { if (!event.currentTarget.contains(event.relatedTarget)) { setRowHovered(false); hoverIntent(false) } }} onContextMenu={event => { event.preventDefault(); event.stopPropagation(); clearTimeout(hoverTimer.current); setHoverOpen(false); menuTrigger.current?.click() }} onKeyDown={event => { if (event.key === 'Escape') { clearTimeout(hoverTimer.current); setHoverOpen(false) }; if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) { event.preventDefault(); event.stopPropagation(); clearTimeout(hoverTimer.current); setHoverOpen(false); menuTrigger.current?.click() } }}>
-    <div ref={rowAnchor} data-testid="taste-agent-row" data-density={variant} data-layout={rowLayout} data-glyph={rowGlyph} data-disc-refinement={discRefinement} data-extra-signals={extraSignals.join(' ')} data-needs-me={item.needsMe} data-unknown-row-fields={[...(item.usage._tag === 'Unknown' ? ['total-usd', 'total-tokens'] : []), ...(item.duration._tag === 'Unknown' ? ['total-duration'] : []), ...(item.lastTurn._tag === 'Unknown' ? ['last-turn'] : []), ...(item.description === undefined ? ['current-work'] : [])].join(' ')} data-required-row-fields={variant === 'SR-2' ? 'true' : undefined} aria-description={metadata} {...stylex.props(styles.rowWrap, variant === 'SR-2' ? item.children.length === 0 ? styles.rowWrapLeaf : styles.rowWrapParent : undefined, styles[variant], active && styles.active)}>
+    <div ref={rowAnchor} data-testid="taste-agent-row" data-time-placement={subtitleTime ? 'subtitle' : 'column'} data-density={variant} data-layout={rowLayout} data-glyph={rowGlyph} data-disc-refinement={discRefinement} data-extra-signals={extraSignals.join(' ')} data-needs-me={item.needsMe} data-unknown-row-fields={[...(item.usage._tag === 'Unknown' ? ['total-usd', 'total-tokens'] : []), ...(item.duration._tag === 'Unknown' ? ['total-duration'] : []), ...(item.lastTurn._tag === 'Unknown' ? ['last-turn'] : []), ...(item.description === undefined ? ['current-work'] : [])].join(' ')} data-required-row-fields={variant === 'SR-2' ? 'true' : undefined} aria-description={metadata} {...stylex.props(styles.rowWrap, variant === 'SR-2' ? item.children.length === 0 ? styles.rowWrapLeaf : styles.rowWrapParent : undefined, subtitleTime && (item.children.length === 0 ? styles.rowWrapSubtitleTime : styles.rowWrapParentSubtitleTime), styles[variant], active && styles.active)}>
       <span data-row-column="status" data-row-field="status" {...stylex.props(styles.glyph)}><SidebarStatus status={item.status} statusLabel={item.statusLabel} statusSince={item.statusSince} now={clock.now} variant={rowGlyph} discRefinement={discRefinement} freshness={item.freshness} iconOnly /></span>
       <span data-row-trailing-signals {...stylex.props(styles.trailingSignals)}>{extraSignals.includes('X-unread') && (item.unread ?? 0) > 0 && <span data-row-signal="X-unread" aria-label={`${item.unread} unread`} {...stylex.props(styles.unread)}>{item.unread}</span>}{extraSignals.includes('X-needs') && item.needsMe && <span data-row-signal="X-needs" data-row-column="attention" title="Needs your attention" aria-label="Needs your attention" {...stylex.props(styles.needsYou)}>!</span>}</span>
-      <span data-row-column="time" data-quick-open={quickOpen ? 'true' : undefined} {...stylex.props(styles.statusTime, quickOpen && styles.timeCovered)}>{rowLayout === 'SR2-A' ? lastTurnField : rowLayout === 'SR2-C' ? spendFields : durationField}{quickOpen && <Button data-row-action="open" aria-label={`Open ${title}`} onPress={open} {...stylex.props(styles.quickOpen)}><Icon name="message" size={12} /></Button>}</span>
+      {!subtitleTime && <span data-row-column="time" data-quick-open={quickOpen ? 'true' : undefined} {...stylex.props(styles.statusTime, quickOpen && styles.timeCovered)}>{rowLayout === 'SR2-A' ? lastTurnField : rowLayout === 'SR2-C' ? spendFields : durationField}{quickOpen && <Button data-row-action="open" aria-label={`Open ${title}`} onPress={open} {...stylex.props(styles.quickOpen)}><Icon name="message" size={12} /></Button>}</span>}
       {/* The button's name is its visible content; React Aria drops aria-description, so reported facts describe it by reference. */}
       {inTree ? <div aria-current={active ? 'page' : undefined} aria-description={metadata} {...rowStyle}>{content}</div> : <><Button aria-describedby={descriptionId} aria-current={active ? 'page' : undefined} isDisabled={!canOpen} onPress={open} {...rowStyle}>{content}</Button><span id={descriptionId} hidden>{metadata}</span></>}
       <div {...stylex.props(styles.actions)}>
@@ -194,6 +199,9 @@ const styles = stylex.create({
   wrapper: { minWidth: 0, width: '100%', containerType: 'inline-size' },
   rowWrapLeaf: { gridTemplateColumns: `${g.icon} minmax(0, 1fr) 0px var(--sidebar-metric-track, ${g.sidebarMetric}) max-content` },
   rowWrapParent: { gridTemplateColumns: `${g.icon} minmax(0, 1fr) ${g.icon} var(--sidebar-metric-track, ${g.sidebarMetric}) max-content` },
+  // Preserve the grid/chevron/signal slots; only the otherwise empty time track disappears.
+  rowWrapSubtitleTime: { gridTemplateColumns: `${g.icon} minmax(0, 1fr) 0px 0px max-content` },
+  rowWrapParentSubtitleTime: { gridTemplateColumns: `${g.icon} minmax(0, 1fr) ${g.icon} 0px max-content` },
   // The row is the containing block for its visually hidden details trigger; without it the
   // absolutely positioned trigger escapes every scroll clip and extends the document.
   rowWrap: { position: 'relative', display: 'grid', gridTemplateColumns: `${g.icon} minmax(0, 1fr) ${g.controlSm} var(--sidebar-metric-track, ${g.sidebarMetric}) max-content`, alignContent: 'center', alignItems: 'center', columnGap: s.xs2, rowGap: s.xs2, minWidth: 0, width: '100%', boxSizing: 'border-box', paddingInline: s.sm, borderRadius: r.sm, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading, color: ink.fg, ':hover': { backgroundColor: surface.rowHover } },

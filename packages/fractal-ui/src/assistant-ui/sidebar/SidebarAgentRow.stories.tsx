@@ -133,6 +133,20 @@ export const QuickOpenAction: Story = { name: 'Row hover · quick Open', render:
   await expect(target.querySelector('[aria-current="page"]')).not.toBeNull()
 } }
 export const AllStates: Story = { render: () => <main {...stylex.props(styles.root)}><CardPair row={knownRow} /><CardPair row={unreportedRow} /><CohortList /></main> }
+export const AccessibleName: Story = {
+  name: 'Accessible name · subtitle time',
+  render: () => <main {...stylex.props(styles.root)}><div data-frame-rows {...stylex.props(styles.list)}><SidebarAgentRow item={knownRow} now={storyNow} variant="SR-2" timePlacement="subtitle" active /></div></main>,
+  play: async ({ canvasElement }) => {
+    const row = within(canvasElement).getByTestId('taste-agent-row')
+    const button = within(row).getByRole('button', { name: /^Sample session / })
+    await expect(button).toHaveAccessibleName(/^Sample session /)
+    await expect(button).not.toHaveAttribute('aria-label')
+    await expect(button).toHaveAccessibleDescription(/Working/)
+    await expect(row).toHaveAttribute('data-time-placement', 'subtitle')
+    await expect(row.querySelector('[data-row-column="time"]')).toBeNull()
+    await expect(button.querySelector('[data-row-field="last-turn"]')).not.toBeNull()
+  },
+}
 
 const styles = stylex.create({
   root: { height: '100vh', minHeight: 0, overflowY: 'auto', boxSizing: 'border-box', padding: s.lg, backgroundColor: surface.canvas, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading, display: 'flex', flexDirection: 'column', gap: s.xl },
