@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add an isolated message-thread coverage publication protocol fixture",
+  "replay": { "status": "none", "detail": "Only cfg(test) SQLite fixtures change; production replay is unchanged." },
+  "schema": { "status": "none", "detail": "Fixture tables and triggers exist only in an in-memory test connection; no production schema changes." },
+  "rules": { "status": "none", "detail": "No admission, checkpoint or fleet rule changes." },
+  "compatibility": { "status": "none", "detail": "No production route, wire response or thread source is installed." },
+  "downtime": { "status": "none", "detail": "No runtime change or service interruption." },
+  "manual": { "status": "none", "detail": "No operator action required." },
+  "recovery": { "status": "none", "detail": "No production state or recovery path changes." }
+}

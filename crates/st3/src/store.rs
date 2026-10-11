@@ -162,6 +162,8 @@ mod checkpoint_replication_capture_tests;
 mod convergence;
 #[cfg(test)]
 mod document_index_tests;
+#[cfg(test)]
+mod message_thread_coverage_contract_tests;
 mod lanes;
 mod operations;
 pub(crate) mod mission_ivm;
