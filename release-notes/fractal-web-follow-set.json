@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web adopts the fractal-ui follow set: a floating Scroll to end pill that hides on press intent and eases back to the growing transcript end (instant under prefers-reduced-motion), reader input cancels the return, and detached history keeps its anchor while content grows or shrinks above it. Bounded turns anchor their nested rows (tool status, thinking entries, work-log summaries) instead of the turn wrapper, and switching back to a conversation inside the app restores the reader's row by its item id. Sidebar rows omit attention and unread signals the runtime does not report. In fractal-ui, both scroll lanes offer Scroll to end only when detached more than 40 px; focus and input signals without movement preserve following, no-op explicit navigation preserves its mode, native focus navigation is measured against the observed scroll coordinate, virtual resize pins before paint and detached virtual history compensates growth or shrink above the reader, momentum reaching the end resumes following, and attached virtual lanes repin non-reader displacement even when a same-height acknowledgement does not trigger resize. Scroll to end hides on press intent and eases toward the growing live edge, yielding immediately to reader input; reduced motion skips or cancels that animation and settles the current end immediately.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only packages/fractal-ui and apps/fractal-web change. The restored row lives in memory for the page lifetime; no storage, protocol or wire-format change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

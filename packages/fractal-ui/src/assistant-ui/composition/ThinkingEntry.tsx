@@ -6,10 +6,10 @@ import { Markdown } from './Markdown'
 import { Icon } from './Icons'
 
 /** Muted reasoning disclosure: collapsed by default, streaming-aware, prose rendered through the shared Markdown seam. */
-export function ThinkingEntry({ text: value, streaming = false }: { text: string; streaming?: boolean }) {
+export function ThinkingEntry({ text: value, streaming = false, itemId }: { text: string; streaming?: boolean; itemId?: string }) {
   const [open, setOpen] = React.useState(false)
   const contentId = React.useId()
-  return <div data-testid="thinking-entry" data-streaming={streaming} {...stylex.props(styles.thinking)}>
+  return <div data-testid="thinking-entry" data-item-id={itemId} data-streaming={streaming} {...stylex.props(styles.thinking)}>
     <AriaButton aria-expanded={open} aria-controls={contentId} onPress={() => setOpen(value => !value)} {...stylex.props(styles.thinkingControl)}>
       <Icon name={streaming ? 'spinner' : open ? 'chevron-down' : 'chevron-right'} spinning={streaming} /><span>Thinking</span>
     </AriaButton>

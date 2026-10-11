@@ -3,8 +3,9 @@ import * as React from 'react'
 import type { Meta, StoryObj } from '@storybook/react-vite'
 import * as stylex from '@stylexjs/stylex'
 import { expect, userEvent, within } from 'storybook/test'
-import { AgentHoverCard, SidebarAgentRow } from './SidebarAgentRow'
+import { AgentHoverCard, AgentRowDetails, SidebarAgentRow } from './SidebarAgentRow'
 import type { SidebarAgentRow as Row } from './model'
+import { lightTheme } from '../composition-theme'
 import { spaceVars as s, surfaceVars as surface, textVars as ink, typeVars as t, geometryVars as g, borderVars as border, radiusVars as r, elevationVars as elevation } from '../composition-tokens.stylex'
 
 const storyNow = Date.UTC(2026, 9, 8, 12, 0, 0)
@@ -22,6 +23,8 @@ const knownRow: Row = {
 }
 /** Same identity, nothing reported beyond title, status, host and counts; every optional fact is omitted. */
 const unreportedRow: Row = { ...knownRow, ref: 'agent/unreported', id: 'unreported', title: 'Unreported session', usage: { _tag: 'Unknown' }, duration: { _tag: 'Unknown' }, lastTurn: { _tag: 'Unknown' }, description: undefined, model: undefined, harness: undefined, pullRequest: undefined, branch: undefined, worktree: undefined, terminal: undefined, mission: undefined, statusSince: undefined, lastActivityAt: undefined }
+/** Attention and unread counts never reported; model and branch reported without harness, worktree or pull request. */
+const uncountedRow: Row = { ...unreportedRow, ref: 'agent/uncounted', id: 'uncounted', title: 'Uncounted session', needsMe: undefined, unread: undefined, model: 'glm-5', branch: 'feat/rows' }
 /** Synthetic cohort: every second row carries no last-turn fact, so its time slot renders empty while the shared metric track keeps every title aligned. */
 const cohortRows: readonly Row[] = [
   { ...knownRow, ref: 'agent/first', id: 'first', title: 'First session' },
@@ -62,6 +65,26 @@ function QuickOpenCohort() {
   const select = React.useCallback((id: string) => setOpenedRef(`agent/${id}`), [])
   return <div data-frame-rows {...stylex.props(styles.list)}>{cohortRows.slice(0, 3).map(row => <SidebarAgentRow key={row.ref} item={row} now={storyNow} actions={{ select }} onOpen={open} active={openedRef === row.ref} />)}</div>
 }
+function DetailsPair({ row }: { readonly row: Row }) {
+  return <div data-testid={`details-${row.id}`} {...stylex.props(styles.spread)}>
+    <div data-frame-rows {...stylex.props(styles.list)}><SidebarAgentRow item={row} now={storyNow} extraSignals={['X-needs', 'X-unread', 'X-model', 'X-pr']} onOpen={() => undefined} /></div>
+    <div {...stylex.props(styles.aside)}><AgentRowDetails row={row} now={storyNow} /></div>
+  </div>
+}
+/** The open row button's description: its name is the visible content, reported facts arrive by `aria-describedby`. */
+const rowDescription = (pair: HTMLElement) => {
+  const button = pair.querySelector<HTMLElement>('[data-testid="taste-agent-row"] button[aria-describedby]')
+  return button === null ? null : pair.ownerDocument.getElementById(button.getAttribute('aria-describedby')!)?.textContent ?? null
+}
+/** Every rendered label, value, title, accessible name and description omits facts the source never reported. */
+async function assertCountsOmitted(pair: HTMLElement) {
+  const labels = [...pair.querySelectorAll('dt')].map(label => label.textContent)
+  for (const label of ['Needs you', 'Unread']) await expect(labels, `${label} rendered without a reported value`).not.toContain(label)
+  await expect(pair.textContent).not.toMatch(/unknown/i)
+  for (const element of pair.querySelectorAll('[title], [aria-label], [aria-description]')) await expect(['title', 'aria-label', 'aria-description'].map(name => element.getAttribute(name) ?? '').join(' ')).not.toMatch(/unknown|not reported/i)
+  await expect(rowDescription(pair), 'row description').toMatch(/^[^.]+ session\. .*Status: Working/)
+  await expect(rowDescription(pair)).not.toMatch(/unread|attention/i)
+}
 
 const meta = {
   title: 'Fractal UI/Sidebar/Agent Row',
@@ -77,6 +100,20 @@ export const HoverCardUnknown: Story = { name: 'Hover card · unreported fields 
   await expect(card.textContent).not.toMatch(/unknown|unavailable|—/i)
   for (const label of ['Spend', 'Duration', 'Last turn', 'Model', 'PR', 'Branch']) await expect(within(card).queryByText(label)).toBeNull()
 } }
+export const CountsUnreported: Story = { name: 'Details · attention and unread unreported', render: () => <main {...stylex.props(styles.root)}><DetailsPair row={uncountedRow} /><DetailsPair row={knownRow} /></main>, play: async ({ canvasElement }) => {
+  const canvas = within(canvasElement)
+  const uncounted = canvas.getByTestId('details-uncounted')
+  await assertCountsOmitted(uncounted)
+  await expect(within(uncounted).getByTitle('model: glm-5')).toBeInTheDocument()
+  await expect(within(uncounted).getByTitle('branch: feat/rows')).toBeInTheDocument()
+  // Control: reported counts render as pairs and in the row description, so the omission check must fail on them.
+  const known = canvas.getByTestId('details-sample')
+  const labels = [...known.querySelectorAll('dt')].map(label => label.textContent)
+  await expect(labels).toEqual(expect.arrayContaining(['Needs you', 'Unread']))
+  await expect(rowDescription(known)).toMatch(/Needs your attention\. Unread: 2\./)
+  await expect(assertCountsOmitted(known)).rejects.toThrow()
+} }
+export const CountsUnreportedLight: Story = { ...CountsUnreported, name: 'Details · attention and unread unreported (light)', render: () => <main {...stylex.props(styles.root, lightTheme)}><DetailsPair row={uncountedRow} /><DetailsPair row={knownRow} /></main> }
 export const TimeCohort: Story = { name: 'Time cohort · known vs none', render: () => <main {...stylex.props(styles.root)}><CohortList /></main>, play: async ({ canvasElement }) => {
   const rows = within(canvasElement).getAllByTestId('taste-agent-row')
   const child = rows.find(row => row.textContent?.includes('Check output'))!

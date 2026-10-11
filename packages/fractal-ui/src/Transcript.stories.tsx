@@ -349,6 +349,7 @@ export const AppendedItems: Story = { render: args => <AppendedItemsStory scheme
   await userEvent.click(thinkingControl)
   await expect(thinkingControl).toHaveAttribute('aria-expanded', 'true')
   const lane = canvas.getByTestId('transcript-scroll')
+  lane.dispatchEvent(new WheelEvent('wheel', { deltaY: -400 }))
   lane.scrollTop = 48
   lane.dispatchEvent(new Event('scroll'))
   const scrollTop = lane.scrollTop

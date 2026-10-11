@@ -97,13 +97,13 @@ function TranscriptPane({ turns, history, onOpenTool }: { turns: readonly Transc
   return <EmbraceRuntimeProvider options={options}><Transcript title="Row checks" turns={turns} sync={sync} now={now} observedAt={now - 8000} history={history} onOpenTool={onOpenTool} /></EmbraceRuntimeProvider>
 }
 
-function TranscriptBench({ turns: count, scheme, history, earlier = 0, onOpenTool }: { turns: number; scheme: Scheme; history?: TranscriptHistory; earlier?: number; onOpenTool?: TranscriptProps['onOpenTool'] }) {
+function TranscriptBench({ turns: count, scheme, history, earlier = 0, onOpenTool, initiallyMounted = true }: { turns: number; scheme: Scheme; history?: TranscriptHistory; earlier?: number; onOpenTool?: TranscriptProps['onOpenTool']; initiallyMounted?: boolean }) {
   // `earlier` older turns stay behind the history boundary until "Load earlier messages" prepends them.
   const series = benchTurns(count + earlier)
   const [loaded, setLoaded] = React.useState(false)
   const turns = React.useMemo(() => loaded ? series : series.slice(earlier), [series, loaded, earlier])
   const shownHistory: TranscriptHistory | undefined = earlier > 0 && !loaded ? { _tag: 'HasOlder', onLoadEarlier: () => setLoaded(true) } : history
-  const [mounted, setMounted] = React.useState(true)
+  const [mounted, setMounted] = React.useState(initiallyMounted)
   const attach = React.useCallback((pane: HTMLDivElement | null) => {
     if (pane === null) return
     let sampling = 0
@@ -210,6 +210,70 @@ export const FindMountsAllTurns: Story = { play: async ({ canvasElement }) => {
   window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true }))
   await expect(turnCount(canvasElement)).toBe(200)
   await expect(Math.abs(anchor.element.getBoundingClientRect().top - scroll.getBoundingClientRect().top - anchor.offset)).toBeLessThanOrEqual(1)
+} }
+/** Opening a long transcript must follow before paint and keep the first distant placeholders at their real heights. */
+export const InitialFollowWithoutLayoutShift: Story = { args: { turns: 50, initiallyMounted: false }, play: async ({ canvasElement, args }) => {
+  const root = canvasElement.querySelector<HTMLElement>('[data-testid="transcript-bench"]')!
+  const originalStyle = root.style.cssText
+  // A short host lane exposes a late initial follow even when every distant turn keeps its correct intrinsic size.
+  root.style.height = '400px'
+  root.style.width = '800px'
+  await frame()
+  await frame()
+  const shifts: number[] = []
+  const recordShifts = (entries: readonly PerformanceEntry[]) => {
+    for (const entry of entries) if ('value' in entry && typeof entry.value === 'number' && 'hadRecentInput' in entry && entry.hadRecentInput === false) shifts.push(entry.value)
+  }
+  const layout = new PerformanceObserver(list => recordShifts(list.getEntries()))
+  layout.observe({ type: 'layout-shift' })
+  const initial = new Map<Element, number>()
+  const observed = new Set<Element>()
+  const witness = new IntersectionObserver(entries => {
+    for (const entry of entries) if (!initial.has(entry.target)) initial.set(entry.target, entry.boundingClientRect.height)
+  })
+  let beforePaint: ResizeObserver | undefined
+  let prePaintFollowGap = 0
+  const mutations = new MutationObserver(() => {
+    const scroll = scroller(canvasElement)
+    if (beforePaint === undefined && scroll?.firstElementChild !== null && scroll?.firstElementChild !== undefined) {
+      // Register after the production observer: its settle callback must run before this pre-paint witness.
+      beforePaint = new ResizeObserver(() => {
+        if (turnCount(canvasElement) > 0) prePaintFollowGap = Math.max(prePaintFollowGap, followGap(scroll))
+      })
+      beforePaint.observe(scroll.firstElementChild)
+    }
+    for (const turn of canvasElement.querySelectorAll('[data-testid="transcript-turn"]')) if (!observed.has(turn)) {
+      observed.add(turn)
+      witness.observe(turn)
+    }
+  })
+  mutations.observe(canvasElement, { childList: true, subtree: true })
+  try {
+    window.__transcriptBench!.mount()
+    await settled(canvasElement, args.turns)
+    for (let index = 0; index < 8; index++) await frame()
+    const scroll = scroller(canvasElement)
+    const distant = [...initial.keys()].filter(turn => turn.hasAttribute('data-distant'))
+    await expect(initial.size).toBe(args.turns)
+    await expect(distant.length).toBeGreaterThan(0)
+    const skipped = distant.filter(turn => !turn.checkVisibility({ contentVisibilityAuto: true }))
+    await expect(skipped.length).toBeGreaterThan(0)
+    const drift = Math.max(...distant.map(turn => Math.abs(turn.getBoundingClientRect().height - initial.get(turn)!)))
+    recordShifts(layout.takeRecords())
+    const proof = { turns: args.turns, distantTurns: distant.length, skippedTurns: skipped.length, drift, viewportHeight: scroll.clientHeight, prePaintFollowGap, followGap: followGap(scroll), rawCls: shifts.reduce((total, value) => total + value, 0), shifts }
+    canvasElement.dataset.layoutProof = JSON.stringify(proof)
+    console.info('transcript-initial-follow-layout', proof)
+    await expect(drift).toBeLessThanOrEqual(1)
+    await expect(followGap(scroll)).toBeLessThanOrEqual(1)
+    await expect(prePaintFollowGap).toBeLessThanOrEqual(1)
+    await expect(proof.rawCls).toBeLessThanOrEqual(0.00001)
+  } finally {
+    mutations.disconnect()
+    witness.disconnect()
+    layout.disconnect()
+    beforePaint?.disconnect()
+    root.style.cssText = originalStyle
+  }
 } }
 const loadEarlier = fn()
 /** Reaching the top mounts the older turns at once; the history boundary above them still loads earlier history. */
