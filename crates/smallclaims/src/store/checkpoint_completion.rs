@@ -4,6 +4,30 @@
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+static RECLAIM_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_NATIVE_CALLS: AtomicU64 = AtomicU64::new(0);
+static RECLAIM_ELAPSED_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-lifetime totals for checkpoint allocator reclamation.
+#[derive(Clone, Copy, Debug)]
+pub struct AllocatorReclaimStats {
+    pub attempts: u64,
+    pub native_calls: u64,
+    pub elapsed: Duration,
+}
+
+/// Independently sampled monotonic totals; a concurrent completion may be reflected
+/// in one field before another. Reading these counters never calls the allocator.
+pub fn allocator_reclaim_stats() -> AllocatorReclaimStats {
+    AllocatorReclaimStats {
+        attempts: RECLAIM_ATTEMPTS.load(Ordering::Relaxed),
+        native_calls: RECLAIM_NATIVE_CALLS.load(Ordering::Relaxed),
+        elapsed: Duration::from_nanos(RECLAIM_ELAPSED_NANOS.load(Ordering::Relaxed)),
+    }
+}
 
 thread_local! {
     static COMPLETION: Cell<(usize, bool)> = const { Cell::new((0, false)) };
@@ -53,15 +77,19 @@ impl Drop for Completion {
 }
 
 fn reclaim_allocator() {
-    #[cfg(any(test, feature = "test-support"))]
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     platform_trim();
+    let elapsed = started.elapsed();
+    let native_calls = u64::from(cfg!(all(target_os = "linux", target_env = "gnu")));
+    RECLAIM_ELAPSED_NANOS.fetch_add(
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed,
+    );
+    RECLAIM_NATIVE_CALLS.fetch_add(native_calls, Ordering::Relaxed);
+    RECLAIM_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     #[cfg(any(test, feature = "test-support"))]
     RECLAIMS.with(|state| {
-        let (attempts, native_calls, elapsed) = state.get();
-        state.set((attempts + 1,
-            native_calls + u64::from(cfg!(all(target_os = "linux", target_env = "gnu"))),
-            elapsed + started.elapsed()));
+        let (attempts, calls, previous_elapsed) = state.get();
+        state.set((attempts + 1, calls + native_calls, previous_elapsed + elapsed));
     });
 }
 
@@ -78,8 +106,7 @@ use self::unsupported_platform_trim as platform_trim;
 #[cfg(any(test, not(all(target_os = "linux", target_env = "gnu"))))]
 fn unsupported_platform_trim() {}
 
-/// Attempts, actual glibc calls, and time spent reclaiming on this thread. No production
-/// timing or counters are installed unless the existing test-support feature is enabled.
+/// Thread-local test totals preserve isolation between concurrent completion proofs.
 #[cfg(any(test, feature = "test-support"))]
 pub(super) fn reclaim_stats() -> (u64, u64, std::time::Duration) {
     RECLAIMS.with(Cell::get)
@@ -88,6 +115,20 @@ pub(super) fn reclaim_stats() -> (u64, u64, std::time::Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_increases_production_reclaim_counters() {
+        let before = allocator_reclaim_stats();
+        { let _work = Completion::work(); }
+        let after = allocator_reclaim_stats();
+        assert!(after.attempts > before.attempts);
+        if cfg!(all(target_os = "linux", target_env = "gnu")) {
+            assert!(after.native_calls > before.native_calls);
+        } else {
+            assert_eq!(after.native_calls, 0);
+        }
+        assert!(after.elapsed > before.elapsed);
+    }
 
     #[test]
     fn nested_work_reclaims_once_after_the_outer_completion() {

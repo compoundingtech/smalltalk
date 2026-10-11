@@ -368,9 +368,10 @@ are never sampled.
 
 ### Metric naming and cardinality
 
-The repository-local st3 instrument namespace uses lowercase dot-separated names under
-`st3.`; HTTP instruments use the OpenTelemetry `http.server` namespace. Duration instruments
-end in `.duration` and use seconds. Depth, size, and age gauges describe saturation. Examples
+The repository-local st3 operation instrument namespace uses lowercase dot-separated names
+under `st3.`; process and allocator instruments use `st.process` and `st.allocator`.
+HTTP instruments use the OpenTelemetry `http.server` namespace. Duration instruments end
+in `.duration` and use seconds. Depth, size, and age gauges describe saturation. Examples
 are `http.server.request.duration`, `st3.writer.wait.duration`, and `st3.fifo.depth`.
 Do not append Prometheus `_total` or `_seconds` suffixes to these OTLP instrument names.
 
@@ -385,11 +386,51 @@ values map to `other`; routes are matched templates, not raw paths.
 | Reconcile `task` | `pass`, `deadline` |
 | Wake `cause`, FIFO `queue`, startup `phase`, replication `result` | Closed registries |
 | Replication `peer` | Fleet node membership |
+| Allocator heap `state` | `allocated`, `free`, `mmapped`, `arena`, `releasable` |
 
 The instrument/label cross-products must total at most 2,000 active series per daemon.
 An enumeration test checks the budget, including histogram expansion. Duration buckets are
 `0.001`, `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`,
 `30`, and `60` seconds.
+
+#### Daemon process and allocator memory
+
+The `st-daemon` SDK meter registers these instruments only when metrics export is enabled.
+The CLI, hooks, and replication worker do not register them. The SDK's periodic reader
+samples them at export time (60 seconds by default; the standard
+`OTEL_METRIC_EXPORT_INTERVAL` override applies). They share the existing resource and
+have no point attributes except the heap gauge's closed `state` vocabulary.
+
+| Instrument | Type | Unit | Source / attributes |
+| --- | --- | --- | --- |
+| `st.process.memory.rss` | Observable gauge | `By` | Linux `/proc/self/statm` resident pages × system page size; no attributes |
+| `st.allocator.heap` | Observable gauge | `By` | Linux glibc `mallinfo2`; `state` = `allocated`, `free`, `mmapped`, `arena`, `releasable` |
+| `st.allocator.reclaim.count` | Observable counter | `{attempt}` | Process-lifetime checkpoint reclamation attempts; no attributes |
+| `st.allocator.reclaim.duration` | Observable counter | `s` | Cumulative checkpoint reclamation elapsed time; no attributes |
+
+One heap callback takes one `mallinfo2` snapshot and emits all five states: `allocated`
+is `uordblks`, `free` is `fordblks`, `mmapped` is `hblkhd`, `arena` is the non-mmapped
+bytes obtained from the system, and `releasable` is `keepcost`. Compare `allocated` with
+`arena` and `free` to distinguish live non-mmapped allocations from retained free heap;
+mmapped allocations are reported separately. `keepcost` estimates the main arena's
+top-most releasable space, not all reclaimable pages across arenas. glibc 2.33 or newer
+is required. RSS is registered only on Linux, and the heap gauge only on Linux GNU
+targets; unsupported targets do not report fabricated memory values. An unreadable RSS
+sample is omitted.
+
+The smallclaims public `allocator_reclaim_stats()` accessor reads relaxed atomic totals
+for attempts, actual native trim calls, and cumulative elapsed time without calling the
+allocator. An attempt occurs when an armed outermost checkpoint completion scope drops;
+nested work triggers one attempt, and skipped work triggers none. The exported count
+is attempts (including no-op unsupported platforms), not trim successes. The existing
+thread-local test counters remain isolated from concurrent completion proofs.
+
+Proof: the completion-scope unit test checks production totals increase. The Linux GNU
+`otel_export` integration test captures positive `allocated` heap and RSS from an isolated
+daemon using `test_bin!("st3")`. The ignored `mallinfo2_fragmented_heap_cost` test measures
+101 snapshots after allocating and touching about 1 GiB in 4 KiB blocks and freeing
+alternate blocks; it reports median, p95, and maximum elapsed time without touching a
+live daemon.
 
 ### Attribute and context policy
 

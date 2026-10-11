@@ -219,6 +219,76 @@ fn duration_view(instrument: &Instrument) -> Option<Stream> {
         })
 }
 
+/// Process metrics belong only to the daemon and are sampled by the SDK reader.
+fn register_daemon_memory_metrics(provider: &SdkMeterProvider) {
+    use opentelemetry::metrics::MeterProvider as _;
+
+    let meter = provider.meter("st3");
+    #[cfg(target_os = "linux")]
+    meter
+        .u64_observable_gauge("st.process.memory.rss")
+        .with_description("Resident process memory from /proc/self/statm")
+        .with_unit("By")
+        .with_callback(|observer| {
+            if let Some(bytes) = linux_rss_bytes() {
+                observer.observe(bytes, &[]);
+            }
+        })
+        .build();
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    meter
+        .u64_observable_gauge("st.allocator.heap")
+        .with_description("glibc heap bytes by allocator state")
+        .with_unit("By")
+        .with_callback(|observer| {
+            // SAFETY: glibc >= 2.33 provides this thread-safe snapshot. It takes
+            // allocator arena locks but neither frees nor invalidates allocations.
+            let heap = unsafe { libc::mallinfo2() };
+            for (state, bytes) in [
+                ("allocated", heap.uordblks),
+                ("free", heap.fordblks),
+                ("mmapped", heap.hblkhd),
+                ("arena", heap.arena),
+                ("releasable", heap.keepcost),
+            ] {
+                observer.observe(bytes as u64, &[KeyValue::new("state", state)]);
+            }
+        })
+        .build();
+
+    meter
+        .u64_observable_counter("st.allocator.reclaim.count")
+        .with_description("Checkpoint allocator reclamation attempts")
+        .with_unit("{attempt}")
+        .with_callback(|observer| {
+            observer.observe(smallclaims::store::allocator_reclaim_stats().attempts, &[]);
+        })
+        .build();
+    meter
+        .f64_observable_counter("st.allocator.reclaim.duration")
+        .with_description("Cumulative time spent reclaiming checkpoint allocator memory")
+        .with_unit("s")
+        .with_callback(|observer| {
+            observer.observe(
+                smallclaims::store::allocator_reclaim_stats().elapsed.as_secs_f64(), &[],
+            );
+        })
+        .build();
+}
+
+#[cfg(target_os = "linux")]
+fn linux_rss_bytes() -> Option<u64> {
+    let mut buffer = [0_u8; 128];
+    let bytes = std::fs::File::open("/proc/self/statm").ok()?.read(&mut buffer).ok()?;
+    let pages = std::str::from_utf8(&buffer[..bytes]).ok()?
+        .split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    // SAFETY: sysconf reads the process's system configuration; this constant
+    // requires no pointer arguments. An unsupported/error return is not a sample.
+    let page_size = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
+    pages.checked_mul(page_size)
+}
+
 pub struct Telemetry {
     tracer_provider: Option<SdkTracerProvider>,
     meter_provider: Option<SdkMeterProvider>,
@@ -306,6 +376,9 @@ impl Telemetry {
                         .with_view(duration_view)
                         .with_resource(resource.clone())
                         .build();
+                    if matches!(unit, Unit::Daemon) {
+                        register_daemon_memory_metrics(&provider);
+                    }
                     opentelemetry::global::set_meter_provider(provider.clone());
                     telemetry.meter_provider = Some(provider);
                 }
@@ -634,5 +707,37 @@ mod tests {
                 assert_eq!(resource.get(&Key::new(key)), Some(Value::from(expected)));
             }
         }
+    }
+
+    /// Opt-in cost proof: ~1 GiB in small, touched allocations, with alternate
+    /// allocations freed so the arena retains fragmented free bins.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    #[ignore = "allocates a fragmented 1 GiB heap; run explicitly for allocator cost evidence"]
+    fn mallinfo2_fragmented_heap_cost() {
+        let mut allocations: Vec<_> = (0..262_144)
+            .map(|_| Some(vec![0x5a_u8; 4096].into_boxed_slice()))
+            .collect();
+        for allocation in allocations.iter_mut().step_by(2) {
+            *allocation = None;
+        }
+        std::hint::black_box(&allocations);
+        // SAFETY: mallinfo2 is a thread-safe, read-only glibc allocator snapshot.
+        let fragmented = unsafe { libc::mallinfo2() };
+        assert!(fragmented.arena >= 1_073_741_824);
+        assert!(fragmented.fordblks >= 500_000_000);
+        let mut samples = [std::time::Duration::ZERO; 101];
+        for sample in &mut samples {
+            let started = std::time::Instant::now();
+            // SAFETY: same read-only allocator snapshot as the production callback.
+            std::hint::black_box(unsafe { libc::mallinfo2() });
+            *sample = started.elapsed();
+        }
+        samples.sort_unstable();
+        println!(
+            "mallinfo2 fragmented heap: arena={} allocated={} free={} bytes; n={}; median={:?} p95={:?} max={:?}",
+            fragmented.arena, fragmented.uordblks, fragmented.fordblks,
+            samples.len(), samples[50], samples[95], samples[100],
+        );
     }
 }
