@@ -9,7 +9,8 @@ as tested hypotheses.
   resolve as an agent or service-principal mailbox for an ordinary
   `message reply`. Resolves by: specifying a real reply recipient with an
   end-to-end proof. Typed request retirement remains blocked until the
-  eval-owned external requester has that working path.
+  eval-owned external requester has that working path. See the staged gates
+  in [the retirement and ring-bound plan](./.experiments/2026-10-07-retirement-and-ring-bound-plan.md#typed-requestreply-retirement).
 - **DQ-S3 Ring bound and identity horizon.** `K = 128` is the implemented
   deduplication and conflicting-content-detection horizon, not merely a fast
   path: an evicted identity is accepted as new, without scanning inbox or
@@ -19,14 +20,16 @@ as tested hypotheses.
   being an event-identity index. What stays open is only the *value*: `128` is
   unmeasured. Resolves by: measuring real adapter emit rates and
   retry/rediscovery windows (CI transitions, builds, timer sources), then
-  keeping the bound, raising it, or choosing a different bounded index.
+  keeping the bound, raising it, or choosing a different bounded index. Use the
+  collection and replay protocol in [the plan](./.experiments/2026-10-07-retirement-and-ring-bound-plan.md#measure-the-stream-receipt-ring-bound-dq-s3-stream-r04r05).
 - **DQ-S4 Request absorption staging.** The typed request/reply envelopes
   (`request.rs`) are absorbed by events + ordinary replies (decision 0004),
   but its wire types carry `deny_unknown_fields` and its invariant row names
   live tests. Resolves by: a staged plan — land replacement proofs including
   the routable reply endpoint from DQ-S1, re-point the invariant row, retire
   the module behind a deprecation window; blocked until both the stream
-  implementation and that reply path are merged.
+  implementation and that reply path are merged. The required proof gates,
+  atomic invariant re-pointing, and release-length window are in [the plan](./.experiments/2026-10-07-retirement-and-ring-bound-plan.md#typed-requestreply-retirement).
 - **DQ-S5 Top-level shared streams.** One adapter feeding many agents
   (STREAM-T02). Must be defined as a generalization: a nested stream is a
   top-level stream whose owner and sole recipient is the enclosing agent.
