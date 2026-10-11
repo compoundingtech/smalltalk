@@ -43,6 +43,8 @@ or an RFC 3339 instant for reproducible relative times.
 For example, the sync canvas supports
 `?id=fractal-ui-scenarios-sync-line--explore&globals=scenario:failed-sync-socket-dropped&args=sync:socket-dropped;scheme:dark`.
 The sync controls also include `reconnected` and `subscription-limit-local`.
+Agent and conversation surfaces use socket vocabulary; follow subscriptions use request
+vocabulary, including the actual local subscription-limit failure.
 The elapsed-time control (`scenarioAt`) defaults to 10,000 ms, after the socket-drop and
 reconnection events. The preview wraps `withScenario` with this manual clock, so the provider
 and the component's observation time agree rather than inventing a transport status.
