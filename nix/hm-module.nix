@@ -8,6 +8,7 @@
 let
   inherit (lib) mkEnableOption mkIf mkOption types;
   cfg = config.services.smalltalk;
+  externallyManaged = cfg.binary.path != null;
   # Copy st3 itself: a symlinkJoin-only executable resolves current_exe() back to the
   # original package, whose bin/pty would still win when seats prepend that directory.
   effectivePackage =
@@ -26,13 +27,13 @@ let
       };
   # Keep the real executable with the daemon's per-user state: current_exe()
   # resolves store symlinks, but seats must watch one replaceable path across deploys.
-  binDir = "${cfg.stateDir}/bin";
-  executable = "${binDir}/st3";
+  binDir = if externallyManaged then builtins.dirOf cfg.binary.path else "${cfg.stateDir}/bin";
+  executable = if externallyManaged then cfg.binary.path else "${binDir}/st3";
   environment = cfg.environment // {
     # The Linux daemon asks the user manager to move PTY servers into their own scopes via busctl.
     PATH = binDir + ":" + lib.makeBinPath (
-      lib.optional (cfg.ptyPackage != null) cfg.ptyPackage
-      ++ [ effectivePackage ]
+      lib.optional (!externallyManaged && cfg.ptyPackage != null) cfg.ptyPackage
+      ++ lib.optional (!externallyManaged) effectivePackage
       ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.systemd
     ) + ":/usr/local/bin:/usr/bin:/bin";
     XDG_CONFIG_HOME = config.xdg.configHome;
@@ -46,7 +47,10 @@ let
     ++ lib.optionals (cfg.clientGatewaySocket != null) [ "--client-gateway-socket" cfg.clientGatewaySocket ]
     ++ lib.optionals (cfg.clientGatewaySocket == null && pkgs.stdenv.hostPlatform.isDarwin)
       [ "--client-gateway-socket" "${cfg.stateDir}/run/st3-client.sock" ]
-    ++ lib.optionals (cfg.ptyPackage != null) [ "--pty-binary" "${cfg.ptyPackage}/bin/pty" ]
+    ++ (if externallyManaged then
+      [ "--pty-binary" "${binDir}/pty" ]
+    else
+      lib.optionals (cfg.ptyPackage != null) [ "--pty-binary" "${cfg.ptyPackage}/bin/pty" ])
     ++ cfg.extraArgs;
   # systemd's command line parser is not a shell; escape its own substitutions too.
   systemdArg = arg:
@@ -74,6 +78,18 @@ in
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.st3;
       description = "The st3 package.";
     };
+    binary.path = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "/opt/smalltalk/bin/st3";
+      description = ''
+        Stable absolute executable path owned by an external deployer. When set,
+        Home Manager neither installs the st3 package nor copies its executable,
+        uses pty from the same directory instead of ptyPackage, and does not
+        restart the daemon on package changes. Null keeps Home Manager
+        responsible for installing and restarting st3.
+      '';
+    };
     person = mkOption {
       type = types.str;
       description = "The person identity used by st3 commands, for example person/ada.";
@@ -90,7 +106,7 @@ in
     ptyPackage = mkOption {
       type = types.nullOr types.package;
       default = null;
-      description = "PTY package used for both the daemon and spawned seats; null uses the bundled PTY.";
+      description = "PTY package used for both the daemon and spawned seats; null uses the bundled PTY. Ignored when binary.path is set, which uses pty beside that executable.";
     };
     environment = mkOption {
       type = types.attrsOf types.str;
@@ -130,8 +146,8 @@ in
   };
 
   config = mkIf cfg.enable {
-    home.packages = [ effectivePackage ];
-    home.activation.smalltalkBinary = lib.hm.dag.entryBetween
+    home.packages = lib.optional (!externallyManaged) effectivePackage;
+    home.activation.smalltalkBinary = mkIf (!externallyManaged) (lib.hm.dag.entryBetween
       [ (if pkgs.stdenv.hostPlatform.isLinux then "reloadSystemd" else "setupLaunchAgents") ]
       [ "writeBoundary" ] ''
         if [[ -n "''${DRY_RUN_CMD:-}" ]]; then
@@ -154,7 +170,7 @@ in
             ${pkgs.coreutils}/bin/ln -sfn st3 "$binDir/st"
           )
         fi
-      '';
+      '');
     xdg.configFile."st3/config.toml".text =
       "person = ${builtins.toJSON cfg.person}\n"
       + lib.optionalString (cfg.node != null) "node = ${builtins.toJSON cfg.node}\n"
@@ -168,7 +184,8 @@ in
         Unit = {
           Description = "st claims graph daemon";
           After = [ "network.target" ];
-          # ExecStart is stable; sd-switch still needs to restart on a new build.
+          # Only Home Manager-owned builds should trigger a daemon restart.
+        } // lib.optionalAttrs (!externallyManaged) {
           X-Restart-Triggers = [ effectivePackage ];
         };
         Service = {
@@ -223,9 +240,10 @@ in
           SoftResourceLimits.NumberOfFiles = 8192;
           StandardOutPath = "${cfg.stateDir}/logs/st3.stdout.log";
           StandardErrorPath = "${cfg.stateDir}/logs/st3.stderr.log";
-          # Home Manager reloads changed plists; retain a build reference even
-          # though ProgramArguments now points at the stable executable.
-          EnvironmentVariables = environment // { SMALLTALK_PACKAGE = toString effectivePackage; };
+          # Only Home Manager-owned builds should trigger a launchd reload.
+          EnvironmentVariables = environment // lib.optionalAttrs (!externallyManaged) {
+            SMALLTALK_PACKAGE = toString effectivePackage;
+          };
         };
       };
     } // lib.optionalAttrs (cfg.declarationsApply.enable && hasDeclarations) {

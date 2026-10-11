@@ -31,6 +31,8 @@ pub use writer_observer::WriterObserver;
 
 use crate::store::current_index;
 
+pub mod telemetry;
+
 /// Read connections a store keeps between reads; more open while more reads run at once.
 /// Each requests `read_cache_kib()` KiB of pages. Opening a connection also parses the database schema
 /// (`sqlite3Init`), which under the daemon's read pattern cost more CPU than the reads
@@ -331,6 +333,7 @@ pub struct WriterConnection {
     /// Tests read them; `st replication status` counts every commit.
     #[cfg_attr(not(test), allow(dead_code))]
     pub batches: Arc<(AtomicU64, AtomicU64)>,
+    fifo: Arc<crate::fifo::Queue>,
 }
 
 pub enum WriterJob {
@@ -341,6 +344,7 @@ pub enum WriterJob {
         profile: Option<crate::profile::Op>,
         /// When profiling, when its caller began to wait and who held the writer then.
         wait: Option<crate::profile::WriterWait>,
+        enqueued: std::time::Instant,
         done: std::sync::mpsc::SyncSender<Result<(), String>>,
     },
     /// Opt-in background queue notification. No SQL or connection is carried here.
@@ -352,11 +356,13 @@ pub enum WriterJob {
         through: u64,
         lent: std::sync::mpsc::SyncSender<Connection>,
         returned: std::sync::mpsc::Receiver<Connection>,
+        enqueued: std::time::Instant,
     },
     /// Hands the connection to a caller until its guard gives it back.
     Lend {
         lent: std::sync::mpsc::SyncSender<Connection>,
         returned: std::sync::mpsc::Receiver<Connection>,
+        enqueued: std::time::Instant,
     },
 }
 
@@ -423,6 +429,8 @@ impl WriterConnection {
         let finalized = finalizers.clone();
         let background = Arc::new(writer_queue::BackgroundAdmission::default());
         let background_queue = background.clone();
+        let fifo = crate::fifo::Queue::new(crate::fifo::Kind::Writer);
+        let observed_fifo = fifo.clone();
         let thread = std::thread::Builder::new()
             .name("st3-writer".into())
             .spawn(move || {
@@ -431,9 +439,9 @@ impl WriterConnection {
                     queue,
                     &index,
                     &counted,
-                    (&observed, &finalized),
-                    mutations.as_ref(),
+                    (&observed, &finalized, mutations.as_ref()),
                     background_queue,
+                    &observed_fifo,
                 )
             })
             .expect("the writer thread starts");
@@ -447,6 +455,7 @@ impl WriterConnection {
             handler_policy,
             mutation_observer,
             batches,
+            fifo,
         })
     }
 
@@ -503,13 +512,18 @@ impl WriterConnection {
     }
 
     pub fn send(&self, job: WriterJob) {
-        self.jobs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
+        let enqueued = match &job {
+            WriterJob::Batched { enqueued, .. } | WriterJob::Lend { enqueued, .. } | WriterJob::FenceLend { enqueued, .. } => Some(*enqueued),
+            WriterJob::BackgroundReady(_) => None,
+        };
+        let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let send = || jobs.as_ref()
             .expect("the writer queue is open while the store is")
-            .send(job)
-            .expect("the writer thread runs while the store is open");
+            .send(job);
+        match enqueued {
+            Some(enqueued) => self.fifo.send_at(enqueued, send),
+            None => send(),
+        }.expect("the writer thread runs while the store is open");
     }
 
     /// Borrow the foreground writer. Foreground jobs retain their arrival order and can
@@ -537,10 +551,11 @@ impl WriterConnection {
         let wait = crate::profile::writer_waiting();
         let (lent, lent_here) = std::sync::mpsc::sync_channel(1);
         let (give_back, returned) = std::sync::mpsc::sync_channel(1);
+        let enqueued = std::time::Instant::now();
         match class {
-            writer_queue::LoanClass::Foreground => self.send(WriterJob::Lend { lent, returned }),
+            writer_queue::LoanClass::Foreground => self.send(WriterJob::Lend { lent, returned, enqueued }),
             writer_queue::LoanClass::Background => {
-                self.enqueue_background(WriterJob::Lend { lent, returned });
+                self.enqueue_background(WriterJob::Lend { lent, returned, enqueued });
             }
             writer_queue::LoanClass::Fence => {
                 // Hold the admission lock while recording the barrier and enqueueing it.
@@ -552,23 +567,25 @@ impl WriterConnection {
                     .get()
                     .map_or(0, |queue| queue.watermark());
                 let job = if through == 0 {
-                    WriterJob::Lend { lent, returned }
+                    WriterJob::Lend { lent, returned, enqueued }
                 } else {
                     WriterJob::FenceLend {
                         through,
                         lent,
                         returned,
+                        enqueued,
                     }
                 };
-                jobs.as_ref()
+                self.fifo.send_at(enqueued, || jobs.as_ref()
                     .expect("the writer queue is open while the store is")
-                    .send(job)
+                    .send(job))
                     .expect("the writer thread runs while the store is open");
             }
         }
         let connection = lent_here
             .recv()
             .expect("the writer thread lends its connection");
+        telemetry::acknowledged(enqueued.elapsed(), false);
         WriterGuard {
             changes_at_lend: connection.total_changes(),
             connection: Some(connection),
@@ -592,7 +609,12 @@ impl WriterConnection {
         if self.background.closed.load(Ordering::Acquire) {
             queue.close();
         }
-        if queue.push(job) {
+        let WriterJob::Lend { enqueued, .. } = &job else {
+            unreachable!("only background loans use background admission")
+        };
+        let wake = self.fifo.send_at(*enqueued, || Ok::<_, std::convert::Infallible>(queue.push(job)))
+            .expect("background admission is infallible");
+        if wake {
             jobs.as_ref()
                 .expect("the writer queue is open while the store is")
                 .send(WriterJob::BackgroundReady(queue.clone()))
@@ -644,15 +666,18 @@ impl WriterConnection {
         let run: Box<dyn FnOnce(&Transaction<'_>) -> bool + Send + 'static> =
             unsafe { std::mem::transmute(run) };
         let (done, done_here) = std::sync::mpsc::sync_channel(1);
+        let enqueued = std::time::Instant::now();
         self.send(WriterJob::Batched {
             run,
             profile: crate::profile::current(),
             wait: crate::profile::writer_waiting(),
             done,
+            enqueued,
         });
         let committed = done_here
             .recv()
             .unwrap_or_else(|_| Err("the writer thread stopped".into()));
+        telemetry::acknowledged(enqueued.elapsed(), true);
         let result = outcome.into_inner().unwrap_or_else(PoisonError::into_inner);
         match (result, committed) {
             (Some(Err(panic)), _) => std::panic::resume_unwind(panic),
@@ -707,14 +732,16 @@ fn write_queue(
     queue: std::sync::mpsc::Receiver<WriterJob>,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
-    callbacks: (&CommitObservers, &TransactionFinalizers),
-    mutation_observer: Option<&Arc<writer_observer::MutationState>>,
+    callbacks: (&CommitObservers, &TransactionFinalizers, Option<&Arc<writer_observer::MutationState>>),
     background: Arc<writer_queue::BackgroundAdmission>,
+    fifo: &Arc<crate::fifo::Queue>,
 ) {
-    let mut admission = writer_queue::Admission::new(queue, background);
+    let mut admission = fifo.receiver(writer_queue::Admission::new(queue, background));
     while let Some(job) = admission.next() {
         match job {
-            WriterJob::Lend { lent, returned } | WriterJob::FenceLend { lent, returned, .. } => {
+            WriterJob::Lend { lent, returned, enqueued } | WriterJob::FenceLend { lent, returned, enqueued, .. } => {
+                fifo.dequeued_at(enqueued);
+                telemetry::METRICS.queue.record(enqueued.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
                 let _hold = crate::windows::Timer::start(crate::windows::StoreWork::WriterHold);
                 if let Err(std::sync::mpsc::SendError(back)) = lent.send(connection) {
                     connection = back;
@@ -734,7 +761,7 @@ fn write_queue(
                     committed_index,
                     batches,
                     callbacks,
-                    mutation_observer,
+                    fifo,
                 );
                 admission.put_back(next);
             }
@@ -752,10 +779,18 @@ fn run_write_batch(
     queue: &std::sync::mpsc::Receiver<WriterJob>,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
-    callbacks: (&CommitObservers, &TransactionFinalizers),
-    mutation_observer: Option<&Arc<writer_observer::MutationState>>,
+    callbacks: (
+        &CommitObservers,
+        &TransactionFinalizers,
+        Option<&Arc<writer_observer::MutationState>>,
+    ),
+    fifo: &crate::fifo::Queue,
 ) -> Option<WriterJob> {
-    let (observers, finalizers) = callbacks;
+    let (observers, finalizers, mutation_observer) = callbacks;
+    if let WriterJob::Batched { enqueued, .. } = &first {
+        fifo.dequeued_at(*enqueued);
+        telemetry::METRICS.queue.record(enqueued.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
+    }
     let started = std::time::Instant::now();
     let _hold = crate::windows::Timer::start(crate::windows::StoreWork::WriterHold);
     let transaction_timer = crate::windows::Timer::start(crate::windows::StoreWork::WriteTransaction);
@@ -776,11 +811,16 @@ fn run_write_batch(
             profile,
             wait,
             done,
+            enqueued,
         } = current
         else {
             lend = Some(current);
             break;
         };
+        if !answers.is_empty() {
+            fifo.dequeued_at(enqueued);
+            telemetry::METRICS.queue.record(enqueued.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
+        }
         match (&transaction, &failure) {
             (Some(transaction), None) => {
                 // The caller's operation waited until now, holds the writer while its write
@@ -813,9 +853,18 @@ fn run_write_batch(
     batches.0.fetch_add(1, Ordering::Relaxed);
     batches.1.fetch_add(answers.len() as u64, Ordering::Relaxed);
     let committed = match (transaction, failure) {
-        (Some(transaction), None) => finalizers
-            .run(&transaction)
-            .and_then(|()| transaction.commit().map_err(anyhow::Error::from)),
+        (Some(transaction), None) => {
+            finalizers.run(&transaction).and_then(|()| {
+                let commit_started = std::time::Instant::now();
+                let result = transaction.commit().map_err(anyhow::Error::from);
+                // Only a COMMIT that landed is a commit-latency sample. A failed one answers its
+                // batch with the error; the batch histogram still records that batch's duration.
+                if result.is_ok() {
+                    telemetry::METRICS.commit.record(commit_started.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
+                }
+                result
+            })
+        }
         // Dropping the transaction rolls back every write in the batch.
         (_, Some(error)) => Err(error),
         (None, None) => unreachable!("a batch without a transaction failed to begin"),
@@ -825,6 +874,8 @@ fn run_write_batch(
     if committed.is_ok() {
         crate::profile::managed_commit_succeeded();
     }
+    telemetry::METRICS.batch.record(started.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
+    telemetry::METRICS.batch_size.record(answers.len() as u64, telemetry::SQLITE.as_slice());
     if let Ok(index) = current_index(connection) {
         committed_index.store(index, Ordering::Release);
     }
@@ -909,7 +960,7 @@ impl Drop for WriterGuard<'_> {
 /// waiting while holding another loan or snapshot can create a dependency cycle.
 /// Within a request or pinned snapshot, raw reads reuse that thread's connection.
 pub struct ReadPool {
-    pub idle: Mutex<Vec<ReadConnection>>,
+    pub idle: Arc<Mutex<Vec<ReadConnection>>>,
     /// Wakes a read waiting for an idle connection, which happens only when the operating system
     /// refuses another one, for example past the open file limit.
     pub returned: Condvar,
@@ -1123,7 +1174,7 @@ impl Drop for PinnedRead<'_> {
 impl ReadPool {
     pub fn new(path: &Path, shared_memory: bool) -> Result<Self> {
         let pool = Self {
-            idle: Mutex::new(Vec::new()),
+            idle: Arc::new(Mutex::new(Vec::new())),
             returned: Condvar::new(),
             path: path.to_path_buf(),
             shared_memory,
@@ -1134,6 +1185,7 @@ impl ReadPool {
         // Open one now, so a store that cannot be read fails to open.
         let connection = pool.open_connection()?;
         pool.release(connection);
+        telemetry::register_pool(&pool);
         Ok(pool)
     }
 
@@ -1157,6 +1209,7 @@ impl ReadPool {
         let open = self.counts.open.fetch_add(1, Ordering::Relaxed) + 1;
         self.counts.peak.fetch_max(open, Ordering::Relaxed);
         let id = self.counts.opened.fetch_add(1, Ordering::Relaxed) + 1;
+        telemetry::METRICS.readers_opened.add(1, telemetry::SQLITE.as_slice());
         Ok(ReadConnection {
             id,
             connection,
@@ -1392,9 +1445,11 @@ impl ReadPool {
                 }
                 Err(error) => {
                     eprintln!("st3: open another read connection: {error:#}; waiting for one");
+                    let wait_started = std::time::Instant::now();
                     let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
                     loop {
                         if let Some(connection) = idle.pop() {
+                            telemetry::read_waited(wait_started.elapsed());
                             break connection;
                         }
                         idle = self
@@ -2029,6 +2084,50 @@ mod tests {
 
 
     #[test]
+    fn otel_writer_taken_job_is_not_backlog_while_transaction_waits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("blocked.sqlite3");
+        let mut blocker = Connection::open(&path).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let transaction = blocker.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let fifo = crate::fifo::Queue::enabled_for_test();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut answers = Vec::new();
+        for expected_depth in [1, 0] {
+            let observed = fifo.clone();
+            let (done, answer) = std::sync::mpsc::sync_channel(1);
+            let enqueued = std::time::Instant::now();
+            fifo.send_at(enqueued, || sender.send(WriterJob::Batched {
+                run: Box::new(move |_| {
+                    assert_eq!(observed.depth_for_test(), expected_depth);
+                    true
+                }),
+                profile: None, wait: None, enqueued, done,
+            })).unwrap();
+            answers.push(answer);
+        }
+        let observed = fifo.clone();
+        let thread = std::thread::spawn(move || {
+            write_queue(writer, receiver, &AtomicU64::new(0),
+                &(AtomicU64::new(0), AtomicU64::new(0)),
+                (&CommitObservers::default(), &TransactionFinalizers::default(), None),
+                Arc::new(writer_queue::BackgroundAdmission::default()), &observed);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while fifo.depth_for_test() == 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(fifo.depth_for_test(), 1, "the first job is processing, only the later job is backlog");
+        assert!(matches!(answers[0].try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        transaction.commit().unwrap();
+        drop(sender);
+        thread.join().unwrap();
+        for answer in answers { answer.recv().unwrap().unwrap(); }
+        assert_eq!(fifo.depth_for_test(), 0);
+    }
+
+    #[test]
     fn repeated_bursts_of_reads_reuse_connections_instead_of_opening_new_ones() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.sqlite3");
@@ -2144,6 +2243,7 @@ mod commit_observer_tests {
     fn queued_claim(writer: &WriterConnection) -> mpsc::Receiver<Result<(), String>> {
         let (done, answer) = mpsc::sync_channel(1);
         writer.send(WriterJob::Batched {
+            enqueued: std::time::Instant::now(),
             run: Box::new(|transaction| {
                 transaction
                     .execute("INSERT INTO claims(authority) VALUES (1)", [])

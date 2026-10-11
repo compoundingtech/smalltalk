@@ -360,8 +360,10 @@ sampled caller. It keeps a deterministic trace-id ratio of 1% of the remaining t
 
 The sampled-caller signal is `st.parent.sampled`: because st3 exports every span with
 AlwaysOn, every exported span carries the sampled flag, and the collector cannot recover the
-caller's decision from trace flags. Server root spans set `st.parent.sampled` to the remote
-parent's sampled flag whenever a remote parent exists; the collector policy keys on that
+caller's decision from trace flags. Server spans set `st.parent.sampled=true` only when
+the remote parent is sampled and its tracestate has no `st` key. st's own clients mark
+collector-owned sampling with `st=c`; their AlwaysOn flag must not force the collector to
+keep every trace. Unsampled or st-marked parents record false; a missing parent records no
 attribute. The decision wait must be long enough for the daemon's SDK batch delay and
 delivery of the completed root and its spans. RED metrics are exported independently and
 are never sampled.
@@ -400,9 +402,8 @@ Upgrade handlers accept absent telemetry context: an unset exporter never change
 handshake authorization or first-frame delivery.
 
 The server extracts W3C `traceparent` and `tracestate` from HTTP request and WebSocket
-upgrade headers and uses the extracted context as the parent. When a remote parent exists,
-the server root span records its sampled flag as the boolean `st.parent.sampled` attribute.
-The collector sampling policy uses that attribute; the process exports every span.
+upgrade headers and uses the extracted context as the parent. The sampled-caller signal
+follows the collector sampling policy above; the process exports every span.
 
 ### Subscription first frames and slow-path roots
 
@@ -545,10 +546,11 @@ is span-only and never a metric label or `span.label`.
 
 ### Metric naming and cardinality
 
-The repository-local st3 instrument namespace uses lowercase dot-separated names under
-`st3.`; HTTP instruments use the OpenTelemetry `http.server` namespace. Duration instruments
-end in `.duration` and use seconds. Depth, size, and age gauges describe saturation. Examples
-are `http.server.request.duration`, `st3.writer.wait.duration`, and `st3.fifo.depth`.
+The repository-local st3 instrument namespace uses lowercase dot-separated names:
+daemon work and storage instruments use `st.`, while HTTP and database client
+instruments use the OpenTelemetry `http.server` and `db.client` namespaces.
+Duration instruments use seconds. Depth, size, and age gauges describe saturation.
+Examples are `http.server.request.duration`, `st.db.writer.queue.duration`, and `st.fifo.depth`.
 Do not append Prometheus `_total` or `_seconds` suffixes to these OTLP instrument names.
 
 Label vocabularies are closed enums or bounded fleet membership. Unknown user-provided
@@ -595,6 +597,270 @@ Duration buckets are
 `0.001`, `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`,
 `30`, and `60` seconds.
 
+### Storage telemetry (O11Y-R14, O11Y-R18)
+
+| Instrument | Type | Unit | Additional attributes / meaning |
+| --- | --- | --- | --- |
+| `db.client.operation.duration` | Histogram | `s` | `db.operation.name=write.batched` or `write.lend`; writer enqueue through ACK |
+| `st.db.writer.queue.duration` | Histogram | `s` | —; enqueue through writer dequeue |
+| `st.db.writer.batch.size` | Histogram | `{job}` | —; jobs in a writer batch |
+| `st.db.writer.commit.duration` | Histogram | `s` | —; writer commit duration |
+| `st.db.writer.batch.duration` | Histogram | `s` | —; whole writer batch duration |
+| `db.client.connection.wait_time` | Histogram | `s` | `db.operation.name=read`; reader checkout wait |
+| `st.db.readers.open` | Observable gauge | `{connection}` | —; current open readers |
+| `st.db.readers.idle` | Observable gauge | `{connection}` | —; current idle readers |
+| `st.db.readers.opened` | Counter | `{connection}` | —; readers opened |
+| `st.db.wal.size` | Observable gauge | `By` | —; stat the main database's `-wal` file |
+| `st.db.wal.checkpoint.duration` | Histogram | `s` | `db.operation.name=checkpoint.truncate`; truncate checkpoint duration |
+
+Every storage metric carries `db.system.name=sqlite`. These are the complete attribute
+sets: at most two combinations per instrument, with no paths, SQL, ids, or other
+unbounded attributes. Duration histograms use the seconds buckets above; batch size uses
+explicit boundaries `1`, `2`, `4`, `8`, `16`, `32`, `64`, `128`, `256`.
+Storage metrics are not sampled.
+
+A scoped thread-local `Option<Arc<WriterWait>>` shares a request accumulator across
+handler, store, action, and API blocking sections. Two relaxed atomics sum writer ACK
+wait in nanoseconds and count writer operations. Outer handler completion records
+`st.writer.wait_ms` (total ACK wait converted to milliseconds) and `st.writer.ops`
+(operation count) on the existing SERVER request span. Each scope restores the previous
+accumulator, including nested blocking sections; writer calls do not create child spans
+or perform per-operation span-context lookup. This preserves the single-span request
+shape and adds no in-process sampling.
+
+### Reconciler and FIFO telemetry (O11Y-R10, O11Y-R11, O11Y-R14, O11Y-R16, O11Y-R18)
+
+```text
+wake source → last recorded cause + coalesced Notify
+                                  ↓ next outer wake
+                     st.reconcile_pass / st.reconcile_deadline
+                                  ↓ stabilization passes
+                             cause=continuation
+
+successful serialized channel send → FIFO enqueue Instant
+real item received                 → remove oldest Instant before processing
+SDK collection                     → sum live depths / max live oldest age
+```
+
+`st.reconcile_pass` and `st.reconcile_deadline` are independent root spans:
+each uses `parent: None` and an empty OpenTelemetry parent context, so neither
+inherits an ambient request or worker span. Their `span.label` values are
+`pass` and `deadline`, respectively. `st.reconcile.items` records the desired
+subject count on the span only; it is not a metric attribute. Errors set span
+status to `ERROR`. These roots have no child or per-item spans and no local
+sampling.
+
+`st.reconcile.wake_cause` uses the following closed, case-sensitive snake_case identifiers.
+The metric's `cause` attribute uses the same registry:
+
+| Wake cause |
+| --- |
+| `api` |
+| `replication_receive` |
+| `deadline` |
+| `timer_restart` |
+| `timer_step_timeout` |
+| `timer_resume_verification` |
+| `timer_gate_timeout` |
+| `timer_gate_recheck` |
+| `timer_gate` |
+| `timer_gate_poll` |
+| `timer_llm_gate` |
+| `file_watch` |
+| `reconciler` |
+| `recorder_receipts` |
+| `startup` |
+| `continuation` |
+| `other` |
+
+Notify coalesces wake requests, not an event backlog. The last recorded wake
+cause is consumed on the next outer wake; subsequent stabilization passes use
+`continuation`. Deadline inspection uses the previous outer wake cause, or
+`startup` for the first check. A direct one-shot pass or deadline uses `other`,
+as does an unknown source. These exported labels do not replace the existing
+in-memory wake labels used by `/v1/performance` and `doctor`; request/detail
+attribution also remains unchanged.
+
+| Instrument | Type | Unit | Complete attribute set |
+| --- | --- | --- | --- |
+| `st.reconcile.pass.duration` | Histogram | `s` | `task=pass` or `task=deadline` |
+| `st.reconcile.wakes` | Counter | `{wake}` | `cause` from the 17-value wake registry |
+| `st.fifo.depth` | Observable u64 gauge | `{item}` | `queue=writer`, `conversation`, or `terminal_emulation` |
+| `st.fifo.oldest_age` | Observable f64 gauge | `s` | `queue=writer`, `conversation`, or `terminal_emulation` |
+
+Every metric attribute is a constant closed value, never an identity.
+These instruments contribute at most `17 + 2 + 3 + 3 = 25` attribute series;
+histogram bucket count is separate. Duration uses the seconds buckets above,
+and metrics are independent of trace sampling.
+
+FIFO gauges describe only pending items in these in-process channels:
+
+| `queue` | Channel and pending-item boundary |
+| --- | --- |
+| `writer` | Unbounded `std::sync::mpsc` writer channel; arrival-order batching and database lending preserve the channel's order |
+| `conversation` | Unbounded WebSocket conversation channel per collection |
+| `terminal_emulation` | Process-singleton unbounded job channel; pending jobs only, not emulation jobs already running |
+
+`smallclaims::fifo` owns shared queue tracking. Each live channel owns an
+`Arc<Queue>`; the registry retains only weak references, so dropping the queue
+ends its observation. `Queue::send` serializes actual enqueue and successful
+enqueue timestamp insertion under one mutex. A failed send adds no timestamp.
+The receiver removes the oldest timestamp before processing the item. A writer
+lending job prefetched behind a batch remains pending until the batch commits
+and the connection is lent. Timestamps are `Instant` values; writer age reuses
+the job's existing enqueue timestamp.
+
+Gauges sample only at SDK collection: for each queue kind, depth is the sum
+across live queue instances and oldest age is the maximum age across those
+instances. Empty or absent queues report zero for both gauges. Collection
+reads only tracker timestamps under their mutexes, never graph, database, or
+file state. Tracking is a no-op without daemon OpenTelemetry initialization.
+
+Excluded from FIFO telemetry are coalesced Notify/watch states, caches,
+durable inbox and seat queues, driver-side mailbox `Subscription` queues, and
+ping sidecar queues.
+
+### Daemon startup telemetry (O11Y-R10, O11Y-R11, O11Y-R14, O11Y-R16, O11Y-R18)
+
+```text
+node_identity::acquire → resolve stable node before telemetry initialization
+Telemetry::init        → st.startup (local root, start backdated to acquisition)
+                         └── st.startup.phase (one per phase, no chunk spans)
+serving()     → close phase and root; batch export while the API serves
+early return  → close phase and root with failed outcome and ERROR
+```
+
+`startup_telemetry::StartupTelemetry` starts after node identity acquisition and
+telemetry initialization, with an explicit root start timestamp measured before acquisition.
+The completed `node_identity` child uses acquisition's measured start and end.
+Successful initialization uses the resolved stable node in the telemetry resource;
+acquisition failure uses the configured node, closes the failed root and phase, flushes
+telemetry, and returns the original error. Acquisition runs only once.
+The root uses `parent: None` and an empty OpenTelemetry parent context.
+`st.startup.outcome` is `serving` or `failed`; failure status uses the constant
+description `startup failed`, not error prose or paths. `span.label` is `startup`.
+Readiness closes both the last phase and the root without an explicit flush.
+The collector retains local roots longer than one second, so slow starts are
+kept. Startup has no local sampling.
+
+The repository-owned phase registry maps the existing kebab-case startup names
+to these closed snake_case values, shared by `st.startup.phase`, `span.label`,
+and the duration metric's `phase` attribute:
+
+| Phase |
+| --- |
+| `node_identity` |
+| `install_hooks` |
+| `open_store` |
+| `judge_claims` |
+| `validate_replication_backlog` |
+| `apply_replication_repairs` |
+| `settle_runs` |
+| `project_replication_backlog` |
+| `initialize_runtime` |
+| `start_services` |
+| `bind_listeners` |
+| `other` (unknown-name fallback) |
+
+Except for the retrospectively recorded `node_identity` phase, each phase starts
+at its readiness transition and ends at the next phase or readiness/failure.
+The active phase receives ERROR on failure. Existing `profile::task` boundaries remain unchanged inside
+their phase; no entered tracing guard crosses an await or enters spawned
+services. `start_services` covers background-service setup before listener binding.
+The projection phase records integer `st.startup.claims_processed` and boolean
+`st.startup.full_replay`. Incremental progress counts actual committed claims,
+not store-index distance; full replay reports base-claim progress from the runtime.
+These numeric/boolean observations are span-only, never metric labels.
+
+`st.startup.duration` is a seconds histogram, recorded once per phase and once
+with `phase=total` per start, including failed starts. Its explicit boundaries
+are `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`,
+`30`, `60`, `120`, `300`, `600`, `1200`, `1800`. The metric contributes at most
+13 attribute series and is independent of trace sampling.
+
+The otelite receiver proof observes the completed serving root before stopping
+the daemon, eleven direct child phase spans, projection attributes, and duration
+points for `total`, `node_identity`, and `open_store`. The root starts at or before
+the identity phase. A database path occupied by a directory proves identity recovery
+failure exports `failed` with ERROR on the root and phase; a readable database with
+an unsupported schema version proves the separate `open_store` failure.
+Unit proofs cover all call-site phase mappings, explicit acquisition timestamps,
+and root completion on serving or guard drop.
+
+### Replication worker telemetry (O11Y-R10, O11Y-R11, O11Y-R14, O11Y-R16, O11Y-R18)
+
+```text
+exchange(peer) → st.replication.round (detached root, one per exchange call)
+heal(peer)     → st.replication.heal  (detached root, one per heal call)
+```
+
+Both roots use the OpenTelemetry API's `start_with_context` with an empty
+parent context. smallclaims depends on the OTel API only; st3 owns providers.
+A heal does not inherit the round, and neither inherits an ambient daemon or
+worker span. `span.label` is the bounded operation `round` or `heal`.
+Span fields use the `st.replication.*` prefix. The round records `peer`,
+`outcome=moved|in_sync|failed|cancelled`, integer `moved_envelopes`, and boolean
+`heal_due`. `moved` follows the exchange's existing progress result,
+including checkpoint adoption; it need not imply a nonzero envelope count.
+Envelope counts sum locally stored pulls and successful pushes whose peer
+inventory changed; push counts are sent batch sizes, not remote receipt counts.
+The heal records `peer`, integer `questions`, and
+`outcome=repaired|unchanged|failed|cancelled`. A heal is repaired when its graph matches
+after refetch, push, or replay; a matching graph without these changes is
+unchanged, and an unresolved, exhausted, or errored heal is failed.
+Failed operations set status `ERROR`
+without exporting raw error prose. There are no per-POST or per-question
+spans and no in-process sampling.
+Dropping an unfinished round or heal, including a dialer aborted after target
+removal, finalizes it as `cancelled` with unset status, not `ERROR`. Explicit
+completion and Drop consume the same recording, so counters and durations
+are recorded once; cancellation does not itself increment the error counter.
+
+| Instrument | Type | Unit | Complete attribute set |
+| --- | --- | --- | --- |
+| `st.replication.rounds` | Counter | `{round}` | `peer`, `outcome=moved|in_sync|failed|cancelled` |
+| `st.replication.round.duration` | Histogram | `s` | `peer`, `outcome=moved|in_sync|failed|cancelled` |
+| `st.replication.batch.size` | Histogram | `{envelope}` | `peer`, `direction=pull|push` |
+| `st.replication.errors` | Counter | `{error}` | `peer`, `reason=down|overloaded|auth_failed|refused|removed|timeout|invalid|other` |
+| `st.replication.heals` | Counter | `{heal}` | `peer`, `outcome=repaired|unchanged|failed|cancelled` |
+| `st.replication.heal.duration` | Histogram | `s` | `peer`, `outcome=repaired|unchanged|failed|cancelled` |
+
+Durations cover the whole call, including failed and cancelled calls, and use the seconds
+buckets above. Pull batch sizes are locally stored envelopes; push sizes are
+successfully sent envelopes. Neither counts signatures or claims.
+`peer` is bounded by fleet members plus explicitly
+configured/bootstrap peers; it is a node name, never a URL, route, session,
+agent, or message id. Outcomes, directions, and reasons are closed
+lowercase registries owned by Smalltalk. No other identities become metric
+attributes.
+
+Error reasons preserve worker failure classification: typed `PeerOverloaded`
+maps to `overloaded`, `RemovedFromFleet` to `removed`, and
+`FabricGrantRefusal` to `refused`. Reqwest timeouts map to `timeout`, other
+reqwest failures to `down`, and JSON decoding, API-version mismatch, and
+inflate failures to `invalid`. The legacy dialer's signature/fleet/member
+authentication classification maps to `auth_failed`; unclassified errors map
+to `other`, while recognized legacy failure-kind strings retain their mappings.
+A signed HTTP refusal does not alone imply `refused`. A terminal unresolved or exhausted heal with
+no classified cause uses `other`. Reasons never include error text.
+
+Trace and metric enabled gates are independent: metrics record without a
+trace exporter, and traces record without a meter provider. Disabled paths
+return before constructing spans, instruments, attribute collections, or
+telemetry-only timers/counts. An enabled operation owns one refcounted peer
+label shared between its span and metrics; only metrics require a monotonic
+start time. Batch/outcome/reason labels use static strings, and point
+recording shares the peer label without copying its bytes.
+Telemetry handles bind to the first provider in the process; production initializes once per process.
+Enabled paths reuse existing exchange, receipt, and heal data rather than
+querying the daemon for telemetry. `ReplicationReceipt` has no timing fields;
+cumulative daemon `ReplicationTimings` are not fetched or turned into per-round
+timings. No new IPC or derived timing math is added.
+
+There are no replication backlog or lag gauges: the worker has no
+`peer_only`/`local_only` counts and the store belongs to the daemon. This
+surface adds no store scans or queries to manufacture those observations.
+
 ### Attribute and context policy
 
 Agent, session, message, terminal, attachment, and lease ids are span attributes only:
@@ -603,9 +869,35 @@ metrics, or logs. Span names and labels use bounded operation vocabulary. Existi
 `profile::Op` and `profile::task` labels supply that vocabulary where available.
 
 W3C `traceparent` and `tracestate` are the wire context, not hash-derived identities.
-HTTP and WebSocket upgrade requests carry context; peer context belongs inside the
-`FleetAuth`-signed header set. Concrete propagation and instrumentation surfaces not
-specified by this core are recorded in [open questions](open-questions.md#st3).
+`crates/st3-client/src/propagation.rs` supplies one injector for both the CLI's internal
+daemon client and the generated typed Rust client. Every HTTP request, Unix HTTP request,
+and WebSocket handshake injects the current tracing span's OpenTelemetry context through
+the global text-map propagator. This makes the daemon's SERVER span a child of the CLI's
+`st3.cli.command` span (or its current child); hook requests use their current span in the
+same way. No SDK/OTel layer or an invalid context produces no trace headers.
+
+The wire-only tracestate entry `st=c` is owned by Smalltalk and means sampling is decided
+by the collector. Injection replaces an existing `st` entry without growing the list.
+When adding `st` to a full 32-entry list, it first drops the rightmost entry; all other
+entries retain their order. It does not mutate the current span's context. The daemon
+treats any present `st` key as collector-owned sampling, so only sampled external callers without that key set
+`st.parent.sampled=true`.
+
+The typed Rust client's optional `trace-propagation` feature owns its OTel API and tracing
+bridge dependencies, not an exporter or SDK initializer. `st3` enables the feature;
+`stui` and the client TUI example leave it disabled. Without the feature, injection is
+a no-op with no context lookup, trace headers, or OTel dependencies. The embedding
+application owns subscriber and propagator setup. The client source is generated from
+`crates/st3-client-codegen/templates/lib.rs.in`; the
+shared propagation module is handwritten. Invalid-context injection performs only a
+current-span/context check, with no allocation, header formatting, or propagator lookup.
+Valid-context injection clones/updates tracestate and uses the propagator to format the
+two W3C headers directly into each transport's existing request, without an intermediate
+header collection.
+
+Peer propagation is pending and is not enabled by these injectors. When implemented,
+peer context belongs inside the `FleetAuth`-signed header set. Other instrumentation
+surfaces are recorded in [open questions](open-questions.md#st3).
 
 ### Proof and overhead
 
@@ -622,6 +914,11 @@ roster/page stage values, and links first-frame roots to the exported upgrade tr
 ids. It asserts that repeated rereads or changes produce no additional first-frame
 roots, cold roster builds are detached and unlinked, and receive projection roots are
 detached but linked to the receive request. Empty receives produce no projection root.
+
+The CLI-to-daemon receiver proof runs a real command with both processes exporting,
+asserts the daemon SERVER span has the CLI root's trace id and a CLI parent span id,
+and checks st-marked parents do not set `st.parent.sampled=true`. Builder unit tests pin
+both headers under a valid current context and their absence without an OTel layer.
 The CLI shutdown helper is tested with an exporter that never returns from shutdown:
 the caller reports a receive timeout and writes the negative cache within the 50 ms
 deadline plus 200 ms of scheduling/filesystem tolerance. The process-level black-hole

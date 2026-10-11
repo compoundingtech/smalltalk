@@ -737,6 +737,12 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                         .iter()
                         .map(|label| label_text(model, label))
                         .collect(),
+                    next_mission: agent.next_work.as_ref().map(|label| label.mission_id.clone()),
+                    queue_missions: agent
+                        .upcoming_work
+                        .iter()
+                        .map(|label| label.mission_id.clone())
+                        .collect(),
                     queued: agent.queued_work_count,
                     harness_state: agent.harness_state.clone(),
                     runtime: None,
@@ -745,6 +751,12 @@ fn agents(model: &Model, missions: &[Mission]) -> Vec<Agent> {
                         .as_ref()
                         .and_then(|usage| usage.context.as_ref())
                         .and_then(|context| context.model.clone()),
+                    effort: agent
+                        .extra
+                        .get("effort")
+                        .and_then(Value::as_str)
+                        .filter(|effort| !effort.is_empty())
+                        .map(str::to_owned),
                     fault: agent.fault.clone().or_else(|| {
                         agent.delivery.as_ref()
                             .filter(|delivery| delivery.state == "stale")
@@ -1947,6 +1959,25 @@ mod tests {
             .unwrap(),
         );
         assert!(!attention(&model, &Extras::default())[0].is_alert());
+    }
+
+    #[test]
+    fn a_seats_configured_effort_reaches_its_details() {
+        let mut model = Model::default();
+        let resource = |effort: serde_json::Value| {
+            serde_json::json!({
+                "id": "agent/example/seat", "kind": "agent", "revision": "r1",
+                "updated_at": "2026-10-10T12:00:00Z", "name": "example/seat",
+                "state": "running", "reachability": "local", "harness_state": "working",
+                "effort": effort, "runtime_ids": [], "under": [],
+            })
+        };
+        model.agents = window(vec![resource(serde_json::json!("high"))]);
+        assert_eq!(agents(&model, &[])[0].details.effort.as_deref(), Some("high"));
+        model.agents = window(vec![resource(serde_json::Value::Null)]);
+        assert_eq!(agents(&model, &[])[0].details.effort, None);
+        model.agents = window(vec![resource(serde_json::json!(""))]);
+        assert_eq!(agents(&model, &[])[0].details.effort, None);
     }
 
     #[test]

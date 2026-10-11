@@ -167,6 +167,16 @@ SQLite reports a statement's time from its first step to its reset, at milliseco
 query whose rows the caller processes one at a time includes that processing, so the outer query
 of a nested loop looks slow. Statement times from concurrent operations overlap.
 
+With OpenTelemetry export enabled, `st.reconcile_pass` and `st.reconcile_deadline` are
+independent roots, even when called inside a request or an attached OpenTelemetry context.
+A pass that continues after an isolated member failure or an unavailable PTY snapshot still
+exports ERROR status. `st.fifo.depth` and `st.fifo.oldest_age` describe pending work only:
+writer jobs leave the backlog before waiting to begin their transaction, and closing a writer,
+conversation, or terminal-emulation receiver discards its pending observations.
+Writer observations include foreground jobs, background loans and configuration fences, but not
+internal background-ready notifications. Dispatch removes the selected job's timestamp, so a
+foreground job overtaking a background loan does not erase the older loan's waiting time.
+
 ## Raw terminal cold opens
 
 Enable profiling on both the gateway and owner to separate admission work from transport work.

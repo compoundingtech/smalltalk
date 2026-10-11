@@ -34,7 +34,7 @@ pub async fn run(
             Ok(Ok(0)) => delay = (delay * 2).min(Duration::from_secs(60)),
             Ok(Ok(_)) => {
                 delay = Duration::from_secs(1);
-                crate::performance::record_wake("recorder receipts", Some("resource.observed"));
+                crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::RecorderReceipts, Some("resource.observed"));
                 notify.notify_one();
                 event_notify.send_modify(|generation| *generation = generation.saturating_add(1));
             }
