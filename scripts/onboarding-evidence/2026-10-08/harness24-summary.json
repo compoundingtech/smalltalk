@@ -1,0 +1,1277 @@
+{
+  "archive_sha256": "e5fc412e12db59c74791ca6d467039a334e8642ce2eea3c8f39df49ac7e31554",
+  "source": "48871974cae9ce31e2dd4e4578bf056c986e7f08",
+  "harness_source": "63f0b36215bc4dca159ea17045914d51ee5fe872",
+  "ubuntu": "24.04",
+  "backend": "docker",
+  "cpus": 2,
+  "memory_gib": 3,
+  "host_mounts": false,
+  "fixture_uid": 42420,
+  "runs": [
+    {
+      "scenario": "both",
+      "counts": {
+        "PASS": 28
+      },
+      "checks": [
+        {
+          "id": "fresh-home",
+          "status": "PASS",
+          "detail": "no existing st config or state"
+        },
+        {
+          "id": "guest-release",
+          "status": "PASS",
+          "detail": "actual guest matches requested Ubuntu release"
+        },
+        {
+          "id": "clean-tool-path",
+          "status": "PASS",
+          "detail": "no gh, developer tools or provider binaries initially installed"
+        },
+        {
+          "id": "archive-extracted",
+          "status": "PASS",
+          "detail": "copied bytes match recorded archive; BUILD.json captured"
+        },
+        {
+          "id": "first-run-questions",
+          "status": "PASS",
+          "detail": "name, machine and default service answered in PTY"
+        },
+        {
+          "id": "harness-choice",
+          "status": "PASS",
+          "detail": "several harnesses ask one choice; scripted selection is Claude"
+        },
+        {
+          "id": "setup-success",
+          "status": "PASS",
+          "detail": "real candidate setup completed"
+        },
+        {
+          "id": "setup-selected-harness",
+          "status": "PASS",
+          "detail": "setup discovers/selects claude exactly once on daemon login PATH"
+        },
+        {
+          "id": "configured-person",
+          "status": "PASS",
+          "detail": "person/ada persisted"
+        },
+        {
+          "id": "configured-node",
+          "status": "PASS",
+          "detail": "node persisted and is not local"
+        },
+        {
+          "id": "self-install",
+          "status": "PASS",
+          "detail": "st3, relative st link and pty installed"
+        },
+        {
+          "id": "service-active",
+          "status": "PASS",
+          "detail": "user service is active/running"
+        },
+        {
+          "id": "login-path",
+          "status": "PASS",
+          "detail": "st resolves in a fresh login shell"
+        },
+        {
+          "id": "doctor-healthy",
+          "status": "PASS",
+          "detail": "ordinary doctor healthy"
+        },
+        {
+          "id": "doctor-user-tools",
+          "status": "PASS",
+          "detail": "no irrelevant tool warnings"
+        },
+        {
+          "id": "linger-guidance",
+          "status": "PASS",
+          "detail": "exact command printed when lingering is refused"
+        },
+        {
+          "id": "tui-frame",
+          "status": "PASS",
+          "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+        },
+        {
+          "id": "fixture-workspace",
+          "status": "PASS",
+          "detail": "private workspace created for the explicit test seat"
+        },
+        {
+          "id": "fixture-seat-start",
+          "status": "PASS",
+          "detail": "explicit claude seat starts without built-in expert"
+        },
+        {
+          "id": "fixture-wake",
+          "status": "PASS",
+          "detail": "real graph message sent to disposable seat"
+        },
+        {
+          "id": "fixture-read-message",
+          "status": "PASS",
+          "detail": "selected native provider successfully reads the exact wake"
+        },
+        {
+          "id": "claude-route",
+          "status": "PASS",
+          "detail": "actual seat uses the expected policy/development route"
+        },
+        {
+          "id": "claude-dialog",
+          "status": "PASS",
+          "detail": "driver answered the development dialog"
+        },
+        {
+          "id": "plain-mcp-idle",
+          "status": "PASS",
+          "detail": "no notifications or error outside a seat"
+        },
+        {
+          "id": "fixture-seat-stopped",
+          "status": "PASS",
+          "detail": "test-created seat stopped after proof"
+        },
+        {
+          "id": "idempotent-setup",
+          "status": "PASS",
+          "detail": "second setup creates no second mission run"
+        },
+        {
+          "id": "machine-restart",
+          "status": "PASS",
+          "detail": "Docker restart is a container restart; Incus is a real guest restart"
+        },
+        {
+          "id": "linger-reboot-behavior",
+          "status": "PASS",
+          "detail": "manager survives only when lingering enabled"
+        }
+      ],
+      "corrected_rerun": false
+    },
+    {
+      "scenario": "claude-policy-absent",
+      "counts": {
+        "PASS": 28
+      },
+      "checks": [
+        {
+          "id": "fresh-home",
+          "status": "PASS",
+          "detail": "no existing st config or state"
+        },
+        {
+          "id": "guest-release",
+          "status": "PASS",
+          "detail": "actual guest matches requested Ubuntu release"
+        },
+        {
+          "id": "clean-tool-path",
+          "status": "PASS",
+          "detail": "no gh, developer tools or provider binaries initially installed"
+        },
+        {
+          "id": "archive-extracted",
+          "status": "PASS",
+          "detail": "copied bytes match recorded archive; BUILD.json captured"
+        },
+        {
+          "id": "setup-success",
+          "status": "PASS",
+          "detail": "real candidate setup completed"
+        },
+        {
+          "id": "setup-selected-harness",
+          "status": "PASS",
+          "detail": "setup discovers/selects claude exactly once on daemon login PATH"
+        },
+        {
+          "id": "setup-channel-route",
+          "status": "PASS",
+          "detail": "setup explains its policy/development plugin route"
+        },
+        {
+          "id": "configured-person",
+          "status": "PASS",
+          "detail": "person/ada persisted"
+        },
+        {
+          "id": "configured-node",
+          "status": "PASS",
+          "detail": "node persisted and is not local"
+        },
+        {
+          "id": "config-merge",
+          "status": "PASS",
+          "detail": "existing checkpoint setting preserved"
+        },
+        {
+          "id": "self-install",
+          "status": "PASS",
+          "detail": "st3, relative st link and pty installed"
+        },
+        {
+          "id": "service-active",
+          "status": "PASS",
+          "detail": "user service is active/running"
+        },
+        {
+          "id": "login-path",
+          "status": "PASS",
+          "detail": "st resolves in a fresh login shell"
+        },
+        {
+          "id": "doctor-healthy",
+          "status": "PASS",
+          "detail": "ordinary doctor healthy"
+        },
+        {
+          "id": "doctor-user-tools",
+          "status": "PASS",
+          "detail": "no irrelevant tool warnings"
+        },
+        {
+          "id": "linger-guidance",
+          "status": "PASS",
+          "detail": "exact command printed when lingering is refused"
+        },
+        {
+          "id": "tui-frame",
+          "status": "PASS",
+          "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+        },
+        {
+          "id": "fixture-workspace",
+          "status": "PASS",
+          "detail": "private workspace created for the explicit test seat"
+        },
+        {
+          "id": "fixture-seat-start",
+          "status": "PASS",
+          "detail": "explicit claude seat starts without built-in expert"
+        },
+        {
+          "id": "fixture-wake",
+          "status": "PASS",
+          "detail": "real graph message sent to disposable seat"
+        },
+        {
+          "id": "fixture-read-message",
+          "status": "PASS",
+          "detail": "selected native provider successfully reads the exact wake"
+        },
+        {
+          "id": "claude-route",
+          "status": "PASS",
+          "detail": "actual seat uses the expected policy/development route"
+        },
+        {
+          "id": "claude-dialog",
+          "status": "PASS",
+          "detail": "driver answered the development dialog"
+        },
+        {
+          "id": "plain-mcp-idle",
+          "status": "PASS",
+          "detail": "no notifications or error outside a seat"
+        },
+        {
+          "id": "fixture-seat-stopped",
+          "status": "PASS",
+          "detail": "test-created seat stopped after proof"
+        },
+        {
+          "id": "idempotent-setup",
+          "status": "PASS",
+          "detail": "second setup creates no second mission run"
+        },
+        {
+          "id": "machine-restart",
+          "status": "PASS",
+          "detail": "Docker restart is a container restart; Incus is a real guest restart"
+        },
+        {
+          "id": "linger-reboot-behavior",
+          "status": "PASS",
+          "detail": "manager survives only when lingering enabled"
+        }
+      ],
+      "corrected_rerun": false
+    },
+    {
+      "scenario": "claude-policy-present",
+      "counts": {
+        "PASS": 28
+      },
+      "checks": [
+        {
+          "id": "fresh-home",
+          "status": "PASS",
+          "detail": "no existing st config or state"
+        },
+        {
+          "id": "guest-release",
+          "status": "PASS",
+          "detail": "actual guest matches requested Ubuntu release"
+        },
+        {
+          "id": "clean-tool-path",
+          "status": "PASS",
+          "detail": "no gh, developer tools or provider binaries initially installed"
+        },
+        {
+          "id": "archive-extracted",
+          "status": "PASS",
+          "detail": "copied bytes match recorded archive; BUILD.json captured"
+        },
+        {
+          "id": "fixture-policy",
+          "status": "PASS",
+          "detail": "candidate policy helper succeeds and ordinary user can read its fragment"
+        },
+        {
+          "id": "setup-success",
+          "status": "PASS",
+          "detail": "real candidate setup completed"
+        },
+        {
+          "id": "setup-selected-harness",
+          "status": "PASS",
+          "detail": "setup discovers/selects claude exactly once on daemon login PATH"
+        },
+        {
+          "id": "setup-channel-route",
+          "status": "PASS",
+          "detail": "setup explains its policy/development plugin route"
+        },
+        {
+          "id": "configured-person",
+          "status": "PASS",
+          "detail": "person/ada persisted"
+        },
+        {
+          "id": "configured-node",
+          "status": "PASS",
+          "detail": "node persisted and is not local"
+        },
+        {
+          "id": "config-merge",
+          "status": "PASS",
+          "detail": "existing checkpoint setting preserved"
+        },
+        {
+          "id": "self-install",
+          "status": "PASS",
+          "detail": "st3, relative st link and pty installed"
+        },
+        {
+          "id": "service-active",
+          "status": "PASS",
+          "detail": "user service is active/running"
+        },
+        {
+          "id": "login-path",
+          "status": "PASS",
+          "detail": "st resolves in a fresh login shell"
+        },
+        {
+          "id": "doctor-healthy",
+          "status": "PASS",
+          "detail": "ordinary doctor healthy"
+        },
+        {
+          "id": "doctor-user-tools",
+          "status": "PASS",
+          "detail": "no irrelevant tool warnings"
+        },
+        {
+          "id": "linger-guidance",
+          "status": "PASS",
+          "detail": "exact command printed when lingering is refused"
+        },
+        {
+          "id": "tui-frame",
+          "status": "PASS",
+          "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+        },
+        {
+          "id": "fixture-workspace",
+          "status": "PASS",
+          "detail": "private workspace created for the explicit test seat"
+        },
+        {
+          "id": "fixture-seat-start",
+          "status": "PASS",
+          "detail": "explicit claude seat starts without built-in expert"
+        },
+        {
+          "id": "fixture-wake",
+          "status": "PASS",
+          "detail": "real graph message sent to disposable seat"
+        },
+        {
+          "id": "fixture-read-message",
+          "status": "PASS",
+          "detail": "selected native provider successfully reads the exact wake"
+        },
+        {
+          "id": "claude-route",
+          "status": "PASS",
+          "detail": "actual seat uses the expected policy/development route"
+        },
+        {
+          "id": "plain-mcp-idle",
+          "status": "PASS",
+          "detail": "no notifications or error outside a seat"
+        },
+        {
+          "id": "fixture-seat-stopped",
+          "status": "PASS",
+          "detail": "test-created seat stopped after proof"
+        },
+        {
+          "id": "idempotent-setup",
+          "status": "PASS",
+          "detail": "second setup creates no second mission run"
+        },
+        {
+          "id": "machine-restart",
+          "status": "PASS",
+          "detail": "Docker restart is a container restart; Incus is a real guest restart"
+        },
+        {
+          "id": "linger-reboot-behavior",
+          "status": "PASS",
+          "detail": "manager survives only when lingering enabled"
+        }
+      ],
+      "corrected_rerun": true
+    },
+    {
+      "scenario": "codex",
+      "counts": {
+        "PASS": 26
+      },
+      "checks": [
+        {
+          "id": "fresh-home",
+          "status": "PASS",
+          "detail": "no existing st config or state"
+        },
+        {
+          "id": "guest-release",
+          "status": "PASS",
+          "detail": "actual guest matches requested Ubuntu release"
+        },
+        {
+          "id": "clean-tool-path",
+          "status": "PASS",
+          "detail": "no gh, developer tools or provider binaries initially installed"
+        },
+        {
+          "id": "archive-extracted",
+          "status": "PASS",
+          "detail": "copied bytes match recorded archive; BUILD.json captured"
+        },
+        {
+          "id": "setup-success",
+          "status": "PASS",
+          "detail": "real candidate setup completed"
+        },
+        {
+          "id": "setup-selected-harness",
+          "status": "PASS",
+          "detail": "setup discovers/selects codex exactly once on daemon login PATH"
+        },
+        {
+          "id": "configured-person",
+          "status": "PASS",
+          "detail": "person/ada persisted"
+        },
+        {
+          "id": "configured-node",
+          "status": "PASS",
+          "detail": "node persisted and is not local"
+        },
+        {
+          "id": "config-merge",
+          "status": "PASS",
+          "detail": "existing checkpoint setting preserved"
+        },
+        {
+          "id": "self-install",
+          "status": "PASS",
+          "detail": "st3, relative st link and pty installed"
+        },
+        {
+          "id": "service-active",
+          "status": "PASS",
+          "detail": "user service is active/running"
+        },
+        {
+          "id": "login-path",
+          "status": "PASS",
+          "detail": "st resolves in a fresh login shell"
+        },
+        {
+          "id": "doctor-healthy",
+          "status": "PASS",
+          "detail": "ordinary doctor healthy"
+        },
+        {
+          "id": "doctor-user-tools",
+          "status": "PASS",
+          "detail": "no irrelevant tool warnings"
+        },
+        {
+          "id": "linger-guidance",
+          "status": "PASS",
+          "detail": "exact command printed when lingering is refused"
+        },
+        {
+          "id": "tui-frame",
+          "status": "PASS",
+          "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+        },
+        {
+          "id": "fixture-workspace",
+          "status": "PASS",
+          "detail": "private workspace created for the explicit test seat"
+        },
+        {
+          "id": "fixture-seat-start",
+          "status": "PASS",
+          "detail": "explicit codex seat starts without built-in expert"
+        },
+        {
+          "id": "fixture-wake",
+          "status": "PASS",
+          "detail": "real graph message sent to disposable seat"
+        },
+        {
+          "id": "fixture-read-message",
+          "status": "PASS",
+          "detail": "selected native provider successfully reads the exact wake"
+        },
+        {
+          "id": "codex-native-server",
+          "status": "PASS",
+          "detail": "native app-server/TUI handshake completed"
+        },
+        {
+          "id": "plain-mcp-idle",
+          "status": "PASS",
+          "detail": "no notifications or error outside a seat"
+        },
+        {
+          "id": "fixture-seat-stopped",
+          "status": "PASS",
+          "detail": "test-created seat stopped after proof"
+        },
+        {
+          "id": "idempotent-setup",
+          "status": "PASS",
+          "detail": "second setup creates no second mission run"
+        },
+        {
+          "id": "machine-restart",
+          "status": "PASS",
+          "detail": "Docker restart is a container restart; Incus is a real guest restart"
+        },
+        {
+          "id": "linger-reboot-behavior",
+          "status": "PASS",
+          "detail": "manager survives only when lingering enabled"
+        }
+      ],
+      "corrected_rerun": false
+    },
+    {
+      "scenario": "gh-broken",
+      "counts": {
+        "PASS": 27
+      },
+      "checks": [
+        {
+          "id": "fresh-home",
+          "status": "PASS",
+          "detail": "no existing st config or state"
+        },
+        {
+          "id": "guest-release",
+          "status": "PASS",
+          "detail": "actual guest matches requested Ubuntu release"
+        },
+        {
+          "id": "clean-tool-path",
+          "status": "PASS",
+          "detail": "no gh, developer tools or provider binaries initially installed"
+        },
+        {
+          "id": "archive-extracted",
+          "status": "PASS",
+          "detail": "copied bytes match recorded archive; BUILD.json captured"
+        },
+        {
+          "id": "setup-success",
+          "status": "PASS",
+          "detail": "real candidate setup completed"
+        },
+        {
+          "id": "setup-selected-harness",
+          "status": "PASS",
+          "detail": "setup discovers/selects codex exactly once on daemon login PATH"
+        },
+        {
+          "id": "configured-person",
+          "status": "PASS",
+          "detail": "person/ada persisted"
+        },
+        {
+          "id": "configured-node",
+          "status": "PASS",
+          "detail": "node persisted and is not local"
+        },
+        {
+          "id": "config-merge",
+          "status": "PASS",
+          "detail": "existing checkpoint setting preserved"
+        },
+        {
+          "id": "self-install",
+          "status": "PASS",
+          "detail": "st3, relative st link and pty installed"
+        },
+        {
+          "id": "service-active",
+          "status": "PASS",
+          "detail": "user service is active/running"
+        },
+        {
+          "id": "login-path",
+          "status": "PASS",
+          "detail": "st resolves in a fresh login shell"
+        },
+        {
+          "id": "doctor-healthy",
+          "status": "PASS",
+          "detail": "ordinary doctor healthy"
+        },
+        {
+          "id": "doctor-user-tools",
+          "status": "PASS",
+          "detail": "no irrelevant tool warnings"
+        },
+        {
+          "id": "linger-guidance",
+          "status": "PASS",
+          "detail": "exact command printed when lingering is refused"
+        },
+        {
+          "id": "tui-frame",
+          "status": "PASS",
+          "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+        },
+        {
+          "id": "fixture-workspace",
+          "status": "PASS",
+          "detail": "private workspace created for the explicit test seat"
+        },
+        {
+          "id": "fixture-seat-start",
+          "status": "PASS",
+          "detail": "explicit codex seat starts without built-in expert"
+        },
+        {
+          "id": "fixture-wake",
+          "status": "PASS",
+          "detail": "real graph message sent to disposable seat"
+        },
+        {
+          "id": "fixture-read-message",
+          "status": "PASS",
+          "detail": "selected native provider successfully reads the exact wake"
+        },
+        {
+          "id": "codex-native-server",
+          "status": "PASS",
+          "detail": "native app-server/TUI handshake completed"
+        },
+        {
+          "id": "gh-optional",
+          "status": "PASS",
+          "detail": "unavailable GitHub integration returns a clear error without hanging"
+        },
+        {
+          "id": "plain-mcp-idle",
+          "status": "PASS",
+          "detail": "no notifications or error outside a seat"
+        },
+        {
+          "id": "fixture-seat-stopped",
+          "status": "PASS",
+          "detail": "test-created seat stopped after proof"
+        },
+        {
+          "id": "idempotent-setup",
+          "status": "PASS",
+          "detail": "second setup creates no second mission run"
+        },
+        {
+          "id": "machine-restart",
+          "status": "PASS",
+          "detail": "Docker restart is a container restart; Incus is a real guest restart"
+        },
+        {
+          "id": "linger-reboot-behavior",
+          "status": "PASS",
+          "detail": "manager survives only when lingering enabled"
+        }
+      ],
+      "corrected_rerun": true
+    },
+    {
+      "scenario": "gh-logged-out",
+      "counts": {
+        "PASS": 27
+      },
+      "checks": [
+        {
+          "id": "fresh-home",
+          "status": "PASS",
+          "detail": "no existing st config or state"
+        },
+        {
+          "id": "guest-release",
+          "status": "PASS",
+          "detail": "actual guest matches requested Ubuntu release"
+        },
+        {
+          "id": "clean-tool-path",
+          "status": "PASS",
+          "detail": "no gh, developer tools or provider binaries initially installed"
+        },
+        {
+          "id": "archive-extracted",
+          "status": "PASS",
+          "detail": "copied bytes match recorded archive; BUILD.json captured"
+        },
+        {
+          "id": "setup-success",
+          "status": "PASS",
+          "detail": "real candidate setup completed"
+        },
+        {
+          "id": "setup-selected-harness",
+          "status": "PASS",
+          "detail": "setup discovers/selects codex exactly once on daemon login PATH"
+        },
+        {
+          "id": "configured-person",
+          "status": "PASS",
+          "detail": "person/ada persisted"
+        },
+        {
+          "id": "configured-node",
+          "status": "PASS",
+          "detail": "node persisted and is not local"
+        },
+        {
+          "id": "config-merge",
+          "status": "PASS",
+          "detail": "existing checkpoint setting preserved"
+        },
+        {
+          "id": "self-install",
+          "status": "PASS",
+          "detail": "st3, relative st link and pty installed"
+        },
+        {
+          "id": "service-active",
+          "status": "PASS",
+          "detail": "user service is active/running"
+        },
+        {
+          "id": "login-path",
+          "status": "PASS",
+          "detail": "st resolves in a fresh login shell"
+        },
+        {
+          "id": "doctor-healthy",
+          "status": "PASS",
+          "detail": "ordinary doctor healthy"
+        },
+        {
+          "id": "doctor-user-tools",
+          "status": "PASS",
+          "detail": "no irrelevant tool warnings"
+        },
+        {
+          "id": "linger-guidance",
+          "status": "PASS",
+          "detail": "exact command printed when lingering is refused"
+        },
+        {
+          "id": "tui-frame",
+          "status": "PASS",
+          "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+        },
+        {
+          "id": "fixture-workspace",
+          "status": "PASS",
+          "detail": "private workspace created for the explicit test seat"
+        },
+        {
+          "id": "fixture-seat-start",
+          "status": "PASS",
+          "detail": "explicit codex seat starts without built-in expert"
+        },
+        {
+          "id": "fixture-wake",
+          "status": "PASS",
+          "detail": "real graph message sent to disposable seat"
+        },
+        {
+          "id": "fixture-read-message",
+          "status": "PASS",
+          "detail": "selected native provider successfully reads the exact wake"
+        },
+        {
+          "id": "codex-native-server",
+          "status": "PASS",
+          "detail": "native app-server/TUI handshake completed"
+        },
+        {
+          "id": "gh-optional",
+          "status": "PASS",
+          "detail": "unavailable GitHub integration returns a clear error without hanging"
+        },
+        {
+          "id": "plain-mcp-idle",
+          "status": "PASS",
+          "detail": "no notifications or error outside a seat"
+        },
+        {
+          "id": "fixture-seat-stopped",
+          "status": "PASS",
+          "detail": "test-created seat stopped after proof"
+        },
+        {
+          "id": "idempotent-setup",
+          "status": "PASS",
+          "detail": "second setup creates no second mission run"
+        },
+        {
+          "id": "machine-restart",
+          "status": "PASS",
+          "detail": "Docker restart is a container restart; Incus is a real guest restart"
+        },
+        {
+          "id": "linger-reboot-behavior",
+          "status": "PASS",
+          "detail": "manager survives only when lingering enabled"
+        }
+      ],
+      "corrected_rerun": true
+    },
+    {
+      "scenario": "no-gh",
+      "counts": {
+        "PASS": 27
+      },
+      "checks": [
+        {
+          "id": "fresh-home",
+          "status": "PASS",
+          "detail": "no existing st config or state"
+        },
+        {
+          "id": "guest-release",
+          "status": "PASS",
+          "detail": "actual guest matches requested Ubuntu release"
+        },
+        {
+          "id": "clean-tool-path",
+          "status": "PASS",
+          "detail": "no gh, developer tools or provider binaries initially installed"
+        },
+        {
+          "id": "archive-extracted",
+          "status": "PASS",
+          "detail": "copied bytes match recorded archive; BUILD.json captured"
+        },
+        {
+          "id": "setup-success",
+          "status": "PASS",
+          "detail": "real candidate setup completed"
+        },
+        {
+          "id": "setup-selected-harness",
+          "status": "PASS",
+          "detail": "setup discovers/selects codex exactly once on daemon login PATH"
+        },
+        {
+          "id": "configured-person",
+          "status": "PASS",
+          "detail": "person/ada persisted"
+        },
+        {
+          "id": "configured-node",
+          "status": "PASS",
+          "detail": "node persisted and is not local"
+        },
+        {
+          "id": "config-merge",
+          "status": "PASS",
+          "detail": "existing checkpoint setting preserved"
+        },
+        {
+          "id": "self-install",
+          "status": "PASS",
+          "detail": "st3, relative st link and pty installed"
+        },
+        {
+          "id": "service-active",
+          "status": "PASS",
+          "detail": "user service is active/running"
+        },
+        {
+          "id": "login-path",
+          "status": "PASS",
+          "detail": "st resolves in a fresh login shell"
+        },
+        {
+          "id": "doctor-healthy",
+          "status": "PASS",
+          "detail": "ordinary doctor healthy"
+        },
+        {
+          "id": "doctor-user-tools",
+          "status": "PASS",
+          "detail": "no irrelevant tool warnings"
+        },
+        {
+          "id": "linger-guidance",
+          "status": "PASS",
+          "detail": "exact command printed when lingering is refused"
+        },
+        {
+          "id": "tui-frame",
+          "status": "PASS",
+          "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+        },
+        {
+          "id": "fixture-workspace",
+          "status": "PASS",
+          "detail": "private workspace created for the explicit test seat"
+        },
+        {
+          "id": "fixture-seat-start",
+          "status": "PASS",
+          "detail": "explicit codex seat starts without built-in expert"
+        },
+        {
+          "id": "fixture-wake",
+          "status": "PASS",
+          "detail": "real graph message sent to disposable seat"
+        },
+        {
+          "id": "fixture-read-message",
+          "status": "PASS",
+          "detail": "selected native provider successfully reads the exact wake"
+        },
+        {
+          "id": "codex-native-server",
+          "status": "PASS",
+          "detail": "native app-server/TUI handshake completed"
+        },
+        {
+          "id": "gh-optional",
+          "status": "PASS",
+          "detail": "unavailable GitHub integration returns a clear error without hanging"
+        },
+        {
+          "id": "plain-mcp-idle",
+          "status": "PASS",
+          "detail": "no notifications or error outside a seat"
+        },
+        {
+          "id": "fixture-seat-stopped",
+          "status": "PASS",
+          "detail": "test-created seat stopped after proof"
+        },
+        {
+          "id": "idempotent-setup",
+          "status": "PASS",
+          "detail": "second setup creates no second mission run"
+        },
+        {
+          "id": "machine-restart",
+          "status": "PASS",
+          "detail": "Docker restart is a container restart; Incus is a real guest restart"
+        },
+        {
+          "id": "linger-reboot-behavior",
+          "status": "PASS",
+          "detail": "manager survives only when lingering enabled"
+        }
+      ],
+      "corrected_rerun": true
+    },
+    {
+      "scenario": "no-harness",
+      "counts": {
+        "PASS": 23
+      },
+      "checks": [
+        {
+          "id": "fresh-home",
+          "status": "PASS",
+          "detail": "no existing st config or state"
+        },
+        {
+          "id": "guest-release",
+          "status": "PASS",
+          "detail": "actual guest matches requested Ubuntu release"
+        },
+        {
+          "id": "clean-tool-path",
+          "status": "PASS",
+          "detail": "no gh, developer tools or provider binaries initially installed"
+        },
+        {
+          "id": "archive-extracted",
+          "status": "PASS",
+          "detail": "copied bytes match recorded archive; BUILD.json captured"
+        },
+        {
+          "id": "setup-success",
+          "status": "PASS",
+          "detail": "real candidate setup completed"
+        },
+        {
+          "id": "configured-person",
+          "status": "PASS",
+          "detail": "person/ada persisted"
+        },
+        {
+          "id": "configured-node",
+          "status": "PASS",
+          "detail": "node persisted and is not local"
+        },
+        {
+          "id": "config-merge",
+          "status": "PASS",
+          "detail": "existing checkpoint setting preserved"
+        },
+        {
+          "id": "self-install",
+          "status": "PASS",
+          "detail": "st3, relative st link and pty installed"
+        },
+        {
+          "id": "service-active",
+          "status": "PASS",
+          "detail": "user service is active/running"
+        },
+        {
+          "id": "login-path",
+          "status": "PASS",
+          "detail": "st resolves in a fresh login shell"
+        },
+        {
+          "id": "doctor-healthy",
+          "status": "PASS",
+          "detail": "ordinary doctor healthy"
+        },
+        {
+          "id": "doctor-user-tools",
+          "status": "PASS",
+          "detail": "no irrelevant tool warnings"
+        },
+        {
+          "id": "linger-guidance",
+          "status": "PASS",
+          "detail": "exact command printed when lingering is refused"
+        },
+        {
+          "id": "tui-frame",
+          "status": "PASS",
+          "detail": "first frame, visible Home/Now, Ctrl+Q and terminal restoration"
+        },
+        {
+          "id": "no-harness-explained",
+          "status": "PASS",
+          "detail": "wizard explains that no provider is installed"
+        },
+        {
+          "id": "no-harness-no-seat",
+          "status": "PASS",
+          "detail": "no expert created without a harness; daemon list succeeds"
+        },
+        {
+          "id": "no-harness-no-mission",
+          "status": "PASS",
+          "detail": "no onboarding mission created without a harness; daemon list succeeds"
+        },
+        {
+          "id": "missing-harness",
+          "status": "PASS",
+          "detail": "clear diagnosis within eight seconds"
+        },
+        {
+          "id": "plain-mcp-idle",
+          "status": "PASS",
+          "detail": "no notifications or error outside a seat"
+        },
+        {
+          "id": "idempotent-setup",
+          "status": "PASS",
+          "detail": "second setup creates no second mission run"
+        },
+        {
+          "id": "machine-restart",
+          "status": "PASS",
+          "detail": "Docker restart is a container restart; Incus is a real guest restart"
+        },
+        {
+          "id": "linger-reboot-behavior",
+          "status": "PASS",
+          "detail": "manager survives only when lingering enabled"
+        }
+      ],
+      "corrected_rerun": false
+    }
+  ],
+  "retained_initial_failures": [
+    {
+      "scenario": "claude-policy-present",
+      "checks": [
+        {
+          "id": "setup-channel-route",
+          "status": "FAIL",
+          "detail": "setup explains its policy/development plugin route"
+        },
+        {
+          "id": "claude-route",
+          "status": "FAIL",
+          "detail": "actual seat uses the expected policy/development route"
+        }
+      ]
+    },
+    {
+      "scenario": "gh-broken",
+      "checks": [
+        {
+          "id": "gh-optional",
+          "status": "FAIL",
+          "detail": "unavailable GitHub integration returns a clear error without hanging"
+        }
+      ]
+    },
+    {
+      "scenario": "gh-logged-out",
+      "checks": [
+        {
+          "id": "gh-optional",
+          "status": "FAIL",
+          "detail": "unavailable GitHub integration returns a clear error without hanging"
+        }
+      ]
+    },
+    {
+      "scenario": "no-gh",
+      "checks": [
+        {
+          "id": "gh-optional",
+          "status": "FAIL",
+          "detail": "unavailable GitHub integration returns a clear error without hanging"
+        }
+      ]
+    }
+  ],
+  "documents": [
+    {
+      "scenario": "both",
+      "corrected": false,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-both-report@dd3878090ff96bc5b25aa56ced172755c385f7d0e5d3b381c001d2d2facab7f5",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-both-receipt@a713fa4a92111f0314afa8529a83ba153f1b51f356f51269130cf33bd600e76f"
+    },
+    {
+      "scenario": "claude-policy-absent",
+      "corrected": false,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-claude-policy-absent-report@ff814eaf28c4921358a43044c72d5d3548f4df106fbda6531999598e54d15225",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-claude-policy-absent-receipt@b6aed570440a857c6df95f54db2f3d927cafb5bdcd3141bac1b753dd0bf2e994"
+    },
+    {
+      "scenario": "claude-policy-present",
+      "corrected": false,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-claude-policy-present-report@f5b95b95d35019f57bd8436f3dd7b022e3da1f28d0b546030d79761a862900b2",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-claude-policy-present-receipt@ef65364eb1ad7a2f19b8a8f85de9b9ee47f27f82a4de57c7d73c366d6b871266"
+    },
+    {
+      "scenario": "codex",
+      "corrected": false,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-codex-report@8e2136d0ff2aac82077cf7d0151401d44de117c4e33e82fb29e1d55ea4754265",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-codex-receipt@adc98ffeb82bbbf633f9b64959e6809abaa3cb3f8aaa510c53a18a4d6d46af9b"
+    },
+    {
+      "scenario": "gh-broken",
+      "corrected": false,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-gh-broken-report@b01a6e49438d8d2decf25be1020d1c5c3660b34edb0795c201d77da59b68abf0",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-gh-broken-receipt@41b036fc838231fb7aa81e925f8d29492dd580d53bd65fbd5a497c07f75ad777"
+    },
+    {
+      "scenario": "gh-logged-out",
+      "corrected": false,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-gh-logged-out-report@88bb91aef3b4f548ba7aac266660b251d18d07b645202c8fbb29fb1a5bb1a9a7",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-gh-logged-out-receipt@50f66782daa857350edf91fa84f0d663a59ed4ef0f0d9ddcd91421b8fd4e6427"
+    },
+    {
+      "scenario": "no-gh",
+      "corrected": false,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-no-gh-report@4b9ba4921d7ab007a32cec2275e6aeed0b243f04b9ce1db44a0cab82b89676f4",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-no-gh-receipt@9124899e78a01354221ba75aa9149d2e91f63407445e56f8618759a517cf321e"
+    },
+    {
+      "scenario": "no-harness",
+      "corrected": false,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-no-harness-report@6398c7d7c25cb19522795c3a7ac3d767b05ab9f4dd8153c308087dab07fdfe90",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-initial-no-harness-receipt@9dc268c09edbf055b8bd717305026814912dc808fde899f75b54190cce1ec329"
+    },
+    {
+      "scenario": "claude-policy-present",
+      "corrected": true,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-corrected-claude-policy-present-report@89bab4049f4545288599ae1d55fd9b894dc0228ccfab65ba5038f5a093902a9c",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-corrected-claude-policy-present-receipt@147c98bbe423a4a8d8f9c1f45318b3007cca2d7faf32464b8160ec8f143b0b77"
+    },
+    {
+      "scenario": "gh-broken",
+      "corrected": true,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-corrected-gh-broken-report@465eadeddcc9de29496a336a6a29a6c8cf520501f8477cc6cf045d71729164c1",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-corrected-gh-broken-receipt@4730a82b00837a86e216c4494d43654324211b5e1941d4226915a9cb1ff2fb0c"
+    },
+    {
+      "scenario": "gh-logged-out",
+      "corrected": true,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-corrected-gh-logged-out-report@6bceeb37e79b6cb9d5297b471d995525fb541225f0d6eba297077ea8b0e1b4e7",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-corrected-gh-logged-out-receipt@bab3c3c2d4c491cfb027701a3c3fa082916ceea2131cc9e50927778d4bcfeec8"
+    },
+    {
+      "scenario": "no-gh",
+      "corrected": true,
+      "report": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-corrected-no-gh-report@bb5925aac819b19f3862a19b9f39ceee2d818fefafc95e0866fd51fd06d40514",
+      "receipt": "doc/fleet/smalltalk/onboarding/2026-10-08d/harness-corrected-no-gh-receipt@394771d746f37adea3b16ed29610c7f5cd4c797266d1baf81132237bb20111fb"
+    }
+  ],
+  "limits": "Harness-only native protocol fixtures; no expert/content, paid model, real VM, stock Ubuntu22 or final release compatibility claim. Four initial scenario failures were corrected in the rig and rerun; original receipts retained."
+}

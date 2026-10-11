@@ -1,0 +1,39 @@
+{
+  "_fixture": {
+    "source": "sanitized native failed evaluation 1: actual assistant tool use and subsequent tool result; not the missing outbound HTTP body",
+    "native_transcript_sha256": "760d31e83d215b934afb78db8e9d46fb78749ae109fb62153dcafd50f4cef695",
+    "sanitization": "opaque tool/step/incarnation IDs replaced; result text shortened; roles/content/caller preserved"
+  },
+  "model": "claude-haiku-4-5-20251001",
+  "messages": [
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "toolu_native_fixture",
+          "name": "Bash",
+          "input": {
+            "command": "st work claim step-run/fixture-generation/hello --as agent/st/expert"
+          },
+          "caller": {
+            "type": "direct"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "tool_use_id": "toolu_native_fixture",
+          "type": "tool_result",
+          "content": "STEP  hello\nSUBJECT    step-run/fixture-generation/hello\nSTATE      claimed \u00b7 attempt 1\nMISSION RUN mission-run/st/onboarding\nGENERATION run-generation/01a11b2b38ad788085044653b67adc42\nDEFINITION e4ca6202a7f81373c26eed5a0beb5d7080c7221e9286e7e74bbd6f0709254ae3\nUPDATED    now\n\nWORKER\n  Assigned to  agent/st/expert\n  Claimant     agent/st/expert\n  Incarnation  fixture-current\n",
+          "is_error": false
+        }
+      ]
+    }
+  ],
+  "stream": true,
+  "max_tokens": 2048
+}

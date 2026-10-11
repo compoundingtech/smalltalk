@@ -1,0 +1,24 @@
+24.04/codex: PASS fresh-home: no existing st config or state
+24.04/codex: PASS guest-release: actual guest matches requested Ubuntu release
+24.04/codex: PASS clean-tool-path: no gh, developer tools or provider binaries initially installed
+24.04/codex: PASS archive-extracted: copied bytes match recorded archive; BUILD.json captured
+24.04/codex: PASS setup-success: real candidate setup completed
+24.04/codex: PASS configured-person: person/ada persisted
+24.04/codex: PASS configured-node: node persisted and is not local
+24.04/codex: PASS config-merge: existing checkpoint setting preserved
+24.04/codex: PASS self-install: st3, relative st link and pty installed
+24.04/codex: PASS service-active: user service is active/running
+24.04/codex: PASS login-path: st resolves in a fresh login shell
+24.04/codex: PASS doctor-healthy: ordinary doctor healthy
+24.04/codex: PASS doctor-user-tools: no irrelevant tool warnings
+24.04/codex: PASS linger-guidance: exact command printed when lingering is refused
+24.04/codex: PASS tui-frame: first frame, visible Home/Now, Ctrl+Q and terminal restoration
+24.04/codex: PASS fixture-workspace: private workspace created for the explicit test seat
+24.04/codex: PASS fixture-seat-start: explicit codex seat starts without built-in expert
+24.04/codex: PASS fixture-wake: real graph message sent to disposable seat
+24.04/codex: PASS fixture-read-message: selected native provider successfully reads the exact wake
+24.04/codex: PASS codex-native-server: native app-server/TUI handshake completed
+24.04/codex: PASS plain-mcp-idle: no notifications or error outside a seat
+24.04/codex: PASS fixture-seat-stopped: test-created seat stopped after proof
+24.04/codex: PASS idempotent-setup: second setup creates no second mission run
+24.04/codex: {"PASS": 23}

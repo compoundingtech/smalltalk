@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Check the actual user plugin in unscoped native Claude, without a model turn."""
+import argparse
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+from pathlib import Path
+import shlex
+import sys
+import tempfile
+
+loader=importlib.machinery.SourceFileLoader("rig",str(Path(__file__).with_name("onboarding-e2e")))
+spec=importlib.util.spec_from_loader(loader.name,loader)
+rig=importlib.util.module_from_spec(spec)
+loader.exec_module(rig)
+
+PROBE=r'''
+import json,os,select,subprocess,time
+from pathlib import Path
+env=dict(os.environ)
+for key in ("ST_AGENT","ST3_SUBJECT","ST3_INCARNATION","ST3_ENDPOINT"):
+ env.pop(key,None)
+settings=json.loads((Path.home()/".claude/settings.json").read_text())
+assert settings["enabledPlugins"]["st-channel@st"] is True,"actual user plugin is not enabled"
+installed=json.loads((Path.home()/".claude/plugins/installed_plugins.json").read_text())
+entries=installed["plugins"]["st-channel@st"]
+entry=next(x for x in entries if x.get("scope")=="user")
+plugin=Path(entry["installPath"])
+server=json.loads((plugin/".mcp.json").read_text())["mcpServers"]["st"]
+argv=[server["command"],*server.get("args",[])]
+proc=subprocess.Popen(argv,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,text=True)
+frames=[]
+try:
+ for ident,method in enumerate(("initialize","tools/list","ping"),1):
+  request={"jsonrpc":"2.0","id":ident,"method":method,"params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"plain-claude-regression","version":"1"}}}
+  proc.stdin.write(json.dumps(request)+"\n"); proc.stdin.flush()
+  assert select.select([proc.stdout],[],[],5)[0],"MCP response timeout"
+  response=json.loads(proc.stdout.readline()); frames.append(response)
+  assert response.get("id")==ident and "error" not in response,response
+  if ident==1:
+   assert response["result"]["capabilities"]=={},response
+   proc.stdin.write(json.dumps({"jsonrpc":"2.0","method":"notifications/initialized"})+"\n"); proc.stdin.flush()
+  if ident==2: assert response["result"]=={"tools":[]},response
+  if ident==3: assert response["result"]=={},response
+ time.sleep(1)
+ assert proc.poll() is None,"idle server exited before EOF"
+ assert not select.select([proc.stdout],[],[],0)[0],"unscoped server emitted an unsolicited notification"
+ proc.stdin.close(); proc.stdin=None
+ out,err=proc.communicate(timeout=5)
+ assert proc.returncode==0 and not out and not err,(proc.returncode,out,err)
+ print(json.dumps({"plugin":"st-channel@st","scope":"user","enabled":True,"plugin_path":str(plugin),"argv":argv,"absent_environment":["ST_AGENT","ST3_SUBJECT"],"responses":frames,"alive_before_eof":True,"exit_after_eof":proc.returncode,"unsolicited_notifications":False,"stderr":err}))
+finally:
+ if proc.poll() is None:
+  proc.kill(); proc.wait()
+'''
+
+def main():
+ parser=argparse.ArgumentParser(description=__doc__)
+ parser.add_argument("--archive",required=True)
+ parser.add_argument("--sha256",required=True)
+ parser.add_argument("--claude",type=Path,required=True,help="native Linux ELF; no host auth is copied")
+ parser.add_argument("--image",default="onb-sysd2404")
+ parser.add_argument("--out",type=Path,required=True)
+ args=parser.parse_args()
+ if args.out.exists(): parser.error("output directory already exists")
+ with args.claude.open("rb") as f:
+  if f.read(4)!=b"\x7fELF": parser.error("Claude must be a native ELF executable")
+ args.backend="docker"; args.keep=False
+ with open("/tmp/st-onboarding-container.lock","a") as lock,tempfile.TemporaryDirectory() as tmp:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  archive,metadata=rig.load_archive(args,tmp)
+  machine=rig.Machine(args,"24.04","plain-claude-enabled")
+  run=rig.Run(machine,args.out,archive,metadata)
+  try:
+   machine.start()
+   if not run.install(False): return 1
+   machine.send(args.claude.read_bytes(),"/home/ada/smalltalk-install/claude-native")
+   r=run.execute("Install native Claude without host auth","mkdir -p ~/.local/bin ~/plain-work; install -m755 ~/smalltalk-install/claude-native ~/.local/bin/claude; ~/.local/bin/claude --version")
+   if not run.check("native-claude",r["exit"]==0,"actual Claude binary copied; no credentials/settings copied"): return 1
+   r=run.execute("Setup without any provider seat",shlex.join([run.st,"setup","--person","ada","--node","studio","--yes","--harness","none","--service","true"]))
+   if not run.check("plain-setup",r["exit"]==0,"configured actual daemon without creating an expert/provider seat"): return 1
+   run.st="/home/ada/.local/bin/st"
+   r=run.cli("Install actual bundled user plugin","claude-channel","install","--no-policy")
+   if not run.check("actual-plugin-install",r["exit"]==0,"candidate installer, no machine policy"): return 1
+   r=run.execute("Explicitly enable actual plugin at user scope","claude plugin enable st-channel@st --scope user; claude plugin list --json")
+   if not run.check("actual-plugin-enabled",r["exit"]==0 and "st-channel@st" in r["stdout"],"user plugin explicitly enabled for this regression"): return 1
+   r=run.execute("Unscoped native Claude checks enabled MCP server","cd ~/plain-work; env -u ST_AGENT -u ST3_SUBJECT -u ST3_INCARNATION -u ST3_ENDPOINT claude mcp list",timeout=35)
+   text=run.output(r)
+   run.check("plain-claude-mcp-healthy",r["exit"]==0 and "st-channel" in text and "Connected" in text and "Failed" not in text,"actual native Claude positively reports connected user st plugin, no failed server")
+   r=run.execute("Actual installed plugin idle protocol", "python3 -c "+shlex.quote(PROBE),timeout=25)
+   run.check("actual-idle-protocol",r["exit"]==0,"installed plugin serves initialize/empty tools/ping; alive before EOF, no notifications/errors")
+  except Exception as error:
+   run.check("runner-error",False,str(error))
+  finally:
+   try: machine.close()
+   except Exception as error: run.check("cleanup",False,str(error))
+  return int(any(c["status"]=="FAIL" for c in run.checks))
+
+if __name__=="__main__": sys.exit(main())

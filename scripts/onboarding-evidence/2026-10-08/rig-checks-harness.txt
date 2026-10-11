@@ -1,0 +1,11 @@
+test_archive_traversal_rejected (__main__.RigChecks.test_archive_traversal_rejected) ... ok
+test_bad_hash_rejected_before_machine_creation (__main__.RigChecks.test_bad_hash_rejected_before_machine_creation) ... ok
+test_fixture_cannot_start_before_consent (__main__.RigChecks.test_fixture_cannot_start_before_consent) ... ok
+test_mission_identity_ignores_runtime_changes (__main__.RigChecks.test_mission_identity_ignores_runtime_changes) ... ok
+test_packaged_selectors_resolve_the_native_mcp_after_consent (__main__.RigChecks.test_packaged_selectors_resolve_the_native_mcp_after_consent) ... ok
+test_vm_refused_in_ci_before_output_creation (__main__.RigChecks.test_vm_refused_in_ci_before_output_creation) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.556s
+
+OK

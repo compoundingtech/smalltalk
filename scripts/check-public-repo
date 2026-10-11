@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parent.parent
 HOSTS = tuple(re.escape(part) for part in ("he" + "tz", "Sil" + "ber", "bl" + "uey"))
 HOST = re.compile(r"(?i)(?<![a-z0-9])(?:" + "|".join(HOSTS) + r")(?![a-z0-9])")
 HOME = re.compile(r"/(?:home|Users)/([A-Za-z][A-Za-z0-9_.-]*)")
+# Reserved invented homes used by public examples and clean-machine fixtures.
+EXAMPLE_HOMES = {"example", "ada"}
 PERSON_NAME = r"([A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*)"
 PERSON = re.compile("person" + r"/" + PERSON_NAME)
 ENCODED_PERSON = re.compile("person" + r"%2[fF]" + PERSON_NAME)
@@ -58,7 +60,7 @@ def findings(path, content):
         if HOST.search(line):
             reasons.append("real host name")
         for match in HOME.finditer(line):
-            if match.group(1) != "example":
+            if match.group(1) not in EXAMPLE_HOMES:
                 reasons.append("personal home path")
         for match in PERSON.finditer(line):
             if match.group(1) not in EXAMPLE_PEOPLE:

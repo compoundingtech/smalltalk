@@ -1,0 +1,74 @@
+24.04/setup: PASS fresh-home: no existing st config or state
+24.04/setup: PASS guest-release: actual guest matches requested Ubuntu release
+24.04/setup: PASS clean-tool-path: no gh, developer tools or provider binaries initially installed
+24.04/setup: PASS archive-extracted: copied bytes match recorded archive; BUILD.json captured
+24.04/setup: PASS setup-success: real candidate setup completed
+24.04/setup: PASS configured-person: person/ada persisted
+24.04/setup: PASS configured-node: node persisted and is not local
+24.04/setup: PASS config-merge: existing checkpoint setting preserved
+24.04/setup: PASS self-install: st3, relative st link and pty installed
+24.04/setup: PASS service-active: user service is active/running
+24.04/setup: PASS login-path: st resolves in a fresh login shell
+24.04/setup: PASS doctor-healthy: ordinary doctor healthy
+24.04/setup: PASS doctor-user-tools: no irrelevant tool warnings
+24.04/setup: PASS default-cache-override-absent: main unit and live daemon override None; healthy doctor reader target 2048 KiB (expected 2048)
+24.04/setup: PASS linger-guidance: exact command printed when lingering is refused
+24.04/setup: PASS tui-frame: first frame, visible Home/Now, Ctrl+Q and terminal restoration
+24.04/setup: PASS idempotent-setup: second setup creates no second mission run
+24.04/setup: PASS default-cache-override-absent: main unit and live daemon override None; healthy doctor reader target 2048 KiB (expected 2048)
+24.04/setup: PASS machine-restart: Docker restart is a container restart; Incus is a real guest restart
+24.04/setup: PASS linger-reboot-behavior: manager survives only when lingering enabled
+24.04/setup: {"PASS": 20}
+24.04/small-machine: PASS fresh-home: no existing st config or state
+24.04/small-machine: PASS guest-release: actual guest matches requested Ubuntu release
+24.04/small-machine: PASS clean-tool-path: no gh, developer tools or provider binaries initially installed
+24.04/small-machine: PASS archive-extracted: copied bytes match recorded archive; BUILD.json captured
+24.04/small-machine: PASS small-machine-memory-limit: visible cgroup memory.max is exactly 1024 MiB
+24.04/small-machine: PASS setup-success: real candidate setup completed
+24.04/small-machine: PASS configured-person: person/ada persisted
+24.04/small-machine: PASS configured-node: node persisted and is not local
+24.04/small-machine: PASS config-merge: existing checkpoint setting preserved
+24.04/small-machine: PASS self-install: st3, relative st link and pty installed
+24.04/small-machine: PASS service-active: user service is active/running
+24.04/small-machine: PASS login-path: st resolves in a fresh login shell
+24.04/small-machine: PASS doctor-healthy: ordinary doctor healthy
+24.04/small-machine: PASS doctor-user-tools: no irrelevant tool warnings
+24.04/small-machine: PASS small-machine-cache-summary: setup selects 2048 KiB from default 2048, 128 retained readers and quarter RAM budget; no summary when default fits
+24.04/small-machine: PASS small-machine-cache-selected: main unit and live daemon override None; healthy doctor reader target 2048 KiB (expected 2048)
+24.04/small-machine: FAIL small-machine-daemon-serving: live daemon API serves the configured machine
+24.04/small-machine: PASS small-machine-restart-cache: main unit and live daemon override None; healthy doctor reader target 2048 KiB (expected 2048)
+24.04/small-machine: PASS small-machine-service-restarted: service restart creates a different daemon PID with persistent cache settings
+24.04/small-machine: PASS linger-guidance: exact command printed when lingering is refused
+24.04/small-machine: PASS tui-frame: first frame, visible Home/Now, Ctrl+Q and terminal restoration
+24.04/small-machine: PASS idempotent-setup: second setup creates no second mission run
+24.04/small-machine: PASS small-machine-idempotent-cache: main unit and live daemon override None; healthy doctor reader target 2048 KiB (expected 2048)
+24.04/small-machine: PASS machine-restart: Docker restart is a container restart; Incus is a real guest restart
+24.04/small-machine: PASS linger-reboot-behavior: manager survives only when lingering enabled
+24.04/small-machine: {"PASS": 24, "FAIL": 1}
+24.04/small-machine-512m: PASS fresh-home: no existing st config or state
+24.04/small-machine-512m: PASS guest-release: actual guest matches requested Ubuntu release
+24.04/small-machine-512m: PASS clean-tool-path: no gh, developer tools or provider binaries initially installed
+24.04/small-machine-512m: PASS archive-extracted: copied bytes match recorded archive; BUILD.json captured
+24.04/small-machine-512m: PASS small-machine-memory-limit: visible cgroup memory.max is exactly 512 MiB
+24.04/small-machine-512m: PASS setup-success: real candidate setup completed
+24.04/small-machine-512m: PASS configured-person: person/ada persisted
+24.04/small-machine-512m: PASS configured-node: node persisted and is not local
+24.04/small-machine-512m: PASS config-merge: existing checkpoint setting preserved
+24.04/small-machine-512m: PASS self-install: st3, relative st link and pty installed
+24.04/small-machine-512m: PASS service-active: user service is active/running
+24.04/small-machine-512m: PASS login-path: st resolves in a fresh login shell
+24.04/small-machine-512m: PASS doctor-healthy: ordinary doctor healthy
+24.04/small-machine-512m: PASS doctor-user-tools: no irrelevant tool warnings
+24.04/small-machine-512m: PASS small-machine-cache-summary: setup selects 1024 KiB from default 2048, 128 retained readers and quarter RAM budget; no summary when default fits
+24.04/small-machine-512m: PASS small-machine-cache-reduced: 512 MiB control selects a strictly smaller cache
+24.04/small-machine-512m: PASS small-machine-cache-selected: main unit and live daemon override 1024; healthy doctor reader target 1024 KiB (expected 1024)
+24.04/small-machine-512m: FAIL small-machine-daemon-serving: live daemon API serves the configured machine
+24.04/small-machine-512m: PASS small-machine-restart-cache: main unit and live daemon override 1024; healthy doctor reader target 1024 KiB (expected 1024)
+24.04/small-machine-512m: PASS small-machine-service-restarted: service restart creates a different daemon PID with persistent cache settings
+24.04/small-machine-512m: PASS linger-guidance: exact command printed when lingering is refused
+24.04/small-machine-512m: PASS tui-frame: first frame, visible Home/Now, Ctrl+Q and terminal restoration
+24.04/small-machine-512m: PASS idempotent-setup: second setup creates no second mission run
+24.04/small-machine-512m: PASS small-machine-idempotent-cache: main unit and live daemon override 1024; healthy doctor reader target 1024 KiB (expected 1024)
+24.04/small-machine-512m: PASS machine-restart: Docker restart is a container restart; Incus is a real guest restart
+24.04/small-machine-512m: PASS linger-reboot-behavior: manager survives only when lingering enabled
+24.04/small-machine-512m: {"PASS": 25, "FAIL": 1}
