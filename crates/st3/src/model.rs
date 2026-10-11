@@ -2026,6 +2026,10 @@ pub struct MessageView {
 pub struct MessageSendReceipt {
     #[serde(flatten)]
     pub message: MessageView,
+    /// This daemon's accepted delivery kind. Absent on pre-silent daemons: tags alone
+    /// cannot confirm that an older daemon honors silent delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// The key that names this message: a request with the same key and content returns it again.
     #[serde(default)]
     pub idempotency_key: String,
@@ -2468,6 +2472,10 @@ pub struct StepRunView {
     pub progress_summary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_at_unix_ms: Option<u128>,
+    /// When st last nudged this attempt's holder for idling with nothing set to wake it, while
+    /// the step is held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nudged_at_unix_ms: Option<u128>,
     /// The `work complete` summary for the current attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_summary: Option<String>,

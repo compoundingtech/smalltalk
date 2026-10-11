@@ -949,7 +949,7 @@ def run(args, root, evidence):
             node.start()
         source = root / "mission.kdl"
         source.write_text(mission_source(node, count, args.harness, hold=args.scenario == "suspend"))
-        node.cli("missions", "publish", str(source), "--as", "person/eval")
+        node.cli("apply", str(source), "--as", "person/eval")
         node.cli("missions", "start", MISSION, "--id", RUN_ID, "--workspace", str(root / "ws"),
                  "--as", "person/eval")
         seats.prove("boot")

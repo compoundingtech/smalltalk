@@ -1,0 +1,80 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "conversation",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 1
+  },
+  "state": {
+    "threads": [
+      {
+        "agent": "agent/example/atlas/builder",
+        "has_more": false,
+        "items": [
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-unicode-builder-1",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-unicode-builder-1",
+            "revision": 1,
+            "role": "user",
+            "sequence": 1,
+            "timestamp": "2030-01-01T11:59:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "واجهة العربية — 日本語の表示 — Café — 👩🏽‍💻 🚀 — 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 — ~/src/atlas/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/fixtures"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-unicode-builder-2",
+            "revision": 1,
+            "role": "user",
+            "sequence": 2,
+            "timestamp": "2030-01-01T11:59:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Preserve exact code points: واجهة العربية — 日本語の表示 — Café — 👩🏽‍💻 🚀 — 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 — ~/src/atlas/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/fixtures"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-unicode-builder-3",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 3,
+            "timestamp": "2030-01-01T11:59:04.000Z",
+            "type": "content"
+          }
+        ],
+        "page_size": 50,
+        "session_id": "session/example-atlas-builder"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/2/timestamp"
+    }
+  ],
+  "variant": "default",
+  "world": "unicode"
+}

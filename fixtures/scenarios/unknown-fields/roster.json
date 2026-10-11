@@ -1,0 +1,336 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "tolerant",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "roster",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 19
+  },
+  "state": {
+    "agents": [
+      {
+        "active_work_count": 1,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "builder/forward-compatibility",
+          "repository": "~/src/atlas"
+        },
+        "current_session_id": "session/example-atlas-builder",
+        "current_work": [
+          {
+            "id": "step-run/example/atlas/forward-compatibility/1/step-1",
+            "mission_id": "mission/example/atlas/forward-compatibility",
+            "mission_run_id": "mission-run/example/atlas/forward-compatibility/1",
+            "path": "step-1",
+            "since": "2030-01-01T11:58:00.000Z",
+            "state": "claimed",
+            "title": "Preserve future daemon observations"
+          }
+        ],
+        "current_work_ids": [
+          "step-run/example/atlas/forward-compatibility/1/step-1"
+        ],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "busy",
+        "host_id": "host/foundry",
+        "id": "agent/example/atlas/builder",
+        "incarnation_id": "rt-atlas-builder-645:2",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:59:58.000Z",
+        "name": "Atlas Builder",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": "mission-run/example/atlas/forward-compatibility/1",
+        "protocol_features": {
+          "compatibility_probes": true,
+          "diagnostic_summaries": true
+        },
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag14",
+        "runtime_ids": [
+          "runtime/example-atlas-builder"
+        ],
+        "since": "2030-01-01T11:58:00.000Z",
+        "state": "reconciling",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:59:58.000Z",
+        "workspace": "~/src/atlas/.worktrees/builder"
+      }
+    ],
+    "machines": [
+      {
+        "capacity": {
+          "reason": "no capacity observation",
+          "state": "unknown"
+        },
+        "fleet_id": "fleet/example-atlas",
+        "host_id": "host/foundry",
+        "id": "machine/foundry",
+        "kind": "machine",
+        "name": "foundry",
+        "occupancy": {
+          "running_runtimes": 1
+        },
+        "projects": [
+          "~/src/atlas"
+        ],
+        "revision": "mh-foundry",
+        "runtime_ids": [
+          "runtime/example-atlas-builder"
+        ],
+        "state": "local",
+        "transports": [
+          {
+            "last_success_at": "2030-01-01T11:59:30.000Z",
+            "protocol": "unix",
+            "status": "local"
+          }
+        ],
+        "updated_at": "2030-01-01T11:59:30.000Z",
+        "work": [
+          "work/example/atlas/forward-compatibility/1/step-1"
+        ]
+      }
+    ],
+    "order": [
+      "agent/example/atlas/builder"
+    ],
+    "resources": [
+      {
+        "id": "compatibility-probe/scenario-unknown-fields-builder",
+        "kind": "compatibility-probe",
+        "mission_id": "mission/example/atlas/forward-compatibility",
+        "owner_id": "agent/example/atlas/builder",
+        "payload": {
+          "preserved_fields": [
+            "protocol_features",
+            "reconciling",
+            "diagnostic_summary"
+          ],
+          "sample_timestamp": "2035-01-02T03:04:05.000Z",
+          "status": "running"
+        },
+        "revision": "1",
+        "updated_at": "2030-01-01T11:59:58.000Z"
+      }
+    ],
+    "runtimes": [
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-atlas-builder",
+        "incarnation_id": "rt-atlas-builder-645:2",
+        "kind": "runtime",
+        "owner_host_id": "host/foundry",
+        "owner_id": "agent/example/atlas/builder",
+        "owner_run_id": "mission-run/example/atlas/forward-compatibility/1",
+        "revision": "rt9",
+        "runtime_id": "rt-atlas-builder-645",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 2000,
+      "removes": [],
+      "store": 2,
+      "upserts": [
+        {
+          "id": "compatibility-probe/scenario-unknown-fields-builder",
+          "kind": "compatibility-probe",
+          "mission_id": "mission/example/atlas/forward-compatibility",
+          "owner_id": "agent/example/atlas/builder",
+          "payload": {
+            "preserved_fields": [
+              "protocol_features",
+              "reconciling",
+              "diagnostic_summary"
+            ],
+            "sample_timestamp": "2035-01-02T03:04:05.000Z",
+            "status": "passed"
+          },
+          "revision": "2",
+          "updated_at": "2030-01-01T12:00:02.000Z"
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 5000,
+      "removes": [
+        "compatibility-probe/scenario-unknown-fields-builder"
+      ],
+      "store": 4,
+      "upserts": []
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/resources/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    }
+  ],
+  "unknown": [
+    {
+      "pointer": "/state/agents/0/protocol_features"
+    },
+    {
+      "known_value": "running",
+      "pointer": "/state/agents/0/state"
+    },
+    {
+      "known_value": {
+        "active_work_count": 1,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "builder/forward-compatibility",
+          "repository": "~/src/atlas"
+        },
+        "current_session_id": "session/example-atlas-builder",
+        "current_work": [
+          {
+            "id": "step-run/example/atlas/forward-compatibility/1/step-1",
+            "mission_id": "mission/example/atlas/forward-compatibility",
+            "mission_run_id": "mission-run/example/atlas/forward-compatibility/1",
+            "path": "step-1",
+            "since": "2030-01-01T11:58:00.000Z",
+            "state": "claimed",
+            "title": "Preserve future daemon observations"
+          }
+        ],
+        "current_work_ids": [
+          "step-run/example/atlas/forward-compatibility/1/step-1"
+        ],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "busy",
+        "host_id": "host/foundry",
+        "id": "agent/example/atlas/builder",
+        "incarnation_id": "rt-atlas-builder-645:2",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:59:58.000Z",
+        "name": "Atlas Builder",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": "mission-run/example/atlas/forward-compatibility/1",
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag14",
+        "runtime_ids": [
+          "runtime/example-atlas-builder"
+        ],
+        "since": "2030-01-01T11:58:00.000Z",
+        "state": "running",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:59:58.000Z",
+        "workspace": "~/src/atlas/.worktrees/builder"
+      },
+      "pointer": "/state/resources/0"
+    },
+    {
+      "known_value": {
+        "active_work_count": 1,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "builder/forward-compatibility",
+          "repository": "~/src/atlas"
+        },
+        "current_session_id": "session/example-atlas-builder",
+        "current_work": [
+          {
+            "id": "step-run/example/atlas/forward-compatibility/1/step-1",
+            "mission_id": "mission/example/atlas/forward-compatibility",
+            "mission_run_id": "mission-run/example/atlas/forward-compatibility/1",
+            "path": "step-1",
+            "since": "2030-01-01T11:58:00.000Z",
+            "state": "claimed",
+            "title": "Preserve future daemon observations"
+          }
+        ],
+        "current_work_ids": [
+          "step-run/example/atlas/forward-compatibility/1/step-1"
+        ],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "busy",
+        "host_id": "host/foundry",
+        "id": "agent/example/atlas/builder",
+        "incarnation_id": "rt-atlas-builder-645:2",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:59:58.000Z",
+        "name": "Atlas Builder",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": "mission-run/example/atlas/forward-compatibility/1",
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag14",
+        "runtime_ids": [
+          "runtime/example-atlas-builder"
+        ],
+        "since": "2030-01-01T11:58:00.000Z",
+        "state": "running",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:59:58.000Z",
+        "workspace": "~/src/atlas/.worktrees/builder"
+      },
+      "pointer": "/timeline/0/upserts/0"
+    }
+  ],
+  "variant": "default",
+  "world": "unknown-fields"
+}

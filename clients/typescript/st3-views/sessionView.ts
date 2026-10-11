@@ -1,3 +1,4 @@
+import type { ConversationHeader } from './conversationView.ts';
 import type { Page, Session } from '@smalltalk/st3-client';
 
 // The gateway's discovery fields are additional properties on the generated
@@ -88,7 +89,7 @@ export type Older = {
   /** Why the last page could not be read; scrolling up tries again. */
   failed?: string;
 };
-export type Conversation<T extends Entry> = { entries: T[]; hasOlder: boolean; newestSequence: number; sessionId?: string; older: Older };
+export type Conversation<T extends Entry> = { entries: T[]; hasOlder: boolean; newestSequence: number; sessionId?: string; /** The conversation header st last sent (`conversation-blocks.v1`), register fields first. */ header?: ConversationHeader; older: Older };
 const noOlder: Older = { paged: false, start: false, loading: false };
 
 // Everything a person reads in a conversation: the harness's turns, tool calls and results, Small
@@ -121,11 +122,12 @@ function moreBefore(older: Older, live: boolean): boolean {
 // back are never dropped. A new newest page keeps those pages while it still meets them.
 export function applyConversation<T extends Entry>(
   previous: Conversation<T> | undefined,
-  frame: { replace: boolean; items: T[]; hasMore: boolean; sessionId?: string },
+  frame: { replace: boolean; items: T[]; hasMore: boolean; sessionId?: string; header?: ConversationHeader },
   want = 1000,
 ): Conversation<T> {
   const otherSession = !!frame.sessionId && !!previous?.sessionId && frame.sessionId !== previous.sessionId;
   const sessionId = frame.sessionId ?? previous?.sessionId;
+  const header = frame.header ?? (otherSession ? undefined : previous?.header);
   let older = previous && !otherSession ? previous.older : noOlder;
   let base: T[] = [];
   let live = previous?.hasOlder ?? frame.hasMore;
@@ -150,7 +152,7 @@ export function applyConversation<T extends Entry>(
     entries = entries.slice(-want);
     live = true;
   }
-  return { entries, hasOlder: moreBefore(older, live), newestSequence, sessionId, older };
+  return { entries, hasOlder: moreBefore(older, live), newestSequence, sessionId, ...(header ? { header } : {}), older };
 }
 
 /** An earlier page of `sessionId`'s timeline; entries already held win. A page for another

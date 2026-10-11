@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web terminal input now admits keys against the live screen of the terminal the view shows: the input session reads that screen through the view's subject address (terminal/<agent path>) and still posts and fences with the gateway's own terminal id (terminal/<agent id>), so typing no longer fails on every live gateway with \"The terminal restarted or stopped updating\".",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only change; no runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Client-only change against the existing gateway terminal.input action; the posted terminal id and fences are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; the app is not deployed by this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

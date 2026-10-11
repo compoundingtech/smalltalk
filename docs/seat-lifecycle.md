@@ -377,3 +377,5 @@ The label must be non-empty. Like declaring a seat in free mode, a person or an 
 any seat. A bound harness must act as itself, and rename preserves the original declaring actor.
 
 [`examples/st3/seats`](../examples/st3/seats) has a seat file for each harness.
+
+Ordinary messages are `silent` or `wake` (the default for every sender and seat). Silent mail stays unread without waking; each real wake offers at most eight, with older mail available on demand. There is no per-seat wake policy or inferred question type. See [silent messages](st3/silent-messages.md).

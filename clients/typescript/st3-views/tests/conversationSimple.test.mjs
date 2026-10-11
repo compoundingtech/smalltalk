@@ -24,3 +24,15 @@ assert.equal(folded[3].tool.title, '$ cat src/main.rs');
 const opened = simplify(entries, new Set([bundleId('t1')]));
 assert.deepEqual(opened.map(row => row.kind), ['entry', 'bundle', 'call', 'call', 'call', 'entry', 'call']);
 assert.equal(opened[1].open, true);
+
+// Content previews and recoverable errors are not swallowed by a run of tool calls.
+{
+  const rows = simplify([
+    call('before', '$ echo before', 'ok'),
+    call('write', 'write demo · 2 lines · 10 bytes', 'ok'),
+    call('error', 'assistant error · recovered · retried', 'ok'),
+    call('compaction', 'compaction · 100 → 20 tokens', 'ok'),
+    call('after', '$ echo after', 'ok'),
+  ], new Set());
+  assert.deepEqual(rows.map(row => row.kind), ['call', 'entry', 'entry', 'entry', 'call']);
+}

@@ -172,11 +172,13 @@ impl Sample {
     }
 }
 
-/// Where an agents roster read's time goes: the refresher's fold and its wait for roster
-/// admission, and a fresh read's wait for a publication at its cut and the page it then builds.
+/// Where an agents roster read's time goes: the refresher's fold, from a previous publication
+/// or from the log when none was kept, and its wait for roster admission; and a fresh read's
+/// wait for a publication at its cut and the page it then builds.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
 pub(super) enum RosterStage {
     Refresh,
+    RefreshCold,
     RefreshAdmission,
     FreshWait,
     FreshPage,
@@ -186,6 +188,7 @@ impl RosterStage {
     fn name(self) -> &'static str {
         match self {
             Self::Refresh => "refresh",
+            Self::RefreshCold => "refresh-cold",
             Self::RefreshAdmission => "refresh-admission",
             Self::FreshWait => "fresh-wait",
             Self::FreshPage => "fresh-page",
@@ -194,7 +197,7 @@ impl RosterStage {
 
     fn population(self) -> &'static str {
         match self {
-            Self::Refresh | Self::RefreshAdmission => "refresher-folds",
+            Self::Refresh | Self::RefreshCold | Self::RefreshAdmission => "refresher-folds",
             Self::FreshWait | Self::FreshPage => "fresh-reads",
         }
     }
@@ -213,6 +216,7 @@ pub(super) struct Meter {
     /// Windows by target position in `slo/targets.toml`: served here, then from another machine.
     targets: Vec<[smallclaims::windows::Series; 2]>,
     cpu: smallclaims::windows::Cpu,
+    client_intervals: BTreeMap<(String, String, Option<String>), smallclaims::windows::IntervalSeries>,
 }
 
 /// How a completed sample is counted in the windows. Build it with [`Timed::resolve`] before
@@ -309,6 +313,7 @@ impl Meter {
             .latency
             .iter()
             .enumerate()
+            .filter(|(_, latency)| !latency.paths.iter().any(|p| p.starts_with("client/ios/")))
             .map(|(index, latency)| {
                 let windows = |remote: bool| {
                     self.targets
@@ -330,7 +335,7 @@ impl Meter {
             })
             .collect::<Vec<_>>();
         rows.extend(crate::slo::store_report(self.cpu.snapshot(now)));
-        let paths = self
+        let mut paths = self
             .paths
             .iter()
             .filter(|(_, series)| !series.is_empty(now))
@@ -342,7 +347,51 @@ impl Meter {
                 })
             })
             .collect::<Vec<_>>();
+        let wall = crate::api::client_now_ms() as u64;
+        for latency in targets.latency.iter().filter(|t| t.paths.iter().any(|p| p.starts_with("client/ios/"))) {
+            let windows = self.client_windows(wall, &latency.name, false);
+            rows.push(json!({"name":latency.name,"about":latency.about,"p99_ms":latency.p99_ms,
+                "population":"client-observed-latencies", "windows":windows}));
+        }
+        for share in &targets.share {
+            rows.push(json!({"name":share.name,"about":share.about,"min_percent":share.min_percent,
+                "population":"client-observed-foreground-ms","windows":self.client_windows(wall,&share.name,true)}));
+        }
+        for ((target,carrier,path),series) in &self.client_intervals {
+            let share = target == "ios-live-share";
+            paths.push(json!({"path":format!("client/ios/{}", target.strip_prefix("ios-").unwrap_or(target)),
+                "target":target,"carrier":carrier,"carrier_path":path,
+                "population":if share {"client-observed-foreground-ms"} else {"client-observed-latencies"},
+                "windows":series.snapshot(wall,share)}));
+        }
         json!({"targets": rows, "paths": paths})
+    }
+
+    pub(super) fn can_report(&self, now_ms: u64, samples: &[super::client_observations::Validated]) -> bool {
+        samples.iter().filter(|s| Self::live_minute(now_ms, &s.minute)).all(|s| self.client_intervals.get(&s.key).is_none_or(|series| series.can_record(&s.minute)))
+    }
+
+    pub(super) fn report(&mut self, now_ms: u64, samples: &[super::client_observations::Validated]) {
+        for s in samples {
+            if Self::live_minute(now_ms, &s.minute) {
+                self.client_intervals.entry(s.key.clone()).or_default().record(now_ms,&s.minute);
+            }
+        }
+    }
+
+    fn live_minute(now_ms: u64, minute: &smallclaims::windows::MinuteSummary) -> bool {
+        minute.start_ms >= now_ms.saturating_sub(3_600_000) && minute.start_ms.saturating_add(60_000) <= now_ms
+    }
+
+    fn client_windows(&self, now_ms: u64, target: &str, share: bool) -> Value {
+        let mut total = smallclaims::windows::IntervalSeries::default();
+        // At most 9 carrier/path combinations per target and 60 minutes per series.
+        for ((name,_,_),series) in &self.client_intervals {
+            if name == target {
+                total.absorb(series);
+            }
+        }
+        total.snapshot(now_ms,share)
     }
 
     pub(super) fn snapshot(&self) -> Vec<Value> {
@@ -511,7 +560,7 @@ mod tests {
         assert_eq!(read["remote_windows"]["5m"]["count"], 2);
         assert_eq!(read["remote_windows"]["5m"]["over_target"], 1);
         assert_eq!(target("write-ack")["windows"]["1h"]["count"], 0);
-        for name in ["sql-statement", "transaction", "cpu"] {
+        for name in ["sql-statement", "transaction", "cpu", "database"] {
             target(name);
         }
         let paths = report["paths"].as_array().unwrap();
@@ -562,7 +611,8 @@ mod tests {
     fn roster_stages_report_their_own_samples_beside_the_route() {
         let mut meter = Meter::default();
         for (stage, ms) in [
-            (RosterStage::Refresh, 40), (RosterStage::Refresh, 60), (RosterStage::RefreshAdmission, 2),
+            (RosterStage::Refresh, 40), (RosterStage::Refresh, 60), (RosterStage::RefreshCold, 1700),
+            (RosterStage::RefreshAdmission, 2),
             (RosterStage::FreshWait, 90), (RosterStage::FreshPage, 4),
         ] {
             meter.record_roster_stage(stage, Duration::from_millis(ms));
@@ -572,6 +622,8 @@ mod tests {
         assert_eq!(stage("refresh")["count"], 2);
         assert_eq!(stage("refresh")["max_ms"], 60);
         assert_eq!(stage("refresh")["population"], "refresher-folds");
+        assert_eq!(stage("refresh-cold")["count"], 1);
+        assert_eq!(stage("refresh-cold")["population"], "refresher-folds");
         assert_eq!(stage("refresh-admission")["p99_ms"], 2);
         assert_eq!(stage("fresh-wait")["p99_ms"], 90);
         assert_eq!(stage("fresh-wait")["population"], "fresh-reads");
@@ -641,4 +693,23 @@ mod tests {
         assert_eq!(renew["max_ms"], 600);
         assert_eq!(meter.snapshot().len(), ROUTES + 1);
     }
+    #[test]
+    fn client_intervals_batch_disjoint_minutes_and_old_reports_are_history_only() {
+        use super::super::client_observations::Validated;
+        let key: (String,String,Option<String>)=("ios-connect".into(),"lan".into(),None);
+        let sample=|start,count|Validated {key:key.clone(), minute:smallclaims::windows::MinuteSummary {
+            start_ms:start,count,over:0,max_ms:100,buckets:vec![(smallclaims::windows::histogram_upper_ms(100),count)]
+        }};
+        let mut meter=Meter::default();
+        meter.report(60_000,&[sample(0,1_000_000_000)]);
+        let now=3_660_000;
+        assert!(meter.can_report(now,&[sample(0,1)]),"expired slot capacity cannot reject history-only reports");
+        meter.report(now,&[sample(0,1)]);
+        assert_eq!(meter.client_windows(now,"ios-connect",false)["1h"]["count"],0);
+        let batch=[sample(3_540_000,100),sample(3_600_000,200)];
+        assert!(meter.can_report(now,&batch));meter.report(now,&batch);
+        assert_eq!(meter.client_windows(now,"ios-connect",false)["5m"]["count"],300);
+        assert_eq!(meter.client_windows(now,"ios-connect",false)["1m"]["count"],200);
+    }
+
 }

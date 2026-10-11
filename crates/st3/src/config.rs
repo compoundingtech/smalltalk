@@ -180,15 +180,28 @@ impl LimitsConfig {
     }
 }
 
-/// `[reconcile]`: maximum background pass starts per minute, default30.
+/// `[reconcile]`: maximum background pass starts per minute, default30, and when a seat that
+/// holds claimed work and has nothing set to wake it is nudged.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReconcileConfig {
     pub max_passes_per_minute: u32,
+    /// How long a seat idles holding a claimed step, with nothing set to wake it, before st nudges
+    /// it: a duration such as `30m`, or `off`.
+    pub idle_nudge_after: String,
+    /// How long a watched thread may stay still and its watch still count as something that will
+    /// wake the seat.
+    pub idle_nudge_quiet_watch: String,
 }
 
 impl Default for ReconcileConfig {
-    fn default() -> Self { Self { max_passes_per_minute: 30 } }
+    fn default() -> Self {
+        Self {
+            max_passes_per_minute: 30,
+            idle_nudge_after: "30m".into(),
+            idle_nudge_quiet_watch: "2h".into(),
+        }
+    }
 }
 
 impl ReconcileConfig {
@@ -196,7 +209,28 @@ impl ReconcileConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!((1..=600).contains(&self.max_passes_per_minute),
             "reconcile.max_passes_per_minute must be between 1 and 600");
+        self.idle_nudge()?;
         Ok(())
+    }
+
+    /// The idle-nudge settings these values name.
+    pub fn idle_nudge(&self) -> Result<crate::reconcile::IdleNudgeSettings> {
+        let at_least_a_minute = |value: &str, name: &str| -> Result<u64> {
+            let ms = parse_duration_ms(value, name)?;
+            anyhow::ensure!(ms >= 60_000, "{name} must be at least 1m");
+            Ok(ms)
+        };
+        let after_ms = match self.idle_nudge_after.trim() {
+            "off" => None,
+            after => Some(at_least_a_minute(after, "reconcile.idle_nudge_after")?),
+        };
+        Ok(crate::reconcile::IdleNudgeSettings {
+            after_ms,
+            quiet_watch_ms: at_least_a_minute(
+                &self.idle_nudge_quiet_watch,
+                "reconcile.idle_nudge_quiet_watch",
+            )?,
+        })
     }
 }
 
@@ -771,6 +805,37 @@ sekrets_profile = "nathan/daemon-gh"
             ))
             .unwrap();
             assert!(parsed.validate().is_err(), "{field}");
+        }
+    }
+
+    #[test]
+    fn idle_nudges_default_to_thirty_minutes_and_a_two_hour_quiet_watch() {
+        let config = Config::default();
+        let settings = config.reconcile.idle_nudge().unwrap();
+        assert_eq!(settings.after_ms, Some(30 * 60_000));
+        assert_eq!(settings.quiet_watch_ms, 2 * 3_600_000);
+        assert!(!toml::to_string(&config).unwrap().contains("[reconcile]"));
+
+        let parsed: Config = toml::from_str(
+            "[reconcile]\nidle_nudge_after = \"45m\"\nidle_nudge_quiet_watch = \"3h\"\n",
+        )
+        .unwrap();
+        parsed.validate().unwrap();
+        let settings = parsed.reconcile.idle_nudge().unwrap();
+        assert_eq!(settings.after_ms, Some(45 * 60_000));
+        assert_eq!(settings.quiet_watch_ms, 3 * 3_600_000);
+
+        let off: Config = toml::from_str("[reconcile]\nidle_nudge_after = \"off\"\n").unwrap();
+        assert_eq!(off.reconcile.idle_nudge().unwrap().after_ms, None);
+
+        for (field, value) in [
+            ("idle_nudge_after", "30s"),
+            ("idle_nudge_after", "soon"),
+            ("idle_nudge_quiet_watch", "off"),
+        ] {
+            let parsed: Config =
+                toml::from_str(&format!("[reconcile]\n{field} = \"{value}\"\n")).unwrap();
+            assert!(parsed.validate().is_err(), "{field} = {value}");
         }
     }
 

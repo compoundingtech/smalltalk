@@ -1,0 +1,189 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "details",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 5
+  },
+  "state": {
+    "missions": [
+      {
+        "active_runs": 1,
+        "id": "mission/example/harbor/cache-policy",
+        "kind": "mission",
+        "mission_revision": "sha256:harbor-mission-1",
+        "revision": "mr-2",
+        "run_generations": {
+          "mission-run/example/harbor/cache-policy/1": "run-generation/example/harbor/cache-policy/1/g1"
+        },
+        "runs": [
+          "mission-run/example/harbor/cache-policy/1"
+        ],
+        "state": "running",
+        "title": "Improve the cache policy",
+        "total_runs": 1,
+        "updated_at": "2030-01-01T11:59:55.000Z"
+      }
+    ],
+    "work": [
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-harbor-builder-521:1",
+        "claimant": "agent/example/harbor/builder",
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-1",
+        "generation_id": "run-generation/example/harbor/cache-policy/1/g1",
+        "goals": [
+          "TTL is 300 seconds"
+        ],
+        "id": "work/example/harbor/cache-policy/1/step-1",
+        "kind": "work",
+        "mission_id": "mission/example/harbor/cache-policy",
+        "mission_run_id": "mission-run/example/harbor/cache-policy/1",
+        "path": "step-1",
+        "readiness_epoch": 1,
+        "revision": "w-1",
+        "state": "waiting-person",
+        "title": "Increase the cache TTL",
+        "updated_at": "2030-01-01T11:59:55.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-harbor-reviewer-396:6",
+        "claimant": "agent/example/harbor/reviewer",
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-2",
+        "generation_id": "run-generation/example/harbor/cache-policy/1/g1",
+        "goals": [
+          "Stale reads are allowed"
+        ],
+        "id": "work/example/harbor/cache-policy/1/step-2",
+        "kind": "work",
+        "mission_id": "mission/example/harbor/cache-policy",
+        "mission_run_id": "mission-run/example/harbor/cache-policy/1",
+        "path": "step-2",
+        "readiness_epoch": 2,
+        "revision": "w-2",
+        "state": "waiting-person",
+        "title": "Allow stale cache reads",
+        "updated_at": "2030-01-01T11:59:55.000Z"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 18000,
+      "removes": [],
+      "store": 18,
+      "upserts": [
+        {
+          "active_runs": 0,
+          "id": "mission/example/harbor/cache-policy",
+          "kind": "mission",
+          "mission_revision": "sha256:harbor-mission-1",
+          "revision": "mr-2",
+          "run_generations": {
+            "mission-run/example/harbor/cache-policy/1": "run-generation/example/harbor/cache-policy/1/g1"
+          },
+          "runs": [
+            "mission-run/example/harbor/cache-policy/1"
+          ],
+          "state": "completed",
+          "title": "Improve the cache policy",
+          "total_runs": 1,
+          "updated_at": "2030-01-01T12:00:18.000Z"
+        },
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-harbor-builder-521:1",
+          "claimant": "agent/example/harbor/builder",
+          "constraints": [
+            "Keep the public API stable until the docs land"
+          ],
+          "definition_id": "def-step-1",
+          "generation_id": "run-generation/example/harbor/cache-policy/1/g1",
+          "goals": [
+            "TTL is 300 seconds"
+          ],
+          "id": "work/example/harbor/cache-policy/1/step-1",
+          "kind": "work",
+          "mission_id": "mission/example/harbor/cache-policy",
+          "mission_run_id": "mission-run/example/harbor/cache-policy/1",
+          "path": "step-1",
+          "readiness_epoch": 1,
+          "revision": "w-1",
+          "state": "completed",
+          "title": "Increase the cache TTL",
+          "updated_at": "2030-01-01T12:00:18.000Z"
+        },
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-harbor-reviewer-396:6",
+          "claimant": "agent/example/harbor/reviewer",
+          "constraints": [
+            "Keep the public API stable until the docs land"
+          ],
+          "definition_id": "def-step-2",
+          "generation_id": "run-generation/example/harbor/cache-policy/1/g1",
+          "goals": [
+            "Stale reads are allowed"
+          ],
+          "id": "work/example/harbor/cache-policy/1/step-2",
+          "kind": "work",
+          "mission_id": "mission/example/harbor/cache-policy",
+          "mission_run_id": "mission-run/example/harbor/cache-policy/1",
+          "path": "step-2",
+          "readiness_epoch": 2,
+          "revision": "w-2",
+          "state": "completed",
+          "title": "Allow stale cache reads",
+          "updated_at": "2030-01-01T12:00:18.000Z"
+        }
+      ]
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/missions/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/2/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "merge-conflict-standoff"
+}

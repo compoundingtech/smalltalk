@@ -65,7 +65,7 @@
   {
     "body": {
       "kind": "event",
-      "value": "transcript unavailable: transcript not bound: Claude session 00000000-0000-4000-8000-000000000000 has no transcript file yet"
+      "value": "starting · transcript unavailable until the harness writes its first line"
     },
     "id": "timeline-entry/noise-24"
   },

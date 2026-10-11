@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Test shared timeline retention boundaries and atomic rollback in private output controls",
+  "replay": {
+    "status": "none",
+    "detail": "Only authored controls and helpers inside the existing cfg(test) module; no shipped writer, SQL, schema, API, native authority or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Only authored controls and helpers inside the existing cfg(test) module; no shipped writer, SQL, schema, API, native authority or recovery behavior changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Only authored controls and helpers inside the existing cfg(test) module; no shipped writer, SQL, schema, API, native authority or recovery behavior changes."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only authored controls and helpers inside the existing cfg(test) module; no shipped writer, SQL, schema, API, native authority or recovery behavior changes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only authored controls and helpers inside the existing cfg(test) module; no shipped writer, SQL, schema, API, native authority or recovery behavior changes."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Only authored controls and helpers inside the existing cfg(test) module; no shipped writer, SQL, schema, API, native authority or recovery behavior changes."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Only authored controls and helpers inside the existing cfg(test) module; no shipped writer, SQL, schema, API, native authority or recovery behavior changes."
+  }
+}

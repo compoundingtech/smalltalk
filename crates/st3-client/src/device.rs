@@ -835,6 +835,7 @@ mod tests {
                 in_reply_to: serde_json::from_value(fields["in_reply_to"].clone()).unwrap(),
                 session_id: serde_json::from_value(fields["session_id"].clone()).unwrap(),
                 tags: serde_json::from_value(fields["tags"].clone()).unwrap(),
+                kind: crate::MessageKind::Wake,
                 attachments: vec![],
                 signature: None,
             };

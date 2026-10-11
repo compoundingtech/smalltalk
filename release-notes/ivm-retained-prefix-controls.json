@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Add real-Store retained-prefix reclamation atomicity and work controls",
+  "replay": {
+    "status": "none",
+    "detail": "Fixture-only real-Store retained-prefix rollback, refused-COMMIT and process-death controls with independent row/byte-counter and native-output oracles. Factor the existing private prune transaction body without SQL changes; no production APIs, schema, Runtime, admission, finalizers or activation change. Exact maintenance successful output visibility only; existing work ceilings and policies remain. Controls unrun at authoring; no cost bound or production qualification claimed."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Fixture-only real-Store retained-prefix rollback, refused-COMMIT and process-death controls with independent row/byte-counter and native-output oracles. Factor the existing private prune transaction body without SQL changes; no production APIs, schema, Runtime, admission, finalizers or activation change. Exact maintenance successful output visibility only; existing work ceilings and policies remain. Controls unrun at authoring; no cost bound or production qualification claimed."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Fixture-only real-Store retained-prefix rollback, refused-COMMIT and process-death controls with independent row/byte-counter and native-output oracles. Factor the existing private prune transaction body without SQL changes; no production APIs, schema, Runtime, admission, finalizers or activation change. Exact maintenance successful output visibility only; existing work ceilings and policies remain. Controls unrun at authoring; no cost bound or production qualification claimed."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Fixture-only real-Store retained-prefix rollback, refused-COMMIT and process-death controls with independent row/byte-counter and native-output oracles. Factor the existing private prune transaction body without SQL changes; no production APIs, schema, Runtime, admission, finalizers or activation change. Exact maintenance successful output visibility only; existing work ceilings and policies remain. Controls unrun at authoring; no cost bound or production qualification claimed."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Fixture-only real-Store retained-prefix rollback, refused-COMMIT and process-death controls with independent row/byte-counter and native-output oracles. Factor the existing private prune transaction body without SQL changes; no production APIs, schema, Runtime, admission, finalizers or activation change. Exact maintenance successful output visibility only; existing work ceilings and policies remain. Controls unrun at authoring; no cost bound or production qualification claimed."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Fixture-only real-Store retained-prefix rollback, refused-COMMIT and process-death controls with independent row/byte-counter and native-output oracles. Factor the existing private prune transaction body without SQL changes; no production APIs, schema, Runtime, admission, finalizers or activation change. Exact maintenance successful output visibility only; existing work ceilings and policies remain. Controls unrun at authoring; no cost bound or production qualification claimed."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Fixture-only real-Store retained-prefix rollback, refused-COMMIT and process-death controls with independent row/byte-counter and native-output oracles. Factor the existing private prune transaction body without SQL changes; no production APIs, schema, Runtime, admission, finalizers or activation change. Exact maintenance successful output visibility only; existing work ceilings and policies remain. Controls unrun at authoring; no cost bound or production qualification claimed."
+  }
+}

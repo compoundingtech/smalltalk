@@ -335,3 +335,47 @@ assert.equal(shouldProbe(1_000, 11_000), true);
   feed.close();
 }
 
+{
+  // A conversation frame carries the header when st sends one (`conversation-blocks.v1`);
+  // without it there is none, and nothing assumes the field.
+  const { client, sockets } = fakeClient();
+  const { handlers } = watch();
+  const feed = new Feed(client, handlers, new ForegroundGate('active'), () => 'action/test', [5]);
+  await settle();
+  const frames = [];
+  feed.followConversation('agent/example/worker', { onEntries: frame => frames.push(frame), onIssue: () => {} });
+  const header = { model: { value: 'synthetic/model', source: 'transcript', as_of: '2026-10-06T12:00:00Z' }, working: { value: true, source: 'register', as_of: '2026-10-06T12:00:00Z' } };
+  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: true, items: [{ id: 'entry/1' }], has_more: false, header });
+  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: false, items: [] });
+  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: true, items: [], header: { model: { value: 'x', source: 'register', as_of: '2026-10-06T12:00:00Z' } } });
+  assert.deepEqual(frames.map(frame => frame.header), [header, undefined, { model: { value: 'x', source: 'register', as_of: '2026-10-06T12:00:00Z' } }]);
+  feed.close();
+}
+
+{
+  // Sidebar follows an explicit owner, applies stream changes and resubscribes on reconnect.
+  const { client, sockets } = fakeClient();
+  const { handlers } = watch();
+  const feed = new Feed(client, handlers, new ForegroundGate('active'), () => 'action/test', [5]);
+  const seen = [], issues = [];
+  const follow = feed.followArrangements('person/avery', { onArrangements: rows => seen.push(rows), onIssue: issue => issues.push(issue) });
+  await settle();
+  assert.deepEqual(sockets[0].sent.at(-1), { kind: 'subscribe', id: 'arrangements', collection: 'arrangements', person: 'person/avery', limit: 100 });
+  const arrangement = { kind: 'arrangement', id: 'arrangement/person/avery/demo', owner: 'person/avery', revision: 'claim/1', deleted: false, body: { version: 1, name: { value: 'Sidebar', revision: 'claim/1' }, folders: {}, placements: {} } };
+  sockets[0].frame({ kind: 'snapshot', id: 'arrangements', collection: 'arrangements', snapshot: snapshot(1), items: [arrangement], order: [arrangement.id], has_more: false });
+  assert.equal(seen[0][0].body.name.value, 'Sidebar');
+  sockets[0].frame({ kind: 'changes', id: 'arrangements', collection: 'arrangements', snapshot: snapshot(2), upserts: [{ ...arrangement, body: { ...arrangement.body, name: { value: 'Renamed', revision: 'claim/2' } } }], removes: [], order: [arrangement.id], has_more: false });
+  assert.equal(seen.at(-1)[0].body.name.value, 'Renamed');
+  sockets[0].frame({ kind: 'resync', id: 'arrangements', retryable: true });
+  assert.equal(sockets[0].sent.filter(command => command.id === 'arrangements').length, 1, 'daemon retries temporary resync itself');
+  sockets[0].drop(new Error('test drop'));
+  await settle(40);
+  assert.equal(sockets[1].sent.at(-1).person, 'person/avery');
+  sockets[1].frame({ kind: 'snapshot', id: 'arrangements', collection: 'arrangements', snapshot: snapshot(3), items: [], order: [], has_more: false });
+  assert.deepEqual(seen.at(-1), []);
+  sockets[1].frame({ kind: 'error', id: 'arrangements', code: 'forbidden', message: 'scope missing' });
+  assert.ok(issues.at(-1).includes('scope missing'));
+  follow.close();
+  assert.deepEqual(sockets[1].sent.at(-1), { kind: 'unsubscribe', id: 'arrangements' });
+  feed.close();
+}

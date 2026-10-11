@@ -85,6 +85,16 @@ const wireState = (world: World, kind: SliceKind, atMs: number): string => JSON.
   ...(kind === 'sync' ? { status: syncStatusAt(world.slices.sync, atMs, world.now) } : {}),
 })
 
+// Pair selection follows check 2's visible expectations, not incidental wire metadata.
+// Notice-only changes do not distinguish roster rows; sync scripts distinguish renders
+// through their projected status, not capabilities or unexecuted future operations.
+const visibleState = (world: World, kind: SliceKind, atMs: number): string => JSON.stringify({
+  loading: world.slices[kind].loading,
+  content: world.slices[kind].loading ? [] : kind === 'sync'
+    ? syncStatusAt(world.slices.sync, atMs, world.now)
+    : markers(world, kind, atMs).sort(),
+})
+
 /** Finds a visible contrast, including sync transitions that occur after the initial snapshot. */
 const contrastTime = (left: World, right: World, kind: SliceKind, atMs: number): number => {
   if (kind !== 'sync') return atMs
@@ -167,7 +177,7 @@ export const scenarioStoryCheck = <TArgs extends Args>(
     return markup
   }
 
-  render(scenario)
+  const initialMarkup = render(scenario)
   const activeKinds = parameter.slices.filter((kind) => parameter.invariant?.[kind] === undefined)
   const baseWorld = resolveScenarioWorld(parameter, { scenario, scenarioNow: now }, baselineArgs)
   let variantPairs = 0
@@ -187,25 +197,32 @@ export const scenarioStoryCheck = <TArgs extends Args>(
 
   if (parameter.world === undefined) {
     skipped[4] = 'Story does not pin a world'
-    let worldPairs = 0
-    for (let leftIndex = 0; leftIndex < catalog.length; leftIndex++) {
-      for (const rightEntry of catalog.slice(leftIndex + 1)) {
-        const leftEntry = catalog[leftIndex]!
-        const left = resolveScenarioWorld(parameter, { scenario: leftEntry.id, scenarioNow: now }, baselineArgs)
-        const right = resolveScenarioWorld(parameter, { scenario: rightEntry.id, scenarioNow: now }, baselineArgs)
-        for (const kind of activeKinds) {
-          const atMs = contrastTime(left, right, kind, options.atMs ?? 0)
-          if (wireState(left, kind, atMs) === wireState(right, kind, atMs)) continue
-          worldPairs++
-          const messages = contrastFailures(left, right, kind, atMs, render(leftEntry.id, {}, atMs), render(rightEntry.id, {}, atMs))
-          failures.push(...messages.map((message): ScenarioCheckFailure => ({ _tag: 'WorldSwitch', check: 3, slice: kind, message: `${leftEntry.id} / ${rightEntry.id}: ${message}` })))
-        }
+    const pendingKinds = new Set(activeKinds)
+    const leftMarkupByTime = new Map([[options.atMs ?? 0, initialMarkup]])
+    // One representative pair per declared slice is enough. Resolve each candidate
+    // once, and render only candidates with a contrast under the declared contract.
+    for (const entry of catalog) {
+      if (pendingKinds.size === 0) break
+      if (entry.id === baseWorld.id) continue
+      const right = resolveScenarioWorld(parameter, { scenario: entry.id, scenarioNow: now }, baselineArgs)
+      const rightMarkupByTime = new Map<number, string>()
+      for (const kind of pendingKinds) {
+        const atMs = contrastTime(baseWorld, right, kind, options.atMs ?? 0)
+        if (wireState(baseWorld, kind, atMs) === wireState(right, kind, atMs)
+          || visibleState(baseWorld, kind, atMs) === visibleState(right, kind, atMs)) continue
+        pendingKinds.delete(kind)
+        const leftMarkup = leftMarkupByTime.get(atMs) ?? render(scenario, {}, atMs)
+        const rightMarkup = rightMarkupByTime.get(atMs) ?? render(entry.id, {}, atMs)
+        leftMarkupByTime.set(atMs, leftMarkup)
+        rightMarkupByTime.set(atMs, rightMarkup)
+        const messages = contrastFailures(baseWorld, right, kind, atMs, leftMarkup, rightMarkup)
+        failures.push(...messages.map((message): ScenarioCheckFailure => ({ _tag: 'WorldSwitch', check: 3, slice: kind, message: `${baseWorld.id} / ${entry.id}: ${message}` })))
       }
     }
-    if (worldPairs === 0) skipped[3] = 'Catalog worlds are equal on the non-invariant declared slices'
+    if (pendingKinds.size === activeKinds.length) skipped[3] = 'Catalog worlds have no visible contrast on the non-invariant declared slices'
   } else {
     skipped[3] = 'Story pins a world'
-    const baseline = render(scenario)
+    const baseline = initialMarkup
     for (const entry of catalog) {
       if (render(entry.id) !== baseline) failures.push({ _tag: 'PinnedWorld', check: 4, message: `toolbar world ${entry.id} changes a pinned story` })
     }

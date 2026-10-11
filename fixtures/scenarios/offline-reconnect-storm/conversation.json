@@ -1,0 +1,460 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "conversation",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 6
+  },
+  "state": {
+    "threads": [
+      {
+        "agent": "agent/example/harbor/builder",
+        "has_more": false,
+        "items": [
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-offline-reconnect-storm-builder-1",
+              "to": "agent/example/harbor/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-offline-reconnect-storm-builder-1",
+            "revision": 1,
+            "role": "user",
+            "sequence": 1,
+            "timestamp": "2030-01-01T11:59:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Verify the deployment and stream the health report. Keep the report authoritative after reconnects."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-offline-reconnect-storm-builder-2",
+            "revision": 1,
+            "role": "user",
+            "sequence": 2,
+            "timestamp": "2030-01-01T11:59:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Deployment is running. Checking readiness, then the canary error budget."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-offline-reconnect-storm-builder-3",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 3,
+            "timestamp": "2030-01-01T11:59:04.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Readiness: 2 of 3 replicas"
+            },
+            "final": false,
+            "id": "timeline-entry/scenario-offline-reconnect-storm-builder-4",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 4,
+            "timestamp": "2030-01-01T11:59:59.000Z",
+            "type": "content"
+          }
+        ],
+        "page_size": 50,
+        "session_id": "session/example-harbor-builder"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 1000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Readiness: 3 of 3 replicas. Canary checks pending."
+          },
+          "final": false,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-4",
+          "revision": 2,
+          "role": "assistant",
+          "sequence": 4,
+          "timestamp": "2030-01-01T12:00:01.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 2
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 3000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Readiness: 3 of 3 replicas. Canary checks: 8 of 12 passed."
+          },
+          "final": false,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-4",
+          "revision": 3,
+          "role": "assistant",
+          "sequence": 4,
+          "timestamp": "2030-01-01T12:00:03.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 3
+    },
+    {
+      "_tag": "replace",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 6000,
+      "has_more": false,
+      "items": [
+        {
+          "body": {
+            "from": "person/ada",
+            "message_id": "message/scenario-offline-reconnect-storm-builder-1",
+            "to": "agent/example/harbor/builder"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-1",
+          "revision": 1,
+          "role": "user",
+          "sequence": 1,
+          "timestamp": "2030-01-01T11:59:00.000Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "media_type": "text/plain",
+            "text": "Verify the deployment and stream the health report. Keep the report authoritative after reconnects."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-2",
+          "revision": 1,
+          "role": "user",
+          "sequence": 2,
+          "timestamp": "2030-01-01T11:59:00.000Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Deployment is running. Checking readiness, then the canary error budget."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-3",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 3,
+          "timestamp": "2030-01-01T11:59:04.000Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Readiness: 3 of 3 replicas. Canary checks: 8 of 12 passed."
+          },
+          "final": false,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-4",
+          "revision": 3,
+          "role": "assistant",
+          "sequence": 4,
+          "timestamp": "2030-01-01T12:00:03.000Z",
+          "type": "content"
+        }
+      ],
+      "session_id": "session/example-harbor-builder",
+      "store": 4
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 7000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Temporary observation: canary counters are still settling."
+          },
+          "final": false,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-5",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 5,
+          "timestamp": "2030-01-01T12:00:07.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 5
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 9000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Readiness: 3 of 3 replicas. Canary checks: 12 of 12 passed. Observing error budget."
+          },
+          "final": false,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-4",
+          "revision": 4,
+          "role": "assistant",
+          "sequence": 4,
+          "timestamp": "2030-01-01T12:00:09.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 6
+    },
+    {
+      "_tag": "replace",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 13000,
+      "has_more": false,
+      "items": [
+        {
+          "body": {
+            "from": "person/ada",
+            "message_id": "message/scenario-offline-reconnect-storm-builder-1",
+            "to": "agent/example/harbor/builder"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-1",
+          "revision": 1,
+          "role": "user",
+          "sequence": 1,
+          "timestamp": "2030-01-01T11:59:00.000Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "media_type": "text/plain",
+            "text": "Verify the deployment and stream the health report. Keep the report authoritative after reconnects."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-2",
+          "revision": 1,
+          "role": "user",
+          "sequence": 2,
+          "timestamp": "2030-01-01T11:59:00.000Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Deployment is running. Checking readiness, then the canary error budget."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-3",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 3,
+          "timestamp": "2030-01-01T11:59:04.000Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Readiness: 3 of 3 replicas. Canary checks: 12 of 12 passed. Observing error budget."
+          },
+          "final": false,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-4",
+          "revision": 4,
+          "role": "assistant",
+          "sequence": 4,
+          "timestamp": "2030-01-01T12:00:09.000Z",
+          "type": "content"
+        }
+      ],
+      "session_id": "session/example-harbor-builder",
+      "store": 7
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 17000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Deployment verified: 3 of 3 replicas ready, 12 of 12 canary checks passed, error budget unchanged. Safe to complete the rollout."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-4",
+          "revision": 5,
+          "role": "assistant",
+          "sequence": 4,
+          "timestamp": "2030-01-01T12:00:17.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 8
+    },
+    {
+      "_tag": "replace",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 22000,
+      "has_more": false,
+      "items": [
+        {
+          "body": {
+            "from": "person/ada",
+            "message_id": "message/scenario-offline-reconnect-storm-builder-1",
+            "to": "agent/example/harbor/builder"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-1",
+          "revision": 1,
+          "role": "user",
+          "sequence": 1,
+          "timestamp": "2030-01-01T11:59:00.000Z",
+          "type": "message"
+        },
+        {
+          "body": {
+            "media_type": "text/plain",
+            "text": "Verify the deployment and stream the health report. Keep the report authoritative after reconnects."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-2",
+          "revision": 1,
+          "role": "user",
+          "sequence": 2,
+          "timestamp": "2030-01-01T11:59:00.000Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Deployment is running. Checking readiness, then the canary error budget."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-3",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 3,
+          "timestamp": "2030-01-01T11:59:04.000Z",
+          "type": "content"
+        },
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Deployment verified: 3 of 3 replicas ready, 12 of 12 canary checks passed, error budget unchanged. Safe to complete the rollout."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-offline-reconnect-storm-builder-4",
+          "revision": 5,
+          "role": "assistant",
+          "sequence": 4,
+          "timestamp": "2030-01-01T12:00:17.000Z",
+          "type": "content"
+        }
+      ],
+      "session_id": "session/example-harbor-builder",
+      "store": 9
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/2/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/3/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/items/2/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/items/3/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/3/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/4/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/5/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/5/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/5/items/2/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/5/items/3/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/6/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/7/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/7/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/7/items/2/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/7/items/3/timestamp"
+    }
+  ],
+  "variant": "default",
+  "world": "offline-reconnect-storm"
+}

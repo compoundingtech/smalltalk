@@ -1,0 +1,38 @@
+{
+  "name": "fractal-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dev": "vite --config vite.config.ts --configLoader runner"
+  },
+  "dependencies": {
+    "@smalltalk/st3-client": "file:../../clients/typescript/st3-client",
+    "effect": "4.0.0-rc.118",
+    "fractional-indexing": "3.2.0",
+    "@smalltalk/fractal-ui": "workspace:*",
+    "@st3/sdk": "workspace:*",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "react-aria": "3.52.1",
+    "react-aria-components": "1.21.1",
+    "@stylexjs/stylex": "0.19.0",
+    "@effect/atom-react": "4.0.0-rc.118"
+  },
+  "devDependencies": {
+    "@effect/vitest": "4.0.0-rc.118",
+    "@types/node": "24.10.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.9",
+    "fast-check": "4.3.0",
+    "fake-indexeddb": "6.2.4",
+    "vite": "8.2.2",
+    "@vitejs/plugin-react": "6.1.1",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@stylexjs/unplugin": "0.19.0",
+    "jsdom": "26.1.0"
+  },
+  "version": "0.1.0"
+}
