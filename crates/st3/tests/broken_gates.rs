@@ -235,19 +235,23 @@ mission "example/preview" state="ready" {
     for (prefix, flag) in [
         (vec!["apply"], "--dry-run"),
         (vec!["apply"], "--preview"),
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-10-st-apply-aliases — DELETE at contraction — https://www.notion.so/3f5e3d41f4a3818aadb6f4b74030c1da
         (vec!["agents", "apply"], "--dry-run"),
         (vec!["missions", "publish"], "--dry-run"),
         (vec!["missions", "publish"], "--preview"),
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-10-st-apply-aliases
     ] {
         let mut args = prefix.clone();
         args.extend([file, "--as", PUBLISHER, flag]);
         let output = daemon.run_cli(&args);
         assert!(output.status.success(), "{output:?}");
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-10-st-apply-aliases — DELETE at contraction — https://www.notion.so/3f5e3d41f4a3818aadb6f4b74030c1da
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             stderr.contains("is legacy; use st apply FILE"),
             prefix.len() == 2
         );
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-10-st-apply-aliases
         let preview = daemon.command(&args);
         let resolved = preview["resolved_intent"]["kdl"].as_str().unwrap();
         let intent = st3::graph::parse_intent(resolved, "orchid").unwrap();
@@ -315,8 +319,10 @@ fn mission_publish_dry_run_prints_blockers_before_refusing_publication() {
     .unwrap();
     for prefix in [
         vec!["apply"],
+        // LIVE-MIGRATION BRIDGE arn:lmig:smalltalk:2026-10-10-st-apply-aliases — DELETE at contraction — https://www.notion.so/3f5e3d41f4a3818aadb6f4b74030c1da
         vec!["agents", "apply"],
         vec!["missions", "publish"],
+        // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-10-st-apply-aliases
     ] {
         let mut args = prefix;
         args.extend([file.to_str().unwrap(), "--as", PUBLISHER, "--dry-run"]);
@@ -592,14 +598,10 @@ mission "orchid/replay" state="ready" {
 "#,
     )
     .unwrap();
-    daemon.command(&[
-        "missions",
-        "publish",
-        file.to_str().unwrap(),
-        "--as",
-        PUBLISHER,
-        "--no-gate-check",
-    ]);
+    daemon.command(&["apply", file.to_str().unwrap(),
+    "--as",
+    PUBLISHER,
+    "--no-gate-check",]);
     daemon.command(&[
         "missions",
         "start",
@@ -659,14 +661,10 @@ mission "orchid/replay" state="ready" {
 "#,
     )
     .unwrap();
-    daemon.command(&[
-        "missions",
-        "publish",
-        file.to_str().unwrap(),
-        "--as",
-        PUBLISHER,
-        "--no-gate-check",
-    ]);
+    daemon.command(&["apply", file.to_str().unwrap(),
+    "--as",
+    PUBLISHER,
+    "--no-gate-check",]);
     daemon.command(&[
         "missions",
         "start",
@@ -866,14 +864,10 @@ fn broken_gates_wait_for_a_revision_that_then_passes_their_steps() {
     // Publish the broken gates as their runs had them; publish would otherwise refuse them.
     let file = root.path().join("replay.kdl");
     std::fs::write(&file, mission(root.path(), false)).unwrap();
-    daemon.command(&[
-        "missions",
-        "publish",
-        file.to_str().unwrap(),
-        "--as",
-        PUBLISHER,
-        "--no-gate-check",
-    ]);
+    daemon.command(&["apply", file.to_str().unwrap(),
+    "--as",
+    PUBLISHER,
+    "--no-gate-check",]);
     daemon.command(&[
         "missions",
         "start",
@@ -1023,15 +1017,11 @@ fn a_check_answers_for_each_gate_and_publish_refuses_a_broken_one() {
     }
 
     // Publish runs the same check and refuses the broken gates, naming each one.
-    let refused = daemon.run_cli(&[
-        "missions",
-        "publish",
-        file,
-        "--as",
-        PUBLISHER,
-        "--workspace",
-        workspace,
-    ]);
+    let refused = daemon.run_cli(&["apply", file,
+    "--as",
+    PUBLISHER,
+    "--workspace",
+    workspace,]);
     assert!(!refused.status.success());
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
@@ -1065,15 +1055,11 @@ fn a_check_answers_for_each_gate_and_publish_refuses_a_broken_one() {
         };
         assert_eq!(gate["answer"], expected, "{gate:#}");
     }
-    daemon.command(&[
-        "missions",
-        "publish",
-        fixed,
-        "--as",
-        PUBLISHER,
-        "--workspace",
-        workspace,
-    ]);
+    daemon.command(&["apply", fixed,
+    "--as",
+    PUBLISHER,
+    "--workspace",
+    workspace,]);
     let listed = daemon.command(&["missions", "ls"]);
     assert!(listed.to_string().contains("orchid/replay"), "{listed}");
 

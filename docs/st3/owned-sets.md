@@ -61,7 +61,7 @@ and missions use the compiled `MissionSpec`. The mission compiler supplies concu
 revision cutover, completion, retry and duration defaults. These values come from the same
 compiler and selected graph definitions as publication; publishers need not reproduce defaults
 or render KDL themselves. Derived revision and step definition hashes remain visible.
-`st missions publish FILE --dry-run` and the intent preview reuse this same `declaration_diffs`
+`st apply FILE --dry-run` and the intent preview reuse this same `declaration_diffs`
 format. These JSON values are inspection data, not an alternative JSON publication input.
 
 Read an applied definition with the client operation `publication.definition`:

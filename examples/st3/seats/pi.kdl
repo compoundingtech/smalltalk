@@ -14,7 +14,7 @@ version 2
 // workspace with an existing checkout on this host. st loads pi's channel extension itself; do
 // not pass it in `args`.
 //
-//   st agents apply examples/st3/seats/pi.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/pi.kdl --as person/operator
 //   st agents show agent/example/worker
 //   st agents stop agent/example/worker --as person/operator
 agent "example/worker" {

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web states unavailable terminal and other workbench views instead of repeating the thread; the terminal toggle uses the fleet's shared, native AgentId-validated subject mapping, remains reachable before the first roster frame and returns to the thread on its second click, while the Changes panel inspects successful tool captures from the existing public conversation feed, labels their loaded-window and excerpt scope, and distinguishes waiting, unavailable and observed-without-captures states",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only change; no runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Client-only change against existing gateway routes."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; the app is not deployed by this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

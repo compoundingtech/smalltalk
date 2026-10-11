@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "One retention policy file names every claim kind's class, window and checkpoint rules",
+  "replay": {"status": "none", "detail": "No replay or rebuild. The registry reads each kind's storage from the policy; every kind keeps the storage it had."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes, triggers or schema version change."},
+  "rules": {"status": "none", "detail": "Rules version 14 is unchanged and the rules description renders byte for byte as before, so the rules digest every member seals with is unchanged. A test pins the description; on a 1.1M-claim production copy the plan's drop and retained digests are identical before and after."},
+  "compatibility": {"status": "none", "detail": "No client, wire, registry or harness contract change."},
+  "downtime": {"status": "none", "detail": "No activation or restart requirement beyond the ordinary deploy."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Binary rollback needs no store change."}
+}

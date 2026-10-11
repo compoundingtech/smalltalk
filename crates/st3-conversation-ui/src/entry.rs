@@ -12,13 +12,22 @@ pub fn bundle_id(first: &str) -> String {
     format!("bundle:{first}")
 }
 
+/// Only ordinary tool calls participate in simplified runs. Preview/error cards
+/// stay independent, both when drawing and when counting rows for history fill.
+pub(crate) fn bundles(body: &Body) -> bool {
+    matches!(body, Body::Tool { title, .. }
+        if !title.starts_with("write ")
+            && !title.starts_with("compaction")
+            && !title.starts_with("assistant error"))
+}
+
 /// How many rows the person sees in the simplified conversation: each entry is one, and a run of
 /// tool calls is one for the whole run.
 pub fn display_rows(entries: &[Entry]) -> usize {
     let mut rows = 0;
     let mut in_run = false;
     for entry in entries {
-        let tool = matches!(entry.body, Body::Tool { .. });
+        let tool = bundles(&entry.body);
         if !(tool && in_run) {
             rows += 1;
         }

@@ -7,6 +7,7 @@ import type { Tab } from './tabs';
 // Home stays in Home's stack and the back button returns there.
 export type StackParams = {
   HomeRoot: undefined;
+  Sidebar: undefined;
   AgentsRoot: undefined;
   MissionsRoot: undefined;
   FleetRoot: undefined;

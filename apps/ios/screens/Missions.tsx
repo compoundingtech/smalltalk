@@ -102,7 +102,7 @@ export function MissionScreen({ route, navigation }: RootScreen<'Mission'>) {
         {outcome ? <T soft>set {outcome.status}{outcome.previous_status ? ` (was ${outcome.previous_status})` : ''} by {outcome.actor}: {outcome.reason}</T> : null}
       </View>
       {waiting.length ? <>
-        <SectionHeader title="needs you" count={waiting.length} color={theme.person} />
+        <SectionHeader title="alerts" count={waiting.length} color={theme.person} />
         {waiting.map(row => <ListRow
           key={row.item.id}
           glyph={row.glyph}

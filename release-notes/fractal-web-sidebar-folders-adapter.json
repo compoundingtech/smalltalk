@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web adds the unmounted sidebar folders adapter: TUI-ordered folder and host-group trees, drop validation with fixed refusal copy, native fractional-key moves that never collide with dormant placements, append-only creation, lift-on-delete, and an explicit Try again that restages structural intent against fresh arrangement state, bound to the Sidebar and agent identities seen at gesture time, instead of resending the refused edit",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only change; no runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Client-only change using the existing arrangement.edit operations; existing folder views are not remounted."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; the adapter is not mounted until the kit sidebar lands."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change; collapse state stays in memory."
+  }
+}

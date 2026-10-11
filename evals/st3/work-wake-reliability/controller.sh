@@ -108,11 +108,11 @@ first_incarnation="$(wait_for_worker)"
 state="$(jq --arg incarnation "$first_incarnation" '.incarnations += [$incarnation]' <<<"$state")"
 persist_state
 
-st3 missions publish "$fresh_file" --as "$REQUESTER" >/dev/null
+st3 apply "$fresh_file" --as "$REQUESTER" >/dev/null
 start_fresh one
 start_fresh two
 
-st3 missions publish "$revisable_v1" --as "$REQUESTER" >/dev/null
+st3 apply "$revisable_v1" --as "$REQUESTER" >/dev/null
 revisable_output="$(st3 missions start eval/work-wake-reliability/revisable \
   --id "revisable-$ST_MISSION_RUN" \
   --workspace "$PWD" \

@@ -262,13 +262,25 @@ pub fn st3_notification_with_attachments(
     envelope
 }
 
-/// Annotate a dictated delivery without changing the durable message or its body digest.
-pub fn with_dictation_notice(notification: String, tags: &[String]) -> String {
-    if tags.iter().any(|tag| tag == "dictated") {
-        format!("(dictated by voice; it may contain transcription mistakes)\n{notification}")
-    } else {
-        notification
+/// Annotate a dictated or silent delivery without changing the durable message or its body digest.
+pub fn with_tag_notices(notification: String, tags: &[String]) -> String {
+    let mut notification = notification;
+    // st3's silent tag: the message was held, without waking the seat, until this turn.
+    if tags.iter().any(|tag| tag == "st3-silent") {
+        notification = format!("(silent: held without waking you until this turn)\n{notification}");
     }
+    if let Some(count) = tags.iter().find_map(|tag| {
+        tag.strip_prefix("st3-silent-remaining:")?
+            .parse::<usize>()
+            .ok()
+    }) {
+        notification = format!("({count} older silent held; st conversations ls)\n{notification}");
+    }
+    if tags.iter().any(|tag| tag == "dictated") {
+        notification =
+            format!("(dictated by voice; it may contain transcription mistakes)\n{notification}");
+    }
+    notification
 }
 
 /// Escape markup characters so sender text cannot start or close an element. Attribute values
@@ -414,7 +426,7 @@ fn poke_text_with_resolver(
             .iter()
             .filter_map(|tag| AttachmentNotice::from_tag(tag))
             .collect();
-        return with_dictation_notice(
+        return with_tag_notices(
             st3_notification_with_attachments(
                 reference,
                 msg.from.as_deref().unwrap_or_default(),
