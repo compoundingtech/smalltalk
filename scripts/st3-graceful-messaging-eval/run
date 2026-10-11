@@ -140,7 +140,7 @@ start_daemon
   done
 } >"$root/seats.kdl"
 cp "$root/seats.kdl" "$out/evidence/seats.kdl"
-st3 agents apply "$root/seats.kdl" --as person/eval >"$out/evidence/apply.txt"
+st3 apply "$root/seats.kdl" --no-gate-check --as person/eval >"$out/evidence/apply.txt"
 
 agent_json() { st3 agents show "agent/gm.$1" --json 2>/dev/null || echo '{}'; }
 

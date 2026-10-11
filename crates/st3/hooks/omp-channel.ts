@@ -134,6 +134,20 @@ type Stash = {
   holdTimer?: ReturnType<typeof setTimeout>;
   /** Serializes handoffs so omp receives messages in arrival order. */
   handoff?: Promise<void>;
+  /** Subagents of this process between their `agent_start` and their end, by omp agent ID. */
+  subagents?: Map<string, OpenSubagent>;
+  /** Reports each busy subagent while any runs, so st ends only one that stopped running. */
+  subagentHeartbeat?: NodeJS.Timeout;
+};
+
+type OpenSubagent = {
+  frame: Record<string, unknown>;
+  /** The subagent session's newest context, asked whether the session is still busy. */
+  ctx: ExtensionContext;
+  reportedAt: number;
+  /** Human waits belong to this subagent, never to the top-level seat. */
+  pendingAsks: Set<string>;
+  pendingApproval: boolean;
 };
 
 /**
@@ -194,6 +208,38 @@ const terminalProviderError = (event: AgentEndFrame): ProviderError | undefined 
     return error;
   }
   return undefined;
+};
+
+/** How a subagent's run ended: an error fails it, an abort interrupts it. */
+const subagentOutcome = (event: AgentEndFrame): "completed" | "failed" | "interrupted" => {
+  if (!Array.isArray(event.messages)) return "completed";
+  for (let index = event.messages.length - 1; index >= 0; index -= 1) {
+    const message = event.messages[index];
+    if (!message || typeof message !== "object") continue;
+    if (!("role" in message) || message.role !== "assistant") continue;
+    if (!("stopReason" in message)) return "completed";
+    if (message.stopReason === "error") return "failed";
+    if (message.stopReason === "aborted") return "interrupted";
+    return "completed";
+  }
+  return "completed";
+};
+
+/** A subagent's tool calls and messages report it at most this often. */
+const SUBAGENT_PROGRESS_MS = 10_000;
+/**
+ * While a subagent's session is busy, as in a long tool call or a nested subagent, it reports at
+ * least this often. st ends a subagent unreported for five minutes (`SILENT_GRACE_MS`).
+ */
+const SUBAGENT_HEARTBEAT_MS = 60_000;
+const SUBAGENT_SILENT_MS = 5 * 60_000;
+const SUBAGENT_ACTIVITY = new Set(["message_end", "tool_execution_start", "tool_execution_end"]);
+
+/** Reject rather than truncate identities: truncation would merge distinct subagents. */
+const subagentText = (value: unknown, maxBytes: number) => {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  return text && Buffer.byteLength(text, "utf8") <= maxBytes ? text : undefined;
 };
 
 /**
@@ -1100,6 +1146,86 @@ export default function (pi: ExtensionAPI) {
   // Keep delivery, receipt evidence and label authority on the top-level seat (#852).
   const isSubagent = (ctx: ExtensionContext | undefined): boolean =>
     (ctx as { agent?: { kind?: unknown } } | undefined)?.agent?.kind === "sub";
+  // A subagent session reports only its runs: st records them on the seat as its subagents, with
+  // a lease the seat's driver renews while the run lasts. A run starts at `agent_start` and ends at
+  // the `agent_end` that does not continue, or when its session shuts down first. Between them it
+  // reports progress at each `turn_end`, at its messages and tool calls, and each minute while omp
+  // says its session is busy; st ends a run that stops reporting. omp names the subagent in
+  // `ctx.agent` (`id`, `name`).
+  const subagentBusy = (ctx: ExtensionContext): boolean => {
+    try {
+      return ctx.isIdle() === false;
+    } catch {
+      return false;
+    }
+  };
+  const reportSubagent = (open: OpenSubagent, now: number) => {
+    open.reportedAt = now;
+    sendFrame({ ...open.frame, event: "progress" });
+  };
+  const closeSubagent = (id: string): boolean => {
+    const closed = state.subagents?.delete(id) ?? false;
+    if (!state.subagents?.size) {
+      clearInterval(state.subagentHeartbeat);
+      state.subagentHeartbeat = undefined;
+    }
+    return closed;
+  };
+  const heartbeat = () => {
+    const now = Date.now();
+    for (const [id, open] of state.subagents ?? []) {
+      // Native omp keeps foreground tools (including asks and approvals) inside the busy run.
+      // Event caches are not liveness evidence: a lost resolution must not renew an idle child.
+      const busy = subagentBusy(open.ctx);
+      if (!busy) {
+        open.pendingAsks.clear();
+        open.pendingApproval = false;
+      }
+      if (busy) reportSubagent(open, now);
+      // st has ended a run this quiet; forget it so the heartbeat stops with the last run.
+      else if (now - open.reportedAt >= SUBAGENT_SILENT_MS) closeSubagent(id);
+    }
+  };
+  const observeSubagent = (event: string, payload: unknown, ctx: ExtensionContext) => {
+    const agent = record(record(ctx)?.agent);
+    const id = subagentText(agent?.id, 256);
+    if (!id) return;
+    const name = subagentText(agent?.name, 128);
+    const frame = { type: "subagent", id, ...(name ? { name } : {}) };
+    const running = (state.subagents ??= new Map<string, OpenSubagent>());
+    const open = running.get(id);
+    if (open) open.ctx = ctx;
+    const now = Date.now();
+    const tool = record(payload);
+    const callId = subagentText(tool?.toolCallId, 256);
+    if (open) {
+      if ((event === "tool_call" || event === "tool_execution_start") &&
+        tool?.toolName === "ask" && callId) open.pendingAsks.add(callId);
+      if ((event === "tool_result" || event === "tool_execution_end") && callId) {
+        open.pendingAsks.delete(callId);
+      }
+      if (event === "tool_approval_requested") open.pendingApproval = true;
+      if (event === "tool_approval_resolved") open.pendingApproval = false;
+    }
+    if (event === "agent_start") {
+      running.set(id, { frame, ctx, reportedAt: now, pendingAsks: new Set(), pendingApproval: false });
+      sendFrame({ ...frame, event: "start" });
+      state.subagentHeartbeat ??= setInterval(heartbeat, SUBAGENT_HEARTBEAT_MS).unref();
+    } else if (event === "turn_end" && open) {
+      reportSubagent(open, now);
+    } else if (SUBAGENT_ACTIVITY.has(event)) {
+      if (open && now - open.reportedAt >= SUBAGENT_PROGRESS_MS) reportSubagent(open, now);
+    } else if (event === "agent_end") {
+      const end = record(payload) ?? {};
+      if (end.willContinue === true) return;
+      if (open && (open.pendingAsks.size || open.pendingApproval) &&
+        subagentBusy(ctx) && subagentOutcome(end) === "completed") return;
+      closeSubagent(id);
+      sendFrame({ ...frame, event: "end", outcome: subagentOutcome(end) });
+    } else if (event === "session_shutdown" && closeSubagent(id)) {
+      sendFrame({ ...frame, event: "end", outcome: "interrupted" });
+    }
+  };
   const register = pi.on.bind(pi) as unknown as (
     event: string,
     handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
@@ -1108,7 +1234,14 @@ export default function (pi: ExtensionAPI) {
     event: string,
     handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
   ) => register(event, (payload, ctx) => {
-    if (isSubagent(ctx)) return;
+    if (isSubagent(ctx)) {
+      try {
+        observeSubagent(event, payload, ctx);
+      } catch {
+        // Observability fails open: a subagent's report never takes its session down.
+      }
+      return;
+    }
     jobContext = ctx;
     return handler(payload, ctx);
   });

@@ -146,6 +146,46 @@ pub(super) fn count_in_snapshot(connection: &Connection, before_unix_ms: u128) -
     Ok(u64::try_from(base + delta)?)
 }
 
+/// At most 128 oldest unoffered held subjects, selected from indexed metadata.
+/// Only these bounded subjects have their sender/recipient/tags read; a reader never writes.
+pub(super) struct UnreadSent {
+    pub to: String,
+    pub from: String,
+    pub tags: Vec<String>,
+    pub sent_unix_ms: u128,
+}
+
+pub(super) fn sent_before(connection: &Connection, before_unix_ms: u128) -> Result<Vec<UnreadSent>> {
+    let before = i64::try_from(before_unix_ms).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare_cached(
+        "SELECT json_extract(sent.body,'$.fields.to'), json_extract(sent.body,'$.fields.from'),
+                json_extract(sent.body,'$.fields.tags'), held.sent_ms
+         FROM coordination_sends held INDEXED BY coordination_sends_held
+         JOIN claims sent ON sent.id=(SELECT id FROM claims
+             WHERE subject=held.subject AND kind='message.sent'
+             ORDER BY CAST(accepted_at_unix_ms AS INTEGER),id LIMIT 1)
+         WHERE held.held=1 AND held.sent_ms < ?1
+         ORDER BY held.sent_ms,held.subject LIMIT 128",
+    )?;
+    let rows = statement.query_map([before], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut sent = Vec::new();
+    for row in rows {
+        let (to, from, tags, time) = row?;
+        let tags = tags
+            .and_then(|tags| serde_json::from_str::<Vec<String>>(&tags).ok())
+            .unwrap_or_default();
+        sent.push(UnreadSent { to, from, tags, sent_unix_ms: u128::try_from(time).unwrap_or_default() });
+    }
+    Ok(sent)
+}
+
 pub(super) fn count_before(transaction: &Transaction<'_>, before_unix_ms: u128) -> Result<u64> {
     // The caller holds one writer transaction: pending changes and their exact age count
     // become visible together, and a concurrent message cannot disappear between the two.

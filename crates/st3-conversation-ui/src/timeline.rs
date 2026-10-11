@@ -15,6 +15,9 @@ pub struct Frame {
     pub items: Vec<TimelineEntry>,
     /// The session the entries belong to, when the stream says.
     pub session_id: Option<String>,
+    /// The conversation header (contract §3) when this frame carries one; absent on a delta
+    /// means the last one still holds.
+    pub header: Option<serde_json::Value>,
 }
 
 #[derive(Default)]
@@ -24,6 +27,8 @@ pub struct Timeline {
     pub replace: bool,
     pub has_more: bool,
     pub session_id: Option<String>,
+    /// The conversation header st last sent for this window, when it sends one.
+    pub header: Option<serde_json::Value>,
     /// Earlier pages read from st's session timeline while the person scrolled back.
     pub older: Older,
 }
@@ -45,6 +50,9 @@ pub struct Older {
 impl Timeline {
     pub fn apply(&mut self, frame: Frame) {
         self.replace = frame.replace;
+        if frame.header.is_some() {
+            self.header = frame.header;
+        }
         let other_session = frame.session_id.is_some()
             && self.session_id.is_some()
             && frame.session_id != self.session_id;

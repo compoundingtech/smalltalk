@@ -25,7 +25,7 @@ export interface EntryInput {
 export const entry = (ctx: FactoryContext, cursor: Thread, input: EntryInput): TimelineEntry => {
   cursor.sequence += 1
   return {
-    id: scenarioId(ctx, 'timeline-entry', `${cursor.agent.role}-${cursor.sequence}`),
+    id: scenarioId(ctx, 'timeline-entry', `${cursor.agent.key}-${cursor.sequence}`),
     sequence: cursor.sequence,
     revision: input.revision ?? 1,
     timestamp: ctx.t.at(input.atMs),
@@ -61,7 +61,7 @@ export const turn = (ctx: FactoryContext, cursor: Thread, input: TurnInput): Tim
   const stepMs = input.stepMs ?? 4_000
   let at = input.atMs
   const out: TimelineEntry[] = []
-  const messageId = scenarioId(ctx, 'message', `${cursor.agent.role}-${cursor.sequence + 1}`)
+  const messageId = scenarioId(ctx, 'message', `${cursor.agent.key}-${cursor.sequence + 1}`)
   const from = input.from._tag === 'person' ? input.from.person.id : input.from.agent.id
   out.push(
     entry(ctx, cursor, {

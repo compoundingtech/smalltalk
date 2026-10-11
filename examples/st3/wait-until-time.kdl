@@ -12,8 +12,8 @@ version 2
 // The wait ends at most fifteen minutes after the time. For a repeating time, use a `schedule`
 // instead (recurring-stewardship.kdl).
 //
-//   st agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st missions publish examples/st3/wait-until-time.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/omp.kdl --as person/operator
+//   st apply examples/st3/wait-until-time.kdl --as person/operator
 //   st missions start example/app/release-at-window --id example/app/release-at-window/2026-10-01 \
 //     --workspace /srv/example/app --as person/operator
 

@@ -19,7 +19,7 @@ export const toolCall = (ctx: FactoryContext, cursor: Thread, input: ToolCallInp
     atMs: input.atMs,
     role: 'assistant',
     type: 'tool_call',
-    body: { call_id: `call-${cursor.agent.role}-${cursor.sequence + 1}`, name: input.name, arguments: input.arguments },
+    body: { call_id: `call-${cursor.agent.key}-${cursor.sequence + 1}`, name: input.name, arguments: input.arguments },
   })
   if (input.outcome === 'pending') return [call]
   const result = entry(ctx, cursor, {

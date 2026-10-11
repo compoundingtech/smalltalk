@@ -68,7 +68,11 @@ pub fn change_keys(change: &Change) -> Vec<String> {
     };
     match change.kind.as_str() {
         "message.sent" => keys.extend(field("to").map(|to| format!("mailbox:{to}"))),
+        "mission-run.report-to" => {
+            keys.extend(field("report_to").map(|agent| format!("reports-to:{agent}")));
+        }
         "mission-run.created" => {
+            keys.extend(field("report_to").map(|agent| format!("reports-to:{agent}")));
             keys.extend(field("root_mission_run").map(|root| format!("children:{root}")));
             keys.extend(field("parent_step_run").map(|step| format!("children-of-step:{step}")));
         }
@@ -83,6 +87,9 @@ pub fn change_keys(change: &Change) -> Vec<String> {
             }
         }
         "intent.desired" => {
+            if let Some((_, agent)) = crate::github_watch::watch_parts(&change.subject) {
+                keys.push(format!("watches:{agent}"));
+            }
             keys.extend(field("owner_run").map(|run| format!("owned:{run}")));
             keys.extend(field("owner_step").map(|step| format!("owned-step:{step}")));
             keys.extend(field("previous_owner_step").map(|step| format!("owned-step:{step}")));

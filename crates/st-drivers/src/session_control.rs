@@ -87,6 +87,40 @@ impl DeliveryGate {
     }
 }
 
+/// Where a native prompt stands in st: still open, answered by the seat's person (and how), or
+/// gone. The same shape as the daemon's `GET /v1/harness-prompts/state`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub enum PromptAnswer {
+    Open,
+    Answered { answer: String },
+    Gone,
+}
+
+type PromptAnswerRead = dyn Fn(u64, u64) -> Option<PromptAnswer> + Send + Sync;
+
+/// How a native driver reads a person's answer to its prompt, named by the (ownership,
+/// transition) sequences of the state record observation the prompt wrote. The owning control
+/// plane supplies it; `None` means st could not say this time.
+#[derive(Clone)]
+pub struct PromptAnswers(Arc<PromptAnswerRead>);
+
+impl PromptAnswers {
+    pub fn new(read: impl Fn(u64, u64) -> Option<PromptAnswer> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    pub(crate) fn read(&self, ownership: u64, transition: u64) -> Option<PromptAnswer> {
+        (self.0)(ownership, transition)
+    }
+}
+
+impl std::fmt::Debug for PromptAnswers {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PromptAnswers")
+    }
+}
+
 /// Catalog drivers retain their product's status transport. Native drivers take graph control.
 #[derive(Clone, Debug, Default)]
 pub enum SessionControl {

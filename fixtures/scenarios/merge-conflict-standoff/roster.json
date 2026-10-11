@@ -1,0 +1,472 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "roster",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 5
+  },
+  "state": {
+    "agents": [
+      {
+        "active_work_count": 1,
+        "ask": "Adjudicate the cache policy conflict",
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "builder/cache-policy",
+          "repository": "~/src/harbor"
+        },
+        "current_session_id": "session/example-harbor-builder",
+        "current_work": [
+          {
+            "id": "step-run/example/harbor/cache-policy/1/step-1",
+            "mission_id": "mission/example/harbor/cache-policy",
+            "mission_run_id": "mission-run/example/harbor/cache-policy/1",
+            "path": "step-1",
+            "since": "2030-01-01T11:59:55.000Z",
+            "state": "waiting-person",
+            "title": "Increase the cache TTL"
+          }
+        ],
+        "current_work_ids": [
+          "step-run/example/harbor/cache-policy/1/step-1"
+        ],
+        "driver": "codex",
+        "fault": null,
+        "harness_state": "idle",
+        "host_id": "host/lantern",
+        "id": "agent/example/harbor/builder",
+        "incarnation_id": "rt-harbor-builder-521:1",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:59:55.000Z",
+        "name": "Harbor Builder",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": "mission-run/example/harbor/cache-policy/1",
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag13",
+        "runtime_ids": [
+          "runtime/example-harbor-builder"
+        ],
+        "since": "2030-01-01T11:57:00.000Z",
+        "state": "waiting",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:59:55.000Z",
+        "workspace": "~/src/harbor/.worktrees/builder"
+      },
+      {
+        "active_work_count": 1,
+        "ask": "Adjudicate the cache policy conflict",
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "reviewer/cache-policy",
+          "repository": "~/src/harbor"
+        },
+        "current_session_id": "session/example-harbor-reviewer",
+        "current_work": [
+          {
+            "id": "step-run/example/harbor/cache-policy/1/step-2",
+            "mission_id": "mission/example/harbor/cache-policy",
+            "mission_run_id": "mission-run/example/harbor/cache-policy/1",
+            "path": "step-2",
+            "since": "2030-01-01T11:59:55.000Z",
+            "state": "waiting-person",
+            "title": "Allow stale cache reads"
+          }
+        ],
+        "current_work_ids": [
+          "step-run/example/harbor/cache-policy/1/step-2"
+        ],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "idle",
+        "host_id": "host/lantern",
+        "id": "agent/example/harbor/reviewer",
+        "incarnation_id": "rt-harbor-reviewer-396:6",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:59:55.000Z",
+        "name": "Harbor Reviewer",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": "mission-run/example/harbor/cache-policy/1",
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag14",
+        "runtime_ids": [
+          "runtime/example-harbor-reviewer"
+        ],
+        "since": "2030-01-01T11:57:00.000Z",
+        "state": "waiting",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:59:55.000Z",
+        "workspace": "~/src/harbor/.worktrees/reviewer"
+      }
+    ],
+    "machines": [
+      {
+        "capacity": {
+          "reason": "no capacity observation",
+          "state": "unknown"
+        },
+        "fleet_id": "fleet/example-harbor",
+        "host_id": "host/lantern",
+        "id": "machine/lantern",
+        "kind": "machine",
+        "name": "lantern",
+        "occupancy": {
+          "running_runtimes": 2
+        },
+        "projects": [
+          "~/src/harbor"
+        ],
+        "revision": "mh-lantern",
+        "runtime_ids": [
+          "runtime/example-harbor-builder",
+          "runtime/example-harbor-reviewer"
+        ],
+        "state": "local",
+        "transports": [
+          {
+            "last_success_at": "2030-01-01T11:59:30.000Z",
+            "protocol": "unix",
+            "status": "local"
+          }
+        ],
+        "updated_at": "2030-01-01T11:59:30.000Z",
+        "work": [
+          "work/example/harbor/cache-policy/1/step-1",
+          "work/example/harbor/cache-policy/1/step-2"
+        ]
+      }
+    ],
+    "order": [
+      "agent/example/harbor/builder",
+      "agent/example/harbor/reviewer"
+    ],
+    "runtimes": [
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-harbor-builder",
+        "incarnation_id": "rt-harbor-builder-521:1",
+        "kind": "runtime",
+        "owner_host_id": "host/lantern",
+        "owner_id": "agent/example/harbor/builder",
+        "owner_run_id": "mission-run/example/harbor/cache-policy/1",
+        "revision": "rt29",
+        "runtime_id": "rt-harbor-builder-521",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:57:00.000Z"
+      },
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-harbor-reviewer",
+        "incarnation_id": "rt-harbor-reviewer-396:6",
+        "kind": "runtime",
+        "owner_host_id": "host/lantern",
+        "owner_id": "agent/example/harbor/reviewer",
+        "owner_run_id": "mission-run/example/harbor/cache-policy/1",
+        "revision": "rt34",
+        "runtime_id": "rt-harbor-reviewer-396",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:57:00.000Z"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 8000,
+      "removes": [],
+      "store": 10,
+      "upserts": [
+        {
+          "capacity": {
+            "reason": "no capacity observation",
+            "state": "unknown"
+          },
+          "fleet_id": "fleet/example-harbor",
+          "host_id": "host/lantern",
+          "id": "machine/lantern",
+          "kind": "machine",
+          "name": "lantern",
+          "occupancy": {
+            "running_runtimes": 3
+          },
+          "projects": [
+            "~/src/harbor"
+          ],
+          "revision": "mh-terminal",
+          "runtime_ids": [
+            "runtime/example-harbor-builder",
+            "runtime/example-harbor-reviewer",
+            "runtime/example-harbor-builder-shell"
+          ],
+          "state": "local",
+          "transports": [
+            {
+              "last_success_at": "2030-01-01T11:59:30.000Z",
+              "protocol": "unix",
+              "status": "local"
+            }
+          ],
+          "updated_at": "2030-01-01T12:00:08.000Z",
+          "work": [
+            "work/example/harbor/cache-policy/1/step-1",
+            "work/example/harbor/cache-policy/1/step-2"
+          ]
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 18000,
+      "removes": [],
+      "store": 17,
+      "upserts": [
+        {
+          "active_work_count": 1,
+          "ask": null,
+          "blocked_on": null,
+          "checkout": {
+            "base": "origin/main",
+            "branch": "builder/cache-policy",
+            "repository": "~/src/harbor"
+          },
+          "current_session_id": "session/example-harbor-builder",
+          "current_work": [
+            {
+              "id": "step-run/example/harbor/cache-policy/1/step-1",
+              "mission_id": "mission/example/harbor/cache-policy",
+              "mission_run_id": "mission-run/example/harbor/cache-policy/1",
+              "path": "step-1",
+              "since": "2030-01-01T12:00:18.000Z",
+              "state": "completed",
+              "title": "Increase the cache TTL"
+            }
+          ],
+          "current_work_ids": [
+            "step-run/example/harbor/cache-policy/1/step-1"
+          ],
+          "driver": "codex",
+          "fault": null,
+          "harness_state": "idle",
+          "host_id": "host/lantern",
+          "id": "agent/example/harbor/builder",
+          "incarnation_id": "rt-harbor-builder-521:1",
+          "kind": "agent",
+          "last_activity_at": "2030-01-01T12:00:18.000Z",
+          "name": "Harbor Builder",
+          "next_work": null,
+          "next_work_id": null,
+          "owner_run_id": "mission-run/example/harbor/cache-policy/1",
+          "queued_work_count": 0,
+          "reachability": "local",
+          "revision": "ag9",
+          "runtime_ids": [
+            "runtime/example-harbor-builder"
+          ],
+          "since": "2030-01-01T11:57:00.000Z",
+          "state": "waiting",
+          "subagents": [],
+          "under": [],
+          "upcoming_work": [],
+          "upcoming_work_ids": [],
+          "updated_at": "2030-01-01T12:00:18.000Z",
+          "workspace": "~/src/harbor/.worktrees/builder"
+        },
+        {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-harbor-builder",
+          "incarnation_id": "rt-harbor-builder-521:1",
+          "kind": "runtime",
+          "owner_host_id": "host/lantern",
+          "owner_id": "agent/example/harbor/builder",
+          "owner_run_id": "mission-run/example/harbor/cache-policy/1",
+          "revision": "rt17",
+          "runtime_id": "rt-harbor-builder-521",
+          "runtime_kind": "agent",
+          "state": "running",
+          "updated_at": "2030-01-01T11:57:00.000Z"
+        },
+        {
+          "active_work_count": 1,
+          "ask": null,
+          "blocked_on": null,
+          "checkout": {
+            "base": "origin/main",
+            "branch": "reviewer/cache-policy",
+            "repository": "~/src/harbor"
+          },
+          "current_session_id": "session/example-harbor-reviewer",
+          "current_work": [
+            {
+              "id": "step-run/example/harbor/cache-policy/1/step-2",
+              "mission_id": "mission/example/harbor/cache-policy",
+              "mission_run_id": "mission-run/example/harbor/cache-policy/1",
+              "path": "step-2",
+              "since": "2030-01-01T12:00:18.000Z",
+              "state": "completed",
+              "title": "Allow stale cache reads"
+            }
+          ],
+          "current_work_ids": [
+            "step-run/example/harbor/cache-policy/1/step-2"
+          ],
+          "driver": "claude",
+          "fault": null,
+          "harness_state": "idle",
+          "host_id": "host/lantern",
+          "id": "agent/example/harbor/reviewer",
+          "incarnation_id": "rt-harbor-reviewer-396:6",
+          "kind": "agent",
+          "last_activity_at": "2030-01-01T12:00:18.000Z",
+          "name": "Harbor Reviewer",
+          "next_work": null,
+          "next_work_id": null,
+          "owner_run_id": "mission-run/example/harbor/cache-policy/1",
+          "queued_work_count": 0,
+          "reachability": "local",
+          "revision": "ag4",
+          "runtime_ids": [
+            "runtime/example-harbor-reviewer"
+          ],
+          "since": "2030-01-01T11:57:00.000Z",
+          "state": "waiting",
+          "subagents": [],
+          "under": [],
+          "upcoming_work": [],
+          "upcoming_work_ids": [],
+          "updated_at": "2030-01-01T12:00:18.000Z",
+          "workspace": "~/src/harbor/.worktrees/reviewer"
+        },
+        {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-harbor-reviewer",
+          "incarnation_id": "rt-harbor-reviewer-396:6",
+          "kind": "runtime",
+          "owner_host_id": "host/lantern",
+          "owner_id": "agent/example/harbor/reviewer",
+          "owner_run_id": "mission-run/example/harbor/cache-policy/1",
+          "revision": "rt28",
+          "runtime_id": "rt-harbor-reviewer-396",
+          "runtime_kind": "agent",
+          "state": "running",
+          "updated_at": "2030-01-01T11:57:00.000Z"
+        }
+      ]
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/2/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/2/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/2/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/2/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/3/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "merge-conflict-standoff"
+}

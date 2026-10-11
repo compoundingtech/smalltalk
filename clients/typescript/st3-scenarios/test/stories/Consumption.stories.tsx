@@ -3,12 +3,14 @@ import type { Args, Meta, StoryObj } from '@storybook/react'
 import { useScenarioSlice } from '../../src/react/index.ts'
 
 const Consumption = () => {
-  const agents = useScenarioSlice('roster', (slice) => slice.state.agents)
+  const roster = useScenarioSlice('roster')
   const attention = useScenarioSlice('attention')
   return <main>
-    <ul>{agents.map((agent) => <li key={agent.id}>{agent.name}</li>)}</ul>
-    <section>{attention.state.attention.map((card) => <h2 key={card.id}>{card.title}</h2>)}</section>
-    <section>{attention.state.messages.map((message) => <h3 key={message.id}>{message.title}</h3>)}</section>
+    {roster.loading ? <p>Loading roster</p> : <ul>{roster.state.agents.map((agent) => <li key={agent.id}>{agent.name}</li>)}</ul>}
+    {attention.loading ? <p>Loading attention</p> : <>
+      <section>{attention.state.attention.map((card) => <h2 key={card.id}>{card.title}</h2>)}</section>
+      <section>{attention.state.messages.map((message) => <h3 key={message.id}>{message.title}</h3>)}</section>
+    </>}
   </main>
 }
 
@@ -31,7 +33,7 @@ export const Fixed = {
 const UndeclaredConsumption = () => {
   const agents = useScenarioSlice('roster')
   useScenarioSlice('details')
-  return <ul>{agents.state.agents.map((agent) => <li key={agent.id}>{agent.name}</li>)}</ul>
+  return agents.loading ? <p>Loading roster</p> : <ul>{agents.state.agents.map((agent) => <li key={agent.id}>{agent.name}</li>)}</ul>
 }
 
 export const Undeclared = {
@@ -41,7 +43,7 @@ export const Undeclared = {
 
 const SyncConsumption = () => {
   const sync = useScenarioSlice('sync')
-  return <p>{Object.entries(sync.status).map(([surface, status]) => `${surface}: ${status._tag}`).join(', ')}</p>
+  return sync.loading ? <p>Loading sync</p> : <p>{Object.entries(sync.status).map(([surface, status]) => `${surface}: ${JSON.stringify(status)}`).join(', ')}</p>
 }
 
 export const Sync = {

@@ -22,7 +22,7 @@ grep -Fq 'mission/eval/free-mode/produced@' published.txt
 st3 work complete "$PRODUCE" --as "$PLANNER" --summary "the mission was published" >/dev/null
 
 # Free mode: generic publication by an ungranted agent succeeds too.
-st3 missions publish produced.kdl --as "$PLANNER" > direct.out
+st3 apply produced.kdl --as "$PLANNER" > direct.out
 
 st3 --json missions start eval/free-mode/produced \
   --id "eval/free-mode/produced/${ST_MISSION_RUN}" \

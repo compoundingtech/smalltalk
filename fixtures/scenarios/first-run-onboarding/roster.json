@@ -1,0 +1,423 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "roster",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 4
+  },
+  "state": {
+    "agents": [],
+    "machines": [],
+    "order": [],
+    "runtimes": []
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 1000,
+      "removes": [],
+      "store": 2,
+      "upserts": [
+        {
+          "capacity": {
+            "reason": "no capacity observation",
+            "state": "unknown"
+          },
+          "fleet_id": "fleet/example-sprout",
+          "host_id": "host/quarry",
+          "id": "machine/quarry",
+          "kind": "machine",
+          "name": "quarry",
+          "occupancy": {
+            "running_runtimes": 0
+          },
+          "projects": [
+            "~/src/sprout"
+          ],
+          "revision": "mh-quarry",
+          "runtime_ids": [],
+          "state": "local",
+          "transports": [
+            {
+              "last_success_at": "2030-01-01T12:00:01.000Z",
+              "protocol": "unix",
+              "status": "local"
+            }
+          ],
+          "updated_at": "2030-01-01T12:00:01.000Z",
+          "work": []
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 2000,
+      "order": [
+        "agent/example/sprout/builder"
+      ],
+      "removes": [],
+      "store": 3,
+      "upserts": [
+        {
+          "active_work_count": 0,
+          "ask": null,
+          "blocked_on": null,
+          "checkout": {
+            "base": "origin/main",
+            "branch": "builder/first-smoke",
+            "repository": "~/src/sprout"
+          },
+          "current_session_id": "session/example-sprout-builder",
+          "current_work": [],
+          "current_work_ids": [],
+          "driver": "claude",
+          "fault": null,
+          "harness_state": "idle",
+          "host_id": "host/quarry",
+          "id": "agent/example/sprout/builder",
+          "incarnation_id": "rt-sprout-builder-260:4",
+          "kind": "agent",
+          "last_activity_at": "2030-01-01T12:00:02.000Z",
+          "name": "Sprout Builder",
+          "next_work": null,
+          "next_work_id": null,
+          "owner_run_id": null,
+          "queued_work_count": 0,
+          "reachability": "local",
+          "revision": "ag32",
+          "runtime_ids": [
+            "runtime/example-sprout-builder"
+          ],
+          "since": "2030-01-01T12:00:02.000Z",
+          "state": "running",
+          "subagents": [],
+          "under": [],
+          "upcoming_work": [],
+          "upcoming_work_ids": [],
+          "updated_at": "2030-01-01T12:00:02.000Z",
+          "workspace": "~/src/sprout/.worktrees/builder"
+        },
+        {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-sprout-builder",
+          "incarnation_id": "rt-sprout-builder-260:4",
+          "kind": "runtime",
+          "owner_host_id": "host/quarry",
+          "owner_id": "agent/example/sprout/builder",
+          "owner_run_id": null,
+          "revision": "rt29",
+          "runtime_id": "rt-sprout-builder-260",
+          "runtime_kind": "agent",
+          "state": "running",
+          "updated_at": "2030-01-01T12:00:02.000Z"
+        },
+        {
+          "capacity": {
+            "reason": "no capacity observation",
+            "state": "unknown"
+          },
+          "fleet_id": "fleet/example-sprout",
+          "host_id": "host/quarry",
+          "id": "machine/quarry",
+          "kind": "machine",
+          "name": "quarry",
+          "occupancy": {
+            "running_runtimes": 1
+          },
+          "projects": [
+            "~/src/sprout"
+          ],
+          "revision": "mh-start",
+          "runtime_ids": [
+            "runtime/example-sprout-builder"
+          ],
+          "state": "local",
+          "transports": [
+            {
+              "last_success_at": "2030-01-01T12:00:01.000Z",
+              "protocol": "unix",
+              "status": "local"
+            }
+          ],
+          "updated_at": "2030-01-01T12:00:02.000Z",
+          "work": []
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 5000,
+      "removes": [],
+      "store": 5,
+      "upserts": [
+        {
+          "active_work_count": 1,
+          "ask": null,
+          "blocked_on": null,
+          "checkout": {
+            "base": "origin/main",
+            "branch": "builder/first-smoke",
+            "repository": "~/src/sprout"
+          },
+          "current_session_id": "session/example-sprout-builder",
+          "current_work": [
+            {
+              "id": "step-run/example/sprout/first-smoke/1/step-1",
+              "mission_id": "mission/example/sprout/first-smoke",
+              "mission_run_id": "mission-run/example/sprout/first-smoke/1",
+              "path": "step-1",
+              "since": "2030-01-01T12:00:05.000Z",
+              "state": "claimed",
+              "title": "Run the project smoke check"
+            }
+          ],
+          "current_work_ids": [
+            "step-run/example/sprout/first-smoke/1/step-1"
+          ],
+          "driver": "claude",
+          "fault": null,
+          "harness_state": "busy",
+          "host_id": "host/quarry",
+          "id": "agent/example/sprout/builder",
+          "incarnation_id": "rt-sprout-builder-260:4",
+          "kind": "agent",
+          "last_activity_at": "2030-01-01T12:00:05.000Z",
+          "name": "Sprout Builder",
+          "next_work": null,
+          "next_work_id": null,
+          "owner_run_id": "mission-run/example/sprout/first-smoke/1",
+          "queued_work_count": 0,
+          "reachability": "local",
+          "revision": "ag26",
+          "runtime_ids": [
+            "runtime/example-sprout-builder"
+          ],
+          "since": "2030-01-01T12:00:02.000Z",
+          "state": "running",
+          "subagents": [],
+          "under": [],
+          "upcoming_work": [],
+          "upcoming_work_ids": [],
+          "updated_at": "2030-01-01T12:00:05.000Z",
+          "workspace": "~/src/sprout/.worktrees/builder"
+        },
+        {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-sprout-builder",
+          "incarnation_id": "rt-sprout-builder-260:4",
+          "kind": "runtime",
+          "owner_host_id": "host/quarry",
+          "owner_id": "agent/example/sprout/builder",
+          "owner_run_id": "mission-run/example/sprout/first-smoke/1",
+          "revision": "rt13",
+          "runtime_id": "rt-sprout-builder-260",
+          "runtime_kind": "agent",
+          "state": "running",
+          "updated_at": "2030-01-01T12:00:02.000Z"
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 6000,
+      "removes": [],
+      "store": 11,
+      "upserts": [
+        {
+          "capacity": {
+            "reason": "no capacity observation",
+            "state": "unknown"
+          },
+          "fleet_id": "fleet/example-sprout",
+          "host_id": "host/quarry",
+          "id": "machine/quarry",
+          "kind": "machine",
+          "name": "quarry",
+          "occupancy": {
+            "running_runtimes": 2
+          },
+          "projects": [
+            "~/src/sprout"
+          ],
+          "revision": "mh-terminal",
+          "runtime_ids": [
+            "runtime/example-sprout-builder",
+            "runtime/example-sprout-builder-shell"
+          ],
+          "state": "local",
+          "transports": [
+            {
+              "last_success_at": "2030-01-01T12:00:01.000Z",
+              "protocol": "unix",
+              "status": "local"
+            }
+          ],
+          "updated_at": "2030-01-01T12:00:06.000Z",
+          "work": [
+            "work/example/sprout/first-smoke/1/step-1"
+          ]
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 16000,
+      "removes": [],
+      "store": 18,
+      "upserts": [
+        {
+          "active_work_count": 1,
+          "ask": null,
+          "blocked_on": null,
+          "checkout": {
+            "base": "origin/main",
+            "branch": "builder/first-smoke",
+            "repository": "~/src/sprout"
+          },
+          "current_session_id": "session/example-sprout-builder",
+          "current_work": [
+            {
+              "id": "step-run/example/sprout/first-smoke/1/step-1",
+              "mission_id": "mission/example/sprout/first-smoke",
+              "mission_run_id": "mission-run/example/sprout/first-smoke/1",
+              "path": "step-1",
+              "since": "2030-01-01T12:00:16.000Z",
+              "state": "completed",
+              "title": "Run the project smoke check"
+            }
+          ],
+          "current_work_ids": [
+            "step-run/example/sprout/first-smoke/1/step-1"
+          ],
+          "driver": "claude",
+          "fault": null,
+          "harness_state": "idle",
+          "host_id": "host/quarry",
+          "id": "agent/example/sprout/builder",
+          "incarnation_id": "rt-sprout-builder-260:4",
+          "kind": "agent",
+          "last_activity_at": "2030-01-01T12:00:16.000Z",
+          "name": "Sprout Builder",
+          "next_work": null,
+          "next_work_id": null,
+          "owner_run_id": "mission-run/example/sprout/first-smoke/1",
+          "queued_work_count": 0,
+          "reachability": "local",
+          "revision": "ag35",
+          "runtime_ids": [
+            "runtime/example-sprout-builder"
+          ],
+          "since": "2030-01-01T12:00:16.000Z",
+          "state": "waiting",
+          "subagents": [],
+          "under": [],
+          "upcoming_work": [],
+          "upcoming_work_ids": [],
+          "updated_at": "2030-01-01T12:00:16.000Z",
+          "workspace": "~/src/sprout/.worktrees/builder"
+        },
+        {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-sprout-builder",
+          "incarnation_id": "rt-sprout-builder-260:4",
+          "kind": "runtime",
+          "owner_host_id": "host/quarry",
+          "owner_id": "agent/example/sprout/builder",
+          "owner_run_id": "mission-run/example/sprout/first-smoke/1",
+          "revision": "rt1",
+          "runtime_id": "rt-sprout-builder-260",
+          "runtime_kind": "agent",
+          "state": "running",
+          "updated_at": "2030-01-01T12:00:16.000Z"
+        }
+      ]
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/2/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/2/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/3/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/3/upserts/0/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/4/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/4/upserts/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/4/upserts/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/4/upserts/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/4/upserts/1/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "first-run-onboarding"
+}

@@ -1,0 +1,261 @@
+[
+  {
+    "id": "parity-1",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "$ printf demo",
+        "state": "ok",
+        "output": [
+          "synthetic result",
+          "exit 0 \u00b7 12ms"
+        ]
+      }
+    }
+  },
+  {
+    "id": "parity-2",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "edit demo.rs",
+        "state": "ok",
+        "output": [
+          "--- a/demo.rs",
+          "+++ b/demo.rs",
+          "-old",
+          "+new"
+        ]
+      }
+    }
+  },
+  {
+    "id": "parity-3",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "write demo.txt \u00b7 1 lines \u00b7 4 bytes",
+        "state": "running",
+        "output": ["demo"]
+      }
+    }
+  },
+  {
+    "id": "parity-4",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "read demo.rs:1-3",
+        "state": "running",
+        "output": []
+      }
+    }
+  },
+  {
+    "id": "parity-5",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "grep demo src",
+        "state": "running",
+        "output": []
+      }
+    }
+  },
+  {
+    "id": "parity-6",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "glob *.rs",
+        "state": "running",
+        "output": []
+      }
+    }
+  },
+  {
+    "id": "parity-7",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "web Rust reference",
+        "state": "running",
+        "output": []
+      }
+    }
+  },
+  {
+    "id": "parity-8",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "todo update",
+        "state": "ok",
+        "output": [
+          "Render",
+          "[x] Render cards",
+          "[ ] Check pending work",
+          "[~] Exercise progress",
+          "[!] Await dependency",
+          "[/] Discard obsolete approach"
+        ]
+      }
+    }
+  },
+  {
+    "id": "parity-9",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "ask",
+        "state": "ok",
+        "output": [
+          "Which mode?",
+          "  1. Full [selected]",
+          "     Keep all synthetic details",
+          "  2. Simple",
+          "     Keep a compact synthetic view",
+          "Which mode?",
+          "  selected: Full"
+        ]
+      }
+    }
+  },
+  {
+    "id": "parity-10",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "task \u00b7 1 agents",
+        "state": "ok",
+        "output": ["parent context / contract:", "Synthetic parent context", "Contract: keep every detail", "Review · reviewer", "Review synthetic code", "Report all findings"]
+      }
+    }
+  },
+  {
+    "id": "parity-11",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "hub status demo",
+        "state": "ok",
+        "output": [
+          "demo \u00b7 running"
+        ]
+      }
+    }
+  },
+  {
+    "id": "parity-12",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "eval py \u00b7 Synthetic evaluation",
+        "state": "running",
+        "output": ["language: py"]
+      }
+    }
+  },
+  {
+    "id": "parity-13",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "custom",
+        "state": "ok",
+        "output": [
+          "synthetic result"
+        ]
+      }
+    }
+  },
+  {
+    "id": "parity-18#child",
+    "body": {
+      "kind": "tool",
+      "value": {
+        "title": "Review \u00b7 completed \u00b7 reviewer",
+        "state": "ok",
+        "output": [
+          "duration 1200ms",
+          "tokens 80",
+          "cost $0.02",
+          "open session/child"
+        ]
+      }
+    }
+  },
+  {
+    "id": "parity-21",
+    "body": {
+      "kind": "mail",
+      "value": {
+        "from": "reviewer",
+        "to": "",
+        "subject": "",
+        "body": "Review ready",
+        "delivered": false,
+        "dictated": false
+      }
+    }
+  },
+  {
+    "id": "parity-22",
+    "body": {
+      "kind": "event",
+      "value": "demo \u00b7 completed \u00b7 exit 0"
+    }
+  },
+  {
+    "id": "parity-23",
+    "body": {
+      "kind": "tool",
+      "value": {"title": "compaction \u00b7 summary \u00b7 100 \u2192 50 tokens", "state": "ok", "output": []}
+    }
+  },
+  {
+    "id": "parity-24",
+    "body": {
+      "kind": "event",
+      "value": "model \u00b7 synthetic/model"
+    }
+  },
+  {
+    "id": "parity-25",
+    "body": {
+      "kind": "event",
+      "value": "thinking \u00b7 high"
+    }
+  },
+  {
+    "id": "parity-26",
+    "body": {
+      "kind": "event",
+      "value": "title \u00b7 Synthetic conversation"
+    }
+  },
+  {
+    "id": "parity-27",
+    "body": {
+      "kind": "event",
+      "value": "session exit \u00b7 done \u00b7 Completed"
+    }
+  },
+  {
+    "id": "parity-28",
+    "body": {
+      "kind": "event",
+      "value": "skill \u00b7 synthetic"
+    }
+  },
+  {
+    "id": "parity-30",
+    "body": {
+      "kind": "event",
+      "value": "Synthetic fallback"
+    }
+  },
+  {"id":"parity-32","body":{"kind":"event","value":"session reset"}},
+  {"id":"parity-34","body":{"kind":"event","value":"title · Synthetic header title"}},
+  {"id":"parity-35#0","body":{"kind":"event","value":"Synthetic harness note."}}
+]

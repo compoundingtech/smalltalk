@@ -1,0 +1,130 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "details",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 7
+  },
+  "state": {
+    "missions": [
+      {
+        "active_runs": 0,
+        "id": "mission/example/meadow/release-candidate",
+        "kind": "mission",
+        "mission_revision": "sha256:meadow-mission-1",
+        "revision": "mr-3",
+        "run_generations": {
+          "mission-run/example/meadow/release-candidate/1": "run-generation/example/meadow/release-candidate/1/g1"
+        },
+        "runs": [
+          "mission-run/example/meadow/release-candidate/1"
+        ],
+        "state": "completed",
+        "title": "Polish the 0.8.4 release candidate",
+        "total_runs": 1,
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      }
+    ],
+    "work": [
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-meadow-builder-443:4",
+        "claimant": "agent/example/meadow/builder",
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-1",
+        "generation_id": "run-generation/example/meadow/release-candidate/1/g1",
+        "goals": [
+          "Bump the patch version"
+        ],
+        "id": "work/example/meadow/release-candidate/1/step-1",
+        "kind": "work",
+        "mission_id": "mission/example/meadow/release-candidate",
+        "mission_run_id": "mission-run/example/meadow/release-candidate/1",
+        "path": "step-1",
+        "readiness_epoch": 1,
+        "revision": "w-1",
+        "state": "completed",
+        "title": "Bump the patch version",
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-meadow-reviewer-814:6",
+        "claimant": "agent/example/meadow/reviewer",
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-2",
+        "generation_id": "run-generation/example/meadow/release-candidate/1/g1",
+        "goals": [
+          "Write the changelog"
+        ],
+        "id": "work/example/meadow/release-candidate/1/step-2",
+        "kind": "work",
+        "mission_id": "mission/example/meadow/release-candidate",
+        "mission_run_id": "mission-run/example/meadow/release-candidate/1",
+        "path": "step-2",
+        "readiness_epoch": 2,
+        "revision": "w-2",
+        "state": "completed",
+        "title": "Write the changelog",
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-meadow-docs-107:1",
+        "claimant": "agent/example/meadow/docs",
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-3",
+        "generation_id": "run-generation/example/meadow/release-candidate/1/g1",
+        "goals": [
+          "Verify the release matrix"
+        ],
+        "id": "work/example/meadow/release-candidate/1/step-3",
+        "kind": "work",
+        "mission_id": "mission/example/meadow/release-candidate",
+        "mission_run_id": "mission-run/example/meadow/release-candidate/1",
+        "path": "step-3",
+        "readiness_epoch": 3,
+        "revision": "w-3",
+        "state": "completed",
+        "title": "Verify the release matrix",
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/missions/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/2/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "release-candidate-polish"
+}

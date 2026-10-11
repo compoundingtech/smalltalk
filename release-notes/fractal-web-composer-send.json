@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web binds the kit composer to message send with exact-key retry; send failures use fixed human copy with no rendered or accessible diagnostic text, idle transcript references stay stable, and unavailable cancel controls and their state text are not rendered. While a conversation cannot be read the composer and its draft stay visible but wait to send with a fixed reason, after the send grant's own reason; a source without a send port says so in plain words. Outbox rows retain their original send time and chronological position across replies and retries. Each new own send resumes following in the shared reading column without retries or echoes issuing another scroll command. The transcript history scrolls only in the space above the composer, inbound replies stay pinned only while the reader follows, and the composer dock is inset from the viewport bottom so its focus outline stays visible. A pinned Todos disclosure above the composer reads the accepted native harness todo snapshot independently of transcript loading; it and the composer stay mounted while the conversation loads or reconnects, a missing snapshot is not shown as an empty list, and stale or truncated snapshots keep their freshness and full-source progress labels",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only change; no runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Uses the existing message send action with an idempotency key. Own-send item and turn keys stay pending/<idempotencyKey> after the server echo, so acknowledgement updates the mounted row instead of replacing it. The message entry's body.message_id correlates the send (derived before POST and confirmed by affected_ids); the existing st-minted mailbox pair joins it to its content. Header-only echoes retain the outbox prose. Aliases live only with the retained conversation, survive later replace pages and revisions, and disappear on reload, which uses server ids. Outbox rows merge with observed history at their original send timestamps; Retry preserves that timestamp, and incremental changes refer to the actual interleaved published page. A retained lastSendId changes only on new Send and commands the kit to resume following; Retry, concurrent settlement and echo retain it. No text matching or server wire changes. Cancel stays unwired; runtime.signal is not a send-cancel contract."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; the app is not deployed by this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

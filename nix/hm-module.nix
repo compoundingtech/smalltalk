@@ -52,8 +52,8 @@ let
   systemdArg = arg:
     "\"${lib.replaceStrings [ "\\" "\"" "$" "%" ] [ "\\\\" "\\\"" "$$" "%%" ] arg}\"";
   applyCommands =
-    map (file: [ "agents" "apply" "${file}" "--as" cfg.person ]) cfg.declarations.seats
-    ++ map (file: [ "missions" "publish" "${file}" "--as" cfg.person ]) cfg.declarations.missions;
+    map (file: [ "apply" "${file}" "--no-gate-check" "--as" cfg.person ]) cfg.declarations.seats
+    ++ map (file: [ "apply" "${file}" "--as" cfg.person ]) cfg.declarations.missions;
   applyScript = pkgs.writeShellScript "smalltalk-apply" (
     ''set -eu
 ''

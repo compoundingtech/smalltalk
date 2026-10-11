@@ -71,15 +71,15 @@ fn can_stall(run: &MissionRunView) -> bool {
 
 impl<R: RuntimeControl> Reconciler<R> {
     /// Who a run reports to: its latest `st missions report-to`, else what it was created with.
-    pub(super) fn run_report(&self, run: &MissionRunView) -> Result<Option<RunReport>> {
+    pub(super) fn run_report(&self, run: &str) -> Result<Option<RunReport>> {
         let claim = match self
             .store
-            .latest_claim(&run.subject, Some(crate::store::RUN_REPORT_KIND))?
+            .latest_claim(run, Some(crate::store::RUN_REPORT_KIND))?
         {
             Some(changed) => changed,
             None => match self
                 .store
-                .latest_claim(&run.subject, Some("mission-run.created"))?
+                .latest_claim(run, Some("mission-run.created"))?
             {
                 Some(created) => created,
                 None => return Ok(None),

@@ -17,8 +17,8 @@ version 2
 // When a mission always follows another run, write the wait as a step with `after-run`, as below.
 // The step is agentless. Here it takes the run from an input.
 //
-//   st agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st missions publish examples/st3/after-another-run.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/omp.kdl --as person/operator
+//   st apply examples/st3/after-another-run.kdl --as person/operator
 //   st missions start example/app/deploy --id example/app/deploy/1 \
 //     --input build_run=example/app/build/1 --workspace /srv/example/app --as person/operator
 

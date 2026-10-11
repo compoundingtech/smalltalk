@@ -15,8 +15,8 @@ version 2
 // Use the exact step-run subject that `attention ls` prints; GENERATION is a placeholder. A
 // rejection fails the gate. Republishing the mission cannot forge a decision.
 //
-//   st agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st missions publish examples/st3/human-review.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/omp.kdl --as person/operator
+//   st apply examples/st3/human-review.kdl --as person/operator
 //   st missions start example/release --id example/release/1.4.0 \
 //     --workspace /srv/example/app --as person/operator
 

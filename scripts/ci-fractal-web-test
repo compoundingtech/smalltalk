@@ -183,3 +183,9 @@ assert "python3 scripts/ci-fractal-web-licenses-test" in freshness
 lanes = (root / "scripts/ci-fractal-web").read_text()
 assert lanes.index("pnpm install --frozen-lockfile") < lanes.index("python3 scripts/ci-fractal-web-licenses --check") < lanes.index("buck2 build //:typecheck")
 print("passed: license coverage and manifest guards are wired into the generated CI lanes")
+assert 'lane "SDK unit tests" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.config.ts' in lanes
+assert 'lane "SDK frame CPU budgets" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.perf.config.ts' in lanes
+sdk = root / "apps/fractal-web/packages/st3-sdk"
+assert "'src/**/*.perf.test.ts'" in (sdk / "vitest.config.ts").read_text()
+assert "include: ['src/**/*.perf.test.ts']" in (sdk / "vitest.perf.config.ts").read_text()
+print("passed: deterministic SDK tests and isolated frame CPU budgets have separate lanes")

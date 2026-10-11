@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 
 import { ANCHOR_MS, catalog, foldSlice, loadWorld, manualClock, syncStatusAt, type SliceKind } from '../src/index.ts'
 import { createReadTracker, ScenarioProvider, useScenarioSlice, type WireSlice } from '../src/react/index.ts'
-import { scenarioArgTypes, scenarioGlobalTypes, scenarioStoryCheck, ScenarioStoryCheckError, withScenario } from '../src/storybook/index.ts'
+import { scenarioArgTypes, scenarioGlobalTypes, scenarioStoryCheck, ScenarioStoryCheckError, withScenario, type ScenarioStoryCheckOptions } from '../src/storybook/index.ts'
 import meta, { Fixed, Good, Invariant, LoadingRoster, Pinned, Sync, Undeclared } from './stories/Consumption.stories.tsx'
 
 const world = loadWorld('fleet-mid-refactor', { now: ANCHOR_MS })
@@ -100,8 +100,7 @@ describe('Storybook scenario binding', () => {
     expect(result.failures).toEqual([])
     expect(result.reads).toEqual(new Set(['roster', 'attention']))
     expect(result.checks.find(({ check }) => check === 5)?._tag).toBe('Passed')
-    // The current catalog's two worlds differ only in sync, never in roster/attention.
-    expect(result.checks.find(({ check }) => check === 3)?._tag).toBe('Skipped')
+    expect(result.checks.find(({ check }) => check === 3)?._tag).toBe('Passed')
   })
 
   it('reports both missing reads and missing data dependence for fixed text', () => {
@@ -109,6 +108,7 @@ describe('Storybook scenario binding', () => {
     expect(result._tag).toBe('Failed')
     expect(result.failures).toContainEqual(expect.objectContaining({ _tag: 'Reads', check: 1, message: expect.stringContaining('missing [roster]') }))
     expect(result.failures).toContainEqual(expect.objectContaining({ _tag: 'DataDependence', check: 2, slice: 'roster', message: 'different wire states render identical content' }))
+    expect(result.failures).toContainEqual(expect.objectContaining({ _tag: 'WorldSwitch', check: 3, slice: 'roster' }))
     expect(() => scenarioStoryCheck(Fixed, meta, { assert: true })).toThrow(ScenarioStoryCheckError)
   })
 
@@ -132,6 +132,21 @@ describe('Storybook scenario binding', () => {
     expect(result.checks.find(({ check }) => check === 3)?._tag).toBe('Passed')
   })
 
+  it('renders sync causes even when both contrast sides have the same status tag', () => {
+    const options = { atMs: 4_000, contrastPairs: { sync: [['socket-dropped', 'open-fail']] } } satisfies ScenarioStoryCheckOptions
+    const result = scenarioStoryCheck(Sync, meta, options)
+    expect(result._tag).toBe('Passed')
+    expect(result.checks.find(({ check }) => check === 2)?._tag).toBe('Passed')
+    const TagsOnly = () => {
+      const sync = useScenarioSlice('sync')
+      return <p>{Object.entries(sync.status).map(([surface, status]) => `${surface}: ${status._tag}`).join(', ')}</p>
+    }
+    const tagsOnly = { ...Sync, render: () => <TagsOnly /> }
+    expect(scenarioStoryCheck(tagsOnly, meta, options).failures).toContainEqual(expect.objectContaining({
+      _tag: 'DataDependence', check: 2, slice: 'sync', message: 'different wire states render identical content',
+    }))
+  })
+
   it('skips data contrasts for a reasoned invariant, but still requires its read', () => {
     const result = scenarioStoryCheck(Invariant, meta)
     expect(result._tag).toBe('Passed')
@@ -148,5 +163,67 @@ describe('Storybook scenario binding', () => {
     const result = scenarioStoryCheck(LoadingRoster, meta, { contrastPairs: { roster: [['default', 'loading']] } })
     expect(result._tag).toBe('Passed')
     expect(result.checks.find(({ check }) => check === 2)?._tag).toBe('Passed')
+  })
+
+  it('does not render backing roster or attention content while loading', () => {
+    const Composed = composeStory(Good, meta, {
+      decorators: [withScenario],
+      globalTypes: scenarioGlobalTypes,
+      initialGlobals: { scenario: 'loading', scenarioNow: ANCHOR_MS },
+    })
+    const markup = renderToStaticMarkup(<Composed />)
+    expect(markup).toContain('Loading roster')
+    expect(markup).toContain('Loading attention')
+    const loading = loadWorld('loading', { now: ANCHOR_MS })
+    expect(loading.slices.roster.state.agents.length).toBeGreaterThan(0)
+    for (const agent of loading.slices.roster.state.agents) expect(markup).not.toContain(agent.name)
+    const attentionItems = [...loading.slices.attention.state.attention, ...loading.slices.attention.state.messages]
+    expect(attentionItems.length).toBeGreaterThan(0)
+    for (const item of attentionItems) {
+      expect(markup).not.toContain(item.title)
+    }
+  })
+
+  it('rejects a loading side that leaks the other side’s data', () => {
+    const LeakingRoster = () => {
+      const roster = useScenarioSlice('roster')
+      return <ul>{roster.state.agents.map((agent) => <li key={agent.id}>{agent.name}</li>)}</ul>
+    }
+    const leaking = { ...LoadingRoster, render: () => <LeakingRoster /> }
+    const result = scenarioStoryCheck(leaking, meta, { contrastPairs: { roster: [['default', 'loading']] } })
+    expect(result._tag).toBe('Failed')
+    expect(result.failures).toContainEqual(expect.objectContaining({
+      _tag: 'DataDependence', check: 2, slice: 'roster',
+      message: expect.stringContaining('loading still renders the other side'),
+    }))
+  })
+
+  it('renders one representative world contrast rather than every catalog pair', () => {
+    let renders = 0
+    const CountedRoster = () => {
+      renders++
+      const roster = useScenarioSlice('roster')
+      return roster.loading ? <p>Loading roster</p> : <ul>{roster.state.agents.map((agent) => <li key={agent.id}>{agent.name}</li>)}</ul>
+    }
+    const counted = { ...LoadingRoster, render: () => <CountedRoster /> }
+    const result = scenarioStoryCheck(counted, meta)
+    expect(result._tag).toBe('Passed')
+    expect(result.checks.find(({ check }) => check === 3)?._tag).toBe('Passed')
+    // Baseline + two variant pairs + one world pair + URL/direct renders.
+    expect(renders).toBeLessThanOrEqual(9)
+  })
+
+  it('skips world contrasts when declared visible content is identical', () => {
+    const result = scenarioStoryCheck(LoadingRoster, meta, { args: { roster: 'empty' } })
+    expect(result._tag).toBe('Passed')
+    expect(result.checks.find(({ check }) => check === 2)?._tag).toBe('Passed')
+    expect(result.checks.find(({ check }) => check === 3)?._tag).toBe('Skipped')
+  })
+
+  it('does not pair sync scripts whose projected status is identical', () => {
+    const result = scenarioStoryCheck(Sync, meta, { args: { sync: 'requested' } })
+    expect(result._tag).toBe('Passed')
+    expect(result.checks.find(({ check }) => check === 2)?._tag).toBe('Passed')
+    expect(result.checks.find(({ check }) => check === 3)?._tag).toBe('Skipped')
   })
 })

@@ -20,7 +20,10 @@ its own target rather than leaving it out: the route total still includes it.
 
 `scope: "agents-roster"` rows (also under route `/v1/client/agents`) time where that wait goes,
 each in its own last-512 sample, `duration_scope: "roster-stage"`. Stage `refresh` is one refresher
-fold and `refresh-admission` its wait for roster admission (`population: "refresher-folds"`).
+fold from the previous publication, `refresh-cold` one with no publication to start from, which
+refolds every card from the log (the daemon's first complete roster, or after a chunked
+replication projection, a trim or a repair forgot every kept reduction), and `refresh-admission`
+its wait for roster admission (`population: "refresher-folds"`).
 Stage `fresh-wait` is a fresh read's wait for a publication at its cut (2 s at most), and
 `fresh-page` the page it then builds (`population: "fresh-reads"`). Stages are not requests: they
 add no route or path rows.
@@ -37,7 +40,7 @@ route durations include deliberate waiting.
 
 [`slo/targets.toml`](../../slo/targets.toml) holds the daemon's targets: reads a person waits on,
 writes and acks, terminal attach to first screen, one SQL statement, any transaction or hold of
-the writer, and daemon CPU. Every daemon builds the file in. CI's daemon_load reads the same file.
+the writer, daemon CPU, and this member's database size. Every daemon builds the file in. CI's daemon_load reads the same file.
 A target describes what we aim for and gates nothing by itself.
 
 The request-latency read adds `targets` and `paths` to `routes`. Each target and each path keeps
@@ -54,6 +57,21 @@ target and counts toward no other: a first page is held to the 100 ms of `person
 list to 300 ms. The `sql-statement`, `transaction` (`read`, `write`, `writer_hold`) and `cpu`
 rows cover the store's statements, its read and write transactions, each hold of its single
 writer, and the process's CPU in cores.
+
+The `database` row is this member's store: `max_live_gb` for the pages in use (the file less its
+free pages, which SQLite reuses before the file grows) and `max_growth_mb_per_day` for their net
+daily growth, what is written less what checkpoints and retention free. The daemon samples the
+store hourly, after its local trims, by reading three pragmas, and keeps two days of samples in
+`meta` (`database_size_samples`), so a restart does not lose the growth. Growth is measured from
+the newest sample at least a day old, or extrapolated from the oldest once there is an hour of
+samples; `size` says over what span. Each sample also records the lengths of the main file and its WAL:
+`physical_bytes` is their sum, what the store takes on disk (page counts include pages committed
+to the WAL but not yet copied into the main file, so they are never added to the WAL), and
+`physical_growth_bytes_per_day` compares it with the sample nearest exactly a day ago, within half
+an hour of it, scaled to a day. It is never extrapolated. A sample dated in the future, after the
+clock went back, is dropped. The newest sample is the one every reader uses
+(`st3::slo::database_size`), so disk-filling conditions read the same ring. [Retention](retention.md) explains what keeps the store
+within it.
 
 The windows live in memory. Each is a ring of slots (12 of 5 seconds, 10 of 30 seconds, 12 of 5
 minutes). Each slot is a sparse histogram with 16 buckets per doubling, so a percentile is
@@ -631,3 +649,91 @@ Raw evidence: [idle, 100 pending](profiles/targeted-mailbox-wakes-2026-10-06-30s
 [idle, 250 pending](profiles/targeted-mailbox-wakes-2026-10-06-30s/idle-250.json), and
 [thirty-second write workload](profiles/targeted-mailbox-wakes-2026-10-06-30s/targeted-wakes.json).
 The earlier three- and five-second measurements remain above for comparison.
+
+## Browser perceived-UX traces
+
+The browser exports `service.name=webfractal-web` to the same-origin OTLP relay. Dogfood pages
+record **100%** of budget roots and SDK detail; the former 10% page-load gate is removed.
+No local storage, transcript content, resource identifiers, credentials, or free-form error
+details enter production spans. The existing 200-span `SpanRing` is the dependency-free local
+assertion surface; adding the separate otelite package is unnecessary for these lifecycle tests.
+
+| Span | `span.label` | Attributes and measured boundary |
+| --- | --- | --- |
+| `wf.ux.reload` | `roster` | Navigation start → committed shell paint → committed roster paint. `wf.ux.shell_ms`, `wf.ux.roster_after_shell_ms`; q96 `wf.ux.budget_ms=100`, `wf.ux.budget_phase=roster-after-shell`, strict `<100ms` `wf.ux.budget_met`. |
+| `wf.ux.switch` | `warm` or `cold` | Selection → transcript DOM commit followed by paint. `wf.ux.cache`, `wf.ux.slot_count`, `wf.ux.data_ready_ms`, `wf.ux.painted`; `wf.ux.budget_ms=100`, `wf.ux.budget_phase=selection-to-paint`, `wf.ux.budget_met`. |
+| `wf.ux.switch.data_ready` | `first page` | Child of switch: selection → first decoded page, separately from painted completion. |
+| `wf.ux.first_frame` | Collection name, `conversation`, or `terminal` | One bounded root per subscribe attempt: actual subscribe send → first verified frame, not paint. `wf.subscription.kind`, `wf.ux.early`, `wf.ux.outcome`; `wf.ux.budget_ms=30000`, `wf.ux.budget_phase=subscribe-to-first-frame`, `wf.ux.budget_met` express the bounded first-frame lifecycle. |
+| `wf.sync.transition` | `window`, `conversation`, `terminal`, `gateway` | SyncStatus v2 tag/stage/reason transitions; `wf.subscription.kind`, `wf.sync.from`, `wf.sync.to`, `wf.sync.stage`, `wf.sync.previous_ms`, `wf.sync.reconnect_ms`. Span duration is capped at 30 seconds; full dwell and reconnect durations remain numeric attributes. `wf.ux.budget_ms=30000`, `wf.ux.budget_phase=transition-bound` describes this lifecycle bound, not a product reconnect SLO. |
+| `wf.ux.send_echo` | `echo` | Feature-owned hook: send → verified echo DOM commit followed by paint; `wf.ux.painted`, `wf.ux.budget_ms=100`, `wf.ux.budget_phase=send-to-echo-paint`, `wf.ux.budget_met`. |
+| `st3.capabilities`, `st3.snapshot`, `st3.messageSend`, `st3.follow.subscribe` | Fixed operation name in production | SDK children inherit the active UX context and propagate their own child traceparent; identifiers and failure details are stripped. |
+| `st3.socket.probe`, `st3.socket.create` | `probe`, `socket` | Per-attempt capability probe and credential/socket issuance. These are children of an active UX operation, or independent roots on reconnect; creation is not a long-lived socket span or a handshake timing claim. |
+
+UX operations have a 30-second deadline and `wf.ux.outcome` distinguishes `painted`, `observed`,
+`timeout`, `superseded`, and `disposed`. Repeated progress ticks do not create new transition
+spans. The 100ms switch/echo comparison is a telemetry budget, not evidence that those feature
+surfaces meet it.
+
+### Feature paint and echo hooks
+
+This data-layer stack has no live transcript renderer or composer. Selection already owns a
+real conversation follow and emits `wf.ux.switch.data_ready`; it never calls a data publication
+“painted.” The feature renderer must call `telemetry.ux.transcriptCommitted(ref)` from the
+actual committed transcript ref/layout boundary, returning its cancellation function as
+the React ref cleanup. Only then does the switch root finish with `wf.ux.painted=true`.
+Until that boundary exists, the root ends explicitly as timeout/superseded/disposed.
+
+For a composer, call `telemetry.ux.beginSendEcho()` at send. Its `committed()` callback belongs
+on the verified matching echo DOM commit, never on the HTTP acknowledgement; call `cancel()`
+when the operation is abandoned. No echo span is fabricated by the data layer.
+
+### Propagation and early roster connection
+
+SDK HTTP requests use the generated-client-compatible `traceContext` callback. Browser
+WebSocket upgrades carry validated W3C context in trace-only URL parameters (browser WebSocket
+APIs cannot set request headers); the gateway strips those parameters before forwarding,
+parents its request span to the browser context, and forwards its child context upstream.
+Subscribe frames carry optional `trace: { traceparent, tracestate? }`; older daemons ignore
+unknown frame fields. Frame-level daemon parenting requires the corresponding daemon protocol
+support; upgrade-level and HTTP parenting do not.
+
+The roster bootstrap runs before the main module and sends its first subscribe without waiting
+for the bundle. The SDK adopts the page-owned socket and buffered frames, without persistence,
+duplicate roster subscribe, or a second initial socket. Its first-frame observation is an
+independent root linked to the bootstrap trace, rather than adopting an unrelated active UX parent.
+Browser fixtures exercise early-send ordering and committed-paint completion; SDK/server tests
+assert trace-ID continuity.
+
+On `pagehide`, the source synchronously closes its collection socket before starting asynchronous
+disposal. Custom SDK sockets receive code 1001; native browser APIs prohibit that reserved code,
+so their adapters use no-argument close (an empty close frame, reported as 1005 by a server).
+A persisted (back/forward-cache) page retains its scope; persisted `pageshow` reconnects and
+resubscribes its existing interests. These lifecycle handlers add no timers. The early unclaimed
+socket also closes synchronously on pagehide.
+The document entry owns a single lifecycle handler: close the socket, synchronously unmount
+React registry consumers, then dispose the source. This explicit ordering does not rely on
+capture/bubble ordering between separately registered window listeners.
+
+The browser proof commands require `playwright-cli` on `PATH` and the locked workspace
+dependencies installed:
+
+```sh
+node apps/fractal-web/scripts/early-connect-proof.mjs
+node apps/fractal-web/scripts/ux-paint-proof.mjs
+```
+
+The early-connect proof controls module delivery, then imports the actual main entry,
+renders the real shell, and checks that the SDK took the one initial socket without sending
+a second roster subscribe. It then dispatches persisted page-transition events to exercise
+retained-scope reconnect, and performs a real browser reload. The test server requires each
+close frame before the next roster subscribe. It expects an empty native close frame on simulated
+pagehide; real navigation may additionally use the browser's own 1001 close. The persisted events
+test the handlers,
+not browser-specific back/forward-cache eligibility. This proves the early path while a bundle
+is loading; it does not promise that every network's WebSocket handshake outruns an already-cached
+bundle. Both commands close their ephemeral servers and browser sessions in `finally`.
+
+The daemon's existing [`CollectionSubscribe`](../../crates/st3/src/api/client_v0.rs)
+derives Serde deserialization without `deny_unknown_fields`, so the optional trace field
+is accepted and ignored by older servers.
+

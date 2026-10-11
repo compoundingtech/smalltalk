@@ -1,0 +1,72 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "details",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 6
+  },
+  "state": {
+    "missions": [
+      {
+        "active_runs": 1,
+        "id": "mission/example/harbor/deploy-summary",
+        "kind": "mission",
+        "mission_revision": "sha256:harbor-mission-1",
+        "revision": "mr-1",
+        "run_generations": {
+          "mission-run/example/harbor/deploy-summary/1": "run-generation/example/harbor/deploy-summary/1/g1"
+        },
+        "runs": [
+          "mission-run/example/harbor/deploy-summary/1"
+        ],
+        "state": "running",
+        "title": "Verify deployment recovery",
+        "total_runs": 1,
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      }
+    ],
+    "work": [
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-harbor-builder-206:3",
+        "claimant": "agent/example/harbor/builder",
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-1",
+        "generation_id": "run-generation/example/harbor/deploy-summary/1/g1",
+        "goals": [
+          "Verify readiness, canary checks and error budget"
+        ],
+        "id": "work/example/harbor/deploy-summary/1/step-1",
+        "kind": "work",
+        "mission_id": "mission/example/harbor/deploy-summary",
+        "mission_run_id": "mission-run/example/harbor/deploy-summary/1",
+        "path": "step-1",
+        "readiness_epoch": 1,
+        "revision": "w-1",
+        "state": "claimed",
+        "title": "Stream the deployment verification report",
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/missions/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/0/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "offline-reconnect-storm"
+}

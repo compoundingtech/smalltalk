@@ -18,9 +18,10 @@ export function simplify(entries: readonly ConversationEntry[], open: ReadonlySe
   const rows: SimpleRow[] = [];
   for (let index = 0; index < entries.length;) {
     const calls: Array<{ entry: ConversationEntry; tool: Tool }> = [];
-    while (index + calls.length < entries.length && entries[index + calls.length].body.kind === 'tool') {
+    while (index + calls.length < entries.length) {
       const entry = entries[index + calls.length];
-      calls.push({ entry, tool: entry.body as Tool });
+      if (entry.body.kind !== 'tool' || entry.body.title.startsWith('assistant error') || entry.body.title.startsWith('compaction') || entry.body.title.startsWith('write ')) break;
+      calls.push({ entry, tool: entry.body });
     }
     if (!calls.length) {
       rows.push({ kind: 'entry', entry: entries[index] });

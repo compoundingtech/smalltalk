@@ -1,0 +1,240 @@
+{
+  "agent/synthetic-138/1": {
+    "kind": "conversation",
+    "session_id": "session/synthetic-138/1",
+    "items": [
+      {
+        "id": "timeline-entry/synthetic-138/1-1",
+        "sequence": 1,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:01.000Z",
+        "role": "user",
+        "type": "message",
+        "body": {
+          "message_id": "message/synthetic-138/1",
+          "from": "person/operator",
+          "to": "agent/synthetic-138/1",
+          "title": "Build a sample",
+          "reply_to": null
+        }
+      },
+      {
+        "id": "timeline-entry/synthetic-138/1-2",
+        "sequence": 2,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:02.000Z",
+        "role": "user",
+        "type": "content",
+        "body": {
+          "media_type": "text/plain",
+          "text": "Prepare a synthetic sample with four rows."
+        }
+      },
+      {
+        "id": "timeline-entry/synthetic-138/1-3",
+        "sequence": 3,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:03.000Z",
+        "role": "assistant",
+        "type": "tool_call",
+        "body": {
+          "call_id": "sample-call-138-1",
+          "name": "read",
+          "arguments": {
+            "path": "/srv/work/sample/input.json"
+          }
+        }
+      },
+      {
+        "id": "timeline-entry/synthetic-138/1-4",
+        "sequence": 4,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:04.000Z",
+        "role": "tool",
+        "type": "tool_result",
+        "body": {
+          "call_id": "sample-call-138-1",
+          "status": "success",
+          "media_type": "application/json",
+          "content": {
+            "rows": 4
+          }
+        }
+      },
+      {
+        "id": "timeline-entry/synthetic-138/1-5",
+        "sequence": 5,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:05.000Z",
+        "role": "assistant",
+        "type": "content",
+        "body": {
+          "media_type": "text/plain",
+          "text": "The sample inspection is complete."
+        }
+      }
+    ],
+    "page": {
+      "limit": 100,
+      "has_more": false
+    }
+  },
+  "agent/synthetic-138/2": {
+    "kind": "conversation",
+    "session_id": "session/synthetic-138/2",
+    "items": [
+      {
+        "id": "timeline-entry/synthetic-138/2-1",
+        "sequence": 1,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:01.000Z",
+        "role": "user",
+        "type": "message",
+        "body": {
+          "message_id": "message/synthetic-138/2",
+          "from": "person/operator",
+          "to": "agent/synthetic-138/2",
+          "title": "Build a sample",
+          "reply_to": null
+        }
+      },
+      {
+        "id": "timeline-entry/synthetic-138/2-2",
+        "sequence": 2,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:02.000Z",
+        "role": "user",
+        "type": "content",
+        "body": {
+          "media_type": "text/plain",
+          "text": "Prepare a synthetic sample with four rows."
+        }
+      },
+      {
+        "id": "timeline-entry/synthetic-138/2-3",
+        "sequence": 3,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:03.000Z",
+        "role": "assistant",
+        "type": "tool_call",
+        "body": {
+          "call_id": "sample-call-138-2",
+          "name": "read",
+          "arguments": {
+            "path": "/srv/work/sample/input.json"
+          }
+        }
+      },
+      {
+        "id": "timeline-entry/synthetic-138/2-5",
+        "sequence": 5,
+        "revision": 1,
+        "final": false,
+        "timestamp": "2032-01-18T23:59:05.000Z",
+        "role": "assistant",
+        "type": "content",
+        "body": {
+          "media_type": "text/plain",
+          "text": "Waiting for the synthetic read."
+        }
+      }
+    ],
+    "page": {
+      "limit": 100,
+      "has_more": false
+    }
+  },
+  "agent/synthetic-138/3": {
+    "kind": "conversation",
+    "session_id": "session/synthetic-138/3",
+    "items": [
+      {
+        "id": "timeline-entry/synthetic-138/3-1",
+        "sequence": 1,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:01.000Z",
+        "role": "user",
+        "type": "message",
+        "body": {
+          "message_id": "message/synthetic-138/3",
+          "from": "person/operator",
+          "to": "agent/synthetic-138/3",
+          "title": "Build a sample",
+          "reply_to": null
+        }
+      },
+      {
+        "id": "timeline-entry/synthetic-138/3-2",
+        "sequence": 2,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:02.000Z",
+        "role": "user",
+        "type": "content",
+        "body": {
+          "media_type": "text/plain",
+          "text": "Prepare a synthetic sample with four rows."
+        }
+      },
+      {
+        "id": "timeline-entry/synthetic-138/3-3",
+        "sequence": 3,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:03.000Z",
+        "role": "assistant",
+        "type": "tool_call",
+        "body": {
+          "call_id": "sample-call-138-3",
+          "name": "read",
+          "arguments": {
+            "path": "/srv/work/sample/input.json"
+          }
+        }
+      },
+      {
+        "id": "timeline-entry/synthetic-138/3-4",
+        "sequence": 4,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:04.000Z",
+        "role": "tool",
+        "type": "tool_result",
+        "body": {
+          "call_id": "sample-call-138-3",
+          "status": "error",
+          "media_type": "application/json",
+          "content": {
+            "error": "Synthetic input unavailable"
+          }
+        }
+      },
+      {
+        "id": "timeline-entry/synthetic-138/3-5",
+        "sequence": 5,
+        "revision": 1,
+        "final": true,
+        "timestamp": "2032-01-18T23:59:05.000Z",
+        "role": "assistant",
+        "type": "content",
+        "body": {
+          "media_type": "text/plain",
+          "text": "The sample inspection is complete."
+        }
+      }
+    ],
+    "page": {
+      "limit": 100,
+      "has_more": false
+    }
+  }
+}

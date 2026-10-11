@@ -1606,6 +1606,42 @@ fn manual_rollout_policy_requires_each_active_daemon_and_is_in_the_receipt_diges
 }
 
 #[test]
+fn manual_authored_resume_adoption_metadata_and_launch_publish_before_rollout_refusal() {
+    let store = Store::open_memory("amber").unwrap();
+    let native = |model: &str| crate::graph::parse_owned_set_intent(&format!(
+        "version 2\nagent \"garden/orchard\" {{ rollout \"manual\"; harness \"claude\" {{ model {model:?}; args \"--resume\" \"authored-session\"; }} }}"), "amber").unwrap();
+    let initial = native("one");
+    direct(&store, &initial, "initial").unwrap();
+    let old = initial.subjects["agent/garden/orchard"].member.clone().unwrap();
+    store.append_claim(&ClaimInput {
+        subject: "agent/garden/orchard".into(), kind: "runtime.observed".into(), actor: None,
+        fields: serde_json::from_value(json!({"status":"running","incarnation_id":"incumbent","runtime_id":old.runtime_id})).unwrap(),
+        evidence: vec![], expected_subject: None, idempotency_key: None,
+    }).unwrap();
+    let mut opts = options(&store, 1);
+    opts.adopt.insert("agent/garden/orchard".into());
+    let preview = store.owned_set_preview(&initial, &opts).unwrap();
+    assert!(preview.blockers.is_empty(), "{:?}", preview.blockers);
+    assert!(preview.rollouts["agent/garden/orchard"]["blocking"][0].as_str().unwrap().contains("declares its own session selection"));
+    opts.expected_subjects = preview.expected_subjects;
+    store.apply_owned_set(&initial, &opts, "adopt", "person/operator").unwrap();
+    let mut metadata = initial.clone();
+    metadata.subjects.get_mut("agent/garden/orchard").unwrap().desired["description"] = json!("Updated purpose");
+    apply(&store, &metadata, 2);
+    let changed = native("two");
+    apply(&store, &changed, 3);
+    assert_eq!(store.desired_subject_with_writer("agent/garden/orchard").unwrap().unwrap().0.member, changed.subjects["agent/garden/orchard"].member);
+    let token = store.selected_desired_token("agent/garden/orchard").unwrap().unwrap();
+    let index = store.index().unwrap();
+    let error = store.request_rollout("agent/garden/orchard", &token, &old, "incumbent",
+        "person/operator", &crate::rollout::Policy::when_idle(1_800_000, false), "refused").unwrap_err();
+    assert!(error.message.contains("declares its own session selection"), "{error:?}");
+    assert_eq!(store.index().unwrap(), index);
+    assert!(store.rollout("agent/garden/orchard").unwrap().is_none());
+    assert_eq!(store.latest_actual_value("agent/garden/orchard").unwrap().unwrap()["status"], "running");
+}
+
+#[test]
 fn pass_staged_subject_selection_uses_the_partial_index() {
     let store = Store::open_memory("amber").unwrap();
     let connection = store.readers.get();

@@ -1,0 +1,1977 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "terminal",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 22
+  },
+  "state": {
+    "terminals": [
+      {
+        "cast": {
+          "events": [
+            [
+              0,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=1 --repeat=12\r\n"
+            ],
+            [
+              5,
+              "o",
+              "seed 001: PASS search before cancellation: 12 assertions\r\nseed 002: PASS search before cancellation: 12 assertions\r\nseed 003: PASS search before cancellation: 12 assertions\r\nseed 004: PASS search before cancellation: 12 assertions\r\nseed 005: PASS search before cancellation: 12 assertions\r\nseed 006: PASS search before cancellation: 12 assertions\r\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 008: PASS search before cancellation: 12 assertions\r\nseed 009: PASS search before cancellation: 12 assertions\r\nseed 010: PASS search before cancellation: 12 assertions\r\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 012: PASS search before cancellation: 12 assertions\r\nbatch 1: 10 passed, 2 failed\r\nAll responses come from the in-memory transport; failing seeds make zero network requests.\r\n"
+            ],
+            [
+              100,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=13 --repeat=12\r\n"
+            ],
+            [
+              105,
+              "o",
+              "seed 013: PASS search before cancellation: 12 assertions\r\nseed 014: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 015: PASS search before cancellation: 12 assertions\r\nseed 016: PASS search before cancellation: 12 assertions\r\nseed 017: PASS search before cancellation: 12 assertions\r\nseed 018: PASS search before cancellation: 12 assertions\r\nseed 019: PASS search before cancellation: 12 assertions\r\nseed 020: PASS search before cancellation: 12 assertions\r\nseed 021: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 022: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 023: PASS search before cancellation: 12 assertions\r\nseed 024: PASS search before cancellation: 12 assertions\r\nbatch 2: 9 passed, 3 failed\r\nAll responses come from the in-memory transport; failing seeds make zero network requests.\r\n"
+            ],
+            [
+              200,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=25 --repeat=12\r\n"
+            ],
+            [
+              205,
+              "o",
+              "seed 025: PASS search before cancellation: 12 assertions\r\nseed 026: PASS search before cancellation: 12 assertions\r\nseed 027: PASS search before cancellation: 12 assertions\r\nseed 028: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 029: PASS search before cancellation: 12 assertions\r\nseed 030: PASS search before cancellation: 12 assertions\r\nseed 031: PASS search before cancellation: 12 assertions\r\nseed 032: PASS search before cancellation: 12 assertions\r\nseed 033: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 034: PASS search before cancellation: 12 assertions\r\nseed 035: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 036: PASS search before cancellation: 12 assertions\r\nbatch 3: 9 passed, 3 failed\r\nAll responses come from the in-memory transport; failing seeds make zero network requests.\r\n"
+            ],
+            [
+              300,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=37 --repeat=12\r\n"
+            ],
+            [
+              305,
+              "o",
+              "seed 037: PASS search before cancellation: 12 assertions\r\nseed 038: PASS search before cancellation: 12 assertions\r\nseed 039: PASS search before cancellation: 12 assertions\r\nseed 040: PASS search before cancellation: 12 assertions\r\nseed 041: PASS search before cancellation: 12 assertions\r\nseed 042: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 043: PASS search before cancellation: 12 assertions\r\nseed 044: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 045: PASS search before cancellation: 12 assertions\r\nseed 046: PASS search before cancellation: 12 assertions\r\nseed 047: PASS search before cancellation: 12 assertions\r\nseed 048: PASS search before cancellation: 12 assertions\r\nbatch 4: 10 passed, 2 failed\r\nAll responses come from the in-memory transport; failing seeds make zero network requests.\r\n"
+            ],
+            [
+              400,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=49 --repeat=12\r\n"
+            ],
+            [
+              405,
+              "o",
+              "seed 049: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 050: PASS search before cancellation: 12 assertions\r\nseed 051: PASS search before cancellation: 12 assertions\r\nseed 052: PASS search before cancellation: 12 assertions\r\nseed 053: PASS search before cancellation: 12 assertions\r\nseed 054: PASS search before cancellation: 12 assertions\r\nseed 055: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 056: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 057: PASS search before cancellation: 12 assertions\r\nseed 058: PASS search before cancellation: 12 assertions\r\nseed 059: PASS search before cancellation: 12 assertions\r\nseed 060: PASS search before cancellation: 12 assertions\r\nbatch 5: 9 passed, 3 failed\r\nAll responses come from the in-memory transport; failing seeds make zero network requests.\r\n"
+            ],
+            [
+              500,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=61 --repeat=12\r\n"
+            ],
+            [
+              505,
+              "o",
+              "seed 061: PASS search before cancellation: 12 assertions\r\nseed 062: PASS search before cancellation: 12 assertions\r\nseed 063: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 064: PASS search before cancellation: 12 assertions\r\nseed 065: PASS search before cancellation: 12 assertions\r\nseed 066: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 067: PASS search before cancellation: 12 assertions\r\nseed 068: PASS search before cancellation: 12 assertions\r\nseed 069: PASS search before cancellation: 12 assertions\r\nseed 070: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 071: PASS search before cancellation: 12 assertions\r\nseed 072: PASS search before cancellation: 12 assertions\r\nbatch 6: 9 passed, 3 failed\r\nAll responses come from the in-memory transport; failing seeds make zero network requests.\r\n"
+            ],
+            [
+              600,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=73 --repeat=12\r\n"
+            ],
+            [
+              605,
+              "o",
+              "seed 073: PASS search before cancellation: 12 assertions\r\nseed 074: PASS search before cancellation: 12 assertions\r\nseed 075: PASS search before cancellation: 12 assertions\r\nseed 076: PASS search before cancellation: 12 assertions\r\nseed 077: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 078: PASS search before cancellation: 12 assertions\r\nseed 079: PASS search before cancellation: 12 assertions\r\nseed 080: PASS search before cancellation: 12 assertions\r\nseed 081: PASS search before cancellation: 12 assertions\r\nseed 082: PASS search before cancellation: 12 assertions\r\nseed 083: PASS search before cancellation: 12 assertions\r\nseed 084: FAIL search after cancellation: AbortError, signal.aborted=true\r\nbatch 7: 10 passed, 2 failed\r\nAll responses come from the in-memory transport; failing seeds make zero network requests.\r\n"
+            ],
+            [
+              700,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=85 --repeat=12\r\n"
+            ],
+            [
+              705,
+              "o",
+              "seed 085: PASS search before cancellation: 12 assertions\r\nseed 086: PASS search before cancellation: 12 assertions\r\nseed 087: PASS search before cancellation: 12 assertions\r\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 089: PASS search before cancellation: 12 assertions\r\nseed 090: PASS search before cancellation: 12 assertions\r\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 092: PASS search before cancellation: 12 assertions\r\nseed 093: PASS search before cancellation: 12 assertions\r\nseed 094: PASS search before cancellation: 12 assertions\r\nseed 095: PASS search before cancellation: 12 assertions\r\nseed 096: PASS search before cancellation: 12 assertions\r\nbatch 8: 10 passed, 2 failed\r\nAll responses come from the in-memory transport; failing seeds make zero network requests.\r\nRejected hypothesis 1: the same AbortError occurs with a stubbed network. Increasing the retry timeout changes nothing.\r\n"
+            ],
+            [
+              800,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=1 --repeat=12\r\n"
+            ],
+            [
+              805,
+              "o",
+              "seed 001: PASS search before cancellation: 12 assertions\r\nseed 002: PASS search before cancellation: 12 assertions\r\nseed 003: PASS search before cancellation: 12 assertions\r\nseed 004: PASS search before cancellation: 12 assertions\r\nseed 005: PASS search before cancellation: 12 assertions\r\nseed 006: PASS search before cancellation: 12 assertions\r\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 008: PASS search before cancellation: 12 assertions\r\nseed 009: PASS search before cancellation: 12 assertions\r\nseed 010: PASS search before cancellation: 12 assertions\r\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 012: PASS search before cancellation: 12 assertions\r\nbatch 1: 10 passed, 2 failed\r\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\r\n"
+            ],
+            [
+              900,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=13 --repeat=12\r\n"
+            ],
+            [
+              905,
+              "o",
+              "seed 013: PASS search before cancellation: 12 assertions\r\nseed 014: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 015: PASS search before cancellation: 12 assertions\r\nseed 016: PASS search before cancellation: 12 assertions\r\nseed 017: PASS search before cancellation: 12 assertions\r\nseed 018: PASS search before cancellation: 12 assertions\r\nseed 019: PASS search before cancellation: 12 assertions\r\nseed 020: PASS search before cancellation: 12 assertions\r\nseed 021: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 022: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 023: PASS search before cancellation: 12 assertions\r\nseed 024: PASS search before cancellation: 12 assertions\r\nbatch 2: 9 passed, 3 failed\r\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\r\n"
+            ],
+            [
+              1000,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=25 --repeat=12\r\n"
+            ],
+            [
+              1005,
+              "o",
+              "seed 025: PASS search before cancellation: 12 assertions\r\nseed 026: PASS search before cancellation: 12 assertions\r\nseed 027: PASS search before cancellation: 12 assertions\r\nseed 028: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 029: PASS search before cancellation: 12 assertions\r\nseed 030: PASS search before cancellation: 12 assertions\r\nseed 031: PASS search before cancellation: 12 assertions\r\nseed 032: PASS search before cancellation: 12 assertions\r\nseed 033: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 034: PASS search before cancellation: 12 assertions\r\nseed 035: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 036: PASS search before cancellation: 12 assertions\r\nbatch 3: 9 passed, 3 failed\r\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\r\n"
+            ],
+            [
+              1100,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=37 --repeat=12\r\n"
+            ],
+            [
+              1105,
+              "o",
+              "seed 037: PASS search before cancellation: 12 assertions\r\nseed 038: PASS search before cancellation: 12 assertions\r\nseed 039: PASS search before cancellation: 12 assertions\r\nseed 040: PASS search before cancellation: 12 assertions\r\nseed 041: PASS search before cancellation: 12 assertions\r\nseed 042: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 043: PASS search before cancellation: 12 assertions\r\nseed 044: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 045: PASS search before cancellation: 12 assertions\r\nseed 046: PASS search before cancellation: 12 assertions\r\nseed 047: PASS search before cancellation: 12 assertions\r\nseed 048: PASS search before cancellation: 12 assertions\r\nbatch 4: 10 passed, 2 failed\r\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\r\n"
+            ],
+            [
+              1200,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=49 --repeat=12\r\n"
+            ],
+            [
+              1205,
+              "o",
+              "seed 049: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 050: PASS search before cancellation: 12 assertions\r\nseed 051: PASS search before cancellation: 12 assertions\r\nseed 052: PASS search before cancellation: 12 assertions\r\nseed 053: PASS search before cancellation: 12 assertions\r\nseed 054: PASS search before cancellation: 12 assertions\r\nseed 055: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 056: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 057: PASS search before cancellation: 12 assertions\r\nseed 058: PASS search before cancellation: 12 assertions\r\nseed 059: PASS search before cancellation: 12 assertions\r\nseed 060: PASS search before cancellation: 12 assertions\r\nbatch 5: 9 passed, 3 failed\r\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\r\n"
+            ],
+            [
+              1300,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=61 --repeat=12\r\n"
+            ],
+            [
+              1305,
+              "o",
+              "seed 061: PASS search before cancellation: 12 assertions\r\nseed 062: PASS search before cancellation: 12 assertions\r\nseed 063: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 064: PASS search before cancellation: 12 assertions\r\nseed 065: PASS search before cancellation: 12 assertions\r\nseed 066: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 067: PASS search before cancellation: 12 assertions\r\nseed 068: PASS search before cancellation: 12 assertions\r\nseed 069: PASS search before cancellation: 12 assertions\r\nseed 070: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 071: PASS search before cancellation: 12 assertions\r\nseed 072: PASS search before cancellation: 12 assertions\r\nbatch 6: 9 passed, 3 failed\r\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\r\n"
+            ],
+            [
+              1400,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=73 --repeat=12\r\n"
+            ],
+            [
+              1405,
+              "o",
+              "seed 073: PASS search before cancellation: 12 assertions\r\nseed 074: PASS search before cancellation: 12 assertions\r\nseed 075: PASS search before cancellation: 12 assertions\r\nseed 076: PASS search before cancellation: 12 assertions\r\nseed 077: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 078: PASS search before cancellation: 12 assertions\r\nseed 079: PASS search before cancellation: 12 assertions\r\nseed 080: PASS search before cancellation: 12 assertions\r\nseed 081: PASS search before cancellation: 12 assertions\r\nseed 082: PASS search before cancellation: 12 assertions\r\nseed 083: PASS search before cancellation: 12 assertions\r\nseed 084: FAIL search after cancellation: AbortError, signal.aborted=true\r\nbatch 7: 10 passed, 2 failed\r\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\r\n"
+            ],
+            [
+              1500,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=85 --repeat=12\r\n"
+            ],
+            [
+              1505,
+              "o",
+              "seed 085: PASS search before cancellation: 12 assertions\r\nseed 086: PASS search before cancellation: 12 assertions\r\nseed 087: PASS search before cancellation: 12 assertions\r\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 089: PASS search before cancellation: 12 assertions\r\nseed 090: PASS search before cancellation: 12 assertions\r\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 092: PASS search before cancellation: 12 assertions\r\nseed 093: PASS search before cancellation: 12 assertions\r\nseed 094: PASS search before cancellation: 12 assertions\r\nseed 095: PASS search before cancellation: 12 assertions\r\nseed 096: PASS search before cancellation: 12 assertions\r\nbatch 8: 10 passed, 2 failed\r\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\r\nRejected hypothesis 2: real timers fail with the same seeds. The abort is already set before the search starts, not during a timer callback.\r\n"
+            ],
+            [
+              1600,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=1 --repeat=12\r\n"
+            ],
+            [
+              1605,
+              "o",
+              "seed 001: PASS search before cancellation: 12 assertions\r\nseed 002: PASS search before cancellation: 12 assertions\r\nseed 003: PASS search before cancellation: 12 assertions\r\nseed 004: PASS search before cancellation: 12 assertions\r\nseed 005: PASS search before cancellation: 12 assertions\r\nseed 006: PASS search before cancellation: 12 assertions\r\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 008: PASS search before cancellation: 12 assertions\r\nseed 009: PASS search before cancellation: 12 assertions\r\nseed 010: PASS search before cancellation: 12 assertions\r\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 012: PASS search before cancellation: 12 assertions\r\nbatch 1: 10 passed, 2 failed\r\nA new empty cache for every trial still fails when cancellation runs before search.\r\n"
+            ],
+            [
+              1700,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=13 --repeat=12\r\n"
+            ],
+            [
+              1705,
+              "o",
+              "seed 013: PASS search before cancellation: 12 assertions\r\nseed 014: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 015: PASS search before cancellation: 12 assertions\r\nseed 016: PASS search before cancellation: 12 assertions\r\nseed 017: PASS search before cancellation: 12 assertions\r\nseed 018: PASS search before cancellation: 12 assertions\r\nseed 019: PASS search before cancellation: 12 assertions\r\nseed 020: PASS search before cancellation: 12 assertions\r\nseed 021: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 022: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 023: PASS search before cancellation: 12 assertions\r\nseed 024: PASS search before cancellation: 12 assertions\r\nbatch 2: 9 passed, 3 failed\r\nA new empty cache for every trial still fails when cancellation runs before search.\r\n"
+            ],
+            [
+              1800,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=25 --repeat=12\r\n"
+            ],
+            [
+              1805,
+              "o",
+              "seed 025: PASS search before cancellation: 12 assertions\r\nseed 026: PASS search before cancellation: 12 assertions\r\nseed 027: PASS search before cancellation: 12 assertions\r\nseed 028: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 029: PASS search before cancellation: 12 assertions\r\nseed 030: PASS search before cancellation: 12 assertions\r\nseed 031: PASS search before cancellation: 12 assertions\r\nseed 032: PASS search before cancellation: 12 assertions\r\nseed 033: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 034: PASS search before cancellation: 12 assertions\r\nseed 035: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 036: PASS search before cancellation: 12 assertions\r\nbatch 3: 9 passed, 3 failed\r\nA new empty cache for every trial still fails when cancellation runs before search.\r\n"
+            ],
+            [
+              1900,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=37 --repeat=12\r\n"
+            ],
+            [
+              1905,
+              "o",
+              "seed 037: PASS search before cancellation: 12 assertions\r\nseed 038: PASS search before cancellation: 12 assertions\r\nseed 039: PASS search before cancellation: 12 assertions\r\nseed 040: PASS search before cancellation: 12 assertions\r\nseed 041: PASS search before cancellation: 12 assertions\r\nseed 042: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 043: PASS search before cancellation: 12 assertions\r\nseed 044: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 045: PASS search before cancellation: 12 assertions\r\nseed 046: PASS search before cancellation: 12 assertions\r\nseed 047: PASS search before cancellation: 12 assertions\r\nseed 048: PASS search before cancellation: 12 assertions\r\nbatch 4: 10 passed, 2 failed\r\nA new empty cache for every trial still fails when cancellation runs before search.\r\n"
+            ],
+            [
+              2000,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=49 --repeat=12\r\n"
+            ],
+            [
+              2005,
+              "o",
+              "seed 049: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 050: PASS search before cancellation: 12 assertions\r\nseed 051: PASS search before cancellation: 12 assertions\r\nseed 052: PASS search before cancellation: 12 assertions\r\nseed 053: PASS search before cancellation: 12 assertions\r\nseed 054: PASS search before cancellation: 12 assertions\r\nseed 055: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 056: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 057: PASS search before cancellation: 12 assertions\r\nseed 058: PASS search before cancellation: 12 assertions\r\nseed 059: PASS search before cancellation: 12 assertions\r\nseed 060: PASS search before cancellation: 12 assertions\r\nbatch 5: 9 passed, 3 failed\r\nA new empty cache for every trial still fails when cancellation runs before search.\r\n"
+            ],
+            [
+              2100,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=61 --repeat=12\r\n"
+            ],
+            [
+              2105,
+              "o",
+              "seed 061: PASS search before cancellation: 12 assertions\r\nseed 062: PASS search before cancellation: 12 assertions\r\nseed 063: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 064: PASS search before cancellation: 12 assertions\r\nseed 065: PASS search before cancellation: 12 assertions\r\nseed 066: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 067: PASS search before cancellation: 12 assertions\r\nseed 068: PASS search before cancellation: 12 assertions\r\nseed 069: PASS search before cancellation: 12 assertions\r\nseed 070: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 071: PASS search before cancellation: 12 assertions\r\nseed 072: PASS search before cancellation: 12 assertions\r\nbatch 6: 9 passed, 3 failed\r\nA new empty cache for every trial still fails when cancellation runs before search.\r\n"
+            ],
+            [
+              2200,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=73 --repeat=12\r\n"
+            ],
+            [
+              2205,
+              "o",
+              "seed 073: PASS search before cancellation: 12 assertions\r\nseed 074: PASS search before cancellation: 12 assertions\r\nseed 075: PASS search before cancellation: 12 assertions\r\nseed 076: PASS search before cancellation: 12 assertions\r\nseed 077: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 078: PASS search before cancellation: 12 assertions\r\nseed 079: PASS search before cancellation: 12 assertions\r\nseed 080: PASS search before cancellation: 12 assertions\r\nseed 081: PASS search before cancellation: 12 assertions\r\nseed 082: PASS search before cancellation: 12 assertions\r\nseed 083: PASS search before cancellation: 12 assertions\r\nseed 084: FAIL search after cancellation: AbortError, signal.aborted=true\r\nbatch 7: 10 passed, 2 failed\r\nA new empty cache for every trial still fails when cancellation runs before search.\r\n"
+            ],
+            [
+              2300,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=85 --repeat=12\r\n"
+            ],
+            [
+              2305,
+              "o",
+              "seed 085: PASS search before cancellation: 12 assertions\r\nseed 086: PASS search before cancellation: 12 assertions\r\nseed 087: PASS search before cancellation: 12 assertions\r\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 089: PASS search before cancellation: 12 assertions\r\nseed 090: PASS search before cancellation: 12 assertions\r\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\r\nseed 092: PASS search before cancellation: 12 assertions\r\nseed 093: PASS search before cancellation: 12 assertions\r\nseed 094: PASS search before cancellation: 12 assertions\r\nseed 095: PASS search before cancellation: 12 assertions\r\nseed 096: PASS search before cancellation: 12 assertions\r\nbatch 8: 10 passed, 2 failed\r\nA new empty cache for every trial still fails when cancellation runs before search.\r\nRejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortError.\r\n"
+            ],
+            [
+              2392,
+              "o",
+              "Diagnosis: cancellation poisoned sharedController; fresh signal required per test.\r\n"
+            ],
+            [
+              2404.3,
+              "o",
+              "atlas:builder $ git diff --stat\r\npackages/web/test/searchClient.test.ts | 2 +-\r\n1 file changed, 1 insertion(+), 1 deletion(-)\r\n"
+            ],
+            [
+              2412,
+              "o",
+              "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --sequence.shuffle --repeat=100\r\n"
+            ],
+            [
+              2420,
+              "o",
+              "\u001b[32m100 shuffled orders passed; 0 AbortError failures\u001b[0m\r\nCancellation coverage intact; no production changes.\r\natlas:builder $ "
+            ]
+          ],
+          "header": {
+            "height": 16,
+            "title": "Forty-minute search test investigation",
+            "version": 2,
+            "width": 110
+          },
+          "started_at_ms": -2400000
+        },
+        "incarnation": "pty-32:1",
+        "owner": "agent/example/atlas/builder",
+        "runtime": {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-atlas-builder-shell",
+          "incarnation_id": "pty-32:1",
+          "kind": "runtime",
+          "owner_host_id": "host/lantern",
+          "owner_id": "agent/example/atlas/builder",
+          "revision": "rt-shell-1",
+          "runtime_id": "example-atlas-builder-shell",
+          "runtime_kind": "terminal",
+          "state": "running",
+          "terminal_id": "terminal/example-atlas-builder",
+          "updated_at": "2030-01-01T11:20:00.000Z"
+        },
+        "screens": [
+          {
+            "at_ms": -1695000,
+            "screen": {
+              "columns": 110,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 15,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 086: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 086: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 087: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 087: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 73,
+                      "text": "seed 088: FAIL search after cancellation: AbortError, signal.aborted=true"
+                    }
+                  ],
+                  "text": "seed 088: FAIL search after cancellation: AbortError, signal.aborted=true",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 089: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 089: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 090: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 090: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 73,
+                      "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true"
+                    }
+                  ],
+                  "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 092: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 092: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 093: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 093: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 094: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 094: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 095: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 095: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 096: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 096: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "batch 8: 10 passed, 2 failed"
+                    }
+                  ],
+                  "text": "batch 8: 10 passed, 2 failed",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [
+                    {
+                      "cells": 90,
+                      "text": "All responses come from the in-memory transport; failing seeds make zero network requests."
+                    }
+                  ],
+                  "text": "All responses come from the in-memory transport; failing seeds make zero network requests.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [
+                    {
+                      "cells": 110,
+                      "text": "Rejected hypothesis 1: the same AbortError occurs with a stubbed network. Increasing the retry timeout changes"
+                    }
+                  ],
+                  "text": "Rejected hypothesis 1: the same AbortError occurs with a stubbed network. Increasing the retry timeout changes",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [
+                    {
+                      "cells": 9,
+                      "text": " nothing."
+                    }
+                  ],
+                  "text": " nothing.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 16,
+              "revision": "cast-16",
+              "rows": 16,
+              "runtime_incarnation": "pty-32:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "Forty-minute search test investigation",
+              "truncated": true
+            }
+          },
+          {
+            "at_ms": -895000,
+            "screen": {
+              "columns": 110,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 15,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 086: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 086: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 087: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 087: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 73,
+                      "text": "seed 088: FAIL search after cancellation: AbortError, signal.aborted=true"
+                    }
+                  ],
+                  "text": "seed 088: FAIL search after cancellation: AbortError, signal.aborted=true",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 089: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 089: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 090: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 090: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 73,
+                      "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true"
+                    }
+                  ],
+                  "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 092: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 092: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 093: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 093: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 094: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 094: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 095: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 095: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 096: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 096: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "batch 8: 10 passed, 2 failed"
+                    }
+                  ],
+                  "text": "batch 8: 10 passed, 2 failed",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [
+                    {
+                      "cells": 94,
+                      "text": "The test still fails with real timers and a drained microtask queue; no timer remains pending."
+                    }
+                  ],
+                  "text": "The test still fails with real timers and a drained microtask queue; no timer remains pending.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [
+                    {
+                      "cells": 110,
+                      "text": "Rejected hypothesis 2: real timers fail with the same seeds. The abort is already set before the search starts"
+                    }
+                  ],
+                  "text": "Rejected hypothesis 2: real timers fail with the same seeds. The abort is already set before the search starts",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [
+                    {
+                      "cells": 30,
+                      "text": ", not during a timer callback."
+                    }
+                  ],
+                  "text": ", not during a timer callback.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 32,
+              "revision": "cast-32",
+              "rows": 16,
+              "runtime_incarnation": "pty-32:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "Forty-minute search test investigation",
+              "truncated": true
+            }
+          },
+          {
+            "at_ms": -95000,
+            "screen": {
+              "columns": 110,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 15,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 086: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 086: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 087: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 087: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 73,
+                      "text": "seed 088: FAIL search after cancellation: AbortError, signal.aborted=true"
+                    }
+                  ],
+                  "text": "seed 088: FAIL search after cancellation: AbortError, signal.aborted=true",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 089: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 089: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 090: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 090: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 73,
+                      "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true"
+                    }
+                  ],
+                  "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 092: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 092: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 093: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 093: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 094: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 094: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 095: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 095: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 096: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 096: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "batch 8: 10 passed, 2 failed"
+                    }
+                  ],
+                  "text": "batch 8: 10 passed, 2 failed",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [
+                    {
+                      "cells": 83,
+                      "text": "A new empty cache for every trial still fails when cancellation runs before search."
+                    }
+                  ],
+                  "text": "A new empty cache for every trial still fails when cancellation runs before search.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [
+                    {
+                      "cells": 110,
+                      "text": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortErro"
+                    }
+                  ],
+                  "text": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortErro",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [
+                    {
+                      "cells": 2,
+                      "text": "r."
+                    }
+                  ],
+                  "text": "r.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 48,
+              "revision": "cast-48",
+              "rows": 16,
+              "runtime_incarnation": "pty-32:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "Forty-minute search test investigation",
+              "truncated": true
+            }
+          },
+          {
+            "at_ms": -8000,
+            "screen": {
+              "columns": 110,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 15,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 087: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 087: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 73,
+                      "text": "seed 088: FAIL search after cancellation: AbortError, signal.aborted=true"
+                    }
+                  ],
+                  "text": "seed 088: FAIL search after cancellation: AbortError, signal.aborted=true",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 089: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 089: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 090: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 090: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 73,
+                      "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true"
+                    }
+                  ],
+                  "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 092: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 092: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 093: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 093: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 094: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 094: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 095: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 095: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [
+                    {
+                      "cells": 56,
+                      "text": "seed 096: PASS search before cancellation: 12 assertions"
+                    }
+                  ],
+                  "text": "seed 096: PASS search before cancellation: 12 assertions",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [
+                    {
+                      "cells": 28,
+                      "text": "batch 8: 10 passed, 2 failed"
+                    }
+                  ],
+                  "text": "batch 8: 10 passed, 2 failed",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 11,
+                  "runs": [
+                    {
+                      "cells": 83,
+                      "text": "A new empty cache for every trial still fails when cancellation runs before search."
+                    }
+                  ],
+                  "text": "A new empty cache for every trial still fails when cancellation runs before search.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 12,
+                  "runs": [
+                    {
+                      "cells": 110,
+                      "text": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortErro"
+                    }
+                  ],
+                  "text": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortErro",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 13,
+                  "runs": [
+                    {
+                      "cells": 2,
+                      "text": "r."
+                    }
+                  ],
+                  "text": "r.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 14,
+                  "runs": [
+                    {
+                      "cells": 82,
+                      "text": "Diagnosis: cancellation poisoned sharedController; fresh signal required per test."
+                    }
+                  ],
+                  "text": "Diagnosis: cancellation poisoned sharedController; fresh signal required per test.",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 15,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 49,
+              "revision": "cast-49",
+              "rows": 16,
+              "runtime_incarnation": "pty-32:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "Forty-minute search test investigation",
+              "truncated": true
+            }
+          }
+        ],
+        "terminal": "terminal/example-atlas-builder"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "screen",
+      "at_ms": 4300,
+      "screen": {
+        "columns": 110,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 15,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 090: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 090: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 73,
+                "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true"
+              }
+            ],
+            "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 092: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 092: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 093: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 093: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 094: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 094: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 095: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 095: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 096: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 096: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 7,
+            "runs": [
+              {
+                "cells": 28,
+                "text": "batch 8: 10 passed, 2 failed"
+              }
+            ],
+            "text": "batch 8: 10 passed, 2 failed",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [
+              {
+                "cells": 83,
+                "text": "A new empty cache for every trial still fails when cancellation runs before search."
+              }
+            ],
+            "text": "A new empty cache for every trial still fails when cancellation runs before search.",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 9,
+            "runs": [
+              {
+                "cells": 110,
+                "text": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortErro"
+              }
+            ],
+            "text": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortErro",
+            "truncated": false,
+            "wrapped": true
+          },
+          {
+            "redacted": false,
+            "row": 10,
+            "runs": [
+              {
+                "cells": 2,
+                "text": "r."
+              }
+            ],
+            "text": "r.",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 11,
+            "runs": [
+              {
+                "cells": 82,
+                "text": "Diagnosis: cancellation poisoned sharedController; fresh signal required per test."
+              }
+            ],
+            "text": "Diagnosis: cancellation poisoned sharedController; fresh signal required per test.",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 12,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "atlas:builder $ git diff --stat"
+              }
+            ],
+            "text": "atlas:builder $ git diff --stat",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 13,
+            "runs": [
+              {
+                "cells": 45,
+                "text": "packages/web/test/searchClient.test.ts | 2 +-"
+              }
+            ],
+            "text": "packages/web/test/searchClient.test.ts | 2 +-",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 14,
+            "runs": [
+              {
+                "cells": 45,
+                "text": "1 file changed, 1 insertion(+), 1 deletion(-)"
+              }
+            ],
+            "text": "1 file changed, 1 insertion(+), 1 deletion(-)",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 15,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 50,
+        "revision": "cast-50",
+        "rows": 16,
+        "runtime_incarnation": "pty-32:1",
+        "terminal_id": "terminal/example-atlas-builder",
+        "title": "Forty-minute search test investigation",
+        "truncated": true
+      },
+      "store": 3,
+      "terminal": "terminal/example-atlas-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 12000,
+      "screen": {
+        "columns": 110,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 15,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 73,
+                "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true"
+              }
+            ],
+            "text": "seed 091: FAIL search after cancellation: AbortError, signal.aborted=true",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 092: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 092: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 093: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 093: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 094: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 094: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 095: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 095: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 096: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 096: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [
+              {
+                "cells": 28,
+                "text": "batch 8: 10 passed, 2 failed"
+              }
+            ],
+            "text": "batch 8: 10 passed, 2 failed",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 7,
+            "runs": [
+              {
+                "cells": 83,
+                "text": "A new empty cache for every trial still fails when cancellation runs before search."
+              }
+            ],
+            "text": "A new empty cache for every trial still fails when cancellation runs before search.",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [
+              {
+                "cells": 110,
+                "text": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortErro"
+              }
+            ],
+            "text": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortErro",
+            "truncated": false,
+            "wrapped": true
+          },
+          {
+            "redacted": false,
+            "row": 9,
+            "runs": [
+              {
+                "cells": 2,
+                "text": "r."
+              }
+            ],
+            "text": "r.",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 10,
+            "runs": [
+              {
+                "cells": 82,
+                "text": "Diagnosis: cancellation poisoned sharedController; fresh signal required per test."
+              }
+            ],
+            "text": "Diagnosis: cancellation poisoned sharedController; fresh signal required per test.",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 11,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "atlas:builder $ git diff --stat"
+              }
+            ],
+            "text": "atlas:builder $ git diff --stat",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 12,
+            "runs": [
+              {
+                "cells": 45,
+                "text": "packages/web/test/searchClient.test.ts | 2 +-"
+              }
+            ],
+            "text": "packages/web/test/searchClient.test.ts | 2 +-",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 13,
+            "runs": [
+              {
+                "cells": 45,
+                "text": "1 file changed, 1 insertion(+), 1 deletion(-)"
+              }
+            ],
+            "text": "1 file changed, 1 insertion(+), 1 deletion(-)",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 14,
+            "runs": [
+              {
+                "cells": 93,
+                "text": "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --sequence.shuffle --repeat=100"
+              }
+            ],
+            "text": "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --sequence.shuffle --repeat=100",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 15,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 51,
+        "revision": "cast-51",
+        "rows": 16,
+        "runtime_incarnation": "pty-32:1",
+        "terminal_id": "terminal/example-atlas-builder",
+        "title": "Forty-minute search test investigation",
+        "truncated": true
+      },
+      "store": 6,
+      "terminal": "terminal/example-atlas-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 20000,
+      "screen": {
+        "columns": 110,
+        "cursor": {
+          "blinking": true,
+          "column": 16,
+          "row": 15,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 093: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 093: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 094: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 094: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 095: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 095: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "seed 096: PASS search before cancellation: 12 assertions"
+              }
+            ],
+            "text": "seed 096: PASS search before cancellation: 12 assertions",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [
+              {
+                "cells": 28,
+                "text": "batch 8: 10 passed, 2 failed"
+              }
+            ],
+            "text": "batch 8: 10 passed, 2 failed",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [
+              {
+                "cells": 83,
+                "text": "A new empty cache for every trial still fails when cancellation runs before search."
+              }
+            ],
+            "text": "A new empty cache for every trial still fails when cancellation runs before search.",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [
+              {
+                "cells": 110,
+                "text": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortErro"
+              }
+            ],
+            "text": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortErro",
+            "truncated": false,
+            "wrapped": true
+          },
+          {
+            "redacted": false,
+            "row": 7,
+            "runs": [
+              {
+                "cells": 2,
+                "text": "r."
+              }
+            ],
+            "text": "r.",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [
+              {
+                "cells": 82,
+                "text": "Diagnosis: cancellation poisoned sharedController; fresh signal required per test."
+              }
+            ],
+            "text": "Diagnosis: cancellation poisoned sharedController; fresh signal required per test.",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 9,
+            "runs": [
+              {
+                "cells": 31,
+                "text": "atlas:builder $ git diff --stat"
+              }
+            ],
+            "text": "atlas:builder $ git diff --stat",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 10,
+            "runs": [
+              {
+                "cells": 45,
+                "text": "packages/web/test/searchClient.test.ts | 2 +-"
+              }
+            ],
+            "text": "packages/web/test/searchClient.test.ts | 2 +-",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 11,
+            "runs": [
+              {
+                "cells": 45,
+                "text": "1 file changed, 1 insertion(+), 1 deletion(-)"
+              }
+            ],
+            "text": "1 file changed, 1 insertion(+), 1 deletion(-)",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 12,
+            "runs": [
+              {
+                "cells": 93,
+                "text": "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --sequence.shuffle --repeat=100"
+              }
+            ],
+            "text": "atlas:builder $ pnpm --filter @atlas/web test searchClient -- --sequence.shuffle --repeat=100",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 13,
+            "runs": [
+              {
+                "cells": 49,
+                "fg": 2,
+                "text": "100 shuffled orders passed; 0 AbortError failures"
+              }
+            ],
+            "text": "100 shuffled orders passed; 0 AbortError failures",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 14,
+            "runs": [
+              {
+                "cells": 52,
+                "text": "Cancellation coverage intact; no production changes."
+              }
+            ],
+            "text": "Cancellation coverage intact; no production changes.",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 15,
+            "runs": [
+              {
+                "cells": 16,
+                "text": "atlas:builder $ "
+              }
+            ],
+            "text": "atlas:builder $ ",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 52,
+        "revision": "cast-52",
+        "rows": 16,
+        "runtime_incarnation": "pty-32:1",
+        "terminal_id": "terminal/example-atlas-builder",
+        "title": "Forty-minute search test investigation",
+        "truncated": true
+      },
+      "store": 7,
+      "terminal": "terminal/example-atlas-builder"
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/terminals/0/runtime/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "long-debug-rabbit-hole"
+}
