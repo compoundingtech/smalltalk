@@ -106,15 +106,19 @@ fn histogram_count(point: &Value) -> Option<u64> {
         .or_else(|| point["count"].as_str().and_then(|count| count.parse().ok()))
 }
 
-// Daemon instruments live on the st-daemon resource: scopeMetrics -> metric
-// -> histogram, gauge or sum data points.
+// scopeMetrics -> metric -> histogram, gauge or sum data points.
 #[cfg(target_os = "linux")]
 fn metric_points<'a>(request: &'a Value, name: &str) -> Vec<&'a Value> {
+    service_metric_points(request, "st-daemon", name)
+}
+
+#[cfg(target_os = "linux")]
+fn service_metric_points<'a>(request: &'a Value, service: &str, name: &str) -> Vec<&'a Value> {
     request["resourceMetrics"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|batch| string_attribute(&batch["resource"], "service.name") == Some("st-daemon"))
+        .filter(|batch| string_attribute(&batch["resource"], "service.name") == Some(service))
         .flat_map(|batch| batch["scopeMetrics"].as_array().into_iter().flatten())
         .flat_map(|scope| scope["metrics"].as_array().into_iter().flatten())
         .filter(|metric| metric["name"].as_str() == Some(name))
@@ -131,11 +135,16 @@ fn metric_points<'a>(request: &'a Value, name: &str) -> Vec<&'a Value> {
 
 #[cfg(target_os = "linux")]
 fn daemon_spans<'a>(request: &'a Value, name: &str) -> Vec<&'a Value> {
+    service_spans(request, "st-daemon", name)
+}
+
+#[cfg(target_os = "linux")]
+fn service_spans<'a>(request: &'a Value, service: &str, name: &str) -> Vec<&'a Value> {
     request["resourceSpans"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|batch| string_attribute(&batch["resource"], "service.name") == Some("st-daemon"))
+        .filter(|batch| string_attribute(&batch["resource"], "service.name") == Some(service))
         .flat_map(|batch| batch["scopeSpans"].as_array().into_iter().flatten())
         .flat_map(|scope| scope["spans"].as_array().into_iter().flatten())
         .filter(|span| span["name"].as_str() == Some(name))
@@ -1154,5 +1163,256 @@ fn daemon_normal_request_exports_no_log_stream() {
             !below_warn,
             "a non-diagnostic (below-WARN) log record was exported:\n{line}"
         );
+    }
+}
+
+#[cfg(target_os = "linux")]
+const REPLICATION_SERVICE: &str = "st-replication-worker";
+#[cfg(target_os = "linux")]
+const REPLICATION_PEERS: [&str; 2] = ["amber", "cobalt"];
+
+#[cfg(target_os = "linux")]
+fn capture_requests(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .split_inclusive('\n')
+        // The running collector may still be appending the final line.
+        .filter(|line| line.ends_with('\n'))
+        .map(|line| serde_json::from_str(line).expect("valid OTLP JSON request"))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn replication_point_count(point: &Value, metric: &str) -> Option<u64> {
+    if metric == "st.replication.round.duration" {
+        histogram_count(point)
+    } else {
+        point["asInt"]
+            .as_u64()
+            .or_else(|| point["asInt"].as_str().and_then(|value| value.parse().ok()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn replication_exports_ready(traces: &[Value], metrics: &[Value]) -> bool {
+    let rounds: Vec<_> = traces
+        .iter()
+        .flat_map(|request| service_spans(request, REPLICATION_SERVICE, "st.replication.round"))
+        .collect();
+    // Prove both movement and a subsequent idle exchange, not just worker startup.
+    ["moved", "in_sync"].into_iter().all(|outcome| {
+        rounds.iter().any(|span| {
+            string_attribute(span, "st.replication.outcome") == Some(outcome)
+        })
+    }) && ["st.replication.rounds", "st.replication.round.duration"]
+        .into_iter()
+        .all(|name| {
+            let points: Vec<_> = metrics
+                .iter()
+                .flat_map(|request| service_metric_points(request, REPLICATION_SERVICE, name))
+                .collect();
+            let peers_exported = REPLICATION_PEERS.into_iter().all(|peer| {
+                points.iter().any(|point| {
+                    string_attribute(point, "peer") == Some(peer)
+                        && string_attribute(point, "outcome")
+                            .is_some_and(|outcome| ["moved", "in_sync"].contains(&outcome))
+                        && replication_point_count(point, name).is_some_and(|count| count > 0)
+                })
+            });
+            peers_exported
+                && ["moved", "in_sync"].into_iter().all(|outcome| {
+                    points.iter().any(|point| {
+                        string_attribute(point, "outcome") == Some(outcome)
+                            && replication_point_count(point, name).is_some_and(|count| count > 0)
+                    })
+                })
+        })
+}
+
+/// The collector launches this exact ignored test in the existing integration binary.
+/// Node owns two isolated foreground daemons and real replication-worker processes;
+/// no services are installed, and its Drop kills and waits for every child.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "launched by replication_worker_exports_rounds_after_graph_convergence under otelite"]
+async fn replication_export_scenario() {
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::fleet::{Node, wait_for_notes};
+
+    let root = PathBuf::from(
+        std::env::var_os("ST3_OTEL_REPLICATION_SCENARIO_ROOT")
+            .expect("replication scenario must run under its otelite parent"),
+    );
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .expect("otelite supplies an ephemeral local endpoint");
+    let secret = root.join("fleet.secret");
+    std::fs::write(&secret, hex::encode([42_u8; 32])).unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut amber = Node::new(&root, REPLICATION_PEERS[0]);
+    let mut cobalt = Node::new(&root, REPLICATION_PEERS[1]);
+    let fleet_id = "8f14e45f-ceea-467a-9a2b-5c3d6e7f8091";
+    amber.legacy_config(fleet_id, &secret, &[(REPLICATION_PEERS[1], cobalt.port)]);
+    cobalt.legacy_config(fleet_id, &secret, &[(REPLICATION_PEERS[0], amber.port)]);
+    for node in [&mut amber, &mut cobalt] {
+        // Node clears inherited environment; opt these processes into this receiver only.
+        node.env.extend(
+            [
+                ("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint.as_str()),
+                ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json"),
+                ("OTEL_TRACES_EXPORTER", "otlp"),
+                ("OTEL_METRICS_EXPORTER", "otlp"),
+                ("OTEL_LOGS_EXPORTER", "none"),
+                ("OTEL_BSP_SCHEDULE_DELAY", "100"),
+                ("OTEL_METRIC_EXPORT_INTERVAL", "250"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned())),
+        );
+        // legacy_config causes start() to launch the actual replication worker too.
+        node.start().await;
+    }
+    amber.note("otel-amber").await;
+    cobalt.note("otel-cobalt").await;
+    let expected = BTreeSet::from([
+        "custom/fleet-test/otel-amber".to_owned(),
+        "custom/fleet-test/otel-cobalt".to_owned(),
+    ]);
+    for node in [&amber, &cobalt] {
+        wait_for_notes(node, &expected, 30, &[&amber, &cobalt]).await;
+    }
+
+    // Workers are killed on Drop, so prove periodic export while they are still live.
+    // Shutdown flushing is deliberately not part of this test's correctness.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let traces = capture_requests(&root.join("capture/traces.ndjson"));
+        let metrics = capture_requests(&root.join("capture/metrics.ndjson"));
+        if replication_exports_ready(&traces, &metrics) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replication periodic exports missing:\ntraces: {traces:?}\nmetrics: {metrics:?}\n{}\n{}",
+            amber.logs(),
+            cobalt.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn replication_worker_exports_rounds_after_graph_convergence() {
+    let Some(collector) = otelite("replication_worker_exports_rounds_after_graph_convergence") else {
+        return;
+    };
+    if st3::test_support::supervise_test() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let output = isolated_command(&collector, root.path())
+        .env("ST3_OTEL_REPLICATION_SCENARIO_ROOT", root.path())
+        // The scenario resolves fixture binaries through test_env!; keep nextest archive paths.
+        .envs(std::env::vars_os().filter(|(name, _)| {
+            name.to_str().is_some_and(|name| {
+                ["NEXTEST_BIN_EXE_", "CARGO_BIN_EXE_", "CI_TEST_"]
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+            })
+        }))
+        .args(["run", "--out"])
+        .arg(root.path().join("capture"))
+        .args(["--protocol", "http/json", "--"])
+        .arg(std::env::current_exe().expect("existing integration test binary"))
+        .args([
+            "--exact",
+            "otel_export::replication_export_scenario",
+            "--ignored",
+            "--nocapture",
+        ])
+        .output()
+        .expect("run two-node replication scenario under otelite");
+    assert!(
+        output.status.success(),
+        "two-node graph replication/export scenario failed: {output:?}"
+    );
+    let traces = capture_requests(&root.path().join("capture/traces.ndjson"));
+    let metrics = capture_requests(&root.path().join("capture/metrics.ndjson"));
+    assert!(
+        replication_exports_ready(&traces, &metrics),
+        "collector must retain worker spans and metrics: {output:?}"
+    );
+    for span in traces
+        .iter()
+        .flat_map(|request| service_spans(request, REPLICATION_SERVICE, "st.replication.round"))
+    {
+        assert!(
+            span["parentSpanId"]
+                .as_str()
+                .is_none_or(|id| id.is_empty() || id == "0000000000000000"),
+            "replication exchanges must be detached roots: {span}"
+        );
+        assert!(
+            string_attribute(span, "st.replication.peer")
+                .is_some_and(|peer| REPLICATION_PEERS.contains(&peer)),
+            "unexpected replication peer: {span}"
+        );
+        let outcome = string_attribute(span, "st.replication.outcome")
+            .expect("replication round outcome attribute");
+        assert!(
+            ["moved", "in_sync", "failed", "cancelled"].contains(&outcome),
+            "closed replication round outcomes: {span}"
+        );
+        if outcome == "failed" {
+            assert_eq!(span["status"]["code"].as_u64(), Some(2), "{span}");
+        } else {
+            assert_ne!(span["status"]["code"].as_u64(), Some(2), "{span}");
+        }
+    }
+    for name in ["st.replication.rounds", "st.replication.round.duration"] {
+        for point in metrics
+            .iter()
+            .flat_map(|request| service_metric_points(request, REPLICATION_SERVICE, name))
+        {
+            let attributes = point["attributes"].as_array().expect("round metric labels");
+            let labels: std::collections::BTreeSet<_> = attributes
+                .iter()
+                .map(|attribute| attribute["key"].as_str().expect("metric label key"))
+                .collect();
+            assert_eq!(
+                labels,
+                std::collections::BTreeSet::from(["peer", "outcome"]),
+                "only closed peer/outcome labels on {name}: {point}"
+            );
+            assert_eq!(attributes.len(), 2, "no duplicate labels: {point}");
+            assert!(
+                string_attribute(point, "peer")
+                    .is_some_and(|peer| REPLICATION_PEERS.contains(&peer)),
+                "bounded invented peers: {point}"
+            );
+            assert!(
+                string_attribute(point, "outcome")
+                    .is_some_and(|outcome| ["moved", "in_sync", "failed", "cancelled"].contains(&outcome)),
+                "closed metric outcomes: {point}"
+            );
+            assert!(
+                replication_point_count(point, name).is_some_and(|count| count > 0),
+                "a completed round contributes a point: {point}"
+            );
+        }
+    }
+    for metric in metrics
+        .iter()
+        .flat_map(|request| request["resourceMetrics"].as_array().into_iter().flatten())
+        .filter(|batch| {
+            string_attribute(&batch["resource"], "service.name") == Some(REPLICATION_SERVICE)
+        })
+        .flat_map(|batch| batch["scopeMetrics"].as_array().into_iter().flatten())
+        .flat_map(|scope| scope["metrics"].as_array().into_iter().flatten())
+        .filter(|metric| metric["name"].as_str() == Some("st.replication.round.duration"))
+    {
+        assert_eq!(metric["unit"].as_str(), Some("s"), "duration unit: {metric}");
     }
 }

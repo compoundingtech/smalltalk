@@ -46,13 +46,13 @@ fn free_port() -> u16 {
 }
 
 /// One isolated node: its own directories, daemon, and replication worker.
-struct Node {
+pub(super) struct Node {
     name: String,
     root: PathBuf,
     /// The st3 executable this node runs; an older release for compatibility tests.
     binary: PathBuf,
-    port: u16,
-    env: Vec<(String, String)>,
+    pub(super) port: u16,
+    pub(super) env: Vec<(String, String)>,
     daemon: Option<Child>,
     worker: Option<Child>,
     /// Every argument list this test passed to an st3 process on this node.
@@ -60,7 +60,7 @@ struct Node {
 }
 
 impl Node {
-    fn new(parent: &Path, name: &str) -> Self {
+    pub(super) fn new(parent: &Path, name: &str) -> Self {
         Self::named(parent, name, name)
     }
 
@@ -162,7 +162,7 @@ impl Node {
         serde_json::from_str(&self.st_ok(&all)).unwrap()
     }
 
-    fn logs(&self) -> String {
+    pub(super) fn logs(&self) -> String {
         [
             "daemon.log",
             "daemon.stderr.log",
@@ -183,7 +183,7 @@ impl Node {
         .join("\n")
     }
 
-    async fn start(&mut self) {
+    pub(super) async fn start(&mut self) {
         let pty = self.root.join("bin/pty");
         let log = |name: &str| fs::File::create(self.root.join(name)).unwrap();
         let up: Vec<&str> = if self.binary == Path::new(st3()) {
@@ -285,7 +285,7 @@ impl Node {
     }
 
     /// Configure this node as a config-peer fleet node, the way the running fleet is today.
-    fn legacy_config(&self, fleet_id: &str, secret: &Path, peers: &[(&str, u16)]) {
+    pub(super) fn legacy_config(&self, fleet_id: &str, secret: &Path, peers: &[(&str, u16)]) {
         let mut config = format!(
             "node = \"{}\"\nperson = \"{PERSON}\"\nfleet_id = \"{fleet_id}\"\nshared_secret_file = \"{}\"\npeer_listen = \"127.0.0.1:{}\"\n",
             self.name,
@@ -402,7 +402,7 @@ impl Node {
         }
     }
 
-    async fn note(&self, text: &str) -> String {
+    pub(super) async fn note(&self, text: &str) -> String {
         self.note_as(text, PERSON).await
     }
 
@@ -484,7 +484,12 @@ where
     panic!("timed out waiting until {what}");
 }
 
-async fn wait_for_notes(node: &Node, expected: &BTreeSet<String>, seconds: u64, nodes: &[&Node]) {
+pub(super) async fn wait_for_notes(
+    node: &Node,
+    expected: &BTreeSet<String>,
+    seconds: u64,
+    nodes: &[&Node],
+) {
     let deadline = Instant::now() + Duration::from_secs(seconds);
     loop {
         let notes = node.notes().await;

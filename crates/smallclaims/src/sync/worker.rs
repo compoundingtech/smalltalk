@@ -350,10 +350,10 @@ fn removal_write_barrier(stage: &str) {
 
 /// A signed refusal from a member that names this node's own key as ended.
 #[derive(Debug)]
-struct RemovedFromFleet {
-    code: String,
+pub(super) struct RemovedFromFleet {
+    pub(super) code: String,
     /// The refusal's message, which names who removed this node and why when the member knows.
-    message: String,
+    pub(super) message: String,
 }
 
 impl std::fmt::Display for RemovedFromFleet {
@@ -529,6 +529,7 @@ pub async fn run<B: Backend>(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
+                super::telemetry::record_error(&name, super::telemetry::ErrorReason::Down);
                 let _ = backend
                     .record_failure(&name, "down", "no recent inbound exchange")
                     .await;
@@ -1162,12 +1163,18 @@ async fn dial_peer<B: Backend>(
                                     selected,
                                     tokio::time::Instant::now() + fabric_refusal_delay(),
                                 ));
+                                super::telemetry::record_error(
+                                    &name, super::telemetry::ErrorReason::Refused,
+                                );
                                 let _ = backend
                                     .record_failure(&name, "refused", &error.to_string())
                                     .await;
                                 route = route.wrapping_add(1);
                                 continue;
                             }
+                            super::telemetry::record_error(
+                                &name, super::telemetry::ErrorReason::Down,
+                            );
                             let _ = backend
                                 .record_failure(&name, "down", &error.to_string())
                                 .await;
@@ -2133,6 +2140,21 @@ pub async fn exchange<B: Backend>(
     auth: &FleetAuth,
     fleet: &FleetContext,
 ) -> Result<(bool, bool)> {
+    let mut telemetry = super::telemetry::Round::new(&peer.name);
+    let result = exchange_inner(http, backend, node, peer, auth, fleet, &mut telemetry).await;
+    telemetry.finish(&result);
+    result
+}
+
+async fn exchange_inner<B: Backend>(
+    http: &reqwest::Client,
+    backend: &B,
+    node: &str,
+    peer: &PeerConfig,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    telemetry: &mut super::telemetry::Round,
+) -> Result<(bool, bool)> {
     let mut heal_now = false;
     // One compact round, then at most one full-inventory round if the compact prefix
     // cannot make progress. Payloadless checkpoint identities can differ indefinitely.
@@ -2159,6 +2181,7 @@ pub async fn exchange<B: Backend>(
         let received = backend
             .receive(&peer.name, auth.fleet_id(), &remote, Some(round_trip))
             .await?;
+        telemetry.pull(received.receipt.received);
         // Progress means new envelopes stored on one side or the other. A peer that keeps sending,
         // or keeps being sent, envelopes that are never stored must not keep the worker busy.
         let pulled = received.receipt.received != 0;
@@ -2188,9 +2211,11 @@ pub async fn exchange<B: Backend>(
             // The peer stores a push before it answers, so its inventory moved if the push landed.
             pushed =
                 !push.envelopes.is_empty() && response.inventory.digest != remote.inventory.digest;
+            telemetry.push(push.envelopes.len(), pushed);
             let received = backend
                 .receive(&peer.name, auth.fleet_id(), &response, Some(round_trip))
                 .await?;
+            telemetry.pull(received.receipt.received);
             pulled_follow_up = received.receipt.received != 0;
             heal_now |= received.receipt.heal;
             if received.changed {
@@ -2320,6 +2345,19 @@ pub async fn heal<B: Backend>(
     auth: &FleetAuth,
     fleet: &FleetContext,
 ) {
+    let mut telemetry = super::telemetry::Heal::new(&peer.name);
+    heal_inner(backend, node, peer, auth, fleet, &mut telemetry).await;
+    telemetry.finish();
+}
+
+async fn heal_inner<B: Backend>(
+    backend: &B,
+    node: &str,
+    peer: &PeerConfig,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    telemetry: &mut super::telemetry::Heal,
+) {
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(3))
         .timeout(HEAL_TIMEOUT)
@@ -2327,6 +2365,7 @@ pub async fn heal<B: Backend>(
         .expect("the heal HTTP client configuration is valid");
     let mut query = ReplicationHealQuery::Ranges;
     for _ in 0..HEAL_QUESTION_LIMIT {
+        telemetry.question();
         let request = ReplicationHealRequest {
             fleet_id: auth.fleet_id().to_owned(),
             query,
@@ -2337,21 +2376,31 @@ pub async fn heal<B: Backend>(
         .await
         {
             Ok((answer, _)) => answer,
-            Err(error) => ReplicationHealAnswer::Failed {
-                message: format!("{} could not answer: {error:#}", peer.name),
-            },
+            Err(error) => {
+                telemetry.error(&error);
+                ReplicationHealAnswer::Failed {
+                    message: format!("{} could not answer: {error:#}", peer.name),
+                }
+            }
         };
         match backend.heal_next(&peer.name, answer).await {
             Ok(ReplicationHealStep::Ask { query: next }) => query = next,
-            Ok(ReplicationHealStep::Done { .. }) | Err(_) => break,
+            Ok(ReplicationHealStep::Done { report }) => {
+                telemetry.complete(&report);
+                break;
+            }
+            Err(error) => {
+                telemetry.error(&error);
+                break;
+            }
         }
     }
     backend.changed().await;
 }
 
 #[derive(Debug)]
-struct PeerOverloaded {
-    retry_after: Duration,
+pub(super) struct PeerOverloaded {
+    pub(super) retry_after: Duration,
 }
 
 impl std::fmt::Display for PeerOverloaded {
