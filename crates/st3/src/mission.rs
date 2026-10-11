@@ -450,6 +450,12 @@ fn parse_mission(
                     format!("mission `{id}` cannot own an account"),
                 ));
             }
+            "condition" => {
+                return Err(St3Error::new(
+                    "condition-inside-mission",
+                    format!("mission `{id}` cannot own a condition"),
+                ));
+            }
             name if crate::graph::is_mission_declaration(name) => {
                 crate::graph::validate_deferred_declaration(child)?;
                 let child = take_agent_constraints(child, default_host, &mut agent_constraints)?;
@@ -1312,6 +1318,12 @@ fn parse_step(
                     return Err(St3Error::new(
                         "account-inside-mission",
                         format!("step `{path}` cannot own an account"),
+                    ));
+                }
+                "condition" => {
+                    return Err(St3Error::new(
+                        "condition-inside-mission",
+                        format!("step `{path}` cannot own a condition"),
                     ));
                 }
                 "lane" => {

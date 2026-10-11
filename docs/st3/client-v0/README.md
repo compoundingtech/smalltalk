@@ -617,13 +617,16 @@ identity or graph context from prose.
 
 `alert` says whether the item is an alert: it blocks or waits on the person. Asks, human
 gates, launch and revision approvals, agent and custom requests, harness prompts and logins, and
-a broken gate the person published are alerts; an update, which asks nothing, is not. `conversation_id` names the agent whose
+condition breaches and a broken gate the person published are alerts; an update, which asks nothing, is not. `conversation_id` names the agent whose
 conversation the item belongs to: the agent that asked, the agent whose work a gate reviews
 (else its run's requester), the launch's planner, the revision's proposer, or the seat itself.
 It is absent when no agent is behind the item. `conversation_ids` lists every conversation the item
 shows in, starting with `conversation_id`: a harness login alert is one alert per login directory
 and host, naming every seat that shares it, since one sign-in answers them all. Daemons that
 predate alerts omit these fields.
+
+A `condition` attention item describes a standing metric breach and clears after recovery. It has no human resolution action. stui and the shared TypeScript Home model display its title and detail on home. Deploy current clients before person-owned declarations: older strict clients do not receive a compatibility downgrade for this new kind.
+
 
 A `harness-prompt` alert is a native prompt a seat's harness shows in its terminal and waits on:
 a permission, a question or a review. Its `source_id` and `conversation_id` are the seat, its

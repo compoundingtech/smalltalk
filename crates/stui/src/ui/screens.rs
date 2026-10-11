@@ -1093,11 +1093,13 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 suggestion.wrap(&text::inline(fix, theme::text()), inner.saturating_sub(4));
                 card.card("suggested fix", theme::GREEN, false, suggestion, inner);
             }
-            card.blank();
-            card.wrap(
-                &text::inline("Act on the source to clear this fault.", theme::soft()),
-                inner,
-            );
+            if !source.starts_with("condition/") {
+                card.blank();
+                card.wrap(
+                    &text::inline("Act on the source to clear this fault.", theme::soft()),
+                    inner,
+                );
+            }
         }
         AttentionKind::Request {
             from,

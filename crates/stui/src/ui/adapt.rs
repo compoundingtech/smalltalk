@@ -365,6 +365,15 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         structured: item.request.clone().map(Box::new),
                     },
                 ),
+                "condition" => (
+                    Tier::Today,
+                    AttentionKind::Fault {
+                        what: if item.title.trim().is_empty() { "Condition breached".into() } else { clean_message_text(&item.title) },
+                        because: if item.detail.trim().is_empty() { "The condition clears when its metric recovers.".into() } else { clean_message_text(&item.detail) },
+                        fix: None,
+                        source: if item.source_id.is_empty() { "condition/unknown".into() } else { item.source_id.clone() },
+                    },
+                ),
                 custom if custom.starts_with("custom.") => (
                     Tier::Today,
                     AttentionKind::Request {
@@ -996,6 +1005,31 @@ mod tests {
         "<shell>",
         "<timezone>",
     ];
+
+    #[test]
+    fn a_condition_attention_item_is_visible_on_home() {
+        let mut model = Model::default();
+        model.actor = "person/example".into();
+        model.now.items.push(serde_json::from_value(serde_json::json!({
+            "kind":"attention", "id":"attention/condition", "revision":"one", "updated_at":"2026-10-03T10:00:00Z",
+            "attention_kind":"condition", "source_id":"condition/example/disk", "person_id":"person/example",
+            "title":"Disk breached", "detail":"Free disk is 10 percent; recovery needs 18 percent.",
+            "priority":"high", "state":"open", "requested_at":"2026-10-03T10:00:00Z", "actions":[]
+        })).unwrap());
+        let items = attention(&model, &Extras::default());
+        assert_eq!(items.len(), 1);
+        let AttentionKind::Fault { what, because, fix, .. } = &items[0].kind else { panic!("condition must be visible without response controls") };
+        assert!(what.contains("Disk breached") && because.contains("Free disk"));
+        assert!(fix.is_none());
+        assert!(items[0].actions.is_empty());
+        let st3_client::Resource::Attention(item) = &mut model.now.items[0] else { panic!("attention resource") };
+        item.title.clear(); item.detail.clear(); item.source_id.clear();
+        let empty = attention(&model, &Extras::default());
+        assert_eq!(empty.len(),1);
+        let AttentionKind::Fault { what,because,fix,.. } = &empty[0].kind else { panic!("empty condition remains visible") };
+        assert!(!what.is_empty() && !because.is_empty() && fix.is_none());
+        assert!(empty[0].actions.is_empty());
+    }
 
     #[test]
     fn an_update_on_home_is_information_not_a_request() {

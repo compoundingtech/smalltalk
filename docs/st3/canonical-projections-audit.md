@@ -295,3 +295,20 @@ The local `coordination_offer` trigger runs after lifecycle claims are inserted 
 for staged, delivered, read and closed receipts it clears `coordination_sends.held` with one
 guarded primary-key update in the existing writer transaction. It adds no reader write or
 conversation payload and is outside shared projection digests.
+
+### Local condition tables added after the baseline
+
+Condition declarations and entry/recovery `condition.state` claims are shared
+facts. Four disposable, host-owned tables serve background evaluation and reads:
+
+| Table | Scope | Authority / bound |
+| --- | --- | --- |
+| `local_condition_heads` | Local cache | Canonical latest transition pointer per declaration, authenticated origin and instance; 32 declarations, at most 256 remote instances each. Origin/phase/order local indexes support bounded 50-row writes; rebuilt by resumable indexed latest-state seeks. |
+| `local_condition_observations` | Local live overlay | Eight recent samples and hold phase; 32 declarations, eight instances each. Never replicated. |
+| `local_condition_notifications` | Local retry queue | Own-host transition deliveries; oldest 256 rows materialized, at most 16 deliveries per tick and three attempts per malformed/deterministically rejected row. Transient failures remain queued; the queue is uncapped. Message identity is durable and idempotent. |
+| `local_condition_claim_bytes` | Local counter | Two days of hourly authored-byte buckets, with bounded background folds. |
+
+These tables do not enter shared projection digests. Graph state uses canonical
+latest selection; local cursors, heartbeat and retry counters live in `meta`.
+Reads never rebuild these tables. Store open creates them without changing
+storage version 18; no global claim index is built at startup.

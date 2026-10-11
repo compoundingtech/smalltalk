@@ -15,6 +15,7 @@ use crate::model::{
 
 const ROOT_NODES: &[&str] = &[
     "account",
+    "condition",
     "agent",
     "exec",
     "pty",
@@ -312,6 +313,9 @@ fn parse_intent_with_owner(
         .collect::<Result<Vec<_>, _>>()?;
     let normalized = json!({ "version": 2, "declarations": normalized_nodes });
     let source_hash = hash_json(&normalized);
+    if context.subjects.values().filter(|subject| subject.kind == "condition").count() > crate::conditions::MAX_CONDITIONS {
+        return Err(St3Error::new("condition-limit", "a document accepts at most 32 conditions"));
+    }
     Ok(NormalizedIntent {
         direct_message_registrations: declarations.iter()
             .filter(|node| !allow_execution_root && public_message_subscription(node))
@@ -439,6 +443,12 @@ fn parse_desired_node(
         return Err(St3Error::new(
             "account-inside-mission",
             "an account declaration must be at the root",
+        ));
+    }
+    if kind == "condition" && context.owner_run.is_some() {
+        return Err(St3Error::new(
+            "condition-inside-mission",
+            "a condition declaration must be at the root",
         ));
     }
     match kind {
@@ -1624,6 +1634,7 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
     validate_name(&name, false)?;
     match kind {
         "account" => validate_account(node)?,
+        "condition" => validate_condition(node, &name)?,
         "doc" => validate_doc(node)?,
         "resource" => validate_resource(node)?,
         "observer" => validate_observer(node)?,
@@ -1669,6 +1680,22 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
         context.document_refs.insert(format!("doc/{name}@{hash}"));
     }
     Ok(())
+}
+
+/// A condition is checked by the same parser the daemon evaluates it with, so a published
+/// condition is one st can evaluate.
+fn validate_condition(node: &KdlNode, name: &str) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    one_string_with_children(node)?;
+    if node.children().is_none() {
+        return Err(St3Error::new(
+            "missing-condition-body",
+            "a condition needs a body",
+        ));
+    }
+    crate::conditions::parse_condition(&namespaced("condition", name), &canonical_node(node)?)
+        .map(|_| ())
+        .map_err(|message| St3Error::new("invalid-condition", message))
 }
 
 fn validate_account(node: &KdlNode) -> Result<(), St3Error> {
@@ -4307,6 +4334,12 @@ pub(crate) fn validate_deferred_declaration(node: &KdlNode) -> Result<(), St3Err
             "an account declaration must be at the root",
         ));
     }
+    if node.name().value() == "condition" {
+        return Err(St3Error::new(
+            "condition-inside-mission",
+            "a condition declaration must be at the root",
+        ));
+    }
     if node.name().value() == "env" {
         validate_string_map(node, true)?;
     }
@@ -5734,6 +5767,23 @@ agent "dotfiles/steward" {
             let error = parse_intent(&source, "node").expect_err("old step syntax must fail");
             assert_eq!(error.code, "unknown-step-field");
         }
+    }
+
+    #[test]
+    fn condition_declarations_are_root_only_and_validated_on_publication() {
+        let condition = r#"condition "fleet/disk" {
+  metric "disk.free-percent"
+  scope "host"
+  below 15
+  for "10m"
+  owner "agent/ops"
+}"#;
+        let source = format!("version 2\n{condition}\n");
+        let intent = parse_intent(&source, "alder").unwrap();
+        assert!(intent.subjects.contains_key("condition/fleet/disk"));
+        assert!(parse_intent(&source.replace("disk.free-percent", "unknown"), "alder").is_err());
+        assert!(parse_intent(&source.replace("scope \"host\"", "scope \"route\""), "alder").is_err());
+        assert!(parse_intent(&format!("version 2\nmission \"sample\" {{\n{condition}\n}}\n"), "alder").is_err());
     }
 
     #[test]

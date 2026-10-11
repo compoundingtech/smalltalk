@@ -70,3 +70,15 @@ assert.deepEqual(withUpdate.map(row => row.color), ['person', 'green']);
   // An item that comes back open loses its mark.
   assert.equal(keepClosed(kept, [open('attention/a')], new Set()).find(item => item.id === 'attention/a').closedElsewhere, undefined);
 }
+
+// A condition is visible without controls and clears through measured recovery.
+{
+  const rows = homeRows([item('disk', 'condition'),item('empty', 'condition', {title:''})], 'person/alex', now);
+  assert.equal(rows.length, 2);
+  assert.deepEqual(rows.map(row => [row.kind,row.tier,row.item.actions]), [['condition','today',[]],['condition','today',[]]]);
+  assert.equal(rows[1].title, 'Condition breached');
+}
+
+const blankCondition = homeRows([item('blank-condition', 'condition', { title: '   ' })], 'person/alex')[0];
+assert.equal(blankCondition.title, 'Condition breached');
+assert.equal(blankCondition.glyph, '!');

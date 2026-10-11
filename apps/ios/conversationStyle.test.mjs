@@ -23,4 +23,6 @@ assert.equal(folds({ kind: 'mail', from: 'planner', to: 'you', subject: '', text
 assert.equal(folds({ kind: 'mail', from: 'you', to: 'planner', subject: '', text: '' }), false);
 
 // Home retains the phone's decision and information colors after model extraction.
-assert.deepEqual(HOME_LEGEND.map(entry => tokenColor(entry.color)), ['#cba6f7', '#a6e3a1']);
+assert.deepEqual(HOME_LEGEND.map(entry => tokenColor(entry.color)), ['#cba6f7', '#a6e3a1', '#cba6f7']);
+assert.equal(HOME_LEGEND.at(-1).word, 'breached');
+assert.equal(HOME_LEGEND.at(-1).glyph, '!');

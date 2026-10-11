@@ -68,6 +68,45 @@ use presentation::{
     shell_argument,
 };
 
+#[derive(Subcommand)]
+enum ConditionsCommand {
+    /// List each declaration and its instance states.
+    Ls,
+    /// Show one declaration and its recent series.
+    Show { condition: String },
+}
+
+async fn run_conditions(client: &Client, command: ConditionsCommand, json_output: bool) -> Result<()> {
+    let conditions: Vec<Value> = client.get("/v1/conditions").await?;
+    let conditions = match command {
+        ConditionsCommand::Ls => conditions,
+        ConditionsCommand::Show { condition } => {
+            let subject = st3::conditions::breach_subject(&condition);
+            vec![conditions.into_iter().find(|value| value["subject"] == subject)
+                .with_context(|| format!("condition `{subject}` is not declared"))?]
+        }
+    };
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&conditions)?);
+    } else if conditions.is_empty() {
+        println!("No conditions declared.");
+    } else {
+        for condition in conditions {
+            println!("{} · {} · owner {}", condition["subject"].as_str().unwrap_or("?"),
+                condition["rule"].as_str().unwrap_or("invalid"), condition["owner"].as_str().unwrap_or("?"));
+            if let Some(error) = condition["invalid"].as_str() { println!("  invalid: {error}"); }
+            let instances = condition["instances"].as_array().cloned().unwrap_or_default();
+            if instances.is_empty() { println!("  awaiting a sample"); }
+            for instance in instances {
+                println!("  {} · {} · value {} · measured {}", st3::conditions::display_text(instance["instance"].as_str().unwrap_or("?")),
+                    instance["phase"].as_str().unwrap_or("?"), instance["value"], instance["measured_at"]);
+                println!("    series: {}", instance["values"]);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(
     name = "st",
@@ -180,6 +219,11 @@ enum Command {
     Terminals {
         #[command(subcommand)]
         command: PtyCommand,
+    },
+    /// Inspect declared conditions and their latest samples.
+    Conditions {
+        #[command(subcommand)]
+        command: ConditionsCommand,
     },
     /// Check the daemon and runtime dependencies.
     Doctor(DoctorArgs),
@@ -5224,6 +5268,7 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Command::Conditions { command } => run_conditions(&client, command, cli.json).await,
         Command::Doctor(args) => run_doctor(&immediate, args, cli.json).await,
         Command::Recorder { command } => run_recorder(command, &config, cli.json),
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
@@ -6194,6 +6239,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
     reconciler.set_idle_nudge(config.reconcile.idle_nudge()?);
     tokio::spawn(reconciler.clone().supervise());
     tokio::spawn(st3::profile::watch_runtime_lag());
+    st3::conditions::evaluate::spawn(
+        store.clone(), config.node.clone(), config.state_dir.join("claims.sqlite3"),
+        notify.clone(), event_notify.clone(),
+    );
     // The policy reads `[limits]` again on every pass, so an edit applies without a restart.
     st3::config::set_daemon_config(args_config.as_deref());
     tokio::spawn(enforce_account_limits(store.clone(), config.limits.clone(), reconciler));

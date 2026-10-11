@@ -256,7 +256,7 @@
           "required": ["kind", "attention_kind", "source_id", "person_id", "title", "detail", "priority", "state", "requested_at", "actions"],
           "properties": {
             "kind": { "const": "attention" },
-            "attention_kind": {"anyOf": [{"enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "person-step", "agent-request", "fault", "harness-login", "harness-prompt"]}, {"type": "string", "pattern": "^custom\\.[a-zA-Z0-9_.-]+$"}]},
+            "attention_kind": {"anyOf": [{"enum": ["human-gate", "launch-approval", "revision-approval", "unread-message", "person-step", "agent-request", "fault", "harness-login", "harness-prompt", "condition"]}, {"type": "string", "pattern": "^custom\\.[a-zA-Z0-9_.-]+$"}]},
           "custom_form": {"type": "object", "description": "Data-only registered reply form; absent on native attention."},
             "source_kind": {"type": "string"},
             "episode": {"type": "string"},
