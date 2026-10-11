@@ -87,6 +87,7 @@ fn catch_up_admission_bounds_the_work_a_queued_write_waits_for() {
         let (done, ack) = mpsc::sync_channel(1);
         let (observed, prefix) = mpsc::sync_channel(1);
         target.connection.send(WriterJob::Batched {
+            enqueued: std::time::Instant::now(),
             run: Box::new(move |tx| {
                 let admitted: usize = tx
                     .query_row("SELECT COUNT(*) FROM claims", [], |r| r.get(0))

@@ -399,9 +399,10 @@ The collector sampling policy uses that attribute; the process exports every spa
 ### Metric naming and cardinality
 
 The repository-local st3 instrument namespace uses lowercase dot-separated names under
-`st3.`; HTTP instruments use the OpenTelemetry `http.server` namespace. Duration instruments
-end in `.duration` and use seconds. Depth, size, and age gauges describe saturation. Examples
-are `http.server.request.duration`, `st3.writer.wait.duration`, and `st3.fifo.depth`.
+`st3.`, with storage instruments under `st.db.`; HTTP and database client instruments use
+the OpenTelemetry `http.server` and `db.client` namespaces. Duration instruments use
+seconds. Depth, size, and age gauges describe saturation. Examples are
+`http.server.request.duration`, `st.db.writer.queue.duration`, and `st3.fifo.depth`.
 Do not append Prometheus `_total` or `_seconds` suffixes to these OTLP instrument names.
 
 Label vocabularies are closed enums or bounded fleet membership. Unknown user-provided
@@ -447,6 +448,37 @@ budget rather than the theoretical label product.
 Duration buckets are
 `0.001`, `0.005`, `0.01`, `0.025`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`,
 `30`, and `60` seconds.
+
+### Storage telemetry (O11Y-R14, O11Y-R18)
+
+| Instrument | Type | Unit | Additional attributes / meaning |
+| --- | --- | --- | --- |
+| `db.client.operation.duration` | Histogram | `s` | `db.operation.name=write.batched` or `write.lend`; writer enqueue through ACK |
+| `st.db.writer.queue.duration` | Histogram | `s` | —; enqueue through writer dequeue |
+| `st.db.writer.batch.size` | Histogram | `{job}` | —; jobs in a writer batch |
+| `st.db.writer.commit.duration` | Histogram | `s` | —; writer commit duration |
+| `st.db.writer.batch.duration` | Histogram | `s` | —; whole writer batch duration |
+| `db.client.connection.wait_time` | Histogram | `s` | `db.operation.name=read`; reader checkout wait |
+| `st.db.readers.open` | Observable gauge | `{connection}` | —; current open readers |
+| `st.db.readers.idle` | Observable gauge | `{connection}` | —; current idle readers |
+| `st.db.readers.opened` | Counter | `{connection}` | —; readers opened |
+| `st.db.wal.size` | Observable gauge | `By` | —; stat the main database's `-wal` file |
+| `st.db.wal.checkpoint.duration` | Histogram | `s` | `db.operation.name=checkpoint.truncate`; truncate checkpoint duration |
+
+Every storage metric carries `db.system.name=sqlite`. These are the complete attribute
+sets: at most two combinations per instrument, with no paths, SQL, ids, or other
+unbounded attributes. Duration histograms use the seconds buckets above; batch size uses
+explicit boundaries `1`, `2`, `4`, `8`, `16`, `32`, `64`, `128`, `256`.
+Storage metrics are not sampled.
+
+A scoped thread-local `Option<Arc<WriterWait>>` shares a request accumulator across
+handler, store, action, and API blocking sections. Two relaxed atomics sum writer ACK
+wait in nanoseconds and count writer operations. Outer handler completion records
+`st.writer.wait_ms` (total ACK wait converted to milliseconds) and `st.writer.ops`
+(operation count) on the existing SERVER request span. Each scope restores the previous
+accumulator, including nested blocking sections; writer calls do not create child spans
+or perform per-operation span-context lookup. This preserves the single-span request
+shape and adds no in-process sampling.
 
 ### Attribute and context policy
 

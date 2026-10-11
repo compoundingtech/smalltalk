@@ -99,6 +99,46 @@ fn int_attribute(record: &Value, name: &str) -> Option<i64> {
         })
 }
 
+// OTLP histogram counts arrive as a JSON number or an OTLP decimal string.
+#[cfg(target_os = "linux")]
+fn histogram_count(point: &Value) -> Option<u64> {
+    point["count"]
+        .as_u64()
+        .or_else(|| point["count"].as_str().and_then(|count| count.parse().ok()))
+}
+
+// Storage instruments live on the st-daemon resource: scopeMetrics -> metric
+// -> histogram or gauge data points.
+#[cfg(target_os = "linux")]
+fn metric_points<'a>(request: &'a Value, name: &str) -> Vec<&'a Value> {
+    request["resourceMetrics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|batch| string_attribute(&batch["resource"], "service.name") == Some("st-daemon"))
+        .flat_map(|batch| batch["scopeMetrics"].as_array().into_iter().flatten())
+        .flat_map(|scope| scope["metrics"].as_array().into_iter().flatten())
+        .filter(|metric| metric["name"].as_str() == Some(name))
+        .flat_map(|metric| {
+            metric["histogram"]["dataPoints"]
+                .as_array()
+                .or_else(|| metric["gauge"]["dataPoints"].as_array())
+                .into_iter()
+                .flatten()
+        })
+        .collect()
+}
+
+// `st.writer.wait_ms` is a double-valued total in milliseconds.
+#[cfg(target_os = "linux")]
+fn double_attribute(record: &Value, name: &str) -> Option<f64> {
+    record["attributes"]
+        .as_array()?
+        .iter()
+        .find(|attribute| attribute["key"].as_str() == Some(name))?["value"]["doubleValue"]
+        .as_f64()
+}
+
 fn command_roots(traces: &str) -> Vec<(Value, Value)> {
     let mut roots = Vec::new();
     for line in traces.lines() {
@@ -433,6 +473,39 @@ impl ExportDaemon {
         );
     }
 
+    /// A real write: POST /v1/claims, so the batch writer commits and ACKs
+    /// inside this request's SERVER span.
+    fn write_claim(&self, traceparent: &str) {
+        use std::io::{Read as _, Write as _};
+        let mut socket = std::os::unix::net::UnixStream::connect(&self.socket).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let body = serde_json::to_string(&serde_json::json!({
+            "subject": "custom/otel/storage",
+            "kind": "custom.otel.storage-written",
+            "fields": {},
+            "idempotency_key": "otel-export-storage-proof",
+        }))
+        .unwrap();
+        write!(
+            socket,
+            "POST /v1/claims HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nx-st3-client: fractal\r\ntraceparent: {traceparent}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "claim write failed: {response}\n{}",
+            self.diagnostics()
+        );
+    }
+
     fn await_export(&mut self, path: &Path, matches: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -620,6 +693,78 @@ fn daemon_request_metric_recorded_without_trace_sampling() {
                             })
                         })
                 })
+            })
+    });
+}
+
+// A real write proves the storage instruments export: the batch writer commits
+// the claim, the WAL gauge observes the file the write produced, and the
+// request's own SERVER span carries the writer totals the handler accumulated.
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_write_request_exports_storage_metrics() {
+    let Some(collector) = otelite("daemon_write_request_exports_storage_metrics") else {
+        return;
+    };
+    const TRACE_ID: &str = "fedcba0987654321fedcba0987654321";
+    const PARENT_ID: &str = "fedcba0987654321";
+    let root = tempfile::tempdir().unwrap();
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    daemon.write_claim(&format!("00-{TRACE_ID}-{PARENT_ID}-01"));
+    // The COMMIT's frames are in the daemon's WAL before the response returns, so the file
+    // on disk is the same WAL the gauge must report.
+    let wal = root.path().join("daemon-state").join("claims.sqlite3-wal");
+    let wal_bytes = std::fs::metadata(&wal).map(|metadata| metadata.len()).unwrap_or(0);
+    assert!(
+        wal_bytes > 0,
+        "the written claim must fill {}: {} bytes",
+        wal.display(),
+        wal_bytes
+    );
+    daemon.await_export(&root.path().join("capture/metrics.ndjson"), |request| {
+        metric_points(request, "db.client.operation.duration")
+            .into_iter()
+            .any(|point| {
+                string_attribute(point, "db.system.name") == Some("sqlite")
+                    && string_attribute(point, "db.operation.name") == Some("write.batched")
+                    && histogram_count(point).is_some_and(|count| count > 0)
+            })
+    });
+    daemon.await_export(&root.path().join("capture/metrics.ndjson"), |request| {
+        metric_points(request, "st.db.writer.commit.duration")
+            .into_iter()
+            .any(|point| {
+                string_attribute(point, "db.system.name") == Some("sqlite")
+                    && histogram_count(point).is_some_and(|count| count > 0)
+            })
+    });
+    // Observable gauge over the main database's -wal file, which the write above filled.
+    daemon.await_export(&root.path().join("capture/metrics.ndjson"), |request| {
+        metric_points(request, "st.db.wal.size")
+            .into_iter()
+            .any(|point| {
+                string_attribute(point, "db.system.name") == Some("sqlite")
+                    && point["asInt"]
+                        .as_f64()
+                        .or_else(|| point["asDouble"].as_f64())
+                        .is_some_and(|size| size > 0.0)
+            })
+    });
+    daemon.await_export(&root.path().join("capture/traces.ndjson"), |request| {
+        request["resourceSpans"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|batch| batch["scopeSpans"].as_array().into_iter().flatten())
+            .flat_map(|scope| scope["spans"].as_array().into_iter().flatten())
+            .any(|span| {
+                span["traceId"].as_str() == Some(TRACE_ID)
+                    && span["parentSpanId"].as_str() == Some(PARENT_ID)
+                    && span["name"].as_str() == Some("POST /v1/claims")
+                    && string_attribute(span, "http.route") == Some("/v1/claims")
+                    && int_attribute(span, "st.writer.ops").is_some_and(|ops| ops >= 1)
+                    && double_attribute(span, "st.writer.wait_ms")
+                        .is_some_and(|wait| wait >= 0.0)
             })
     });
 }

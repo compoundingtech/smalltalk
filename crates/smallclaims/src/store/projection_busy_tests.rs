@@ -407,7 +407,7 @@ fn truncate_requests_the_fifo_writer_before_changing_the_wal() {
     let job = requests
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("TRUNCATE must ask the FIFO writer");
-    let crate::sqlite::WriterJob::Lend { lent, returned } = job else {
+    let crate::sqlite::WriterJob::Lend { lent, returned, .. } = job else {
         panic!("expected a writer loan");
     };
     assert!(

@@ -1,6 +1,6 @@
 use super::*;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn writer() -> WriterConnection {
     let connection = Connection::open_in_memory().unwrap();
@@ -17,7 +17,7 @@ fn loan() -> (WriterJob, Loan) {
     let (lent, receives) = mpsc::sync_channel(1);
     let (gives, returned) = mpsc::sync_channel(1);
     (
-        WriterJob::Lend { lent, returned },
+        WriterJob::Lend { lent, returned, enqueued: Instant::now() },
         Loan {
             lent: receives,
             returned: gives,
@@ -189,13 +189,14 @@ fn hook_configuration_fence_drains_prior_background_but_not_later_background() {
         .unwrap();
     let through = queue.watermark();
     let (job, fence) = loan();
-    let WriterJob::Lend { lent, returned } = job else {
+    let WriterJob::Lend { lent, returned, enqueued } = job else {
         unreachable!()
     };
     sent.send(WriterJob::FenceLend {
         through,
         lent,
         returned,
+        enqueued,
     })
     .unwrap();
     let (later, later_loan) = loan();
@@ -288,6 +289,7 @@ fn foreground_only_fifo_and_batched_durable_answers_are_unchanged() {
         profile: None,
         wait: None,
         done,
+        enqueued: Instant::now(),
     });
     let last = foreground(&writer);
     drop(held);
