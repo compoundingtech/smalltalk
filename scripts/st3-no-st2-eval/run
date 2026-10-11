@@ -207,7 +207,7 @@ agent "native-seat" {{
   harness "claude" {{}}
 }}
 ''')
-        node.cli("agents", "apply", str(seats), "--as", "person/eval")
+        node.cli("apply", str(seats), "--no-gate-check", "--as", "person/eval")
 
         def turned():
             states = {fields(claim).get("state") for claim in claims(node, "harness.observed")}

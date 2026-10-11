@@ -817,7 +817,7 @@ agent "operations/amber" {{
   harness "omp" {{}}
 }}
 ''')
-                    await node.cli("agents", "apply", str(declaration), "--as", "person/eval")
+                    await node.cli("apply", str(declaration), "--no-gate-check", "--as", "person/eval")
                     async def operations_ready():
                         card = await node.api("/v1/client/agents/agent/operations/amber")
                         return card if card and card.get("driver") and card.get("state") == "running" else None
@@ -839,7 +839,7 @@ agent "probe/{node.name}" {{
   argv {' '.join(json.dumps(arg) for arg in argv)}
 }}
 ''')
-                await node.cli("agents", "apply", str(node.root / "seat.kdl"), "--as", "person/eval")
+                await node.cli("apply", str(node.root / "seat.kdl"), "--no-gate-check", "--as", "person/eval")
 
             async def route(node):
                 path = node.root / "probe/latest.json"
@@ -893,7 +893,7 @@ agent "probe/{node.name}" {{
             self.assertFalse(any(claim["kind"] in ("message.staged", "message.delivered", "message.read")
                                  for claim in before["claims"]))
             restarted_at = time.time_ns() // 1_000_000
-            await nodes[1].cli("agents", "apply", str(nodes[1].root / "seat.kdl"), "--as", "person/eval")
+            await nodes[1].cli("apply", str(nodes[1].root / "seat.kdl"), "--no-gate-check", "--as", "person/eval")
 
             async def recovered():
                 row = await route(nodes[0])

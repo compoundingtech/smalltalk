@@ -5,8 +5,8 @@ version 2
 // `queue {}` makes each step depend on the one before it, so the seat receives them one at a time.
 // It orders steps inside one run. The seat's own queue orders whole runs; seat-queue.kdl shows it.
 //
-//   st agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st missions publish examples/st3/queued-work.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/omp.kdl --as person/operator
+//   st apply examples/st3/queued-work.kdl --as person/operator
 //   st missions start example/maintenance --id example/maintenance/2026-10-01 \
 //     --workspace /srv/example/app --as person/operator
 

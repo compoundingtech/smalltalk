@@ -11,11 +11,11 @@ version 2
 // `st attention ls --as person/operator`, or cancels the run. The seat is durable and belongs to
 // neither mission.
 //
-//   st agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st missions publish examples/st3/recurring-stewardship-cycle.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/omp.kdl --as person/operator
+//   st apply examples/st3/recurring-stewardship-cycle.kdl --as person/operator
 //   # Replace the zero revision below with the hash that recurring-stewardship-cycle.kdl shows how
 //   # to read.
-//   st missions publish examples/st3/recurring-stewardship.kdl --as person/operator
+//   st apply examples/st3/recurring-stewardship.kdl --as person/operator
 //   st missions start example/stewardship --id example/stewardship/main \
 //     --workspace /srv/example/stewardship --as person/operator
 

@@ -924,13 +924,9 @@ agent "example/operations/coordinator" {
     value(
         &run_cli(
             &socket,
-            &[
-                "agents",
-                "apply",
-                parent.to_str().unwrap(),
-                "--as",
-                "person/operator",
-            ],
+            &["apply", "--no-gate-check", parent.to_str().unwrap(),
+            "--as",
+            "person/operator",],
         )
         .await,
     );
@@ -952,7 +948,7 @@ agent "example/operations/deputy" {
     let applied = run_cli_with_agent_env(
         &socket,
         actor,
-        &["agents", "apply", deputy.to_str().unwrap(), "--as", actor],
+        &["apply", "--no-gate-check", deputy.to_str().unwrap(), "--as", actor],
     )
     .await;
     value(&applied);
@@ -969,13 +965,9 @@ agent "example/operations/deputy" {
         &run_cli_with_agent_env(
             &socket,
             actor,
-            &[
-                "missions",
-                "publish",
-                mission.to_str().unwrap(),
-                "--as",
-                actor,
-            ],
+            &["apply", mission.to_str().unwrap(),
+            "--as",
+            actor,],
         )
         .await,
     );
@@ -3720,13 +3712,9 @@ async fn agents_start_preserves_command_declarations_and_refuses_harness_options
         value(
             &run_cli(
                 &socket,
-                &[
-                    "agents",
-                    "apply",
-                    source.to_str().unwrap(),
-                    "--as",
-                    "person/avery",
-                ],
+                &["apply", "--no-gate-check", source.to_str().unwrap(),
+                "--as",
+                "person/avery",],
             )
             .await,
         );
@@ -3838,13 +3826,9 @@ async fn agents_start_patches_only_explicit_typed_harness_fields() {
     value(
         &run_cli(
             &socket,
-            &[
-                "agents",
-                "apply",
-                source.to_str().unwrap(),
-                "--as",
-                "person/avery",
-            ],
+            &["apply", "--no-gate-check", source.to_str().unwrap(),
+            "--as",
+            "person/avery",],
         )
         .await,
     );
@@ -4074,13 +4058,9 @@ async fn creation_commands_end_with_actions_and_json_remains_parseable() {
     value(
         &run_cli(
             &socket,
-            &[
-                "missions",
-                "publish",
-                mission.to_str().unwrap(),
-                "--as",
-                "person/avery",
-            ],
+            &["apply", mission.to_str().unwrap(),
+            "--as",
+            "person/avery",],
         )
         .await,
     );
