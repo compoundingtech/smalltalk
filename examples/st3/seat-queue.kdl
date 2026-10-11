@@ -11,9 +11,9 @@ version 2
 // Apply one worker seat from seats/, and seats/chief.kdl if an agent should reorder the queue.
 // Then publish these two missions and start one run of each:
 //
-//   st agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st agents apply examples/st3/seats/chief.kdl --as person/operator
-//   st missions publish examples/st3/seat-queue.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/omp.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/chief.kdl --as person/operator
+//   st apply examples/st3/seat-queue.kdl --as person/operator
 //   st missions start example/docs-refresh --id example/docs-refresh/2026-10-01 \
 //     --workspace /srv/example/app --as person/operator
 //   st missions start example/release-notes --id example/release-notes/2026-10-01 \

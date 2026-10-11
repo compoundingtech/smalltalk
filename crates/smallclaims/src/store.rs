@@ -7997,9 +7997,56 @@ pub fn repair_operations_tx(
     Ok(changed)
 }
 
+/// Reconcile every receipt with the complete canonical fold at this writer cut.
+/// Exact rows with a matching known-key logical cache receive no attempted DML.
+/// Damaged, stale or inconsistently cached rows are removed by rowid.
+/// This still scans complete input/receipt inventories and can rewrite every row.
 pub fn rebuild_operations_tx(transaction: &Transaction<'_>) -> Result<()> {
-    transaction.execute("DELETE FROM operations", [])?;
-    for (id, (request_digest, canonical_claim_id, state)) in expected_operations(transaction)? {
+    let mut expected = expected_operations(transaction)?;
+    // `operations` is an ordinary rowid table. Inspect raw values: damaged NULL/BLOB or
+    // invalid UTF-8 identities must not make a typed reader overlook a stale receipt.
+    // Finish discovery and drop the statement before applying any mutations.
+    let obsolete = {
+        let mut statement = transaction.prepare(
+            "SELECT o.rowid, o.id, o.request_digest, o.canonical_claim_id, o.state,
+                    CASE WHEN typeof(o.id)='text' AND typeof(o.request_digest)='text'
+                           AND typeof(o.canonical_claim_id)='text' AND typeof(o.state)='text'
+                         THEN cached.row_json IS json_array(o.canonical_claim_id,o.id,o.request_digest,o.state)
+                         ELSE 0 END
+             FROM operations AS o
+             LEFT JOIN projection_digest_operation_rows AS cached ON cached.operation_id=o.id",
+        )?;
+        let mut rows = statement.query([])?;
+        // The joined comparison uses exactly refresh_operation's SQLite JSON encoding.
+        // CASE keeps NULL/BLOB storage out of json_array; raw byte comparisons below
+        // still reject invalid UTF-8 TEXT rather than granting it canonical authority.
+        let mut obsolete = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id = match row.get_ref(1)? {
+                rusqlite::types::ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok(),
+                _ => None,
+            };
+            let canonical = id.and_then(|id| expected.get(id));
+            let correct = if let Some((digest, claim, state)) = canonical {
+                let exact_row = matches!(row.get_ref(2)?, rusqlite::types::ValueRef::Text(bytes) if bytes == digest.as_bytes())
+                    && matches!(row.get_ref(3)?, rusqlite::types::ValueRef::Text(bytes) if bytes == claim.as_bytes())
+                    && matches!(row.get_ref(4)?, rusqlite::types::ValueRef::Text(bytes) if bytes == state.as_bytes());
+                exact_row && row.get::<_, bool>(5)?
+            } else {
+                false
+            };
+            if correct {
+                expected.remove(id.expect("a matching receipt has a valid text identity"));
+            } else {
+                obsolete.push(row.get::<_, i64>(0)?);
+            }
+        }
+        obsolete
+    };
+    for rowid in obsolete {
+        transaction.execute("DELETE FROM operations WHERE rowid=?1", [rowid])?;
+    }
+    for (id, (request_digest, canonical_claim_id, state)) in expected {
         transaction.execute(
             "INSERT INTO operations(id, request_digest, canonical_claim_id, state) VALUES (?1, ?2, ?3, ?4)",
             params![id, request_digest, canonical_claim_id, state],

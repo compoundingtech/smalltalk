@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "fractal-web renders the selected agent conversation with the shared kit transcript and per-conversation SyncLine",
+  "replay": {"status": "none", "detail": "Read-only presentation of retained conversation observations; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "All nine conversation item variants and SDK sync verdicts are passed unchanged to the kit. Unavailable and earlier-history boundaries use kit EmptyState and Note; the transcript remains read-only and keeps the kit's existing empty copy. The kit does not yet expose message send-state presentation."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No deployed installation action required."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

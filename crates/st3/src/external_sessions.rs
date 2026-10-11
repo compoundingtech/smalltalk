@@ -3534,6 +3534,17 @@ fn push_unrecognized(
         json!({"raw": value}),
         &label,
     );
+    if matches!(driver, "omp" | "pi")
+        && let Some((kind, view, visibility)) = crate::native_views::omp_record_view(value)
+        && let Some(item) = items.last_mut()
+    {
+        let block = &mut item["body"]["blocks"][0];
+        block["kind"] = json!(kind);
+        block["view"] = view;
+        if let Some(visibility) = visibility {
+            block["visibility"] = json!(visibility);
+        }
+    }
 }
 
 /// Native bodies stay owner-local. HTTP negotiation adds size bounds and owner fetch refs;
@@ -3893,6 +3904,128 @@ fn push_claude_content(
     }
 }
 
+/// OMP persists a failed assistant turn with `stopReason: "error"`, an `errorMessage`, and —
+/// once an automatic retry settles — a `retryRecovery` marker recording how the attempt was
+/// recovered or superseded. Project the presentation exactly as the harness resolves it:
+/// superseded attempts are hidden, recovered ones render a compact note that still discloses
+/// the original error, silent and user-interrupt aborts render nothing, and terminal failures
+/// render in full. `label` is the resolved display text; `message` keeps the original error.
+fn omp_assistant_error_view(message: &Value) -> Option<Value> {
+    const SILENT_ABORT_MARKER: &str = "__omp.silent_abort__";
+    const USER_INTERRUPT_LABEL: &str = "Interrupted by user";
+    const GENERIC_ABORT_SENTINEL: &str = "Request was aborted";
+    let retry = message
+        .get("retryRecovery")
+        .filter(|retry| retry.is_object());
+    let stop_reason = message.get("stopReason").and_then(Value::as_str);
+    let error_message = message.get("errorMessage").and_then(Value::as_str);
+    let error_id = message.get("errorId").and_then(Value::as_i64);
+    let flagged = |bit: i64| error_id.is_some_and(|id| id & bit != 0);
+    let silent_abort = error_message == Some(SILENT_ABORT_MARKER) || flagged(0x0200_0000);
+    let user_interrupt = error_message == Some(USER_INTERRUPT_LABEL) || flagged(0x0400_0000);
+    let retry_note = || {
+        retry
+            .and_then(|retry| retry.get("note"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    let (status, presentation, is_error, label) = match retry
+        .and_then(|retry| retry.get("status"))
+        .and_then(Value::as_str)
+    {
+        Some("recovered") => ("recovered", "compact-recovered", false, retry_note()),
+        Some("superseded") => ("superseded", "none", false, ""),
+        _ => match stop_reason {
+            Some("error") => ("failed", "full", true, error_message.unwrap_or("Error")),
+            Some("aborted") => {
+                if silent_abort || user_interrupt {
+                    return None;
+                }
+                let custom = error_message.is_some_and(|text| {
+                    !text.is_empty()
+                        && text != GENERIC_ABORT_SENTINEL
+                        && text != SILENT_ABORT_MARKER
+                });
+                (
+                    "failed",
+                    "full",
+                    true,
+                    if custom {
+                        error_message.unwrap_or_default()
+                    } else {
+                        "Operation aborted"
+                    },
+                )
+            }
+            _ => {
+                let text = error_message?;
+                if text.is_empty() || silent_abort || user_interrupt {
+                    return None;
+                }
+                ("failed", "full", true, text)
+            }
+        },
+    };
+    let mut view = json!({
+        "type": "assistant_error",
+        "status": status,
+        "presentation": presentation,
+        "is_error": is_error,
+        "label": label,
+        "message": error_message.unwrap_or(""),
+    });
+    if let Some(stop_reason) = stop_reason {
+        view["stop_reason"] = json!(stop_reason);
+    }
+    if let Some(error_id) = error_id {
+        view["error_id"] = json!(error_id);
+    }
+    for field in ["api", "provider", "model"] {
+        if let Some(value) = message.get(field).and_then(Value::as_str) {
+            view[field] = json!(value);
+        }
+    }
+    if let Some(retry) = retry {
+        let mut projected = json!({});
+        for field in ["kind", "status", "recovery", "note"] {
+            if let Some(value) = retry.get(field).and_then(Value::as_str) {
+                projected[field] = json!(value);
+            }
+        }
+        if let Some(attempt) = retry.get("attempt").and_then(Value::as_u64) {
+            projected["attempt"] = json!(attempt);
+        }
+        if let Some(recovered_at) = retry.get("recoveredAt").and_then(Value::as_str) {
+            projected["recovered_at"] = json!(recovered_at);
+        }
+        if let Some(superseded) = retry.get("supersededBy").filter(|value| value.is_object()) {
+            let mut by = json!({});
+            if let Some(at) = superseded.get("timestamp").and_then(Value::as_i64) {
+                by["timestamp"] = json!(at);
+            }
+            for (target, field) in [
+                ("response_id", "responseId"),
+                ("provider", "provider"),
+                ("model", "model"),
+            ] {
+                if let Some(value) = superseded.get(field).and_then(Value::as_str) {
+                    by[target] = json!(value);
+                }
+            }
+            if by.as_object().is_some_and(|by| !by.is_empty()) {
+                projected["superseded_by"] = by;
+            }
+        }
+        if projected
+            .as_object()
+            .is_some_and(|projected| !projected.is_empty())
+        {
+            view["retry"] = projected;
+        }
+    }
+    Some(view)
+}
+
 fn normalize_omp(
     driver: ExternalDriver,
     value: &Value,
@@ -3907,6 +4040,8 @@ fn normalize_omp(
     let timestamp = native_timestamp(value.get("timestamp"))
         .or_else(|| native_timestamp(value.pointer("/message/timestamp")))
         .unwrap_or_else(|| fallback_timestamp.to_owned());
+    let record_view = crate::native_views::omp_record_view(value);
+    let first_item = items.len();
     match value.get("type").and_then(Value::as_str) {
         Some("message") => {}
         Some(kind @ ("compaction" | "branch_summary")) => {
@@ -3931,6 +4066,17 @@ fn normalize_omp(
                     value,
                 );
             }
+            if let Some((kind, view, visibility)) = record_view
+                && let Some(item) = items.last_mut()
+            {
+                let block = &mut item["body"]["blocks"][0];
+                block["kind"] = json!(kind);
+                block["payload"] = json!({"raw":value});
+                block["view"] = view;
+                if let Some(visibility) = visibility {
+                    block["visibility"] = json!(visibility);
+                }
+            }
             return;
         }
         Some("custom_message") => {
@@ -3944,6 +4090,93 @@ fn normalize_omp(
                     &timestamp,
                     "system",
                 );
+                if let Some((kind, view, visibility)) = record_view {
+                    for item in &mut items[first_item..] {
+                        if let Some(blocks) = item["body"]["blocks"].as_array_mut() {
+                            for block in blocks {
+                                block["kind"] = json!(kind);
+                                block["payload"] = json!({"raw":value});
+                                block["view"] = view.clone();
+                                if let Some(visibility) = visibility {
+                                    block["visibility"] = json!(visibility);
+                                }
+                            }
+                        }
+                    }
+                    if items.len() == first_item {
+                        push_unrecognized(
+                            items,
+                            sequence,
+                            &timestamp,
+                            label,
+                            "entry",
+                            Some("custom_message"),
+                            value,
+                        );
+                    }
+                }
+            }
+            return;
+        }
+        Some("custom") => {
+            if let Some((kind, view, visibility)) = record_view
+                && view["type"] == "tool_start"
+            {
+                let tool = view["tool"].as_str().unwrap_or("tool");
+                push_native_block(
+                    items,
+                    sequence,
+                    &timestamp,
+                    "system",
+                    (kind, "custom"),
+                    json!({"raw": value}),
+                    &format!("[{label} tool start {tool}]"),
+                );
+                let block = &mut items.last_mut().unwrap()["body"]["blocks"][0];
+                block["view"] = view;
+                if let Some(visibility) = visibility {
+                    block["visibility"] = json!(visibility);
+                }
+            } else {
+                push_unrecognized(
+                    items,
+                    sequence,
+                    &timestamp,
+                    label,
+                    "entry",
+                    Some("custom"),
+                    value,
+                );
+            }
+            return;
+        }
+        Some(record_type @ ("reset_boundary" | "credential_pin" | "title")) => {
+            let text = match record_type {
+                "reset_boundary" => format!("[{label} session reset]"),
+                "credential_pin" => format!(
+                    "[{label} credential pin {}]",
+                    value["provider"].as_str().unwrap_or_default()
+                ),
+                _ => format!(
+                    "[{label} title] {}",
+                    value["title"].as_str().unwrap_or_default()
+                ),
+            };
+            if let Some((kind, view, visibility)) = record_view {
+                push_native_block(
+                    items,
+                    sequence,
+                    &timestamp,
+                    "system",
+                    (kind, record_type),
+                    json!({"raw": value}),
+                    &text,
+                );
+                let block = &mut items.last_mut().unwrap()["body"]["blocks"][0];
+                block["view"] = view;
+                if let Some(visibility) = visibility {
+                    block["visibility"] = json!(visibility);
+                }
             }
             return;
         }
@@ -3960,6 +4193,7 @@ fn normalize_omp(
             "user"
                 | "assistant"
                 | "system"
+                | "developer"
                 | "tool"
                 | "toolResult"
                 | "tool_result"
@@ -3999,6 +4233,21 @@ fn normalize_omp(
                     .unwrap_or(false),
             );
             preserve_omp_result_timing(items, message);
+            if let Some(item) = items.last_mut() {
+                item["body"]["blocks"][0]["view"] = crate::native_views::tool_output_view(
+                    message
+                        .get("toolName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool"),
+                    message["toolCallId"].as_str().unwrap_or_default(),
+                    message
+                        .get("isError")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    message.get("details"),
+                );
+                item["body"]["blocks"][0]["payload"] = json!({"body_ref":true,"raw":value});
+            }
             return;
         }
         // A shell command the person ran with `!`: shown as the harness recorded it, without
@@ -4031,6 +4280,7 @@ fn normalize_omp(
         }
         _ => {}
     }
+    let first_content = items.len();
     push_omp_content(
         driver,
         items,
@@ -4039,6 +4289,50 @@ fn normalize_omp(
         &timestamp,
         role,
     );
+    if native_role == Some("assistant")
+        && let Some(view) = omp_assistant_error_view(message)
+    {
+        // The error presentation is its own block after the turn's content, so every
+        // existing native block identity stays stable.
+        let error_sequence = items
+            .last()
+            .and_then(|item| item["sequence"].as_u64())
+            .map_or(sequence + 1, |last| last + 1);
+        let label = view["label"].as_str().unwrap_or_default().to_owned();
+        let fallback = match view["presentation"].as_str() {
+            Some("full") => format!("[error] {label}"),
+            Some("compact-recovered") => format!("[retry recovered] {label}"),
+            _ => String::new(),
+        };
+        push_content(items, error_sequence, &timestamp, "assistant", &fallback);
+        let block = &mut items.last_mut().expect("error item just pushed")["body"]["blocks"][0];
+        block["kind"] = json!("error");
+        block["source_type"] = json!(format!("{}/assistant_error", driver.as_str()));
+        block["payload"] = json!({"body_ref": true});
+        block["view"] = view;
+    }
+    // Message-level metadata has one owner: the last emitted block, including a
+    // tool call or an error. Newest-first header windows retain that block even
+    // when they split a message, without counting each part as another response.
+    if let Some(metadata) = crate::native_views::assistant_metadata(message)
+        && let Some(block) = items[first_content..]
+            .iter_mut()
+            .rev()
+            .filter_map(|item| item["body"]["blocks"].as_array_mut())
+            .find_map(|blocks| blocks.last_mut())
+    {
+        if let Some(existing) = block.get_mut("metadata").and_then(Value::as_object_mut) {
+            if let Some(additions) = metadata.as_object() {
+                existing.extend(
+                    additions
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+            }
+        } else {
+            block["metadata"] = metadata;
+        }
+    }
 }
 
 fn push_omp_content(
@@ -4066,28 +4360,55 @@ fn push_omp_content(
                             part["text"].as_str().unwrap_or_default(),
                         );
                     }
-                    Some("toolCall" | "tool_call") => push_tool_call(
-                        items,
-                        item_sequence,
-                        &timestamp,
-                        part.get("id")
-                            .or_else(|| part.get("toolCallId"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("native-call"),
-                        part.get("name").and_then(Value::as_str).unwrap_or("tool"),
-                        part.get("arguments").cloned().unwrap_or_else(|| json!({})),
-                    ),
+                    Some("toolCall" | "tool_call") => {
+                        let tool = part.get("name").and_then(Value::as_str).unwrap_or("tool");
+                        push_tool_call(
+                            items,
+                            item_sequence,
+                            &timestamp,
+                            part.get("id")
+                                .or_else(|| part.get("toolCallId"))
+                                .and_then(Value::as_str)
+                                .unwrap_or("native-call"),
+                            tool,
+                            part.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                        );
+                        if let Some(item) = items.last_mut() {
+                            item["body"]["blocks"][0]["view"] = crate::native_views::tool_call_view(
+                                tool,
+                                &item["body"]["arguments"],
+                            );
+                        }
+                    }
                     Some("toolResult" | "tool_result") => {
+                        let call_id = part
+                            .get("toolCallId")
+                            .or_else(|| part.get("call_id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("native-call");
                         push_tool_result(
                             items,
                             item_sequence,
                             &timestamp,
-                            part.get("toolCallId")
-                                .or_else(|| part.get("call_id"))
-                                .and_then(Value::as_str)
-                                .unwrap_or("native-call"),
+                            call_id,
                             part.get("content").cloned().unwrap_or(Value::Null),
                         );
+                        if let Some(item) = items.last_mut() {
+                            item["body"]["blocks"][0]["view"] =
+                                crate::native_views::tool_output_view(
+                                    part.get("toolName")
+                                        .or_else(|| part.get("name"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("tool"),
+                                    call_id,
+                                    part.get("isError")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false),
+                                    part.get("details"),
+                                );
+                            item["body"]["blocks"][0]["payload"] =
+                                json!({"body_ref":true,"raw":part});
+                        }
                         preserve_omp_result_timing(items, part);
                     }
                     Some(kind) if REASONING_BLOCKS.contains(&kind) => {
@@ -4361,6 +4682,211 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_omp_message_usage_once(content: Value) {
+        for driver in [ExternalDriver::Omp, ExternalDriver::Pi] {
+            let mut items = Vec::new();
+            for (sequence, usd) in [(0, 0.25), (1000, 0.5)] {
+                let record = json!({
+                    "type": "message",
+                    "message": {
+                        "role": "assistant", "content": content, "model": "test-model",
+                        "usage": {"input": 12, "output": 5, "totalTokens": 17, "cost": {"total": usd}},
+                        "contextSnapshot": {"promptTokens": 23},
+                    },
+                });
+                let first = items.len();
+                normalize_omp(driver, &record, sequence, "2026-10-06T00:00:00Z", &mut items);
+                let blocks: Vec<_> = items[first..]
+                    .iter()
+                    .filter_map(|item| item["body"]["blocks"].as_array())
+                    .flatten()
+                    .collect();
+                let owner = blocks.last().unwrap();
+                assert_eq!(owner["metadata"]["usage"]["cost_usd"], usd);
+                assert_eq!(owner["metadata"]["usage"]["total"], 17);
+                assert_eq!(blocks.iter().filter(|block| block["metadata"]["usage"].is_object()).count(), 1);
+            }
+            let header = crate::conversation_header::derive(&items, false);
+            assert_eq!(header["cost"]["value"]["usd"], 0.75);
+            assert_eq!(header["model"]["value"], "test-model");
+            assert_eq!(header["context"]["value"]["tokens"], 23);
+        }
+    }
+
+    #[test]
+    fn omp_thinking_and_text_count_message_usage_once() {
+        assert_omp_message_usage_once(json!([
+            {"type": "thinking", "thinking": "Consider the request"},
+            {"type": "text", "text": "Answer"},
+        ]));
+    }
+
+    #[test]
+    fn omp_tool_call_only_counts_message_usage_once() {
+        assert_omp_message_usage_once(json!([
+            {"type": "toolCall", "id": "first", "name": "read", "arguments": {"path": "a"}},
+            {"type": "toolCall", "id": "second", "name": "read", "arguments": {"path": "b"}},
+        ]));
+    }
+
+    #[test]
+    fn omp_split_newest_header_window_keeps_latest_message_metadata() {
+        let mut content: Vec<_> = (0..201)
+            .map(|index| json!({"type": "text", "text": format!("part {index}")}))
+            .collect();
+        content.push(json!({
+            "type": "toolCall", "id": "last-call", "name": "read", "arguments": {"path": "a"},
+        }));
+        assert_omp_message_usage_once(json!(content));
+        for driver in [ExternalDriver::Omp, ExternalDriver::Pi] {
+            let mut items = Vec::new();
+            for (sequence, message, timestamp) in [
+                (0, json!({
+                    "role": "assistant", "content": "previous answer", "model": "old-model",
+                    "usage": {"cost": {"total": 0.25}},
+                    "contextSnapshot": {"promptTokens": 11},
+                }), "2026-10-06T00:00:00Z"),
+                (1000, json!({
+                    "role": "assistant", "content": content, "model": "latest-model",
+                    "usage": {"input": 12, "output": 5, "totalTokens": 17, "cost": {"total": 0.5}},
+                    "contextSnapshot": {"promptTokens": 23}, "ttft": 10, "duration": 30,
+                }), "2026-10-06T00:00:01Z"),
+            ] {
+                normalize_omp(driver, &json!({"type": "message", "message": message}),
+                    sequence, timestamp, &mut items);
+            }
+            let owner = &items.last().unwrap()["body"]["blocks"][0];
+            assert_eq!(owner["kind"], "tool_call");
+            assert_eq!(owner["metadata"]["usage"]["total"], 17);
+            assert_eq!(owner["metadata"]["ttft_ms"], 10);
+            assert_eq!(owner["metadata"]["duration_ms"], 30);
+            // Match the native header's newest-first 200-item window: the latest
+            // message spans 202 entries, so its first projected blocks are absent.
+            items.reverse();
+            let head = &items[..200];
+            assert_eq!(head.len(), 200);
+            assert!(head.iter().all(|item| item["sequence"].as_u64().unwrap() > 1001));
+            let header = crate::conversation_header::derive(head, true);
+            assert_eq!(header["cost"]["value"], json!({"usd": 0.5, "window": true}));
+            assert_eq!(header["model"]["value"], "latest-model");
+            assert_eq!(header["context"]["value"], json!({"tokens": 23, "window": true}));
+            for field in ["cost", "model", "context"] {
+                assert_eq!(header[field]["as_of"], "2026-10-06T00:00:01Z");
+            }
+        }
+    }
+
+    #[test]
+    fn omp_parity_fixture_projects_all_views_without_losing_native_payloads() {
+        for driver in [ExternalDriver::Omp, ExternalDriver::Pi] {
+            let mut items = Vec::new();
+            for (index, line) in include_str!("../fixtures/native-records/omp-parity.jsonl")
+                .lines()
+                .enumerate()
+            {
+                let record: Value = serde_json::from_str(line).unwrap();
+                let first = items.len();
+                normalize_omp(
+                    driver,
+                    &record,
+                    index as u64 * 100,
+                    "2026-10-06T00:00:00Z",
+                    &mut items,
+                );
+                if let Some((_, view, _)) = crate::native_views::omp_record_view(&record) {
+                    let block = &items[first]["body"]["blocks"][0];
+                    assert_eq!(block["payload"]["raw"], record);
+                    assert_eq!(block["view"], view);
+                }
+                if record.pointer("/message/role").and_then(Value::as_str) == Some("toolResult") {
+                    assert_eq!(
+                        items.last().unwrap()["body"]["content"],
+                        record["message"]["content"]
+                    );
+                    assert_eq!(
+                        items.last().unwrap()["body"]["blocks"][0]["payload"]["raw"],
+                        record
+                    );
+                }
+                if let Some(parts) = record.pointer("/message/content").and_then(Value::as_array) {
+                    for part in parts.iter().filter(|part| part["type"] == "toolCall") {
+                        let call = items[first..]
+                            .iter()
+                            .find(|item| item["type"] == "tool_call")
+                            .unwrap();
+                        assert_eq!(call["body"]["arguments"], part["arguments"]);
+                    }
+                }
+            }
+            let pairs: std::collections::BTreeSet<_> = items
+                .iter()
+                .flat_map(|item| item["body"]["blocks"].as_array().into_iter().flatten())
+                .filter_map(|block| {
+                    Some((block["kind"].as_str()?, block["view"]["type"].as_str()?))
+                })
+                .collect();
+            for expected in [
+                ("tool_call", "bash"),
+                ("tool_call", "edit"),
+                ("tool_call", "write"),
+                ("tool_call", "read"),
+                ("tool_call", "search"),
+                ("tool_call", "todo"),
+                ("tool_call", "ask"),
+                ("tool_call", "task"),
+                ("tool_call", "hub"),
+                ("tool_call", "eval"),
+                ("tool_call", "generic"),
+                ("tool_output", "bash"),
+                ("tool_output", "edit"),
+                ("tool_output", "search"),
+                ("tool_output", "todo"),
+                ("tool_output", "ask"),
+                ("tool_output", "task"),
+                ("tool_output", "hub"),
+                ("tool_output", "generic"),
+                ("irc", "irc"),
+                ("job", "job"),
+                ("status", "skill"),
+                ("status", "compaction"),
+                ("status", "model_change"),
+                ("status", "thinking_level"),
+                ("status", "title"),
+                ("status", "session_exit"),
+                ("status", "tool_start"),
+                ("error", "assistant_error"),
+            ] {
+                assert!(
+                    pairs.contains(&expected),
+                    "missing {expected:?} for {driver:?}"
+                );
+            }
+            let blocks: Vec<_> = items
+                .iter()
+                .flat_map(|item| item["body"]["blocks"].as_array().into_iter().flatten())
+                .collect();
+            assert!(
+                blocks
+                    .iter()
+                    .any(|block| block["view"]["type"] == "tool_start"
+                        && block["visibility"] == "internal")
+            );
+            assert!(blocks.iter().any(|block| block["metadata"]["context_tokens"] == 23
+                && block["metadata"]["usage"]["cost_usd"] == 0.01));
+            for kind in ["text", "reasoning"] {
+                assert!(blocks.iter().any(|block| block["kind"] == kind));
+            }
+            assert!(items.iter().any(|item| item["body"]["text"]
+                == "Synthetic extension fallback"
+                && item["body"]["blocks"][0]["kind"] == "text"));
+            assert!(
+                !items
+                    .iter()
+                    .any(|item| item["body"]["text"] == "Synthetic hidden extension")
+            );
+        }
+    }
 
     #[test]
     fn metadata_cache_refreshes_after_a_transcript_changes() {
@@ -5032,6 +5558,258 @@ mod tests {
             json!({"existing": true, "wallTimeMs": 0, "timeoutSeconds": 0.125, "future": "unchanged"})
         );
         assert_eq!(items[0]["body"]["blocks"], source_before);
+    }
+
+    #[test]
+    fn omp_failed_assistant_record_appends_typed_error_block() {
+        let record = json!({
+            "type": "message",
+            "id": "err-one",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "synthetic planning note"}],
+                "api": "openai-codex-responses",
+                "provider": "openai-codex",
+                "model": "gpt-5.6-sol",
+                "stopReason": "error",
+                "errorId": 135168,
+                "errorMessage": "synthetic socket closed",
+                "retryRecovery": {
+                    "kind": "auto-retry",
+                    "status": "recovered",
+                    "attempt": 1,
+                    "recoveredAt": "2026-01-01T00:00:20Z",
+                    "recovery": "plain",
+                    "note": "error; retried",
+                    "supersededBy": {
+                        "timestamp": 1789031579362i64,
+                        "responseId": "resp_synthetic",
+                        "provider": "openai-codex",
+                        "model": "gpt-5.6-sol"
+                    }
+                }
+            }
+        });
+        for (driver, source_type) in [
+            (ExternalDriver::Omp, "omp/assistant_error"),
+            (ExternalDriver::Pi, "pi/assistant_error"),
+        ] {
+            let mut items = Vec::new();
+            normalize_omp(driver, &record, 16, "", &mut items);
+            assert_eq!(items.len(), 3);
+            // Prior content and its native block identity are untouched.
+            assert_eq!(items[1]["type"], "content");
+            assert_eq!(items[1]["body"]["blocks"][0]["id"], "native-17/0");
+            let error = items.last().unwrap();
+            assert_eq!(error["type"], "content");
+            assert_eq!(error["role"], "assistant");
+            assert_eq!(error["sequence"], 18);
+            let block = &error["body"]["blocks"][0];
+            assert_eq!(block["id"], "native-18/0");
+            assert_eq!(block["kind"], "error");
+            assert_eq!(block["source_type"], source_type);
+            assert_eq!(block["payload"], json!({"body_ref": true}));
+            assert_eq!(block["view"]["type"], "assistant_error");
+            assert_eq!(block["view"]["status"], "recovered");
+            assert_eq!(block["view"]["presentation"], "compact-recovered");
+            assert_eq!(block["view"]["is_error"], false);
+            assert_eq!(block["view"]["label"], "error; retried");
+            assert_eq!(block["view"]["message"], "synthetic socket closed");
+            assert_eq!(block["view"]["stop_reason"], "error");
+            assert_eq!(block["view"]["error_id"], 135168);
+            assert_eq!(block["view"]["api"], "openai-codex-responses");
+            assert_eq!(block["view"]["provider"], "openai-codex");
+            assert_eq!(block["view"]["model"], "gpt-5.6-sol");
+            assert_eq!(block["view"]["retry"]["kind"], "auto-retry");
+            assert_eq!(block["view"]["retry"]["status"], "recovered");
+            assert_eq!(block["view"]["retry"]["attempt"], 1);
+            assert_eq!(block["view"]["retry"]["recovery"], "plain");
+            assert_eq!(block["view"]["retry"]["note"], "error; retried");
+            assert_eq!(
+                block["view"]["retry"]["recovered_at"],
+                "2026-01-01T00:00:20Z"
+            );
+            assert_eq!(
+                block["view"]["retry"]["superseded_by"],
+                json!({
+                    "timestamp": 1789031579362i64,
+                    "response_id": "resp_synthetic",
+                    "provider": "openai-codex",
+                    "model": "gpt-5.6-sol"
+                })
+            );
+            assert!(
+                block["view"]["retry"]["superseded_by"]
+                    .get("responseId")
+                    .is_none()
+            );
+            assert_eq!(error["body"]["text"], "[retry recovered] error; retried");
+        }
+    }
+
+    #[test]
+    fn omp_terminal_assistant_error_renders_in_full() {
+        let mut record = json!({
+            "type": "message",
+            "id": "err-two",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": "synthetic boom"
+            }
+        });
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &record, 0, "", &mut items);
+        let block = &items.last().unwrap()["body"]["blocks"][0];
+        assert_eq!(block["view"]["status"], "failed");
+        assert_eq!(block["view"]["presentation"], "full");
+        assert_eq!(block["view"]["is_error"], true);
+        assert_eq!(block["view"]["label"], "synthetic boom");
+        assert_eq!(block["view"]["message"], "synthetic boom");
+        assert!(block["view"]["retry"].is_null());
+        assert!(block["view"]["provider"].is_null());
+        assert_eq!(
+            items.last().unwrap()["body"]["text"],
+            "[error] synthetic boom"
+        );
+
+        record["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("errorMessage");
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &record, 0, "", &mut items);
+        assert_eq!(
+            items.last().unwrap()["body"]["blocks"][0]["view"]["label"],
+            "Error"
+        );
+    }
+
+    #[test]
+    fn omp_superseded_retry_error_is_typed_but_not_an_error() {
+        let record = json!({
+            "type": "message",
+            "id": "err-three",
+            "message": {
+                "role": "assistant",
+                "content": [],
+                "stopReason": "error",
+                "errorMessage": "synthetic rate limited",
+                "retryRecovery": {
+                    "kind": "auto-retry",
+                    "status": "superseded",
+                    "attempt": 2,
+                    "recovery": "model",
+                    "note": "switched model; retried"
+                }
+            }
+        });
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &record, 0, "", &mut items);
+        let block = &items.last().unwrap()["body"]["blocks"][0];
+        assert_eq!(block["kind"], "error");
+        assert_eq!(block["view"]["status"], "superseded");
+        assert_eq!(block["view"]["presentation"], "none");
+        assert_eq!(block["view"]["is_error"], false);
+        assert_eq!(block["view"]["label"], "");
+        assert_eq!(block["view"]["message"], "synthetic rate limited");
+        assert_eq!(block["view"]["retry"]["status"], "superseded");
+        assert_eq!(block["view"]["retry"]["attempt"], 2);
+        assert!(block["view"]["retry"]["superseded_by"].is_null());
+        assert_eq!(items.last().unwrap()["body"]["text"], "");
+    }
+
+    #[test]
+    fn omp_aborted_assistant_errors_match_native_presentation_rules() {
+        let cases = [
+            (
+                json!({"stopReason":"aborted","errorMessage":"__omp.silent_abort__"}),
+                None,
+            ),
+            (
+                json!({"stopReason":"aborted","errorMessage":"Interrupted by user"}),
+                None,
+            ),
+            (
+                json!({"stopReason":"aborted","errorId": 0x0400_0000i64, "errorMessage":"synthetic"}),
+                None,
+            ),
+            (
+                json!({"stopReason":"aborted","errorId": 0x0200_0000i64}),
+                None,
+            ),
+            (json!({"stopReason":"aborted"}), Some("Operation aborted")),
+            (
+                json!({"stopReason":"aborted","errorMessage":"Request was aborted"}),
+                Some("Operation aborted"),
+            ),
+            (
+                json!({"stopReason":"aborted","errorMessage":"synthetic context limit"}),
+                Some("synthetic context limit"),
+            ),
+            (
+                json!({"errorMessage":"synthetic late failure"}),
+                Some("synthetic late failure"),
+            ),
+            (json!({"stopReason":"stop"}), None),
+            (json!({}), None),
+        ];
+        for (fields, expected) in cases {
+            let record = json!({
+                "type": "message",
+                "id": "abort-one",
+                "message": {"role": "assistant", "content": []}
+            });
+            let mut record = record;
+            let message = record["message"].as_object_mut().unwrap();
+            for (key, value) in fields.as_object().unwrap() {
+                message.insert(key.clone(), value.clone());
+            }
+            let mut items = Vec::new();
+            normalize_omp(ExternalDriver::Omp, &record, 0, "", &mut items);
+            match expected {
+                None => assert_eq!(items.len(), 1, "no error block for {fields}"),
+                Some(label) => {
+                    let block = &items.last().unwrap()["body"]["blocks"][0];
+                    assert_eq!(block["view"]["status"], "failed", "for {fields}");
+                    assert_eq!(block["view"]["presentation"], "full", "for {fields}");
+                    assert_eq!(block["view"]["is_error"], true, "for {fields}");
+                    assert_eq!(block["view"]["label"], label, "for {fields}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn omp_assistant_error_block_keeps_source_record_and_native_identity() {
+        let record = json!({
+            "type": "message",
+            "id": "err-four",
+            "message": {
+                "role": "assistant",
+                "content": "synthetic partial answer",
+                "stopReason": "error",
+                "errorMessage": "synthetic socket closed"
+            }
+        });
+        let mut items = Vec::new();
+        normalize_native_line(ExternalDriver::Omp, &record, 16, "", &mut items);
+        // Source record stays on the first item; the error block is separate.
+        assert_eq!(items[0]["body"]["blocks"][0]["kind"], "source_record");
+        assert_eq!(items[0]["body"]["blocks"][0]["payload"]["raw"], record);
+        assert_eq!(items[0]["body"]["blocks"][0]["visibility"], "internal");
+        assert_eq!(items[1]["body"]["blocks"][0]["id"], "native-17/0");
+        assert_eq!(items[1]["body"]["blocks"][0]["kind"], "text");
+        let error = items.last().unwrap();
+        assert_eq!(error["sequence"], 18);
+        assert_eq!(error["body"]["blocks"][0]["kind"], "error");
+        assert_eq!(
+            error["body"]["blocks"][0]["source_type"],
+            "omp/assistant_error"
+        );
+        assert_eq!(error["body"]["text"], "[error] synthetic socket closed");
     }
 
     #[test]
@@ -5723,6 +6501,42 @@ mod tests {
             .unwrap();
         assert_eq!(result["body"]["status"], "error");
         assert_unique_ids(&items);
+    }
+
+    #[test]
+    fn omp_developer_reminders_are_system_text_without_unknown_blocks() {
+        let text = "<system-reminder>\nSynthetic incomplete todo reminder.\n</system-reminder>";
+        let mut record = json!({
+            "type": "message",
+            "message": {
+                "role": "developer",
+                "attribution": {"source": "harness"},
+                "timestamp": "2026-10-06T12:00:00Z",
+                "content": [{"type": "text", "text": text}]
+            }
+        });
+        let mut items = Vec::new();
+        normalize_omp(ExternalDriver::Omp, &record, 16, &timestamp(0), &mut items);
+        assert!(items.iter().all(|item| item["role"] == "system"));
+        let blocks: Vec<_> = items
+            .iter()
+            .flat_map(|item| item["body"]["blocks"].as_array().into_iter().flatten())
+            .collect();
+        assert!(blocks.iter().all(|block| block["kind"] != "unknown"));
+        assert!(blocks.iter().any(|block| block["kind"] == "text"));
+        assert!(items.iter().any(|item| item["body"]["text"] == text));
+
+        // Native attribution is handled exactly as it is for other OMP system messages.
+        record["message"]["role"] = json!("system");
+        let mut system_items = Vec::new();
+        normalize_omp(
+            ExternalDriver::Omp,
+            &record,
+            16,
+            &timestamp(0),
+            &mut system_items,
+        );
+        assert_eq!(items, system_items);
     }
 
     #[test]

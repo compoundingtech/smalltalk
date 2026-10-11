@@ -1,0 +1,538 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "roster",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 1
+  },
+  "state": {
+    "agents": [
+      {
+        "active_work_count": 1,
+        "ask": null,
+        "blocked_on": "pnpm -r typecheck fails in packages/worker",
+        "checkout": {
+          "base": "origin/main",
+          "branch": "builder/load-user-rename",
+          "repository": "~/src/atlas"
+        },
+        "current_session_id": "session/example-atlas-builder",
+        "current_work": [
+          {
+            "id": "step-run/example/atlas/load-user-rename/1/step-3",
+            "mission_id": "mission/example/atlas/load-user-rename",
+            "mission_run_id": "mission-run/example/atlas/load-user-rename/1",
+            "path": "step-3",
+            "since": "2030-01-01T11:22:00.000Z",
+            "state": "blocked",
+            "title": "Fix the worker after the rename"
+          }
+        ],
+        "current_work_ids": [
+          "step-run/example/atlas/load-user-rename/1/step-3"
+        ],
+        "driver": "codex",
+        "fault": null,
+        "harness_state": "blocked",
+        "host_id": "host/meadow",
+        "id": "agent/example/atlas/builder",
+        "incarnation_id": "rt-atlas-builder-271:8",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:58:25.000Z",
+        "name": "Atlas Builder",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": "mission-run/example/atlas/load-user-rename/1",
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag35",
+        "runtime_ids": [
+          "runtime/example-atlas-builder"
+        ],
+        "since": "2030-01-01T11:22:00.000Z",
+        "state": "running",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:58:25.000Z",
+        "workspace": "~/src/atlas/.worktrees/builder"
+      },
+      {
+        "active_work_count": 1,
+        "ask": "Review the loadUser rename before the CLI changes",
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "reviewer/load-user-rename",
+          "repository": "~/src/atlas"
+        },
+        "current_session_id": "session/example-atlas-reviewer",
+        "current_work": [
+          {
+            "id": "step-run/example/atlas/load-user-rename/1/step-4",
+            "mission_id": "mission/example/atlas/load-user-rename",
+            "mission_run_id": "mission-run/example/atlas/load-user-rename/1",
+            "path": "step-4",
+            "since": "2030-01-01T11:48:00.000Z",
+            "state": "waiting-person",
+            "title": "Review the rename"
+          }
+        ],
+        "current_work_ids": [
+          "step-run/example/atlas/load-user-rename/1/step-4"
+        ],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "idle",
+        "host_id": "host/foundry",
+        "id": "agent/example/atlas/reviewer",
+        "incarnation_id": "rt-atlas-reviewer-914:1",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:48:00.000Z",
+        "name": "Atlas Reviewer",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": "mission-run/example/atlas/load-user-rename/1",
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag30",
+        "runtime_ids": [
+          "runtime/example-atlas-reviewer"
+        ],
+        "since": "2030-01-01T11:48:00.000Z",
+        "state": "waiting",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:48:00.000Z",
+        "workspace": "~/src/atlas/.worktrees/reviewer"
+      },
+      {
+        "active_work_count": 1,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "migrator/load-user-rename",
+          "repository": "~/src/atlas"
+        },
+        "current_session_id": "session/example-atlas-migrator",
+        "current_work": [
+          {
+            "id": "step-run/example/atlas/load-user-rename/1/step-2",
+            "mission_id": "mission/example/atlas/load-user-rename",
+            "mission_run_id": "mission-run/example/atlas/load-user-rename/1",
+            "path": "step-2",
+            "since": "2030-01-01T11:39:00.000Z",
+            "state": "claimed",
+            "title": "Update call sites in packages/web"
+          }
+        ],
+        "current_work_ids": [
+          "step-run/example/atlas/load-user-rename/1/step-2"
+        ],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "busy",
+        "host_id": "host/meadow",
+        "id": "agent/example/atlas/migrator",
+        "incarnation_id": "rt-atlas-migrator-210:4",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:59:56.000Z",
+        "name": "Atlas Migrator",
+        "next_work": {
+          "id": "step-run/example/atlas/load-user-rename/1/step-5",
+          "mission_id": "mission/example/atlas/load-user-rename",
+          "mission_run_id": "mission-run/example/atlas/load-user-rename/1",
+          "path": "step-5",
+          "since": "2030-01-01T11:39:00.000Z",
+          "state": "ready",
+          "title": "Update the users API reference"
+        },
+        "next_work_id": "step-run/example/atlas/load-user-rename/1/step-5",
+        "owner_run_id": "mission-run/example/atlas/load-user-rename/1",
+        "queued_work_count": 1,
+        "reachability": "local",
+        "revision": "ag37",
+        "runtime_ids": [
+          "runtime/example-atlas-migrator"
+        ],
+        "since": "2030-01-01T11:39:00.000Z",
+        "state": "running",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [
+          {
+            "id": "step-run/example/atlas/load-user-rename/1/step-5",
+            "mission_id": "mission/example/atlas/load-user-rename",
+            "mission_run_id": "mission-run/example/atlas/load-user-rename/1",
+            "path": "step-5",
+            "since": "2030-01-01T11:39:00.000Z",
+            "state": "ready",
+            "title": "Update the users API reference"
+          }
+        ],
+        "upcoming_work_ids": [
+          "step-run/example/atlas/load-user-rename/1/step-5"
+        ],
+        "updated_at": "2030-01-01T11:59:56.000Z",
+        "workspace": "~/src/atlas/.worktrees/migrator"
+      },
+      {
+        "active_work_count": 0,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "docs/load-user-rename",
+          "repository": "~/src/atlas"
+        },
+        "current_session_id": "session/example-atlas-docs",
+        "current_work": [],
+        "current_work_ids": [],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "idle",
+        "host_id": "host/foundry",
+        "id": "agent/example/atlas/docs",
+        "incarnation_id": "rt-atlas-docs-354:9",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:05:00.000Z",
+        "name": "Atlas Docs",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": null,
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag25",
+        "runtime_ids": [
+          "runtime/example-atlas-docs"
+        ],
+        "since": "2030-01-01T11:05:00.000Z",
+        "state": "waiting",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:05:00.000Z",
+        "workspace": "~/src/atlas/.worktrees/docs"
+      }
+    ],
+    "machines": [
+      {
+        "capacity": {
+          "reason": "no capacity observation",
+          "state": "unknown"
+        },
+        "fleet_id": "fleet/example-atlas",
+        "host_id": "host/meadow",
+        "id": "machine/meadow",
+        "kind": "machine",
+        "name": "meadow",
+        "occupancy": {
+          "running_runtimes": 2
+        },
+        "projects": [
+          "~/src/atlas"
+        ],
+        "revision": "mh-meadow",
+        "runtime_ids": [
+          "runtime/example-atlas-builder",
+          "runtime/example-atlas-migrator"
+        ],
+        "state": "local",
+        "transports": [
+          {
+            "last_success_at": "2030-01-01T11:59:30.000Z",
+            "protocol": "unix",
+            "status": "local"
+          }
+        ],
+        "updated_at": "2030-01-01T11:59:30.000Z",
+        "work": []
+      },
+      {
+        "capacity": {
+          "reason": "no capacity observation",
+          "state": "unknown"
+        },
+        "fleet_id": "fleet/example-atlas",
+        "host_id": "host/foundry",
+        "id": "machine/foundry",
+        "kind": "machine",
+        "name": "foundry",
+        "occupancy": {
+          "running_runtimes": 2
+        },
+        "projects": [
+          "~/src/atlas"
+        ],
+        "revision": "mh-foundry",
+        "runtime_ids": [
+          "runtime/example-atlas-reviewer",
+          "runtime/example-atlas-docs"
+        ],
+        "state": "reachable",
+        "transports": [
+          {
+            "last_success_at": "2030-01-01T11:59:30.000Z",
+            "protocol": "fabric",
+            "status": "up"
+          }
+        ],
+        "updated_at": "2030-01-01T11:59:30.000Z",
+        "work": []
+      }
+    ],
+    "order": [
+      "agent/example/atlas/builder",
+      "agent/example/atlas/reviewer",
+      "agent/example/atlas/migrator",
+      "agent/example/atlas/docs"
+    ],
+    "runtimes": [
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-atlas-builder",
+        "incarnation_id": "rt-atlas-builder-271:8",
+        "kind": "runtime",
+        "owner_host_id": "host/meadow",
+        "owner_id": "agent/example/atlas/builder",
+        "owner_run_id": "mission-run/example/atlas/load-user-rename/1",
+        "revision": "rt34",
+        "runtime_id": "rt-atlas-builder-271",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:22:00.000Z"
+      },
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-atlas-reviewer",
+        "incarnation_id": "rt-atlas-reviewer-914:1",
+        "kind": "runtime",
+        "owner_host_id": "host/foundry",
+        "owner_id": "agent/example/atlas/reviewer",
+        "owner_run_id": "mission-run/example/atlas/load-user-rename/1",
+        "revision": "rt5",
+        "runtime_id": "rt-atlas-reviewer-914",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:48:00.000Z"
+      },
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-atlas-migrator",
+        "incarnation_id": "rt-atlas-migrator-210:4",
+        "kind": "runtime",
+        "owner_host_id": "host/meadow",
+        "owner_id": "agent/example/atlas/migrator",
+        "owner_run_id": "mission-run/example/atlas/load-user-rename/1",
+        "revision": "rt25",
+        "runtime_id": "rt-atlas-migrator-210",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:39:00.000Z"
+      },
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-atlas-docs",
+        "incarnation_id": "rt-atlas-docs-354:9",
+        "kind": "runtime",
+        "owner_host_id": "host/foundry",
+        "owner_id": "agent/example/atlas/docs",
+        "owner_run_id": null,
+        "revision": "rt38",
+        "runtime_id": "rt-atlas-docs-354",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:05:00.000Z"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 6000,
+      "removes": [],
+      "store": 5,
+      "upserts": [
+        {
+          "active_work_count": 1,
+          "ask": null,
+          "blocked_on": null,
+          "checkout": {
+            "base": "origin/main",
+            "branch": "docs/load-user-rename",
+            "repository": "~/src/atlas"
+          },
+          "current_session_id": "session/example-atlas-docs",
+          "current_work": [
+            {
+              "id": "step-run/example/atlas/load-user-rename/1/step-5",
+              "mission_id": "mission/example/atlas/load-user-rename",
+              "mission_run_id": "mission-run/example/atlas/load-user-rename/1",
+              "path": "step-5",
+              "since": "2030-01-01T12:00:06.000Z",
+              "state": "claimed",
+              "title": "Update the users API reference"
+            }
+          ],
+          "current_work_ids": [
+            "step-run/example/atlas/load-user-rename/1/step-5"
+          ],
+          "driver": "claude",
+          "fault": null,
+          "harness_state": "busy",
+          "host_id": "host/foundry",
+          "id": "agent/example/atlas/docs",
+          "incarnation_id": "rt-atlas-docs-354:9",
+          "kind": "agent",
+          "last_activity_at": "2030-01-01T12:00:06.000Z",
+          "name": "Atlas Docs",
+          "next_work": null,
+          "next_work_id": null,
+          "owner_run_id": "mission-run/example/atlas/load-user-rename/1",
+          "queued_work_count": 0,
+          "reachability": "local",
+          "revision": "ag29",
+          "runtime_ids": [
+            "runtime/example-atlas-docs"
+          ],
+          "since": "2030-01-01T12:00:06.000Z",
+          "state": "running",
+          "subagents": [],
+          "under": [],
+          "upcoming_work": [],
+          "upcoming_work_ids": [],
+          "updated_at": "2030-01-01T12:00:06.000Z",
+          "workspace": "~/src/atlas/.worktrees/docs"
+        }
+      ]
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/2/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/2/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/2/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/2/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/2/next_work/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/2/upcoming_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/3/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/3/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/3/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/2/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/3/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/1/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/current_work/0/since"
+    }
+  ],
+  "variant": "default",
+  "world": "failed-sync-page-cursor-expired"
+}

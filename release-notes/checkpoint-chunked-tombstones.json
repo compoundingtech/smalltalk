@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "A trim records its tombstones in 20 ms chunks instead of one long transaction",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No tables, columns or indexes. The checkpoints table gains a 'recording' state value while a trim records its tombstones."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged; the same claims are dropped. A sealed set ignores tombstones of a checkpoint still recording, so a node interrupted mid-recording plans the same drop and verifies the same certificate."},
+  "compatibility": {"status": "none", "detail": "Inventories, authority digests and manifests are unchanged: a tombstone and its envelope share one identity, and manifests read tombstones by checkpoint name. Adoption of a peer's manifest still records in one transaction, as it replaces every other tombstone."},
+  "downtime": {"status": "none", "detail": "None. On a production copy, a 468,134-claim trim held the writer at p50 41 ms / p99 229 ms instead of a single 53 s transaction."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "changed", "detail": "An older build that finds a checkpoint in the 'recording' state after a rollback treats it as not applied: its sealed set then reads the partial tombstones, its plan differs from the certificate, and it adopts the manifest from a peer, which replaces those tombstones. Roll back only after a trim finishes, or expect one manifest adoption."}
+}

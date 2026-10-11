@@ -1,0 +1,142 @@
+{
+  "api_version": "st3.client.v0",
+  "request_id": "request/timeline-views-1",
+  "snapshot": {
+    "id": "snapshot/host-a/1855/8e21", "host_id": "host/host-a", "store_index": 1855,
+    "projection_version": "client-projection.v0", "created_at": "2026-10-06T09:15:42Z"
+  },
+  "value": {
+    "kind": "timeline-page",
+    "session_id": "session/demo-seat/4",
+    "items": [
+      {
+        "id": "timeline-entry/demo-seat/4/1", "sequence": 1, "revision": 1, "timestamp": "2026-10-06T09:14:00Z",
+        "role": "user", "type": "message", "final": true,
+        "body": {
+          "message_id": "turn/parity-1",
+          "blocks": [
+            { "id": "block/1", "kind": "text", "source_type": "omp.message.text", "payload": { "text": "Please land the parity fixture." } }
+          ]
+        }
+      },
+      {
+        "id": "timeline-entry/demo-seat/4/2", "sequence": 2, "revision": 1, "timestamp": "2026-10-06T09:14:10Z",
+        "role": "assistant", "type": "tool_call", "final": true,
+        "body": {
+          "call_id": "toolu_01", "name": "bash",
+          "arguments": { "command": "cargo test -p st3-client", "timeout": 60000, "i": "prove the fixtures still decode" },
+          "blocks": [
+            {
+              "id": "block/2", "kind": "tool_call", "source_type": "omp.tool.call",
+              "view": { "type": "bash", "tool": "bash", "intent": "prove the fixtures still decode", "command": "cargo test -p st3-client", "cwd": "/srv/demo", "timeout_s": 60, "background": false },
+              "payload": { "toolCallId": "toolu_01", "command": "cargo test -p st3-client", "timeout": 60000, "i": "prove the fixtures still decode" }
+            }
+          ]
+        }
+      },
+      {
+        "id": "timeline-entry/demo-seat/4/3", "sequence": 3, "revision": 1, "timestamp": "2026-10-06T09:14:16Z",
+        "role": "tool", "type": "tool_result", "final": true,
+        "body": {
+          "call_id": "toolu_01", "status": "success", "media_type": "text/plain", "content": "ok. 12 passed",
+          "blocks": [
+            {
+              "id": "block/3", "kind": "tool_output", "source_type": "omp.tool.result",
+              "metadata": { "wallTimeMs": 4210 },
+              "view": { "type": "bash", "tool": "bash", "call_id": "toolu_01", "is_error": false, "exit_code": 0, "wall_ms": 4210 },
+              "payload": { "toolCallId": "toolu_01", "exitCode": 0, "stdout": "ok. 12 passed" }
+            }
+          ]
+        }
+      },
+      {
+        "id": "timeline-entry/demo-seat/4/4", "sequence": 4, "revision": 1, "timestamp": "2026-10-06T09:14:20Z",
+        "role": "assistant", "type": "message", "final": true,
+        "body": {
+          "message_id": "msg/assistant-1",
+          "blocks": [
+            {
+              "id": "block/4", "kind": "text", "source_type": "omp.message.text",
+              "metadata": {
+                "model": "anthropic/claude-opus-5-5", "provider": "anthropic",
+                "usage": { "input": 1432, "output": 211, "cache_read": 98221, "cache_write": 0, "total": 99864, "cost_usd": 0.41 },
+                "context_tokens": 101296, "stop_reason": "end_turn", "ttft_ms": 640, "duration_ms": 8120
+              },
+              "payload": { "text": "Fixture recorded." }
+            }
+          ]
+        }
+      },
+      {
+        "id": "timeline-entry/demo-seat/4/5", "sequence": 5, "revision": 1, "timestamp": "2026-10-06T09:14:24Z",
+        "role": "system", "type": "status", "final": true,
+        "body": {
+          "status": "running",
+          "blocks": [
+            {
+              "id": "block/5", "kind": "irc", "source_type": "omp.custom_message.irc",
+              "view": { "type": "irc", "from": "person/ada", "message": "release channel pings stay in the transcript", "message_id": "irc-9182" },
+              "payload": { "kind": "irc:incoming", "from": "person/ada", "text": "release channel pings stay in the transcript", "messageId": "irc-9182" }
+            },
+            {
+              "id": "block/6", "kind": "job", "source_type": "omp.custom_message.launch-completion",
+              "view": { "type": "job", "jobs": [ { "id": "job/sync-7", "name": "nightly-sync", "type": "bash", "state": "running", "started_at": "2026-10-06T09:14:02.000Z" } ] },
+              "payload": { "kind": "launch-completion", "details": { "daemons": [ { "id": "job/sync-7", "name": "nightly-sync", "state": "running" } ] } }
+            },
+            {
+              "id": "block/7", "kind": "status", "source_type": "omp.model_change",
+              "view": { "type": "model_change", "model": "anthropic/claude-opus-5-5", "role": "assistant" },
+              "payload": { "type": "model_change", "model": "anthropic/claude-opus-5-5" }
+            }
+          ]
+        }
+      },
+      {
+        "id": "timeline-entry/demo-seat/4/6", "sequence": 6, "revision": 1, "timestamp": "2026-10-06T09:14:30Z",
+        "role": "assistant", "type": "tool_call", "final": true,
+        "body": {
+          "call_id": "toolu_02", "name": "task",
+          "arguments": { "tasks": [ { "name": "DocsScout", "agent": "scout", "task": "check the docs" } ] },
+          "blocks": [
+            {
+              "id": "block/8", "kind": "tool_call", "source_type": "omp.tool.call",
+              "view": { "type": "task", "tool": "task", "tasks": [ { "name": "DocsScout", "agent": "scout", "task": "check the docs" } ] },
+              "payload": { "toolCallId": "toolu_02", "tasks": [ { "name": "DocsScout", "agent": "scout", "task": "check the docs" } ] }
+            }
+          ]
+        }
+      },
+      {
+        "id": "timeline-entry/demo-seat/4/7", "sequence": 7, "revision": 1, "timestamp": "2026-10-06T09:14:46Z",
+        "role": "tool", "type": "tool_result", "final": true,
+        "body": {
+          "call_id": "toolu_02", "status": "success", "media_type": "text/plain", "content": "1 agent finished",
+          "blocks": [
+            {
+              "id": "block/9", "kind": "tool_output", "source_type": "omp.tool.result",
+              "view": {
+                "type": "task", "tool": "task", "call_id": "toolu_02", "is_error": false, "async": false, "total_ms": 15230,
+                "agents": [ { "id": "sub_docs_1", "agent": "scout", "status": "completed", "task": "check the docs", "duration_ms": 15230, "tokens": 18422, "cost_usd": 0.12, "requests": 9, "tool_count": 14, "conversation": { "session_id": "session/demo-seat/5" } } ]
+              },
+              "payload": { "toolCallId": "toolu_02", "agents": [ { "id": "sub_docs_1", "status": "completed" } ] }
+            }
+          ]
+        }
+      }
+    ],
+    "page": { "limit": 50, "has_more": false, "next_cursor": null, "cursor_expires_at": null },
+    "header": {
+      "model": { "value": "anthropic/claude-opus-5-5", "source": "transcript", "as_of": "2026-10-06T09:15:41.000Z" },
+      "context": { "value": { "tokens": 101296, "window": 200000 }, "source": "transcript", "as_of": "2026-10-06T09:15:41.000Z" },
+      "cost": { "value": { "usd": 12.34 }, "source": "transcript", "as_of": "2026-10-06T09:15:41.000Z" },
+      "todos": {
+        "value": [ { "phase": "wire the schema", "items": [ { "content": "encode views", "status": "completed" }, { "content": "encode header", "status": "in_progress" } ] } ],
+        "source": "transcript", "as_of": "2026-10-06T09:15:41.000Z"
+      },
+      "jobs": { "value": [ { "id": "job/sync-7", "name": "nightly-sync", "type": "bash", "state": "running", "started_at": "2026-10-06T09:14:02.000Z" } ], "source": "transcript", "as_of": "2026-10-06T09:15:41.000Z" },
+      "subagents": { "value": [ { "id": "sub_docs_1", "agent": "scout", "status": "completed", "task": "check the docs", "conversation": { "session_id": "session/demo-seat/5" } } ], "source": "transcript", "as_of": "2026-10-06T09:15:41.000Z" },
+      "ask": { "value": null, "source": "transcript", "as_of": "2026-10-06T09:15:41.000Z" },
+      "working": { "value": true, "source": "register", "as_of": "2026-10-06T09:15:42.000Z" }
+    }
+  }
+}

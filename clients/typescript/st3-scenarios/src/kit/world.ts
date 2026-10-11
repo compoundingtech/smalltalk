@@ -55,6 +55,10 @@ export class UnknownVariantError extends Error {}
 const changesState = (event: TimelineEvent): boolean => {
   switch (event._tag) {
     case 'changes':
+    case 'thread-create':
+    case 'thread-remove':
+    case 'terminal-create':
+    case 'terminal-remove':
     case 'entries':
     case 'replace':
     case 'incarnation':

@@ -1,0 +1,353 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "conversation",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 1
+  },
+  "state": {
+    "threads": [
+      {
+        "agent": "agent/example/atlas/builder",
+        "has_more": false,
+        "items": [
+          {
+            "body": {
+              "from": "person/robin",
+              "message_id": "message/scenario-fleet-mid-refactor-builder-1",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-builder-1",
+            "revision": 1,
+            "role": "user",
+            "sequence": 1,
+            "timestamp": "2030-01-01T11:51:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Can you check why the worker typecheck fails after the rename?"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-builder-2",
+            "revision": 1,
+            "role": "user",
+            "sequence": 2,
+            "timestamp": "2030-01-01T11:51:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "The worker passes only the user id. loadUser now needs the session too, so syncAvatars has to thread it through."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-builder-3",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 3,
+            "timestamp": "2030-01-01T11:51:50.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm -r typecheck"
+              },
+              "call_id": "call-builder-4",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-builder-4",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 4,
+            "timestamp": "2030-01-01T11:52:40.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-4",
+              "content": "packages/api typecheck: Done\npackages/web typecheck: Done\npackages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but got 1.\npackages/worker typecheck: Failed",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-builder-5",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 5,
+            "timestamp": "2030-01-01T11:53:21.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "The typecheck still fails in packages/worker: syncAvatars calls loadUser with one argument. I asked Robin whether to thread the session through."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-builder-6",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 6,
+            "timestamp": "2030-01-01T11:53:30.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-builder-7",
+            "revision": 1,
+            "role": "system",
+            "sequence": 7,
+            "timestamp": "2030-01-01T11:54:20.000Z",
+            "type": "status"
+          }
+        ],
+        "page_size": 50,
+        "session_id": "session/example-atlas-builder"
+      },
+      {
+        "agent": "agent/example/atlas/migrator",
+        "has_more": false,
+        "items": [
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-fleet-mid-refactor-migrator-1",
+              "to": "agent/example/atlas/migrator"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-migrator-1",
+            "revision": 1,
+            "role": "user",
+            "sequence": 1,
+            "timestamp": "2030-01-01T11:39:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Please rename fetchUser to loadUser everywhere and keep the tests green."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-migrator-2",
+            "revision": 1,
+            "role": "user",
+            "sequence": 2,
+            "timestamp": "2030-01-01T11:39:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "I found 23 call sites of fetchUser in four packages. I will rename them package by package and run the typecheck after each one."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-migrator-3",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 3,
+            "timestamp": "2030-01-01T11:40:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "new_string": "import { loadUser } from '@atlas/api'\n\nexport const useProfile = (id: string) => useQuery(() => loadUser(id))\n",
+                "old_string": "import { fetchUser } from '@atlas/api'\n\nexport const useProfile = (id: string) => useQuery(() => fetchUser(id))\n",
+                "path": "packages/web/src/profile/useProfile.ts"
+              },
+              "call_id": "call-migrator-4",
+              "name": "edit"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-migrator-4",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 4,
+            "timestamp": "2030-01-01T11:41:00.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-migrator-4",
+              "content": "--- a/packages/web/src/profile/useProfile.ts\n+++ b/packages/web/src/profile/useProfile.ts\n@@ -1,3 +1,3 @@\n-import { fetchUser } from '@atlas/api'\n-\n-export const useProfile = (id: string) => useQuery(() => fetchUser(id))\n+import { loadUser } from '@atlas/api'\n+\n+export const useProfile = (id: string) => useQuery(() => loadUser(id))\n",
+              "media_type": "text/plain",
+              "status": "success"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-fleet-mid-refactor-migrator-5",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 5,
+            "timestamp": "2030-01-01T11:41:00.300Z",
+            "type": "tool_result"
+          }
+        ],
+        "page_size": 50,
+        "session_id": "session/example-atlas-migrator"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/migrator",
+      "at_ms": 2000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Next: packages/api/src/users/index.ts still"
+          },
+          "final": false,
+          "id": "timeline-entry/scenario-fleet-mid-refactor-migrator-6",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 6,
+          "timestamp": "2030-01-01T12:00:02.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 2
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/migrator",
+      "at_ms": 3000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Next: packages/api/src/users/index.ts still re-exports fetchUser. Replacing the export."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-fleet-mid-refactor-migrator-6",
+          "revision": 2,
+          "role": "assistant",
+          "sequence": 6,
+          "timestamp": "2030-01-01T12:00:03.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 3
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/migrator",
+      "at_ms": 5000,
+      "items": [
+        {
+          "body": {
+            "arguments": {
+              "new_string": "export { loadUser } from './loadUser.ts'\n",
+              "old_string": "export { fetchUser } from './fetchUser.ts'\n",
+              "path": "packages/api/src/users/index.ts"
+            },
+            "call_id": "call-migrator-7",
+            "name": "edit"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-fleet-mid-refactor-migrator-7",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 7,
+          "timestamp": "2030-01-01T12:00:05.000Z",
+          "type": "tool_call"
+        },
+        {
+          "body": {
+            "call_id": "call-migrator-7",
+            "content": "--- a/packages/api/src/users/index.ts\n+++ b/packages/api/src/users/index.ts\n@@ -1,1 +1,1 @@\n-export { fetchUser } from './fetchUser.ts'\n+export { loadUser } from './loadUser.ts'\n",
+            "media_type": "text/plain",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-fleet-mid-refactor-migrator-8",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 8,
+          "timestamp": "2030-01-01T12:00:05.300Z",
+          "type": "tool_result"
+        }
+      ],
+      "store": 4
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/2/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/3/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/4/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/5/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/6/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/2/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/3/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/4/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/items/1/timestamp"
+    }
+  ],
+  "variant": "default",
+  "world": "failed-sync-page-cursor-expired"
+}

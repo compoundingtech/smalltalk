@@ -1,0 +1,399 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "details",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 21
+  },
+  "state": {
+    "missions": [
+      {
+        "active_runs": 1,
+        "id": "mission/example/atlas/repair-dependency-bump",
+        "kind": "mission",
+        "mission_revision": "sha256:atlas-mission-1",
+        "revision": "mr-4",
+        "run_generations": {
+          "mission-run/example/atlas/repair-dependency-bump/1": "run-generation/example/atlas/repair-dependency-bump/1/g1"
+        },
+        "runs": [
+          "mission-run/example/atlas/repair-dependency-bump/1"
+        ],
+        "state": "running",
+        "title": "Repair CI after the option-schema bump",
+        "total_runs": 1,
+        "updated_at": "2030-01-01T11:59:30.000Z"
+      }
+    ],
+    "work": [
+      {
+        "attempt": 1,
+        "blocked_reason": "TypeError: Expected a number, received undefined",
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-builder-726:8",
+        "claimant": "agent/example/atlas/builder",
+        "constraints": [
+          "Do not revert the dependency bump or widen the patch"
+        ],
+        "definition_id": "def-step-1",
+        "generation_id": "run-generation/example/atlas/repair-dependency-bump/1/g1",
+        "goals": [
+          "Keep option-schema 4.1 installed",
+          "Omitted limit retains the default of 20",
+          "CI typecheck, test and build pass"
+        ],
+        "id": "work/example/atlas/repair-dependency-bump/1/step-1",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/repair-dependency-bump",
+        "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+        "path": "step-1",
+        "readiness_epoch": 1,
+        "revision": "w-red",
+        "state": "failed",
+        "title": "Check main after the dependency bump",
+        "updated_at": "2030-01-01T11:59:30.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-builder-726:8",
+        "claimant": "agent/example/atlas/builder",
+        "constraints": [
+          "Do not revert the dependency bump or widen the patch"
+        ],
+        "definition_id": "def-step-2",
+        "generation_id": "run-generation/example/atlas/repair-dependency-bump/1/g1",
+        "goals": [
+          "Keep option-schema 4.1 installed",
+          "Omitted limit retains the default of 20",
+          "CI typecheck, test and build pass"
+        ],
+        "id": "work/example/atlas/repair-dependency-bump/1/step-2",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/repair-dependency-bump",
+        "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+        "path": "step-2",
+        "readiness_epoch": 2,
+        "revision": "w-bisect",
+        "state": "claimed",
+        "title": "Bisect the regression",
+        "updated_at": "2030-01-01T11:59:35.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-builder-726:8",
+        "claimant": "agent/example/atlas/builder",
+        "constraints": [
+          "Do not revert the dependency bump or widen the patch"
+        ],
+        "definition_id": "def-step-3",
+        "generation_id": "run-generation/example/atlas/repair-dependency-bump/1/g1",
+        "goals": [
+          "Keep option-schema 4.1 installed",
+          "Omitted limit retains the default of 20",
+          "CI typecheck, test and build pass"
+        ],
+        "id": "work/example/atlas/repair-dependency-bump/1/step-3",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/repair-dependency-bump",
+        "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+        "path": "step-3",
+        "readiness_epoch": 3,
+        "revision": "w-patch-ready",
+        "state": "ready",
+        "title": "Restore the omitted limit default",
+        "updated_at": "2030-01-01T11:59:35.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-builder-726:8",
+        "claimant": "agent/example/atlas/builder",
+        "constraints": [
+          "Do not revert the dependency bump or widen the patch"
+        ],
+        "definition_id": "def-step-4",
+        "generation_id": "run-generation/example/atlas/repair-dependency-bump/1/g1",
+        "goals": [
+          "Keep option-schema 4.1 installed",
+          "Omitted limit retains the default of 20",
+          "CI typecheck, test and build pass"
+        ],
+        "id": "work/example/atlas/repair-dependency-bump/1/step-4",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/repair-dependency-bump",
+        "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+        "path": "step-4",
+        "readiness_epoch": 4,
+        "revision": "w-retry-ready",
+        "state": "ready",
+        "title": "Rerun the CI matrix",
+        "updated_at": "2030-01-01T11:59:35.000Z"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 10000,
+      "removes": [],
+      "store": 9,
+      "upserts": [
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-atlas-builder-726:8",
+          "claimant": "agent/example/atlas/builder",
+          "constraints": [
+            "Do not revert the dependency bump or widen the patch"
+          ],
+          "definition_id": "def-step-2",
+          "generation_id": "run-generation/example/atlas/repair-dependency-bump/1/g1",
+          "goals": [
+            "Keep option-schema 4.1 installed",
+            "Omitted limit retains the default of 20",
+            "CI typecheck, test and build pass"
+          ],
+          "id": "work/example/atlas/repair-dependency-bump/1/step-2",
+          "kind": "work",
+          "mission_id": "mission/example/atlas/repair-dependency-bump",
+          "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "path": "step-2",
+          "readiness_epoch": 2,
+          "revision": "w-bisect-complete",
+          "state": "completed",
+          "title": "Bisect the regression",
+          "updated_at": "2030-01-01T12:00:10.000Z"
+        },
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-atlas-builder-726:8",
+          "claimant": "agent/example/atlas/builder",
+          "constraints": [
+            "Do not revert the dependency bump or widen the patch"
+          ],
+          "definition_id": "def-step-3",
+          "generation_id": "run-generation/example/atlas/repair-dependency-bump/1/g1",
+          "goals": [
+            "Keep option-schema 4.1 installed",
+            "Omitted limit retains the default of 20",
+            "CI typecheck, test and build pass"
+          ],
+          "id": "work/example/atlas/repair-dependency-bump/1/step-3",
+          "kind": "work",
+          "mission_id": "mission/example/atlas/repair-dependency-bump",
+          "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "path": "step-3",
+          "readiness_epoch": 3,
+          "revision": "w-patching",
+          "state": "claimed",
+          "title": "Restore the omitted limit default",
+          "updated_at": "2030-01-01T12:00:10.000Z"
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 18000,
+      "removes": [],
+      "store": 14,
+      "upserts": [
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-atlas-builder-726:8",
+          "claimant": "agent/example/atlas/builder",
+          "constraints": [
+            "Do not revert the dependency bump or widen the patch"
+          ],
+          "definition_id": "def-step-3",
+          "generation_id": "run-generation/example/atlas/repair-dependency-bump/1/g1",
+          "goals": [
+            "Keep option-schema 4.1 installed",
+            "Omitted limit retains the default of 20",
+            "CI typecheck, test and build pass"
+          ],
+          "id": "work/example/atlas/repair-dependency-bump/1/step-3",
+          "kind": "work",
+          "mission_id": "mission/example/atlas/repair-dependency-bump",
+          "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "path": "step-3",
+          "readiness_epoch": 3,
+          "revision": "w-patched",
+          "state": "completed",
+          "title": "Restore the omitted limit default",
+          "updated_at": "2030-01-01T12:00:18.000Z"
+        },
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-atlas-builder-726:8",
+          "claimant": "agent/example/atlas/builder",
+          "constraints": [
+            "Do not revert the dependency bump or widen the patch"
+          ],
+          "definition_id": "def-step-4",
+          "generation_id": "run-generation/example/atlas/repair-dependency-bump/1/g1",
+          "goals": [
+            "Keep option-schema 4.1 installed",
+            "Omitted limit retains the default of 20",
+            "CI typecheck, test and build pass"
+          ],
+          "id": "work/example/atlas/repair-dependency-bump/1/step-4",
+          "kind": "work",
+          "mission_id": "mission/example/atlas/repair-dependency-bump",
+          "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "path": "step-4",
+          "readiness_epoch": 4,
+          "revision": "w-verifying",
+          "state": "verifying",
+          "title": "Rerun the CI matrix",
+          "updated_at": "2030-01-01T12:00:18.000Z"
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 30000,
+      "removes": [],
+      "store": 21,
+      "upserts": [
+        {
+          "attempt": 2,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-atlas-builder-726:8",
+          "claimant": "agent/example/atlas/builder",
+          "constraints": [
+            "Do not revert the dependency bump or widen the patch"
+          ],
+          "definition_id": "def-step-1",
+          "generation_id": "run-generation/example/atlas/repair-dependency-bump/1/g1",
+          "goals": [
+            "Keep option-schema 4.1 installed",
+            "Omitted limit retains the default of 20",
+            "CI typecheck, test and build pass"
+          ],
+          "id": "work/example/atlas/repair-dependency-bump/1/step-1",
+          "kind": "work",
+          "mission_id": "mission/example/atlas/repair-dependency-bump",
+          "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "path": "step-1",
+          "readiness_epoch": 1,
+          "revision": "w-green",
+          "state": "completed",
+          "title": "Check main after the dependency bump",
+          "updated_at": "2030-01-01T12:00:30.000Z"
+        },
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-atlas-builder-726:8",
+          "claimant": "agent/example/atlas/builder",
+          "constraints": [
+            "Do not revert the dependency bump or widen the patch"
+          ],
+          "definition_id": "def-step-4",
+          "generation_id": "run-generation/example/atlas/repair-dependency-bump/1/g1",
+          "goals": [
+            "Keep option-schema 4.1 installed",
+            "Omitted limit retains the default of 20",
+            "CI typecheck, test and build pass"
+          ],
+          "id": "work/example/atlas/repair-dependency-bump/1/step-4",
+          "kind": "work",
+          "mission_id": "mission/example/atlas/repair-dependency-bump",
+          "mission_run_id": "mission-run/example/atlas/repair-dependency-bump/1",
+          "path": "step-4",
+          "readiness_epoch": 4,
+          "revision": "w-retry-green",
+          "state": "completed",
+          "title": "Rerun the CI matrix",
+          "updated_at": "2030-01-01T12:00:30.000Z"
+        },
+        {
+          "active_runs": 0,
+          "id": "mission/example/atlas/repair-dependency-bump",
+          "kind": "mission",
+          "mission_revision": "sha256:atlas-mission-1",
+          "revision": "mr-green",
+          "run_generations": {
+            "mission-run/example/atlas/repair-dependency-bump/1": "run-generation/example/atlas/repair-dependency-bump/1/g1"
+          },
+          "runs": [
+            "mission-run/example/atlas/repair-dependency-bump/1"
+          ],
+          "state": "completed",
+          "title": "Repair CI after the option-schema bump",
+          "total_runs": 1,
+          "updated_at": "2030-01-01T12:00:30.000Z"
+        }
+      ]
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/missions/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/2/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/3/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/upserts/2/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "ci-failing-fix"
+}

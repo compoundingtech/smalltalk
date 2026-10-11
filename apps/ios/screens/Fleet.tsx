@@ -13,6 +13,7 @@ import { theme } from '../theme';
 import { Button, Field, ListRow, Note, Screen, SectionHeader, T } from '../ui';
 import { UsageCard } from './Usage';
 import { UNPINNED_WARNING } from '../pairingProof';
+import { fabricTargetLabel } from '../fabricTarget';
 
 function machineGlyph(state: string): { glyph: string; color: string } {
   if (state === 'local' || state === 'reachable' || state === 'dial-out') return { glyph: '●', color: theme.idle };
@@ -47,7 +48,7 @@ function useClients() {
 
 // Fleet: machines, what runs where, this connection, who is connected, and the paired devices.
 export function FleetScreen() {
-  const { data, truncated, caps, url, gatewayMachineId, gatewayHost, order, actions, glassesOn, simpleOn } = useStore();
+  const { data, truncated, caps, url, gatewayMachineId, gatewayHost, order, actions, glassesOn, simpleOn, carrierInfo } = useStore();
   useListsOnFocus(['machines', 'devices', 'sessions']);
   const refresh = useRefresh(['machines', 'devices', 'sessions']);
   const scroll = useRef<ScrollView>(null);
@@ -104,8 +105,12 @@ export function FleetScreen() {
         <T>{caps ? `${caps.session_actor} · ${caps.transport}` : 'reconnecting'}</T>
         <T dim selectable>{url}</T>
         {gatewayTransport(url) === 'lan' ? <T color={theme.waiting}>{LAN_HTTP_WARNING}</T> : null}
+        <T>route · {carrierInfo.routeText}</T>
+        {carrierInfo.route.fellBack && carrierInfo.route.why ? <T color={theme.waiting}>{carrierInfo.route.why}</T> : null}
+        {carrierInfo.issue ? <T color={theme.fault}>{carrierInfo.issue}</T> : null}
         <Button label="forget this device" color={theme.red} onPress={() => Alert.alert('Forget this device?', 'You will need to pair again.', [{ text: 'Cancel', style: 'cancel' }, { text: 'Forget', style: 'destructive', onPress: () => void actions.forget() }])} />
       </View>
+      <CarrierSection />
       <SectionHeader title="connected clients" count={clients?.items.length} />
       {clientsIssue ? <Note tone="warning">{clientsIssue}</Note> : null}
       {!clients && !clientsIssue ? <Note>Loading connected clients…</Note> : null}
@@ -129,9 +134,60 @@ export function FleetScreen() {
   </Screen>;
 }
 
+// The carrier: how this phone reaches its member. The saved gateway (Tailscale, the local network or
+// HTTPS) is the default. Fabric is an opt-in, offered only where this build links its bridge, and a
+// fabric that cannot be used falls back to the saved gateway with the reason shown above.
+function CarrierSection() {
+  const { carrierInfo, actions, error } = useStore();
+  const [draft, setDraft] = useState('');
+  useEffect(() => { if (carrierInfo.built) void actions.loadFabricNode(); }, [carrierInfo.built]);
+  if (!carrierInfo.built) return null;
+  const fabricOn = carrierInfo.choice === 'fabric';
+  return <>
+    <SectionHeader title="carrier" />
+    <ListRow
+      glyph={fabricOn ? '●' : '○'}
+      glyphColor={fabricOn ? theme.green : theme.overlay1}
+      title={`Fabric · ${fabricOn ? 'on' : 'off'} (experimental)`}
+      second={fabricOn ? 'this phone reaches its member over fabric; Tailscale stays saved' : 'off: this phone uses its saved gateway'}
+      onPress={() => void actions.setCarrier(fabricOn ? 'tailscale' : 'fabric')}
+      accessibilityLabel={`Fabric, ${fabricOn ? 'on' : 'off'}. Double-tap to turn ${fabricOn ? 'off' : 'on'}.`}
+    />
+    <View style={{ paddingHorizontal: 12, gap: 2 }}>
+      <T dim>{carrierInfo.target ? `target · ${fabricTargetLabel(carrierInfo.target)}` : 'no fabric target saved'}</T>
+      {fabricOn && (carrierInfo.fabric.phase === 'failed' || carrierInfo.fabric.phase === 'refused') ? <Button label="try fabric again" onPress={() => actions.retryFabric()} /> : null}
+      {carrierInfo.route.kind === 'fabric' ? <>
+        <T dim>path · {carrierInfo.path === 'unknown' ? 'not measured yet' : carrierInfo.path}</T>
+        <Button label="check the path" onPress={() => void actions.refreshFabricPath()} />
+      </> : null}
+    </View>
+    <ListRow
+      glyph={carrierInfo.fallback ? '●' : '○'}
+      glyphColor={carrierInfo.fallback ? theme.green : theme.overlay1}
+      title={`Fall back to the saved gateway · ${carrierInfo.fallback ? 'on' : 'off'}`}
+      second="when fabric cannot connect or the member refuses it"
+      onPress={() => void actions.setFabricFallback(!carrierInfo.fallback)}
+    />
+    <View style={{ paddingHorizontal: 12, gap: 4 }}>
+      <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} placeholder="node=…&service=…  (paste the member's fabric target)" value={draft} onChangeText={setDraft} />
+      <Button label="save fabric target" onPress={() => void actions.saveFabricTarget(draft).then(saved => { if (saved) setDraft(''); })} disabled={!draft.trim()} />
+      {carrierInfo.target ? <Button label="forget the fabric target" color={theme.red} onPress={() => void actions.clearFabricTarget()} /> : null}
+      {error && draft ? <T color={theme.fault}>{error}</T> : null}
+      {carrierInfo.node ? <>
+        <T dim>this phone's fabric node ID, for the member's grant (public)</T>
+        <T selectable>{carrierInfo.node}</T>
+      </> : null}
+    </View>
+  </>;
+}
+
 // Pairing: the one screen before a device has a credential.
 export function PairScreen() {
-  const { url, urlDraft, setUrlDraft, pairDraft, busy, actions } = useStore();
+  const { carrierInfo: fabricInfo, actions: fabricActions } = useStore();
+  useEffect(() => { if (fabricInfo.built) void fabricActions.loadFabricNode(); }, [fabricInfo.built]);
+  const { url, urlDraft, setUrlDraft, pairDraft, busy, actions, carrierInfo } = useStore();
+  // Fabric chosen with a target saved (a build can carry one): a device with no gateway pairs over fabric alone.
+  const overFabric = carrierInfo.built && carrierInfo.choice === 'fabric' && !!carrierInfo.target;
   const [id, setId] = useState(pairDraft?.id ?? ''), [code, setCode] = useState(pairDraft?.code ?? '');
   const [fingerprint, setFingerprint] = useState(''), [unpinned, setUnpinned] = useState(false);
   useEffect(() => {
@@ -142,12 +198,15 @@ export function PairScreen() {
     <Banners />
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ padding: 12, paddingBottom: 48 }} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
       <T soft>Begin pairing on a trusted st machine, then enter its short-lived ID, code, and the person-root fingerprint copied separately. Use HTTPS or an already encrypted path such as Tailscale for the paired-only gateway.</T>
-      {pairDraft ? <T soft>Pairing with {pairDraft.gateway}</T> : <>
+      {pairDraft ? <T soft>Pairing with {pairDraft.gateway}</T> : overFabric && !url ? <>
+        <T soft>Pairing over Fabric with {carrierInfo.target ? fabricTargetLabel(carrierInfo.target) : ''}. {carrierInfo.fabric.phase === 'ready' ? 'Fabric is connected.' : carrierInfo.fabric.phase === 'failed' || carrierInfo.fabric.phase === 'refused' ? carrierInfo.fabric.reason : 'Connecting to Fabric…'}</T>
+        {carrierInfo.node ? <><T dim>This phone's fabric node ID, for the member's grant (public):</T><T selectable>{carrierInfo.node}</T></> : null}
+      </> : <>
       <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} keyboardType="url" placeholder="https://gateway, http://100.x.y.z:port, or http://host.local:port" value={urlDraft} onChangeText={setUrlDraft} />
       {gatewayTransport(urlDraft) === 'lan' ? <T color={theme.waiting}>{LAN_HTTP_WARNING}</T> : null}
       <Button label="save gateway" onPress={() => void actions.saveUrl()} />
       </>}
-      {url || pairDraft ? <>
+      {url || pairDraft || overFabric ? <>
         <SectionHeader title="pair" />
         <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} placeholder="pairing ID" value={id} onChangeText={setId} />
         <Field autoCapitalize="none" autoCorrect={false} spellCheck={false} placeholder="pairing code" value={code} onChangeText={setCode} />

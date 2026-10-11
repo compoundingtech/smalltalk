@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "fractal-web sidebar folders follow the owner's native arrangements: the live arrangement named exactly \"Sidebar\" with the lowest UUIDv7 wins, and every owner-wide arrangements frame re-reads the complete list",
+  "replay": {"status": "none", "detail": "Read-only client projection; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "Uses the existing arrangements list route and owner-wide arrangements subscription. Daemons without owner inventory invalidation still serve the sidebar, but cannot announce changes outside the subscription window."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No deployed installation action required; the app is not deployed by this change."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}
