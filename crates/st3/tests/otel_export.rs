@@ -562,6 +562,66 @@ impl Drop for ExportDaemon {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cli_request_and_daemon_server_share_one_trace() {
+    let Some(collector) = otelite("cli_request_and_daemon_server_share_one_trace") else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    let mut command = isolated_command(&collector, root.path());
+    command
+        .args(["run", "--out"])
+        .arg(root.path().join("cli-capture"))
+        .args(["--protocol", "http/json", "--"])
+        .arg(st3())
+        .arg("--endpoint")
+        .arg(&daemon.socket)
+        .args(["--daemon-wait", "0", "agents", "ls"]);
+    let output = command.output().expect("run CLI against exporting test daemon");
+    assert!(
+        output.status.success(),
+        "CLI request failed: {output:?}\n{}",
+        daemon.diagnostics(),
+    );
+    let traces = std::fs::read_to_string(root.path().join("cli-capture/traces.ndjson"))
+        .expect("CLI exports to otelite");
+    let roots = command_roots(&traces);
+    assert_eq!(roots.len(), 1, "exactly one CLI command root: {traces}");
+    let (resource, cli) = &roots[0];
+    assert_eq!(string_attribute(resource, "service.name"), Some("st-cli"));
+    let trace_id = cli["traceId"].as_str().expect("CLI trace id");
+    let cli_span_id = cli["spanId"].as_str().expect("CLI span id");
+    daemon.await_export(&root.path().join("capture/traces.ndjson"), |request| {
+        request["resourceSpans"].as_array().is_some_and(|batches| {
+            batches.iter().any(|batch| {
+                string_attribute(&batch["resource"], "service.name") == Some("st-daemon")
+                    && batch["scopeSpans"].as_array().is_some_and(|scopes| {
+                        scopes.iter().any(|scope| {
+                            scope["spans"].as_array().is_some_and(|spans| {
+                                spans.iter().any(|server| {
+                                    server["traceId"].as_str() == Some(trace_id)
+                                        && server["parentSpanId"].as_str() == Some(cli_span_id)
+                                        && string_attribute(server, "http.request.method") == Some("GET")
+                                        && int_attribute(server, "http.response.status_code") == Some(200)
+                                        && (server["kind"].as_str() == Some("SPAN_KIND_SERVER")
+                                            || server["kind"].as_u64() == Some(2))
+                                        && server["attributes"].as_array().is_some_and(|attributes| {
+                                            !attributes.iter().any(|attribute| {
+                                                attribute["key"] == "st.parent.sampled"
+                                                    && attribute["value"]["boolValue"] == true
+                                            })
+                                        })
+                                })
+                            })
+                        })
+                    })
+            })
+        })
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn daemon_request_span_continues_caller_trace() {
     let Some(collector) = otelite("daemon_request_span_continues_caller_trace") else {
         return;

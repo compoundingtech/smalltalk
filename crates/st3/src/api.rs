@@ -1373,7 +1373,10 @@ fn request_trace(
     let parent = remote.span();
     let context = parent.span_context();
     if context.is_valid() {
-        span.record("st.parent.sampled", context.is_sampled());
+        span.record(
+            "st.parent.sampled",
+            context.is_sampled() && context.trace_state().get("st").is_none(),
+        );
     }
     span.set_parent(remote);
     Some(span)
