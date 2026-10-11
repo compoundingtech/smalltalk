@@ -3,7 +3,6 @@
 //! `ST3_OTELITE_BIN` supplies the collector; `ST3_OTEL_REQUIRE=1` forbids a local skip.
 //! Like the st2 export test, `otelite run` owns the ephemeral receiver and flushes its
 //! capture after the command exits, avoiding capture-mode stdin/readiness races.
-//! Daemon startup export is not covered by PR 1: startup spans land in a later PR.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -964,6 +963,135 @@ fn daemon_write_exports_independent_reconcile_pass_and_metrics() {
     }
     assert!(pass_count > 0, "no reconcile pass exported:\n{traces}");
     assert!(api_count > 0, "write must export an API-woken reconcile pass:\n{traces}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_startup_exports_completed_root_phases_and_duration() {
+    let Some(collector) = otelite("daemon_startup_exports_completed_root_phases_and_duration") else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    let traces_path = root.path().join("capture/traces.ndjson");
+    let metrics_path = root.path().join("capture/metrics.ndjson");
+    // Observe the completed root while the daemon is still serving: no flush at readiness.
+    daemon.await_export(&traces_path, |request| {
+        daemon_spans(request, "st.startup").into_iter().any(|span| {
+            string_attribute(span, "st.startup.outcome") == Some("serving")
+        })
+    });
+    let durations = daemon.await_export(&metrics_path, |request| {
+        ["total", "node_identity", "open_store"].iter().all(|phase| {
+            metric_points(request, "st.startup.duration").into_iter().any(|point| {
+                string_attribute(point, "phase") == Some(*phase)
+                    && histogram_count(point) == Some(1)
+            })
+        })
+    });
+    for point in metric_points(&durations, "st.startup.duration") {
+        assert_eq!(histogram_count(point), Some(1), "one duration per phase: {point}");
+        let boundaries = point["explicitBounds"].as_array().expect("explicit startup boundaries");
+        assert_eq!(boundaries.first().and_then(Value::as_f64), Some(0.01));
+        assert_eq!(boundaries.last().and_then(Value::as_f64), Some(1800.0));
+    }
+    drop(daemon);
+    let traces = std::fs::read_to_string(&traces_path).unwrap();
+    let requests: Vec<Value> = traces.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let roots: Vec<_> = requests.iter().flat_map(|request| daemon_spans(request, "st.startup")).collect();
+    assert_eq!(roots.len(), 1, "one root per start: {traces}");
+    let startup = roots[0];
+    assert_eq!(string_attribute(startup, "st.startup.outcome"), Some("serving"));
+    assert!(startup["parentSpanId"].as_str().is_none_or(|id| id.is_empty() || id == "0000000000000000"));
+    assert_ne!(startup["status"]["code"].as_u64(), Some(2));
+    let phases: Vec<_> = requests.iter().flat_map(|request| daemon_spans(request, "st.startup.phase")).collect();
+    assert_eq!(phases.len(), 11, "one aggregate span per startup phase: {traces}");
+    for phase in &phases {
+        assert_eq!(phase["traceId"], startup["traceId"]);
+        assert_eq!(phase["parentSpanId"], startup["spanId"]);
+        assert!(string_attribute(phase, "span.label").is_some());
+    }
+    let identity = phases.iter().find(|phase| {
+        string_attribute(phase, "st.startup.phase") == Some("node_identity")
+    }).expect("node identity phase");
+    let timestamp = |span: &Value, key: &str| {
+        span[key].as_str().and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| span[key].as_u64()).expect("OTLP timestamp")
+    };
+    assert!(timestamp(startup, "startTimeUnixNano") <= timestamp(identity, "startTimeUnixNano"));
+    let hooks = phases.iter().find(|phase| {
+        string_attribute(phase, "st.startup.phase") == Some("install_hooks")
+    }).unwrap();
+    assert!(timestamp(identity, "endTimeUnixNano") <= timestamp(hooks, "startTimeUnixNano"));
+    for name in ["open_store", "project_replication_backlog"] {
+        assert!(phases.iter().any(|phase| string_attribute(phase, "st.startup.phase") == Some(name)));
+    }
+    let projection = phases.iter().find(|phase| {
+        string_attribute(phase, "st.startup.phase") == Some("project_replication_backlog")
+    }).unwrap();
+    assert!(int_attribute(projection, "st.startup.claims_processed").is_some());
+    assert!(projection["attributes"].as_array().unwrap().iter().any(|attribute| {
+        attribute["key"] == "st.startup.full_replay" && attribute["value"]["boolValue"].is_boolean()
+    }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_startup_identity_failure_exports_failed_error_root() {
+    assert_startup_failure("node_identity");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_startup_store_failure_exports_failed_error_root() {
+    assert_startup_failure("open_store");
+}
+
+#[cfg(target_os = "linux")]
+fn assert_startup_failure(failed_phase: &str) {
+    let Some(collector) = otelite("daemon_startup_failure_exports_failed_error_root") else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("daemon-state");
+    std::fs::create_dir_all(&state).unwrap();
+    if failed_phase == "node_identity" {
+        // Recovery cannot inspect a directory as a database, even when run as root.
+        std::fs::create_dir(state.join("claims.sqlite3")).unwrap();
+    } else {
+        // Identity inspection accepts this readable database; store schema admission does not.
+        let database = rusqlite::Connection::open(state.join("claims.sqlite3")).unwrap();
+        database.execute_batch("PRAGMA user_version = 999;").unwrap();
+    }
+    let mut command = isolated_command(&collector, root.path());
+    let output = command
+        .args(["run", "--out"])
+        .arg(root.path().join("capture"))
+        .args(["--protocol", "http/json", "--"])
+        .arg(st3())
+        .args(["up", "--node", "otel-test", "--state-dir"])
+        .arg(state)
+        .arg("--socket")
+        .arg(root.path().join("run/api.sock"))
+        .arg("--client-gateway-socket")
+        .arg(root.path().join("run/client.sock"))
+        .args(["--pty-binary", "pty"])
+        .output().unwrap();
+    assert!(!output.status.success(), "{failed_phase} must fail: {output:?}");
+    let traces = std::fs::read_to_string(root.path().join("capture/traces.ndjson")).unwrap();
+    let requests: Vec<Value> = traces.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let roots: Vec<_> = requests.iter().flat_map(|request| daemon_spans(request, "st.startup")).collect();
+    assert_eq!(roots.len(), 1, "one failed startup root: {traces}\n{output:?}");
+    assert_eq!(string_attribute(roots[0], "st.startup.outcome"), Some("failed"));
+    assert_eq!(roots[0]["status"]["code"].as_u64(), Some(2));
+    let phases: Vec<_> = requests.iter().flat_map(|request| daemon_spans(request, "st.startup.phase")).collect();
+    let failed = phases.iter().find(|phase| {
+        string_attribute(phase, "st.startup.phase") == Some(failed_phase)
+    }).expect("failed startup phase");
+    assert_eq!(failed["status"]["code"].as_u64(), Some(2));
+    assert_eq!(failed["traceId"], roots[0]["traceId"]);
+    assert_eq!(failed["parentSpanId"], roots[0]["spanId"]);
+    assert_eq!(string_attribute(failed, "span.label"), Some(failed_phase));
 }
 
 #[cfg(target_os = "linux")]

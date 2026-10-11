@@ -249,6 +249,8 @@ const DURATION_BUCKET_BOUNDARIES: [f64; 14] = [
 fn duration_view(instrument: &Instrument) -> Option<Stream> {
     if instrument.unit() != "s"
         || instrument.kind() != opentelemetry_sdk::metrics::InstrumentKind::Histogram
+        // Startup owns longer, explicit boundaries rather than the request-duration view.
+        || instrument.name() == "st.startup.duration"
     {
         return None;
     }
@@ -262,8 +264,8 @@ fn duration_view(instrument: &Instrument) -> Option<Stream> {
     Some(stream.build().expect("seconds histogram view is valid"))
 }
 
-/// The request-duration histogram instrument, so every second-bucketed histogram shares
-/// the st2 view (30 s and 60 s buckets included for long-polls and replay).
+/// The request-duration histogram shares the st2 view (30 s and 60 s buckets
+/// included for long-polls and replay); startup owns its longer bucket range.
 const HTTP_SERVER_DURATION_INSTRUMENT: &str = "http.server.request.duration";
 
 /// O11Y-R14 active-series budget for the request-duration histogram. The raw label
