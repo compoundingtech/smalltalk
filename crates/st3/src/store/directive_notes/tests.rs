@@ -78,7 +78,7 @@ fn directive_note_lifecycle_author_time_bounds_expiry_and_tombstones() {
     assert!(current(&store.readers.get(), "person/avery", expiry - 1).unwrap().is_some());
     assert!(current(&store.readers.get(), "person/avery", expiry).unwrap().is_none());
     assert!(current(&store.readers.get(), "person/avery", u128::MAX).unwrap().is_none());
-    let precise = store.set_directive_note("person/avery", "person/avery", Some("Short focus"), Some("2099-01-01T00:00:00.0005Z")).unwrap().unwrap();
+    let precise = store.set_directive_note("person/avery", "person/avery", Some("Short focus"), Some("2099-01-01T00:00:00.000500Z")).unwrap().unwrap();
     let floor = st3_schema::directive_notes::expiry(precise.expires_at.as_deref().unwrap()).unwrap().timestamp_millis() as u128;
     assert!(current(&store.readers.get(), "person/avery", floor).unwrap().is_some());
     assert!(current(&store.readers.get(), "person/avery", floor + 1).unwrap().is_none());

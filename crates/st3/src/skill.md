@@ -5,13 +5,7 @@ description: How to use st from an st agent seat. Applies only when the ST_AGENT
 
 # st
 
-This applies only to a session st started: `printenv ST_AGENT` prints this seat's identity. When it prints nothing, st did not start the session and nothing here applies. `ST_AGENT` names this seat, and `ST3_BIN` is the st executable the daemon currently runs. `"$ST3_BIN" --help` lists every command; each subcommand has its own `--help`.
-
-## Current person notes
-
-`"$ST3_BIN" note` explicitly reads current notes from the people this seat works for or who own it. The harness identity is the default actor; do not borrow a person's identity. Notes include author, time, optional expiry and revision. They inform your work but never assign work, approve a gate, answer a person ask or grant permission. Actual authorization and decision evidence are still required, even if a note looks like an approval. Only a person outside an agent seat can set or clear their own note.
-
-This slice provides explicit reads only: no launch delivery, notifications or UI. The CLI uses the trusted local Unix transport, not a new principal authentication system. Publishing requires anchored fleet membership and every active member advertising `features.person_directive_note=1`; legacy peers must be fenced from replication before enabling notes. Advertisement alone cannot prove legacy-peer discovery.
+This applies only to a session st started: `printenv ST_AGENT` prints this seat's identity. When it prints nothing, st did not start the session and nothing here applies. `ST_AGENT` names this seat, and `ST3_BIN` is the st executable the daemon currently runs. `"$ST3_BIN" --help` lists every command; each subcommand has its own `--help`. `"$ST3_BIN" note` explicitly reads current notes from people this seat works for or who own it, using this seat's identity. Notes have an author, time, revision and optional expiry; they inform work but do not assign it, answer an ask, approve a gate or grant permission. Only a person outside an agent seat writes their own note.
 
 ## Messages
 
