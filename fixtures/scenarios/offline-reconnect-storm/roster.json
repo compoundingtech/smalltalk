@@ -1,0 +1,260 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "roster",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 6
+  },
+  "state": {
+    "agents": [
+      {
+        "active_work_count": 1,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "builder/deploy-summary",
+          "repository": "~/src/harbor"
+        },
+        "current_session_id": "session/example-harbor-builder",
+        "current_work": [
+          {
+            "id": "step-run/example/harbor/deploy-summary/1/step-1",
+            "mission_id": "mission/example/harbor/deploy-summary",
+            "mission_run_id": "mission-run/example/harbor/deploy-summary/1",
+            "path": "step-1",
+            "since": "2030-01-01T11:58:00.000Z",
+            "state": "claimed",
+            "title": "Stream the deployment verification report"
+          }
+        ],
+        "current_work_ids": [
+          "step-run/example/harbor/deploy-summary/1/step-1"
+        ],
+        "driver": "codex",
+        "fault": null,
+        "harness_state": "busy",
+        "host_id": "host/foundry",
+        "id": "agent/example/harbor/builder",
+        "incarnation_id": "rt-harbor-builder-206:3",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:58:00.000Z",
+        "name": "Harbor Builder",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": "mission-run/example/harbor/deploy-summary/1",
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag40",
+        "runtime_ids": [
+          "runtime/example-harbor-builder"
+        ],
+        "since": "2030-01-01T11:58:00.000Z",
+        "state": "running",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:58:00.000Z",
+        "workspace": "~/src/harbor/.worktrees/builder"
+      },
+      {
+        "active_work_count": 0,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "reviewer/deploy-summary",
+          "repository": "~/src/harbor"
+        },
+        "current_session_id": "session/example-harbor-reviewer",
+        "current_work": [],
+        "current_work_ids": [],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "idle",
+        "host_id": "host/orchard",
+        "id": "agent/example/harbor/reviewer",
+        "incarnation_id": "rt-harbor-reviewer-449:3",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:57:00.000Z",
+        "name": "Harbor Reviewer",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": null,
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag11",
+        "runtime_ids": [
+          "runtime/example-harbor-reviewer"
+        ],
+        "since": "2030-01-01T11:57:00.000Z",
+        "state": "waiting",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:57:00.000Z",
+        "workspace": "~/src/harbor/.worktrees/reviewer"
+      }
+    ],
+    "machines": [
+      {
+        "capacity": {
+          "reason": "no capacity observation",
+          "state": "unknown"
+        },
+        "fleet_id": "fleet/example-harbor",
+        "host_id": "host/foundry",
+        "id": "machine/foundry",
+        "kind": "machine",
+        "name": "foundry",
+        "occupancy": {
+          "running_runtimes": 1
+        },
+        "projects": [
+          "~/src/harbor"
+        ],
+        "revision": "mh-foundry",
+        "runtime_ids": [
+          "runtime/example-harbor-builder"
+        ],
+        "state": "local",
+        "transports": [
+          {
+            "last_success_at": "2030-01-01T11:59:30.000Z",
+            "protocol": "unix",
+            "status": "local"
+          }
+        ],
+        "updated_at": "2030-01-01T11:59:30.000Z",
+        "work": []
+      },
+      {
+        "capacity": {
+          "reason": "no capacity observation",
+          "state": "unknown"
+        },
+        "fleet_id": "fleet/example-harbor",
+        "host_id": "host/orchard",
+        "id": "machine/orchard",
+        "kind": "machine",
+        "name": "orchard",
+        "occupancy": {
+          "running_runtimes": 1
+        },
+        "projects": [
+          "~/src/harbor"
+        ],
+        "revision": "mh-orchard",
+        "runtime_ids": [
+          "runtime/example-harbor-reviewer"
+        ],
+        "state": "reachable",
+        "transports": [
+          {
+            "last_success_at": "2030-01-01T11:59:30.000Z",
+            "protocol": "fabric",
+            "status": "up"
+          }
+        ],
+        "updated_at": "2030-01-01T11:59:30.000Z",
+        "work": []
+      }
+    ],
+    "order": [
+      "agent/example/harbor/builder",
+      "agent/example/harbor/reviewer"
+    ],
+    "runtimes": [
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-harbor-builder",
+        "incarnation_id": "rt-harbor-builder-206:3",
+        "kind": "runtime",
+        "owner_host_id": "host/foundry",
+        "owner_id": "agent/example/harbor/builder",
+        "owner_run_id": "mission-run/example/harbor/deploy-summary/1",
+        "revision": "rt30",
+        "runtime_id": "rt-harbor-builder-206",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      },
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-harbor-reviewer",
+        "incarnation_id": "rt-harbor-reviewer-449:3",
+        "kind": "runtime",
+        "owner_host_id": "host/orchard",
+        "owner_id": "agent/example/harbor/reviewer",
+        "owner_run_id": null,
+        "revision": "rt26",
+        "runtime_id": "rt-harbor-reviewer-449",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:57:00.000Z"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/1/transports/0/last_success_at"
+    }
+  ],
+  "variant": "default",
+  "world": "offline-reconnect-storm"
+}

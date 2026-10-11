@@ -43,6 +43,7 @@ export interface SliceFile {
   readonly anchor: string
   readonly source: AnySlice['source']
   readonly decode: AnySlice['decode']
+  readonly unknown?: AnySlice['unknown']
   readonly loading: boolean
   readonly times: TimePointer[]
   readonly state: unknown
@@ -57,6 +58,7 @@ export const sliceFile = (world: World, slice: AnySlice): SliceFile => ({
   anchor: ANCHOR,
   source: slice.source,
   decode: slice.decode,
+  ...(slice.unknown === undefined ? {} : { unknown: slice.unknown }),
   loading: slice.loading,
   times: sliceTimes(slice),
   state: slice.state,

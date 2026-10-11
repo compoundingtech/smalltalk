@@ -34,7 +34,9 @@ export const loadDefinitions = (): Record<string, Node> =>
 const typeOf = (value: unknown): string =>
   value === null ? 'null' : Array.isArray(value) ? 'array' : Number.isInteger(value) ? 'integer' : typeof value
 
-export const makeInstantFinder = (defs: Record<string, Node>) => {
+export type InstantFinder = (definition: string, value: unknown, pointer: string) => TimePointer[]
+
+export const makeInstantFinder = (defs: Record<string, Node>): InstantFinder => {
   const deref = (node: Node): Node => {
     if (typeof node === 'boolean' || node.$ref === undefined) return node
     const name = String(node.$ref).replace('#/$defs/', '')
