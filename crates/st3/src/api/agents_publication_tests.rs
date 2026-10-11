@@ -702,7 +702,7 @@ async fn agents_publication_rate_and_rss_realistic_200_and_400() {
         let agent = turn % agents.len();
         roster_fixture_append(&store, &publication_bench_subject(agent), "harness.todo.observed",
             publication_todo(&format!("publication-bench-{agent}"), &agents[agent].texts,
-                (turn / agents.len()) % 2 == 0));
+                (turn / agents.len()).is_multiple_of(2)));
         turn += 1;
         store.index().unwrap()
     };
@@ -732,7 +732,7 @@ async fn agents_publication_rate_and_rss_realistic_200_and_400() {
     while phase.started.elapsed() < Duration::from_secs(10) {
         let written = change();
         phase.writes += 1;
-        if phase.writes % 5 == 0 {
+        if phase.writes.is_multiple_of(5) {
             let (seen, elapsed) = fresh_read().await;
             assert!(seen >= written, "a fresh read must see its own write");
             phase.fresh_ms.push(elapsed);
