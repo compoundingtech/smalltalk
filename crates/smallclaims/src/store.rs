@@ -956,7 +956,17 @@ impl Store {
             .optional()?
             .and_then(|value| value.parse().ok());
         let seeded_batch_rowid = match stored_cursor {
-            Some(cursor) => cursor.min(max_rowid),
+            Some(cursor) if cursor > max_rowid => {
+                // A checkpoint can delete the last batches. Their implicit rowids may then
+                // be reused, so the startup clamp must be durable before a new batch lands:
+                // snapshot readers use this committed cursor, not the live Atomic.
+                connection.execute(
+                    "UPDATE meta SET value=?1 WHERE key='seeded_batch_rowid'",
+                    [max_rowid.to_string()],
+                )?;
+                max_rowid
+            }
+            Some(cursor) => cursor,
             None => {
                 let found: i64 = connection.query_row(
                     "SELECT COALESCE(
@@ -1050,6 +1060,8 @@ pub struct ReplicationSnapshot {
     pub authority_digest: String,
     pub graph_generation: i64,
     pub projection_generation: i64,
+    /// The anchor is persisted with the database cut, unlike the live replica counter.
+    pub fleet_anchor: Option<String>,
     pub graph_digest: String,
     pub legacy_graph_digest: String,
     pub projection_digests: BTreeMap<String, String>,
@@ -1057,6 +1069,27 @@ pub struct ReplicationSnapshot {
     /// digests then count claims its inventory does not, so `replication_snapshot` seals and
     /// reads again rather than offer it.
     pub unsealed: bool,
+}
+
+enum CapturedSnapshotInventory {
+    Full(CompactReplicationInventory, i64, usize),
+    Append(Vec<(i64, ReplicaEnvelopeId)>),
+}
+
+/// Everything the snapshot constructor may learn from SQLite, owned before its read pin ends.
+struct CapturedReplicationSnapshot {
+    store_index: u64,
+    replica_generation: u64,
+    graph_generation: i64,
+    projection_generation: i64,
+    fleet_anchor: Option<String>,
+    inventory_generation: i64,
+    pinned_tail: i64,
+    previous: Option<Arc<ReplicationSnapshot>>,
+    inventory: CapturedSnapshotInventory,
+    legacy_graph_digest: String,
+    projection_digests: BTreeMap<String, String>,
+    unsealed: bool,
 }
 
 /// Cumulative replication time by stage, in nanoseconds.
@@ -5500,31 +5533,32 @@ impl Store {
     /// written since the last exchange shows once the next exchange seals it.
     pub fn sealed_replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
         let current = |store: &Self| -> Result<Option<Arc<ReplicationSnapshot>>> {
-            let store_index = store.index()?;
-            let replica_generation = store.replica_generation.load(Ordering::Acquire);
-            // The store index never moves back, so deleting the newest claim leaves it
-            // unchanged, and a projection or a replay writes no claims at all. The graph
-            // generation moves with every change to a digested table, and sealing a batch adds
-            // an envelope row.
-            let reader = store.readers.get();
-            let current_graph_generation = graph_generation(&reader)?;
-            let current_projection_generation = projection_digest::generation(&reader)?;
-            let envelope_rowid = max_envelope_rowid(&reader)?;
-            let inventory_generation = inventory_generation::current(&reader)?;
-            Ok(store
-                .replication_snapshot
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-                .filter(|snapshot| {
-                    snapshot.store_index == store_index
-                        && snapshot.replica_generation == replica_generation
-                        && snapshot.graph_generation == current_graph_generation
-                        && snapshot.projection_generation == current_projection_generation
-                        && snapshot.max_envelope_rowid == envelope_rowid
-                        && snapshot.inventory_generation == inventory_generation
-                })
-                .cloned())
+            store.read_snapshot(|store_index| {
+                let replica_generation = store.replica_generation.load(Ordering::Acquire);
+                // The high-water index survives trims. Every marker below is read on the
+                // same cut, including when an outer status reader already owns that cut.
+                let reader = store.readers.get();
+                let current_graph_generation = graph_generation(&reader)?;
+                let current_projection_generation = projection_digest::generation(&reader)?;
+                let current_fleet_anchor = fleet_meta(&reader, "fleet_anchor_key")?;
+                let envelope_rowid = max_envelope_rowid(&reader)?;
+                let inventory_generation = inventory_generation::current(&reader)?;
+                Ok(store
+                    .replication_snapshot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                    .filter(|snapshot| {
+                        snapshot.store_index == store_index
+                            && snapshot.replica_generation == replica_generation
+                            && snapshot.graph_generation == current_graph_generation
+                            && snapshot.projection_generation == current_projection_generation
+                            && snapshot.fleet_anchor == current_fleet_anchor
+                            && snapshot.max_envelope_rowid == envelope_rowid
+                            && snapshot.inventory_generation == inventory_generation
+                    })
+                    .cloned())
+            })
         };
         if let Some(snapshot) = current(self)? {
             return Ok(snapshot);
@@ -5537,43 +5571,58 @@ impl Store {
             return Ok(snapshot);
         }
         let _timing = time_stage(&self.replication_timers.snapshot);
-        self.read_snapshot(|_| {
+        let captured = self.read_snapshot(|_| {
             let connection = self.readers.get();
-            self.build_replication_snapshot(&connection)
-        })
+            self.capture_replication_snapshot(&connection)
+        })?;
+        // When this call owns the outermost read, the physical SQLite transaction is over.
+        // A caller already holding a same-store pin still owns that pin and its cut.
+        Ok(self.finish_replication_snapshot(captured))
     }
 
     pub fn build_replication_snapshot(
         &self,
         connection: &Connection,
     ) -> Result<Arc<ReplicationSnapshot>> {
+        let captured = self.capture_replication_snapshot(connection)?;
+        Ok(self.finish_replication_snapshot(captured))
+    }
+
+    fn capture_replication_snapshot(
+        &self,
+        connection: &Connection,
+    ) -> Result<CapturedReplicationSnapshot> {
+        let store_index = current_index(connection)?;
+        let graph_generation = graph_generation(connection)?;
+        let projection_generation = projection_digest::generation(connection)?;
+        let fleet_anchor = fleet_meta(connection, "fleet_anchor_key")?;
+        let inventory_generation = inventory_generation::current(connection)?;
+        let pinned_tail = max_envelope_rowid(connection)?;
         let previous = self
             .replication_snapshot
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take();
+            .as_ref()
+            .filter(|cached| {
+                cached.store_index <= store_index
+                    && cached.graph_generation <= graph_generation
+                    && cached.projection_generation <= projection_generation
+                    && !(cached.fleet_anchor.is_some() && cached.fleet_anchor != fleet_anchor)
+                    && cached.inventory_generation <= inventory_generation
+                    && (cached.inventory_generation != inventory_generation
+                        || cached.max_envelope_rowid <= pinned_tail)
+            })
+            .cloned();
         // The six-table digest stays on the legacy peer wire format. Its generation lets us
         // retain compatibility without rescanning those tables for unrelated source changes.
-        let graph_generation = graph_generation(connection)?;
         let reusable_graph_digest = previous
             .as_ref()
             .filter(|previous| previous.graph_generation == graph_generation)
             .map(|previous| previous.legacy_graph_digest.clone());
-        let inventory_generation = inventory_generation::current(connection)?;
-        let full = |connection: &Connection| -> Result<_> {
-            let (inventory, max_rowid, envelope_rows) =
-                load_compact_replication_inventory(connection)?;
-            let buckets = inventory.buckets();
-            Ok((inventory, max_rowid, buckets, Vec::new(), 0, envelope_rows))
-        };
-        let (
-            mut inventory,
-            max_envelope_rowid,
-            buckets,
-            mut digest_prefixes,
-            resume_from,
-            envelope_count,
-        ) = if let Some(previous) = previous {
+        let inventory = if let Some(previous) = previous.as_ref()
+            && inventory_generation == previous.inventory_generation
+            && previous.max_envelope_rowid <= pinned_tail
+        {
             let mut statement = connection.prepare(
                 "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
                      WHERE rowid>?1 ORDER BY rowid",
@@ -5590,23 +5639,80 @@ impl Store {
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
-            if inventory_generation == previous.inventory_generation {
+            CapturedSnapshotInventory::Append(additions)
+        } else {
+            let (inventory, max_rowid, envelope_rows) =
+                load_compact_replication_inventory(connection)?;
+            CapturedSnapshotInventory::Full(inventory, max_rowid, envelope_rows)
+        };
+        let legacy_graph_digest = match reusable_graph_digest {
+            Some(digest) => digest,
+            None => legacy_graph_digest(connection, self.runtime.legacy_digest_tables())?,
+        };
+        let projection_digests = projection_digest::tables(connection)?;
+        // The cursor is part of this SQLite cut. A live Atomic can move while an older
+        // reader is pinned, hiding pending local batches in an otherwise old snapshot.
+        let unsealed = connection.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM batches WHERE rowid>
+                 COALESCE((SELECT CAST(value AS INTEGER) FROM meta
+                           WHERE key='seeded_batch_rowid'),0)
+               AND NOT EXISTS(
+                 SELECT 1 FROM replica_envelopes WHERE replica_envelopes.batch_id=batches.id))",
+        )?.query_row([], |row| row.get(0))?;
+        Ok(CapturedReplicationSnapshot {
+            store_index,
+            replica_generation: self.replica_generation.load(Ordering::Acquire),
+            graph_generation,
+            projection_generation,
+            fleet_anchor,
+            inventory_generation,
+            pinned_tail,
+            previous,
+            inventory,
+            legacy_graph_digest,
+            projection_digests,
+            unsealed,
+        })
+    }
+
+    fn finish_replication_snapshot(
+        &self,
+        captured: CapturedReplicationSnapshot,
+    ) -> Arc<ReplicationSnapshot> {
+        let CapturedReplicationSnapshot {
+            store_index, replica_generation, graph_generation, projection_generation,
+            fleet_anchor, inventory_generation, pinned_tail, previous, inventory,
+            legacy_graph_digest, projection_digests, unsealed,
+        } = captured;
+        let (
+            mut inventory, max_envelope_rowid, buckets, mut digest_prefixes,
+            resume_from, envelope_count,
+        ) = match inventory {
+            CapturedSnapshotInventory::Append(additions) => {
+                let previous = previous.expect("an append capture has a previous snapshot");
                 let envelope_rows = previous.envelope_rows + additions.len();
                 let mut max_rowid = previous.max_envelope_rowid;
-                // Most snapshots are owned only by this cache. Move their inventory
-                // into the successor so a graph write does not allocate and free
-                // every envelope ID. Keep the old snapshot intact for concurrent
-                // callers that still hold it.
-                let (mut inventory, mut buckets, digest_prefixes) = match Arc::try_unwrap(previous)
-                {
-                    Ok(snapshot) => (
-                        snapshot.inventory,
-                        snapshot.buckets,
-                        snapshot.digest_prefixes,
-                    ),
+                // Keep the old cache until every fallible database read has succeeded. If
+                // nobody else holds it, move its compact identities instead of cloning them.
+                let cached = {
+                    let mut cache = self.replication_snapshot.lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if cache.as_ref().is_some_and(|cached| Arc::ptr_eq(cached, &previous)) {
+                        cache.take()
+                    } else {
+                        None
+                    }
+                };
+                let source = if let Some(cached) = cached {
+                    drop(previous);
+                    cached
+                } else {
+                    previous
+                };
+                let (mut inventory, mut buckets, digest_prefixes) = match Arc::try_unwrap(source) {
+                    Ok(snapshot) => (snapshot.inventory, snapshot.buckets, snapshot.digest_prefixes),
                     Err(shared) => (
-                        shared.inventory.clone(),
-                        shared.buckets.clone(),
+                        shared.inventory.clone(), shared.buckets.clone(),
                         shared.digest_prefixes.clone(),
                     ),
                 };
@@ -5648,27 +5754,21 @@ impl Store {
                     resume_from,
                     envelope_rows,
                 )
-            } else {
-                full(connection)?
             }
-        } else {
-            full(connection)?
+            CapturedSnapshotInventory::Full(inventory, max_rowid, envelope_rows) => {
+                let buckets = inventory.buckets();
+                (inventory, max_rowid, buckets, Vec::new(), 0, envelope_rows)
+            }
         };
         inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
         // every payload again on each graph change.
         let authority_digest = inventory.digest.clone();
-        let legacy_graph_digest = match reusable_graph_digest {
-            Some(digest) => digest,
-            None => legacy_graph_digest(connection, self.runtime.legacy_digest_tables())?,
-        };
-        let projection_generation = projection_digest::generation(connection)?;
-        let projection_digests = projection_digest::tables(connection)?;
         let graph_digest = projection_digest::root(&projection_digests);
         let snapshot = Arc::new(ReplicationSnapshot {
-            store_index: current_index(connection)?,
-            replica_generation: self.replica_generation.load(Ordering::Acquire),
+            store_index,
+            replica_generation,
             max_envelope_rowid,
             envelope_rows: envelope_count,
             inventory_generation,
@@ -5678,23 +5778,27 @@ impl Store {
             authority_digest,
             graph_generation,
             projection_generation,
+            fleet_anchor: fleet_anchor.clone(),
             graph_digest,
             legacy_graph_digest,
             projection_digests,
-            unsealed: connection
-                .prepare_cached(
-                    "SELECT EXISTS(SELECT 1 FROM batches WHERE rowid>?1 AND NOT EXISTS(
-                         SELECT 1 FROM replica_envelopes WHERE replica_envelopes.batch_id=batches.id))",
-                )?
-                .query_row([self.seeded_batch_rowid.load(Ordering::Acquire)], |row| {
-                    row.get(0)
-                })?,
+            unsealed,
         });
-        *self
-            .replication_snapshot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(snapshot.clone());
-        Ok(snapshot)
+        let mut cache = self.replication_snapshot.lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let ahead = cache.as_ref().is_some_and(|cached| {
+            cached.store_index > store_index
+                || cached.graph_generation > graph_generation
+                || cached.projection_generation > projection_generation
+                || (cached.fleet_anchor.is_some() && cached.fleet_anchor != fleet_anchor)
+                || cached.inventory_generation > inventory_generation
+                || (cached.inventory_generation == inventory_generation
+                    && cached.max_envelope_rowid > pinned_tail)
+        });
+        if !ahead {
+            *cache = Some(snapshot.clone());
+        }
+        snapshot
     }
 
     pub fn export_replication_summary(&self, fleet_id: &str) -> Result<ReplicationExchange> {
@@ -8468,5 +8572,42 @@ mod replay_log_tests {
         assert!(!line.contains(['\n', '\r', '\t']));
         assert!(line.len() < 1200);
         assert!(line.contains(&format!("frontier={} target={}", u64::MAX, u64::MAX)));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_capture_tests {
+    use super::{Store, runtime::Plain};
+    use std::sync::Arc;
+
+    #[test]
+    fn captured_cut_releases_its_reader_before_inventory_construction() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("capture.sqlite3"), "alder", Arc::new(Plain))
+            .unwrap();
+        let insert = |rowid: i64| {
+            store.connection.write().execute(
+                "INSERT INTO replica_envelopes(rowid,writer,sequence,envelope_hash,
+                     accepted_at_unix_ms,payload,relay,receipt_state,received_at_unix_ms)
+                 VALUES(?1,'alder',?1,?2,'0',X'','alder','pending','0')",
+                rusqlite::params![rowid, format!("hash-{rowid}")],
+            ).unwrap();
+        };
+        insert(1);
+        let captured = store.read_snapshot(|_| {
+            let reader = store.readers.get();
+            store.capture_replication_snapshot(&reader)
+        }).unwrap();
+        // A checkpoint on a separate connection cannot truncate a WAL held by this cut.
+        let busy: i64 = store.connection.write()
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0)).unwrap();
+        assert_eq!(busy, 0, "the capture returned with a live SQLite reader");
+
+        insert(2);
+        let old = store.finish_replication_snapshot(captured);
+        assert_eq!(old.envelope_rows, 1);
+        let latest = store.sealed_replication_snapshot().unwrap();
+        assert_eq!(latest.envelope_rows, 2);
+        assert_ne!(old.inventory.digest, latest.inventory.digest);
     }
 }

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Release an outermost cold replication snapshot reader before CPU construction",
+  "replay": {"status": "none", "detail": "Projection replay, canonical ordering, and complete digest coverage are unchanged."},
+  "schema": {"status": "none", "detail": "No table, index, trigger, or schema-version change. A stale seeded batch cursor is conditionally clamped in existing meta on startup before new batch rowids can be reused."},
+  "rules": {"status": "none", "detail": "Envelope authority, receipt admission, pending guards, signing, and checkpoint rules are unchanged."},
+  "compatibility": {"status": "none", "detail": "No wire, archive, API, or peer protocol change. Legacy graph digest and complete inventory inputs remain on one database cut."},
+  "downtime": {"status": "none", "detail": "The snapshot cache rebuilds from committed inputs after an outermost read transaction ends; nested caller-owned reads keep their original cut."},
+  "manual": {"status": "none", "detail": "No operator action or migration command is needed."},
+  "recovery": {"status": "changed", "detail": "Reopening after checkpoint trim persists the existing batch cursor clamp so reused rowids cannot hide pending local work. Rollback and older-reader/newer-cache protections remain."}
+}
