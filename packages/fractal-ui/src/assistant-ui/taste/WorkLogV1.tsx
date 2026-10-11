@@ -6,7 +6,7 @@ import { Icon } from '../composition/Icons'
 import { ErrorOverlay } from '../composition/ErrorOverlay'
 import { HighlightedSource } from '../composition/Markdown'
 import type { WorkLogCall, WorkLogTurn } from './work-log'
-import { errorReason, failedCommandSource, formatWorkDuration, workLogOutputLanguage } from './work-log'
+import { errorReason, failedCommandSource, formatWorkDuration, readableCommand, workLogOutputLanguage } from './work-log'
 
 export type WorkLogCallDetailRenderer = (call: WorkLogCall) => React.ReactNode
 const CallDetailRenderer = React.createContext<WorkLogCallDetailRenderer | undefined>(undefined)
@@ -40,7 +40,7 @@ export function WorkLogV1({ turn, listStyle, renderCallDetail, previewCallDetail
     {turn.running && !hideLiveRow && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.live)}><Icon name="spinner" spinning /><span>Working</span></div>}
     {interactiveCalls ? <Button isDisabled={!settled} aria-expanded={!settled || open} onPress={() => setOpen(value => !value)} {...stylex.props(styles.summary, failed && styles.failureInk)}><Icon name={!settled || open ? 'chevron-down' : 'chevron-right'} size={12} />{summaryContent}</Button> : <div {...stylex.props(styles.summary, styles.staticCall, failed && styles.failureInk)}>{summaryContent}</div>}
     {(!interactiveCalls || !settled || open) && <><div {...stylex.props(styles.list, listStyle)}>{turn.calls.map(call => <TimelineCall key={call.id} call={call} />)}</div>{expandedBody}<hr data-testid="work-log-divider" {...stylex.props(styles.divider)} /></>}
-    {failed && <ErrorOverlay id={`work-failure-${turn.calls[0]?.id ?? 'turn'}`} title={failedCommand === undefined ? 'Run failed.' : 'Command did not complete'} detail={errorReason(failedCall?.detail ?? turn.failureNote ?? '')} rawDetail={detail} command={failedCommandSource(failedCall?.detail ?? turn.failureNote ?? '')} onRetry={onRetry} onOpenOutput={failedCall === undefined || onOpenOutput === undefined ? undefined : () => onOpenOutput(failedCall)} />}
+    {failed && <ErrorOverlay id={`work-failure-${turn.calls[0]?.id ?? 'turn'}`} title={failedCommand === undefined ? 'Run failed.' : 'Command did not complete'} detail={errorReason(failedCall?.detail ?? turn.failureNote ?? '')} rawDetail={detail} command={failedCall === undefined ? failedCommandSource(turn.failureNote ?? '') : readableCommand(failedCall)} onRetry={onRetry} onOpenOutput={failedCall === undefined || onOpenOutput === undefined ? undefined : () => onOpenOutput(failedCall)} />}
     {turn.interrupted && <div {...stylex.props(styles.promoted)}><Icon name="stop" size={14} /><span>Run interrupted.</span></div>}
   </section></CallPresentation.Provider></CallDetailRenderer.Provider>
 }

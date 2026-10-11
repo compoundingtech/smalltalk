@@ -4,7 +4,7 @@ import { createServer } from 'vite'
 
 const server = await createServer({ configFile: false, root: new URL('../../../', import.meta.url).pathname, optimizeDeps: { noDiscovery: true, include: [] }, server: { middlewareMode: true } })
 after(() => server.close())
-const { errorReason, failedCommandSource, workLogTurnFromItems } = await server.ssrLoadModule('/src/assistant-ui/taste/work-log.ts')
+const { errorReason, failedCommandSource, readableCommand, workLogTurnFromItems } = await server.ssrLoadModule('/src/assistant-ui/taste/work-log.ts')
 const at = '2026-01-15T12:30:00Z'
 const project = content => workLogTurnFromItems([{ _tag: 'ToolCall', id: 'tool/read', callId: 'call/read', name: 'read', input: {}, status: 'success', callSeen: true, at, result: { content, isError: false, at } }], { kindFor: () => 'read', running: false, failed: false, interrupted: false }).calls[0]
 
@@ -97,4 +97,11 @@ test('first-level reasons are capped to one short line', () => {
   const reason = errorReason(`ValueError: ${'x'.repeat(400)}`)
   assert.equal(reason.length, 160)
   assert.ok(reason.endsWith('…') && !reason.includes('\n'))
+})
+test('a run keeps its own source as the readable command, unless the failure names a subprocess command', () => {
+  const run = (input, content) => workLogTurnFromItems([{ _tag: 'ToolCall', id: 'tool/run', callId: 'call/run', name: 'bash', input, status: 'error', callSeen: true, at, result: { content, isError: true, at } }], { kindFor: () => 'run', running: false, failed: true, interrupted: false }).calls[0]
+  assert.equal(readableCommand(run({ command: 'pnpm test', i: 'Run tests' }, 'Process exited with code 2')), 'pnpm test')
+  assert.equal(readableCommand(run({ code: 'print(1)' }, timeoutTrace)), 'sleep 60')
+  assert.equal(readableCommand(run({ i: 'No source' }, 'boom')), undefined)
+  assert.equal(workLogTurnFromItems([{ _tag: 'ToolCall', id: 'tool/read', callId: 'call/read', name: 'read', input: { command: 'not a run' }, status: 'success', callSeen: true, at }], { kindFor: () => 'read', running: false, failed: false, interrupted: false }).calls[0].command, undefined)
 })

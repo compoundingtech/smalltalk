@@ -559,6 +559,30 @@ describe('ConversationPane composition activation', () => {
     expect(banner.querySelector('[data-testid="error-overlay-command"] code')?.textContent).toBe("set -eu\necho 'ready'\n")
   })
 
+  it.each([
+    ['its own source when the failure names no command', { command: 'pnpm test --filter app' }, 'Process exited with code 2', 'Exited with code 2', 'pnpm test --filter app'],
+    ['the subprocess command a timeout names', { code: 'run_step()' }, "subprocess.TimeoutExpired: Command '['sh', '-c', '\\nset -eu\\nmake check\\n']' timed out after 30 seconds", 'Command timed out after 30s', 'set -eu\nmake check\n'],
+  ])('shows a failed row its readable command: %s', async (_name, input, diagnostic, reason, command) => {
+    source.feed = { _tag: 'Observed', freshness: 'live', value: {
+      items: [scenario[0]!, { _tag: 'ToolCall', id: 'failed-run', callId: 'failed-call', name: 'run',
+        input, status: 'error', callSeen: true, at: at(1),
+        result: { content: diagnostic, isError: true, at: at(3) } }],
+      hasOlder: false, observation: { empty: false },
+    } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    const fold = container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')!
+    await act(async () => { fold.click() })
+    const row = container.querySelector<HTMLElement>('[data-tool-status="error"]')!
+    const open = row.querySelector<HTMLButtonElement>('button')
+    if (open !== null) await act(async () => { open.click() })
+    const preview = container.querySelector<HTMLElement>('[data-testid="tool-detail-preview"]')!
+    expect(preview.querySelector('[data-testid="tool-error-reason"]')?.textContent).toBe(reason)
+    const raw = [...preview.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Show raw input/output')!
+    await act(async () => { raw.click() })
+    expect(preview.querySelector('[data-testid="tool-command"] code')?.textContent).toBe(command)
+  })
+
   it('keeps optimistic send state visible on its prompt', async () => {
     const pending: ConversationItem = { _tag: 'Text', id: 'p2', role: 'user', text: 'And verify the fix.', attachments: [], streaming: false, at: at(10), sendState: { _tag: 'Pending' } }
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [...scenario, pending], hasOlder: false, observation: { empty: false } } }

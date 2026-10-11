@@ -15,6 +15,8 @@ export interface WorkLogCall {
   readonly outputLanguage?: string
   /** Observed edit/write path, not a guessed title. */
   readonly changedPath?: string
+  /** A run's own command or script source; display it only as code inside the raw disclosure. */
+  readonly command?: string
 }
 export interface WorkLogTurn {
   readonly calls: readonly WorkLogCall[]
@@ -118,6 +120,10 @@ export function failedCommandSource(detail: string): string | undefined {
   return undefined
 }
 
+/** The command a failure reason stands in for: a subprocess command named by the failure, else the run's own source. */
+export const readableCommand = (call: WorkLogCall): string | undefined =>
+  (call.detail === undefined ? undefined : failedCommandSource(call.detail)) ?? call.command
+
 /** Selected workshop call projection; the host owns classification, lifecycle and timing. */
 export function workLogTurnFromItems(items: readonly ConversationItem[], facts: {
   readonly kindFor: (name: string) => WorkKind
@@ -144,6 +150,7 @@ export function workLogTurnFromItems(items: readonly ConversationItem[], facts: 
       detail: toolOutput(call.result?.content) || undefined,
       outputLanguage: (media === undefined ? undefined : outputMediaLanguages[media]) ?? (kind === 'run' ? 'bash' : kind === 'read' ? extension : undefined),
       changedPath: kind === 'edit' && call.callSeen && call.status === 'success' ? path : undefined,
+      command: kind === 'run' ? ['command', 'code', 'script'].map(key => input?.[key]).find((value): value is string => typeof value === 'string' && value.trim().length > 0) : undefined,
     }]
   })
   const complete = facts.completeHistory === true
