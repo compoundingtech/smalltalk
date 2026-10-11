@@ -5,7 +5,7 @@ version 2
 // Publish this file before github-intake.kdl. The intake names these missions and each new
 // request starts their current ready revision:
 //
-//   st missions publish examples/st3/github-intake-work.kdl --as person/operator
+//   st apply examples/st3/github-intake-work.kdl --as person/operator
 // A later review revision needs only a publish; future requests use it automatically.
 //
 // Each run receives the discovered item as its `source` input, pinned to the exact discovery

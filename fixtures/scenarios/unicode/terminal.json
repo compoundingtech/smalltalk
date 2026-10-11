@@ -1,0 +1,591 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "terminal",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 1
+  },
+  "state": {
+    "terminals": [
+      {
+        "cast": {
+          "events": [
+            [
+              0,
+              "o",
+              "\u001b[32matlas\u001b[0m:builder $ pnpm test display-width\r\n"
+            ],
+            [
+              0.596,
+              "o",
+              "واجهة العربية — 日本語の表示 — Café — 👩🏽‍💻 🚀 — 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 — ~/src/atlas/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/display-width/fixtures\r\n"
+            ],
+            [
+              1.368,
+              "o",
+              "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界: preserved\r\n"
+            ],
+            [
+              1.418,
+              "o",
+              "\u001b[32matlas\u001b[0m:builder $ "
+            ]
+          ],
+          "header": {
+            "height": 12,
+            "title": "pnpm test display-width",
+            "version": 2,
+            "width": 100
+          },
+          "started_at_ms": -10000
+        },
+        "incarnation": "pty-57:1",
+        "owner": "agent/example/atlas/builder",
+        "runtime": {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-atlas-builder-shell",
+          "incarnation_id": "pty-57:1",
+          "kind": "runtime",
+          "owner_host_id": "host/meadow",
+          "owner_id": "agent/example/atlas/builder",
+          "revision": "rt-shell-1",
+          "runtime_id": "example-atlas-builder-shell",
+          "runtime_kind": "terminal",
+          "state": "running",
+          "terminal_id": "terminal/example-atlas-builder",
+          "updated_at": "2030-01-01T11:59:50.000Z"
+        },
+        "screens": [
+          {
+            "at_ms": -10000,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 1,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 34,
+                      "text": ":builder $ pnpm test display-width"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm test display-width",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 1,
+              "revision": "cast-1",
+              "rows": 12,
+              "runtime_incarnation": "pty-57:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm test display-width",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -9404,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 6,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 34,
+                      "text": ":builder $ pnpm test display-width"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm test display-width",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "واجهة العربية — 日本語の表示 — Café — 👩🏽‍💻 🚀 — 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+                    }
+                  ],
+                  "text": "واجهة العربية — 日本語の表示 — Café — 👩🏽‍💻 🚀 — 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+                    }
+                  ],
+                  "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 — ~/src/atlas/display-width/display-width/display-wid"
+                    }
+                  ],
+                  "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 — ~/src/atlas/display-width/display-width/display-wid",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "th/display-width/display-width/display-width/display-width/display-width/display-width/display-width"
+                    }
+                  ],
+                  "text": "th/display-width/display-width/display-width/display-width/display-width/display-width/display-width",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 93,
+                      "text": "/display-width/display-width/display-width/display-width/display-width/display-width/fixtures"
+                    }
+                  ],
+                  "text": "/display-width/display-width/display-width/display-width/display-width/display-width/fixtures",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 2,
+              "revision": "cast-2",
+              "rows": 12,
+              "runtime_incarnation": "pty-57:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm test display-width",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -8632,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 9,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 34,
+                      "text": ":builder $ pnpm test display-width"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm test display-width",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "واجهة العربية — 日本語の表示 — Café — 👩🏽‍💻 🚀 — 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+                    }
+                  ],
+                  "text": "واجهة العربية — 日本語の表示 — Café — 👩🏽‍💻 🚀 — 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+                    }
+                  ],
+                  "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 — ~/src/atlas/display-width/display-width/display-wid"
+                    }
+                  ],
+                  "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 — ~/src/atlas/display-width/display-width/display-wid",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "th/display-width/display-width/display-width/display-width/display-width/display-width/display-width"
+                    }
+                  ],
+                  "text": "th/display-width/display-width/display-width/display-width/display-width/display-width/display-width",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 93,
+                      "text": "/display-width/display-width/display-width/display-width/display-width/display-width/fixtures"
+                    }
+                  ],
+                  "text": "/display-width/display-width/display-width/display-width/display-width/display-width/fixtures",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+                    }
+                  ],
+                  "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+                    }
+                  ],
+                  "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [
+                    {
+                      "cells": 11,
+                      "text": ": preserved"
+                    }
+                  ],
+                  "text": ": preserved",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 3,
+              "revision": "cast-3",
+              "rows": 12,
+              "runtime_incarnation": "pty-57:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm test display-width",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -8582,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 16,
+                "row": 9,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 34,
+                      "text": ":builder $ pnpm test display-width"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm test display-width",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "واجهة العربية — 日本語の表示 — Café — 👩🏽‍💻 🚀 — 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+                    }
+                  ],
+                  "text": "واجهة العربية — 日本語の表示 — Café — 👩🏽‍💻 🚀 — 界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+                    }
+                  ],
+                  "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 — ~/src/atlas/display-width/display-width/display-wid"
+                    }
+                  ],
+                  "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界 — ~/src/atlas/display-width/display-width/display-wid",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "th/display-width/display-width/display-width/display-width/display-width/display-width/display-width"
+                    }
+                  ],
+                  "text": "th/display-width/display-width/display-width/display-width/display-width/display-width/display-width",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 93,
+                      "text": "/display-width/display-width/display-width/display-width/display-width/display-width/fixtures"
+                    }
+                  ],
+                  "text": "/display-width/display-width/display-width/display-width/display-width/display-width/fixtures",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+                    }
+                  ],
+                  "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [
+                    {
+                      "cells": 100,
+                      "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界"
+                    }
+                  ],
+                  "text": "界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界",
+                  "truncated": false,
+                  "wrapped": true
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [
+                    {
+                      "cells": 11,
+                      "text": ": preserved"
+                    }
+                  ],
+                  "text": ": preserved",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 11,
+                      "text": ":builder $ "
+                    }
+                  ],
+                  "text": "atlas:builder $ ",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 4,
+              "revision": "cast-4",
+              "rows": 12,
+              "runtime_incarnation": "pty-57:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm test display-width",
+              "truncated": false
+            }
+          }
+        ],
+        "terminal": "terminal/example-atlas-builder"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/terminals/0/runtime/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "unicode"
+}

@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+mod intervals;
+pub use intervals::{IntervalSeries, MinuteSummary, histogram_upper_ms, histogram_lower_ms};
+
 /// The windows every series keeps: name, slot width and slot count.
 const TIERS: [(&str, u64, usize); 3] = [("1m", 5, 12), ("5m", 30, 10), ("1h", 300, 12)];
 
@@ -50,9 +53,10 @@ fn upper(bucket: u16) -> u64 {
 struct Histogram {
     count: u64,
     over: u64,
+    /// Histogram unit: microseconds for Series, integer milliseconds for IntervalSeries.
     max_us: u64,
     /// Sorted by bucket.
-    buckets: Vec<(u16, u32)>,
+    buckets: Vec<(u16, u64)>,
 }
 
 impl Histogram {
@@ -84,7 +88,7 @@ impl Histogram {
         let rank = (self.count * percent).div_ceil(100).max(1);
         let mut seen = 0;
         for &(bucket, count) in &self.buckets {
-            seen += u64::from(count);
+            seen += count;
             if seen >= rank {
                 return upper(bucket).min(self.max_us);
             }

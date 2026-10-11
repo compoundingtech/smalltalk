@@ -1,6 +1,6 @@
 import type { Resource } from '@smalltalk/st3-client'
 
-import type { AnySlice, Slice, SliceKind, SliceStates, SyncSurface, TimelineEvent } from './slice.ts'
+import type { AnySlice, Slice, SliceKind, SliceStates, SyncSurface, TimelineEvent, WireResource } from './slice.ts'
 import type { SyncStatus } from './syncStatus.ts'
 
 type Keyed = { readonly id?: string }
@@ -10,7 +10,8 @@ const upsert = <A extends Keyed>(list: readonly A[], value: A): A[] => {
   return index === -1 ? [...list, value] : list.map((item, at) => (at === index ? value : item))
 }
 
-const COLLECTION_OF_KIND: Record<string, string> = {
+/** Complete client-v0 known-kind set; unsupported collections must not become future resources. */
+const COLLECTION_OF_KIND: Record<Resource['kind'], string> = {
   agent: 'agents',
   runtime: 'runtimes',
   machine: 'machines',
@@ -18,14 +19,32 @@ const COLLECTION_OF_KIND: Record<string, string> = {
   work: 'work',
   attention: 'attention',
   message: 'messages',
+  launch: 'launches',
+  'launch-variant': 'launchVariants',
+  'launch-decision': 'launchDecisions',
+  'launch-approval': 'launchApprovals',
+  observer: 'observers',
+  subscription: 'subscriptions',
+  lane: 'lanes',
+  device: 'devices',
+  operation: 'operations',
+  history: 'history',
+  session: 'sessions',
+  glass: 'glasses',
+  arrangement: 'arrangements',
+  'owned-set': 'ownedSets',
+  summary: 'summary',
 }
 
-const applyChanges = <S extends object>(state: S, upserts: readonly Resource[], removes: readonly string[], order: readonly string[] | undefined): S => {
+const applyChanges = <S extends object>(state: S, upserts: readonly WireResource[], removes: readonly string[], order: readonly string[] | undefined): S => {
   const next = { ...state } as Record<string, unknown>
   for (const value of upserts) {
-    const key = COLLECTION_OF_KIND[value.kind]
-    if (key === undefined || !Array.isArray(next[key])) throw new Error(`a ${value.kind} upsert has no place in this slice`)
-    next[key] = upsert(next[key] as Keyed[], value as Keyed)
+    const key = Object.hasOwn(COLLECTION_OF_KIND, value.kind) ? COLLECTION_OF_KIND[value.kind as Resource['kind']] : undefined
+    if (key === undefined) next.resources = upsert((next.resources ?? []) as Keyed[], value)
+    else {
+      if (!Array.isArray(next[key])) throw new Error(`a ${value.kind} upsert has no place in this slice`)
+      next[key] = upsert(next[key] as Keyed[], value)
+    }
   }
   for (const [key, list] of Object.entries(next)) {
     if (key !== 'order' && Array.isArray(list)) next[key] = (list as Keyed[]).filter((item) => !removes.includes(item.id ?? ''))
@@ -42,6 +61,22 @@ const applyEvent = (slice: AnySlice, event: TimelineEvent): AnySlice['state'] =>
   switch (event._tag) {
     case 'changes':
       return applyChanges(slice.state, event.upserts, event.removes, event.order)
+    case 'thread-create': {
+      const state = slice.state as SliceStates['conversation']
+      return { ...state, threads: [...state.threads.filter((thread) => thread.agent !== event.thread.agent), event.thread] }
+    }
+    case 'thread-remove': {
+      const state = slice.state as SliceStates['conversation']
+      return { ...state, threads: state.threads.filter((thread) => thread.agent !== event.agent) }
+    }
+    case 'terminal-create': {
+      const state = slice.state as SliceStates['terminal']
+      return { ...state, terminals: [...state.terminals.filter((record) => record.terminal !== event.record.terminal), event.record] }
+    }
+    case 'terminal-remove': {
+      const state = slice.state as SliceStates['terminal']
+      return { ...state, terminals: state.terminals.filter((record) => record.terminal !== event.terminal) }
+    }
     case 'entries': {
       const state = slice.state as SliceStates['conversation']
       return {
@@ -86,6 +121,10 @@ const applyEvent = (slice: AnySlice, event: TimelineEvent): AnySlice['state'] =>
     }
     case 'unavailable':
     case 'open-fail':
+    case 'open-ok':
+    case 'open-hold':
+    case 'open-release':
+    case 'error-clear':
     case 'http-raw':
     case 'close':
     case 'reopen':

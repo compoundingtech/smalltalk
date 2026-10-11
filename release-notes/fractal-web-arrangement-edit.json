@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web exposes optimistic winning-Sidebar arrangement edits with typed refusals and explicit stale-fence retry",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only change; no runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Uses existing arrangement.edit operations and control.arrangements grants. New Sidebars use the reserved subject arrangement/<owner>/00000000-0000-7000-8000-000000000001, shared by concurrent clients and adopted by identity even after rename. Otherwise the lowest UUIDv7 exact-name live person-owned legacy Sidebar wins, with a non-blocking duplicate note and no automatic consolidation. Retired reserved subjects cannot be restored; terminal refusal is remembered for the session, while an explicit retry of a definitively refused create can adopt a later-visible live legacy Sidebar. Uncertain delivery retries retain their original target. Read-only pairings remain read-only."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; the app is not deployed by this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change. Optimistic edit and retry state remains in memory only."
+  }
+}

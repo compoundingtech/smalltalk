@@ -77,6 +77,31 @@ The shared views have no React, React Native, Expo or native key-store dependenc
 return `person`/`green` color tokens; map them through your palette. Pass your product name,
 version and build to `clientName`, and a device label to `signatureRefusal` if desired.
 
+## Fractal web browser telemetry
+
+Browser trace export is opt-in. Set `VITE_OTLP_TRACES_URL` to the complete OTLP/HTTP
+traces endpoint when building the Fractal web app with Vite (or in its Vite `.env`
+file). For example, a deployment build can set
+`VITE_OTLP_TRACES_URL=https://collector.example.test/v1/traces`. Vite embeds this
+public URL in the browser bundle; changing it requires rebuilding the bundle.
+The collector must accept browser OTLP/JSON requests and allow the app origin
+through CORS. Do not put credentials in this public configuration.
+
+With the key unset or blank, the browser installs no exporter and sends no OTLP
+requests. In-process tracing remains available. Configured deployments retain
+100% dogfood sampling. The app server does not proxy OTLP requests.
+
+Tracing and the mandatory first-frame context are captured synchronously. When a collector
+is configured, exporter construction and its flush timer normally wait until the committed
+shell or observed roster has painted. A ten-second timeout, foreground visibility change,
+startup error or pagehide releases that gate if no paint arrives. Up to 256 completed startup
+spans are kept in memory and handed to the exporter with their original trace identities and
+timestamps; spans still open at that boundary are exported when they end. Early pagehide or
+shutdown initializes the same exporter once and drains the startup buffer instead of dropping
+it. Shutdown initialization, already-started pagehide transport and the native final flush
+share one absolute one-second deadline; the native flush receives only the time remaining
+after the manual transport drain. The independently demanded session-trace provider remains lazy.
+
 ## Connect, follow and send
 
 Rust local clients use `Client::unix` or `unix_as`. A paired Unix gateway uses `unix_gateway`;
@@ -143,6 +168,18 @@ acknowledgement or explicit discard, and says **Accepted**, not delivered. For a
 continue asynchronously, follow the returned operation (`followOperation` in TypeScript;
 `operations_get` in Rust) and display its terminal result. The server enforces actor and fences;
 show stable refusals through the client's plain-error helpers instead of parsing CLI messages.
+
+fractal-web's `source.attachments.send` owns this fence: callers pass `Send` or `Resend`
+with message fields, never a snapshot or fence. It publishes a first send's optimistic
+`Pending` row before awaiting anything, then uses the newest gateway-store snapshot
+already held in the SDK's collection-window sync evidence (highest `store_index`).
+Conversation frames carry no snapshot, and opaque conversation cursors cannot be used
+as fences; remote terminal-owner snapshots are excluded. With no held window snapshot,
+the existing SDK `snapshot` read obtains a fresh capabilities envelope, not cached discovery.
+An unavailable snapshot or `stale-fence` refusal leaves the row `Failed` with a typed
+reason and human-readable detail. After refreshing the observed window, explicit `Resend`
+keeps the original action ID, body and idempotency key while acquiring the refreshed fence;
+it never retries automatically or drops the failed row.
 
 Remote device sends may require a device signature: pairing credentials authenticate the
 gateway connection, while the signature attributes the message to the device's person.

@@ -1,0 +1,315 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "roster",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 7
+  },
+  "state": {
+    "agents": [
+      {
+        "active_work_count": 0,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "builder/release-candidate",
+          "repository": "~/src/meadow"
+        },
+        "current_session_id": "session/example-meadow-builder",
+        "current_work": [],
+        "current_work_ids": [],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "idle",
+        "host_id": "host/quarry",
+        "id": "agent/example/meadow/builder",
+        "incarnation_id": "rt-meadow-builder-443:4",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:58:00.000Z",
+        "name": "Meadow Builder",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": null,
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag14",
+        "runtime_ids": [
+          "runtime/example-meadow-builder"
+        ],
+        "since": "2030-01-01T11:58:00.000Z",
+        "state": "waiting",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:58:00.000Z",
+        "workspace": "~/src/meadow/.worktrees/builder"
+      },
+      {
+        "active_work_count": 0,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "reviewer/release-candidate",
+          "repository": "~/src/meadow"
+        },
+        "current_session_id": "session/example-meadow-reviewer",
+        "current_work": [],
+        "current_work_ids": [],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "idle",
+        "host_id": "host/lantern",
+        "id": "agent/example/meadow/reviewer",
+        "incarnation_id": "rt-meadow-reviewer-814:6",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:58:00.000Z",
+        "name": "Meadow Reviewer",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": null,
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag25",
+        "runtime_ids": [
+          "runtime/example-meadow-reviewer"
+        ],
+        "since": "2030-01-01T11:58:00.000Z",
+        "state": "waiting",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:58:00.000Z",
+        "workspace": "~/src/meadow/.worktrees/reviewer"
+      },
+      {
+        "active_work_count": 0,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "docs/release-candidate",
+          "repository": "~/src/meadow"
+        },
+        "current_session_id": "session/example-meadow-docs",
+        "current_work": [],
+        "current_work_ids": [],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "idle",
+        "host_id": "host/quarry",
+        "id": "agent/example/meadow/docs",
+        "incarnation_id": "rt-meadow-docs-107:1",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:58:00.000Z",
+        "name": "Meadow Docs",
+        "next_work": null,
+        "next_work_id": null,
+        "owner_run_id": null,
+        "queued_work_count": 0,
+        "reachability": "local",
+        "revision": "ag14",
+        "runtime_ids": [
+          "runtime/example-meadow-docs"
+        ],
+        "since": "2030-01-01T11:58:00.000Z",
+        "state": "waiting",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [],
+        "upcoming_work_ids": [],
+        "updated_at": "2030-01-01T11:58:00.000Z",
+        "workspace": "~/src/meadow/.worktrees/docs"
+      }
+    ],
+    "machines": [
+      {
+        "capacity": {
+          "reason": "no capacity observation",
+          "state": "unknown"
+        },
+        "fleet_id": "fleet/example-meadow",
+        "host_id": "host/quarry",
+        "id": "machine/quarry",
+        "kind": "machine",
+        "name": "quarry",
+        "occupancy": {
+          "running_runtimes": 2
+        },
+        "projects": [
+          "~/src/meadow"
+        ],
+        "revision": "mh-quarry",
+        "runtime_ids": [
+          "runtime/example-meadow-builder",
+          "runtime/example-meadow-docs"
+        ],
+        "state": "local",
+        "transports": [
+          {
+            "last_success_at": "2030-01-01T11:59:30.000Z",
+            "protocol": "unix",
+            "status": "local"
+          }
+        ],
+        "updated_at": "2030-01-01T11:59:30.000Z",
+        "work": []
+      },
+      {
+        "capacity": {
+          "reason": "no capacity observation",
+          "state": "unknown"
+        },
+        "fleet_id": "fleet/example-meadow",
+        "host_id": "host/lantern",
+        "id": "machine/lantern",
+        "kind": "machine",
+        "name": "lantern",
+        "occupancy": {
+          "running_runtimes": 1
+        },
+        "projects": [
+          "~/src/meadow"
+        ],
+        "revision": "mh-lantern",
+        "runtime_ids": [
+          "runtime/example-meadow-reviewer"
+        ],
+        "state": "reachable",
+        "transports": [
+          {
+            "last_success_at": "2030-01-01T11:59:30.000Z",
+            "protocol": "fabric",
+            "status": "up"
+          }
+        ],
+        "updated_at": "2030-01-01T11:59:30.000Z",
+        "work": []
+      }
+    ],
+    "order": [
+      "agent/example/meadow/builder",
+      "agent/example/meadow/reviewer",
+      "agent/example/meadow/docs"
+    ],
+    "runtimes": [
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-meadow-builder",
+        "incarnation_id": "rt-meadow-builder-443:4",
+        "kind": "runtime",
+        "owner_host_id": "host/quarry",
+        "owner_id": "agent/example/meadow/builder",
+        "owner_run_id": null,
+        "revision": "rt16",
+        "runtime_id": "rt-meadow-builder-443",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      },
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-meadow-reviewer",
+        "incarnation_id": "rt-meadow-reviewer-814:6",
+        "kind": "runtime",
+        "owner_host_id": "host/lantern",
+        "owner_id": "agent/example/meadow/reviewer",
+        "owner_run_id": null,
+        "revision": "rt33",
+        "runtime_id": "rt-meadow-reviewer-814",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      },
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-meadow-docs",
+        "incarnation_id": "rt-meadow-docs-107:1",
+        "kind": "runtime",
+        "owner_host_id": "host/quarry",
+        "owner_id": "agent/example/meadow/docs",
+        "owner_run_id": null,
+        "revision": "rt2",
+        "runtime_id": "rt-meadow-docs-107",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/1/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/2/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/2/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/2/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/2/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/1/transports/0/last_success_at"
+    }
+  ],
+  "variant": "default",
+  "world": "release-candidate-polish"
+}

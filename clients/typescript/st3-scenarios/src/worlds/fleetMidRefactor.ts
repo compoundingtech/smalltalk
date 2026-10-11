@@ -4,7 +4,8 @@ import type { CastAgent, CastPerson } from '../kit/cast.ts'
 import { child, type FactoryContext } from '../kit/context.ts'
 import { agent } from '../kit/factories/agent.ts'
 import { diff } from '../kit/factories/diff.ts'
-import { terminalRun, type TerminalRunResult } from '../kit/factories/terminalRun.ts'
+import { terminalRun } from '../kit/factories/terminalRun.ts'
+import { terminalRecord } from '../kit/factories/terminalRecord.ts'
 import { toolCall } from '../kit/factories/toolCall.ts'
 import { entry, revise, thread, turn } from '../kit/factories/turn.ts'
 import * as resources from '../kit/resources.ts'
@@ -302,30 +303,3 @@ const build = (ctx: FactoryContext): Slices => {
   return { roster, details, attention, conversation, terminal, sync: { ...liveSync(ctx, { conversation }), variant: 'default', source } }
 }
 
-/** A terminal record whose screens up to `now` are state; later screens become events. */
-export const terminalRecord = (
-  ctx: FactoryContext,
-  member: CastAgent,
-  run: TerminalRunResult,
-  startedMs: number,
-): TerminalRecord => ({
-  terminal: member.terminal,
-  owner: member.id,
-  runtime: {
-    id: member.terminalRuntime,
-    kind: 'runtime',
-    revision: 'rt-shell-1',
-    updated_at: ctx.t.at(startedMs),
-    runtime_kind: 'terminal',
-    owner_id: member.id,
-    owner_host_id: member.host.id,
-    state: 'running',
-    runtime_id: member.terminalRuntime.replace('runtime/', ''),
-    incarnation_id: member.terminalIncarnation,
-    desired_revision: 'desired-1',
-    terminal_id: member.terminal,
-  },
-  incarnation: member.terminalIncarnation,
-  cast: run.cast,
-  screens: run.screens.filter((screen) => screen.at_ms <= 0),
-})

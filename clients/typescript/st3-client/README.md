@@ -6,7 +6,8 @@ The package exports TypeScript source with explicit `.ts` relative import specif
 consumers use `allowImportingTsExtensions` for no-emit checking, or
 `rewriteRelativeImportExtensions` when emitting JavaScript.
 The generated source uses erasable TypeScript syntax, and the package type checks enforce
-`erasableSyntaxOnly` for both the raw client and rich schemas.
+`erasableSyntaxOnly` and `exactOptionalPropertyTypes` for both the raw client and rich schemas.
+The raw client also type checks with `verbatimModuleSyntax`.
 
 The client uses standard `fetch`, so callers can supply a fetch implementation and a credential callback. Call `discover()` before rendering capability-dependent controls. List and event limits are checked against the server's advertised bounds. Submit fenced actions with the generated typed methods, then use `followOperation(operation_id)` for accepted actions. `terminalStream` opens the screen stream a `terminal.attach` capability allows and calls `onScreen` with each changed screen; it needs a WebSocket that accepts headers, such as React Native's, or a `socket` factory. `collectionStream` opens the one collections socket: `subscribe` holds a window of missions, attention, agents, or work, `subscribeTerminal` follows a terminal with its attach capability, and `subscribeConversation` follows an agent's or a session's conversation, each by a client-chosen ID; `onFrame` receives every frame. `applyWindow` folds `snapshot` and `changes` frames into a window's ordered rows. Commands sent before the socket opens wait for it.
 
@@ -59,6 +60,12 @@ external app sampling decisions. Daemons without trace propagation ignore both
 headers.
 Web streams require a header-capable `socket` factory: the browser's native
 WebSocket API cannot set these headers.
+
+Collection subscribe commands additionally carry `trace: { traceparent, tracestate? }`, captured when the subscribe is issued rather than when a queued command flushes; daemons ignore unknown command fields.
+
+`client.withTraceContext(callback)` returns a view whose requests and streams carry that callback's context instead, sharing credentials, transport, and discovered capabilities with the original. Use it when one call has its own span, since an asynchronous call reads the callback after its first `await`.
+
+Browser `WebSocket` cannot set headers. A browser socket factory must move the context it receives in `headers` to the `traceparent`/`tracestate` URL query parameters, which the Fractal gateway validates and strips before forwarding.
 
 ## Rich Effect schemas
 

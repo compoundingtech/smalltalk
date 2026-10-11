@@ -1,0 +1,13 @@
+{
+  "generated": true,
+  "reason": "Browser runtime bootstrap asset; the native encoder is used without a renderer or JS semantic port",
+  "revision": "a887df42c56f6de86c0fe6da9c4eeca37931e083",
+  "source": "https://github.com/ghostty-org/ghostty/tree/a887df42c56f6de86c0fe6da9c4eeca37931e083",
+  "zig": "0.15.2",
+  "target": "wasm32-freestanding",
+  "optimize": "ReleaseSmall",
+  "wasmSha256": "e7ddb75d97d435605ea32907544b34d18ebd421b5e885079f87c9c656e9c73c0",
+  "keyHeaderSha256": "0eb11bfab67b887f4b409557b396a5da6ea17e9e62d92b97a38e723b46db635d",
+  "regenerate": "node src/terminal/generateGhosttyEncoder.mjs <pinned-ghostty-source> <zig-0.15.2> <zig-system-deps> <bulk-scratch>",
+  "options": "Mirrored cursor/keypad/kitty flags. Native defaults for modes not published in TerminalModes. Explicit alt escape prefix for browser Alt shortcuts. Browser supplies committed IME text."
+}

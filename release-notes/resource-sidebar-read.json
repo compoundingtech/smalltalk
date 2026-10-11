@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Spaces and the phone now show shared sidebar folders, grouped resources, filtering and device-local collapse choices; empty installs explain how to start",
+  "replay": {
+    "status": "none",
+    "detail": "No runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Read-only arrangement views use existing optional arrangements capability and collections stream. stui reserves its three conversations and terminal on older daemons; the phone falls back to grouped resources with older pairings. No arrangement edits or new required wire fields."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual upgrade step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

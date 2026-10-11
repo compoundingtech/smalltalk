@@ -174,6 +174,13 @@ pub trait Runtime: Send + Sync {
         cut: u128,
     ) -> Result<Value>;
 
+    /// Answers that belong to no one subject, such as a fold across every seat, that a checkpoint
+    /// must leave unchanged. The proof computes them on its copy, which they may write to, before
+    /// and after the drop, and compares them with the subjects' answers.
+    fn checkpoint_global_answers(&self, _transaction: &Transaction<'_>) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
     /// Return the same proof answers, with optional bounded per-item source identities captured
     /// during that read. Sources are diagnostic only and never enter the proof/digest contract.
     fn checkpoint_subject_answers_with_sources(

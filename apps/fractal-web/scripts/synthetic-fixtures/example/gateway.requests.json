@@ -1,0 +1,9 @@
+{
+  "missionId": "mission/synthetic-138/1",
+  "subscriptionId": "subscription/synthetic-138/1",
+  "verifiedSubject": {
+    "state": "present",
+    "reason": null
+  },
+  "requests": []
+}

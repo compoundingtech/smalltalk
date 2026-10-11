@@ -58,8 +58,10 @@ const REQUIRED_CODEX_SERVER_NOTIFICATIONS: &[&str] = &[
     "turn/completed",
     "turn/started",
 ];
-// The control observer does not answer server requests. A listed request is reviewed and safe to
-// ignore. An unlisted request creates a delivery hold until the thread reports a safe status.
+// The control observer answers only an approval request for its own thread, and only with the
+// answer the seat's person gave in st (`CodexApprovalAnswer`). A listed request is reviewed and
+// safe to ignore otherwise. An unlisted request creates a delivery hold until the thread reports
+// a safe status.
 const CLASSIFIED_CODEX_SERVER_REQUESTS: &[&str] = &[
     "account/chatgptAuthTokens/refresh",
     "applyPatchApproval",
@@ -547,6 +549,8 @@ struct CodexDeliveryConfig {
     /// diagnostic's `producerVersion`. `None` only in tests that build a config without a gate.
     producer_version: Option<String>,
     model: Option<String>,
+    /// The seat's person's answers to an approval request, from the owning control plane.
+    prompt_answers: Option<crate::session_control::PromptAnswers>,
 }
 
 impl CodexDeliveryConfig {
@@ -574,6 +578,7 @@ impl CodexDeliveryConfig {
             supervisor,
             producer_version: None,
             model: None,
+            prompt_answers: None,
         })
     }
 
@@ -2114,9 +2119,10 @@ impl CodexControlState {
             | "item/permissions/requestApproval"
                 if message.get("id").is_some() =>
             {
-                // This control subscriber never answers provider requests. Modern requests
-                // carry threadId; older ones use conversationId. The socket can broadcast
-                // requests for other threads, so an unattributed request proves no block here.
+                // Observing a request answers nothing; only a person's answer from st does
+                // (`CodexApprovalAnswer`). Modern requests carry threadId; older ones use
+                // conversationId. The socket can broadcast requests for other threads, so an
+                // unattributed request proves no block here.
                 let request_thread = message
                     .pointer("/params/threadId")
                     .and_then(Value::as_str)
@@ -2754,6 +2760,7 @@ pub fn run_controlled_paths(
     runtime_id: String,
     codex_argv: Vec<String>,
     gate: crate::session_control::DeliveryGate,
+    prompt_answers: Option<crate::session_control::PromptAnswers>,
     resume_thread: Option<String>,
 ) -> Result<()> {
     anyhow::ensure!(
@@ -2781,6 +2788,7 @@ pub fn run_controlled_paths(
         supervisor: None,
         producer_version: Some(producer_version),
         model: None,
+        prompt_answers,
     };
     let _owner_lock = acquire_owner_lock(state_dir)?;
     let mut diagnostics = WrapperDiagnostics::open(state_dir, &identity, &runtime_id)?;
@@ -2849,6 +2857,7 @@ pub fn adopt_controlled_paths(
     socket_path: PathBuf,
     safe_fallback: bool,
     gate: crate::session_control::DeliveryGate,
+    prompt_answers: Option<crate::session_control::PromptAnswers>,
 ) -> Result<()> {
     anyhow::ensure!(
         !codex_argv.is_empty(),
@@ -2875,6 +2884,7 @@ pub fn adopt_controlled_paths(
         supervisor: None,
         producer_version: Some(producer_version),
         model: declared_codex_model(&codex_argv[1..]),
+        prompt_answers,
     };
     let _owner_lock = acquire_owner_lock(state_dir)?;
     let mut diagnostics = WrapperDiagnostics::open(state_dir, &identity, &runtime_id)?;
@@ -4975,6 +4985,169 @@ fn resume_permission_overrides_applied(
         })
 }
 
+/// How often a waiting approval request asks st whether the seat's person answered it.
+const APPROVAL_ANSWER_POLL: Duration = Duration::from_secs(1);
+const APPROVAL_DENIED_FROM_ST: &str = "The person denied this from st.";
+
+/// An approval request Codex waits on for this seat's thread.
+#[derive(Debug, Clone, PartialEq)]
+struct PendingCodexApproval {
+    id: Value,
+    method: String,
+    params: Value,
+    /// The state record's (ownership, transition) sequences of the observation this wait wrote:
+    /// the exact prompt st's answer must be for.
+    prompt: Option<(u64, u64)>,
+    polled: Option<Instant>,
+}
+
+/// Lets the seat's person answer an approval request from st (`prompt.respond`). The app-server
+/// broadcasts the request to every client and takes the first response, so the TUI's prompt and
+/// st race; `serverRequest/resolved` or the thread moving on forgets the request, and st's answer
+/// is sent at most once. A request for another thread is never remembered or answered.
+///
+/// Like Claude's prompt hook, the request binds to the observation its wait wrote, named by the
+/// seat's state record, and st answers only that observation (or a restatement of it). A request
+/// whose wait wrote no new transition (a second request while the record still shows the first)
+/// never binds: it is answered in the terminal, never with the earlier request's answer.
+#[derive(Debug, Default)]
+struct CodexApprovalAnswer {
+    pending: Option<PendingCodexApproval>,
+    /// The last observation a request bound to; a later request never reuses it.
+    last_prompt: Option<(u64, u64)>,
+}
+
+impl CodexApprovalAnswer {
+    fn observe(&mut self, message: &Value, thread_id: &str) {
+        let Some(method) = message.get("method").and_then(Value::as_str) else {
+            return;
+        };
+        let thread = message
+            .pointer("/params/threadId")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                message
+                    .pointer("/params/conversationId")
+                    .and_then(Value::as_str)
+            });
+        match method {
+            "execCommandApproval"
+            | "applyPatchApproval"
+            | "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval" => {
+                if let Some(id) = message.get("id")
+                    && thread == Some(thread_id)
+                {
+                    self.pending = Some(PendingCodexApproval {
+                        id: id.clone(),
+                        method: method.to_owned(),
+                        params: message.get("params").cloned().unwrap_or(Value::Null),
+                        prompt: None,
+                        polled: None,
+                    });
+                }
+            }
+            "serverRequest/resolved" => {
+                if self.pending.as_ref().is_some_and(|pending| {
+                    message.pointer("/params/requestId") == Some(&pending.id)
+                }) {
+                    self.pending = None;
+                }
+            }
+            "thread/status/changed" if thread == Some(thread_id) => {
+                let waiting = message
+                    .pointer("/params/status/activeFlags")
+                    .and_then(Value::as_array)
+                    .is_some_and(|flags| flags.iter().any(|flag| flag == "waitingOnApproval"));
+                if !waiting {
+                    self.pending = None;
+                }
+            }
+            "turn/completed" if thread == Some(thread_id) => self.pending = None,
+            _ => {}
+        }
+    }
+
+    /// The response to send once st reports the person's answer, checked at most once a second.
+    /// `record` reads the seat's state record, which the request's wait has written by the time
+    /// this runs; `read` asks st about the bound observation.
+    fn answer_if_due(
+        &mut self,
+        now: Instant,
+        record: impl FnOnce() -> Option<harness_state::Observed>,
+        read: impl FnOnce(u64, u64) -> Option<crate::session_control::PromptAnswer>,
+    ) -> Option<Value> {
+        use crate::session_control::PromptAnswer;
+        let pending = self.pending.as_mut()?;
+        if pending
+            .polled
+            .is_some_and(|polled| now.duration_since(polled) < APPROVAL_ANSWER_POLL)
+        {
+            return None;
+        }
+        pending.polled = Some(now);
+        if pending.prompt.is_none() {
+            pending.prompt = record()
+                .filter(|observed| {
+                    observed.blocked_on == harness_state::BlockedOn::Human
+                        && observed.ask == harness_state::Ask::Permission
+                })
+                .and_then(|observed| {
+                    observed
+                        .ownership_sequence
+                        .zip(observed.transition_sequence)
+                })
+                .filter(|prompt| self.last_prompt != Some(*prompt));
+            if pending.prompt.is_some() {
+                self.last_prompt = pending.prompt;
+            }
+        }
+        let (ownership, transition) = pending.prompt?;
+        match read(ownership, transition)? {
+            PromptAnswer::Open => None,
+            PromptAnswer::Gone => {
+                self.pending = None;
+                None
+            }
+            PromptAnswer::Answered { answer } => {
+                let pending = self.pending.take()?;
+                let result = approval_decision(&pending.method, &pending.params, &answer)?;
+                Some(json!({ "id": pending.id, "result": result }))
+            }
+        }
+    }
+}
+
+/// The result of an approval request for a person's `allow` or `deny`, in the method's words:
+/// legacy requests take a `ReviewDecision`, v2 command and file requests `accept`/`decline`, and a
+/// permissions request the profile it grants (the one requested, or none). Measured live on Codex
+/// 0.160.1: only `item/commandExecution/requestApproval` answered `accept` from a non-TUI client.
+/// Every other shape here (`decline`, file changes, the legacy `approved` and object-form
+/// `denied`, permissions grants) follows that version's generated app-server schema only.
+fn approval_decision(method: &str, params: &Value, answer: &str) -> Option<Value> {
+    let allow = match answer {
+        "allow" => true,
+        "deny" => false,
+        _ => return None,
+    };
+    Some(match method {
+        "execCommandApproval" | "applyPatchApproval" if allow => json!({ "decision": "approved" }),
+        "execCommandApproval" | "applyPatchApproval" => {
+            json!({ "decision": { "denied": { "rejection": APPROVAL_DENIED_FROM_ST } } })
+        }
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            json!({ "decision": if allow { "accept" } else { "decline" } })
+        }
+        "item/permissions/requestApproval" if allow => json!({
+            "permissions": params.get("permissions").cloned().unwrap_or_else(|| json!({})),
+            "scope": "turn",
+        }),
+        "item/permissions/requestApproval" => json!({ "permissions": {} }),
+        _ => return None,
+    })
+}
+
 fn pump_control(
     mut websocket: WebSocket<UnixStream>,
     binding_path: &Path,
@@ -5012,6 +5185,16 @@ fn pump_control(
         let mut last_transcript_turn_recovery = None;
         let mut peer_closed = false;
         let delivery_ledger_path = control_state_path.with_file_name(delivery_ledger::LEDGER_FILE);
+        // The answer source, and the state record the approval's observation is written to.
+        let prompt_answers = delivery.as_ref().and_then(|config| {
+            config.prompt_answers.clone().map(|answers| {
+                (
+                    answers,
+                    harness_state::harness_state_path(&config.agent_dir),
+                )
+            })
+        });
+        let mut approval_answer = CodexApprovalAnswer::default();
         let mut delivery = delivery
             .map(|config| {
                 CodexInboxDelivery::new(
@@ -5052,6 +5235,16 @@ fn pump_control(
         loop {
             if let Some(delivery) = delivery.as_mut() {
                 delivery.sync_safe_fallback_diagnostic();
+            }
+            if let Some((answers, record)) = prompt_answers.as_ref()
+                && let Some(response) = approval_answer.answer_if_due(
+                    Instant::now(),
+                    || harness_state::read(record, None),
+                    |ownership, transition| answers.read(ownership, transition),
+                )
+            {
+                write_json_message(&mut websocket, &response)
+                    .context("answering a Codex approval request from st")?;
             }
             if !peer_closed
                 && let Err(error) = websocket.get_ref().set_read_timeout(Some(CONTROL_POLL))
@@ -5225,6 +5418,7 @@ fn pump_control(
             let state = control_state
                 .as_mut()
                 .context("Codex control state is unbound")?;
+            approval_answer.observe(&message, state.thread_id());
             if let Some(delivery) = delivery.as_mut() {
                 // Some Codex builds keep a secondary subscriber busy with status traffic while
                 // omitting the compaction item itself. Rate-limit this independently of socket
