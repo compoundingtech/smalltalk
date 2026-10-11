@@ -1,0 +1,191 @@
+{
+  "labels": [
+    {
+      "name": "area:agent-spec",
+      "color": "1d76db",
+      "description": "Agent Spec format, parsing, and the agent-spec crate · Set: manual"
+    },
+    {
+      "name": "area:catalog",
+      "color": "1d76db",
+      "description": "Catalog structure, declarations, transactions, and admission · Set: manual"
+    },
+    {
+      "name": "area:ci",
+      "color": "1d76db",
+      "description": "CI workflows, runners, and pipeline configuration · Set: manual"
+    },
+    {
+      "name": "area:ding",
+      "color": "1d76db",
+      "description": "DING delivery: inbox notice into a running agent · Set: manual"
+    },
+    {
+      "name": "area:doctor",
+      "color": "1d76db",
+      "description": "doctor, validate, and task inventory diagnostics · Set: manual"
+    },
+    {
+      "name": "area:driver",
+      "color": "1d76db",
+      "description": "Harness drivers: launch, MCP, app-server, native delivery · Set: manual"
+    },
+    {
+      "name": "area:eval",
+      "color": "1d76db",
+      "description": "st2 eval harness and fixtures · Set: manual"
+    },
+    {
+      "name": "area:exec",
+      "color": "1d76db",
+      "description": "Exec backend and process-group management · Set: manual"
+    },
+    {
+      "name": "area:identity",
+      "color": "1d76db",
+      "description": "Agent, session, run, and launch-generation identity · Set: manual"
+    },
+    {
+      "name": "area:message",
+      "color": "1d76db",
+      "description": "Native message bus, inbox, archive, and receipts · Set: manual"
+    },
+    {
+      "name": "area:presence",
+      "color": "1d76db",
+      "description": "Presence, status records, and heartbeats · Set: manual"
+    },
+    {
+      "name": "area:pty",
+      "color": "1d76db",
+      "description": "PTY sessions and terminal integration · Set: manual"
+    },
+    {
+      "name": "area:reconcile",
+      "color": "1d76db",
+      "description": "Supervisor run loop, lifecycle, restart, park, and teardown · Set: manual"
+    },
+    {
+      "name": "area:resource",
+      "color": "1d76db",
+      "description": "Typed Resource bindings and linked records · Set: manual"
+    },
+    {
+      "name": "area:telemetry",
+      "color": "1d76db",
+      "description": "OpenTelemetry and observability instrumentation · Set: manual"
+    },
+    {
+      "name": "area:vrs",
+      "color": "1d76db",
+      "description": "VRS documentation system (vision/requirements/spec) · Set: manual"
+    },
+    {
+      "name": "ci-priority",
+      "color": "d73a4a",
+      "description": "Urgent trusted PR: reserve CI capacity ahead of ordinary PRs · Set: manual"
+    },
+    {
+      "name": "harness:claude",
+      "color": "a371f7",
+      "description": "Claude Code-specific behavior · Set: manual"
+    },
+    {
+      "name": "harness:codex",
+      "color": "a371f7",
+      "description": "Codex-specific behavior · Set: manual"
+    },
+    {
+      "name": "harness:neutral",
+      "color": "a371f7",
+      "description": "Harness-neutral core that must not encode provider specifics · Set: manual"
+    },
+    {
+      "name": "macos-ci",
+      "color": "5319e7",
+      "description": "Run the optional macOS CI workflow for this pull request · Set: manual"
+    },
+    {
+      "name": "needs-design-input",
+      "color": "6e7781",
+      "description": "Draft needs Nathan’s design feedback only; never authorizes merge · Set: author or maintainer"
+    },
+    {
+      "name": "origin:agent",
+      "color": "6f42c1",
+      "description": "Filed or primarily produced by an AI agent · Set: AI agent or manual"
+    },
+    {
+      "name": "origin:janitor",
+      "color": "6f42c1",
+      "description": "Filed by janitor automation · Set: janitor-cli"
+    },
+    {
+      "name": "priority:p0",
+      "color": "b60205",
+      "description": "First in the capped ready set: instant web app or memory/OOM fix · Set: author or maintainer"
+    },
+    {
+      "name": "state:blocked",
+      "color": "6e7781",
+      "description": "Blocked on an external dependency or decision · Set: manual"
+    },
+    {
+      "name": "state:needs-research",
+      "color": "6e7781",
+      "description": "Needs research / investigation before scope or approach is clear · Set: manual"
+    },
+    {
+      "name": "state:open-design-question",
+      "color": "6e7781",
+      "description": "Unresolved design choice requiring explicit alignment before implementation · Set: manual"
+    },
+    {
+      "name": "state:triage",
+      "color": "6e7781",
+      "description": "Needs classification or owner decision · Set: manual"
+    },
+    {
+      "name": "type:agent-tooling",
+      "color": "1f8fb8",
+      "description": "Agent, automation, AI workflow, or developer-agent tooling · Set: manual"
+    },
+    {
+      "name": "type:bug",
+      "color": "d73a4a",
+      "description": "Something broken or a regression · Set: manual"
+    },
+    {
+      "name": "type:chore",
+      "color": "bfd4e2",
+      "description": "Maintenance, cleanup, dependencies, or CI · Set: manual"
+    },
+    {
+      "name": "type:docs",
+      "color": "0075ca",
+      "description": "Documentation-only change or documentation task · Set: manual"
+    },
+    {
+      "name": "type:epic",
+      "color": "8250df",
+      "description": "Large tracking issue with child tasks · Set: manual"
+    },
+    {
+      "name": "type:feature",
+      "color": "0e8a16",
+      "description": "New user-visible or system capability · Set: manual"
+    },
+    {
+      "name": "type:incident",
+      "color": "b60205",
+      "description": "Live or recent operational incident · Set: manual or andon CLI"
+    },
+    {
+      "name": "type:rca",
+      "color": "5319e7",
+      "description": "Root-cause analysis or investigation record · Set: manual"
+    }
+  ],
+  "deprecated": [],
+  "legacyMigrations": []
+}
