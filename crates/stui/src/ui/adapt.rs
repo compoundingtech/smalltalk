@@ -1833,6 +1833,7 @@ mod tests {
             st3_ui_model::missions::StepMetadata {
                 blocked_reason: None,
                 last_progress: Some("  Tests pass on\nmain; opening the PR \n".into()),
+                nudged: None,
             },
         );
         mission.step_metadata.insert(

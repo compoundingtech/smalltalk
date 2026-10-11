@@ -1146,6 +1146,7 @@ export type MissionStep = {
   loop_reason?: string | null;
   loop_round?: number | null;
   next_wake_at?: (Timestamp | null);
+  nudged_at?: (Timestamp | null);
   path: string;
   progress_at?: (Timestamp | null);
   since: Timestamp;
@@ -2377,6 +2378,7 @@ export type Work = ResourceHeader & {
   last_progress?: string | null;
   mission_id?: (Id | null);
   mission_run_id: Id;
+  nudged_at_unix_ms?: number | null;
   path: string;
   person_answers?: Array<PersonAnswerRecord>;
   progress_at?: (Timestamp | null);

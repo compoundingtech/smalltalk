@@ -937,7 +937,8 @@
         "next_wake_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "Observed not-before time: earliest work eligibility, not a promise of wake dispatch." },
         "wake_reason": { "type": ["string", "null"], "description": "The deferral's blocked reason, or the observed wake failure when no deferral reason exists." },
         "wake": { "oneOf": [{ "$ref": "#/$defs/MissionWake" }, { "type": "null" }] },
-        "claim_expires_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+        "claim_expires_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "nudged_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "When st last nudged this held step's holder for idling with nothing set to wake it." }
       }
     },
     "MissionWake": {
@@ -994,6 +995,7 @@
             "agentless": { "type": "boolean" },
             "claim_expires_at_unix_ms": { "type": ["integer", "null"], "minimum": 0, "x-st-codec": "epoch-ms" },
             "execution_started_at_unix_ms": { "type": ["integer", "null"], "minimum": 0, "x-st-codec": "epoch-ms" },
+            "nudged_at_unix_ms": { "type": ["integer", "null"], "minimum": 0, "x-st-codec": "epoch-ms", "description": "When st last nudged this held step's holder for idling with nothing set to wake it." },
             "execution_elapsed_ms": { "type": "integer", "minimum": 0, "x-st-codec": "duration-ms" },
             "timeout_ms": { "type": ["integer", "null"], "minimum": 0, "x-st-codec": "duration-ms" },
             "blocked_reason": { "type": ["string", "null"] },

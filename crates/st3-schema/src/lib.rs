@@ -1529,6 +1529,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "work.nudged",
+            &["step-run"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
+        ),
+        (
             "gate.requested",
             &["gate-operation"],
             WritePolicy::SystemOnly,
@@ -2753,6 +2762,14 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("handoff_to", reference()),
             ("handoff_message", reference()),
             ("handoff_acknowledged", reference()),
+        ],
+        "work.nudged" => &[
+            ("attempt", integer()),
+            ("agent", reference()),
+            ("message", reference()),
+            ("idle_since_unix_ms", string()),
+            ("reason", string()),
+            ("waits", array()),
         ],
         "gate.requested" => &[
             ("status", string()),
@@ -4215,6 +4232,7 @@ mod tests {
                 "work.claimed",
                 "work.extended",
                 "work.failed",
+                "work.nudged",
                 "work.person-asked",
                 "work.person-cancelled",
                 "work.person-done",
