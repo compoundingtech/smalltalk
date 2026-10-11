@@ -3425,9 +3425,9 @@ impl Store {
     pub fn subscribe_agents_publications(
         &self,
     ) -> tokio::sync::watch::Receiver<Option<Arc<agents_publication::AgentsPublication>>> {
-        let receiver = self.smalltalk.agents_publication.subscribe();
-        // Register before requesting, so the source owner cannot miss new demand.
-        self.request_agent_roster_refresh();
+        let (receiver, first) = self.smalltalk.agents_publication.subscribe();
+        // Register before requesting. Later sockets join the same freshness owner.
+        if first { self.request_agent_roster_refresh(); }
         receiver
     }
 

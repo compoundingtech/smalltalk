@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Stream complete agents publications with bounded snapshot chunks and revision-fenced changes",
+  "replay": {"status": "none", "detail": "Only the current publication is available. Reconnect and resubscribe start with a complete snapshot. No replay log is added."},
+  "schema": {"status": "none", "detail": "No database tables, indexes, migrations or claim schemas change. The client contract adds an explicit revisioned agents subscription and typed publication frames."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes."},
+  "compatibility": {"status": "none", "detail": "The revisioned agents stream is opt-in. Legacy HTTP and WebSocket payloads remain unchanged. New clients can request complete snapshots and use epoch and base revision to fence changes. The collections.agents.revisioned.v1 capability requires read.projections."},
+  "downtime": {"status": "none", "detail": "An ordinary binary upgrade restart starts a new publication epoch. No additional interruption is required."},
+  "manual": {"status": "none", "detail": "Existing installations require no configuration or state changes."},
+  "recovery": {"status": "none", "detail": "Returning to the previous binary requires no database rollback. Clients without the capability continue to use legacy subscriptions."}
+}

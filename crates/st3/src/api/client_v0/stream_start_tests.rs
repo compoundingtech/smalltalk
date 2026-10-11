@@ -65,7 +65,7 @@ async fn cold_open_four_subscriptions_do_not_wait_for_slow_roster() {
     server.abort();
 }
 
-fn process_cpu_ms() -> f64 {
+pub(in crate::api) fn process_cpu_ms() -> f64 {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: getrusage initializes the structure on success.
     assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) }, 0);

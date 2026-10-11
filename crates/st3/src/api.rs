@@ -15974,6 +15974,7 @@ mod tests {
     use axum::http::Request;
     use std::path::PathBuf;
     include!("api/agents_publication_tests.rs");
+    include!("api/agents_stream_bench_tests.rs");
 
 
     #[tokio::test]

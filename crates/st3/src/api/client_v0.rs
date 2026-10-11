@@ -11,18 +11,22 @@ pub(super) mod arrangements;
 pub(super) mod conversation_blocks;
 mod collection_windows;
 mod collection_ivm;
+mod agents_publication_stream;
+mod agents_publication_frames;
 #[cfg(test)]
 mod collection_refresh_tests;
 mod summary;
 
 #[cfg(test)]
-mod stream_start_tests;
+pub(super) mod stream_start_tests;
 #[cfg(test)]
 pub(super) mod observer_subscription_detail_tests;
 #[cfg(test)]
 mod launch_detail_tests;
 #[cfg(test)]
 mod agents_window_tests;
+#[cfg(test)]
+mod agents_publication_stream_tests;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
@@ -50,6 +54,7 @@ struct CollectionSubscribe {
     #[serde(default, deserialize_with = "collection_name")]
     collection: String,
     limit: Option<usize>,
+    agents_publication_version: Option<u8>,
     person: Option<String>,
     /// Follow one arrangement instead of the owner's bounded prefix window.
     subject: Option<String>,
@@ -81,6 +86,7 @@ struct CollectionSubscription {
     previous: Arc<BTreeMap<String, Value>>,
     ivm: Option<Arc<collection_ivm::Adapter>>,
     cursor: Option<collection_ivm::Delivered>,
+    revisioned: Option<agents_publication_stream::Subscription>,
     order: Vec<String>,
     has_more: bool,
     /// The roster publication revision when this window's last read began. An agents window
@@ -742,6 +748,7 @@ async fn deliver_collection(
 enum CollectionRead {
     Legacy(Result<(ClientSnapshot, Vec<Value>, bool), ApiError>),
     Ivm(Box<Result<collection_ivm::Candidate, ApiError>>),
+    Revisioned(Result<agents_publication_stream::Delivery, ApiError>),
 }
 
 async fn deliver_ivm_collection(
@@ -1313,6 +1320,9 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut ivm_notices = sources.as_ref().map(|sources| sources.subscribe());
     let mut changed = state.event_notify.subscribe();
     let mut roster = state.store.subscribe_agent_roster();
+    // Only opted-in subscriptions keep revisioned-owner demand alive.
+    let mut publications: Option<watch::Receiver<Option<Arc<crate::store::agents_publication::AgentsPublication>>>> = None;
+    let mut publication_due: Option<tokio::time::Instant> = None;
     let mut views = state.store.subscribe_collection_views();
     let windows = collection_windows::Windows::attach(&state.store);
     let mut window_revisions = [0; 8];
@@ -1385,6 +1395,10 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                             if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
                             break 'command;
                         }
+                        if let Err(error) = agents_publication_stream::validate(&request) {
+                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "collection":request.collection, "code":error.code, "message":error.message, "retryable":false})).await { return; }
+                            break 'command;
+                        }
                         // What this client follows, for clients.list.
                         if let Some(presence) = &presence {
                             presence.follow(&request.id, match request.collection.as_str() {
@@ -1442,7 +1456,12 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                         }
                         refresh.push(request.id.clone());
                         // Collection results and conversation frames share the same generation fence.
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm: sources.as_ref().and_then(|sources| sources.adapter(&request.collection)), cursor: None, order: Vec::new(), has_more: false, roster_revision: 0, view_revision: 0, opened: Some(std::time::Instant::now()), request });
+                        let revisioned = request.agents_publication_version.map(|_| {
+                            if publications.is_none() { publications = Some(state.store.subscribe_agents_publications()); }
+                            agents_publication_stream::Subscription::default()
+                        });
+                        let ivm = if revisioned.is_none() { sources.as_ref().and_then(|sources| sources.adapter(&request.collection)) } else { None };
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { generation, reading: None, dirty: false, delivered: false, previous: Arc::new(BTreeMap::new()), ivm, cursor: None, revisioned, order: Vec::new(), has_more: false, roster_revision: 0, view_revision: 0, opened: Some(std::time::Instant::now()), request });
 
                     }
                     next = futures_util::FutureExt::now_or_never(socket.recv());
@@ -1453,15 +1472,24 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 let Some(subscription) = subscriptions.get_mut(&id) else { continue; };
                 if subscription.generation != generation { continue; }
                 subscription.reading = None;
-                if std::mem::take(&mut subscription.dirty) { refresh.push(id.clone()); }
+                if std::mem::take(&mut subscription.dirty) && subscription.revisioned.is_none() { refresh.push(id.clone()); }
                 let refreshed = match result {
                     CollectionRead::Legacy(result) => deliver_collection(&mut socket, subscription, result).await,
                     CollectionRead::Ivm(result) => deliver_ivm_collection(&mut socket, subscription, *result, &mut refresh).await,
+                    CollectionRead::Revisioned(result) => agents_publication_stream::deliver(&mut socket, &state, &session, subscription, result).await,
                 };
+                if matches!(refreshed, Refreshed::Current) && subscription.revisioned.as_ref().is_some_and(|held| !held.is_current(state.store.agents_publication().as_deref())) {
+                    // A final quiet input must survive an older successful preparation/send.
+                    publication_due.get_or_insert_with(tokio::time::Instant::now);
+                }
                 match refreshed {
                     Refreshed::Current => {}
                     Refreshed::Retry => {
-                        if subscription.ivm.is_some() { subscription.dirty = true; }
+                        if subscription.revisioned.is_some() {
+                            subscription.dirty = true;
+                            publication_due.get_or_insert(tokio::time::Instant::now() + Duration::from_millis(50));
+                        }
+                        else if subscription.ivm.is_some() { subscription.dirty = true; }
                         else { reread_due.insert(id.clone()); }
                     }
                     Refreshed::Dropped => { subscriptions.remove(&id); reread_due.remove(&id); }
@@ -1495,7 +1523,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 // a commit that can change the agents roster asks its refresher to publish.
                 let index = state.store.index().unwrap_or(weighed);
                 let roster_refresher = state.store.agent_roster_refresher_running();
-                let followed = |s: &CollectionSubscription| s.ivm.is_none()
+                let followed = |s: &CollectionSubscription| s.revisioned.is_none() && s.ivm.is_none()
                     && !state.store.collection_view_published(&s.request.collection);
                 if !subscriptions.values().any(followed) {
                     weighed = index;
@@ -1553,15 +1581,39 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 if result.is_err() { return; }
                 // A window read before this roster was published rereads it.
                 let published = *roster.borrow_and_update();
-                let stale = subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                let stale = subscriptions.iter().filter(|(_, s)| s.revisioned.is_none() && s.ivm.is_none()
                     && s.request.collection == "agents" && s.roster_revision < published);
                 if publication_rereads(stale, &mut reread_due, &mut refresh, last_reread) { continue; }
+            }
+            result = async {
+                match &mut publications {
+                    Some(receiver) => receiver.changed().await,
+                    None => std::future::pending().await,
+                }
+            }, if !command_waiting && publications.is_some() => {
+                if result.is_err() { return; }
+                // Mark this notice consumed without retaining a second complete publication.
+                if let Some(receiver) = &mut publications { receiver.borrow_and_update(); }
+                // The first notice sets a non-sliding deadline. Bursts replace the owner's
+                // latest pointer; they do not accumulate historical revisions or extend it.
+                agents_publication_stream::schedule_notice(&mut publication_due);
+            }
+            () = async {
+                match publication_due {
+                    Some(due) => tokio::time::sleep_until(due).await,
+                    None => std::future::pending().await,
+                }
+            }, if !command_waiting && publication_due.is_some() => {
+                publication_due = None;
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.revisioned.as_ref()
+                    .is_some_and(|held| s.dirty || !held.is_current(state.store.agents_publication().as_deref())))
+                    .map(|(id, _)| id.clone()));
             }
             result = views.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 // The same for every other published view.
                 let published = *views.borrow_and_update();
-                let stale = subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                let stale = subscriptions.iter().filter(|(_, s)| s.revisioned.is_none() && s.ivm.is_none()
                     && s.view_revision < crate::store::published_views::revision(&published, &s.request.collection));
                 if publication_rereads(stale, &mut reread_due, &mut refresh, last_reread) { continue; }
             }
@@ -1576,7 +1628,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 // paired grant's expiry. Stable rows remain reusable; authority and local
                 // overlays are rechecked on reads.
                 let paired = session.transport != "unix";
-                refresh.extend(subscriptions.iter().filter(|(_, s)| s.ivm.is_none()
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.revisioned.is_none() && s.ivm.is_none()
                     && (paired || collection_follows_clock(&s.request.collection)))
                     .map(|(id, _)| id.clone()));
             }
@@ -1613,6 +1665,10 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 continue;
             }
         }
+        if !subscriptions.values().any(|subscription| subscription.revisioned.is_some()) {
+            publications = None;
+            publication_due = None;
+        }
         refresh.sort_unstable();
         refresh.dedup();
         // A permanently refused dirty window no longer counts toward held-window refreshes.
@@ -1622,8 +1678,8 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
         }
         // Rereads are paced together: reading any due window, or every held window (as a lone
         // new subscription does), starts the next interval.
-        let legacy_windows = subscriptions.values().filter(|s| s.ivm.is_none()).count();
-        let refreshed_legacy = refresh.iter().filter(|id| subscriptions.get(*id).is_some_and(|s| s.ivm.is_none())).count();
+        let legacy_windows = subscriptions.values().filter(|s| s.revisioned.is_none() && s.ivm.is_none()).count();
+        let refreshed_legacy = refresh.iter().filter(|id| subscriptions.get(*id).is_some_and(|s| s.revisioned.is_none() && s.ivm.is_none())).count();
         if refresh.iter().any(|id| reread_due.contains(id)) || legacy_windows > 0 && refreshed_legacy == legacy_windows {
             last_reread = tokio::time::Instant::now();
         }
@@ -1652,13 +1708,17 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
             let adapter = subscription.ivm.clone();
             let cursor = subscription.cursor.clone();
             let previous = subscription.previous.clone();
+            let delivered = subscription.revisioned.as_ref().and_then(|held| held.delivered.clone());
+            let revisioned = subscription.revisioned.is_some();
             reads.push(async move {
                 tokio::select! {
                     biased;
                     _ = canceled => None,
                     result = async {
                         let permit = read_slots.acquire_owned().await.expect("socket read slots stay open");
-                        if let (Some(sources), Some(adapter)) = (sources, adapter) {
+                        if revisioned {
+                            CollectionRead::Revisioned(agents_publication_stream::prepare(state, session, request, delivered, permit).await)
+                        } else if let (Some(sources), Some(adapter)) = (sources, adapter) {
                             CollectionRead::Ivm(Box::new(collection_ivm::read(state, session, request, permit, sources, adapter, collection_ivm::Held {cursor, rows:previous}).await))
                         } else {
                             CollectionRead::Legacy(read(state, session, request, permit).await)
@@ -2163,7 +2223,7 @@ impl ClientSession {
         }
     }
 
-    fn local(person: Option<&str>) -> Result<Self, ApiError> {
+    pub(super) fn local(person: Option<&str>) -> Result<Self, ApiError> {
         let custom_forms = false;
         if person.is_some_and(|person| {
             !(person.starts_with("person/") && person.matches('/').count() == 1
@@ -2251,6 +2311,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
     // the attention collection and routes, and the summary counts alerts.
     capabilities.push(json!({"id":"alerts", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"collections", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
+    capabilities.push(json!({"id":"collections.agents.revisioned.v1", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"custom-subjects", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"owned-sets", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
     capabilities.push(json!({"id":"glasses", "version":2, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
