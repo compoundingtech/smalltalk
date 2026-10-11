@@ -432,6 +432,238 @@ mod tests {
             .unwrap()
     }
 
+    // Seed a finite retained history without fabricating historical callback or
+    // outbox evidence. These rows are authored fixtures, not submitted batches;
+    // the byte-boundary fixture can contain a retained row wider than MAX_BATCH.
+    fn seed_retained_timeline(root: &Path, operations: &[Operation]) {
+        let mut connection = super::super::open(root).unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        for operation in operations {
+            tx.execute(
+                "INSERT INTO timeline(incarnation,source,body) VALUES (?1,?2,?3)",
+                params![
+                    operation.incarnation_id,
+                    operation.source_id,
+                    serde_json::to_string(operation).unwrap()
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    fn retained_timeline_sizes(root: &Path) -> Vec<(u64, u64, u64)> {
+        super::super::open(root)
+            .unwrap()
+            .prepare("SELECT id,length(CAST(body AS BLOB)),length(body) FROM timeline ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    fn retention_operation(template: &Operation, sequence: u64) -> Operation {
+        let mut operation = template.clone();
+        operation.sequence = sequence;
+        operation.entry_id = format!("retained-{sequence}");
+        operation.source_id = Some(format!("source/retained-{sequence}"));
+        operation
+    }
+
+    fn operation_with_serialized_size(template: &Operation, size: usize) -> Operation {
+        let mut operation = template.clone();
+        operation.body = serde_json::json!({"text":""});
+        let overhead = serde_json::to_vec(&operation).unwrap().len();
+        assert!(size >= overhead);
+        // ASCII padding makes each added byte exact. The submitted boundary
+        // operation below deliberately uses multibyte UTF-8 instead.
+        operation.body = serde_json::json!({"text":"x".repeat(size - overhead)});
+        assert_eq!(serde_json::to_vec(&operation).unwrap().len(), size);
+        operation
+    }
+
+    #[test]
+    fn shared_timeline_retention_keeps_4096_rows_and_prunes_only_the_oldest() {
+        let production = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        prepare(production.path(), "omp");
+        let (_, mut record, template, seq) = prepare(private.path(), "omp");
+        let history = (1..4096)
+            .map(|sequence| retention_operation(&template, sequence))
+            .collect::<Vec<_>>();
+        for root in [production.path(), private.path()] {
+            seed_retained_timeline(root, &history);
+            let sizes = retained_timeline_sizes(root);
+            assert_eq!(sizes.len(), 4095);
+            assert!(sizes.iter().map(|row| row.1).sum::<u64>() < 2_097_152);
+        }
+        let production_before = pending_bytes(production.path());
+        let private_before = pending_bytes(private.path());
+        for sequence in [4096, 4097] {
+            let operation = retention_operation(&template, sequence);
+            record.next_sequence = sequence + 1;
+            record.operations = vec![operation.clone()];
+            super::super::write_timeline(
+                production.path(),
+                &record,
+                std::slice::from_ref(&operation),
+            )
+            .unwrap();
+            write_timeline_with_output(
+                private.path(),
+                &record,
+                std::slice::from_ref(&operation),
+                &batch(&record, seq, &[]),
+            )
+            .unwrap();
+            assert_eq!(
+                shared_timeline_image(production.path()),
+                shared_timeline_image(private.path())
+            );
+            let sizes = retained_timeline_sizes(private.path());
+            assert_eq!(sizes.len(), 4096);
+            assert_eq!(sizes.first().unwrap().0, sequence - 4095);
+            assert_eq!(sizes.last().unwrap().0, sequence);
+            assert!(sizes.iter().map(|row| row.1).sum::<u64>() < 2_097_152);
+            assert_eq!(
+                pending_bytes(production.path()) - production_before,
+                pending_bytes(private.path()) - private_before - output_event_bytes(private.path())
+            );
+        }
+    }
+
+    #[test]
+    fn shared_timeline_retention_keeps_exact_utf8_byte_limit_then_prunes_whole_rows() {
+        const LIMIT: usize = 2_097_152;
+        let production = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        prepare(production.path(), "omp");
+        let (_, mut record, template, seq) = prepare(private.path(), "omp");
+        let mut first = retention_operation(&template, 3);
+        first.body = serde_json::json!({"text":"λ🙂".repeat(256)});
+        let first_bytes = serde_json::to_vec(&first).unwrap().len();
+        let old_first = operation_with_serialized_size(&retention_operation(&template, 1), 700_000);
+        let old_second = operation_with_serialized_size(
+            &retention_operation(&template, 2),
+            LIMIT - 700_000 - first_bytes,
+        );
+        let history = [old_first, old_second];
+        for root in [production.path(), private.path()] {
+            seed_retained_timeline(root, &history);
+            assert_eq!(
+                retained_timeline_sizes(root)
+                    .iter()
+                    .map(|row| row.1)
+                    .sum::<u64>(),
+                (LIMIT - first_bytes) as u64
+            );
+        }
+        let second = retention_operation(&template, 4);
+        let second_bytes = serde_json::to_vec(&second).unwrap().len();
+        let production_before = pending_bytes(production.path());
+        let private_before = pending_bytes(private.path());
+        for operation in [first, second] {
+            record.next_sequence = operation.sequence + 1;
+            record.operations = vec![operation.clone()];
+            super::super::write_timeline(
+                production.path(),
+                &record,
+                std::slice::from_ref(&operation),
+            )
+            .unwrap();
+            write_timeline_with_output(
+                private.path(),
+                &record,
+                std::slice::from_ref(&operation),
+                &batch(&record, seq, &[]),
+            )
+            .unwrap();
+            assert_eq!(
+                shared_timeline_image(production.path()),
+                shared_timeline_image(private.path())
+            );
+            let sizes = retained_timeline_sizes(private.path());
+            let ids = sizes.iter().map(|row| row.0).collect::<Vec<_>>();
+            let bytes = sizes.iter().map(|row| row.1).sum::<u64>();
+            if operation.sequence == 3 {
+                assert_eq!(ids, vec![1, 2, 3]);
+                assert_eq!(bytes, LIMIT as u64, "exact byte limit is inclusive");
+            } else {
+                assert_eq!(ids, vec![2, 3, 4]);
+                assert_eq!(bytes, (LIMIT - 700_000 + second_bytes) as u64);
+            }
+            assert!(sizes.iter().map(|row| row.2).sum::<u64>() < bytes);
+            assert_eq!(
+                pending_bytes(production.path()) - production_before,
+                pending_bytes(private.path()) - private_before - output_event_bytes(private.path())
+            );
+        }
+    }
+
+    #[test]
+    fn failed_output_event_restores_rows_pruned_by_shared_timeline_retention() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut record, template, seq) = prepare(root.path(), "omp");
+        let history = (1..=4096)
+            .map(|sequence| retention_operation(&template, sequence))
+            .collect::<Vec<_>>();
+        seed_retained_timeline(root.path(), &history);
+        assert!(
+            retained_timeline_sizes(root.path())
+                .iter()
+                .map(|row| row.1)
+                .sum::<u64>()
+                < 2_097_152
+        );
+        let operation = retention_operation(&template, 4097);
+        record.next_sequence = 4098;
+        record.operations = vec![operation.clone()];
+        let progress = [OutputProgress {
+            operation: &operation,
+            original_at_ms: 10,
+            body_changed: true,
+            tool_identity_complete: true,
+        }];
+        let before = spool_image(root.path());
+        super::super::open(root.path())
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_output_retention BEFORE INSERT ON events
+             WHEN NEW.kind='harness-output'
+             BEGIN SELECT RAISE(ABORT,'output retention failure'); END;",
+            )
+            .unwrap();
+        let error = write_timeline_with_output(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &progress),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("output retention failure"));
+        assert_eq!(spool_image(root.path()), before);
+        super::super::open(root.path())
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_output_retention")
+            .unwrap();
+        // The same admitted batch now succeeds and actually crosses retention,
+        // so a guard refusal before append cannot satisfy the rollback control.
+        write_timeline_with_output(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &progress),
+        )
+        .unwrap();
+        let sizes = retained_timeline_sizes(root.path());
+        assert_eq!(sizes.len(), 4096);
+        assert_eq!(sizes.first().unwrap().0, 2);
+        assert_eq!(sizes.last().unwrap().0, 4097);
+    }
+
     #[test]
     fn production_and_private_writes_match_shared_timeline_effects() {
         for driver in ["codex", "claude", "pi", "omp", "opencode"] {
