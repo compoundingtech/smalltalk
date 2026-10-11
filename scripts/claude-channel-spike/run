@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Probe a real Claude binary in a fresh container; secrets travel only over stdin."""
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--claude", type=Path, default=Path(shutil.which("claude") or "claude"))
+parser.add_argument("--key-file", type=Path)
+parser.add_argument("--out", type=Path, required=True)
+parser.add_argument("--timeout", type=int, default=60)
+parser.add_argument("--case", action="append", choices=["approved-absent", "development-installed",
+    "plain-installed", "inline-plugin", "inline-development", "server-fallback"],
+    help="run only this case (repeatable)")
+args = parser.parse_args()
+with args.claude.resolve().open("rb") as binary:
+    if binary.read(4) != b"\x7fELF":
+        parser.error("--claude must name the native Linux executable")
+key = (args.key_file.read_text().strip() if args.key_file else os.environ.get("ANTHROPIC_API_KEY", ""))
+if not key:
+    parser.error("supply ANTHROPIC_API_KEY or --key-file; the key is never copied into the container filesystem")
+args.out.mkdir(parents=True, exist_ok=False)
+here = Path(__file__).resolve().parent
+name = "st-channel-spike-" + uuid.uuid4().hex[:12]
+
+def docker(*argv, **kwargs):
+    return subprocess.run(["docker", *argv], check=True, **kwargs)
+
+with tempfile.TemporaryDirectory(prefix="st-channel-build-") as stage:
+    stage = Path(stage)
+    for filename in ["Dockerfile", "key_helper.py", "mcp.py", "pty_probe.py"]:
+        shutil.copyfile(here / filename, stage / filename)
+    shutil.copyfile(args.claude.resolve(), stage / "claude")
+    docker("build", "-t", name, str(stage))
+    try:
+        docker("run", "-d", "--name", name, "--cpus", "2", "--memory", "3g", name,
+               stdout=subprocess.DEVNULL)
+        fixture = stage / "fixture"
+        (fixture / ".claude-plugin").mkdir(parents=True)
+        plugin = fixture / "st-channel"
+        (plugin / ".claude-plugin").mkdir(parents=True)
+        (fixture / ".claude-plugin/marketplace.json").write_text(json.dumps({
+            "name": "st", "owner": {"name": "Ada"},
+            "plugins": [{"name": "st-channel", "source": "./st-channel"}]}))
+        (plugin / ".claude-plugin/plugin.json").write_text(json.dumps({"name": "st-channel", "version": "0.0.1"}))
+        (plugin / ".mcp.json").write_text(json.dumps({"mcpServers": {
+            "st": {"command": "python3", "args": ["/opt/spike/mcp.py"]}}}))
+        docker("cp", str(fixture), name + ":/opt/fixture")
+        docker("exec", name, "mkdir", "-p", "/home/ada/home-installed/.claude")
+        install_env = ["-e", "HOME=/home/ada/home-installed", "-e", "CLAUDE_CONFIG_DIR=/home/ada/home-installed/.claude"]
+        for argv in [("plugin", "marketplace", "add", "/opt/fixture"),
+                     ("plugin", "install", "st-channel@st", "--scope", "user")]:
+            result = docker("exec", *install_env, name, "claude", *argv, capture_output=True, text=True)
+            with (args.out / "install.txt").open("a") as out:
+                out.write(result.stdout + result.stderr)
+        version = docker("exec", name, "claude", "--version", capture_output=True, text=True).stdout.strip()
+        docker("exec", name, "sh", "-c", "test ! -e /etc/claude-code/managed-settings.json && test ! -d /etc/claude-code/managed-settings.d")
+        cases = [
+            ("approved-absent", ["--channels", "plugin:st-channel@st"]),
+            ("development-installed", ["--dangerously-load-development-channels", "plugin:st-channel@st"]),
+            ("plain-installed", []),
+            ("inline-plugin", ["--plugin-dir=/opt/fixture/st-channel", "--dangerously-load-development-channels", "plugin:st-channel@st"]),
+            ("inline-development", ["--plugin-dir=/opt/fixture/st-channel", "--dangerously-load-development-channels", "plugin:st-channel@inline"]),
+            ("server-fallback", ["--mcp-config=" + json.dumps({"mcpServers": {"st3": {
+                "command": "python3", "args": ["/opt/spike/mcp.py"]}}}),
+                "--dangerously-load-development-channels=server:st3"]),
+        ]
+        summaries = []
+        for case, flags in cases:
+            if args.case and case not in args.case:
+                continue
+            for attempt in range(2):
+                attempt_case = case + ("-retry" if attempt else "")
+                result = docker("exec", "-i", "-e", "SPIKE_TIMEOUT=" + str(args.timeout), name,
+                                "python3", "/opt/spike/pty_probe.py", attempt_case, *flags,
+                                input=key + "\n", capture_output=True, text=True)
+                summary = json.loads(result.stdout)
+                summaries.append(summary)
+                print(json.dumps(summary), flush=True)
+                debug = docker("exec", name, "cat", "/home/ada/results/" + attempt_case + "-debug.txt",
+                               capture_output=True, text=True).stdout
+                # Preserve the cold-start failure and allow one subsequent launch after
+                # Claude fetches its own availability state. Never override that state.
+                if attempt or "Channel notifications skipped: channels feature is not currently available" not in debug:
+                    break
+                time.sleep(3)
+        docker("exec", name, "sh", "-c", "test ! -e /etc/claude-code/managed-settings.json && test ! -d /etc/claude-code/managed-settings.d")
+        docker("cp", name + ":/home/ada/results/.", str(args.out), stdout=subprocess.DEVNULL)
+        # Capture only the native transcript, never the config directory or auth state.
+        docker("exec", name, "python3", "-c",
+               "from pathlib import Path; import shutil; "
+               "[(shutil.copyfile(p,Path('/home/ada/results')/(p.stem+'-transcript.jsonl'))) "
+               "for p in Path('/home/ada').glob('home-*/.claude/projects/*/*.jsonl')]")
+        docker("cp", name + ":/home/ada/results/.", str(args.out), stdout=subprocess.DEVNULL)
+        for path in args.out.iterdir():
+            if path.is_symlink():
+                path.unlink()
+            elif path.is_file():
+                path.write_bytes(path.read_bytes().replace(key.encode(), b"[REDACTED]"))
+        (args.out / "run.json").write_text(json.dumps({"version": version, "cases": summaries,
+            "policy_files": [], "cpus": 2, "memory_bytes": 3221225472, "host_mounts": []}, indent=2) + "\n")
+    finally:
+        docker("rm", "-f", name, stdout=subprocess.DEVNULL)
+        docker("image", "rm", name, stdout=subprocess.DEVNULL)

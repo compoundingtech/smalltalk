@@ -1,0 +1,2 @@
+Adding marketplace…✔ Successfully added marketplace: st (declared in user settings)
+Installing plugin "st-channel@st"...✔ Successfully installed plugin: st-channel@st (scope: user)

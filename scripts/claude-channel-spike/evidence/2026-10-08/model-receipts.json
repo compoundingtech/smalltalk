@@ -1,0 +1,59 @@
+[
+  {
+    "run": "primary",
+    "case": "development-installed",
+    "request": {
+      "method": "tools/call",
+      "params": {
+        "name": "record_ack",
+        "arguments": {
+          "text": "CHANNEL_SPIKE_ACK"
+        },
+        "_meta": {
+          "claudecode/toolUseId": "toolu_01JaRHi8bibHB4V45pWdivLQ",
+          "progressToken": 2
+        }
+      },
+      "jsonrpc": "2.0",
+      "id": 2
+    }
+  },
+  {
+    "run": "inline",
+    "case": "inline-development-retry",
+    "request": {
+      "method": "tools/call",
+      "params": {
+        "name": "record_ack",
+        "arguments": {
+          "text": "CHANNEL_SPIKE_ACK"
+        },
+        "_meta": {
+          "claudecode/toolUseId": "toolu_01GZ2MXa3ee43N4hEMcmTMzC",
+          "progressToken": 2
+        }
+      },
+      "jsonrpc": "2.0",
+      "id": 2
+    }
+  },
+  {
+    "run": "inline",
+    "case": "server-fallback",
+    "request": {
+      "method": "tools/call",
+      "params": {
+        "name": "record_ack",
+        "arguments": {
+          "text": "CHANNEL_SPIKE_ACK"
+        },
+        "_meta": {
+          "claudecode/toolUseId": "toolu_01KEZAwv8keJfcfwLdypqGSp",
+          "progressToken": 2
+        }
+      },
+      "jsonrpc": "2.0",
+      "id": 2
+    }
+  }
+]
