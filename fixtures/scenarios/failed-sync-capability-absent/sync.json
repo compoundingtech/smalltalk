@@ -1,0 +1,70 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "sync",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 1
+  },
+  "state": {
+    "capabilities": {
+      "capabilities": [
+        {
+          "id": "read.projections",
+          "state": "granted",
+          "version": 0
+        },
+        {
+          "id": "terminal.read",
+          "state": "granted",
+          "version": 0
+        },
+        {
+          "id": "control.messages",
+          "state": "granted",
+          "version": 0
+        },
+        {
+          "id": "collections",
+          "state": "granted",
+          "version": 1
+        }
+      ],
+      "event_cursor": "event-cursor/scenario-fleet-mid-refactor/1",
+      "kind": "capabilities",
+      "limits": {
+        "max_event_items": 500,
+        "max_page_items": 200,
+        "max_response_bytes": 8388608,
+        "max_wait_ms": 30000
+      },
+      "oldest_event_cursor": "event-cursor/scenario-fleet-mid-refactor/0",
+      "schemas": [
+        "../schemas/client-v0.schema.json",
+        "../schemas/operations.json"
+      ],
+      "session_actor": "person/ada/session/device-1",
+      "transport": "fabric-loopback"
+    },
+    "expected": [
+      {
+        "at_ms": 0,
+        "compare": "shape",
+        "status": {
+          "_tag": "Failed",
+          "cause": {
+            "_tag": "Local",
+            "kind": "unsupported"
+          }
+        },
+        "surface": "terminal:terminal/example-atlas-builder"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [],
+  "variant": "capability-absent",
+  "world": "failed-sync-capability-absent"
+}

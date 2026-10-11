@@ -1,0 +1,401 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "terminal",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 4
+  },
+  "state": {
+    "terminals": []
+  },
+  "timeline": [
+    {
+      "_tag": "terminal-create",
+      "at_ms": 6000,
+      "record": {
+        "cast": {
+          "events": [
+            [
+              0,
+              "o",
+              "\u001b[32msprout\u001b[0m:builder $ pnpm test smoke\r\n"
+            ],
+            [
+              0.392,
+              "o",
+              "Running sprout smoke check\r\n"
+            ],
+            [
+              0.826,
+              "o",
+              "\u001b[32m3 tests passed; 0 failures\u001b[0m\r\n"
+            ],
+            [
+              0.876,
+              "o",
+              "\u001b[32msprout\u001b[0m:builder $ "
+            ]
+          ],
+          "header": {
+            "height": 12,
+            "title": "pnpm test smoke",
+            "version": 2,
+            "width": 100
+          },
+          "started_at_ms": 6000
+        },
+        "incarnation": "pty-20:1",
+        "owner": "agent/example/sprout/builder",
+        "runtime": {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-sprout-builder-shell",
+          "incarnation_id": "pty-20:1",
+          "kind": "runtime",
+          "owner_host_id": "host/quarry",
+          "owner_id": "agent/example/sprout/builder",
+          "revision": "rt-shell-1",
+          "runtime_id": "example-sprout-builder-shell",
+          "runtime_kind": "terminal",
+          "state": "running",
+          "terminal_id": "terminal/example-sprout-builder",
+          "updated_at": "2030-01-01T12:00:06.000Z"
+        },
+        "screens": [],
+        "terminal": "terminal/example-sprout-builder"
+      },
+      "store": 12
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 6000,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 1,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 6,
+                "fg": 2,
+                "text": "sprout"
+              },
+              {
+                "cells": 26,
+                "text": ":builder $ pnpm test smoke"
+              }
+            ],
+            "text": "sprout:builder $ pnpm test smoke",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 1,
+        "revision": "cast-1",
+        "rows": 12,
+        "runtime_incarnation": "pty-20:1",
+        "terminal_id": "terminal/example-sprout-builder",
+        "title": "pnpm test smoke",
+        "truncated": false
+      },
+      "store": 12,
+      "terminal": "terminal/example-sprout-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 6392,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 2,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 6,
+                "fg": 2,
+                "text": "sprout"
+              },
+              {
+                "cells": 26,
+                "text": ":builder $ pnpm test smoke"
+              }
+            ],
+            "text": "sprout:builder $ pnpm test smoke",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 26,
+                "text": "Running sprout smoke check"
+              }
+            ],
+            "text": "Running sprout smoke check",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 2,
+        "revision": "cast-2",
+        "rows": 12,
+        "runtime_incarnation": "pty-20:1",
+        "terminal_id": "terminal/example-sprout-builder",
+        "title": "pnpm test smoke",
+        "truncated": false
+      },
+      "store": 12,
+      "terminal": "terminal/example-sprout-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 6826,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 3,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 6,
+                "fg": 2,
+                "text": "sprout"
+              },
+              {
+                "cells": 26,
+                "text": ":builder $ pnpm test smoke"
+              }
+            ],
+            "text": "sprout:builder $ pnpm test smoke",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 26,
+                "text": "Running sprout smoke check"
+              }
+            ],
+            "text": "Running sprout smoke check",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 26,
+                "fg": 2,
+                "text": "3 tests passed; 0 failures"
+              }
+            ],
+            "text": "3 tests passed; 0 failures",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 3,
+        "revision": "cast-3",
+        "rows": 12,
+        "runtime_incarnation": "pty-20:1",
+        "terminal_id": "terminal/example-sprout-builder",
+        "title": "pnpm test smoke",
+        "truncated": false
+      },
+      "store": 12,
+      "terminal": "terminal/example-sprout-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 6876,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 17,
+          "row": 3,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 6,
+                "fg": 2,
+                "text": "sprout"
+              },
+              {
+                "cells": 26,
+                "text": ":builder $ pnpm test smoke"
+              }
+            ],
+            "text": "sprout:builder $ pnpm test smoke",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 26,
+                "text": "Running sprout smoke check"
+              }
+            ],
+            "text": "Running sprout smoke check",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 26,
+                "fg": 2,
+                "text": "3 tests passed; 0 failures"
+              }
+            ],
+            "text": "3 tests passed; 0 failures",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [
+              {
+                "cells": 6,
+                "fg": 2,
+                "text": "sprout"
+              },
+              {
+                "cells": 11,
+                "text": ":builder $ "
+              }
+            ],
+            "text": "sprout:builder $ ",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 4,
+        "revision": "cast-4",
+        "rows": 12,
+        "runtime_incarnation": "pty-20:1",
+        "terminal_id": "terminal/example-sprout-builder",
+        "title": "pnpm test smoke",
+        "truncated": false
+      },
+      "store": 12,
+      "terminal": "terminal/example-sprout-builder"
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/record/runtime/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "first-run-onboarding"
+}

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "stui shows each alert in the conversation of the agent it belongs to, above the message box, with one-tap answers (a Claude permission prompt's allow and deny beside the pending call, a structured request's named answers, a yes-or-no question) and a way into the whole card in Now; the top bar prints nothing at zero alerts and 'N alerts' otherwise, native harness prompts and logins list in Now, and a seat whose harness is compacting reads 'compacting'",
+  "replay": {
+    "status": "none",
+    "detail": "No replay, backfill, stored data or transcript change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, operation or contract digest change. stui reads the alert, conversation_id, conversation_ids and activity fields the client gateway already serves, and sends the existing prompt.respond action."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim, checkpoint, retention or authority rule change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Against a daemon that predates alerts, an item is an alert unless it is an update or a message, and an alert shows in the agent st or its step names. Old routes and collection names are unchanged. The shared client fixtures gain the compacting agent word."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Client-only change; no deployment ordering."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery, durable payload or initialization changes."
+  }
+}

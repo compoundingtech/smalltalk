@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Accept bounded paired-client phone latency and live-share observations in original UTC minute windows, with local bounded JSONL history",
+  "replay": {"status":"none","detail":"No graph claims or projection replay. Report deduplication/overlap and live windows are bounded process memory and reset on restart; retained JSONL is not replayed into live windows."},
+  "schema": {"status":"none","detail":"No SQLite table, index or migration. Public client-v0 wire schemas and generated Rust/Swift/TypeScript expose observations.report and a response without snapshot or action receipt."},
+  "rules": {"status":"none","detail":"No claim/checkpoint rule changes."},
+  "compatibility": {"status":"changed","detail":"Adds paired-only POST /v1/client/observations and seven client-observed SLO targets to request-latency and doctor. Latency and foreground/live share are distinct types; old clients continue existing calls. Sparse bins use integer milliseconds and shared histogram arithmetic. Minute boundary exclusions and incomplete reported coverage are explicit."},
+  "downtime": {"status":"none","detail":"Normal daemon restart; no live phone activation or deployment included."},
+  "manual": {"status":"none","detail":"No recorder/transport settings in this change. Optional reporters retry identical disjoint intervals/UUIDs on the same member; acceptance is local, not durable replicated ACK."},
+  "recovery": {"status":"changed","detail":"History rotates at 4MiB/day into eight local JSONL segments, expired segments removed on next admission after seven days. Downgrade ignores these files. Memory dedup/overlap resets on restart or oldest-first eviction; retries then can double count. History failures refuse before memory admission; no fsync/power-loss guarantee."}
+}

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Remove an extra borrow from the shared timeline append helper",
+  "replay": {
+    "status": "none",
+    "detail": "Only a redundant borrow of the already borrowed transaction is removed; append statements, ownership, commit, wake and runtime behavior are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Only a redundant borrow of the already borrowed transaction is removed; append statements, ownership, commit, wake and runtime behavior are unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Only a redundant borrow of the already borrowed transaction is removed; append statements, ownership, commit, wake and runtime behavior are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only a redundant borrow of the already borrowed transaction is removed; append statements, ownership, commit, wake and runtime behavior are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only a redundant borrow of the already borrowed transaction is removed; append statements, ownership, commit, wake and runtime behavior are unchanged."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Only a redundant borrow of the already borrowed transaction is removed; append statements, ownership, commit, wake and runtime behavior are unchanged."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Only a redundant borrow of the already borrowed transaction is removed; append statements, ownership, commit, wake and runtime behavior are unchanged."
+  }
+}

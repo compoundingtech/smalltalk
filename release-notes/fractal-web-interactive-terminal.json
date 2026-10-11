@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web opens the live terminal grid from the thread header's terminal toggle, with copy, find, links and resize; keyboard input stays disabled because no gateway producer offers ordered terminal input, history states that it is unavailable, and left terminals are bounded to the four most recent. The terminal opens as a drawer below the thread so the thread, composer and header actions stay mounted; a terminal failure stays inside the drawer with the source's specific reason and offers Retry only when the gateway marks the failure retryable. An agent with no runtimes, one missing from the live roster, or one whose roster authority is still pending disables the header terminal toggle with its reason. The page policy permits compilation of the native WebAssembly key encoder without permitting JavaScript eval",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only change; no runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Client-only change against existing gateway terminal attach, screen and resize routes. The page script-src policy adds wasm-unsafe-eval so the native terminal key encoder can compile; it does not add unsafe-eval or permit JavaScript string evaluation."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; the app is not deployed by this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

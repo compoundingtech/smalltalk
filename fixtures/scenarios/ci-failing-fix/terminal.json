@@ -1,0 +1,1477 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "terminal",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 21
+  },
+  "state": {
+    "terminals": [
+      {
+        "cast": {
+          "events": [
+            [
+              0,
+              "o",
+              "\u001b[32matlas\u001b[0m:builder $ pnpm --filter @atlas/api test\r\n"
+            ],
+            [
+              0.81,
+              "o",
+              "\u001b[31mFAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit\u001b[0m\r\n"
+            ],
+            [
+              1.151,
+              "o",
+              "\u001b[31mTypeError: Expected a number, received undefined\u001b[0m\r\n"
+            ],
+            [
+              1.61,
+              "o",
+              "\u001b[31mat parseOptions (packages/api/src/options.ts:18)\u001b[0m\r\n"
+            ],
+            [
+              2.237,
+              "o",
+              "\u001b[31mTests: 1 failed, 47 passed; exit 1\u001b[0m\r\n"
+            ],
+            [
+              2.287,
+              "o",
+              "\u001b[32matlas\u001b[0m:builder $ "
+            ],
+            [
+              50,
+              "o",
+              "pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build\r\n"
+            ],
+            [
+              50.745,
+              "o",
+              "\u001b[32mPASS packages/api/test/parseOptions.test.ts\u001b[0m\r\n"
+            ],
+            [
+              51.218,
+              "o",
+              "\u001b[32mTests: 48 passed, 0 failed\u001b[0m\r\n"
+            ],
+            [
+              51.765,
+              "o",
+              "\u001b[32mCI retry #2: typecheck, test, build all passed\u001b[0m\r\n"
+            ],
+            [
+              51.815,
+              "o",
+              "\u001b[32matlas\u001b[0m:builder $ "
+            ]
+          ],
+          "header": {
+            "height": 12,
+            "title": "pnpm --filter @atlas/api test",
+            "version": 2,
+            "width": 100
+          },
+          "started_at_ms": -30000
+        },
+        "incarnation": "pty-15:1",
+        "owner": "agent/example/atlas/builder",
+        "runtime": {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-atlas-builder-shell",
+          "incarnation_id": "pty-15:1",
+          "kind": "runtime",
+          "owner_host_id": "host/meadow",
+          "owner_id": "agent/example/atlas/builder",
+          "revision": "rt-shell-1",
+          "runtime_id": "example-atlas-builder-shell",
+          "runtime_kind": "terminal",
+          "state": "running",
+          "terminal_id": "terminal/example-atlas-builder",
+          "updated_at": "2030-01-01T11:59:30.000Z"
+        },
+        "screens": [
+          {
+            "at_ms": -30000,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 1,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 40,
+                      "text": ":builder $ pnpm --filter @atlas/api test"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 1,
+              "revision": "cast-1",
+              "rows": 12,
+              "runtime_incarnation": "pty-15:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm --filter @atlas/api test",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -29190,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 2,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 40,
+                      "text": ":builder $ pnpm --filter @atlas/api test"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 70,
+                      "fg": 1,
+                      "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
+                    }
+                  ],
+                  "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 2,
+              "revision": "cast-2",
+              "rows": 12,
+              "runtime_incarnation": "pty-15:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm --filter @atlas/api test",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -28849,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 3,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 40,
+                      "text": ":builder $ pnpm --filter @atlas/api test"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 70,
+                      "fg": 1,
+                      "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
+                    }
+                  ],
+                  "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 48,
+                      "fg": 1,
+                      "text": "TypeError: Expected a number, received undefined"
+                    }
+                  ],
+                  "text": "TypeError: Expected a number, received undefined",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 3,
+              "revision": "cast-3",
+              "rows": 12,
+              "runtime_incarnation": "pty-15:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm --filter @atlas/api test",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -28390,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 4,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 40,
+                      "text": ":builder $ pnpm --filter @atlas/api test"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 70,
+                      "fg": 1,
+                      "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
+                    }
+                  ],
+                  "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 48,
+                      "fg": 1,
+                      "text": "TypeError: Expected a number, received undefined"
+                    }
+                  ],
+                  "text": "TypeError: Expected a number, received undefined",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 48,
+                      "fg": 1,
+                      "text": "at parseOptions (packages/api/src/options.ts:18)"
+                    }
+                  ],
+                  "text": "at parseOptions (packages/api/src/options.ts:18)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 4,
+              "revision": "cast-4",
+              "rows": 12,
+              "runtime_incarnation": "pty-15:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm --filter @atlas/api test",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -27763,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 5,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 40,
+                      "text": ":builder $ pnpm --filter @atlas/api test"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 70,
+                      "fg": 1,
+                      "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
+                    }
+                  ],
+                  "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 48,
+                      "fg": 1,
+                      "text": "TypeError: Expected a number, received undefined"
+                    }
+                  ],
+                  "text": "TypeError: Expected a number, received undefined",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 48,
+                      "fg": 1,
+                      "text": "at parseOptions (packages/api/src/options.ts:18)"
+                    }
+                  ],
+                  "text": "at parseOptions (packages/api/src/options.ts:18)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 34,
+                      "fg": 1,
+                      "text": "Tests: 1 failed, 47 passed; exit 1"
+                    }
+                  ],
+                  "text": "Tests: 1 failed, 47 passed; exit 1",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 5,
+              "revision": "cast-5",
+              "rows": 12,
+              "runtime_incarnation": "pty-15:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm --filter @atlas/api test",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -27713,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 16,
+                "row": 5,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 40,
+                      "text": ":builder $ pnpm --filter @atlas/api test"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm --filter @atlas/api test",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 70,
+                      "fg": 1,
+                      "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
+                    }
+                  ],
+                  "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 48,
+                      "fg": 1,
+                      "text": "TypeError: Expected a number, received undefined"
+                    }
+                  ],
+                  "text": "TypeError: Expected a number, received undefined",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 48,
+                      "fg": 1,
+                      "text": "at parseOptions (packages/api/src/options.ts:18)"
+                    }
+                  ],
+                  "text": "at parseOptions (packages/api/src/options.ts:18)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 34,
+                      "fg": 1,
+                      "text": "Tests: 1 failed, 47 passed; exit 1"
+                    }
+                  ],
+                  "text": "Tests: 1 failed, 47 passed; exit 1",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 11,
+                      "text": ":builder $ "
+                    }
+                  ],
+                  "text": "atlas:builder $ ",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 6,
+              "revision": "cast-6",
+              "rows": 12,
+              "runtime_incarnation": "pty-15:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm --filter @atlas/api test",
+              "truncated": false
+            }
+          }
+        ],
+        "terminal": "terminal/example-atlas-builder"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "screen",
+      "at_ms": 20000,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 6,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 5,
+                "fg": 2,
+                "text": "atlas"
+              },
+              {
+                "cells": 40,
+                "text": ":builder $ pnpm --filter @atlas/api test"
+              }
+            ],
+            "text": "atlas:builder $ pnpm --filter @atlas/api test",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 70,
+                "fg": 1,
+                "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
+              }
+            ],
+            "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 1,
+                "text": "TypeError: Expected a number, received undefined"
+              }
+            ],
+            "text": "TypeError: Expected a number, received undefined",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 1,
+                "text": "at parseOptions (packages/api/src/options.ts:18)"
+              }
+            ],
+            "text": "at parseOptions (packages/api/src/options.ts:18)",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [
+              {
+                "cells": 34,
+                "fg": 1,
+                "text": "Tests: 1 failed, 47 passed; exit 1"
+              }
+            ],
+            "text": "Tests: 1 failed, 47 passed; exit 1",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [
+              {
+                "cells": 5,
+                "fg": 2,
+                "text": "atlas"
+              },
+              {
+                "cells": 78,
+                "text": ":builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
+              }
+            ],
+            "text": "atlas:builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 7,
+        "revision": "cast-7",
+        "rows": 12,
+        "runtime_incarnation": "pty-15:1",
+        "terminal_id": "terminal/example-atlas-builder",
+        "title": "pnpm --filter @atlas/api test",
+        "truncated": false
+      },
+      "store": 15,
+      "terminal": "terminal/example-atlas-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 20745,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 7,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 5,
+                "fg": 2,
+                "text": "atlas"
+              },
+              {
+                "cells": 40,
+                "text": ":builder $ pnpm --filter @atlas/api test"
+              }
+            ],
+            "text": "atlas:builder $ pnpm --filter @atlas/api test",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 70,
+                "fg": 1,
+                "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
+              }
+            ],
+            "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 1,
+                "text": "TypeError: Expected a number, received undefined"
+              }
+            ],
+            "text": "TypeError: Expected a number, received undefined",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 1,
+                "text": "at parseOptions (packages/api/src/options.ts:18)"
+              }
+            ],
+            "text": "at parseOptions (packages/api/src/options.ts:18)",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [
+              {
+                "cells": 34,
+                "fg": 1,
+                "text": "Tests: 1 failed, 47 passed; exit 1"
+              }
+            ],
+            "text": "Tests: 1 failed, 47 passed; exit 1",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [
+              {
+                "cells": 5,
+                "fg": 2,
+                "text": "atlas"
+              },
+              {
+                "cells": 78,
+                "text": ":builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
+              }
+            ],
+            "text": "atlas:builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [
+              {
+                "cells": 43,
+                "fg": 2,
+                "text": "PASS packages/api/test/parseOptions.test.ts"
+              }
+            ],
+            "text": "PASS packages/api/test/parseOptions.test.ts",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 7,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 8,
+        "revision": "cast-8",
+        "rows": 12,
+        "runtime_incarnation": "pty-15:1",
+        "terminal_id": "terminal/example-atlas-builder",
+        "title": "pnpm --filter @atlas/api test",
+        "truncated": false
+      },
+      "store": 15,
+      "terminal": "terminal/example-atlas-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 21218,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 8,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 5,
+                "fg": 2,
+                "text": "atlas"
+              },
+              {
+                "cells": 40,
+                "text": ":builder $ pnpm --filter @atlas/api test"
+              }
+            ],
+            "text": "atlas:builder $ pnpm --filter @atlas/api test",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 70,
+                "fg": 1,
+                "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
+              }
+            ],
+            "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 1,
+                "text": "TypeError: Expected a number, received undefined"
+              }
+            ],
+            "text": "TypeError: Expected a number, received undefined",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 1,
+                "text": "at parseOptions (packages/api/src/options.ts:18)"
+              }
+            ],
+            "text": "at parseOptions (packages/api/src/options.ts:18)",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [
+              {
+                "cells": 34,
+                "fg": 1,
+                "text": "Tests: 1 failed, 47 passed; exit 1"
+              }
+            ],
+            "text": "Tests: 1 failed, 47 passed; exit 1",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [
+              {
+                "cells": 5,
+                "fg": 2,
+                "text": "atlas"
+              },
+              {
+                "cells": 78,
+                "text": ":builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
+              }
+            ],
+            "text": "atlas:builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [
+              {
+                "cells": 43,
+                "fg": 2,
+                "text": "PASS packages/api/test/parseOptions.test.ts"
+              }
+            ],
+            "text": "PASS packages/api/test/parseOptions.test.ts",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 7,
+            "runs": [
+              {
+                "cells": 26,
+                "fg": 2,
+                "text": "Tests: 48 passed, 0 failed"
+              }
+            ],
+            "text": "Tests: 48 passed, 0 failed",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 9,
+        "revision": "cast-9",
+        "rows": 12,
+        "runtime_incarnation": "pty-15:1",
+        "terminal_id": "terminal/example-atlas-builder",
+        "title": "pnpm --filter @atlas/api test",
+        "truncated": false
+      },
+      "store": 15,
+      "terminal": "terminal/example-atlas-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 21765,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 9,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 5,
+                "fg": 2,
+                "text": "atlas"
+              },
+              {
+                "cells": 40,
+                "text": ":builder $ pnpm --filter @atlas/api test"
+              }
+            ],
+            "text": "atlas:builder $ pnpm --filter @atlas/api test",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 70,
+                "fg": 1,
+                "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
+              }
+            ],
+            "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 1,
+                "text": "TypeError: Expected a number, received undefined"
+              }
+            ],
+            "text": "TypeError: Expected a number, received undefined",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 1,
+                "text": "at parseOptions (packages/api/src/options.ts:18)"
+              }
+            ],
+            "text": "at parseOptions (packages/api/src/options.ts:18)",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [
+              {
+                "cells": 34,
+                "fg": 1,
+                "text": "Tests: 1 failed, 47 passed; exit 1"
+              }
+            ],
+            "text": "Tests: 1 failed, 47 passed; exit 1",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [
+              {
+                "cells": 5,
+                "fg": 2,
+                "text": "atlas"
+              },
+              {
+                "cells": 78,
+                "text": ":builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
+              }
+            ],
+            "text": "atlas:builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [
+              {
+                "cells": 43,
+                "fg": 2,
+                "text": "PASS packages/api/test/parseOptions.test.ts"
+              }
+            ],
+            "text": "PASS packages/api/test/parseOptions.test.ts",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 7,
+            "runs": [
+              {
+                "cells": 26,
+                "fg": 2,
+                "text": "Tests: 48 passed, 0 failed"
+              }
+            ],
+            "text": "Tests: 48 passed, 0 failed",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [
+              {
+                "cells": 46,
+                "fg": 2,
+                "text": "CI retry #2: typecheck, test, build all passed"
+              }
+            ],
+            "text": "CI retry #2: typecheck, test, build all passed",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 9,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 10,
+        "revision": "cast-10",
+        "rows": 12,
+        "runtime_incarnation": "pty-15:1",
+        "terminal_id": "terminal/example-atlas-builder",
+        "title": "pnpm --filter @atlas/api test",
+        "truncated": false
+      },
+      "store": 15,
+      "terminal": "terminal/example-atlas-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 21815,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 16,
+          "row": 9,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 5,
+                "fg": 2,
+                "text": "atlas"
+              },
+              {
+                "cells": 40,
+                "text": ":builder $ pnpm --filter @atlas/api test"
+              }
+            ],
+            "text": "atlas:builder $ pnpm --filter @atlas/api test",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 70,
+                "fg": 1,
+                "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit"
+              }
+            ],
+            "text": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 1,
+                "text": "TypeError: Expected a number, received undefined"
+              }
+            ],
+            "text": "TypeError: Expected a number, received undefined",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [
+              {
+                "cells": 48,
+                "fg": 1,
+                "text": "at parseOptions (packages/api/src/options.ts:18)"
+              }
+            ],
+            "text": "at parseOptions (packages/api/src/options.ts:18)",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 4,
+            "runs": [
+              {
+                "cells": 34,
+                "fg": 1,
+                "text": "Tests: 1 failed, 47 passed; exit 1"
+              }
+            ],
+            "text": "Tests: 1 failed, 47 passed; exit 1",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 5,
+            "runs": [
+              {
+                "cells": 5,
+                "fg": 2,
+                "text": "atlas"
+              },
+              {
+                "cells": 78,
+                "text": ":builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
+              }
+            ],
+            "text": "atlas:builder $ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 6,
+            "runs": [
+              {
+                "cells": 43,
+                "fg": 2,
+                "text": "PASS packages/api/test/parseOptions.test.ts"
+              }
+            ],
+            "text": "PASS packages/api/test/parseOptions.test.ts",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 7,
+            "runs": [
+              {
+                "cells": 26,
+                "fg": 2,
+                "text": "Tests: 48 passed, 0 failed"
+              }
+            ],
+            "text": "Tests: 48 passed, 0 failed",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 8,
+            "runs": [
+              {
+                "cells": 46,
+                "fg": 2,
+                "text": "CI retry #2: typecheck, test, build all passed"
+              }
+            ],
+            "text": "CI retry #2: typecheck, test, build all passed",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 9,
+            "runs": [
+              {
+                "cells": 5,
+                "fg": 2,
+                "text": "atlas"
+              },
+              {
+                "cells": 11,
+                "text": ":builder $ "
+              }
+            ],
+            "text": "atlas:builder $ ",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 11,
+        "revision": "cast-11",
+        "rows": 12,
+        "runtime_incarnation": "pty-15:1",
+        "terminal_id": "terminal/example-atlas-builder",
+        "title": "pnpm --filter @atlas/api test",
+        "truncated": false
+      },
+      "store": 15,
+      "terminal": "terminal/example-atlas-builder"
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/terminals/0/runtime/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "ci-failing-fix"
+}

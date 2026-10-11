@@ -44,6 +44,72 @@ Every screen is judged by these.
 
 Mauve (`person`) means a person is needed. Nothing else may use it.
 
+### Web client cold selection
+
+The selected conversation owns its cold first-page request. Background follows require
+explicit pointer or keyboard-focus intent, and are admitted only after every visible
+conversation has committed a native first page through the frame writer. Reading a
+hidden snapshot does not acquire a follow. Observations survive warm switches in memory;
+reloads do not restore cached roster or transcript claims from browser storage.
+
+### Native web data ports
+
+Roster usage, requested checkout, workspace, activity, blocking reason and ask are
+`Known(value)` or `Unknown`; missing facts are never fabricated as zero. Session start
+and end remain unknown until the native roster supplies them. Native content search
+reads server conversation content rather than scanning the loaded window. Attachment
+upload, chunk reads and message sending independently honor their native grants and
+preserve refusal envelopes. Upload alone never acknowledges a send; the gateway chooses
+the canonical message identity independently of the client's idempotency key.
+
+Only an actual replacement page with explicit pagination evidence establishes an empty
+conversation. Newer deltas do not change the older-history boundary. `hasOlder` reports
+that boundary, not an available fetch operation.
+
+### Web session trace providers
+
+`src/data/sessionTrace.ts` defines the Effect `SessionTraceProvider` service and the
+`TraceSeries` schema. Queries carry a native session ID, range (`1d`, `7d`, `30d`)
+and bucket (`5m`, `15m`, `1h`, `1d`). Native `UsageRow.native_session_id` is the
+root-session join key for an independently injected provider, including its subagents.
+The public schema contains no deployment or provider-specific identifiers.
+
+Every metric is `Known(value)` or `Unknown(reason)`; buckets contain time, input/output
+and cache tokens, cost with currency, and model, with a separate subagent breakdown.
+Responses distinguish `self` from `including_subagents`, carry an explicit `partial`
+flag and observation freshness. An observed read is not a claim of continuous liveness.
+
+The live source installs the st-only layer. It reuses native usage rows and the L3
+agent reader: self-only roster spend meters are labelled `agent-incarnations` and
+always partial. Native aggregate totals can include subagent responses and do not
+establish self-only coverage across historical incarnations. The default therefore
+keeps spend `Unknown('not-attributed')` until accounting evidence establishes that
+coverage; a current driver or a root join alone is not sufficient. These cumulative
+meters are neither the requested range's totals nor the selected root's totals.
+Missing values never become zero, and unavailable
+series/subagent coverage remains `Unknown('no-provider')`, not an empty series.
+Context-only native summaries leave spend unknown; observed context meters remain
+available. Consumers call the live source's `sessionTrace(query)` port, bound to its
+owned runtime, or use the same-named Effect operation inside a provided context.
+Another Effect layer can provide `SessionTraceProvider` via `Layer.provide`, or be
+passed as `liveSource({ sessionTraceLayer, options })`, without changing consumer code.
+
+### Web follow budgets and synchronization
+
+Conversation follows have a bounded LRU lane. The advertised subscription budget reserves
+four shared slots for the three standing windows and a terminal; older capability sets
+use the conservative budget. Invisible warm follows continue folding until eviction,
+which unsubscribes them; selecting an evicted conversation starts a new follow.
+
+The SDK publishes `SyncStatus` v2 for each follow and the gateway. `Requested` means the
+subscribe was sent, and `Live` requires decoded protocol data, not merely an open socket.
+Reconnect, resync, eviction and failure carry only observed evidence. The data layer
+retains trusted content through failed reads but removes authorization-revoked rows.
+Terminal screens also lose display authority when their dependent roster or replacement
+runtime lookup is refused. A Live window status refreshes its native snapshot evidence
+for every observed change while preserving the original Live transition clock.
+Status consumers share their follow's lifetime, and last content never manufactures Live.
+
 ## Header
 
 The header's right side names the host and person, led by the connection: `● live`, a spinner

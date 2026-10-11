@@ -195,8 +195,8 @@ fn suspend_state(store: &Store, request: &ClaimRecord) -> Result<Suspension> {
 }
 
 /// Where the seat's latest suspend or resume stands, or `None` when it has none that still
-/// applies. A suspension belongs to the launch it was taken under: a stop, or a declaration that
-/// changes how the seat launches, ends it, and the seat then starts by the usual rules.
+/// applies. A stop or an applied launch change ends it. A pending manual publication still
+/// selects the incumbent launch for suspension and resume.
 pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
     let requests = requests(store, subject)?;
     let Some(request) = requests.last() else {
@@ -215,7 +215,17 @@ pub fn current(store: &Store, subject: &str) -> Result<Option<Suspension>> {
             }) { moved = true; break; }
         }
     }
-    if !moved && !evidence(request, 0).is_some_and(|token| lineage.iter().any(|item| item == token)) {
+    let mut applies = evidence(request, 0)
+        .is_some_and(|token| lineage.iter().any(|item| item == token));
+    if !applies
+        && let Some(token) = evidence(request, 0)
+        && let Some((incumbent, _)) = crate::rollout::pending_manual_launch(store, subject)?
+    {
+        let incumbent_lineage = store.launch_lineage_from(&incumbent)?;
+        let request_lineage = store.launch_lineage_from(token)?;
+        applies = request_lineage.iter().any(|token| incumbent_lineage.contains(token));
+    }
+    if !moved && !applies {
         return Ok(None);
     }
     if action(request) == Some("suspend") {

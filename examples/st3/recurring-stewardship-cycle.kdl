@@ -5,7 +5,7 @@ version 2
 // Publish it first, then copy its revision hash into the schedule in place of the zero
 // placeholder:
 //
-//   st missions publish examples/st3/recurring-stewardship-cycle.kdl --as person/operator
+//   st apply examples/st3/recurring-stewardship-cycle.kdl --as person/operator
 //   st missions ls --all --json | jq -r '.value.items[]
 //     | select(.id == "mission/example/stewardship-cycle") | .mission_revision'
 //

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Move publication examples, evaluations and integration workloads to st apply while retaining the legacy aliases during caller rollout",
+  "replay": { "status": "none", "detail": "Publication still uses the same resolved intent and subject-token fences; no replay change." },
+  "schema": { "status": "none", "detail": "No database or declaration schema change." },
+  "rules": { "status": "none", "detail": "No checkpoint rule change." },
+  "compatibility": { "status": "none", "detail": "Both legacy publication commands remain available with their existing stderr notices. Migrated seat callers explicitly pass --no-gate-check; unified apply adds published_missions to successful seat receipts." },
+  "downtime": { "status": "none", "detail": "No service restart or interruption is required by these caller changes." },
+  "manual": { "status": "none", "detail": "No required upgrade step. External callers can replace missions publish FILE with apply FILE using the same options, and agents apply FILE with apply FILE --no-gate-check." },
+  "recovery": { "status": "none", "detail": "No durable-state mutation or new recovery procedure." }
+}

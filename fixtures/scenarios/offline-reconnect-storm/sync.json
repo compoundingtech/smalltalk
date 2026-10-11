@@ -1,0 +1,508 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "sync",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 6
+  },
+  "state": {
+    "capabilities": {
+      "capabilities": [
+        {
+          "id": "read.projections",
+          "state": "granted",
+          "version": 0
+        },
+        {
+          "id": "terminal.read",
+          "state": "granted",
+          "version": 0
+        },
+        {
+          "id": "terminal.attach",
+          "state": "granted",
+          "version": 0
+        },
+        {
+          "id": "control.messages",
+          "state": "granted",
+          "version": 0
+        },
+        {
+          "id": "collections",
+          "state": "granted",
+          "version": 1
+        }
+      ],
+      "event_cursor": "event-cursor/scenario-offline-reconnect-storm/1",
+      "kind": "capabilities",
+      "limits": {
+        "max_event_items": 500,
+        "max_page_items": 200,
+        "max_response_bytes": 8388608,
+        "max_wait_ms": 30000
+      },
+      "oldest_event_cursor": "event-cursor/scenario-offline-reconnect-storm/0",
+      "schemas": [
+        "../schemas/client-v0.schema.json",
+        "../schemas/operations.json"
+      ],
+      "session_actor": "person/ada/session/device-1",
+      "transport": "fabric-loopback"
+    },
+    "expected": [
+      {
+        "at_ms": 0,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 0
+        },
+        "surface": "agents"
+      },
+      {
+        "at_ms": 0,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 0
+        },
+        "surface": "missions"
+      },
+      {
+        "at_ms": 0,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 0
+        },
+        "surface": "work"
+      },
+      {
+        "at_ms": 0,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 0
+        },
+        "surface": "attention"
+      },
+      {
+        "at_ms": 0,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 0
+        },
+        "surface": "conversation:agent/example/harbor/builder"
+      },
+      {
+        "at_ms": 2000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 0,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 5000
+          }
+        },
+        "surface": "agents"
+      },
+      {
+        "at_ms": 2000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 0,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 5000
+          }
+        },
+        "surface": "missions"
+      },
+      {
+        "at_ms": 2000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 0,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 5000
+          }
+        },
+        "surface": "work"
+      },
+      {
+        "at_ms": 2000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 0,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 5000
+          }
+        },
+        "surface": "attention"
+      },
+      {
+        "at_ms": 2000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 0,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 5000
+          }
+        },
+        "surface": "conversation:agent/example/harbor/builder"
+      },
+      {
+        "at_ms": 6000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 6000
+        },
+        "surface": "agents"
+      },
+      {
+        "at_ms": 6000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 6000
+        },
+        "surface": "missions"
+      },
+      {
+        "at_ms": 6000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 6000
+        },
+        "surface": "work"
+      },
+      {
+        "at_ms": 6000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 6000
+        },
+        "surface": "attention"
+      },
+      {
+        "at_ms": 6000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 6000
+        },
+        "surface": "conversation:agent/example/harbor/builder"
+      },
+      {
+        "at_ms": 8000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 6000,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 11000
+          }
+        },
+        "surface": "agents"
+      },
+      {
+        "at_ms": 8000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 6000,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 11000
+          }
+        },
+        "surface": "missions"
+      },
+      {
+        "at_ms": 8000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 6000,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 11000
+          }
+        },
+        "surface": "work"
+      },
+      {
+        "at_ms": 8000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 6000,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 11000
+          }
+        },
+        "surface": "attention"
+      },
+      {
+        "at_ms": 8000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 6000,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 11000
+          }
+        },
+        "surface": "conversation:agent/example/harbor/builder"
+      },
+      {
+        "at_ms": 13000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 13000
+        },
+        "surface": "agents"
+      },
+      {
+        "at_ms": 13000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 13000
+        },
+        "surface": "missions"
+      },
+      {
+        "at_ms": 13000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 13000
+        },
+        "surface": "work"
+      },
+      {
+        "at_ms": 13000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 13000
+        },
+        "surface": "attention"
+      },
+      {
+        "at_ms": 13000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 13000
+        },
+        "surface": "conversation:agent/example/harbor/builder"
+      },
+      {
+        "at_ms": 16000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 13000,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 19000
+          }
+        },
+        "surface": "agents"
+      },
+      {
+        "at_ms": 16000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 13000,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 19000
+          }
+        },
+        "surface": "missions"
+      },
+      {
+        "at_ms": 16000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 13000,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 19000
+          }
+        },
+        "surface": "work"
+      },
+      {
+        "at_ms": 16000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 13000,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 19000
+          }
+        },
+        "surface": "attention"
+      },
+      {
+        "at_ms": 16000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Stale",
+          "lastLiveAt": 13000,
+          "reason": {
+            "_tag": "Reconnecting",
+            "attempt": 1,
+            "issue": "collections socket ended",
+            "nextAt": 19000
+          }
+        },
+        "surface": "conversation:agent/example/harbor/builder"
+      },
+      {
+        "at_ms": 22000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 22000
+        },
+        "surface": "agents"
+      },
+      {
+        "at_ms": 22000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 22000
+        },
+        "surface": "missions"
+      },
+      {
+        "at_ms": 22000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 22000
+        },
+        "surface": "work"
+      },
+      {
+        "at_ms": 22000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 22000
+        },
+        "surface": "attention"
+      },
+      {
+        "at_ms": 22000,
+        "compare": "shape",
+        "status": {
+          "_tag": "Live",
+          "since": 22000
+        },
+        "surface": "conversation:agent/example/harbor/builder"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "close",
+      "at_ms": 2000,
+      "code": 1006,
+      "reason": "",
+      "store": 2
+    },
+    {
+      "_tag": "reopen",
+      "after_ms": 3000,
+      "at_ms": 2000,
+      "store": 2
+    },
+    {
+      "_tag": "close",
+      "at_ms": 8000,
+      "code": 1006,
+      "reason": "",
+      "store": 5
+    },
+    {
+      "_tag": "reopen",
+      "after_ms": 3000,
+      "at_ms": 8000,
+      "store": 5
+    },
+    {
+      "_tag": "close",
+      "at_ms": 16000,
+      "code": 1006,
+      "reason": "",
+      "store": 7
+    },
+    {
+      "_tag": "reopen",
+      "after_ms": 5000,
+      "at_ms": 16000,
+      "store": 7
+    }
+  ],
+  "times": [],
+  "variant": "default",
+  "world": "offline-reconnect-storm"
+}

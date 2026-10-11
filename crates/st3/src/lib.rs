@@ -24,7 +24,12 @@ pub mod delivery_hold;
 pub mod driver_hook;
 pub mod environment;
 pub(crate) mod external_sessions;
+pub(crate) mod native_views;
+pub(crate) mod conversation_header;
+pub(crate) mod subagent_sessions;
 pub mod fleet;
+/// Silent messages are stored and readable without waking the recipient.
+pub mod silent;
 /// `st missions check`: run a mission file's exec gates once, now, the way a run would.
 pub mod gate_check;
 /// Built-in gate kinds: what gates shelled out for most, answered by st itself.

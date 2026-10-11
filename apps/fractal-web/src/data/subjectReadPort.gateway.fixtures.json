@@ -1,0 +1,1271 @@
+{
+  "provenance": {
+    "generatedAt": "2030-01-03T22:54:16.747Z",
+    "transport": "Synthetic contract cases for the st3.client.v0 read projections; GET only",
+    "contractSha256": "135849d425c51a95fbe522a2f9be7753bb3be7a9ebc59cd32f9b4cf9beced18f",
+    "redactions": "Synthetic identifiers, dates, counts, versions and topology. Native enum/state/time/numeric shapes preserved. Empty families cover absence, not synthetic success."
+  },
+  "capabilities": {
+    "api_version": "st3.client.v0",
+    "request_id": "request/8b9f97bf0d6e2a9b",
+    "snapshot": {
+      "id": "snapshot/9739e4f157b62c23",
+      "host_id": "host/37eda7d15d948865",
+      "store_index": 50201,
+      "projection_version": "client-projection.v0",
+      "created_at": "2030-01-03T22:31:50.380Z"
+    },
+    "value": {
+      "kind": "capabilities",
+      "machine_version": "0.1.0+synthetic",
+      "session_actor": "person/operator",
+      "transport": "fabric-loopback",
+      "capabilities": [
+        {
+          "id": "read.projections",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "read.declarations",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "read.glasses",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "control.glasses",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "terminal.read",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "terminal.control",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "control.attention",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "control.messages",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "control.launches",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "control.missions",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "control.work",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "control.runtimes",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "control.pairing",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "owned-sets",
+          "version": 1,
+          "state": "granted"
+        },
+        {
+          "id": "glasses",
+          "version": 2,
+          "state": "granted"
+        },
+        {
+          "id": "attention.resolve",
+          "version": 0,
+          "state": "unavailable"
+        },
+        {
+          "id": "review.approve",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "review.reject",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "review.request-changes",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "message.send",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "message.read",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "message.close",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "launch.create",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "launch.revise",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "launch.preview",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "launch.approve",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "launch.cancel",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "mission.start",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "mission.revise",
+          "version": 0,
+          "state": "unavailable"
+        },
+        {
+          "id": "mission.approve-revision",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "mission.cancel-revision",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "mission.cancel",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "session.import",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "work.ask",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "work.done",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "work.cancel-ask",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "work.claim",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "work.renew",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "work.progress",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "work.complete",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "work.fail",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "work.release",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "work.retry",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "work.publish-mission",
+          "version": 0,
+          "state": "unavailable"
+        },
+        {
+          "id": "agent.create",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "agent.stop",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "agent.start",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "agent.suspend",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "agent.resume",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "terminal.create",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "terminal.end",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "agent.queue-move",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "lane.join",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "lane.leave",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "lane.move",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "lane.mark",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "lane.approve",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "runtime.stop",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "runtime.restart",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "runtime.reset",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "runtime.context-clear",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "runtime.signal",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "terminal.input",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "terminal.resize",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "terminal.attach",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "terminal.detach",
+          "version": 0,
+          "state": "granted"
+        },
+        {
+          "id": "pairing.revoke",
+          "version": 0,
+          "state": "granted"
+        }
+      ],
+      "limits": {
+        "max_page_items": 200,
+        "max_event_items": 500,
+        "max_response_bytes": 1048576,
+        "max_wait_ms": 30000,
+        "max_glass_body_bytes": 65536,
+        "max_glasses": 100,
+        "max_glass_depth": 32,
+        "max_glass_nodes": 1024
+      },
+      "event_cursor": "recorded-40540b96e3de4c8b",
+      "oldest_event_cursor": "recorded-2ded1ecd6878e9b7",
+      "schemas": [
+        "../96b3995394a1efb8",
+        "../39e1f8b73d2038f"
+      ]
+    }
+  },
+  "cases": {
+    "mission": {
+      "ref": "mission/a3bbc810d73c508e",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/65589c9f1c57f88a",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50413,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:25.021Z"
+        },
+        "value": {
+          "id": "mission/a3bbc810d73c508e",
+          "kind": "mission",
+          "revision": "fe20339b3fb855c55ee79bb8876952e4448f554b9eb86d0aa4bbe34e3bc1feab",
+          "updated_at": "2030-01-03T22:05:17.459Z",
+          "title": "Recorded gateway value",
+          "state": "running",
+          "mission_revision": "recorded-11f00c677fff2372",
+          "runs": [
+            "mission-run/ca074a0d84ac0e92"
+          ],
+          "run_details": [
+            {
+              "id": "mission-run/ca074a0d84ac0e92",
+              "generation_id": "run-generation/dbd9f91be4d58f62",
+              "requester": "agent/99d626d796265330",
+              "status": "running",
+              "phase": "normal",
+              "progress": {
+                "done": 0,
+                "total": 1
+              },
+              "current_steps": [
+                {
+                  "id": "step-run/3d3f317df9dc7644",
+                  "title": null,
+                  "assignee": null,
+                  "claimant": null,
+                  "state": "claimed",
+                  "since": "2030-01-03T22:05:18.176Z"
+                }
+              ],
+              "must_act": "you",
+              "state_since": "2030-01-03T22:05:17.459Z",
+              "outcome": null,
+              "last_progress": null,
+              "blocker": null,
+              "after": null,
+              "deadline": null,
+              "steps": [
+                {
+                  "id": "step-run/3d3f317df9dc7644",
+                  "path": "Recorded gateway value",
+                  "title": null,
+                  "state": "claimed",
+                  "attempt": 1,
+                  "assignee": null,
+                  "claimant": null,
+                  "agentless": true,
+                  "since": "2030-01-03T22:05:18.176Z",
+                  "last_progress": null,
+                  "blocked_reason": null,
+                  "blockers": [],
+                  "goals": [],
+                  "constraints": []
+                }
+              ]
+            }
+          ],
+          "must_act": "you",
+          "active_runs": 1,
+          "run_generations": {
+            "mission-run/ca074a0d84ac0e92": "run-generation/dbd9f91be4d58f62"
+          }
+        }
+      }
+    },
+    "work": {
+      "ref": "step-run/bae275d95dcecaed",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/65589c9f1c57f88a",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50413,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:25.021Z"
+        },
+        "value": {
+          "id": "step-run/bae275d95dcecaed",
+          "kind": "work",
+          "revision": "4219b50e411fbd42c047ab1f14023224acc7e29261d4f95702f3a6834ed8cd3a",
+          "updated_at": "2030-01-01T17:10:43.487Z",
+          "mission_id": "mission/cc94272e0bfef192",
+          "mission_run_id": "mission-run/2ba9ae7211fc3aa6",
+          "generation_id": "run-generation/8c0c1ad8001c6eaf",
+          "definition_id": "4219b50e411fbd42c047ab1f14023224acc7e29261d4f95702f3a6834ed8cd3a",
+          "path": "Recorded gateway value",
+          "title": null,
+          "assigned_to": null,
+          "last_progress": null,
+          "state": "claimed",
+          "agentless": true,
+          "gate_kind": "human",
+          "attempt": 1,
+          "readiness_epoch": 1,
+          "claimant": null,
+          "claim_incarnation": null,
+          "claim_expires_at_unix_ms": null,
+          "execution_started_at_unix_ms": 1790961043487,
+          "execution_elapsed_ms": 192581534,
+          "timeout_ms": null,
+          "goals": [],
+          "constraints": [],
+          "person_answers": [],
+          "blocked_reason": null,
+          "blockers": []
+        }
+      }
+    },
+    "agent": {
+      "ref": "agent/1d34acd36c9a4c89",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/65589c9f1c57f88a",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50413,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:25.021Z"
+        },
+        "value": {
+          "id": "agent/1d34acd36c9a4c89",
+          "kind": "agent",
+          "revision": "ae66038c5a09606826bbccb958c24021de6e4110c07d740c2a4d6579848ac701",
+          "updated_at": "2030-01-03T22:35:47.176Z",
+          "name": "Recorded gateway value",
+          "state": "running",
+          "reachability": "reachable",
+          "runtime_ids": [
+            "runtime/5025ca7d83cfe8dd"
+          ],
+          "owner_run_id": null,
+          "driver": "recorded-609b485a15e5efaf",
+          "harness_state": "recorded-cf613040d2c69182",
+          "blocked_on": null,
+          "ask": null,
+          "reason": null,
+          "host_id": "host/ad8787c4cc9d991e",
+          "last_activity_at": "2030-01-03T22:39:01.254Z",
+          "silent_since": "2030-01-03T22:39:01.254Z",
+          "fault": null,
+          "incarnation_id": "recorded-1d7c0ce548c462e7",
+          "current_session_id": "session/3c0b2415ce17e080",
+          "current_work_ids": [],
+          "active_work_count": 0,
+          "next_work_id": null,
+          "upcoming_work_ids": [],
+          "queued_work_count": 0,
+          "current_work": [],
+          "next_work": null,
+          "upcoming_work": [],
+          "under": []
+        }
+      }
+    },
+    "message": {
+      "ref": "message/27753b69bd8968c2",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/ab3fdc170b9a4055",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50427,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:41.165Z"
+        },
+        "value": {
+          "id": "message/27753b69bd8968c2",
+          "kind": "message",
+          "revision": "a217d19b359170ca991893069c8c116d1bec81e88afee2560eaabadb8b5ceee8",
+          "updated_at": "2030-01-03T17:23:23.809Z",
+          "from": "agent/c3cb4b974b57062e",
+          "to": "person/reviewer",
+          "title": null,
+          "content": "Recorded gateway value",
+          "state": "sent",
+          "delivery": {
+            "state": "waiting",
+            "phase": "sent",
+            "reason": "Recorded gateway value",
+            "age_ms": 19048628,
+            "recipient_delivery": null
+          },
+          "sent_at": "2030-01-03T17:23:23.809Z",
+          "session_id": null,
+          "in_reply_to": "message/3c0db569fc217587",
+          "tags": [],
+          "attachments": []
+        }
+      }
+    },
+    "runtime": {
+      "ref": "runtime/901dee053163764b",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/11c1b05126206478",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50428,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:42.624Z"
+        },
+        "value": {
+          "id": "runtime/901dee053163764b",
+          "kind": "runtime",
+          "revision": "48c59b5f8e6604ffd08e3b9045ac99b7217be7ebcb8dc1704a5c4e977b34247e",
+          "updated_at": "2030-01-02T08:02:30.217Z",
+          "runtime_kind": "terminal",
+          "owner_id": "agent/99d626d796265330",
+          "owner_host_id": "host/ad8787c4cc9d991e",
+          "state": "running",
+          "runtime_id": "recorded-41ea9fd7f6ad3573",
+          "incarnation_id": "recorded-ab7ec0b4f177908f",
+          "desired_revision": "4b43cb004ddeeebc01362dc8f03f66ccbda414ad3cf3ef539288e607285130ff",
+          "owner_run_id": null,
+          "terminal_id": "terminal/9ef9e2b2bdf97ecc",
+          "terminal_sequence": null,
+          "terminal_access": {
+            "read": "unavailable",
+            "input": "unavailable",
+            "resize": "unavailable"
+          }
+        }
+      }
+    },
+    "observer": {
+      "ref": "observer/2a64b6ec6b525862",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/e5156f2a172891d5",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50431,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:51.193Z"
+        },
+        "value": {
+          "id": "observer/2a64b6ec6b525862",
+          "kind": "observer",
+          "revision": "0a7df48bf8fe5f1b3a33db39f951ae3d9ec1ebbc644d49496a122c3022f1adad",
+          "updated_at": "2030-01-01T17:20:30.654Z",
+          "state": "healthy",
+          "spec": {
+            "resource": "resource/270de19d4eb8a082",
+            "provider": "local.file",
+            "locator": "/recorded/gateway",
+            "fields": [
+              "status",
+              "content_hash"
+            ],
+            "every_ms": 2000,
+            "stopped": false
+          },
+          "owner_run_id": "mission-run/dc2fd798d532c801",
+          "owner_generation_id": "run-generation/a5f331e706f2f608",
+          "owner_step_id": null
+        }
+      }
+    },
+    "subscription": {
+      "ref": "subscription/3b27561019ac7de",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/e5156f2a172891d5",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50431,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:51.193Z"
+        },
+        "value": {
+          "id": "subscription/3b27561019ac7de",
+          "kind": "subscription",
+          "revision": "4b1e2cdbe9d785a0b935588902fb347d081f7b7f9fef913f5d60e42faa0740ee",
+          "updated_at": "2030-01-01T17:20:30.960Z",
+          "state": "active",
+          "spec": {
+            "observer": "observer/2a64b6ec6b525862",
+            "to": "agent/99d626d796265330",
+            "fields": [
+              "content_hash"
+            ],
+            "delivery": "message",
+            "stopped": false
+          },
+          "owner_run_id": "mission-run/dc2fd798d532c801",
+          "owner_generation_id": "run-generation/a5f331e706f2f608",
+          "owner_step_id": null
+        }
+      }
+    },
+    "operation": {
+      "ref": "operation/dbd3d524dd9caefe",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/e5156f2a172891d5",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50431,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:51.193Z"
+        },
+        "value": {
+          "id": "operation/dbd3d524dd9caefe",
+          "kind": "operation",
+          "revision": "terminal-exec-gates:pass",
+          "updated_at": "2030-01-03T22:40:51.193Z",
+          "component": "daemon",
+          "severity": "info",
+          "state": "healthy",
+          "summary": "Recorded gateway value",
+          "targets": []
+        }
+      }
+    },
+    "history": {
+      "ref": "history/1f9c562965839d",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/e5156f2a172891d5",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50431,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:51.193Z"
+        },
+        "value": {
+          "id": "history/1f9c562965839d",
+          "kind": "history",
+          "revision": "7aec757a7ea95e665be08f6b45aed79a113b5231c006132146b2b5afcc4d505e",
+          "updated_at": "2030-01-03T22:32:52.694Z",
+          "event_type": "recorded-9f9d081cb274639",
+          "occurred_at": "2030-01-03T22:32:52.694Z",
+          "store_index": 50205,
+          "summary": "Recorded gateway value",
+          "targets": [
+            "resource/e0e3218ccd561eb6"
+          ]
+        }
+      }
+    },
+    "session": {
+      "ref": "session/a516d6442dfe378d",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/e5156f2a172891d5",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50431,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:51.193Z"
+        },
+        "value": {
+          "id": "session/a516d6442dfe378d",
+          "kind": "session",
+          "revision": "7018:2030-01-03T13:11:17.057Z",
+          "updated_at": "2030-01-03T22:40:25.874Z",
+          "owner_id": "agent/710581912fe4f12",
+          "state": "running",
+          "started_at": "2030-01-03T13:11:17.089Z",
+          "ended_at": null,
+          "timeline_cursor": "recorded-c1b8d04f8a596554",
+          "runtime_incarnation": "recorded-d63f6d11b644662"
+        }
+      }
+    },
+    "glass": {
+      "ref": "glass/5a2ab6fd199587e7",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/d03b290c74009491",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50433,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:57.696Z"
+        },
+        "value": {
+          "id": "glass/5a2ab6fd199587e7",
+          "kind": "glass",
+          "revision": "62790a8723e615e9c20ab5642362fc9ee6c7aabdf4f46778b1ee622e41cfa330",
+          "body": {
+            "layout": {
+              "tabs": [
+                {
+                  "pane": "recorded-b43e4b597c751c2"
+                },
+                {
+                  "pane": "recorded-e96af826317ce248"
+                }
+              ]
+            },
+            "name": "Recorded gateway value"
+          },
+          "deleted": false,
+          "base_revision": "43798cb1ce92175dd9d968fd770c2e7167f3594d125d3fc6876eaeea4eb20a9f",
+          "replaced_revision": "43798cb1ce92175dd9d968fd770c2e7167f3594d125d3fc6876eaeea4eb20a9f",
+          "updated_at": "2030-01-02T14:30:25.866Z"
+        }
+      }
+    },
+    "device": {
+      "ref": "device/21ef1f816c533e96",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/d03b290c74009491",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50433,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:57.696Z"
+        },
+        "value": {
+          "kind": "page",
+          "collection": "devices",
+          "filters": {
+            "person": "person/reviewer"
+          },
+          "items": [
+            {
+              "id": "device/21ef1f816c533e96",
+              "kind": "device",
+              "revision": "4958a0be1a694b8d53207da101c811f68438a80d5745f481c5416b58677cb3e6",
+              "updated_at": "2030-01-02T21:38:27.475Z",
+              "person_id": "person/reviewer",
+              "name": "Recorded gateway value",
+              "session_actor": "person/operator",
+              "state": "active",
+              "scopes": [
+                "read.projections",
+                "read.declarations",
+                "read.glasses",
+                "control.glasses",
+                "terminal.read",
+                "terminal.control",
+                "control.attention",
+                "control.messages",
+                "control.launches",
+                "control.missions",
+                "control.work",
+                "control.runtimes",
+                "control.pairing"
+              ],
+              "expires_at": "2030-02-01T21:38:27.471Z"
+            }
+          ],
+          "page": {
+            "limit": 100,
+            "has_more": false
+          }
+        }
+      }
+    },
+    "machine": {
+      "ref": "machine/bf7c7ed767b08e86",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/d03b290c74009491",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50433,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:57.696Z"
+        },
+        "value": {
+          "kind": "page",
+          "collection": "machines",
+          "filters": {},
+          "items": [
+            {
+              "host_id": "host/37eda7d15d948865",
+              "name": "Recorded gateway value",
+              "state": "local",
+              "fleet_id": "00000000-0000-4000-8000-00000000f1ee",
+              "capacity": {
+                "state": "unknown",
+                "reason": "Recorded gateway value"
+              },
+              "occupancy": {
+                "running_runtimes": 2
+              },
+              "projects": [],
+              "work": [
+                "step-run/3e3a4d89ae89403a"
+              ],
+              "transports": [
+                {
+                  "protocol": "unix",
+                  "status": "local",
+                  "last_success_at": null
+                }
+              ],
+              "runtime_ids": [
+                "runtime/000000000000a001",
+                "runtime/000000000000a002"
+              ],
+              "id": "machine/bf7c7ed767b08e86",
+              "kind": "machine",
+              "revision": "machine:07521e71c748f15bbfda2134397b517c2ab6fc28fd595813f398d4ec456b40c7",
+              "updated_at": "2030-01-03T22:41:00.504Z"
+            },
+            {
+              "host_id": "host/ad8787c4cc9d991e",
+              "name": "Recorded gateway value",
+              "state": "reachable",
+              "fleet_id": "00000000-0000-4000-8000-00000000f1ee",
+              "capacity": {
+                "state": "unknown",
+                "reason": "Recorded gateway value"
+              },
+              "occupancy": {
+                "running_runtimes": 3
+              },
+              "projects": [],
+              "work": [
+                "step-run/1a515a32f0c6a1fc"
+              ],
+              "transports": [
+                {
+                  "protocol": "replication",
+                  "status": "up",
+                  "last_success_at": "2030-01-03T22:41:02.651Z"
+                }
+              ],
+              "runtime_ids": [
+                "runtime/901dee053163764b",
+                "runtime/5025ca7d83cfe8dd",
+                "runtime/000000000000a003"
+              ],
+              "id": "machine/743add6f155e634e",
+              "kind": "machine",
+              "revision": "machine:52f8d33a394e2fe3e39e55728d3a588cd7b300f92decfb61b5650f8b4e0f5eb7",
+              "updated_at": "2030-01-03T22:35:44.684Z"
+            },
+            {
+              "host_id": "host/5204a206c2f886ce",
+              "name": "Recorded gateway value",
+              "state": "last-seen",
+              "fleet_id": "00000000-0000-4000-8000-00000000f1ee",
+              "capacity": {
+                "state": "unknown",
+                "reason": "Recorded gateway value"
+              },
+              "occupancy": {
+                "running_runtimes": 1
+              },
+              "projects": [],
+              "work": [],
+              "transports": [
+                {
+                  "protocol": "replication",
+                  "status": "last-seen",
+                  "last_success_at": "2030-01-03T06:21:40.199Z"
+                }
+              ],
+              "runtime_ids": [
+                "runtime/000000000000a004"
+              ],
+              "id": "machine/70810221c14f821c",
+              "kind": "machine",
+              "revision": "machine:d84e766c95c23704f015eda8a4ac71e04595de70047faff8907eab093b7d1eba",
+              "updated_at": "2030-01-02T13:54:21.458Z"
+            }
+          ],
+          "page": {
+            "limit": 100,
+            "has_more": false
+          }
+        }
+      }
+    },
+    "agentQueue": {
+      "ref": "agent/1d34acd36c9a4c89",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/d03b290c74009491",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50433,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:57.696Z"
+        },
+        "value": {
+          "kind": "agent-queue",
+          "agent_id": "agent/1d34acd36c9a4c89",
+          "current_work_ids": [],
+          "next_work_id": null,
+          "runs": [],
+          "moves": [],
+          "move_count": 0
+        }
+      }
+    },
+    "launch": {
+      "ref": "launch/236dcd2f4893b3a1",
+      "status": 404,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "error_version": "st3.client.error.v0",
+        "request_id": "request/49264d180a0c70e0",
+        "code": "not-found",
+        "message": "launch `launch/f0437922eda1f242",
+        "retryable": false,
+        "details": {}
+      }
+    },
+    "lane": {
+      "ref": "lane/b9b379018f7dfe46",
+      "status": 404,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "error_version": "st3.client.error.v0",
+        "request_id": "request/a0850a9902272caf",
+        "code": "not-found",
+        "message": "lane `lane/24abbf0621fc67d4",
+        "retryable": false,
+        "details": {}
+      }
+    },
+    "attention": {
+      "ref": "attention/b87f4036584c3c46",
+      "status": 404,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "error_version": "st3.client.error.v0",
+        "request_id": "request/e3543340cf509f87",
+        "code": "not-found",
+        "message": "attention `attention/c5f4b290bc47e8a6",
+        "retryable": false,
+        "details": {}
+      }
+    },
+    "terminalScreen": {
+      "ref": "terminal/d9ae9fb77ef08f1d",
+      "status": 422,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "error_version": "st3.client.error.v0",
+        "request_id": "request/f8b08f88091ec8f9",
+        "code": "runtime-authority-indeterminate",
+        "message": "subject `subject-read-contract-absent` has indeterminate runtime authority",
+        "retryable": true,
+        "details": {}
+      }
+    },
+    "document": {
+      "ref": "subject-read-contract-absent",
+      "status": 422,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "error_version": "st3.client.error.v0",
+        "request_id": "request/1640c1669934ab86",
+        "code": "internal",
+        "message": "a document name needs `@HASH`",
+        "retryable": false,
+        "details": {}
+      }
+    },
+    "blob": {
+      "ref": "blob/a29b5795a37726b2",
+      "status": 403,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "error_version": "st3.client.error.v0",
+        "request_id": "request/7d7a40fb17880fdf",
+        "code": "forbidden",
+        "message": "this attachment is not in a conversation the session may read",
+        "retryable": false,
+        "details": {}
+      }
+    },
+    "launchVariant": {
+      "ref": "launch-variant/4fb78a0b5183efa6",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "request_id": "request/263166c09a6ac245",
+        "snapshot": {
+          "id": "snapshot/21df716216c26992",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50202,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:32:00.548Z"
+        },
+        "value": {
+          "kind": "page",
+          "collection": "launches",
+          "filters": {},
+          "items": [],
+          "page": {
+            "limit": 100,
+            "has_more": false
+          }
+        }
+      }
+    },
+    "launchDecision": {
+      "ref": "launch-decision/999336cae374385c",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "request_id": "request/263166c09a6ac245",
+        "snapshot": {
+          "id": "snapshot/21df716216c26992",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50202,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:32:00.548Z"
+        },
+        "value": {
+          "kind": "page",
+          "collection": "launches",
+          "filters": {},
+          "items": [],
+          "page": {
+            "limit": 100,
+            "has_more": false
+          }
+        }
+      }
+    },
+    "launchApproval": {
+      "ref": "launch-approval/74c64b606bc2fc3a",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "request_id": "request/263166c09a6ac245",
+        "snapshot": {
+          "id": "snapshot/21df716216c26992",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50202,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:32:00.548Z"
+        },
+        "value": {
+          "kind": "page",
+          "collection": "launches",
+          "filters": {},
+          "items": [],
+          "page": {
+            "limit": 100,
+            "has_more": false
+          }
+        }
+      }
+    },
+    "resource": {
+      "ref": "resource/c1b12c413523f78a",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "request_id": "request/cdf03896ed80038c",
+        "snapshot": {
+          "id": "snapshot/1c70dac91dfaf579",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 51375,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T23:22:34.130Z"
+        },
+        "value": {
+          "kind": "page",
+          "collection": "resources",
+          "filters": {
+            "subject_prefix": "resource/c1b12c413523f78a"
+          },
+          "items": [
+            {
+              "id": "resource/c1b12c413523f78a",
+              "kind": "filesystem.file",
+              "facts": {
+                "content_hash": "Recorded resource fact",
+                "path": "Recorded resource fact",
+                "status": "Recorded resource fact"
+              },
+              "observed_at": "2030-01-02T11:12:43.088Z",
+              "opened_by": null,
+              "opened_by_run": null
+            }
+          ],
+          "page": {
+            "limit": 50,
+            "has_more": false
+          }
+        }
+      }
+    },
+    "missionRun": {
+      "ref": "mission-run/ca074a0d84ac0e92",
+      "status": 200,
+      "payload": {
+        "api_version": "st3.client.v0",
+        "snapshot": {
+          "id": "snapshot/65589c9f1c57f88a",
+          "host_id": "host/37eda7d15d948865",
+          "store_index": 50413,
+          "projection_version": "client-projection.v0",
+          "created_at": "2030-01-03T22:40:25.021Z"
+        },
+        "value": {
+          "id": "mission/a3bbc810d73c508e",
+          "kind": "mission",
+          "revision": "fe20339b3fb855c55ee79bb8876952e4448f554b9eb86d0aa4bbe34e3bc1feab",
+          "updated_at": "2030-01-03T22:05:17.459Z",
+          "title": "Recorded gateway value",
+          "state": "running",
+          "mission_revision": "recorded-11f00c677fff2372",
+          "runs": [
+            "mission-run/ca074a0d84ac0e92"
+          ],
+          "run_details": [
+            {
+              "id": "mission-run/ca074a0d84ac0e92",
+              "generation_id": "run-generation/dbd9f91be4d58f62",
+              "requester": "agent/99d626d796265330",
+              "status": "running",
+              "phase": "normal",
+              "progress": {
+                "done": 0,
+                "total": 1
+              },
+              "current_steps": [
+                {
+                  "id": "step-run/3d3f317df9dc7644",
+                  "title": null,
+                  "assignee": null,
+                  "claimant": null,
+                  "state": "claimed",
+                  "since": "2030-01-03T22:05:18.176Z"
+                }
+              ],
+              "must_act": "you",
+              "state_since": "2030-01-03T22:05:17.459Z",
+              "outcome": null,
+              "last_progress": null,
+              "blocker": null,
+              "after": null,
+              "deadline": null,
+              "steps": [
+                {
+                  "id": "step-run/3d3f317df9dc7644",
+                  "path": "Recorded gateway value",
+                  "title": null,
+                  "state": "claimed",
+                  "attempt": 1,
+                  "assignee": null,
+                  "claimant": null,
+                  "agentless": true,
+                  "since": "2030-01-03T22:05:18.176Z",
+                  "last_progress": null,
+                  "blocked_reason": null,
+                  "blockers": [],
+                  "goals": [],
+                  "constraints": []
+                }
+              ]
+            }
+          ],
+          "must_act": "you",
+          "active_runs": 1,
+          "run_generations": {
+            "mission-run/ca074a0d84ac0e92": "run-generation/dbd9f91be4d58f62"
+          }
+        }
+      }
+    }
+  }
+}

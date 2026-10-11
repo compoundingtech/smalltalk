@@ -9,6 +9,7 @@ package_view(
     dependency_view = "//buck2/dependencies:view_clients_typescript_st3_views_4839e64c8727",
     files = {
         "clientName.ts": "clientName.ts",
+        "conversationContent.ts": "conversationContent.ts",
         "conversationSimple.ts": "conversationSimple.ts",
         "conversationView.ts": "conversationView.ts",
         "deviceSigning.ts": "deviceSigning.ts",

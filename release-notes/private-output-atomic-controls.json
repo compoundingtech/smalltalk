@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Verify private atomic output capture fences without installing a producer",
+  "replay": {
+    "status": "none",
+    "detail": "Test-only spool prototype; no provider adapter, daemon replay or callback change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Existing event spool used only in isolated test roots; no installed schema or index change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No fleet/checkpoint rule, claim admission or turn obligation change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "All new modules are cfg(test); no shipped event producer, public schema or client contract change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service, writer scheduling, cache or timer change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator or installation action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No physical authority or native protocol acceptance; original recovery hold remains separate."
+  }
+}

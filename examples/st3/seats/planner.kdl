@@ -6,7 +6,7 @@ version 2
 // invented repository. Missions give it planning steps by assigning them to
 // `agent/example/planner`. Apply it with a worker seat and seats/reviewer.kdl:
 //
-//   st agents apply examples/st3/seats/planner.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/planner.kdl --as person/operator
 //   st agents queue agent/example/planner
 agent "example/planner" {
   workspace "/srv/example/planner"

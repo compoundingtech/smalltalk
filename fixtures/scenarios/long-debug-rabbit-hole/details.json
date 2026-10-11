@@ -1,0 +1,261 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "details",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 22
+  },
+  "state": {
+    "missions": [
+      {
+        "active_runs": 1,
+        "id": "mission/example/atlas/search-test-flake",
+        "kind": "mission",
+        "mission_revision": "sha256:atlas-mission-1",
+        "revision": "mr-3",
+        "run_generations": {
+          "mission-run/example/atlas/search-test-flake/1": "run-generation/example/atlas/search-test-flake/1/g1"
+        },
+        "runs": [
+          "mission-run/example/atlas/search-test-flake/1"
+        ],
+        "state": "running",
+        "title": "Find the order-dependent search test flake",
+        "total_runs": 1,
+        "updated_at": "2030-01-01T11:59:52.000Z"
+      }
+    ],
+    "work": [
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-builder-750:4",
+        "claimant": "agent/example/atlas/builder",
+        "constraints": [
+          "Keep the patch to one line in the test fixture"
+        ],
+        "definition_id": "def-step-1",
+        "generation_id": "run-generation/example/atlas/search-test-flake/1/g1",
+        "goals": [
+          "No AbortError in 100 shuffled orders",
+          "Change only the test fixture, not production retry behavior"
+        ],
+        "id": "work/example/atlas/search-test-flake/1/step-1",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/search-test-flake",
+        "mission_run_id": "mission-run/example/atlas/search-test-flake/1",
+        "path": "step-1",
+        "readiness_epoch": 1,
+        "revision": "w-hypotheses-rejected",
+        "state": "completed",
+        "title": "Reproduce and reject the three hypotheses",
+        "updated_at": "2030-01-01T11:59:52.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-builder-750:4",
+        "claimant": "agent/example/atlas/builder",
+        "constraints": [
+          "Keep the patch to one line in the test fixture"
+        ],
+        "definition_id": "def-step-2",
+        "generation_id": "run-generation/example/atlas/search-test-flake/1/g1",
+        "goals": [
+          "No AbortError in 100 shuffled orders",
+          "Change only the test fixture, not production retry behavior"
+        ],
+        "id": "work/example/atlas/search-test-flake/1/step-2",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/search-test-flake",
+        "mission_run_id": "mission-run/example/atlas/search-test-flake/1",
+        "path": "step-2",
+        "readiness_epoch": 2,
+        "revision": "w-fix",
+        "state": "claimed",
+        "title": "Isolate the test abort signal",
+        "updated_at": "2030-01-01T11:59:52.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-builder-750:4",
+        "claimant": "agent/example/atlas/builder",
+        "constraints": [
+          "Keep the patch to one line in the test fixture"
+        ],
+        "definition_id": "def-step-3",
+        "generation_id": "run-generation/example/atlas/search-test-flake/1/g1",
+        "goals": [
+          "No AbortError in 100 shuffled orders",
+          "Change only the test fixture, not production retry behavior"
+        ],
+        "id": "work/example/atlas/search-test-flake/1/step-3",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/search-test-flake",
+        "mission_run_id": "mission-run/example/atlas/search-test-flake/1",
+        "path": "step-3",
+        "readiness_epoch": 3,
+        "revision": "w-repeat-ready",
+        "state": "ready",
+        "title": "Verify shuffled test orders",
+        "updated_at": "2030-01-01T11:59:52.000Z"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 6000,
+      "removes": [],
+      "store": 5,
+      "upserts": [
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-atlas-builder-750:4",
+          "claimant": "agent/example/atlas/builder",
+          "constraints": [
+            "Keep the patch to one line in the test fixture"
+          ],
+          "definition_id": "def-step-2",
+          "generation_id": "run-generation/example/atlas/search-test-flake/1/g1",
+          "goals": [
+            "No AbortError in 100 shuffled orders",
+            "Change only the test fixture, not production retry behavior"
+          ],
+          "id": "work/example/atlas/search-test-flake/1/step-2",
+          "kind": "work",
+          "mission_id": "mission/example/atlas/search-test-flake",
+          "mission_run_id": "mission-run/example/atlas/search-test-flake/1",
+          "path": "step-2",
+          "readiness_epoch": 2,
+          "revision": "w-isolated",
+          "state": "completed",
+          "title": "Isolate the test abort signal",
+          "updated_at": "2030-01-01T12:00:06.000Z"
+        },
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-atlas-builder-750:4",
+          "claimant": "agent/example/atlas/builder",
+          "constraints": [
+            "Keep the patch to one line in the test fixture"
+          ],
+          "definition_id": "def-step-3",
+          "generation_id": "run-generation/example/atlas/search-test-flake/1/g1",
+          "goals": [
+            "No AbortError in 100 shuffled orders",
+            "Change only the test fixture, not production retry behavior"
+          ],
+          "id": "work/example/atlas/search-test-flake/1/step-3",
+          "kind": "work",
+          "mission_id": "mission/example/atlas/search-test-flake",
+          "mission_run_id": "mission-run/example/atlas/search-test-flake/1",
+          "path": "step-3",
+          "readiness_epoch": 3,
+          "revision": "w-shuffled",
+          "state": "verifying",
+          "title": "Verify shuffled test orders",
+          "updated_at": "2030-01-01T12:00:06.000Z"
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 22000,
+      "removes": [],
+      "store": 9,
+      "upserts": [
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-atlas-builder-750:4",
+          "claimant": "agent/example/atlas/builder",
+          "constraints": [
+            "Keep the patch to one line in the test fixture"
+          ],
+          "definition_id": "def-step-3",
+          "generation_id": "run-generation/example/atlas/search-test-flake/1/g1",
+          "goals": [
+            "No AbortError in 100 shuffled orders",
+            "Change only the test fixture, not production retry behavior"
+          ],
+          "id": "work/example/atlas/search-test-flake/1/step-3",
+          "kind": "work",
+          "mission_id": "mission/example/atlas/search-test-flake",
+          "mission_run_id": "mission-run/example/atlas/search-test-flake/1",
+          "path": "step-3",
+          "readiness_epoch": 3,
+          "revision": "w-repeat-green",
+          "state": "completed",
+          "title": "Verify shuffled test orders",
+          "updated_at": "2030-01-01T12:00:22.000Z"
+        },
+        {
+          "active_runs": 0,
+          "id": "mission/example/atlas/search-test-flake",
+          "kind": "mission",
+          "mission_revision": "sha256:atlas-mission-1",
+          "revision": "mr-complete",
+          "run_generations": {
+            "mission-run/example/atlas/search-test-flake/1": "run-generation/example/atlas/search-test-flake/1/g1"
+          },
+          "runs": [
+            "mission-run/example/atlas/search-test-flake/1"
+          ],
+          "state": "completed",
+          "title": "Find the order-dependent search test flake",
+          "total_runs": 1,
+          "updated_at": "2030-01-01T12:00:22.000Z"
+        }
+      ]
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/missions/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/2/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/1/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "long-debug-rabbit-hole"
+}
