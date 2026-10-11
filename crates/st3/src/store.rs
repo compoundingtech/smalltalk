@@ -141,6 +141,9 @@ mod person_work;
 pub(crate) mod work_summaries_ivm;
 mod subagents;
 mod watches;
+mod idle_holds;
+mod idle_mail;
+pub use idle_holds::WORK_NUDGED_KIND;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
 pub use limits::{AccountLimit, LIMITS_ACTOR, LIMITS_CATCH_UP_PAGE, LimitsOutcome, LimitsPolicy};
 pub use subagents::{
@@ -524,6 +527,9 @@ WHERE kind='custom.client.terminal-attached';
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
+CREATE INDEX IF NOT EXISTS claims_run_report_to_index
+ON claims(json_extract(body, '$.fields.report_to'), subject)
+WHERE kind IN ('mission-run.created','mission-run.report-to');
 CREATE INDEX IF NOT EXISTS claims_message_from_index
 ON claims(json_extract(body, '$.fields.from'), store_index)
 WHERE kind='message.sent';
@@ -715,6 +721,11 @@ CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject
 CREATE INDEX IF NOT EXISTS desired_claim_index ON desired(claim_id);
 CREATE INDEX IF NOT EXISTS desired_agent_subject_index ON desired(subject) WHERE kind='agent';
 CREATE INDEX IF NOT EXISTS desired_agent_host_index ON desired(json_extract(member, '$.host'), subject) WHERE kind='agent';
+
+-- Watch subjects encode OWNER/REPO/NUMBER followed by the recipient (which may contain slashes).
+-- Seek that suffix so an idle seat never scans the fleet's declarations.
+CREATE INDEX IF NOT EXISTS desired_watch_agent_index ON desired(substr(substr(substr(substr(subject, 20), instr(substr(subject, 20), '/') + 1), instr(substr(substr(subject, 20), instr(substr(subject, 20), '/') + 1), '/') + 1), instr(substr(substr(substr(subject, 20), instr(substr(subject, 20), '/') + 1), instr(substr(substr(subject, 20), instr(substr(subject, 20), '/') + 1), '/') + 1), '/') + 1))
+WHERE subject >= 'subscription/watch/' AND subject < 'subscription/watch0';
 
 -- A replicated projection finds a mission run tree's runs, generations and proposals from the
 -- claims that create them, without reading every such claim.
@@ -31774,6 +31785,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         blocked_reason: row.get(15)?,
         blockers: Vec::new(),
         not_before_unix_ms: not_before.and_then(|value| value.parse().ok()),
+        nudged_at_unix_ms: None,
         created_at_unix_ms: created.parse().unwrap_or(0),
         updated_at_unix_ms: updated.parse().unwrap_or(0),
         person_answers: Vec::new(),
@@ -31832,10 +31844,38 @@ fn enrich_step_queue_at(
     view.timeout_extension_ms =
         step_timeout_extension_at(connection, &view.subject, view.attempt, snapshot_unix_ms)?;
     enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
+    enrich_step_nudge_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)?;
     adhoc_work::enrich_handoff(connection, view, snapshot_unix_ms)?;
     person_work::enrich_responses(connection, view)
+}
+
+/// When st last nudged a held step's holder in this attempt: one indexed lookup of the step's
+/// newest `work.nudged` claim.
+fn enrich_step_nudge_at(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<()> {
+    if !matches!(view.status.as_str(), "claimed" | "working") {
+        return Ok(());
+    }
+    let snapshot = snapshot_unix_ms.to_string();
+    view.nudged_at_unix_ms = connection
+        .prepare_cached(
+            "SELECT accepted_at_unix_ms FROM claims
+             WHERE subject=?1 AND kind='work.nudged'
+               AND json_extract(body, '$.fields.attempt')=?2
+               AND (length(accepted_at_unix_ms), accepted_at_unix_ms) <= (length(?3), ?3)
+             ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC LIMIT 1",
+        )?
+        .query_row(params![view.subject, view.attempt, snapshot], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .and_then(|at| at.parse().ok());
+    Ok(())
 }
 
 /// Copies the worker's latest progress summary and its completion summary for the

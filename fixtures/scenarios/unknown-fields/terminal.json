@@ -1,0 +1,498 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "terminal",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 19
+  },
+  "state": {
+    "terminals": [
+      {
+        "cast": {
+          "events": [
+            [
+              0,
+              "o",
+              "\u001b[32matlas\u001b[0m:builder $ pnpm test client-forward-compatibility\r\n"
+            ],
+            [
+              0.791,
+              "o",
+              "Agent extra fields: preserved\r\n"
+            ],
+            [
+              1.371,
+              "o",
+              "Future agent state: reconciling\r\n"
+            ],
+            [
+              1.458,
+              "o",
+              "Compatibility probe: watching HTTP and collection streams\r\n"
+            ],
+            [
+              1.508,
+              "o",
+              "\u001b[32matlas\u001b[0m:builder $ "
+            ]
+          ],
+          "header": {
+            "height": 12,
+            "title": "pnpm test client-forward-compatibility",
+            "version": 2,
+            "width": 100
+          },
+          "started_at_ms": -15000
+        },
+        "incarnation": "pty-61:1",
+        "owner": "agent/example/atlas/builder",
+        "runtime": {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-atlas-builder-shell",
+          "incarnation_id": "pty-61:1",
+          "kind": "runtime",
+          "owner_host_id": "host/foundry",
+          "owner_id": "agent/example/atlas/builder",
+          "revision": "rt-shell-1",
+          "runtime_id": "example-atlas-builder-shell",
+          "runtime_kind": "terminal",
+          "state": "running",
+          "terminal_id": "terminal/example-atlas-builder",
+          "updated_at": "2030-01-01T11:59:45.000Z"
+        },
+        "screens": [
+          {
+            "at_ms": -15000,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 1,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 49,
+                      "text": ":builder $ pnpm test client-forward-compatibility"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm test client-forward-compatibility",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 1,
+              "revision": "cast-1",
+              "rows": 12,
+              "runtime_incarnation": "pty-61:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm test client-forward-compatibility",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -14209,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 2,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 49,
+                      "text": ":builder $ pnpm test client-forward-compatibility"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm test client-forward-compatibility",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "Agent extra fields: preserved"
+                    }
+                  ],
+                  "text": "Agent extra fields: preserved",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 2,
+              "revision": "cast-2",
+              "rows": 12,
+              "runtime_incarnation": "pty-61:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm test client-forward-compatibility",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -13629,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 3,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 49,
+                      "text": ":builder $ pnpm test client-forward-compatibility"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm test client-forward-compatibility",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "Agent extra fields: preserved"
+                    }
+                  ],
+                  "text": "Agent extra fields: preserved",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 31,
+                      "text": "Future agent state: reconciling"
+                    }
+                  ],
+                  "text": "Future agent state: reconciling",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 3,
+              "revision": "cast-3",
+              "rows": 12,
+              "runtime_incarnation": "pty-61:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm test client-forward-compatibility",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -13542,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 4,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 49,
+                      "text": ":builder $ pnpm test client-forward-compatibility"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm test client-forward-compatibility",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "Agent extra fields: preserved"
+                    }
+                  ],
+                  "text": "Agent extra fields: preserved",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 31,
+                      "text": "Future agent state: reconciling"
+                    }
+                  ],
+                  "text": "Future agent state: reconciling",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 57,
+                      "text": "Compatibility probe: watching HTTP and collection streams"
+                    }
+                  ],
+                  "text": "Compatibility probe: watching HTTP and collection streams",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 4,
+              "revision": "cast-4",
+              "rows": 12,
+              "runtime_incarnation": "pty-61:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm test client-forward-compatibility",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -13492,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 16,
+                "row": 4,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 49,
+                      "text": ":builder $ pnpm test client-forward-compatibility"
+                    }
+                  ],
+                  "text": "atlas:builder $ pnpm test client-forward-compatibility",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "Agent extra fields: preserved"
+                    }
+                  ],
+                  "text": "Agent extra fields: preserved",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 31,
+                      "text": "Future agent state: reconciling"
+                    }
+                  ],
+                  "text": "Future agent state: reconciling",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 57,
+                      "text": "Compatibility probe: watching HTTP and collection streams"
+                    }
+                  ],
+                  "text": "Compatibility probe: watching HTTP and collection streams",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 5,
+                      "fg": 2,
+                      "text": "atlas"
+                    },
+                    {
+                      "cells": 11,
+                      "text": ":builder $ "
+                    }
+                  ],
+                  "text": "atlas:builder $ ",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 5,
+              "revision": "cast-5",
+              "rows": 12,
+              "runtime_incarnation": "pty-61:1",
+              "terminal_id": "terminal/example-atlas-builder",
+              "title": "pnpm test client-forward-compatibility",
+              "truncated": false
+            }
+          }
+        ],
+        "terminal": "terminal/example-atlas-builder"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/terminals/0/runtime/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "unknown-fields"
+}

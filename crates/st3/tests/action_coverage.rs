@@ -1999,13 +1999,9 @@ async fn cli_missions_publish_cancel_outcome_retire_and_work_leases_survive_rest
         daemon
             .cli(
                 PERSON,
-                &[
-                    "missions",
-                    "publish",
-                    file.to_str().unwrap(),
-                    "--as",
-                    PERSON,
-                ],
+                &["apply", file.to_str().unwrap(),
+                "--as",
+                PERSON,],
             )
             .await,
     );
@@ -4554,7 +4550,7 @@ async fn cli_agent_and_shell_declarations_survive_restart() {
         daemon
             .cli(
                 PERSON,
-                &["agents", "apply", file.to_str().unwrap(), "--as", PERSON],
+                &["apply", "--no-gate-check", file.to_str().unwrap(), "--as", PERSON],
             )
             .await,
     );

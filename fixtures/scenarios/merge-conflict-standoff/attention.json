@@ -1,0 +1,143 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "attention",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 5
+  },
+  "state": {
+    "attention": [
+      {
+        "actions": [
+          "review.approve",
+          "review.request-changes",
+          "custom.reply"
+        ],
+        "attention_kind": "agent-request",
+        "detail": "packages/cache/policy.ts\n<<<<<<< ours\nexport const cachePolicy = { ttl: 300, stale: false };\n||||||| base\nexport const cachePolicy = { ttl: 60, stale: false };\n=======\nexport const cachePolicy = { ttl: 60, stale: true };\n>>>>>>> theirs\n",
+        "id": "attention/scenario-merge-conflict-standoff-review-builder",
+        "kind": "attention",
+        "mission_id": "mission/example/harbor/cache-policy",
+        "mission_run_id": "mission-run/example/harbor/cache-policy/1",
+        "person_id": "person/ada",
+        "priority": "high",
+        "requested_at": "2030-01-01T11:59:55.000Z",
+        "requester_id": "agent/example/harbor/builder",
+        "revision": "a1",
+        "source_id": "agent/example/harbor/builder",
+        "state": "open",
+        "targets": [
+          "agent/example/harbor/builder"
+        ],
+        "title": "Review the cache policy three-way conflict",
+        "updated_at": "2030-01-01T11:59:55.000Z"
+      },
+      {
+        "actions": [
+          "review.approve",
+          "review.request-changes",
+          "custom.reply"
+        ],
+        "attention_kind": "agent-request",
+        "detail": "packages/cache/policy.ts\n<<<<<<< ours\nexport const cachePolicy = { ttl: 300, stale: false };\n||||||| base\nexport const cachePolicy = { ttl: 60, stale: false };\n=======\nexport const cachePolicy = { ttl: 60, stale: true };\n>>>>>>> theirs\n",
+        "id": "attention/scenario-merge-conflict-standoff-review-reviewer",
+        "kind": "attention",
+        "mission_id": "mission/example/harbor/cache-policy",
+        "mission_run_id": "mission-run/example/harbor/cache-policy/1",
+        "person_id": "person/ada",
+        "priority": "high",
+        "requested_at": "2030-01-01T11:59:55.000Z",
+        "requester_id": "agent/example/harbor/reviewer",
+        "revision": "a1",
+        "source_id": "agent/example/harbor/reviewer",
+        "state": "open",
+        "targets": [
+          "agent/example/harbor/reviewer"
+        ],
+        "title": "Review the cache policy three-way conflict",
+        "updated_at": "2030-01-01T11:59:55.000Z"
+      }
+    ],
+    "messages": []
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 2000,
+      "removes": [
+        "attention/scenario-merge-conflict-standoff-review-builder",
+        "attention/scenario-merge-conflict-standoff-review-reviewer"
+      ],
+      "store": 2,
+      "upserts": [
+        {
+          "content": "Keep the 300-second TTL from builder and stale reads from reviewer. Combine both changes, run the cache tests, then land the patch.",
+          "from": "person/ada",
+          "id": "message/scenario-merge-conflict-standoff-decision-builder",
+          "in_reply_to": null,
+          "kind": "message",
+          "revision": "m1",
+          "sent_at": "2030-01-01T12:00:02.000Z",
+          "state": "delivered",
+          "tags": [],
+          "title": "Combined cache policy approved",
+          "to": "agent/example/harbor/builder",
+          "updated_at": "2030-01-01T12:00:02.000Z"
+        },
+        {
+          "content": "Keep the 300-second TTL from builder and stale reads from reviewer. Combine both changes, run the cache tests, then land the patch.",
+          "from": "person/ada",
+          "id": "message/scenario-merge-conflict-standoff-decision-reviewer",
+          "in_reply_to": null,
+          "kind": "message",
+          "revision": "m1",
+          "sent_at": "2030-01-01T12:00:02.000Z",
+          "state": "delivered",
+          "tags": [],
+          "title": "Combined cache policy approved",
+          "to": "agent/example/harbor/reviewer",
+          "updated_at": "2030-01-01T12:00:02.000Z"
+        }
+      ]
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/attention/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/attention/0/requested_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/attention/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/attention/1/requested_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/sent_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/1/sent_at"
+    }
+  ],
+  "variant": "default",
+  "world": "merge-conflict-standoff"
+}

@@ -11,8 +11,8 @@ version 2
 // the remediation step, whose worker must change files. A mission-level constraint would bind
 // every step.
 //
-//   st agents apply examples/st3/seats/omp.kdl --as person/operator
-//   st missions publish examples/st3/review-remediation.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/omp.kdl --as person/operator
+//   st apply examples/st3/review-remediation.kdl --as person/operator
 //   st missions start example/review-remediation --id example/review-remediation/1 \
 //     --workspace /srv/example/app --as person/operator
 

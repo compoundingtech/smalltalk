@@ -10,7 +10,7 @@ version 2
 //
 // Apply it as a person, after one of the worker seat files beside it:
 //
-//   st agents apply examples/st3/seats/chief.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/chief.kdl --as person/operator
 //
 // The chief then moves a queued run with its own identity, and the move records it as the actor:
 //

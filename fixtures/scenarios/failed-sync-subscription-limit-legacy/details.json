@@ -1,0 +1,188 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "details",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 1
+  },
+  "state": {
+    "missions": [
+      {
+        "active_runs": 1,
+        "id": "mission/example/atlas/load-user-rename",
+        "kind": "mission",
+        "mission_revision": "sha256:atlas-mission-1",
+        "revision": "mr-5",
+        "run_generations": {
+          "mission-run/example/atlas/load-user-rename/1": "run-generation/example/atlas/load-user-rename/1/g1"
+        },
+        "runs": [
+          "mission-run/example/atlas/load-user-rename/1"
+        ],
+        "state": "running",
+        "title": "Rename fetchUser to loadUser",
+        "total_runs": 1,
+        "updated_at": "2030-01-01T11:58:25.000Z"
+      }
+    ],
+    "work": [
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-builder-271:8",
+        "claimant": "agent/example/atlas/builder",
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-1",
+        "generation_id": "run-generation/example/atlas/load-user-rename/1/g1",
+        "goals": [
+          "Rename the export and its tests"
+        ],
+        "id": "work/example/atlas/load-user-rename/1/step-1",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/load-user-rename",
+        "mission_run_id": "mission-run/example/atlas/load-user-rename/1",
+        "path": "step-1",
+        "readiness_epoch": 1,
+        "revision": "w-1",
+        "state": "completed",
+        "title": "Rename fetchUser in packages/api",
+        "updated_at": "2030-01-01T11:30:00.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-migrator-210:4",
+        "claimant": "agent/example/atlas/migrator",
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-2",
+        "generation_id": "run-generation/example/atlas/load-user-rename/1/g1",
+        "goals": [
+          "Every web call site uses loadUser"
+        ],
+        "id": "work/example/atlas/load-user-rename/1/step-2",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/load-user-rename",
+        "mission_run_id": "mission-run/example/atlas/load-user-rename/1",
+        "path": "step-2",
+        "readiness_epoch": 2,
+        "revision": "w-2",
+        "state": "claimed",
+        "title": "Update call sites in packages/web",
+        "updated_at": "2030-01-01T11:39:00.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": "syncAvatars calls loadUser without the session",
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-builder-271:8",
+        "claimant": "agent/example/atlas/builder",
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-3",
+        "generation_id": "run-generation/example/atlas/load-user-rename/1/g1",
+        "goals": [
+          "pnpm -r typecheck passes"
+        ],
+        "id": "work/example/atlas/load-user-rename/1/step-3",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/load-user-rename",
+        "mission_run_id": "mission-run/example/atlas/load-user-rename/1",
+        "path": "step-3",
+        "readiness_epoch": 3,
+        "revision": "w-3",
+        "state": "blocked",
+        "title": "Fix the worker after the rename",
+        "updated_at": "2030-01-01T11:58:25.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-reviewer-914:1",
+        "claimant": "agent/example/atlas/reviewer",
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-4",
+        "generation_id": "run-generation/example/atlas/load-user-rename/1/g1",
+        "goals": [
+          "A person approves the rename"
+        ],
+        "id": "work/example/atlas/load-user-rename/1/step-4",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/load-user-rename",
+        "mission_run_id": "mission-run/example/atlas/load-user-rename/1",
+        "path": "step-4",
+        "readiness_epoch": 4,
+        "revision": "w-4",
+        "state": "waiting-person",
+        "title": "Review the rename",
+        "updated_at": "2030-01-01T11:48:00.000Z"
+      },
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": null,
+        "claimant": null,
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-5",
+        "generation_id": "run-generation/example/atlas/load-user-rename/1/g1",
+        "goals": [
+          "docs/api/users.md describes loadUser"
+        ],
+        "id": "work/example/atlas/load-user-rename/1/step-5",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/load-user-rename",
+        "mission_run_id": "mission-run/example/atlas/load-user-rename/1",
+        "path": "step-5",
+        "readiness_epoch": 5,
+        "revision": "w-5",
+        "state": "ready",
+        "title": "Update the users API reference",
+        "updated_at": "2030-01-01T11:48:00.000Z"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/missions/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/2/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/3/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/4/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "failed-sync-subscription-limit-legacy"
+}

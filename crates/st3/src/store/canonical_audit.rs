@@ -61,6 +61,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "agent_message_sends",
         "agent_message_days",
         "local_agent_message_pending",
+        "local_idle_messages",
         "coordination_sends",
         "local_coordination_backfill",
         "local_observations",

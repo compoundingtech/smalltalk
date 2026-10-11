@@ -1,0 +1,1461 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "terminal",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 7
+  },
+  "state": {
+    "terminals": [
+      {
+        "cast": {
+          "events": [
+            [
+              0,
+              "o",
+              "\u001b[32mmeadow\u001b[0m:builder $ pnpm release:verify --version 0.8.4\r\n"
+            ],
+            [
+              0.939,
+              "o",
+              "Release candidate 0.8.4\r\n"
+            ],
+            [
+              1.172,
+              "o",
+              "linux   unit tests       PASS (184 tests)\r\n"
+            ],
+            [
+              1.775,
+              "o",
+              "macos   unit tests       PASS (184 tests)\r\n"
+            ],
+            [
+              2.248,
+              "o",
+              "all     typecheck        PASS\r\n"
+            ],
+            [
+              3.05,
+              "o",
+              "all     lint             PASS\r\n"
+            ],
+            [
+              3.335,
+              "o",
+              "all     package smoke    PASS\r\n"
+            ],
+            [
+              3.529,
+              "o",
+              "all     release notes    PASS\r\n"
+            ],
+            [
+              3.912,
+              "o",
+              "Matrix: 6/6 checks passed\r\n"
+            ],
+            [
+              4.476,
+              "o",
+              "Exit code: 0\r\n"
+            ],
+            [
+              4.526,
+              "o",
+              "\u001b[32mmeadow\u001b[0m:builder $ "
+            ]
+          ],
+          "header": {
+            "height": 12,
+            "title": "pnpm release:verify --version 0.8.4",
+            "version": 2,
+            "width": 100
+          },
+          "started_at_ms": -420000
+        },
+        "incarnation": "pty-86:1",
+        "owner": "agent/example/meadow/builder",
+        "runtime": {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-meadow-builder-shell",
+          "incarnation_id": "pty-86:1",
+          "kind": "runtime",
+          "owner_host_id": "host/quarry",
+          "owner_id": "agent/example/meadow/builder",
+          "revision": "rt-shell-1",
+          "runtime_id": "example-meadow-builder-shell",
+          "runtime_kind": "terminal",
+          "state": "exited",
+          "terminal_id": "terminal/example-meadow-builder",
+          "updated_at": "2030-01-01T11:53:00.000Z"
+        },
+        "screens": [
+          {
+            "at_ms": -420000,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 1,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 46,
+                      "text": ":builder $ pnpm release:verify --version 0.8.4"
+                    }
+                  ],
+                  "text": "meadow:builder $ pnpm release:verify --version 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 1,
+              "revision": "cast-1",
+              "rows": 12,
+              "runtime_incarnation": "pty-86:1",
+              "terminal_id": "terminal/example-meadow-builder",
+              "title": "pnpm release:verify --version 0.8.4",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -419061,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 2,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 46,
+                      "text": ":builder $ pnpm release:verify --version 0.8.4"
+                    }
+                  ],
+                  "text": "meadow:builder $ pnpm release:verify --version 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 23,
+                      "text": "Release candidate 0.8.4"
+                    }
+                  ],
+                  "text": "Release candidate 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 2,
+              "revision": "cast-2",
+              "rows": 12,
+              "runtime_incarnation": "pty-86:1",
+              "terminal_id": "terminal/example-meadow-builder",
+              "title": "pnpm release:verify --version 0.8.4",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -418828,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 3,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 46,
+                      "text": ":builder $ pnpm release:verify --version 0.8.4"
+                    }
+                  ],
+                  "text": "meadow:builder $ pnpm release:verify --version 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 23,
+                      "text": "Release candidate 0.8.4"
+                    }
+                  ],
+                  "text": "Release candidate 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "linux   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "linux   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 3,
+              "revision": "cast-3",
+              "rows": 12,
+              "runtime_incarnation": "pty-86:1",
+              "terminal_id": "terminal/example-meadow-builder",
+              "title": "pnpm release:verify --version 0.8.4",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -418225,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 4,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 46,
+                      "text": ":builder $ pnpm release:verify --version 0.8.4"
+                    }
+                  ],
+                  "text": "meadow:builder $ pnpm release:verify --version 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 23,
+                      "text": "Release candidate 0.8.4"
+                    }
+                  ],
+                  "text": "Release candidate 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "linux   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "linux   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "macos   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "macos   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 4,
+              "revision": "cast-4",
+              "rows": 12,
+              "runtime_incarnation": "pty-86:1",
+              "terminal_id": "terminal/example-meadow-builder",
+              "title": "pnpm release:verify --version 0.8.4",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -417752,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 5,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 46,
+                      "text": ":builder $ pnpm release:verify --version 0.8.4"
+                    }
+                  ],
+                  "text": "meadow:builder $ pnpm release:verify --version 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 23,
+                      "text": "Release candidate 0.8.4"
+                    }
+                  ],
+                  "text": "Release candidate 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "linux   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "linux   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "macos   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "macos   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     typecheck        PASS"
+                    }
+                  ],
+                  "text": "all     typecheck        PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 5,
+              "revision": "cast-5",
+              "rows": 12,
+              "runtime_incarnation": "pty-86:1",
+              "terminal_id": "terminal/example-meadow-builder",
+              "title": "pnpm release:verify --version 0.8.4",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -416950,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 6,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 46,
+                      "text": ":builder $ pnpm release:verify --version 0.8.4"
+                    }
+                  ],
+                  "text": "meadow:builder $ pnpm release:verify --version 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 23,
+                      "text": "Release candidate 0.8.4"
+                    }
+                  ],
+                  "text": "Release candidate 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "linux   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "linux   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "macos   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "macos   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     typecheck        PASS"
+                    }
+                  ],
+                  "text": "all     typecheck        PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     lint             PASS"
+                    }
+                  ],
+                  "text": "all     lint             PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 6,
+              "revision": "cast-6",
+              "rows": 12,
+              "runtime_incarnation": "pty-86:1",
+              "terminal_id": "terminal/example-meadow-builder",
+              "title": "pnpm release:verify --version 0.8.4",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -416665,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 7,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 46,
+                      "text": ":builder $ pnpm release:verify --version 0.8.4"
+                    }
+                  ],
+                  "text": "meadow:builder $ pnpm release:verify --version 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 23,
+                      "text": "Release candidate 0.8.4"
+                    }
+                  ],
+                  "text": "Release candidate 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "linux   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "linux   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "macos   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "macos   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     typecheck        PASS"
+                    }
+                  ],
+                  "text": "all     typecheck        PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     lint             PASS"
+                    }
+                  ],
+                  "text": "all     lint             PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     package smoke    PASS"
+                    }
+                  ],
+                  "text": "all     package smoke    PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 7,
+              "revision": "cast-7",
+              "rows": 12,
+              "runtime_incarnation": "pty-86:1",
+              "terminal_id": "terminal/example-meadow-builder",
+              "title": "pnpm release:verify --version 0.8.4",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -416471,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 8,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 46,
+                      "text": ":builder $ pnpm release:verify --version 0.8.4"
+                    }
+                  ],
+                  "text": "meadow:builder $ pnpm release:verify --version 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 23,
+                      "text": "Release candidate 0.8.4"
+                    }
+                  ],
+                  "text": "Release candidate 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "linux   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "linux   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "macos   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "macos   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     typecheck        PASS"
+                    }
+                  ],
+                  "text": "all     typecheck        PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     lint             PASS"
+                    }
+                  ],
+                  "text": "all     lint             PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     package smoke    PASS"
+                    }
+                  ],
+                  "text": "all     package smoke    PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     release notes    PASS"
+                    }
+                  ],
+                  "text": "all     release notes    PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 8,
+              "revision": "cast-8",
+              "rows": 12,
+              "runtime_incarnation": "pty-86:1",
+              "terminal_id": "terminal/example-meadow-builder",
+              "title": "pnpm release:verify --version 0.8.4",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -416088,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 9,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 46,
+                      "text": ":builder $ pnpm release:verify --version 0.8.4"
+                    }
+                  ],
+                  "text": "meadow:builder $ pnpm release:verify --version 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 23,
+                      "text": "Release candidate 0.8.4"
+                    }
+                  ],
+                  "text": "Release candidate 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "linux   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "linux   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "macos   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "macos   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     typecheck        PASS"
+                    }
+                  ],
+                  "text": "all     typecheck        PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     lint             PASS"
+                    }
+                  ],
+                  "text": "all     lint             PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     package smoke    PASS"
+                    }
+                  ],
+                  "text": "all     package smoke    PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     release notes    PASS"
+                    }
+                  ],
+                  "text": "all     release notes    PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [
+                    {
+                      "cells": 25,
+                      "text": "Matrix: 6/6 checks passed"
+                    }
+                  ],
+                  "text": "Matrix: 6/6 checks passed",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 9,
+              "revision": "cast-9",
+              "rows": 12,
+              "runtime_incarnation": "pty-86:1",
+              "terminal_id": "terminal/example-meadow-builder",
+              "title": "pnpm release:verify --version 0.8.4",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -415524,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 0,
+                "row": 10,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 46,
+                      "text": ":builder $ pnpm release:verify --version 0.8.4"
+                    }
+                  ],
+                  "text": "meadow:builder $ pnpm release:verify --version 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 23,
+                      "text": "Release candidate 0.8.4"
+                    }
+                  ],
+                  "text": "Release candidate 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "linux   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "linux   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "macos   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "macos   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     typecheck        PASS"
+                    }
+                  ],
+                  "text": "all     typecheck        PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     lint             PASS"
+                    }
+                  ],
+                  "text": "all     lint             PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     package smoke    PASS"
+                    }
+                  ],
+                  "text": "all     package smoke    PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     release notes    PASS"
+                    }
+                  ],
+                  "text": "all     release notes    PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [
+                    {
+                      "cells": 25,
+                      "text": "Matrix: 6/6 checks passed"
+                    }
+                  ],
+                  "text": "Matrix: 6/6 checks passed",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [
+                    {
+                      "cells": 12,
+                      "text": "Exit code: 0"
+                    }
+                  ],
+                  "text": "Exit code: 0",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [],
+                  "text": "",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 10,
+              "revision": "cast-10",
+              "rows": 12,
+              "runtime_incarnation": "pty-86:1",
+              "terminal_id": "terminal/example-meadow-builder",
+              "title": "pnpm release:verify --version 0.8.4",
+              "truncated": false
+            }
+          },
+          {
+            "at_ms": -415474,
+            "screen": {
+              "columns": 100,
+              "cursor": {
+                "blinking": true,
+                "column": 17,
+                "row": 10,
+                "style": "block",
+                "visible": true
+              },
+              "kind": "terminal-screen",
+              "lines": [
+                {
+                  "redacted": false,
+                  "row": 0,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 46,
+                      "text": ":builder $ pnpm release:verify --version 0.8.4"
+                    }
+                  ],
+                  "text": "meadow:builder $ pnpm release:verify --version 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 1,
+                  "runs": [
+                    {
+                      "cells": 23,
+                      "text": "Release candidate 0.8.4"
+                    }
+                  ],
+                  "text": "Release candidate 0.8.4",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 2,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "linux   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "linux   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 3,
+                  "runs": [
+                    {
+                      "cells": 41,
+                      "text": "macos   unit tests       PASS (184 tests)"
+                    }
+                  ],
+                  "text": "macos   unit tests       PASS (184 tests)",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 4,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     typecheck        PASS"
+                    }
+                  ],
+                  "text": "all     typecheck        PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 5,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     lint             PASS"
+                    }
+                  ],
+                  "text": "all     lint             PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 6,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     package smoke    PASS"
+                    }
+                  ],
+                  "text": "all     package smoke    PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 7,
+                  "runs": [
+                    {
+                      "cells": 29,
+                      "text": "all     release notes    PASS"
+                    }
+                  ],
+                  "text": "all     release notes    PASS",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 8,
+                  "runs": [
+                    {
+                      "cells": 25,
+                      "text": "Matrix: 6/6 checks passed"
+                    }
+                  ],
+                  "text": "Matrix: 6/6 checks passed",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 9,
+                  "runs": [
+                    {
+                      "cells": 12,
+                      "text": "Exit code: 0"
+                    }
+                  ],
+                  "text": "Exit code: 0",
+                  "truncated": false,
+                  "wrapped": false
+                },
+                {
+                  "redacted": false,
+                  "row": 10,
+                  "runs": [
+                    {
+                      "cells": 6,
+                      "fg": 2,
+                      "text": "meadow"
+                    },
+                    {
+                      "cells": 11,
+                      "text": ":builder $ "
+                    }
+                  ],
+                  "text": "meadow:builder $ ",
+                  "truncated": false,
+                  "wrapped": false
+                }
+              ],
+              "modes": {
+                "alternate_screen": false,
+                "application_cursor": false,
+                "application_keypad": false,
+                "bracketed_paste": false,
+                "focus_events": false,
+                "mouse_encoding": "default",
+                "mouse_tracking": "none"
+              },
+              "next_sequence": 11,
+              "revision": "cast-11",
+              "rows": 12,
+              "runtime_incarnation": "pty-86:1",
+              "terminal_id": "terminal/example-meadow-builder",
+              "title": "pnpm release:verify --version 0.8.4",
+              "truncated": false
+            }
+          }
+        ],
+        "terminal": "terminal/example-meadow-builder"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/terminals/0/runtime/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "release-candidate-polish"
+}

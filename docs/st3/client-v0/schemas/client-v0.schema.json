@@ -954,7 +954,8 @@
         "next_wake_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "Observed not-before time: earliest work eligibility, not a promise of wake dispatch." },
         "wake_reason": { "type": ["string", "null"], "description": "The deferral's blocked reason, or the observed wake failure when no deferral reason exists." },
         "wake": { "oneOf": [{ "$ref": "#/$defs/MissionWake" }, { "type": "null" }] },
-        "claim_expires_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+        "claim_expires_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "nudged_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "When st last nudged this held step's holder for idling with nothing set to wake it." }
       }
     },
     "MissionWake": {
@@ -1011,6 +1012,7 @@
             "agentless": { "type": "boolean" },
             "claim_expires_at_unix_ms": { "type": ["integer", "null"], "minimum": 0, "x-st-codec": "epoch-ms" },
             "execution_started_at_unix_ms": { "type": ["integer", "null"], "minimum": 0, "x-st-codec": "epoch-ms" },
+            "nudged_at_unix_ms": { "type": ["integer", "null"], "minimum": 0, "x-st-codec": "epoch-ms", "description": "When st last nudged this held step's holder for idling with nothing set to wake it." },
             "execution_elapsed_ms": { "type": "integer", "minimum": 0, "x-st-codec": "duration-ms" },
             "timeout_ms": { "type": ["integer", "null"], "minimum": 0, "x-st-codec": "duration-ms" },
             "blocked_reason": { "type": ["string", "null"] },
@@ -1714,7 +1716,62 @@
         "diverged_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
       }
     },
-    "TimelineBlock": {"type": "object", "additionalProperties": false, "required": ["id", "kind", "source_type", "payload"], "properties": {"id": {"type": "string"}, "kind": {"type": "string", "description": "text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, error, document, source_record, raw_text, unknown; future kinds remain readable as JSON"}, "source_type": {"type": "string"}, "visibility": {"type": "string", "description": "UI hint: visible (default), internal or hidden-by-harness; never an access restriction"}, "metadata": {"type": "object", "description": "Source-supplied metadata including timing (wallTimeMs, timeoutSeconds); preserve names, units, values and future fields"}, "payload": {"description": "Native JSON; {body_ref:true} refers to the containing known fallback body without duplication"}, "continuation": {"$ref": "#/$defs/ConversationContentRef"}}},
+    "TimelineBlock": {"type": "object", "additionalProperties": false, "required": ["id", "kind", "source_type", "payload"], "properties": {"id": {"type": "string"}, "kind": {"type": "string", "description": "text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, error, document, source_record, raw_text, irc, unknown; future kinds remain readable as JSON"}, "source_type": {"type": "string"}, "visibility": {"type": "string", "description": "UI hint: visible (default), internal or hidden-by-harness; never an access restriction"}, "metadata": {"type": "object", "description": "Source-supplied metadata including timing (wallTimeMs, timeoutSeconds); assistant text/reasoning blocks may carry model, provider, usage {input, output, cache_read, cache_write, total, cost_usd}, context_tokens, stop_reason, ttft_ms and duration_ms; preserve names, units, values and future fields"}, "view": {"$ref": "#/$defs/TimelineView", "description": "Parsed typed projection of the block; a renderer that does not know the view type renders the block as without a view. The full native data stays in payload"}, "payload": {"description": "Native JSON; {body_ref:true} refers to the containing known fallback body without duplication"}, "continuation": {"$ref": "#/$defs/ConversationContentRef"}}},
+    "TimelineView": {"description": "Parsed typed projection of a block, discriminated by type. Known types are closed; future types keep JSON through the fallback.", "oneOf": [{"$ref": "#/$defs/TimelineViewBash"}, {"$ref": "#/$defs/TimelineViewEdit"}, {"$ref": "#/$defs/TimelineViewWrite"}, {"$ref": "#/$defs/TimelineViewRead"}, {"$ref": "#/$defs/TimelineViewSearch"}, {"$ref": "#/$defs/TimelineViewTodo"}, {"$ref": "#/$defs/TimelineViewAsk"}, {"$ref": "#/$defs/TimelineViewTask"}, {"$ref": "#/$defs/TimelineViewHub"}, {"$ref": "#/$defs/TimelineViewEval"}, {"$ref": "#/$defs/TimelineViewGeneric"}, {"$ref": "#/$defs/TimelineViewIrc"}, {"$ref": "#/$defs/TimelineViewJob"}, {"$ref": "#/$defs/TimelineViewSkill"}, {"$ref": "#/$defs/TimelineViewCompaction"}, {"$ref": "#/$defs/TimelineViewAssistantError"}, {"$ref": "#/$defs/TimelineViewModelChange"}, {"$ref": "#/$defs/TimelineViewThinkingLevel"}, {"$ref": "#/$defs/TimelineViewTitle"}, {"$ref": "#/$defs/TimelineViewSessionExit"}, {"$ref": "#/$defs/TimelineViewToolStart"}, {"$ref": "#/$defs/TimelineViewResetBoundary"}, {"$ref": "#/$defs/TimelineViewCredentialPin"}, {"type": "object", "description": "Fallback for a future view.type: render the block as without a view", "required": ["type"], "properties": {"type": {"type": "string", "not": {"enum": ["bash", "edit", "write", "read", "search", "todo", "ask", "task", "hub", "eval", "generic", "irc", "job", "skill", "compaction", "assistant_error", "model_change", "thinking_level", "title", "session_exit", "tool_start", "reset_boundary", "credential_pin"]}}}}]},
+    "TimelineViewBash": {"type": "object", "additionalProperties": false, "required": ["type", "tool"], "description": "tool_call fields: command, cwd, timeout_s, env_keys, background; tool_output fields: call_id, is_error, exit_code, wall_ms, timed_out.", "properties": {"type": {"const": "bash"}, "tool": {"type": "string", "description": "Native tool name"}, "intent": {"type": "string", "description": "Parsed from the OMP `i` field"}, "command": {"type": "string"}, "cwd": {"type": "string"}, "timeout_s": {"type": "integer", "minimum": 0}, "env_keys": {"type": "array", "items": {"type": "string"}}, "background": {"type": "boolean"}, "call_id": {"type": "string"}, "is_error": {"type": "boolean"}, "exit_code": {"type": "integer"}, "wall_ms": {"type": "integer", "minimum": 0}, "timed_out": {"type": "boolean"}}},
+    "TimelineViewEdit": {"type": "object", "additionalProperties": false, "required": ["type", "tool"], "description": "tool_call fields: path (first [PATH#TAG] header), ops, input_bytes; tool_output fields: path, first_changed_line, diff.", "properties": {"type": {"const": "edit"}, "tool": {"type": "string"}, "intent": {"type": "string"}, "path": {"type": "string"}, "ops": {"type": "integer", "minimum": 0}, "input_bytes": {"type": "integer", "minimum": 0}, "call_id": {"type": "string"}, "is_error": {"type": "boolean"}, "first_changed_line": {"type": "integer", "minimum": 0}, "diff": {"type": "string", "description": "Unified diff as given"}}},
+    "TimelineViewWrite": {"type": "object", "additionalProperties": false, "required": ["type", "tool", "path", "bytes"], "properties": {"type": {"const": "write"}, "tool": {"type": "string"}, "intent": {"type": "string"}, "path": {"type": "string"}, "bytes": {"type": "integer", "minimum": 0}, "content": {"type": "string"}, "line_count": {"type": "integer", "minimum": 0}}},
+    "TimelineViewRead": {"type": "object", "additionalProperties": false, "required": ["type", "tool", "path"], "properties": {"type": {"const": "read"}, "tool": {"type": "string"}, "intent": {"type": "string"}, "path": {"type": "string"}, "range": {"type": "string", "description": "Suffix after `:` in the read path"}}},
+    "TimelineViewSearch": {"type": "object", "additionalProperties": false, "required": ["type", "tool", "engine"], "properties": {"type": {"const": "search"}, "tool": {"type": "string"}, "intent": {"type": "string"}, "engine": {"enum": ["grep", "glob", "web"]}, "pattern": {"type": "string"}, "path": {"type": "string"}, "query": {"type": "string"}, "case": {"type": "boolean"}, "hidden": {"type": "boolean"}, "gitignore": {"type": "boolean"}, "limit": {"type": "integer", "minimum": 0}, "skip": {"type": "integer", "minimum": 0}, "call_id": {"type": "string"}, "is_error": {"type": "boolean"}, "match_count": {"type": "integer", "minimum": 0}, "file_count": {"type": "integer", "minimum": 0}, "truncated": {"type": "boolean"}, "file_limit_reached": {"type": "integer", "minimum": 0}, "per_file_limit_reached": {"type": "integer", "minimum": 0}, "warning": {"type": "string"}}},
+    "TimelineViewTodo": {"type": "object", "additionalProperties": false, "required": ["type", "tool"], "description": "tool_call fields: op, items, phase, task; tool_output fields: phases.", "properties": {"type": {"const": "todo"}, "tool": {"type": "string"}, "intent": {"type": "string"}, "op": {"type": "string"}, "items": {"type": "array", "items": {"$ref": "#/$defs/TimelineTodoItem"}}, "phase": {"type": "string"}, "task": {"type": "string"}, "phases": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["name", "items"], "properties": {"name": {"type": "string"}, "items": {"type": "array", "items": {"$ref": "#/$defs/TimelineTodoItem"}}}}}, "call_id": {"type": "string"}, "is_error": {"type": "boolean"}}},
+    "TimelineViewAsk": {"type": "object", "additionalProperties": false, "required": ["type", "tool"], "description": "tool_call fields: questions; tool_output fields: answers.", "properties": {"type": {"const": "ask"}, "tool": {"type": "string"}, "intent": {"type": "string"}, "questions": {"type": "array", "items": {"$ref": "#/$defs/TimelineAskQuestion"}}, "answers": {"type": "array", "items": {"$ref": "#/$defs/TimelineAskAnswer"}}, "call_id": {"type": "string"}, "is_error": {"type": "boolean"}}},
+    "TimelineViewTask": {"type": "object", "additionalProperties": false, "required": ["type", "tool"], "description": "tool_call fields: context, tasks; tool_output fields: async, total_ms, agents.", "properties": {"type": {"const": "task"}, "tool": {"type": "string"}, "intent": {"type": "string"}, "context": {"type": "string"}, "tasks": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["task"], "properties": {"name": {"type": "string"}, "agent": {"type": "string"}, "task": {"type": "string"}}}}, "call_id": {"type": "string"}, "is_error": {"type": "boolean"}, "async": {"type": "boolean"}, "total_ms": {"type": "integer", "minimum": 0}, "agents": {"type": "array", "items": {"$ref": "#/$defs/SubagentSummary"}}}},
+    "TimelineViewHub": {"type": "object", "additionalProperties": false, "required": ["type", "tool", "op"], "description": "tool_call fields: op, name, target, message, timeout_s; tool_output fields: timed_out, jobs, state.", "properties": {"type": {"const": "hub"}, "tool": {"type": "string"}, "intent": {"type": "string"}, "op": {"type": "string"}, "name": {"type": "string"}, "target": {"type": "string"}, "message": {"type": "string"}, "timeout_s": {"type": "integer", "minimum": 0}, "call_id": {"type": "string"}, "is_error": {"type": "boolean"}, "timed_out": {"type": "boolean"}, "jobs": {"type": "array", "items": {"$ref": "#/$defs/JobSummary"}}, "state": {"type": "string"}}},
+    "TimelineViewEval": {"type": "object", "additionalProperties": false, "required": ["type", "tool", "language", "code_bytes"], "properties": {"type": {"const": "eval"}, "tool": {"type": "string"}, "intent": {"type": "string"}, "language": {"type": "string"}, "title": {"type": "string"}, "code_bytes": {"type": "integer", "minimum": 0}, "code": {"type": "string"}, "timeout_s": {"type": "integer", "minimum": 0}, "reset": {"type": "boolean"}}},
+    "TimelineViewGeneric": {"type": "object", "additionalProperties": false, "required": ["type", "tool"], "description": "Any other tool: tool_call field name; tool_output fields is_error, wall_ms.", "properties": {"type": {"const": "generic"}, "tool": {"type": "string"}, "intent": {"type": "string"}, "name": {"type": "string"}, "call_id": {"type": "string"}, "is_error": {"type": "boolean"}, "wall_ms": {"type": "integer", "minimum": 0}}},
+    "TimelineViewIrc": {"type": "object", "additionalProperties": false, "required": ["type", "from", "message", "message_id"], "description": "Block kind `irc` from a custom_message irc:incoming record.", "properties": {"type": {"const": "irc"}, "from": {"type": "string"}, "message": {"type": "string"}, "reply_to": {"type": "string"}, "message_id": {"type": "string"}}},
+    "TimelineViewJob": {"type": "object", "additionalProperties": false, "required": ["type", "jobs"], "description": "Block kind `job` from launch-completion (details.jobs) and async-result records.", "properties": {"type": {"const": "job"}, "jobs": {"type": "array", "items": {"$ref": "#/$defs/JobSummary"}}}},
+    "TimelineViewSkill": {"type": "object", "additionalProperties": false, "required": ["type", "name"], "properties": {"type": {"const": "skill"}, "name": {"type": "string"}, "path": {"type": "string"}, "args": {"description": "Native skill arguments, any JSON"}}},
+    "TimelineViewCompaction": {"type": "object", "additionalProperties": false, "required": ["type"], "description": "On a status block; summary is bounded with an owner continuation.", "properties": {"type": {"const": "compaction"}, "method": {"type": "string"}, "tokens_before": {"type": "integer", "minimum": 0}, "tokens_after": {"type": "integer", "minimum": 0}, "short_summary": {"type": "string"}, "summary": {"type": "string"}}},
+    "TimelineViewAssistantError": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "status", "presentation", "is_error", "label", "message"],
+      "description": "Assistant error from the native session record and its persisted retry marker; no retry state is inferred.",
+      "properties": {
+        "type": {"const": "assistant_error"},
+        "status": {"enum": ["failed", "recovered", "superseded"]},
+        "presentation": {"enum": ["full", "compact-recovered", "none"]},
+        "is_error": {"type": "boolean"}, "label": {"type": "string"}, "message": {"type": "string"},
+        "stop_reason": {"type": "string"}, "error_id": {"type": "integer"},
+        "api": {"type": "string"}, "provider": {"type": "string"}, "model": {"type": "string"},
+        "retry": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "kind": {"type": "string"}, "status": {"type": "string"},
+            "attempt": {"type": "integer"}, "recovery": {"type": "string"}, "note": {"type": "string"},
+            "recovered_at": {"$ref": "#/$defs/Timestamp"},
+            "superseded_by": {"type": "object", "additionalProperties": false, "properties": {
+              "timestamp": {"type": "integer"}, "response_id": {"type": "string"},
+              "provider": {"type": "string"}, "model": {"type": "string"}
+            }}
+          }
+        }
+      }
+    },
+    "TimelineViewModelChange": {"type": "object", "additionalProperties": false, "required": ["type", "model"], "properties": {"type": {"const": "model_change"}, "model": {"type": "string"}, "role": {"type": "string"}, "fallback": {"type": "boolean"}}},
+    "TimelineViewThinkingLevel": {"type": "object", "additionalProperties": false, "required": ["type", "level"], "properties": {"type": {"const": "thinking_level"}, "level": {"type": "string"}, "configured": {"type": "boolean"}}},
+    "TimelineViewResetBoundary": {"type": "object", "additionalProperties": false, "required": ["type"], "properties": {"type": {"const": "reset_boundary"}}},
+    "TimelineViewCredentialPin": {"type": "object", "additionalProperties": false, "required": ["type", "provider"], "description": "Credential bookkeeping, with internal visibility. The hash stays in the raw record only.", "properties": {"type": {"const": "credential_pin"}, "provider": {"type": "string"}}},
+    "TimelineViewTitle": {"type": "object", "additionalProperties": false, "required": ["type", "title"], "properties": {"type": {"const": "title"}, "title": {"type": "string"}, "previous": {"type": "string"}, "source": {"type": "string"}}},
+    "TimelineViewSessionExit": {"type": "object", "additionalProperties": false, "required": ["type", "kind", "reason"], "properties": {"type": {"const": "session_exit"}, "kind": {"type": "string"}, "reason": {"type": "string"}}},
+    "TimelineViewToolStart": {"type": "object", "additionalProperties": false, "required": ["type", "call_id", "tool", "started_at"], "description": "On an internal-visibility `status` block; renderers attach it to the call row and do not draw it alone.", "properties": {"type": {"const": "tool_start"}, "call_id": {"type": "string"}, "tool": {"type": "string"}, "started_at": {"$ref": "#/$defs/Timestamp"}}},
+    "TimelineTodoItem": {"type": "object", "additionalProperties": false, "required": ["content", "status"], "properties": {"content": {"type": "string"}, "status": {"type": "string"}}},
+    "TimelineAskQuestion": {"type": "object", "additionalProperties": false, "required": ["id", "question", "options", "multi"], "properties": {"id": {"type": "string"}, "question": {"type": "string"}, "options": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["label"], "properties": {"label": {"type": "string"}, "description": {"type": "string"}}}}, "multi": {"type": "boolean"}, "recommended": {"type": "integer", "minimum": 0}}},
+    "TimelineAskAnswer": {"type": "object", "additionalProperties": false, "required": ["question", "selected"], "properties": {"question": {"type": "string"}, "selected": {"type": "array", "items": {"type": "string"}}, "custom": {"type": "string"}, "note": {"type": "string"}}},
+    "SubagentSummary": {"type": "object", "additionalProperties": false, "required": ["id", "status"], "description": "One subagent of a task tool output. name is the OMP name (id when no separate name exists), agent is the type, task is the full assignment. conversation.session_id opens the readable child transcript.", "properties": {"id": {"type": "string"}, "name": {"type": "string"}, "agent": {"type": "string"}, "status": {"type": "string"}, "task": {"type": "string"}, "duration_ms": {"type": "integer", "minimum": 0}, "tokens": {"type": "integer", "minimum": 0}, "cost_usd": {"type": "number", "minimum": 0}, "requests": {"type": "integer", "minimum": 0}, "tool_count": {"type": "integer", "minimum": 0}, "conversation": {"type": "object", "additionalProperties": false, "required": ["session_id"], "properties": {"session_id": {"$ref": "#/$defs/Id"}}}}},
+    "JobSummary": {"type": "object", "additionalProperties": false, "required": ["id", "state"], "properties": {"id": {"type": "string"}, "name": {"type": "string"}, "type": {"type": "string"}, "state": {"type": "string"}, "exit_code": {"type": "integer"}, "started_at": {"$ref": "#/$defs/Timestamp"}, "ended_at": {"$ref": "#/$defs/Timestamp"}, "duration_ms": {"type": "integer", "minimum": 0}, "output_bytes": {"type": "integer", "minimum": 0}}},
+    "ConversationHeaderField": {"type": "object", "additionalProperties": false, "required": ["value", "source", "as_of"], "description": "One conversation header field: its latest value, where it came from and when.", "properties": {"value": {"description": "Field value, any JSON; see each ConversationHeader property for its shape"}, "source": {"enum": ["register", "transcript"], "description": "register: live latest-wins value; transcript: derived from the fold window"}, "as_of": {"$ref": "#/$defs/Timestamp"}}},
+    "ConversationHeader": {"type": "object", "description": "Optional conversation header on timeline pages and delta responses (conversation-blocks.v1). A field is absent when neither source has it; `working` comes only from the register and the register wins over the transcript once live.", "properties": {"model": {"$ref": "#/$defs/ConversationHeaderField", "description": "value: model id string"}, "context": {"$ref": "#/$defs/ConversationHeaderField", "description": "value: {tokens: integer|null, window: integer|null}"}, "cost": {"$ref": "#/$defs/ConversationHeaderField", "description": "value: {usd: number, window: true when the fold window is truncated}"}, "todos": {"$ref": "#/$defs/ConversationHeaderField", "description": "value: [{phase, items: [TimelineTodoItem]}]"}, "jobs": {"$ref": "#/$defs/ConversationHeaderField", "description": "value: [JobSummary], latest state per job id, keeping non-terminal ones"}, "subagents": {"$ref": "#/$defs/ConversationHeaderField", "description": "value: [SubagentSummary], task outputs whose status is not terminal"}, "ask": {"$ref": "#/$defs/ConversationHeaderField", "description": "value: {call_id, questions: [TimelineAskQuestion]} or null for the last ask call without a matching result"}, "working": {"$ref": "#/$defs/ConversationHeaderField", "description": "value: boolean"}}},
     "ConversationContentRef": {"type": "object", "additionalProperties": false, "required": ["ref", "media_type"], "properties": {"ref": {"type": "string"}, "media_type": {"type": "string"}, "size": {"type": "integer", "minimum": 0}, "reason": {"type": "string"}}},
     "ConversationContentChunk": {"type": "object", "additionalProperties": false, "required": ["kind", "ref", "media_type", "offset", "size", "data"], "properties": {"kind": {"const": "conversation-content-chunk"}, "ref": {"type": "string"}, "media_type": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "size": {"type": "integer", "minimum": 0}, "data": {"type": "string", "description": "Base64 bytes"}, "next_offset": {"type": ["integer", "null"], "minimum": 0}}},
     "TimelineEntry": {
@@ -1772,7 +1829,8 @@
         "kind": { "const": "timeline-page" },
         "session_id": { "$ref": "#/$defs/Id" },
         "items": { "type": "array", "items": { "$ref": "#/$defs/TimelineEntry" } },
-        "page": { "$ref": "#/$defs/PageInfo" }
+        "page": { "$ref": "#/$defs/PageInfo" },
+        "header": { "$ref": "#/$defs/ConversationHeader", "description": "Present when conversation-blocks.v1 is negotiated; each field names its value, source and as_of" }
       }
     },
     "ConversationChanges": {
@@ -1782,7 +1840,8 @@
         "kind": { "const": "conversation-changes" },
         "session_id": { "$ref": "#/$defs/Id" },
         "items": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/TimelineEntry" } },
-        "next_cursor": { "$ref": "#/$defs/Cursor" }
+        "next_cursor": { "$ref": "#/$defs/Cursor" },
+        "header": { "$ref": "#/$defs/ConversationHeader", "description": "Present when conversation-blocks.v1 is negotiated; each field names its value, source and as_of" }
       }
     },
     "ProjectionEvent": {
@@ -1813,7 +1872,8 @@
         "operation": { "enum": ["append", "replace", "finalize"] },
         "entry_id": { "$ref": "#/$defs/Id" },
         "revision": { "type": "integer", "minimum": 1 },
-        "entry": { "$ref": "#/$defs/TimelineEntry" }
+        "entry": { "$ref": "#/$defs/TimelineEntry" },
+        "header": { "$ref": "#/$defs/ConversationHeader", "description": "Present when conversation-blocks.v1 is negotiated; each field names its value, source and as_of" }
       },
       "allOf": [
         { "if": { "properties": { "operation": { "enum": ["append", "replace"] } } }, "then": { "required": ["entry"] } }
@@ -2559,7 +2619,8 @@
             "session_id": { "$ref": "#/$defs/Id" },
             "replace": { "type": "boolean" },
             "items": { "type": "array", "items": { "$ref": "#/$defs/TimelineEntry" } },
-            "has_more": { "type": "boolean" }
+            "has_more": { "type": "boolean" },
+            "header": { "$ref": "#/$defs/ConversationHeader", "description": "Present when conversation-blocks.v1 is negotiated and at least one header field is available" }
           }
         },
         {

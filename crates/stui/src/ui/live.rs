@@ -186,6 +186,7 @@ fn usage_error(error: &st3_client::ClientError) -> String {
 }
 
 enum Fetched {
+    Content(super::content::Key, Result<(String, Vec<u8>), String>),
     Read(String, ReceiptOutcome),
     /// A page before the oldest entry of a conversation's session: its entries, whether st
     /// holds more before them, and the cursor for that next page; or why it could not be read.
@@ -202,6 +203,7 @@ enum Fetched {
     Notice(String),
     /// Harness sessions st did not start, found on this machine.
     Sessions(Collection),
+    Session(String, Result<Box<st3_client::Session>, String>),
     /// The Fleet tab's machines and paired devices.
     Machines(Collection),
     Terminals(Vec<super::resource_sidebar::ResourceRow>, bool),
@@ -317,6 +319,7 @@ pub fn run(context: Context) -> Result<()> {
     let mut conversing: Vec<String> = Vec::new();
     // The session each conversation was last subscribed again for, so it is asked once.
     let mut resubscribed: BTreeMap<String, String> = BTreeMap::new();
+    let mut sessions_requested = HashSet::new();
     let mut preview_requested: HashSet<String> = HashSet::new();
     let mut body_requested: HashSet<String> = HashSet::new();
     let mut read_receipts = ReadReceipts::default();
@@ -356,7 +359,8 @@ pub fn run(context: Context) -> Result<()> {
     // How images are drawn: asked of a terminal known to draw them, once, inside the
     // alternate screen and before any event is read. A terminal that never answers would
     // leave the query reading stdin and swallow keys, so others get half blocks unasked.
-    ui.picker = Some(if super::attach::graphics_terminal() {
+    ui.auto_images = super::attach::graphics_terminal();
+    ui.picker = Some(if ui.auto_images {
         ratatui_image::picker::Picker::from_query_stdio()
             .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
     } else {
@@ -388,6 +392,7 @@ pub fn run(context: Context) -> Result<()> {
     // one was on screen keeps it followed.
     let mut missions_sent = false;
     let mut missions_until: Option<Instant> = None;
+    let mut content_reads = super::content::Reads::default();
     // When usage was last asked for and over how many hours, and whether that read is out.
     let mut usage_read: Option<(Instant, u64)> = None;
     // When the connected clients were last read, while the fleet shows, and whether a read is out.
@@ -439,6 +444,7 @@ pub fn run(context: Context) -> Result<()> {
                     extras.live = false;
                     attached = None;
                     shown_tab = usize::MAX;
+                    sessions_requested.clear();
                     preview_requested.clear();
                     body_requested.clear();
                     changed = true;
@@ -525,12 +531,17 @@ pub fn run(context: Context) -> Result<()> {
                     replace,
                     has_more,
                     items,
+                    header,
                 } => {
                     failed.remove(&target);
                     if replace && !timelines.get(&target).is_some_and(|timeline| timeline.older.paged) {
                         filled.remove(&target);
                     }
                     ui.conversation_updated(&target);
+                    if let Some(header) = &header {
+                        ui.conversation_headers
+                            .insert(target.clone(), header.clone());
+                    }
                     timelines
                         .entry(target)
                         .or_default()
@@ -539,6 +550,7 @@ pub fn run(context: Context) -> Result<()> {
                             has_more,
                             items,
                             session_id: Some(session_id),
+                            header,
                         });
                     // A message sent from here is done once st shows it in the conversation.
                     pending.retain(|pending| {
@@ -647,6 +659,10 @@ pub fn run(context: Context) -> Result<()> {
         }
         while let Ok(result) = fetched.try_recv() {
             match result {
+                Fetched::Content(key, result) => {
+                    content_reads.complete(&key);
+                    ui.content.complete(key, result);
+                }
                 Fetched::Read(id, result) => {
                     read_receipts.completed(id, result, Instant::now());
                 }
@@ -686,6 +702,15 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::Notice(notice) => ui.flash(notice),
                 Fetched::Sessions(native) => {
                     model.sessions = native;
+                }
+                Fetched::Session(id, outcome) => {
+                    match outcome {
+                        Ok(session) => model.add_opened_session(*session),
+                        Err(message) => {
+                            ui.flash(format!("Could not open {id}: {message}"));
+                            failed.insert(id, message);
+                        }
+                    }
                 }
                 Fetched::Machines(machines) => {
                     machines_reading = false;
@@ -989,6 +1014,23 @@ pub fn run(context: Context) -> Result<()> {
         // Every conversation on screen rides the feed's socket (the focused one first): st
         // pushes each change, so nothing here reads one again on a timer.
         let wanted = ui.live_conversations();
+        for id in &wanted {
+            if id.starts_with("session/")
+                && !model.opened_sessions.contains_key(id)
+                && sessions_requested.insert(id.clone())
+            {
+                let client = client.clone();
+                let tx = fetched_tx.clone();
+                let id = id.clone();
+                runtime.spawn(async move {
+                    let outcome = Model::read_session(&client, &id)
+                        .await
+                        .map(Box::new)
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(Fetched::Session(id, outcome));
+                });
+            }
+        }
         if wanted != conversing {
             let _ = commands.send(Command::Converse {
                 targets: wanted.clone(),
@@ -1089,6 +1131,9 @@ pub fn run(context: Context) -> Result<()> {
                 continue;
             }
             if !extras.live && !matches!(effect, Effect::CloseTerminal) {
+                if let Effect::LoadContent(key) = effect {
+                    ui.content.complete(key, Err("Offline · reconnect, then load again".into()));
+                }
                 ui.flash(if extras.degraded.is_some() {
                     "Reconnecting to st · try again in a moment; nothing was queued"
                 } else {
@@ -1098,6 +1143,9 @@ pub fn run(context: Context) -> Result<()> {
             }
             ui.note_acted(&effect);
             match effect {
+                Effect::LoadContent(key) => {
+                    content_reads.enqueue(key);
+                }
                 Effect::OpenTerminal { agent } => {
                     // The PTY session's own bytes, through st's raw stream to whichever host owns
                     // it; st's screen view (the feed follows it on its socket) only when st cannot
@@ -1364,6 +1412,7 @@ pub fn run(context: Context) -> Result<()> {
         }
 
         if changed {
+            ui.content.index(&timelines);
             extras.conversations = conversations(&model, &person, &timelines, &failed, &conversing);
             for entry in &pending {
                 if let Some(Load::Ready(entries)) = extras.conversations.get_mut(&entry.agent) {
@@ -1410,6 +1459,16 @@ pub fn run(context: Context) -> Result<()> {
         })?;
         if hyperlinks && !links.is_empty() {
             super::hyperlinks::write_links(terminal.backend_mut(), &links)?;
+        }
+        if extras.live
+            && let Some(key) = ui.next_content_read(&mut content_reads)
+        {
+            let client = client.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                let result = super::content::fetch(&client, &key).await;
+                let _ = tx.send(Fetched::Content(key, result));
+            });
         }
         // The attached terminal's cursor shape (vim's bar while inserting), and the person's
         // own shape back once it is gone.
@@ -1944,7 +2003,7 @@ async fn perform(
 ) -> Result<(String, Option<String>)> {
     match effect {
         // Glass writes and retries never reach here: the loop handles them itself.
-        Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::Forget { .. } => {
+        Effect::SaveGlass(_) | Effect::Resend { .. } | Effect::Forget { .. } | Effect::LoadContent(_) => {
             Ok((String::new(), None))
         }
         Effect::AgentControl { agent, control } => {

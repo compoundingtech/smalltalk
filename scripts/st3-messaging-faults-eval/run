@@ -530,7 +530,7 @@ agent "fault-probe" {{
   harness "omp" {{}}
 }}
 ''')
-        await target.cli("agents", "apply", str(seats), "--as", "person/eval")
+        await target.cli("apply", str(seats), "--no-gate-check", "--as", "person/eval")
 
         async def ready():
             value = await agent(target)

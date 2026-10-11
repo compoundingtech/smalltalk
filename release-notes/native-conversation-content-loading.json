@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Native conversations load full clipped tool output on explicit block actions or stui's expand-all for visible clipped blocks; viewport-visible images load automatically in memory on the phone and in stui when terminal graphics are supported.",
+  "replay": {
+    "status": "none",
+    "detail": "Conversation views use the existing owner-native content chunk route for explicit full-output reads and automatic viewport-visible image reads; no claims are replayed or projections rebuilt."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema, migrations or generated client wire fields change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, retention or fleet coordination rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Clients reuse conversation-blocks.v1 continuation refs and conversation-content-chunk responses. Continuation byte sizes describe the original owner value rather than its clipped display preview."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No coordinated outage or API interruption is required."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No configuration change is required. Full tool output loads on an explicit per-block action or stui's o expand-all for visible clipped blocks. Images load automatically when visible: stui requires terminal graphics support, and the phone serializes reads through a viewport queue."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Expanded JSON, image bytes and inline rendering data remain in memory only; no new stored state or rollback procedure is introduced."
+  }
+}

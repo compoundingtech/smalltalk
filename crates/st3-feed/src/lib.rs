@@ -143,6 +143,8 @@ pub enum Update {
         /// Availability before the live window; absent on deltas means unchanged.
         has_more: Option<bool>,
         items: Vec<TimelineEntry>,
+        /// The conversation header (contract §3) when this frame carries one.
+        header: Option<serde_json::Value>,
     },
     /// st could not show the open conversation; the feed asks again after a backoff, unless
     /// st said it never can (`permanent`).
@@ -654,10 +656,10 @@ async fn connected(
                             }
                         }
                     }
-                    CollectionEvent::Conversation { id, session_id, replace, items, has_more } => {
+                    CollectionEvent::Conversation { id, session_id, replace, items, has_more, header } => {
                         let Some(current) = conversing.iter_mut().find(|current| current.id == id) else { continue };
                         current.failures = 0;
-                        if updates.send(Update::Conversation { target: current.target.clone(), session_id, replace, has_more, items }).is_err() {
+                        if updates.send(Update::Conversation { target: current.target.clone(), session_id, replace, has_more, items, header }).is_err() {
                             return Ended::Closed;
                         }
                     }

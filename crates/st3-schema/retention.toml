@@ -172,6 +172,7 @@
 "work.claimed" = { class = "durable" }
 "work.extended" = { class = "durable" }
 "work.failed" = { class = "durable" }
+"work.nudged" = { class = "durable" }
 "work.person-asked" = { class = "durable" }
 "work.person-cancelled" = { class = "durable" }
 "work.person-done" = { class = "durable" }

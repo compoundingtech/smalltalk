@@ -1215,6 +1215,39 @@ export const CollectionName = /*#__PURE__*/ (() => Schema.Literals(["missions","
 export type CollectionName = typeof CollectionName.Type
 export type CollectionNameEncoded = typeof CollectionName.Encoded
 
+/** One conversation header field: its latest value, where it came from and when. */
+export const ConversationHeaderField = /*#__PURE__*/ (() => Schema.Struct({
+  "as_of": Timestamp,
+  /** register: live latest-wins value; transcript: derived from the fold window */
+  "source": Schema.Literals(["register","transcript"]).annotate({ description: "register: live latest-wins value; transcript: derived from the fold window" }),
+  /** Field value, any JSON; see each ConversationHeader property for its shape */
+  "value": Schema.Unknown.annotate({ description: "Field value, any JSON; see each ConversationHeader property for its shape" })
+}).annotate({ identifier: "ConversationHeaderField", description: "One conversation header field: its latest value, where it came from and when." }))()
+export type ConversationHeaderField = typeof ConversationHeaderField.Type
+export type ConversationHeaderFieldEncoded = typeof ConversationHeaderField.Encoded
+
+/** Optional conversation header on timeline pages and delta responses (conversation-blocks.v1). A field is absent when neither source has it; `working` comes only from the register and the register wins over the transcript once live. */
+export const ConversationHeader = /*#__PURE__*/ (() => Schema.Struct({
+  /** value: {call_id, questions: [TimelineAskQuestion]} or null for the last ask call without a matching result */
+  "ask": optionalKey(ConversationHeaderField),
+  /** value: {tokens: integer|null, window: integer|null} */
+  "context": optionalKey(ConversationHeaderField),
+  /** value: {usd: number, window: true when the fold window is truncated} */
+  "cost": optionalKey(ConversationHeaderField),
+  /** value: [JobSummary], latest state per job id, keeping non-terminal ones */
+  "jobs": optionalKey(ConversationHeaderField),
+  /** value: model id string */
+  "model": optionalKey(ConversationHeaderField),
+  /** value: [SubagentSummary], task outputs whose status is not terminal */
+  "subagents": optionalKey(ConversationHeaderField),
+  /** value: [{phase, items: [TimelineTodoItem]}] */
+  "todos": optionalKey(ConversationHeaderField),
+  /** value: boolean */
+  "working": optionalKey(ConversationHeaderField)
+}).annotate({ identifier: "ConversationHeader", description: "Optional conversation header on timeline pages and delta responses (conversation-blocks.v1). A field is absent when neither source has it; `working` comes only from the register and the register wins over the transcript once live." }))()
+export type ConversationHeader = typeof ConversationHeader.Type
+export type ConversationHeaderEncoded = typeof ConversationHeader.Encoded
+
 export const Device = /*#__PURE__*/ (() => Schema.Struct({
   "expires_at": Timestamp,
   "id": Id,
@@ -1611,6 +1644,8 @@ export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   "loop_round": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE).annotate({ description: "Current round of this step's loop, enriched on mission detail reads." }),
   /** Observed not-before time: earliest work eligibility, not a promise of wake dispatch. */
   "next_wake_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Observed not-before time: earliest work eligibility, not a promise of wake dispatch." }),
+  /** When st last nudged this held step's holder for idling with nothing set to wake it. */
+  "nudged_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "When st last nudged this held step's holder for idling with nothing set to wake it." }),
   "path": Schema.String,
   /** Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress. */
   "progress_at": Schema.OptionFromOptionalNullOr(Timestamp, NULL_NONE).annotate({ description: "Current attempt latest nonempty work.progress summary time; not lease renewal or seat activity. Lightweight mission list cards are unhydrated and return null, not proof of no progress." }),
@@ -1891,6 +1926,8 @@ export const Work = /*#__PURE__*/ (() => Schema.Struct({
   /** The mission this work's run belongs to. */
   "mission_id": Schema.OptionFromOptionalNullOr(Id, NULL_NONE).annotate({ description: "The mission this work's run belongs to." }),
   "mission_run_id": Id,
+  /** When st last nudged this held step's holder for idling with nothing set to wake it. */
+  "nudged_at_unix_ms": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).pipe(Schema.decodeTo(Schema.DateTimeUtcFromMillis.check(epochRange))), NULL_NONE).annotate({ description: "When st last nudged this held step's holder for idling with nothing set to wake it." }),
   "operational": optionalKey(Operational),
   "path": Schema.String,
   /** Responses to the asks this attempt made, or a person ask's own response. */
@@ -2065,16 +2102,399 @@ export const ConversationContentRef = /*#__PURE__*/ (() => Schema.Struct({
 export type ConversationContentRef = typeof ConversationContentRef.Type
 export type ConversationContentRefEncoded = typeof ConversationContentRef.Encoded
 
+export const TimelineAskAnswer = /*#__PURE__*/ (() => Schema.Struct({
+  "custom": optionalKey(Schema.String),
+  "note": optionalKey(Schema.String),
+  "question": Schema.String,
+  "selected": Schema.Array(Schema.String)
+}).annotate({ identifier: "TimelineAskAnswer" }))()
+export type TimelineAskAnswer = typeof TimelineAskAnswer.Type
+export type TimelineAskAnswerEncoded = typeof TimelineAskAnswer.Encoded
+
+export const TimelineAskQuestion = /*#__PURE__*/ (() => Schema.Struct({
+  "id": Schema.String,
+  "multi": Schema.Boolean,
+  "options": Schema.Array(Schema.Struct({ "description": optionalKey(Schema.String), "label": Schema.String })),
+  "question": Schema.String,
+  "recommended": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
+}).annotate({ identifier: "TimelineAskQuestion" }))()
+export type TimelineAskQuestion = typeof TimelineAskQuestion.Type
+export type TimelineAskQuestionEncoded = typeof TimelineAskQuestion.Encoded
+
+/** tool_call fields: questions; tool_output fields: answers. */
+export const TimelineViewAsk = /*#__PURE__*/ (() => Schema.Struct({
+  "answers": optionalKey(Schema.Array(TimelineAskAnswer)),
+  "call_id": optionalKey(Schema.String),
+  "intent": optionalKey(Schema.String),
+  "is_error": optionalKey(Schema.Boolean),
+  "questions": optionalKey(Schema.Array(TimelineAskQuestion)),
+  "tool": Schema.String,
+  "type": Schema.Literal("ask")
+}).annotate({ identifier: "TimelineViewAsk", description: "tool_call fields: questions; tool_output fields: answers." }))()
+export type TimelineViewAsk = typeof TimelineViewAsk.Type
+export type TimelineViewAskEncoded = typeof TimelineViewAsk.Encoded
+
+/** Assistant error from the native session record and its persisted retry marker; no retry state is inferred. */
+export const TimelineViewAssistantError = /*#__PURE__*/ (() => Schema.Struct({
+  "api": optionalKey(Schema.String),
+  "error_id": optionalKey(Schema.Int),
+  "is_error": Schema.Boolean,
+  "label": Schema.String,
+  "message": Schema.String,
+  "model": optionalKey(Schema.String),
+  "presentation": Schema.Literals(["full","compact-recovered","none"]),
+  "provider": optionalKey(Schema.String),
+  "retry": optionalKey(Schema.Struct({ "attempt": optionalKey(Schema.Int), "kind": optionalKey(Schema.String), "note": optionalKey(Schema.String), "recovered_at": optionalKey(Timestamp), "recovery": optionalKey(Schema.String), "status": optionalKey(Schema.String), "superseded_by": optionalKey(Schema.Struct({ "model": optionalKey(Schema.String), "provider": optionalKey(Schema.String), "response_id": optionalKey(Schema.String), "timestamp": optionalKey(Schema.Int) })) })),
+  "status": Schema.Literals(["failed","recovered","superseded"]),
+  "stop_reason": optionalKey(Schema.String),
+  "type": Schema.Literal("assistant_error")
+}).annotate({ identifier: "TimelineViewAssistantError", description: "Assistant error from the native session record and its persisted retry marker; no retry state is inferred." }))()
+export type TimelineViewAssistantError = typeof TimelineViewAssistantError.Type
+export type TimelineViewAssistantErrorEncoded = typeof TimelineViewAssistantError.Encoded
+
+/** tool_call fields: command, cwd, timeout_s, env_keys, background; tool_output fields: call_id, is_error, exit_code, wall_ms, timed_out. */
+export const TimelineViewBash = /*#__PURE__*/ (() => Schema.Struct({
+  "background": optionalKey(Schema.Boolean),
+  "call_id": optionalKey(Schema.String),
+  "command": optionalKey(Schema.String),
+  "cwd": optionalKey(Schema.String),
+  "env_keys": optionalKey(Schema.Array(Schema.String)),
+  "exit_code": optionalKey(Schema.Int),
+  /** Parsed from the OMP `i` field */
+  "intent": optionalKey(Schema.String).annotate({ description: "Parsed from the OMP `i` field" }),
+  "is_error": optionalKey(Schema.Boolean),
+  "timed_out": optionalKey(Schema.Boolean),
+  "timeout_s": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  /** Native tool name */
+  "tool": Schema.String.annotate({ description: "Native tool name" }),
+  "type": Schema.Literal("bash"),
+  "wall_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
+}).annotate({ identifier: "TimelineViewBash", description: "tool_call fields: command, cwd, timeout_s, env_keys, background; tool_output fields: call_id, is_error, exit_code, wall_ms, timed_out." }))()
+export type TimelineViewBash = typeof TimelineViewBash.Type
+export type TimelineViewBashEncoded = typeof TimelineViewBash.Encoded
+
+/** On a status block; summary is bounded with an owner continuation. */
+export const TimelineViewCompaction = /*#__PURE__*/ (() => Schema.Struct({
+  "method": optionalKey(Schema.String),
+  "short_summary": optionalKey(Schema.String),
+  "summary": optionalKey(Schema.String),
+  "tokens_after": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "tokens_before": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "type": Schema.Literal("compaction")
+}).annotate({ identifier: "TimelineViewCompaction", description: "On a status block; summary is bounded with an owner continuation." }))()
+export type TimelineViewCompaction = typeof TimelineViewCompaction.Type
+export type TimelineViewCompactionEncoded = typeof TimelineViewCompaction.Encoded
+
+/** Credential bookkeeping, with internal visibility. The hash stays in the raw record only. */
+export const TimelineViewCredentialPin = /*#__PURE__*/ (() => Schema.Struct({
+  "provider": Schema.String,
+  "type": Schema.Literal("credential_pin")
+}).annotate({ identifier: "TimelineViewCredentialPin", description: "Credential bookkeeping, with internal visibility. The hash stays in the raw record only." }))()
+export type TimelineViewCredentialPin = typeof TimelineViewCredentialPin.Type
+export type TimelineViewCredentialPinEncoded = typeof TimelineViewCredentialPin.Encoded
+
+/** tool_call fields: path (first [PATH#TAG] header), ops, input_bytes; tool_output fields: path, first_changed_line, diff. */
+export const TimelineViewEdit = /*#__PURE__*/ (() => Schema.Struct({
+  "call_id": optionalKey(Schema.String),
+  /** Unified diff as given */
+  "diff": optionalKey(Schema.String).annotate({ description: "Unified diff as given" }),
+  "first_changed_line": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "input_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "intent": optionalKey(Schema.String),
+  "is_error": optionalKey(Schema.Boolean),
+  "ops": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "path": optionalKey(Schema.String),
+  "tool": Schema.String,
+  "type": Schema.Literal("edit")
+}).annotate({ identifier: "TimelineViewEdit", description: "tool_call fields: path (first [PATH#TAG] header), ops, input_bytes; tool_output fields: path, first_changed_line, diff." }))()
+export type TimelineViewEdit = typeof TimelineViewEdit.Type
+export type TimelineViewEditEncoded = typeof TimelineViewEdit.Encoded
+
+export const TimelineViewEval = /*#__PURE__*/ (() => Schema.Struct({
+  "code": optionalKey(Schema.String),
+  "code_bytes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "intent": optionalKey(Schema.String),
+  "language": Schema.String,
+  "reset": optionalKey(Schema.Boolean),
+  "timeout_s": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "title": optionalKey(Schema.String),
+  "tool": Schema.String,
+  "type": Schema.Literal("eval")
+}).annotate({ identifier: "TimelineViewEval" }))()
+export type TimelineViewEval = typeof TimelineViewEval.Type
+export type TimelineViewEvalEncoded = typeof TimelineViewEval.Encoded
+
+/** Any other tool: tool_call field name; tool_output fields is_error, wall_ms. */
+export const TimelineViewGeneric = /*#__PURE__*/ (() => Schema.Struct({
+  "call_id": optionalKey(Schema.String),
+  "intent": optionalKey(Schema.String),
+  "is_error": optionalKey(Schema.Boolean),
+  "name": optionalKey(Schema.String),
+  "tool": Schema.String,
+  "type": Schema.Literal("generic"),
+  "wall_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
+}).annotate({ identifier: "TimelineViewGeneric", description: "Any other tool: tool_call field name; tool_output fields is_error, wall_ms." }))()
+export type TimelineViewGeneric = typeof TimelineViewGeneric.Type
+export type TimelineViewGenericEncoded = typeof TimelineViewGeneric.Encoded
+
+export const JobSummary = /*#__PURE__*/ (() => Schema.Struct({
+  "duration_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "ended_at": optionalKey(Timestamp),
+  "exit_code": optionalKey(Schema.Int),
+  "id": Schema.String,
+  "name": optionalKey(Schema.String),
+  "output_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "started_at": optionalKey(Timestamp),
+  "state": Schema.String,
+  "type": optionalKey(Schema.String)
+}).annotate({ identifier: "JobSummary" }))()
+export type JobSummary = typeof JobSummary.Type
+export type JobSummaryEncoded = typeof JobSummary.Encoded
+
+/** tool_call fields: op, name, target, message, timeout_s; tool_output fields: timed_out, jobs, state. */
+export const TimelineViewHub = /*#__PURE__*/ (() => Schema.Struct({
+  "call_id": optionalKey(Schema.String),
+  "intent": optionalKey(Schema.String),
+  "is_error": optionalKey(Schema.Boolean),
+  "jobs": optionalKey(Schema.Array(JobSummary)),
+  "message": optionalKey(Schema.String),
+  "name": optionalKey(Schema.String),
+  "op": Schema.String,
+  "state": optionalKey(Schema.String),
+  "target": optionalKey(Schema.String),
+  "timed_out": optionalKey(Schema.Boolean),
+  "timeout_s": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "tool": Schema.String,
+  "type": Schema.Literal("hub")
+}).annotate({ identifier: "TimelineViewHub", description: "tool_call fields: op, name, target, message, timeout_s; tool_output fields: timed_out, jobs, state." }))()
+export type TimelineViewHub = typeof TimelineViewHub.Type
+export type TimelineViewHubEncoded = typeof TimelineViewHub.Encoded
+
+/** Block kind `irc` from a custom_message irc:incoming record. */
+export const TimelineViewIrc = /*#__PURE__*/ (() => Schema.Struct({
+  "from": Schema.String,
+  "message": Schema.String,
+  "message_id": Schema.String,
+  "reply_to": optionalKey(Schema.String),
+  "type": Schema.Literal("irc")
+}).annotate({ identifier: "TimelineViewIrc", description: "Block kind `irc` from a custom_message irc:incoming record." }))()
+export type TimelineViewIrc = typeof TimelineViewIrc.Type
+export type TimelineViewIrcEncoded = typeof TimelineViewIrc.Encoded
+
+/** Block kind `job` from launch-completion (details.jobs) and async-result records. */
+export const TimelineViewJob = /*#__PURE__*/ (() => Schema.Struct({
+  "jobs": Schema.Array(JobSummary),
+  "type": Schema.Literal("job")
+}).annotate({ identifier: "TimelineViewJob", description: "Block kind `job` from launch-completion (details.jobs) and async-result records." }))()
+export type TimelineViewJob = typeof TimelineViewJob.Type
+export type TimelineViewJobEncoded = typeof TimelineViewJob.Encoded
+
+export const TimelineViewModelChange = /*#__PURE__*/ (() => Schema.Struct({
+  "fallback": optionalKey(Schema.Boolean),
+  "model": Schema.String,
+  "role": optionalKey(Schema.String),
+  "type": Schema.Literal("model_change")
+}).annotate({ identifier: "TimelineViewModelChange" }))()
+export type TimelineViewModelChange = typeof TimelineViewModelChange.Type
+export type TimelineViewModelChangeEncoded = typeof TimelineViewModelChange.Encoded
+
+export const TimelineViewRead = /*#__PURE__*/ (() => Schema.Struct({
+  "intent": optionalKey(Schema.String),
+  "path": Schema.String,
+  /** Suffix after `:` in the read path */
+  "range": optionalKey(Schema.String).annotate({ description: "Suffix after `:` in the read path" }),
+  "tool": Schema.String,
+  "type": Schema.Literal("read")
+}).annotate({ identifier: "TimelineViewRead" }))()
+export type TimelineViewRead = typeof TimelineViewRead.Type
+export type TimelineViewReadEncoded = typeof TimelineViewRead.Encoded
+
+export const TimelineViewResetBoundary = /*#__PURE__*/ (() => Schema.Struct({
+  "type": Schema.Literal("reset_boundary")
+}).annotate({ identifier: "TimelineViewResetBoundary" }))()
+export type TimelineViewResetBoundary = typeof TimelineViewResetBoundary.Type
+export type TimelineViewResetBoundaryEncoded = typeof TimelineViewResetBoundary.Encoded
+
+export const TimelineViewSearch = /*#__PURE__*/ (() => Schema.Struct({
+  "call_id": optionalKey(Schema.String),
+  "case": optionalKey(Schema.Boolean),
+  "engine": Schema.Literals(["grep","glob","web"]),
+  "file_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "file_limit_reached": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "gitignore": optionalKey(Schema.Boolean),
+  "hidden": optionalKey(Schema.Boolean),
+  "intent": optionalKey(Schema.String),
+  "is_error": optionalKey(Schema.Boolean),
+  "limit": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "match_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "path": optionalKey(Schema.String),
+  "pattern": optionalKey(Schema.String),
+  "per_file_limit_reached": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "query": optionalKey(Schema.String),
+  "skip": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "tool": Schema.String,
+  "truncated": optionalKey(Schema.Boolean),
+  "type": Schema.Literal("search"),
+  "warning": optionalKey(Schema.String)
+}).annotate({ identifier: "TimelineViewSearch" }))()
+export type TimelineViewSearch = typeof TimelineViewSearch.Type
+export type TimelineViewSearchEncoded = typeof TimelineViewSearch.Encoded
+
+export const TimelineViewSessionExit = /*#__PURE__*/ (() => Schema.Struct({
+  "kind": Schema.String,
+  "reason": Schema.String,
+  "type": Schema.Literal("session_exit")
+}).annotate({ identifier: "TimelineViewSessionExit" }))()
+export type TimelineViewSessionExit = typeof TimelineViewSessionExit.Type
+export type TimelineViewSessionExitEncoded = typeof TimelineViewSessionExit.Encoded
+
+export const TimelineViewSkill = /*#__PURE__*/ (() => Schema.Struct({
+  /** Native skill arguments, any JSON */
+  "args": optionalKey(Schema.Unknown).annotate({ description: "Native skill arguments, any JSON" }),
+  "name": Schema.String,
+  "path": optionalKey(Schema.String),
+  "type": Schema.Literal("skill")
+}).annotate({ identifier: "TimelineViewSkill" }))()
+export type TimelineViewSkill = typeof TimelineViewSkill.Type
+export type TimelineViewSkillEncoded = typeof TimelineViewSkill.Encoded
+
+/** One subagent of a task tool output. name is the OMP name (id when no separate name exists), agent is the type, task is the full assignment. conversation.session_id opens the readable child transcript. */
+export const SubagentSummary = /*#__PURE__*/ (() => Schema.Struct({
+  "agent": optionalKey(Schema.String),
+  "conversation": optionalKey(Schema.Struct({ "session_id": Id })),
+  "cost_usd": optionalKey(Schema.Number.check(Schema.isGreaterThanOrEqualTo(0))),
+  "duration_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "id": Schema.String,
+  "name": optionalKey(Schema.String),
+  "requests": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "status": Schema.String,
+  "task": optionalKey(Schema.String),
+  "tokens": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "tool_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)))
+}).annotate({ identifier: "SubagentSummary", description: "One subagent of a task tool output. name is the OMP name (id when no separate name exists), agent is the type, task is the full assignment. conversation.session_id opens the readable child transcript." }))()
+export type SubagentSummary = typeof SubagentSummary.Type
+export type SubagentSummaryEncoded = typeof SubagentSummary.Encoded
+
+/** tool_call fields: context, tasks; tool_output fields: async, total_ms, agents. */
+export const TimelineViewTask = /*#__PURE__*/ (() => Schema.Struct({
+  "agents": optionalKey(Schema.Array(SubagentSummary)),
+  "async": optionalKey(Schema.Boolean),
+  "call_id": optionalKey(Schema.String),
+  "context": optionalKey(Schema.String),
+  "intent": optionalKey(Schema.String),
+  "is_error": optionalKey(Schema.Boolean),
+  "tasks": optionalKey(Schema.Array(Schema.Struct({ "agent": optionalKey(Schema.String), "name": optionalKey(Schema.String), "task": Schema.String }))),
+  "tool": Schema.String,
+  "total_ms": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "type": Schema.Literal("task")
+}).annotate({ identifier: "TimelineViewTask", description: "tool_call fields: context, tasks; tool_output fields: async, total_ms, agents." }))()
+export type TimelineViewTask = typeof TimelineViewTask.Type
+export type TimelineViewTaskEncoded = typeof TimelineViewTask.Encoded
+
+export const TimelineViewThinkingLevel = /*#__PURE__*/ (() => Schema.Struct({
+  "configured": optionalKey(Schema.Boolean),
+  "level": Schema.String,
+  "type": Schema.Literal("thinking_level")
+}).annotate({ identifier: "TimelineViewThinkingLevel" }))()
+export type TimelineViewThinkingLevel = typeof TimelineViewThinkingLevel.Type
+export type TimelineViewThinkingLevelEncoded = typeof TimelineViewThinkingLevel.Encoded
+
+export const TimelineViewTitle = /*#__PURE__*/ (() => Schema.Struct({
+  "previous": optionalKey(Schema.String),
+  "source": optionalKey(Schema.String),
+  "title": Schema.String,
+  "type": Schema.Literal("title")
+}).annotate({ identifier: "TimelineViewTitle" }))()
+export type TimelineViewTitle = typeof TimelineViewTitle.Type
+export type TimelineViewTitleEncoded = typeof TimelineViewTitle.Encoded
+
+export const TimelineTodoItem = /*#__PURE__*/ (() => Schema.Struct({
+  "content": Schema.String,
+  "status": Schema.String
+}).annotate({ identifier: "TimelineTodoItem" }))()
+export type TimelineTodoItem = typeof TimelineTodoItem.Type
+export type TimelineTodoItemEncoded = typeof TimelineTodoItem.Encoded
+
+/** tool_call fields: op, items, phase, task; tool_output fields: phases. */
+export const TimelineViewTodo = /*#__PURE__*/ (() => Schema.Struct({
+  "call_id": optionalKey(Schema.String),
+  "intent": optionalKey(Schema.String),
+  "is_error": optionalKey(Schema.Boolean),
+  "items": optionalKey(Schema.Array(TimelineTodoItem)),
+  "op": optionalKey(Schema.String),
+  "phase": optionalKey(Schema.String),
+  "phases": optionalKey(Schema.Array(Schema.Struct({ "items": Schema.Array(TimelineTodoItem), "name": Schema.String }))),
+  "task": optionalKey(Schema.String),
+  "tool": Schema.String,
+  "type": Schema.Literal("todo")
+}).annotate({ identifier: "TimelineViewTodo", description: "tool_call fields: op, items, phase, task; tool_output fields: phases." }))()
+export type TimelineViewTodo = typeof TimelineViewTodo.Type
+export type TimelineViewTodoEncoded = typeof TimelineViewTodo.Encoded
+
+/** On an internal-visibility `status` block; renderers attach it to the call row and do not draw it alone. */
+export const TimelineViewToolStart = /*#__PURE__*/ (() => Schema.Struct({
+  "call_id": Schema.String,
+  "started_at": Timestamp,
+  "tool": Schema.String,
+  "type": Schema.Literal("tool_start")
+}).annotate({ identifier: "TimelineViewToolStart", description: "On an internal-visibility `status` block; renderers attach it to the call row and do not draw it alone." }))()
+export type TimelineViewToolStart = typeof TimelineViewToolStart.Type
+export type TimelineViewToolStartEncoded = typeof TimelineViewToolStart.Encoded
+
+export const TimelineViewWrite = /*#__PURE__*/ (() => Schema.Struct({
+  "bytes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "content": optionalKey(Schema.String),
+  "intent": optionalKey(Schema.String),
+  "line_count": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
+  "path": Schema.String,
+  "tool": Schema.String,
+  "type": Schema.Literal("write")
+}).annotate({ identifier: "TimelineViewWrite" }))()
+export type TimelineViewWrite = typeof TimelineViewWrite.Type
+export type TimelineViewWriteEncoded = typeof TimelineViewWrite.Encoded
+
+/** Parsed typed projection of a block, discriminated by type. Known types are closed; future types keep JSON through the fallback. */
+export const TimelineView = /*#__PURE__*/ (() => Schema.Union([
+  TimelineViewBash,
+  TimelineViewEdit,
+  TimelineViewWrite,
+  TimelineViewRead,
+  TimelineViewSearch,
+  TimelineViewTodo,
+  TimelineViewAsk,
+  TimelineViewTask,
+  TimelineViewHub,
+  TimelineViewEval,
+  TimelineViewGeneric,
+  TimelineViewIrc,
+  TimelineViewJob,
+  TimelineViewSkill,
+  TimelineViewCompaction,
+  TimelineViewAssistantError,
+  TimelineViewModelChange,
+  TimelineViewThinkingLevel,
+  TimelineViewTitle,
+  TimelineViewSessionExit,
+  TimelineViewToolStart,
+  TimelineViewResetBoundary,
+  TimelineViewCredentialPin,
+  Schema.Struct({ "type": unknownCase(["bash","edit","write","read","search","todo","ask","task","hub","eval","generic","irc","job","skill","compaction","assistant_error","model_change","thinking_level","title","session_exit","tool_start","reset_boundary","credential_pin"]) })
+], { mode: "oneOf" }).annotate({ identifier: "TimelineView", description: "Parsed typed projection of a block, discriminated by type. Known types are closed; future types keep JSON through the fallback." }))()
+export type TimelineView = typeof TimelineView.Type
+export type TimelineViewEncoded = typeof TimelineView.Encoded
+
 export const TimelineBlock = /*#__PURE__*/ (() => Schema.Struct({
   "continuation": optionalKey(ConversationContentRef),
   "id": Schema.String,
-  /** text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, error, document, source_record, raw_text, unknown; future kinds remain readable as JSON */
-  "kind": Schema.String.annotate({ description: "text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, error, document, source_record, raw_text, unknown; future kinds remain readable as JSON" }),
-  /** Source-supplied metadata including timing (wallTimeMs, timeoutSeconds); preserve names, units, values and future fields */
-  "metadata": optionalKey(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "Source-supplied metadata including timing (wallTimeMs, timeoutSeconds); preserve names, units, values and future fields" }),
+  /** text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, error, document, source_record, raw_text, irc, unknown; future kinds remain readable as JSON */
+  "kind": Schema.String.annotate({ description: "text, reasoning, tool_call, tool_output, image, image_link, job, subagent, ask, status, error, document, source_record, raw_text, irc, unknown; future kinds remain readable as JSON" }),
+  /** Source-supplied metadata including timing (wallTimeMs, timeoutSeconds); assistant text/reasoning blocks may carry model, provider, usage {input, output, cache_read, cache_write, total, cost_usd}, context_tokens, stop_reason, ttft_ms and duration_ms; preserve names, units, values and future fields */
+  "metadata": optionalKey(Schema.Record(Schema.String, Schema.Unknown)).annotate({ description: "Source-supplied metadata including timing (wallTimeMs, timeoutSeconds); assistant text/reasoning blocks may carry model, provider, usage {input, output, cache_read, cache_write, total, cost_usd}, context_tokens, stop_reason, ttft_ms and duration_ms; preserve names, units, values and future fields" }),
   /** Native JSON; {body_ref:true} refers to the containing known fallback body without duplication */
   "payload": Schema.Unknown.annotate({ description: "Native JSON; {body_ref:true} refers to the containing known fallback body without duplication" }),
   "source_type": Schema.String,
+  /** Parsed typed projection of the block; a renderer that does not know the view type renders the block as without a view. The full native data stays in payload */
+  "view": optionalKey(TimelineView),
   /** UI hint: visible (default), internal or hidden-by-harness; never an access restriction */
   "visibility": optionalKey(Schema.String).annotate({ description: "UI hint: visible (default), internal or hidden-by-harness; never an access restriction" })
 }).annotate({ identifier: "TimelineBlock" }))()
@@ -2217,7 +2637,8 @@ export const CollectionFrame = /*#__PURE__*/ (() => Schema.Union([
   Schema.Struct({ "collection": CollectionName, "has_more": Schema.Boolean, "id": Schema.String, "items": Schema.Array(Resource), "kind": Schema.Literal("snapshot"), "order": Schema.Array(Id), "snapshot": Snapshot }),
   Schema.Struct({ "collection": CollectionName, "has_more": Schema.Boolean, "id": Schema.String, "kind": Schema.Literal("changes"), "order": Schema.Array(Id), "removes": Schema.Array(Id), "snapshot": Snapshot, "upserts": Schema.Array(Resource) }),
   Schema.Struct({ "collection": Schema.Literal("terminal"), "id": Schema.String, "kind": Schema.Literal("screen"), "snapshot": Snapshot, "value": TerminalScreen }),
-  Schema.Struct({ "collection": Schema.Literal("conversation"), "has_more": optionalKey(Schema.Boolean), "id": Schema.String, "items": Schema.Array(TimelineEntry), "kind": Schema.Literal("conversation"), "replace": Schema.Boolean, "session_id": Id }),
+  Schema.Struct({ "collection": Schema.Literal("conversation"), "has_more": optionalKey(Schema.Boolean), /** Present when conversation-blocks.v1 is negotiated and at least one header field is available */
+"header": optionalKey(ConversationHeader), "id": Schema.String, "items": Schema.Array(TimelineEntry), "kind": Schema.Literal("conversation"), "replace": Schema.Boolean, "session_id": Id }),
   Schema.Struct({ "code": optionalKey(Schema.String), "collection": optionalKey(Schema.String), "id": Schema.String, "kind": Schema.Literal("resync"), "message": optionalKey(Schema.String), "retryable": optionalKey(Schema.Boolean) }),
   Schema.Struct({ "code": optionalKey(Schema.String), "collection": optionalKey(Schema.String), "id": optionalKey(Schema.String), "kind": Schema.Literal("error"), "message": Schema.String, "retryable": optionalKey(Schema.Boolean) })
 ], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("kind")).annotate({ identifier: "CollectionFrame" }))()
@@ -2225,6 +2646,8 @@ export type CollectionFrame = typeof CollectionFrame.Type
 export type CollectionFrameEncoded = typeof CollectionFrame.Encoded
 
 export const ConversationChanges = /*#__PURE__*/ (() => Schema.Struct({
+  /** Present when conversation-blocks.v1 is negotiated; each field names its value, source and as_of */
+  "header": optionalKey(ConversationHeader),
   "items": Schema.Array(TimelineEntry).check(Schema.isMaxLength(200)),
   "kind": Schema.Literal("conversation-changes"),
   "next_cursor": Cursor,
@@ -2296,9 +2719,12 @@ export type DocumentContent = typeof DocumentContent.Type
 export type DocumentContentEncoded = typeof DocumentContent.Encoded
 
 export const TimelineDelta = /*#__PURE__*/ (() => Schema.Union([
-  Schema.Struct({ "entry": TimelineEntry, "entry_id": Id, "operation": Schema.Literal("append"), "revision": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)) }),
-  Schema.Struct({ "entry": TimelineEntry, "entry_id": Id, "operation": Schema.Literal("replace"), "revision": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)) }),
-  Schema.Struct({ "entry": optionalKey(TimelineEntry), "entry_id": Id, "operation": Schema.Literal("finalize"), "revision": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)) })
+  Schema.Struct({ "entry": TimelineEntry, "entry_id": Id, /** Present when conversation-blocks.v1 is negotiated; each field names its value, source and as_of */
+"header": optionalKey(ConversationHeader), "operation": Schema.Literal("append"), "revision": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)) }),
+  Schema.Struct({ "entry": TimelineEntry, "entry_id": Id, /** Present when conversation-blocks.v1 is negotiated; each field names its value, source and as_of */
+"header": optionalKey(ConversationHeader), "operation": Schema.Literal("replace"), "revision": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)) }),
+  Schema.Struct({ "entry": optionalKey(TimelineEntry), "entry_id": Id, /** Present when conversation-blocks.v1 is negotiated; each field names its value, source and as_of */
+"header": optionalKey(ConversationHeader), "operation": Schema.Literal("finalize"), "revision": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)) })
 ], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("operation")).annotate({ identifier: "TimelineDelta" }))()
 export type TimelineDelta = typeof TimelineDelta.Type
 export type TimelineDeltaEncoded = typeof TimelineDelta.Encoded
@@ -2439,6 +2865,8 @@ export type SubjectDefinition = typeof SubjectDefinition.Type
 export type SubjectDefinitionEncoded = typeof SubjectDefinition.Encoded
 
 export const TimelinePage = /*#__PURE__*/ (() => Schema.Struct({
+  /** Present when conversation-blocks.v1 is negotiated; each field names its value, source and as_of */
+  "header": optionalKey(ConversationHeader),
   "items": Schema.Array(TimelineEntry),
   "kind": Schema.Literal("timeline-page"),
   "page": PageInfo,
