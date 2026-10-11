@@ -244,7 +244,7 @@ async fn launch_detail_and_envelope_use_one_cut_across_cancellation() {
         writer_barrier.wait();
     });
     let reader_state = state.clone();
-    let before = read_deadline::spawn_handler(move || {
+    let before = read_deadline::spawn_handler(None, move || {
         reader_state.store.read_snapshot(|index| {
             let snapshot = client_snapshot_at(&reader_state, index);
             let expected = client_launch_detail_at(&reader_state, "one", false)?.unwrap();
@@ -304,7 +304,7 @@ async fn launch_detail_selected_work_stays_flat_as_unrelated_sessions_and_declar
         // Measure the real handler's SQLite work on its pinned thread, separately from
         // process-global counters and authentication. The router is also exercised below.
         let reader_state = state.clone();
-        let (selected, cost) = read_deadline::spawn_handler(move || {
+        let (selected, cost) = read_deadline::spawn_handler(None, move || {
             let scope = SqliteWorkScope::start();
             let caller = super::ClientSession::local(None).unwrap();
             let (_, Json(selected)) = tokio::runtime::Handle::current()
