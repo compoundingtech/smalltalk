@@ -6294,6 +6294,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::api::start_native_session_discovery(&state);
     // Nor does the first agents roster read fold every agent's card.
     st3::api::start_agent_roster(&state);
+    // Nor does an attention window fold every person's attention.
+    st3::api::start_attention_list(&state);
     startup.phase("bind-listeners");
     let bound = std::sync::atomic::AtomicUsize::new(0);
     let ready = || {

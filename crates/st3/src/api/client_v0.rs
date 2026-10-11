@@ -13,7 +13,7 @@ mod collection_windows;
 mod collection_ivm;
 #[cfg(test)]
 mod collection_refresh_tests;
-mod summary;
+pub(in crate::api) mod summary;
 
 #[cfg(test)]
 mod stream_start_tests;
@@ -480,6 +480,62 @@ async fn collection_items_with_windows(
                 } else {
                     None
                 };
+                // A daemon's windows never fold attention or read glasses and arrangements:
+                // they serve the newest published view under that view's own cut, and wake its
+                // refresher when it is older.
+                let published_rows = if store.published_view_serving(&collection) {
+                    use super::published_attention::{published_attention_rows, published_owner_rows};
+                    use crate::store::owner_lists::OwnerView;
+                    let rows = match collection.as_str() {
+                        "attention" => Some(published_attention_rows(
+                            &store, index, person.as_deref(), limit.saturating_add(1),
+                        )),
+                        "summary" => {
+                            use crate::store::summary_list::PublishedSummary;
+                            match store.published_summary(person.as_deref()) {
+                                PublishedSummary::Row(cut, at, row) => {
+                                    if cut < index {
+                                        store.request_attention_list_refresh();
+                                    }
+                                    Some(Some((cut, at, vec![row])))
+                                }
+                                PublishedSummary::Pending => {
+                                    store.request_attention_list_refresh();
+                                    Some(None)
+                                }
+                                // A selection it does not serve: this window reads its own.
+                                PublishedSummary::Unserved => None,
+                            }
+                        }
+                        "glasses" => Some(published_owner_rows(
+                            &store, OwnerView::Glasses, index,
+                            person.as_deref().expect("authenticated glass owner"),
+                        )),
+                        "arrangements" => Some(published_owner_rows(
+                            &store, OwnerView::Arrangements, index,
+                            person.as_deref().expect("explicit arrangement owner"),
+                        ).map(|(cut, at, mut rows)| {
+                            if let Some(subject) = &subject {
+                                rows.retain(|row| row["id"] == subject.as_str());
+                            }
+                            (cut, at, rows)
+                        })),
+                        _ => None,
+                    };
+                    match rows {
+                        Some(Some((cut, at, rows))) => {
+                            published = Some(cut);
+                            published_at = Some(at);
+                            Some(rows)
+                        }
+                        Some(None) => {
+                            return Ok(Err(super::published_attention::published_view_not_ready(&collection)));
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
                 let snapshot = match published_at {
                     Some(at) => super::roster_snapshot(&state, published.unwrap_or(index), at),
                     None => client_snapshot_at(&state, index),
@@ -488,6 +544,9 @@ async fn collection_items_with_windows(
                 let compute = || {
                     let mut items = match collection.as_str() {
                         "summary" => {
+                            if let Some(rows) = &published_rows {
+                                return Ok((rows.clone(), false));
+                            }
                             return Ok((summary::native(&state, &current, &request, &snapshot,
                                 now, windows.as_deref(), commits)?, false));
                         }
@@ -499,6 +558,9 @@ async fn collection_items_with_windows(
                             let mut items = mission_list_cards_at(&store, &ids, now)?;
                             has_more |= bound_mission_cards(&mut items)?;
                             return Ok((items, has_more));
+                        }
+                        "glasses" | "arrangements" if published_rows.is_some() => {
+                            published_rows.clone().expect("published rows")
                         }
                         "glasses" => store.glasses(
                             person.as_deref().expect("authenticated glass owner"),
@@ -514,9 +576,10 @@ async fn collection_items_with_windows(
                                 )?
                             }
                         }
-                        "attention" => {
-                            client_attention_resources_at(&store, person.as_deref(), false, now)?
-                        }
+                        "attention" => match &published_rows {
+                            Some(rows) => rows.clone(),
+                            None => client_attention_resources_at(&store, person.as_deref(), false, now)?,
+                        },
                         "agents" => {
                             // Published cards already exist; a cold unfiltered window folds
                             // only its visible cards and gets has_more from shallow membership.
@@ -11367,6 +11430,10 @@ pub(super) async fn action(
     result["snapshot_id"] = Value::String(new_client_snapshot(&state).id);
     Ok(Json(result))
 }
+
+#[cfg(test)]
+#[path = "client_v0/published_attention_tests.rs"]
+mod published_attention_tests;
 
 #[cfg(test)]
 mod tests {
