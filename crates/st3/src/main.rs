@@ -18343,6 +18343,8 @@ struct NativeLoopState {
     claude_attachment_reconciled: bool,
     #[serde(default)]
     claude_attachment_terminal: Option<ClaudeAttachmentTerminal>,
+    #[serde(default)]
+    claude_readiness_fallback: ClaudeReadinessFallback,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -18559,6 +18561,7 @@ async fn drive_st2_native(
         let _ = write_driver_log(subject, &format!("Claude attachment check will retry: {error:#}"));
     }
     let mut observations = NativeObservations::start(&agent_dir, &incarnation)?;
+    loop_state.claude_readiness_fallback.native_state_seen |= observations.native_state_seen;
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
@@ -18628,6 +18631,7 @@ async fn drive_st2_native(
                 }
             }
             result = &mut task, if completion_announced || fixture_completion_task_enabled() => {
+                loop_state.claude_readiness_fallback.native_state_seen |= observations.native_state_seen;
                 let outcome = result?;
                 if let Some(session) = detached_session(&outcome) {
                     loop_state.delivery_episode = delivery.episode;
@@ -18711,6 +18715,16 @@ async fn drive_st2_native(
 
                 if observations.retry_pending {
                     match observations.drain_live(client, subject, driver, &mut loop_state.ready).await {
+                        Ok(ended) => completion_announced |= ended,
+                        Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
+                    }
+                    if completion_announced { continue; }
+                }
+
+                if driver == "claude" && mailbox.subscription.is_some() {
+                    match publish_claude_readiness_fallback(
+                        client, &mailbox, &mut observations, &mut loop_state, current_unix_ms()? as u64,
+                    ).await {
                         Ok(ended) => completion_announced |= ended,
                         Err(error) => note_driver_tick_failure(subject, error, &mut last_control_warning),
                     }
@@ -18862,8 +18876,9 @@ async fn drive_st2_native(
                         && let Some(observed) = st_drivers::harness_state::read(&harness_state_path, None)
                     {
                         // A session claim is a startup fence, not an observation. Preserve the
-                        // explicit `starting` state until a hook or the initialized ST3 channel
-                        // supplies positive evidence; publishing the derived `claimed`
+                        // explicit `starting` state until a native observation supplies positive
+                        // evidence. Push Claude startup readiness has a separate grace fallback;
+                        // publishing the derived `claimed`
                         // indeterminacy would erase the more precise lifecycle state.
                         let claim_placeholder =
                             observed.state == st_drivers::harness_state::Activity::Unknown
@@ -19186,6 +19201,7 @@ struct NativeObservations {
     runtime: String,
     enabled: bool,
     provider_incarnation: Option<String>,
+    native_state_seen: bool,
     evidence_deadline: Option<serde_json::Value>,
     retry_pending: bool,
     initial_wake: bool,
@@ -19213,6 +19229,11 @@ impl NativeObservations {
             st_drivers::harness_state::read_raw_at(raw, None, st_drivers::message::now_ms())
                 .evidence_incarnation
         });
+        let native_state_seen = snapshot.as_deref().is_some_and(|raw| {
+            let state = st_drivers::harness_state::read_raw_at(raw, None, st_drivers::message::now_ms());
+            !(state.state == st_drivers::harness_state::Activity::Unknown
+                && state.reason.as_deref() == Some("claimed"))
+        });
         let evidence_deadline = snapshot
             .as_deref()
             .and_then(|raw| serde_json::from_slice(raw).ok());
@@ -19221,6 +19242,7 @@ impl NativeObservations {
             runtime: runtime.into(),
             enabled,
             provider_incarnation,
+            native_state_seen,
             evidence_deadline,
             retry_pending: enabled,
             initial_wake: enabled,
@@ -19379,6 +19401,11 @@ impl NativeObservations {
                         == st_drivers::harness_state::Activity::Unknown
                         && observed.reason.as_deref() == Some("claimed");
                     if !placeholder {
+                        // Even an unknown, blocked or ended native state prevents a synthetic
+                        // startup-ready claim. Mark before POST, including a failed publication.
+                        if event.runtime_incarnation == self.runtime && source_driver == driver {
+                            self.native_state_seen = true;
+                        }
                         publish_harness_activity(
                             &publisher,
                             subject,
@@ -22772,6 +22799,111 @@ fn push_mailbox_enabled() -> bool {
     std::env::var("ST3_MAILBOX_TRANSPORT").as_deref() == Ok("push")
 }
 
+/// Startup-only fallback for a channel whose provider never writes native state.
+/// The single driver loop orders this before any subsequently published hook event.
+/// A native state permanently suppresses it, including failed/unknown/terminal state.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ClaudeReadinessFallback {
+    initialized_at_ms: Option<u64>,
+    native_state_seen: bool,
+}
+impl ClaudeReadinessFallback {
+    fn observe_attachment(&mut self, checked: &Result<st3::mailbox::Attachment>, now_ms: u64) {
+        if checked.as_ref().is_ok_and(|attachment| attachment.attached) {
+            self.initialized_at_ms.get_or_insert(now_ms);
+        } else {
+            self.initialized_at_ms = None;
+        }
+    }
+}
+
+async fn publish_claude_readiness_fallback(
+    client: &Client,
+    mailbox: &NativeMailbox,
+    observations: &mut NativeObservations,
+    state: &mut NativeLoopState,
+    now_ms: u64,
+) -> Result<bool> {
+    state.claude_readiness_fallback.native_state_seen |= observations.native_state_seen;
+    if !observations.enabled
+        || state.ready
+        || state.claude_readiness_fallback.native_state_seen
+        || !state
+            .claude_readiness_fallback
+            .initialized_at_ms
+            .is_some_and(|started| now_ms.saturating_sub(started) >= 15_000)
+    {
+        return Ok(false);
+    }
+    let fence = &mailbox.fence;
+    anyhow::ensure!(
+        fence.incarnation == observations.runtime && fence.component == "title",
+        "the Claude readiness fallback belongs to another native mailbox incarnation"
+    );
+    // A bounded drain may leave a backlog. The current runtime snapshot still reveals
+    // native state already queued behind that backlog, without granting readiness.
+    if let Some(raw) =
+        st_drivers::harness_events::read_runtime_state(&observations.dir, &observations.runtime)?
+    {
+        let observed = st_drivers::harness_state::read_raw_at(&raw, None, now_ms);
+        if !(observed.state == st_drivers::harness_state::Activity::Unknown
+            && observed.reason.as_deref() == Some("claimed"))
+        {
+            observations.native_state_seen = true;
+            state.claude_readiness_fallback.native_state_seen = true;
+            return Ok(false);
+        }
+    }
+    let checked =
+        checked_claude_attachment(client, &fence.subject, &fence.incarnation, fence).await;
+    state
+        .claude_readiness_fallback
+        .observe_attachment(&checked, now_ms);
+    if !checked?.attached {
+        return Ok(false);
+    }
+    // Consume queued native state first, independently of the wake/tick select order.
+    // If publication fails, no readiness claim may bypass that native observation.
+    let drained = observations
+        .drain_live(client, &fence.subject, "claude", &mut state.ready)
+        .await;
+    state.claude_readiness_fallback.native_state_seen |= observations.native_state_seen;
+    if drained? {
+        return Ok(true);
+    }
+    if state.ready || state.claude_readiness_fallback.native_state_seen {
+        return Ok(false);
+    }
+    let _: ClaimRecord = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: fence.subject.clone(),
+                kind: "harness.observed".into(),
+                actor: Some(fence.subject.clone()),
+                fields: with_quiescence(BTreeMap::from([
+                    ("state".into(), json!("ready")),
+                    ("driver".into(), json!("claude")),
+                    ("transport".into(), json!("claude-channel")),
+                    ("incarnation_id".into(), json!(fence.incarnation)),
+                    (
+                        "reason".into(),
+                        json!("channelInitializedWithoutNativeState"),
+                    ),
+                ])),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: Some(format!(
+                    "claude-hookless-ready:{}:{}",
+                    fence.subject, fence.incarnation
+                )),
+            },
+        )
+        .await?;
+    state.ready = true;
+    Ok(false)
+}
+
 async fn check_claude_attachment(
     client: &Client,
     subject: &str,
@@ -22782,6 +22914,7 @@ async fn check_claude_attachment(
 ) -> Result<()> {
     let fence = &mailbox.fence;
     let mut checked = checked_claude_attachment(client, subject, incarnation, fence).await;
+    state.claude_readiness_fallback.observe_attachment(&checked, current_unix_ms()? as u64);
     // Readiness is independent of diagnostic publication. A rejected or uncertain
     // POST must not silence a current subscription's readiness report.
     report_claude_attachment(mailbox, &checked, state.claude_attachment_terminal.as_ref())?;
@@ -26474,6 +26607,7 @@ mod tests {
                 claude_attachment_pending: None,
                 claude_attachment_reconciled: false,
                 claude_attachment_terminal: None,
+                claude_readiness_fallback: ClaudeReadinessFallback::default(),
             },
         };
         let back: DriverResume =

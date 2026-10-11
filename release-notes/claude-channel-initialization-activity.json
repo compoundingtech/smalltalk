@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Separate Claude protocol initialization from native activity, preserving hookless startup readiness.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or checkpoint changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Uses existing harness.diagnostic and harness.observed kinds and fields. No registry/schema bytes or digest change. The component diagnostic remains Durable: at most one replicated initialization claim per delivery epoch; no new trim rule. The startup-ready fallback is Retention::Latest."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Mailbox admission, binding/incarnation fences and canonical state ordering remain unchanged. The diagnostic does not grant attachment."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "New channels record initialization without replacing native activity. Native hook events retain idle/working/blocked/ended state. If no native state arrives, the driver reports startup readiness after 15 seconds of admitted initialized attachment. Old channel images can still publish unconditional ready; the channel-initialized namespace preserves old channel-ready inputs. Older drivers lack this fallback and require working hooks until their driver image upgrades. The serde-defaulted fallback latch transfers through graceful driver re-exec."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional downtime beyond normal channel image rollout."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Upgrade both channel and driver images together. New-channel/old-driver seats need working native hooks to become ready; repair unhealthy hooks or upgrade the driver. Hookless new drivers recover startup readiness after the grace, but ongoing native activity still requires working hooks."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Rollback restores legacy readiness. Already committed old ready claims and old-image in-flight POSTs are not repaired or proved cancelled. Graceful driver re-exec preserves whether native state arrived; abrupt process death has no resume-state guarantee. Disconnected or rejected attachment resets the grace; fences remain enforced. Informational initialization is omitted from conversation error rows."
+  }
+}

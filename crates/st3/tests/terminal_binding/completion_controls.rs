@@ -157,9 +157,17 @@ async fn completion_control(order: Option<&str>, exit: u8, rejection: Option<&st
     // Claude channel notification and exits. All files live under this fixture's HOME.
     let provider = root.path().join("fake-claude.py");
     let received = root.path().join("received.json");
+    let native_idle = root.path().join("native-idle");
     std::fs::write(&provider, r#"
 import json, os, subprocess, sys, time
 from pathlib import Path
+# These completion/fence controls exercise a healthy native session. Channel
+# initialization alone is deliberately no longer a native-state publication.
+hook = subprocess.run([os.environ['ST3_BIN'], 'driver-hook', 'claude-observe', 'SessionStart'],
+    input=json.dumps({'session_id': '019a0000-0000-7000-8000-000000000004'}), text=True, capture_output=True)
+Path(os.environ['FIXTURE_NATIVE_IDLE'] + '.hook-result').write_text(json.dumps({
+    'exit': hook.returncode, 'stderr': hook.stderr, 'stdout': hook.stdout}))
+hook.check_returncode()
 channel = subprocess.Popen([os.environ['ST3_BIN'], 'driver', 'claude-mcp', '--subject', os.environ['ST_AGENT']],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
 try:
@@ -170,6 +178,8 @@ try:
         event = json.loads(line)
         if event.get('method') == 'notifications/claude/channel':
             Path(os.environ['FIXTURE_RECEIVED']).write_text(json.dumps(event))
+            while not Path(os.environ['FIXTURE_NATIVE_IDLE']).exists():
+                time.sleep(0.005)
             break
     else:
         raise RuntimeError('channel ended without mail')
@@ -200,6 +210,7 @@ sys.exit(int(os.environ.get('FIXTURE_PROVIDER_EXIT', '0')))
         .env("ST3_DRIVER_STATE_DIR", root.path().join("drivers"))
         .env("ST3_MAILBOX_TRANSPORT", "push")
         .env("FIXTURE_RECEIVED", &received)
+        .env("FIXTURE_NATIVE_IDLE", &native_idle)
         .env("FIXTURE_PROVIDER", provider)
         .env("FIXTURE_PYTHON", python)
         .current_dir(root.path())
@@ -290,6 +301,28 @@ read -r _
         )
         .await
         .unwrap();
+    // Admit the real SessionStart observation before releasing the provider to
+    // finish or forcing a foreign fence. The initialized channel must be live
+    // before the channel fence permits the native idle view. This does not grant readiness from channel presence.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if store.current_harness(SEAT).unwrap().is_some_and(|h| {
+                h.state == "idle" && h.incarnation_id == agent_incarnation
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "the actual SessionStart must publish native idle: {error}; graph={:?}; hook={:?}",
+            store.current_harness(SEAT).unwrap(),
+            std::fs::read_to_string(native_idle.with_extension("hook-result")),
+        )
+    });
+    std::fs::write(&native_idle, b"go").unwrap();
     let mut rejection_fence = if let Some(rejection) = rejection.filter(|_| order.is_none()) {
         wait_file(&received).await;
         // Reject an established stream, rather than racing its initial HTTP admission.
