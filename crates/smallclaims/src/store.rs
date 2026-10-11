@@ -6429,20 +6429,38 @@ impl Store {
     pub fn replay_replication_graph(&self) -> Result<()> {
         crate::profile::note("projection: full replay for a heal");
         let _replay = crate::profile::span("projection/heal-replay");
+        let started = std::time::Instant::now();
+        let started_unix_ms = now_ms();
         let mut connection = self.connection.write();
+        let acquired = std::time::Instant::now();
+        let writer_wait_ms = started.elapsed().as_millis();
         let _timing = time_stage(&self.replication_timers.projection);
-        let transaction = connection.transaction()?;
-        self.runtime.replay_from_nothing(&transaction)?;
-        self.runtime.after_projection(&transaction)?;
-        transaction.execute(
-            "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
+        let result = (|| {
+            let transaction = connection.transaction()?;
+            self.runtime.replay_from_nothing(&transaction)?;
+            self.runtime.after_projection(&transaction)?;
+            transaction.execute(
+                "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
              VALUES ('graph', 'healthy', ?1, ?2)
              ON CONFLICT(aggregate) DO UPDATE SET status='healthy', last_good_store_index=excluded.last_good_store_index,
                 error_code=NULL, error_message=NULL, updated_at_unix_ms=excluded.updated_at_unix_ms",
-            params![current_index_tx(&transaction)?, now_ms().to_string()],
-        )?;
-        transaction.commit()?;
+                params![current_index_tx(&transaction)?, now_ms().to_string()],
+            )?;
+            transaction.commit()?;
+            Ok::<_, anyhow::Error>(())
+        })();
         drop(connection);
+        let writer_hold_ms = acquired.elapsed().as_millis();
+        eprintln!(
+            "st: projection heal-replay started_at_unix_ms={started_unix_ms} ended_at_unix_ms={} writer_wait_ms={writer_wait_ms} writer_hold_ms={writer_hold_ms} outcome={}",
+            now_ms(),
+            if result.is_ok() {
+                "committed"
+            } else {
+                "failed"
+            }
+        );
+        result?;
         self.runtime.forget_views();
         Ok(())
     }

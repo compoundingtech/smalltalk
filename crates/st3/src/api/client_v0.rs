@@ -11018,12 +11018,10 @@ fn action_request_digest(request: &ActionRequest) -> Result<String, ApiError> {
     )))
 }
 
-pub(super) async fn action(
-    State(state): State<AppState>,
-    Extension(snapshot): Extension<ClientSnapshot>,
-    Extension(session): Extension<ClientSession>,
-    Json(request): Json<ActionRequest>,
-) -> Result<Json<Value>, ApiError> {
+fn validate_action_admission(
+    session: &ClientSession,
+    request: &ActionRequest,
+) -> Result<(), ApiError> {
     if request.api_version != CLIENT_API_VERSION
         || !request.id.starts_with("action/")
         || !(16..=256).contains(&request.idempotency_key.len())
@@ -11045,20 +11043,144 @@ pub(super) async fn action(
     }
     let scope = action_scope(&request.action_type)
         .ok_or_else(|| validation("the action type is unknown"))?;
-    require_scope(&session, scope)?;
+    require_scope(session, scope)?;
     // Snapshot provenance is checked, while freshness belongs to the action's own
     // revision, generation, incarnation, or screen checks.
     let read_only_terminal_lifecycle = matches!(
         request.action_type.as_str(),
         "terminal.attach" | "terminal.detach"
     );
-    if !read_only_terminal_lifecycle && !acting_party(&session) {
+    if !read_only_terminal_lifecycle && !acting_party(session) {
         return Err(forbidden(
             "client mutations require a concrete person or a local agent",
         ));
     }
+    Ok(())
+}
+
+pub(super) async fn action(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    Json(request): Json<ActionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    static PENDING_SENDS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    action_with_send_wait(
+        state,
+        snapshot,
+        session,
+        request,
+        std::time::Duration::from_secs(3),
+        PENDING_SENDS
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(16)))
+            .clone(),
+    )
+    .await
+}
+
+// A confirmation deadline does not cancel a queued write or its durable receipt. Keep
+// the existing same-key gate until both finish; an identical retry finds that receipt.
+async fn action_with_send_wait(
+    state: AppState,
+    snapshot: ClientSnapshot,
+    session: ClientSession,
+    request: ActionRequest,
+    wait: std::time::Duration,
+    pending: Arc<tokio::sync::Semaphore>,
+) -> Result<Json<Value>, ApiError> {
+    if request.action_type != "message.send" {
+        return action_inner(
+            State(state),
+            Extension(snapshot),
+            Extension(session),
+            Json(request),
+            None,
+        )
+        .await;
+    }
+    validate_action_admission(&session, &request)?;
+    let deadline = tokio::time::Instant::now() + wait;
+    let action_id = request.id.clone();
+    let key = request.idempotency_key.clone();
+    // Reserve the same gate the dispatch holds through receipt persistence BEFORE
+    // taking capacity. A retry cannot create another worker or race the first send.
+    let gate = action_gate(&state, &session, &key);
+    // Healthy concurrent retries still receive the durable receipt. Waiting for
+    // this key allocates neither a worker nor a pending-send permit, and shares
+    // the same absolute confirmation deadline with the later worker wait.
+    let reserved_gate = tokio::time::timeout_at(deadline, gate.lock_owned())
+        .await
+        .map_err(|_| send_unconfirmed(&action_id, &key))?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(send_unconfirmed(&action_id, &key));
+    }
+    let permit = pending.try_acquire_owned().map_err(|_| ApiError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        code: "rate-limited".into(),
+        message: "message sends are still waiting for the database; this request was not submitted"
+            .into(),
+        details: Box::new(serde_json::Map::from_iter([
+            ("applied".into(), json!("none")),
+            ("retry_after_ms".into(), json!(1000)),
+        ])),
+    })?;
+    let runtime = tokio::runtime::Handle::current();
+    let profile = crate::profile::current();
+    let cpu = crate::performance::current();
+    let trace = crate::relay_trace::current();
+    // Always use a separate blocking worker: the action includes synchronous writer
+    // waits, which cannot be preempted by a timeout around the action future itself.
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _entered = crate::profile::enter(profile.as_ref());
+        crate::performance::with_charged(cpu, || {
+            crate::relay_trace::blocking(trace, || {
+                runtime.block_on(action_inner(
+                    State(state),
+                    Extension(snapshot),
+                    Extension(session),
+                    Json(request),
+                    Some(reserved_gate),
+                ))
+            })
+        })
+    });
+    match tokio::time::timeout_at(deadline, task).await {
+        Ok(result) => result.map_err(ApiError::internal)?,
+        Err(_) => Err(send_unconfirmed(&action_id, &key)),
+    }
+}
+
+fn send_unconfirmed(action_id: &str, key: &str) -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "message-send-unconfirmed".into(),
+        message: "the database has not confirmed this send yet; it may still complete. Retry the identical request with the same idempotency key".into(),
+        details: Box::new(serde_json::Map::from_iter([
+            ("applied".into(), json!("unknown")),
+            ("action_id".into(), json!(action_id)),
+            ("idempotency_key".into(), json!(key)),
+        ])),
+    }
+}
+
+async fn action_inner(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    Json(request): Json<ActionRequest>,
+    reserved_gate: Option<tokio::sync::OwnedMutexGuard<()>>,
+) -> Result<Json<Value>, ApiError> {
+    // The message-send wrapper validates before reserving its gate and capacity.
+    // Other actions retain their original admission order here.
+    if reserved_gate.is_none() {
+        validate_action_admission(&session, &request)?;
+    }
     let gate = action_gate(&state, &session, &request.idempotency_key);
-    let _guard = gate.lock().await;
+    let _guard = match reserved_gate {
+        Some(guard) => guard,
+        None => gate.lock_owned().await,
+    };
     let request_digest = action_request_digest(&request)?;
     let receipt_digest = hex::encode(Sha256::digest(
         format!("{}:{}", session.actor, request.idempotency_key).as_bytes(),
@@ -15791,6 +15913,225 @@ subscription "watch/source" {
         other.idempotency_key = "steady-send-foreign-snapshot".into();
         other.fence.snapshot_id = snapshot.id.replace("snapshot/", "snapshot/foreign-");
         assert_eq!(submit(other).await.unwrap_err().code, "stale-fence");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn message_send_confirmation_expires_without_losing_identity_or_pending_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/held-writer-send".into(),
+            action_type: "message.send".into(),
+            idempotency_key: "held-writer-send-exact-key".into(),
+            fence: Fence {
+                snapshot_id: snapshot.id.clone(),
+                ..Default::default()
+            },
+            parameters: json!({"to":"agent/blair","content":"Retain this exact send."}),
+        };
+        let pending = Arc::new(tokio::sync::Semaphore::new(1));
+        let writer = state.store.connection.write();
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            action_with_send_wait(
+                state.clone(),
+                snapshot.clone(),
+                session.clone(),
+                request.clone(),
+                std::time::Duration::from_millis(25),
+                pending.clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(refused.code, "message-send-unconfirmed");
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.details["applied"], "unknown");
+        assert_eq!(refused.details["action_id"], request.id);
+        assert_eq!(refused.details["idempotency_key"], request.idempotency_key);
+        assert_eq!(
+            pending.available_permits(),
+            0,
+            "the retained worker still owns capacity"
+        );
+        let mut other = request.clone();
+        other.idempotency_key = "held-writer-refused-other-key".into();
+        let busy = action_with_send_wait(
+            state.clone(),
+            snapshot.clone(),
+            session.clone(),
+            other,
+            std::time::Duration::from_secs(1),
+            pending.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(busy.code, "rate-limited");
+        assert_eq!(busy.details["applied"], "none");
+        drop(writer);
+        // Wait on actual completion, not a guessed sleep; capacity returns only after
+        // the original dispatch, receipt and same-key gate have all finished.
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pending.clone().acquire_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(finished);
+        let first = action_with_send_wait(
+            state.clone(),
+            snapshot.clone(),
+            session.clone(),
+            request.clone(),
+            std::time::Duration::from_secs(10),
+            pending.clone(),
+        )
+        .await
+        .unwrap()
+        .0;
+        let replay = action_with_send_wait(
+            state.clone(),
+            snapshot.clone(),
+            session.clone(),
+            request.clone(),
+            std::time::Duration::from_secs(10),
+            pending.clone(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(replay["affected_ids"], first["affected_ids"]);
+        for kind in ["message.sent", "custom.client.action-result"] {
+            assert_eq!(
+                state
+                    .store
+                    .claims_for_kind_at(kind, None, true, 100)
+                    .unwrap()
+                    .claims
+                    .len(),
+                1
+            );
+        }
+        let mut changed = request;
+        changed.parameters["content"] = json!("A different send must conflict");
+        assert_eq!(
+            action_with_send_wait(
+                state.clone(),
+                snapshot,
+                session,
+                changed,
+                std::time::Duration::from_secs(10),
+                pending
+            )
+            .await
+            .unwrap_err()
+            .code,
+            "idempotency-conflict"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_key_unconfirmed_retries_keep_capacity_for_other_senders() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(),
+            id: "action/one-held-key".into(),
+            action_type: "message.send".into(),
+            idempotency_key: "one-held-key-many-retries".into(),
+            fence: Fence {
+                snapshot_id: snapshot.id.clone(),
+                ..Default::default()
+            },
+            parameters: json!({"to":"agent/blair","content":"Only one retained worker."}),
+        };
+        let pending = Arc::new(tokio::sync::Semaphore::new(16));
+        let writer = state.store.connection.write();
+        let first = action_with_send_wait(
+            state.clone(),
+            snapshot.clone(),
+            session.clone(),
+            request.clone(),
+            std::time::Duration::from_millis(25),
+            pending.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(first.code, "message-send-unconfirmed");
+        for _ in 0..32 {
+            let retry = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                action_with_send_wait(
+                    state.clone(),
+                    snapshot.clone(),
+                    session.clone(),
+                    request.clone(),
+                    std::time::Duration::from_millis(25),
+                    pending.clone(),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(retry.code, "message-send-unconfirmed");
+            assert_eq!(retry.details["applied"], "unknown");
+            assert_eq!(retry.details["action_id"], request.id);
+            assert_eq!(retry.details["idempotency_key"], request.idempotency_key);
+            assert_eq!(pending.available_permits(), 15);
+        }
+        drop(writer);
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pending.clone().acquire_many_owned(16),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(finished);
+        let receipt = action_with_send_wait(
+            state.clone(),
+            snapshot,
+            session,
+            request,
+            std::time::Duration::from_secs(10),
+            pending,
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(!receipt["affected_ids"].as_array().unwrap().is_empty());
+        for kind in ["message.sent", "custom.client.action-result"] {
+            assert_eq!(
+                state
+                    .store
+                    .claims_for_kind_at(kind, None, true, 100)
+                    .unwrap()
+                    .claims
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn message_send_unconfirmed_envelope_preserves_unknown_outcome_without_generic_retry() {
+        let envelope = client_error_envelope(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"code":"message-send-unconfirmed", "message":"Retry the identical send",
+                "details":{"applied":"unknown","action_id":"action/example","idempotency_key":"example-exact-key"}}),
+            "request/example",
+        );
+        assert_eq!(envelope["code"], "message-send-unconfirmed");
+        assert_eq!(envelope["retryable"], false);
+        assert_eq!(envelope["details"]["applied"], "unknown");
+        assert_eq!(envelope["details"]["idempotency_key"], "example-exact-key");
     }
 
     #[tokio::test]

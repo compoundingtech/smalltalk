@@ -941,6 +941,19 @@ The v0 action discriminators are:
 | Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation; resize and a line of input (`mode` `line`) also require the screen sequence; raw and key input do not |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
 
+After authentication and snapshot admission, `message.send` waits at most three seconds
+for confirmation of dispatch and its action receipt. HTTP 503 `message-send-unconfirmed`
+has `retryable: false` and details `{applied: "unknown", action_id, idempotency_key}`.
+The admitted send can still finish; this response does not assert rollback or rejection.
+Keep the original action ID, key and payload, and resend that identical request to recover
+the durable outcome. Never create a new key for this response. At most sixteen send workers
+remain pending in a daemon. Concurrent retries wait for the held key within the same
+confirmation deadline and consume no additional worker capacity while waiting. Healthy
+retries return the original durable receipt; an expired wait returns the same unconfirmed
+outcome. A full limit returns the existing `rate-limited` code with
+`applied: "none"` before submitting that request. This bounds confirmation waiting and
+pending send workers, not authentication, snapshot admission or the underlying writer hold.
+
 `runtime.stop` publishes a stop for the selected member. `runtime.restart` terminates the current
 incarnation of a member with an `always` restart policy; its desired state then starts the next
 incarnation. `runtime.reset` publishes a restart-window reset for a run-owned member. A client

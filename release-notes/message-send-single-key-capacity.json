@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Reserve one pending send worker per idempotency key",
+  "replay": {
+    "status": "changed",
+    "detail": "Successful heal replay backoff begins after actual replay completion instead of before writer waiting. The reservation, graph/health publication and original backoff interval remain. A refused rebuild can still wait on snapshot digest work; one admitted rebuild is unbounded."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Unchanged by the same-key worker admission correction."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Unchanged by the same-key worker admission correction."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "An already-held message.send key waits asynchronously within the shared confirmation deadline before allocating another pending worker. Healthy identical retries receive the original durable receipt; an expired wait returns the existing unconfirmed outcome. Completed receipt and changed-payload conflict handling remain. No new response shape or generated contract."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Unchanged by the same-key worker admission correction."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Unchanged by the same-key worker admission correction."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Unchanged by the same-key worker admission correction."
+  }
+}
