@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Test private output input widths, cumulative strings, nesting and traversal limits",
+  "replay": {
+    "status": "none",
+    "detail": "Only the cfg(test) private prototype input gate and authored controls change; no shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Only the cfg(test) private prototype input gate and authored controls change; no shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Only the cfg(test) private prototype input gate and authored controls change; no shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only the cfg(test) private prototype input gate and authored controls change; no shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only the cfg(test) private prototype input gate and authored controls change; no shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Only the cfg(test) private prototype input gate and authored controls change; no shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Only the cfg(test) private prototype input gate and authored controls change; no shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  }
+}
