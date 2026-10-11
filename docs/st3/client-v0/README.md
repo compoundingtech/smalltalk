@@ -56,6 +56,9 @@ Operational repairs exclude the repaired original from current-note selection,
 even when its immutable claim row remains retained. Incremental reads and full
 replay both select the latest unrepaired revision.
 The text is advisory only: no approval, gate, ask or assignment reads it as evidence.
+The daemon cost suite measures both the populated read and a real person-authenticated
+PUT replacement over Unix transport at two generated store sizes. Its fixture passes
+anchored membership and active-peer advertisements rather than measuring a refused write.
 
 The trusted local CLI writes with `PUT /v1/notes`, using a concrete person identity
 and a body containing that same `person` and `actor`, nullable `text`, and optional

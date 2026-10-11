@@ -421,6 +421,19 @@ const fn post(
     }
 }
 
+const fn put(
+    route: &'static str,
+    path: &'static str,
+    body: fn(&Fixture, usize) -> Value,
+) -> Probe {
+    Probe {
+        route,
+        path,
+        body: Some(body),
+        direct: None,
+    }
+}
+
 const fn direct(route: &'static str, call: Direct) -> Probe {
     Probe {
         route,
@@ -431,6 +444,11 @@ const fn direct(route: &'static str, call: Direct) -> Probe {
 }
 
 const PROBES: &[Probe] = &[
+    put("PUT /v1/notes", "/v1/notes", |_, attempt| json!({
+        "person":"person/bench-operator", "actor":"person/bench-operator",
+        "text":format!("Invented current person context {attempt}"),
+    })),
+    get("GET /v1/client/notes", "/v1/client/notes"),
     get(
         "GET /v1/client/adapter/deliveries",
         "/v1/client/adapter/deliveries?after={adapter_frontier}&wait_ms=0",
@@ -1746,11 +1764,28 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     let store = Arc::new(Store::open(&database, NODE).unwrap());
     store.bind_fleet(FLEET).ok();
     let peer = Arc::new(Store::open(&peer_database, PEER).unwrap());
+    // Notes publish only after the real fleet admission/advertisement barrier.
+    let anchor = Arc::new(st3::fleet::MemberKey::generate().unwrap().0);
+    let peer_key = Arc::new(st3::fleet::MemberKey::generate().unwrap().0);
+    store.pin_fleet_anchor(anchor.public()).unwrap();
+    store.set_member_key(Some(anchor.clone())).unwrap();
+    store.admit_fleet_anchor(FLEET, anchor.public(), "listening").unwrap();
+    store.append_claim(&ClaimInput {
+        subject:format!("host/{PEER}"), kind:"fleet.member-admitted".into(), actor:None,
+        fields:serde_json::from_value(json!({
+            "fleet_id":FLEET, "member_key":peer_key.public(), "via":"invite",
+            "sponsor":format!("host/{NODE}"), "mode":"listening",
+        })).unwrap(),
+        evidence:Vec::new(), expected_subject:None, idempotency_key:None,
+    }).unwrap();
+    peer.pin_fleet_anchor(anchor.public()).unwrap();
+    peer.set_member_key(Some(peer_key)).unwrap();
+    sync(&store, NODE, &peer);
     for (daemon, name) in [(&store, NODE), (&peer, PEER)] {
         let mut started = claim_input("daemon.started", "cost-owned-set-support", 0, "");
         started.subject = format!("daemon/{name}");
         started.fields = serde_json::from_value(json!({
-            "status":"running", "features":{"owned_sets":1},
+            "status":"running", "features":{"owned_sets":1,"person_directive_note":1},
         }))
         .unwrap();
         daemon.append_claim(&started).unwrap();
@@ -1791,6 +1826,13 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     let client = Client::unix(&socket);
     // Client reads come from a person, as stui and the app make them.
     let person = Client::unix_as(&socket, "person/bench-operator").unwrap();
+    let seeded: Value = person.request("PUT", "/v1/notes", Some(&json!({
+        "person":"person/bench-operator", "actor":"person/bench-operator",
+        "text":"Invented current person context",
+    }))).await.expect("the note write probe must pass the real feature barrier");
+    assert_eq!(seeded["note"]["person"], "person/bench-operator");
+    let notes: Value = person.get("/v1/client/notes").await.unwrap();
+    assert_eq!(notes["notes"], json!([seeded["note"]]));
     let arrangement_person = Client::unix_as(&socket, ARRANGEMENT_OWNER).unwrap();
     let subjects = {
         let store = store.clone();
@@ -1949,7 +1991,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                     arrangement_person.clone()
                 } else if path.starts_with("/v1/client/adapter/") {
                     adapter.clone()
-                } else if path.starts_with("/v1/client/") {
+                } else if path.starts_with("/v1/client/") || path == "/v1/notes" {
                     person.clone()
                 } else {
                     client.clone()
@@ -1957,7 +1999,10 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
                 counted(|| async move {
                     let answer = match &body {
                         None => client.get::<Value>(&path).await,
-                        Some(body) => client.post::<_, Value>(&path, body).await,
+                        Some(body) => {
+                            let method = probe.route.split_once(' ').unwrap().0;
+                            client.request::<_, Value>(method, &path, Some(body)).await
+                        }
                     };
                     answer.map_err(|error| error.to_string().chars().take(200).collect())
                 })
