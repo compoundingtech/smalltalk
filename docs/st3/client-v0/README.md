@@ -905,10 +905,10 @@ uses this continuation and registers its wake before reading the frontier. The l
 `GET /v1/events` keeps its array shape, returns at most 200 rows, and reports continuation in
 `X-ST-Next-After`, `X-ST-Has-More`, and `X-ST-Frontier`; owner filters and subject filters
 during migration require the page endpoint. CLI condition, restart, and harness waits use pages.
-A new CLI probes that route once. On a bare missing-route 404, it negotiates only a legacy daemon
-that explicitly advertises `features.bounded_legacy_events=1`; otherwise it stops with daemon
-upgrade guidance before requesting legacy history. Typed refusals, errors and HTTP 410 never
-activate negotiation.
+The CLI requires the page endpoint and never falls back to legacy event history. On a bare
+missing-route 404, a daemon without `features.bounded_legacy_events=1` receives daemon upgrade
+guidance. A daemon advertising that capability but missing the page route receives the normal
+unexpected-response error. Typed refusals, errors and HTTP 410 retain their existing handling.
 A cursor before the recorded checkpoint deletion floor receives HTTP 410 `cursor-gap` with
 `full_resync=true`, `resume_floor`, and `frontier`. Refresh projections and establish a new
 cursor explicitly; do not silently reset or keep retrying the old cursor. Client-v0 event feeds

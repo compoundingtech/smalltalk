@@ -10513,35 +10513,26 @@ fn event_cursor_error(error: anyhow::Error, query: &str, trace: bool) -> anyhow:
 
 #[derive(Default)]
 struct LocalEventFeed {
-    legacy: bool,
     trace: bool,
 }
 
 impl LocalEventFeed {
     async fn read(&mut self, client: &Client, query: &str) -> Result<LocalEventPage> {
-        if !self.legacy {
-            match client.get(&format!("/v1/events/page?{query}")).await {
-                Ok(page) => return Ok(page),
-                Err(error) if st3::client::is_missing_route(&error) => {
-                    let health: Value = client.get("/v1/health").await?;
-                    anyhow::ensure!(
-                        health
-                            .pointer("/features/bounded_legacy_events")
-                            .and_then(Value::as_u64)
-                            == Some(1),
-                        "this daemon does not support bounded event continuation; upgrade the daemon and retry"
-                    );
-                    self.legacy = true;
-                }
-                Err(error) => return Err(event_cursor_error(error, query, self.trace)),
+        match client.get(&format!("/v1/events/page?{query}")).await {
+            Ok(page) => Ok(page),
+            Err(error) if st3::client::is_missing_route(&error) => {
+                let health: Value = client.get("/v1/health").await?;
+                anyhow::ensure!(
+                    health
+                        .pointer("/features/bounded_legacy_events")
+                        .and_then(Value::as_u64)
+                        == Some(1),
+                    "this daemon does not support bounded event continuation; upgrade the daemon and retry"
+                );
+                Err(error)
             }
+            Err(error) => Err(event_cursor_error(error, query, self.trace)),
         }
-        let items: Vec<EventRecord> = client
-            .get(&format!("/v1/events?{query}"))
-            .await
-            .map_err(|error| event_cursor_error(error, query, self.trace))?;
-        let next_after = items.last().map(|event| event.store_index);
-        Ok(LocalEventPage { items, next_after })
     }
 }
 
