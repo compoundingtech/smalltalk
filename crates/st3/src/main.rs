@@ -24541,6 +24541,7 @@ fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
                 std::thread::sleep(retry_interval);
                 retry_interval = WAL_CHECKPOINT_INTERVAL;
                 let started = Instant::now();
+                let trace_started = std::time::SystemTime::now();
                 // A weak reference does not keep the Store alive between attempts at shutdown.
                 let Some(store) = store.upgrade() else { break };
                 // The connection is taken into the attempt and dropped on unwind; no
@@ -24572,6 +24573,7 @@ fn recycle_idle_wal(path: PathBuf, store: std::sync::Weak<Store>) {
                 let report = result.as_ref().ok();
                 let stuck = pin.observe(report);
                 let abnormal = abnormal_wal_checkpoint(report) || stuck >= WAL_PIN_REPORT_AFTER;
+                st3::otel::record_wal_checkpoint(trace_started, report, abnormal);
                 let bucket = if abnormal { &mut abnormal_outcomes } else { &mut ordinary_outcomes };
                 if let Some(retained) = bucket.record(now, report, duration_ms) {
                     let outcome = match report {
