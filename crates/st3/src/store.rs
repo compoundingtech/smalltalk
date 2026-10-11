@@ -1529,6 +1529,10 @@ fn subject_status_at_with_mode(
         }, None)));
     }
     let desired = desired_row_at(connection, subject, at_index)?;
+    #[cfg(test)]
+    if let Some(after_read) = STATUS_AFTER_DESIRED_READ.with(|slot| slot.borrow_mut().take()) {
+        after_read();
+    }
     let member = desired
         .as_ref()
         .and_then(|row| row.member.as_deref())
@@ -12177,6 +12181,27 @@ impl Store {
     }
 
     fn status_at_view_for_names(
+        &self,
+        selected: Option<&str>,
+        selected_owner_run: Option<&str>,
+        at_index: Option<u64>,
+        include_history: bool,
+        selected_names: Option<BTreeSet<String>>,
+    ) -> Result<StatusResponse> {
+        // A request reader loan alone can see a commit between statements. Keep the
+        // selected declaration, runtime observation and conflict leaves in one snapshot.
+        self.read_snapshot(|_| {
+            self.status_at_view_for_names_in_snapshot(
+                selected,
+                selected_owner_run,
+                at_index,
+                include_history,
+                selected_names,
+            )
+        })
+    }
+
+    fn status_at_view_for_names_in_snapshot(
         &self,
         selected: Option<&str>,
         selected_owner_run: Option<&str>,
@@ -27160,6 +27185,7 @@ mod fleet_admission_tests {
 #[cfg(test)]
 thread_local! {
     pub(crate) static SUBJECT_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STATUS_AFTER_DESIRED_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     /// Steps whose queue, timing and wake a read enriched, so a test can see a read's work.
     pub(crate) static STEPS_ENRICHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -33931,6 +33957,11 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    mod stopped_seat_declaration_controls {
+        use super::*;
+        include!("store/stopped_seat_declaration_controls.rs");
+    }
 
     #[test]
     fn an_agent_card_build_does_not_hold_other_read_snapshots_at_the_cache_lock() {
