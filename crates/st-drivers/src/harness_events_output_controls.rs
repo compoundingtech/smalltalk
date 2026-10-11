@@ -17,6 +17,105 @@ use crate::harness_timeline::{Operation, Record};
 const SNAPSHOT_KIND: &str = "harness-output";
 const MAX_BATCH: usize = 128;
 const MAX_BATCH_BYTES: usize = 256 * 1024;
+const MAX_IDENTITY_BYTES: usize = 4096;
+const MAX_INPUT_STRING_BYTES: usize = 3 * MAX_BATCH_BYTES;
+const MAX_INPUT_NODES: usize = 4096;
+const MAX_INPUT_DEPTH: usize = 32;
+
+// Private proposed input bounds, checked before membership equality or serde.
+// References in record/new/progress are each charged, even when duplicated.
+// This neither prevents their earlier allocation nor qualifies numeric/serde
+// scan cost, adapters, persisted input decoding or physical provenance.
+struct InputBudget {
+    bytes: usize,
+    nodes: usize,
+}
+
+impl InputBudget {
+    fn text(&mut self, text: &str, field_limit: usize) -> Result<()> {
+        anyhow::ensure!(
+            text.len() <= field_limit,
+            "native output input field is too wide"
+        );
+        anyhow::ensure!(
+            text.len() <= self.bytes,
+            "native output input strings exceed budget"
+        );
+        self.bytes -= text.len();
+        Ok(())
+    }
+
+    fn value(&mut self, value: &Value, depth: usize) -> Result<()> {
+        anyhow::ensure!(depth <= MAX_INPUT_DEPTH, "native output input is too deep");
+        anyhow::ensure!(self.nodes > 0, "native output input nodes exceed budget");
+        self.nodes -= 1;
+        match value {
+            Value::String(text) => self.text(text, MAX_BATCH_BYTES)?,
+            Value::Array(values) => {
+                for value in values {
+                    self.value(value, depth + 1)?;
+                }
+            }
+            Value::Object(values) => {
+                for (key, value) in values {
+                    self.text(key, MAX_BATCH_BYTES)?;
+                    self.value(value, depth + 1)?;
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+        Ok(())
+    }
+}
+
+fn check_input_bounds(
+    record: &Record,
+    new_operations: &[Operation],
+    batch: &OutputBatch<'_>,
+) -> Result<()> {
+    anyhow::ensure!(
+        record.operations.len() <= MAX_BATCH
+            && new_operations.len() <= MAX_BATCH
+            && batch.progress.len() <= MAX_BATCH,
+        "native output input has too many operations"
+    );
+    let mut budget = InputBudget {
+        bytes: MAX_INPUT_STRING_BYTES,
+        nodes: MAX_INPUT_NODES,
+    };
+    for text in [
+        record.schema.as_str(),
+        record.driver.as_str(),
+        record.incarnation_id.as_str(),
+        batch.runtime_incarnation,
+        batch.provider_incarnation,
+        batch.driver,
+        batch.component,
+        batch.capability,
+    ] {
+        budget.text(text, MAX_IDENTITY_BYTES)?;
+    }
+    for operation in record
+        .operations
+        .iter()
+        .chain(new_operations)
+        .chain(batch.progress.iter().map(|progress| progress.operation))
+    {
+        for text in [
+            operation.operation.as_str(),
+            operation.entry_id.as_str(),
+            operation.role.as_str(),
+            operation.entry_type.as_str(),
+            operation.driver.as_str(),
+            operation.incarnation_id.as_str(),
+            operation.source_id.as_deref().unwrap_or(""),
+        ] {
+            budget.text(text, MAX_IDENTITY_BYTES)?;
+        }
+        budget.value(&operation.body, 0)?;
+    }
+    Ok(())
+}
 
 // Count serializer output without retaining an encoded copy of each operation.
 // This bounds accepted serialized bytes, not the already allocated input Value,
@@ -92,6 +191,7 @@ pub(crate) fn write_timeline_with_output(
     new_operations: &[Operation],
     batch: &OutputBatch<'_>,
 ) -> Result<()> {
+    check_input_bounds(record, new_operations, batch)?;
     anyhow::ensure!(
         crate::contracts::schema_matches(&record.schema, "st.harness-timeline.v1")
             && !batch.runtime_incarnation.is_empty()
@@ -504,6 +604,193 @@ mod tests {
         operation.body = serde_json::json!({"text":"x".repeat(size - overhead)});
         assert_eq!(serde_json::to_vec(&operation).unwrap().len(), size);
         operation
+    }
+
+    fn assert_input_refused(
+        root: &Path,
+        record: &Record,
+        operations: &[Operation],
+        batch: &OutputBatch<'_>,
+        expected: &str,
+    ) {
+        let before = spool_image(root);
+        let error = write_timeline_with_output(root, record, operations, batch).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:#}");
+        assert_eq!(spool_image(root), before);
+    }
+
+    fn nested_input(depth: usize) -> Value {
+        (0..depth).fold(Value::Null, |value, _| Value::Array(vec![value]))
+    }
+
+    #[test]
+    fn private_output_refuses_wide_identity_and_body_before_owner_lookup() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, original, template, seq) = prepare(root.path(), "omp");
+        let wide = "x".repeat(MAX_IDENTITY_BYTES + 1);
+        let mut input = batch(&original, seq, &[]);
+        input.runtime_incarnation = &wide;
+        assert_input_refused(
+            root.path(),
+            &original,
+            std::slice::from_ref(&template),
+            &input,
+            "native output input field is too wide",
+        );
+        let mut operation = template.clone();
+        operation.entry_id = wide;
+        let mut record = original.clone();
+        record.operations = vec![operation.clone()];
+        assert_input_refused(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &[]),
+            "native output input field is too wide",
+        );
+        operation = template.clone();
+        operation.body = serde_json::json!({"text": "x".repeat(MAX_BATCH_BYTES + 1)});
+        record.operations = vec![operation.clone()];
+        assert_input_refused(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &[]),
+            "native output input field is too wide",
+        );
+        write_timeline_with_output(
+            root.path(),
+            &original,
+            std::slice::from_ref(&template),
+            &batch(&original, seq, &[]),
+        )
+        .unwrap();
+        assert_eq!(retained_timeline_sizes(root.path()).len(), 1);
+    }
+
+    #[test]
+    fn private_output_refuses_deep_values_but_accepts_exact_depth_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut record, mut operation, seq) = prepare(root.path(), "omp");
+        operation.body = nested_input(MAX_INPUT_DEPTH + 1);
+        record.operations = vec![operation.clone()];
+        assert_input_refused(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &[]),
+            "native output input is too deep",
+        );
+        operation.body = nested_input(MAX_INPUT_DEPTH);
+        record.operations = vec![operation.clone()];
+        write_timeline_with_output(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::read_timeline(root.path())
+                .unwrap()
+                .unwrap()
+                .operations,
+            vec![operation]
+        );
+    }
+
+    #[test]
+    fn private_output_refuses_node_budget_exhaustion_without_spool_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut record, mut operation, seq) = prepare(root.path(), "omp");
+        operation.body = Value::Array(vec![Value::Null; MAX_INPUT_NODES]);
+        record.operations = vec![operation.clone()];
+        assert_input_refused(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &[]),
+            "native output input nodes exceed budget",
+        );
+        operation.body = Value::Array(vec![Value::Null; 1024]);
+        record.operations = vec![operation.clone()];
+        write_timeline_with_output(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::read_timeline(root.path())
+                .unwrap()
+                .unwrap()
+                .operations,
+            vec![operation]
+        );
+    }
+
+    #[test]
+    fn private_output_bounds_retained_and_foreign_progress_inputs_cumulatively() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut record, template, seq) = prepare(root.path(), "omp");
+        let mut submitted = retention_operation(&template, 5);
+        record.next_sequence = 6;
+        record.operations = (1..=4)
+            .map(|sequence| {
+                let mut operation = retention_operation(&template, sequence);
+                operation.body = serde_json::json!({"text":"x".repeat(200 * 1024)});
+                operation
+            })
+            .collect();
+        record.operations.push(submitted.clone());
+        assert!(serialized_batch_size(std::slice::from_ref(&submitted)).unwrap() < MAX_BATCH_BYTES);
+        assert_input_refused(
+            root.path(),
+            &record,
+            std::slice::from_ref(&submitted),
+            &batch(&record, seq, &[]),
+            "native output input strings exceed budget",
+        );
+        record.operations = vec![submitted.clone()];
+        let mut foreign = template.clone();
+        foreign.body = serde_json::json!({"text":"x".repeat(MAX_BATCH_BYTES + 1)});
+        let progress = [OutputProgress {
+            operation: &foreign,
+            original_at_ms: 10,
+            body_changed: true,
+            tool_identity_complete: true,
+        }];
+        assert_input_refused(
+            root.path(),
+            &record,
+            std::slice::from_ref(&submitted),
+            &batch(&record, seq, &progress),
+            "native output input field is too wide",
+        );
+        // A small valid same-owner callback stays admissible after both refusals.
+        submitted.body = serde_json::json!({"text":"small admitted output"});
+        record.operations = vec![submitted.clone()];
+        let progress = [OutputProgress {
+            operation: &submitted,
+            original_at_ms: 10,
+            body_changed: true,
+            tool_identity_complete: true,
+        }];
+        write_timeline_with_output(
+            root.path(),
+            &record,
+            std::slice::from_ref(&submitted),
+            &batch(&record, seq, &progress),
+        )
+        .unwrap();
+        let image: Envelope = serde_json::from_slice(
+            &super::super::read_snapshot(root.path(), SNAPSHOT_KIND)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(image.output.last_output.unwrap().at_unix_ms, 10);
     }
 
     #[test]
