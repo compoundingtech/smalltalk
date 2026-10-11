@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Test private output object-key and exact cumulative input budget boundaries",
+  "replay": {
+    "status": "none",
+    "detail": "Only authored controls in the existing cfg(test) output module change; no input gate, shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Only authored controls in the existing cfg(test) output module change; no input gate, shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Only authored controls in the existing cfg(test) output module change; no input gate, shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Only authored controls in the existing cfg(test) output module change; no input gate, shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Only authored controls in the existing cfg(test) output module change; no input gate, shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Only authored controls in the existing cfg(test) output module change; no input gate, shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Only authored controls in the existing cfg(test) output module change; no input gate, shipped SQL, authority, schema, adapters, native recovery or public contracts are modified."
+  }
+}

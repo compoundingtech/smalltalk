@@ -624,6 +624,184 @@ mod tests {
     }
 
     #[test]
+    fn private_output_bounds_object_keys_before_spool_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut record, mut operation, seq) = prepare(root.path(), "omp");
+        operation.body = Value::Object(
+            [("λ".repeat(MAX_BATCH_BYTES / 2) + "x", Value::Null)]
+                .into_iter()
+                .collect(),
+        );
+        record.operations = vec![operation.clone()];
+        assert_input_refused(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &[]),
+            "native output input field is too wide",
+        );
+
+        // The key limit counts UTF-8 bytes, not characters. This exact key
+        // passes the input walker only; JSON overhead prevents a claim that
+        // it also fits the separate serialized-operation limit.
+        let exact = Value::Object(
+            [("λ".repeat(MAX_BATCH_BYTES / 2), Value::Null)]
+                .into_iter()
+                .collect(),
+        );
+        let mut budget = InputBudget {
+            bytes: MAX_BATCH_BYTES,
+            nodes: 2,
+        };
+        budget.value(&exact, 0).unwrap();
+        assert_eq!((budget.bytes, budget.nodes), (0, 0));
+
+        operation.body = serde_json::json!({"small-key": "admitted"});
+        record.operations = vec![operation.clone()];
+        write_timeline_with_output(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::read_timeline(root.path())
+                .unwrap()
+                .unwrap()
+                .operations,
+            vec![operation]
+        );
+    }
+
+    #[test]
+    fn private_output_node_budget_accepts_exact_total_and_refuses_one_extra() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut record, mut operation, seq) = prepare(root.path(), "omp");
+        // The root array and its null children cost 2,048 nodes per reference.
+        // Record and new each visit it once; no progress reference is supplied.
+        operation.body = Value::Array(vec![Value::Null; MAX_INPUT_NODES / 2 - 1]);
+        let mut retained = retention_operation(&operation, 2);
+        retained.body = Value::Null;
+        record.operations = vec![retained, operation.clone()];
+        record.next_sequence = 3;
+        assert_input_refused(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &[]),
+            "native output input nodes exceed budget",
+        );
+
+        // Removing only the retained null removes exactly one node.
+        record.operations = vec![operation.clone()];
+        write_timeline_with_output(
+            root.path(),
+            &record,
+            std::slice::from_ref(&operation),
+            &batch(&record, seq, &[]),
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::read_timeline(root.path())
+                .unwrap()
+                .unwrap()
+                .operations,
+            vec![operation]
+        );
+    }
+
+    #[test]
+    fn private_output_string_budget_accepts_exact_total_and_refuses_one_extra() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut record, template, seq) = prepare(root.path(), "omp");
+        let mut submitted = retention_operation(&template, 4);
+        submitted.body = Value::Null;
+        record.operations = (1..=3)
+            .map(|sequence| {
+                let mut retained = retention_operation(&template, sequence);
+                retained.body = Value::String(String::new());
+                retained
+            })
+            .collect();
+        record.operations.push(submitted.clone());
+        record.next_sequence = 5;
+
+        // All body strings are empty initially, with no object keys. Compute
+        // the fixture's fixed header/identity bytes independently of the walker;
+        // the submitted identity is charged in both record and new.
+        let input = batch(&record, seq, &[]);
+        let header_bytes: usize = [
+            record.schema.as_str(),
+            record.driver.as_str(),
+            record.incarnation_id.as_str(),
+            input.runtime_incarnation,
+            input.provider_incarnation,
+            input.driver,
+            input.component,
+            input.capability,
+        ]
+        .into_iter()
+        .map(str::len)
+        .sum();
+        let identity_bytes: usize = record
+            .operations
+            .iter()
+            .chain(std::iter::once(&submitted))
+            .map(|operation| {
+                [
+                    operation.operation.as_str(),
+                    operation.entry_id.as_str(),
+                    operation.role.as_str(),
+                    operation.entry_type.as_str(),
+                    operation.driver.as_str(),
+                    operation.incarnation_id.as_str(),
+                    operation.source_id.as_deref().unwrap(),
+                ]
+                .into_iter()
+                .map(str::len)
+                .sum::<usize>()
+            })
+            .sum();
+        let fixed_bytes = header_bytes + identity_bytes;
+        assert!(fixed_bytes > 0 && fixed_bytes < MAX_BATCH_BYTES);
+        for retained in &mut record.operations[..2] {
+            retained.body = Value::String("x".repeat(MAX_BATCH_BYTES));
+        }
+        let last_bytes = MAX_BATCH_BYTES - fixed_bytes;
+        record.operations[2].body = Value::String("x".repeat(last_bytes + 1));
+        assert_input_refused(
+            root.path(),
+            &record,
+            std::slice::from_ref(&submitted),
+            &batch(&record, seq, &[]),
+            "native output input strings exceed budget",
+        );
+
+        record.operations[2].body = Value::String("x".repeat(last_bytes));
+        assert_eq!(
+            fixed_bytes + 2 * MAX_BATCH_BYTES + last_bytes,
+            MAX_INPUT_STRING_BYTES
+        );
+        write_timeline_with_output(
+            root.path(),
+            &record,
+            std::slice::from_ref(&submitted),
+            &batch(&record, seq, &[]),
+        )
+        .unwrap();
+        // Retained fixture inputs are scanned, not appended or certified as
+        // prior provider output. Only the small submitted operation is stored.
+        assert_eq!(
+            super::super::read_timeline(root.path())
+                .unwrap()
+                .unwrap()
+                .operations,
+            vec![submitted]
+        );
+    }
+
+    #[test]
     fn private_output_refuses_wide_identity_and_body_before_owner_lookup() {
         let root = tempfile::tempdir().unwrap();
         let (_, original, template, seq) = prepare(root.path(), "omp");
