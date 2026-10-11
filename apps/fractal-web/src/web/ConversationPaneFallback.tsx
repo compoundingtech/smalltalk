@@ -19,6 +19,7 @@ export const ConversationPaneFallback = ({ agentName, visible = true }: {
     <header data-testid="transcript-header" {...stylex.props(styles.header)}><strong {...stylex.props(styles.title)}>{agentName}</strong></header>
     <ErrorOverlayHost lane>
       <EmbraceScrollViewport items={noItems} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
+        <div data-testid="transcript-history-slot" {...stylex.props(styles.historyBoundary)} />
         {/* TODO(kit): replace with the exported TranscriptSkeleton */}
         <div data-testid="transcript-placeholder" aria-label="Loading conversation" {...stylex.props(styles.placeholder)}>
           <p role="status">Loading conversation…</p>
@@ -40,6 +41,7 @@ const styles = stylex.create({
   title: { flex: '1 1 0', minWidth: 0, fontWeight: t.weightMedium, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   lane: { flex: '1 1 0', minHeight: 0, minWidth: 0, overflowY: 'auto', overflowX: 'hidden', overflowAnchor: 'none' },
   content: { paddingBlock: s.lg },
+  historyBoundary: { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: s.md, minHeight: g.controlMd, flexShrink: 0 },
   placeholder: { display: 'flex', flexDirection: 'column', gap: s.lg },
   turn: { display: 'flex', flexDirection: 'column', gap: s.md, minWidth: 0 },
   skeletonPrompt: { width: '100%', height: `calc(${t.bodyLeading} + ${s.md})`, borderLeftWidth: g.focusRing, borderLeftStyle: 'solid', borderLeftColor: accent.primary, backgroundColor: surface.rowActive },

@@ -8,7 +8,7 @@ import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import { useConversation, useConversationSync, useDataSource, useFeedInterest, useGrants, useNow } from '../data/react.tsx'
 import { createConversationTranscript, openableImageUrl, transcriptObservedAt, transcriptSyncStatus, type ConversationTranscriptState } from './conversationTranscript.ts'
 import { composerSendBinding, type SendRefusal } from './composerSend.ts'
-import { spaceVars } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
+import { geometryVars, spaceVars } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
 import type { UxTelemetry } from '../telemetry/ux.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
@@ -107,12 +107,7 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
     refusal, onRefused: setRefusal,
   })
   const retryConversation = source.retryConversation
-  // The first readable snapshot initializes the runtime together with its send binding.
-  // A runtime born empty adopts later in a passive effect, painting a partial transcript
-  // and a temporary read-only composer before the same snapshot is ready.
-  const [initialized, setInitialized] = React.useState(state._tag !== 'Waiting')
-  if (!initialized && state._tag !== 'Waiting') setInitialized(true)
-  return <EmbraceRuntimeProvider key={`${agentRef}:${initialized}`} options={{ ...binding.runtime, isRunning: state._tag === 'Observed' && state.isRunning }}>
+  return <EmbraceRuntimeProvider key={agentRef} options={{ ...binding.runtime, isRunning: state._tag === 'Observed' && state.isRunning }}>
     {/* Bound the 100%-height kit frame to the space left above the composer. */}
     <div data-testid="conversation-history-host" style={{ flex: '1 1 0', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
     <Transcript
@@ -120,6 +115,7 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
       turns={state._tag === 'Observed' ? state.turns : []}
       scrollToBottomKey={feed._tag === 'Observed' ? feed.value.lastSendId : undefined}
       title={agentName}
+      loadingState={<div data-testid="transcript-placeholder" role="status" aria-label="Loading conversation" />}
       sync={transcriptSyncStatus(observation, feed, now)}
       now={now}
       observedAt={transcriptObservedAt(observation, now)}
@@ -142,7 +138,7 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
     </div>
     <LiveAgentTodos agentRef={agentRef} />
     {/* An unreadable conversation keeps its composer and draft; the binding names why sending waits. */}
-    <div data-testid="conversation-composer-dock" style={{ flexShrink: 0, paddingBottom: spaceVars.lg }}>
+    <div data-testid="conversation-composer-dock" style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', minHeight: `calc(${geometryVars.controlLg} + ${geometryVars.controlMd} + 3 * ${spaceVars.md} + 2 * ${geometryVars.hairline} + ${spaceVars.lg})`, paddingBottom: spaceVars.lg }}>
       <EmbraceComposer variant="C1" readingColumn disabledReason={binding.disabledReason} />
     </div>
   </EmbraceRuntimeProvider>

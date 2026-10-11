@@ -53,7 +53,7 @@ describe('conversation code-loading fallback', () => {
 
     expect(shape(fallback)).toEqual(shape(waiting))
     expect([...fallback.querySelectorAll('[data-testid]')].map(node => node.getAttribute('data-testid')))
-      .toEqual(['transcript-header', 'transcript-scroll', 'transcript-placeholder', 'sync-line'])
+      .toEqual(['transcript-header', 'transcript-scroll', 'transcript-history-slot', 'transcript-placeholder', 'sync-line'])
     expect(fallback.querySelector('[data-testid="transcript-placeholder"]')?.getAttribute('aria-label')).toBe('Loading conversation')
     expect(fallback.querySelector('[data-testid="transcript-scroll"]')?.getAttribute('aria-label')).toBe('Conversation history')
     expect(fallback.querySelector('header')?.textContent).toBe('Example Agent')

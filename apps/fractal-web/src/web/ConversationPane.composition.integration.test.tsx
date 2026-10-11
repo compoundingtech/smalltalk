@@ -6,6 +6,7 @@
  * rendered transcript reproduces the Storybook-reference structure on real components.
  */
 import * as React from 'react'
+import { useAui } from '@assistant-ui/react'
 import { createRoot, type Root } from 'react-dom/client'
 import { act } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -41,6 +42,7 @@ const source = vi.hoisted(() => ({
   transcriptTurns: [] as (readonly TranscriptTurn[])[],
   scrollToBottomKeys: [] as (string | undefined)[],
   composerProps: [] as React.ComponentProps<typeof Kit.EmbraceComposer>[],
+  setDraft: undefined as ((text: string) => void) | undefined,
   viewportCommits: [] as {
     readonly anchorHistory: React.ComponentProps<typeof KitViewport.EmbraceScrollViewport>['anchorHistory']
     readonly rowIds: readonly string[]
@@ -65,11 +67,16 @@ vi.mock('../data/react.tsx', async () => {
 // Tap the input seams but keep the real kit/runtime rendering and effects.
 vi.mock('../../../../packages/fractal-ui/src/assistant-ui/EmbraceRuntime.tsx', async importOriginal => {
   const kit = await importOriginal<typeof KitRuntime>()
+  const DraftProbe = () => {
+    const aui = useAui()
+    source.setDraft = text => aui.composer().setText(text)
+    return null
+  }
   return {
     ...kit,
     EmbraceRuntimeProvider: (props: React.ComponentProps<typeof Kit.EmbraceRuntimeProvider>) => {
       source.runtimeItems.push(props.options.messages ?? [])
-      return <kit.EmbraceRuntimeProvider {...props} />
+      return <kit.EmbraceRuntimeProvider {...props}><DraftProbe />{props.children}</kit.EmbraceRuntimeProvider>
     },
   }
 })
@@ -172,22 +179,42 @@ const mount = async (ux?: UxTelemetry) => {
 const text = () => container.textContent ?? ''
 
 describe('ConversationPane composition activation', () => {
-  it('initializes the first readable runtime atomically and retains its draft on later observations', async () => {
+  it('waits for actual source adoption without painting stranded rows or replacing the composer', async () => {
     source.sendEnabled = true
     source.feed = { _tag: 'Waiting' }
     source.sync = { status: { _tag: 'Requested', since: 990 }, observedAt: 990 }
     await mount()
+    expect(container.querySelector('[data-testid="transcript-placeholder"]')?.textContent).toBe('')
+    expect(container.querySelector('[data-testid="transcript-history-slot"]')).not.toBeNull()
+    const strandedPaints: Element[] = []
+    const observer = new MutationObserver(records => {
+      for (const record of records) for (const node of record.addedNodes) if (node instanceof Element) {
+        if (node.matches('[data-testid="transcript-stranded"]')) strandedPaints.push(node)
+        strandedPaints.push(...node.querySelectorAll('[data-testid="transcript-stranded"]'))
+      }
+    })
+    observer.observe(container, { childList: true, subtree: true })
     const loadingInput = container.querySelector('textarea')
+    await act(async () => { source.setDraft!('Retain this unsent draft') })
+    loadingInput!.setSelectionRange(7, 11)
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: true, observation: { empty: false } } }
     source.sync = { status: { _tag: 'Live', since: 1000 }, observedAt: 1000 }
-    await mount()
+    try { await mount() } finally { observer.disconnect() }
+    expect(strandedPaints).toHaveLength(0)
     const readyInput = container.querySelector('textarea')
-    expect(readyInput).not.toBe(loadingInput)
+    expect(readyInput).toBe(loadingInput)
+    expect(readyInput?.value).toBe('Retain this unsent draft')
+    expect(readyInput?.selectionStart).toBe(7)
+    expect(readyInput?.selectionEnd).toBe(11)
     expect(container.querySelector('[data-testid="transcript-placeholder"]')).toBeNull()
     expect(container.querySelector('[data-testid="history-boundary"]')).not.toBeNull()
+    readyInput?.focus()
     source.feed = { ...source.feed, value: { ...source.feed.value, items: [...scenario] } }
     await mount()
     expect(container.querySelector('textarea')).toBe(readyInput)
+    expect(document.activeElement).toBe(readyInput)
+    expect(readyInput?.selectionStart).toBe(7)
+    expect(readyInput?.selectionEnd).toBe(11)
   })
 
   it('keeps an overflowing visible suffix stable instead of growing it at idle, and finds older rows on demand', async () => {

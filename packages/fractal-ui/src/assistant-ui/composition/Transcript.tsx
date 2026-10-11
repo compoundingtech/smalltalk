@@ -49,6 +49,8 @@ export interface TranscriptProps {
   readonly availability?: TranscriptAvailability
   readonly history?: TranscriptHistory
   readonly emptyState?: React.ReactNode | TranscriptEmptyState
+  /** Host-owned first-publication body; an empty body can keep a switch lane stable. */
+  readonly loadingState?: React.ReactNode
   /** Workbench conversation key for the owning surface's scroll memory. */
   readonly viewportKey?: string
   /** Host command, e.g. the newest own pending send: a changed key brings the latest turn into view. */
@@ -235,27 +237,30 @@ const PreparedTurn = React.memo(function PreparedTurn({ turn, stranded, onOpenTo
 // Hosts using AssistantRuntimeProvider directly expose no adoption store; its absence never changes.
 const staticSubscription = () => () => undefined
 /** Locked U2·F3·Y3 presentation under the host's AssistantRuntimeProvider. */
-export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, onRetrySync, onRetryRun, onRetrySend, resolveImage, onLoadImage, availability = { _tag: 'Available' }, history = { _tag: 'Complete' }, emptyState, viewportKey, scrollToBottomKey, landmarkContext }: TranscriptProps) {
+export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, onRetrySync, onRetryRun, onRetrySend, resolveImage, onLoadImage, availability = { _tag: 'Available' }, history = { _tag: 'Complete' }, emptyState, loadingState, viewportKey, scrollToBottomKey, landmarkContext }: TranscriptProps) {
   const messages = useAuiState(state => state.thread.messages)
   // External-store runtimes adopt each snapshot in a passive effect, and the store publishes the
-  // adopted messages a task later. Recording the snapshot after its commit is the adoption epoch.
-  // An id is pending (deferred so the turn stays mounted) while its snapshot has not been through a
-  // commit or while the runtime holds it and the store has yet to publish it; once committed and
-  // absent from the runtime, it is stranded. Only unpublished ids depend on the epoch or on runtime
-  // adoption, so neither is recorded while every id is published: a freshly mounted pane commits once.
+  // adopted messages a task later. A child effect runs before its provider's adoption effect, so
+  // a host render alone cannot classify missing ids as stranded. The adoption store first confirms
+  // the source snapshot reached the runtime; ids it holds remain pending until publication, while
+  // ids it did not adopt may render their fallback. Only unpublished ids subscribe to this seam.
   const [adoptionEpoch, setAdoptionEpoch] = React.useState<readonly TranscriptTurn[]>()
   const published = React.useMemo(() => new Set(messages.map(message => message.id)), [messages])
   const unpublished = React.useMemo(() => turns.flatMap(turn => [...(turn.prompt === undefined ? [] : [turn.prompt.id]), ...turn.items.map(item => item.id)]).filter(id => !published.has(id)), [turns, published])
   const adoption = React.useContext(RuntimeAdoptedIds)
   const getHeldKey = () => {
     const held = adoption?.get()
-    return JSON.stringify(held === undefined ? [] : unpublished.filter(id => held.has(id)))
+    const source = adoption?.getSourceIds()
+    return JSON.stringify({ held: held === undefined ? [] : unpublished.filter(id => held.has(id)), sourceAdopted: adoption === undefined || source !== undefined && unpublished.every(id => source.has(id)) })
   }
   const heldKey = React.useSyncExternalStore(adoption?.subscribe ?? staticSubscription, getHeldKey, getHeldKey)
-  const runtimeIds = React.useMemo(() => new Set<string>(JSON.parse(heldKey)), [heldKey])
+  const { runtimeIds, sourceAdopted } = React.useMemo(() => {
+    const snapshot = JSON.parse(heldKey)
+    return { runtimeIds: new Set<string>(snapshot.held), sourceAdopted: snapshot.sourceAdopted === true }
+  }, [heldKey])
   React.useEffect(() => {
-    if (adoptionEpoch !== turns && unpublished.some(id => !runtimeIds.has(id))) setAdoptionEpoch(turns)
-  }, [turns, unpublished, runtimeIds, adoptionEpoch])
+    if (sourceAdopted && adoptionEpoch !== turns && unpublished.some(id => !runtimeIds.has(id))) setAdoptionEpoch(turns)
+  }, [turns, unpublished, runtimeIds, adoptionEpoch, sourceAdopted])
   const { committed, stranded } = React.useMemo(() => {
     const settled = new Set(adoptionEpoch?.flatMap(turn => [...(turn.prompt === undefined ? [] : [turn.prompt.id]), ...turn.items.map(item => item.id)]))
     const stranded = new Set<string>()
@@ -353,9 +358,9 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     {availability.action !== undefined && <Button data-testid="transcript-unavailable-action" onPress={availability.action.onPress} {...stylex.props(styles.unavailableAction)}>{availability.action.label}</Button>}
     {availability.detail !== undefined && <Disclosure {...stylex.props(styles.unavailableDetails)}><Button slot="trigger" {...stylex.props(styles.historyLoad)}>Show details</Button><DisclosurePanel><p data-testid="transcript-unavailable-detail" {...stylex.props(styles.unavailableDetail)}>{availability.detail}</p></DisclosurePanel></Disclosure>}
   </div></section>
-  const empty = committed.length === 0 && sync._tag === 'Live'
+  const empty = committed.length === 0 && turns.length === 0 && sync._tag === 'Live'
     ? <div aria-label="Empty conversation" data-testid="transcript-empty" {...stylex.props(styles.emptyBody)}><TranscriptEmptyContent emptyState={emptyState} /></div>
-    : <TranscriptSkeleton sync={sync} now={now} observedAt={observedAt} onRetrySync={onRetrySync} />
+    : loadingState ?? <TranscriptSkeleton sync={sync} now={now} observedAt={observedAt} onRetrySync={onRetrySync} />
   return <MarkdownImagePolicy.Provider value={imageOptions}><RetrySend.Provider value={onRetrySend}><ThreadPrimitive.Root aria-label={`Transcript${landmarkContext ? `, ${landmarkContext}` : ''}`} {...stylex.props(styles.frame)}>
     <header data-testid="transcript-header" {...stylex.props(styles.header)}><strong {...stylex.props(styles.title)}>{title}</strong>
       {progress !== undefined && <ProgressBar aria-label="Thread synchronization" value={progress.done} maxValue={progress.total} {...stylex.props(styles.progress)}><div {...stylex.props(styles.track)}><div {...stylex.props(styles.fill(`${progress.total === 0 ? 0 : progress.done! / progress.total! * 100}%`))} /></div></ProgressBar>}
@@ -363,8 +368,10 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
       {running !== undefined && <><div role="progressbar" aria-label="Run in progress" aria-valuetext="Running" data-testid="run-progress" {...stylex.props(styles.runningProgress)}><span {...stylex.props(styles.runningSegment)} /></div><span data-testid="run-elapsed">Running{Number.isFinite(started) && started <= now ? ` · ${formatWorkDuration(now - started) || '<1s'}` : ''}</span></>}
     </header>
     <ErrorOverlayHost lane><EmbraceScrollViewport ref={viewport} items={rows} anchorHistory={anchorHistory} stateKey={viewportKey} scrollToBottomKey={scrollToBottomKey} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
-      {start > 0 && <div {...stylex.props(styles.historyBoundary)}><Button data-testid="transcript-reveal-earlier" onPress={() => mountOlder(true)} {...stylex.props(styles.historyLoad)}>Show earlier messages</Button></div>}
-      {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
+      <div data-testid="transcript-history-slot" {...stylex.props(styles.historyBoundary)}>
+        {start > 0 && <Button data-testid="transcript-reveal-earlier" onPress={() => mountOlder(true)} {...stylex.props(styles.historyLoad)}>Show earlier messages</Button>}
+        {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
+      </div>
       {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(visibleTurns, 0, gridOrigin - turnStart).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
     </EmbraceScrollViewport>{failure?.tone === 'error' && <ErrorOverlay id={`sync-${failure.text}`} title={failure.text} detail="History stays on screen." onRetry={onRetrySync} />}</ErrorOverlayHost>
   </ThreadPrimitive.Root></RetrySend.Provider></MarkdownImagePolicy.Provider>
