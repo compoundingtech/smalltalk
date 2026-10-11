@@ -47,6 +47,15 @@ importers:
       '@effect/vitest':
         specifier: 4.0.0-rc.118
         version: 4.0.0-rc.118(effect@4.0.0-rc.118)(vitest@4.1.9(@types/node@24.10.0)(jsdom@26.1.0(supports-color@8.1.1))(vite@8.2.2(@types/node@24.10.0)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1)))
+      '@storybook/addon-a11y':
+        specifier: 10.6.1
+        version: 10.6.1(storybook@10.6.1(@types/react@19.2.14)(react@19.2.3))
+      '@storybook/addon-docs':
+        specifier: 10.6.1
+        version: 10.6.1(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(storybook@10.6.1(@types/react@19.2.14)(react@19.2.3))
+      '@storybook/react-vite':
+        specifier: 10.6.1
+        version: 10.6.1(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.3(react@19.2.3))(react@19.2.3)(storybook@10.6.1(@types/react@19.2.14)(react@19.2.3))(supports-color@8.1.1)(typescript@6.0.3)(vite@8.2.2(@types/node@24.10.0)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1))
       '@stylexjs/unplugin':
         specifier: 0.19.0
         version: 0.19.0(supports-color@8.1.1)(unplugin@2.3.11)
@@ -71,6 +80,9 @@ importers:
       jsdom:
         specifier: 26.1.0
         version: 26.1.0(supports-color@8.1.1)
+      storybook:
+        specifier: 10.6.1
+        version: 10.6.1(@types/react@19.2.14)(react@19.2.3)
       typescript:
         specifier: 6.0.3
         version: 6.0.3
@@ -6523,6 +6535,14 @@ snapshots:
     optionalDependencies:
       typescript: 6.0.3
 
+  '@joshwooding/vite-plugin-react-docgen-typescript@0.7.0(typescript@6.0.3)(vite@8.2.2(@types/node@24.10.0)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1))':
+    dependencies:
+      glob: 13.0.6
+      react-docgen-typescript: 2.4.0(typescript@6.0.3)
+      vite: 8.2.2(@types/node@24.10.0)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1)
+    optionalDependencies:
+      typescript: 6.0.3
+
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
       '@jridgewell/sourcemap-codec': 1.6.0
@@ -7744,6 +7764,12 @@ snapshots:
       ts-dedent: 2.3.0
       vite: 8.0.5(@emnapi/core@1.11.0)(@emnapi/runtime@1.11.0)(@types/node@26.6.4)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1)
 
+  '@storybook/builder-vite@10.6.1(storybook@10.6.1(@types/react@19.2.14)(react@19.2.3))(vite@8.2.2(@types/node@24.10.0)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1))':
+    dependencies:
+      storybook: 10.6.1(@types/react@19.2.14)(react@19.2.3)
+      ts-dedent: 2.3.0
+      vite: 8.2.2(@types/node@24.10.0)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1)
+
   '@storybook/global@5.0.0': {}
 
   '@storybook/icons@2.1.0(react@19.2.3)':
@@ -7774,6 +7800,29 @@ snapshots:
       storybook: 10.6.1(@types/react@19.2.14)(react@19.2.3)
       tsconfig-paths: 4.2.0
       vite: 8.0.5(@emnapi/core@1.11.0)(@emnapi/runtime@1.11.0)(@types/node@26.6.4)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1)
+    optionalDependencies:
+      typescript: 6.0.3
+    transitivePeerDependencies:
+      - '@types/react'
+      - '@types/react-dom'
+      - rollup
+      - supports-color
+
+  '@storybook/react-vite@10.6.1(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.3(react@19.2.3))(react@19.2.3)(storybook@10.6.1(@types/react@19.2.14)(react@19.2.3))(supports-color@8.1.1)(typescript@6.0.3)(vite@8.2.2(@types/node@24.10.0)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1))':
+    dependencies:
+      '@joshwooding/vite-plugin-react-docgen-typescript': 0.7.0(typescript@6.0.3)(vite@8.2.2(@types/node@24.10.0)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1))
+      '@rollup/pluginutils': 5.4.0
+      '@storybook/builder-vite': 10.6.1(storybook@10.6.1(@types/react@19.2.14)(react@19.2.3))(vite@8.2.2(@types/node@24.10.0)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1))
+      '@storybook/react': 10.6.1(@types/react-dom@19.2.3(@types/react@19.2.14))(@types/react@19.2.14)(react-dom@19.2.3(react@19.2.3))(react@19.2.3)(storybook@10.6.1(@types/react@19.2.14)(react@19.2.3))(supports-color@8.1.1)(typescript@6.0.3)
+      empathic: 2.1.0
+      magic-string: 1.4.3
+      react: 19.2.3
+      react-docgen: 8.0.4(supports-color@8.1.1)
+      react-dom: 19.2.3(react@19.2.3)
+      resolve: 1.22.12
+      storybook: 10.6.1(@types/react@19.2.14)(react@19.2.3)
+      tsconfig-paths: 4.2.0
+      vite: 8.2.2(@types/node@24.10.0)(esbuild@0.28.2)(jiti@2.7.0)(terser@5.51.2)(yaml@2.9.1)
     optionalDependencies:
       typescript: 6.0.3
     transitivePeerDependencies:

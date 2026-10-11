@@ -5,34 +5,40 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "dev": "vite --config vite.config.ts --configLoader runner"
+    "dev": "vite --config vite.config.ts --configLoader runner",
+    "storybook": "storybook dev -p 53706 --host 127.0.0.1 --no-open --disable-telemetry",
+    "build-storybook": "storybook build --output-dir storybook-static --disable-telemetry"
   },
   "dependencies": {
+    "@effect/atom-react": "4.0.0-rc.118",
+    "@smalltalk/fractal-ui": "workspace:*",
     "@smalltalk/st3-client": "file:../../clients/typescript/st3-client",
+    "@st3/sdk": "workspace:*",
+    "@stylexjs/stylex": "0.19.0",
     "effect": "4.0.0-rc.118",
     "fractional-indexing": "3.2.0",
-    "@smalltalk/fractal-ui": "workspace:*",
-    "@st3/sdk": "workspace:*",
     "react": "19.2.3",
-    "react-dom": "19.2.3",
     "react-aria": "3.52.1",
     "react-aria-components": "1.21.1",
-    "@stylexjs/stylex": "0.19.0",
-    "@effect/atom-react": "4.0.0-rc.118"
+    "react-dom": "19.2.3"
   },
   "devDependencies": {
     "@effect/vitest": "4.0.0-rc.118",
+    "@storybook/addon-a11y": "10.6.1",
+    "@storybook/addon-docs": "10.6.1",
+    "@storybook/react-vite": "10.6.1",
+    "@stylexjs/unplugin": "0.19.0",
     "@types/node": "24.10.0",
-    "typescript": "6.0.3",
-    "vitest": "4.1.9",
-    "fast-check": "4.3.0",
-    "fake-indexeddb": "6.2.4",
-    "vite": "8.2.2",
-    "@vitejs/plugin-react": "6.1.1",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
-    "@stylexjs/unplugin": "0.19.0",
-    "jsdom": "26.1.0"
+    "@vitejs/plugin-react": "6.1.1",
+    "fake-indexeddb": "6.2.4",
+    "fast-check": "4.3.0",
+    "jsdom": "26.1.0",
+    "storybook": "10.6.1",
+    "typescript": "6.0.3",
+    "vite": "8.2.2",
+    "vitest": "4.1.9"
   },
   "version": "0.1.0"
 }

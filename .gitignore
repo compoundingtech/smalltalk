@@ -35,3 +35,6 @@ clients/typescript/st3-scenarios/node_modules/
 # Buck2: the web devShell links the rules and capabilities cells; build output.
 /.buck2/
 /buck-out/
+
+# App and kit Storybook builds are review artifacts, not source.
+**/storybook-static/
