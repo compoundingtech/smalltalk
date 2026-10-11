@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Fail doctor for a current missing-agent mission fault lasting five minutes",
+  "replay": {
+    "status": "none",
+    "detail": "Reuses current fault projection and an indexed exact-episode lookup. No replay trigger, new fault claim or history fold."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No persisted schema or public resource field changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint-rule, declaration authority, currentness predicate or timer changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Doctor adds check mission-no-eligible-agent, failing for existing current episodes at least five minutes old. Before the threshold the check passes; source recovery clears it. Requires the stable fault condition introduced by PR1850; no second attention episode is created."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Uses the ordinary daemon upgrade. Upgrade interruption is not measured by this source control."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new operator step; declare a seat or revise the existing assignment through normal controls."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "Rollback removes the bounded doctor failure while existing canonical fault history remains readable. The earlier immediate current fault attention behavior remains available on builds containing PR1850."
+  }
+}

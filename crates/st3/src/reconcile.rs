@@ -16053,6 +16053,7 @@ fn now_ms() -> u128 {
 mod tests {
     mod channel_recovery;
     mod differential;
+    mod doctor_eligibility_tests;
     mod first_readiness_tests;
     mod github_watch_selection;
     mod incremental_deadlines;

@@ -14,6 +14,8 @@ The reconciler raises an existing `operational.failure` with stable `fields.cond
 
 Episodes are deduplicated by generation, step and readiness epoch. Only the latest episode for a run is visible. It disappears when the targeted step regains an eligible desired binding, the generation changes, or the run leaves its normal phase or ends. A later loss of eligibility after readiness has a new epoch. Desired presence is not proof that a runtime or harness is ready.
 
+Doctor reports `mission-no-eligible-agent` as a failure when an existing current fault episode has lasted at least five minutes. Fault attention still appears immediately on admitted missing eligibility. Doctor reuses its current attention/fault snapshot and looks up the exact episode claim by ID; it publishes no additional fault, timer or recovery claim. The clock measures the age of that episode, while currentness is live state, not a historical snapshot at that clock. Eligibility restoration, an explicit root stop, cutover and terminal state remove the current diagnosis through the same fault currentness. The check lists at most twenty overdue episodes and reports the remaining count.
+
 Eligibility reads register the absent binding as a dependency. Its later publication dirties the settled blocked run directly. Quiet root stops and deduplicated episodes return from reader checks without joining the writer queue. A needed fault writer rechecks the run, generation, step and bindings under its transaction and uses an indexed source lookup for deduplication; it adds no polling loop or replay of historical operational episodes.
 
 ## Controls
