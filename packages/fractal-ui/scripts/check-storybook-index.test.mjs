@@ -5,6 +5,7 @@ import { resolve } from 'node:path'
 import { test } from 'node:test'
 import { checkIndex } from './check-storybook-index.mjs'
 import { appRef, composition } from '../.storybook/composition.ts'
+import { publishRef } from './publish-storybook-ref.mjs'
 
 const manifest = { version: 1, exceptions: [{ book: 'kit', title: 'Fractal/Explore/Workbench', classification: 'explore', owner: 'fractal-web-live', reason: 'Not the production workspace.' }] }
 const index = (title, tags = []) => ({ v: 5, entries: { example: { id: 'example', type: 'story', title, name: 'AllStates', tags } } })
@@ -68,4 +69,19 @@ test('CI owns one serial build, app before landing, with index controls wired', 
   assert.match(script, /check-storybook-index.mjs kit/)
   const lanes = readFileSync(new URL('../../../scripts/ci-fractal-web', import.meta.url), 'utf8')
   assert.match(lanes, /lane "Composed Fractal Storybooks" bash scripts\/ci-fractal-web-storybooks/)
+})
+
+test('composition protocol publishes the real index and revision without 404 probes', () => {
+  const output = mkdtempSync(resolve(tmpdir(), 'fractal-ref-publish-'))
+  try {
+    const contents = JSON.stringify(index('Fractal/App/Workspace'))
+    writeFileSync(resolve(output, 'index.json'), contents)
+    assert.equal(publishRef(output, { version: 1, exceptions: [] }, 'abc123').stories, 1)
+    assert.equal(readFileSync(resolve(output, 'stories.json'), 'utf8'), contents)
+    assert.deepEqual(JSON.parse(readFileSync(resolve(output, 'metadata.json'), 'utf8')), { title: 'Fractal App', revision: 'abc123', storyCount: 1 })
+    writeFileSync(resolve(output, 'index.json'), JSON.stringify(index('Misplaced/Workspace')))
+    assert.throws(() => publishRef(output, { version: 1, exceptions: [] }, 'abc123'), /Non-conforming/)
+  } finally {
+    rmSync(output, { recursive: true, force: true })
+  }
 })

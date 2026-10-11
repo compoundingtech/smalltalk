@@ -8,6 +8,7 @@ if [ -d apps/fractal-web/.storybook ]; then
   pnpm --filter fractal-web build-storybook
   test -s apps/fractal-web/storybook-static/index.html
   node packages/fractal-ui/scripts/check-storybook-index.mjs app apps/fractal-web/storybook-static/index.json
+  node packages/fractal-ui/scripts/publish-storybook-ref.mjs apps/fractal-web/storybook-static
 else
   echo 'App Storybook not introduced yet; publishing kit with the unavailable app ref disabled.'
 fi
