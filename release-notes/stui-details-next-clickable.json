@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "In stui's agent details, the missions listed under next open their mission when clicked",
+  "replay": {"status": "none", "detail": "No replay, backfill, stored data or transcript change."},
+  "schema": {"status": "none", "detail": "No schema, operation or contract digest change. stui uses the mission id the agent's next and upcoming work already carry."},
+  "rules": {"status": "none", "detail": "No claim, checkpoint, retention or authority rule change."},
+  "compatibility": {"status": "none", "detail": "Client-only; the shared demo-world fixture gains the mission ids of the queue."},
+  "downtime": {"status": "none", "detail": "Client-only change; no deployment ordering."},
+  "manual": {"status": "none", "detail": "No manual action."},
+  "recovery": {"status": "none", "detail": "No recovery, durable payload or initialization changes."}
+}

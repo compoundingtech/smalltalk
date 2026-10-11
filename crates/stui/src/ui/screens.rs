@@ -2912,28 +2912,49 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
     }
     doc.blank();
     doc.section("next", Some(details.queued as usize), width);
+    // Each queued step opens its mission when clicked.
+    let open_mission = |doc: &mut Doc, lines: Vec<Line<'static>>, mission: Option<&String>| {
+        if let Some(mission) = mission.filter(|mission| !mission.is_empty()) {
+            for offset in 0..lines.len() {
+                doc.targets.push(super::doc::Target {
+                    line: doc.lines.len() + offset,
+                    column: 2,
+                    width: width.saturating_sub(2) as u16,
+                    hit: Hit::Open(mission.clone()),
+                });
+            }
+        }
+        doc.lines(lines);
+    };
     match &details.next {
-        Some(next) => doc.lines(text::wrap(
-            &[run(next.clone(), theme::text())],
-            width,
-            &[run("› ", theme::fg(theme::ACCENT))],
-            &[run("  ", theme::dim())],
-            None,
-        )),
+        Some(next) => open_mission(
+            &mut doc,
+            text::wrap(
+                &[run(next.clone(), theme::text())],
+                width,
+                &[run("› ", theme::fg(theme::ACCENT))],
+                &[run("  ", theme::dim())],
+                None,
+            ),
+            details.next_mission.as_ref(),
+        ),
         None => doc.line(Line::from(span("Nothing queued.", theme::dim()))),
     }
-    for item in details
-        .queue
-        .iter()
-        .filter(|item| Some(*item) != details.next.as_ref())
-    {
-        doc.lines(text::wrap(
-            &[run(item.clone(), theme::soft())],
-            width,
-            &[run("· ", theme::dim())],
-            &[run("  ", theme::dim())],
-            None,
-        ));
+    for (index, item) in details.queue.iter().enumerate() {
+        if Some(item) == details.next.as_ref() {
+            continue;
+        }
+        open_mission(
+            &mut doc,
+            text::wrap(
+                &[run(item.clone(), theme::soft())],
+                width,
+                &[run("· ", theme::dim())],
+                &[run("  ", theme::dim())],
+                None,
+            ),
+            details.queue_missions.get(index),
+        );
     }
     if !agent.subagents.is_empty() {
         doc.blank();
@@ -2969,6 +2990,11 @@ pub fn agent_details(world: &World, agent: &Agent, width: usize, spinner: &'stat
     };
     field(&mut doc, "harness", Some(agent.harness.name()));
     field(&mut doc, "model", details.model.as_deref());
+    // Beside the model, only when the seat is configured with one: an unset effort is the
+    // harness's own default, which is not worth a row of "unknown".
+    if let Some(effort) = details.effort.as_deref() {
+        field(&mut doc, "effort", Some(effort));
+    }
     field(&mut doc, "state", details.harness_state.as_deref());
     field(&mut doc, "runtime", details.runtime.as_deref());
     field(&mut doc, "host", Some(&agent.host));
