@@ -116,13 +116,16 @@ impl Cache {
             // A run of tool calls, or one other entry drawn as in full.
             let run = entries[index..]
                 .iter()
-                .take_while(|entry| matches!(entry.body, Body::Tool { .. }))
+                .take_while(|entry| crate::entry::bundles(&entry.body))
                 .count();
             if run == 0 {
                 let entry = &entries[index];
                 doc.entries.push((entry.id.clone(), doc.lines.len()));
                 // Mail between others is two lines until opened (Nathan, 2026-10-02).
-                if folds(&entry.body) && !expanded.contains(&entry.id) {
+                if matches!(&entry.body, Body::Mail { .. })
+                    && folds(&entry.body)
+                    && !expanded.contains(&entry.id)
+                {
                     doc.append(mail_lines(entry, width, theme), 0);
                     index += 1;
                     continue;
@@ -141,15 +144,15 @@ impl Cache {
             }
             let calls = &entries[index..index + run];
             let bundle = bundle_id(&calls[0].id);
-            for entry in calls {
-                doc.entries.push((entry.id.clone(), doc.lines.len()));
-            }
             let open = expanded.contains(&bundle);
             if run > 1 {
+                doc.entries.push((bundle.clone(), doc.lines.len()));
                 doc.append(bundle_line(calls, &bundle, open, width, spinner, theme), 0);
             }
             if run == 1 || open {
                 for entry in calls {
+                    // Content decorators own this call's range, not the bundle header.
+                    doc.entries.push((entry.id.clone(), doc.lines.len()));
                     if expanded.contains(&entry.id) {
                         doc.append(render_entry(entry, width, true, spinner, theme), 0);
                     } else {
@@ -413,6 +416,9 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 title_style = title_style.add_modifier(Modifier::BOLD);
             }
             let row_style = fg(look.rows, theme);
+            let preview_head = title.starts_with("write ") || title.starts_with("compaction");
+            let child_name = title.split(" · ").next().unwrap_or(title);
+            let recovered = title.starts_with("assistant error · recovered");
             let title = text::truncate(&text::sanitize(title), width.saturating_sub(6));
             doc.targets.push(Target {
                 line: 0,
@@ -426,9 +432,17 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 Span::styled(title, title_style),
             ]));
             // Every row the output takes once wrapped; collapsed, a call shows its last few.
+            // A subagent card's `open <session>` row also opens that child conversation.
             let mut rows = Vec::new();
+            let mut open_row = None;
             for line in output {
-                let line = text::sanitize(line);
+                let opens = line.starts_with("open ") && open_row.is_none();
+                let before = rows.len();
+                let line = if opens {
+                    text::sanitize(&format!("open {child_name}"))
+                } else {
+                    text::sanitize(line)
+                };
                 let style = if line.starts_with('+') {
                     fg(rules.added, theme)
                 } else if line.starts_with('-') || line.contains("error") {
@@ -448,10 +462,15 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                     &[edge(), run("  ", style)],
                     None,
                 ));
+                if opens {
+                    open_row = Some(before);
+                }
             }
             let total = rows.len();
             let hidden = if open {
                 0
+            } else if recovered {
+                total
             } else {
                 total.saturating_sub(COLLAPSED_TOOL_LINES)
             };
@@ -465,7 +484,32 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             if open && total > COLLAPSED_TOOL_LINES {
                 control(&mut doc, rules.collapse.text.into());
             }
-            doc.lines(rows.into_iter().skip(hidden));
+            if preview_head {
+                doc.lines(rows.into_iter().take(total - hidden));
+            } else {
+                doc.lines(rows.into_iter().skip(hidden));
+            }
+            if let (Some(row), Some(session)) = (
+                open_row.filter(|row| {
+                    if preview_head {
+                        *row < total - hidden
+                    } else {
+                        *row >= hidden
+                    }
+                }),
+                crate::header::open_session(output),
+            ) {
+                doc.targets.push(Target {
+                    line: if preview_head {
+                        row + 1
+                    } else {
+                        row - hidden + 1
+                    },
+                    column: 0,
+                    width: width as u16,
+                    hit: PaneIntent::Open(session.to_owned()),
+                });
+            }
             if open && total > COLLAPSED_TOOL_LINES {
                 control(&mut doc, rules.collapse.text.into());
             }

@@ -1084,6 +1084,23 @@ fn ts_conditional_body(value: &Value) -> Result<Option<String>> {
     }
 }
 
+/// The typed `TimelineView` and `ConversationHeader` schemas serve schema consumers and docs;
+/// generated clients carry both as loose JSON, so the raw TypeScript model renders the named
+/// fields as `unknown` instead of projecting every definition.
+fn ts_loose_json_fields(definition: &Value, fields: &[&str]) -> Value {
+    let mut loose = definition.clone();
+    for field in fields {
+        if let Some(properties) = loose
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .and_then(|properties| properties.get_mut(*field))
+        {
+            *properties = Value::Object(serde_json::Map::new());
+        }
+    }
+    loose
+}
+
 fn typescript_models(schema: &Value, operations: &Value) -> Result<String> {
     let defs = schema["$defs"].as_object().context("schema definitions")?;
     let mut out = format!(
@@ -1093,6 +1110,13 @@ fn typescript_models(schema: &Value, operations: &Value) -> Result<String> {
         if name == "ActionRequest" {
             continue;
         }
+        let loose = match name.as_str() {
+            "TimelineBlock" => ts_loose_json_fields(definition, &["view"]),
+            "TimelinePage" | "ConversationChanges" | "TimelineDelta" => {
+                ts_loose_json_fields(definition, &["header"])
+            }
+            _ => definition.clone(),
+        };
         let shape = if name == "Resource" {
             // UnknownResource's open `kind: string` would defeat discriminant narrowing in the
             // raw union; like the Rust and Swift clients, raw TypeScript models known kinds only.
@@ -1102,7 +1126,7 @@ fn typescript_models(schema: &Value, operations: &Value) -> Result<String> {
             }
             ts_type(&known)?
         } else {
-            ts_conditional_body(definition)?.unwrap_or(ts_type(definition)?)
+            ts_conditional_body(&loose)?.unwrap_or(ts_type(&loose)?)
         };
         writeln!(out, "export type {name} = {shape};\n")?;
     }

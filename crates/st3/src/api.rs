@@ -3178,35 +3178,7 @@ fn client_session_resources(
         .sessions
         .retain(|session| !managed_native_sessions.contains(&session.native_id));
     for session in external.sessions {
-        let running = session.process.is_some();
-        let process = session.process.as_ref().map(|process| {
-            json!({
-                "pid": process.pid,
-                "started_at": crate::external_sessions::timestamp(process.started_at_unix_ms),
-                "fingerprint": process.fingerprint,
-                "exact_session": process.exact_session
-            })
-        });
-        sessions.push(json!({
-            "id": session.id,
-            "kind": "session",
-            "revision": session.revision,
-            "updated_at": crate::external_sessions::timestamp(session.updated_at_unix_ms),
-            "owner_id": format!("external-session/{}/{}", session.driver.as_str(), session.native_id),
-            "state": if running { "running" } else { "completed" },
-            "started_at": crate::external_sessions::timestamp(session.started_at_unix_ms),
-            "ended_at": if running { None } else { Some(crate::external_sessions::timestamp(session.updated_at_unix_ms)) },
-            "timeline_cursor": format!("timeline-cursor/{}/latest", session.id.trim_start_matches("session/")),
-            "usage": null,
-            "managed": false,
-            "driver": session.driver.as_str(),
-            "native_session_id": session.native_id,
-            "workspace": session.cwd.map(|path| path.display().to_string()),
-            "title": session.title,
-            "importable": true,
-            "import_reason": null,
-            "process": process
-        }));
+        sessions.push(external_session_resource(session));
     }
     for unresolved in external.unresolved_processes {
         sessions.push(unresolved_session_resource(unresolved, at));
@@ -3218,6 +3190,38 @@ fn client_session_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(sessions)
+}
+
+fn external_session_resource(session: crate::external_sessions::ExternalSession) -> Value {
+    let running = session.process.is_some();
+    let process = session.process.as_ref().map(|process| {
+        json!({
+            "pid": process.pid,
+            "started_at": crate::external_sessions::timestamp(process.started_at_unix_ms),
+            "fingerprint": process.fingerprint,
+            "exact_session": process.exact_session
+        })
+    });
+    json!({
+        "id": session.id,
+        "kind": "session",
+        "revision": session.revision,
+        "updated_at": crate::external_sessions::timestamp(session.updated_at_unix_ms),
+        "owner_id": format!("external-session/{}/{}", session.driver.as_str(), session.native_id),
+        "state": if running { "running" } else { "completed" },
+        "started_at": crate::external_sessions::timestamp(session.started_at_unix_ms),
+        "ended_at": if running { None } else { Some(crate::external_sessions::timestamp(session.updated_at_unix_ms)) },
+        "timeline_cursor": format!("timeline-cursor/{}/latest", session.id.trim_start_matches("session/")),
+        "usage": null,
+        "managed": false,
+        "driver": session.driver.as_str(),
+        "native_session_id": session.native_id,
+        "workspace": session.cwd.map(|path| path.display().to_string()),
+        "title": session.title,
+        "importable": true,
+        "import_reason": null,
+        "process": process
+    })
 }
 
 fn unresolved_session_resource(
@@ -5046,6 +5050,17 @@ async fn client_sessions_detail(
             }
         }
         return client_v0::timeline_value(&state, &snapshot, &session, id, &query);
+    }
+    // Child transcripts are deliberately absent from the top-level session inventory.
+    // Resolve their resource by the same parent/task identity used by timeline reads.
+    let session_id = client_detail_id("session", &id);
+    if let Some(child) = crate::subagent_sessions::resolve_child(
+        state.native_session_home.as_deref(),
+        &session_id,
+    )
+    .map_err(ApiError::internal)?
+    {
+        return Ok(Json(external_session_resource(child)));
     }
     client_detail(
         client_session_resources(
@@ -15871,6 +15886,69 @@ mod tests {
     use std::path::PathBuf;
 
     #[tokio::test]
+    async fn child_session_detail_resolves_readable_transcript_outside_session_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("native");
+        let transcript = home.join(".omp/agent/sessions/example/native-test.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"native-test\",\"cwd\":\"/work/example\",\"timestamp\":\"2026-10-06T12:00:00Z\"}\n",
+                "{\"type\":\"message\",\"id\":\"parent-message\",\"timestamp\":\"2026-10-06T12:00:01Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"parent only\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        let child_transcript = transcript.with_extension("").join("task-1.jsonl");
+        std::fs::create_dir_all(child_transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &child_transcript,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"child\",\"cwd\":\"/work/example\",\"timestamp\":\"2026-10-06T12:01:00Z\"}\n",
+                "{\"type\":\"message\",\"id\":\"child-message\",\"timestamp\":\"2026-10-06T12:01:01Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"child only\"}]}}\n",
+            ),
+        )
+        .unwrap();
+        let parent = crate::external_sessions::discover(Some(&home), true)
+            .unwrap()
+            .sessions
+            .into_iter()
+            .find(|session| session.native_id == "native-test")
+            .unwrap();
+        let child_id = crate::subagent_sessions::child_session_id(&parent, "task-1");
+        let mut state = state(root.path());
+        state.native_session_home = Some(home);
+        let app = router(state);
+        let path = format!("/v1/client/sessions/{child_id}");
+        let (status, detail) = get_request(app.clone(), &path).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["id"], child_id);
+        assert_eq!(detail["kind"], "session");
+        assert_eq!(detail["managed"], false);
+        assert_eq!(detail["driver"], "omp");
+        assert_eq!(detail["native_session_id"], "native-test/task-1");
+        assert_eq!(detail["workspace"], "/work/example");
+        assert_eq!(detail["title"], "native-test · task-1");
+        assert_eq!(detail["owner_id"], "external-session/omp/native-test/task-1");
+        assert_eq!(detail["state"], "completed");
+        assert_eq!(detail["updated_at"], detail["ended_at"]);
+        assert!(detail["started_at"].as_str().is_some());
+        assert!(detail["updated_at"].as_str().is_some());
+        let (status, timeline) = get_request(app.clone(), &format!("{path}/timeline")).await;
+        assert_eq!(status, StatusCode::OK, "{timeline}");
+        assert_eq!(timeline["session_id"], child_id);
+        assert!(
+            timeline["items"].as_array().unwrap().iter().any(|item| {
+                item["body"]["text"] == "child only"
+            }),
+            "{timeline}"
+        );
+        std::fs::remove_file(child_transcript).unwrap();
+        let (status, missing) = get_request(app, &path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+    }
+
+    #[tokio::test]
     async fn resources_page_keeps_rows_when_sync_forecast_is_unrepresentable() {
         use smallclaims::replication::MAX_SAFE_DURATION_SECONDS;
         use smallclaims::store::PeerSyncProgress;
@@ -18734,9 +18812,14 @@ condition "fleet/disk" {
         let envelope: Value = serde_json::from_slice(&bytes).unwrap();
         if path.starts_with("/v1/client/") {
             assert_eq!(envelope["api_version"], "st3.client.v0");
-            assert_eq!(envelope["snapshot"]["host_id"], "host/node");
             assert!(envelope["request_id"].as_str().unwrap().contains('-'));
-            assert!(envelope["snapshot"]["store_index"].is_u64());
+            if status.is_success() {
+                assert_eq!(envelope["snapshot"]["host_id"], "host/node");
+                assert!(envelope["snapshot"]["store_index"].is_u64());
+            } else {
+                assert_eq!(envelope["error_version"], "st3.client.error.v0");
+                assert!(envelope["code"].as_str().is_some());
+            }
         } else {
             assert_eq!(envelope["api_version"], "st3.v1");
             assert_eq!(envelope["snapshot_host"], "node");

@@ -453,7 +453,7 @@ public struct TimelineEntry: Codable, Sendable, Identifiable {
         switch body { case .message(let value): try values.encode(value, forKey: .body); case .content(let value): try values.encode(value, forKey: .body); case .toolCall(let value): try values.encode(value, forKey: .body); case .toolResult(let value): try values.encode(value, forKey: .body); case .status(let value): try values.encode(value, forKey: .body); case .error(let value): try values.encode(value, forKey: .body); case .usage(let value): try values.encode(value, forKey: .body); case .redaction(let value): try values.encode(value, forKey: .body); case .truncation(let value): try values.encode(value, forKey: .body) }
     }
 }
-public struct TimelinePage: Codable, Sendable { public let kind: String; public let sessionID: String; public let items: [TimelineEntry]; public let page: PageInfo; enum CodingKeys: String, CodingKey { case kind, sessionID = "session_id", items, page } }
+public struct TimelinePage: Codable, Sendable { public let kind: String; public let sessionID: String; public let items: [TimelineEntry]; public let page: PageInfo; public let header: JSONValue?; enum CodingKeys: String, CodingKey { case kind, sessionID = "session_id", items, page, header } }
 public struct ConversationSearchHit: Codable, Sendable {
     public let conversationID: String
     public let entryID: String
@@ -473,7 +473,7 @@ public struct ConversationSearch: Codable, Sendable {
     public let refreshing: Bool
     enum CodingKeys: String, CodingKey { case kind, items, page, indexedAt = "indexed_at", hostID = "host_id", incompleteSources = "incomplete_sources", refreshing }
 }
-public struct ConversationChanges: Codable, Sendable { public let kind: String; public let sessionID: String; public let items: [TimelineEntry]; public let nextCursor: String; enum CodingKeys: String, CodingKey { case kind, sessionID = "session_id", items, nextCursor = "next_cursor" } }
+public struct ConversationChanges: Codable, Sendable { public let kind: String; public let sessionID: String; public let items: [TimelineEntry]; public let nextCursor: String; public let header: JSONValue?; enum CodingKeys: String, CodingKey { case kind, sessionID = "session_id", items, nextCursor = "next_cursor", header } }
 public struct ProjectionEvent: Codable, Sendable, Identifiable { public let id: String; public let epoch: String; public let sequence: UInt64; public let previousCursor: String; public let nextCursor: String; public let timestamp: String; public let type: String; public let resourceIDs: [String]; public let snapshotID: String; public let body: [String: JSONValue]; enum CodingKeys: String, CodingKey { case id, epoch, sequence, previousCursor = "previous_cursor", nextCursor = "next_cursor", timestamp, type, resourceIDs = "resource_ids", snapshotID = "snapshot_id", body } }
 public struct EventPage: Codable, Sendable { public let kind: String; public let oldestCursor: String; public let resumeCursor: String; public let items: [ProjectionEvent]; public let hasMore: Bool; enum CodingKeys: String, CodingKey { case kind, oldestCursor = "oldest_cursor", resumeCursor = "resume_cursor", items, hasMore = "has_more" } }
 
@@ -766,8 +766,8 @@ public struct ArrangementCollectionFrame: Codable, Sendable {
 
 public struct TimelineBlock: Codable, Sendable {
     public let id: String; public let kind: String; public let sourceType: String
-    public let payload: JSONValue; public let visibility: String?; public let metadata: JSONValue?; public let continuation: ConversationContentRef?
-    enum CodingKeys: String, CodingKey { case id, kind, sourceType = "source_type", payload, visibility, metadata, continuation }
+    public let payload: JSONValue; public let visibility: String?; public let metadata: JSONValue?; public let view: JSONValue?; public let continuation: ConversationContentRef?
+    enum CodingKeys: String, CodingKey { case id, kind, sourceType = "source_type", payload, visibility, metadata, view, continuation }
 }
 public struct ConversationContentRef: Codable, Sendable {
     public let ref: String; public let mediaType: String; public let size: UInt64?; public let reason: String?
