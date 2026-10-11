@@ -32,7 +32,41 @@ static METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
 pub fn export_enabled() -> bool {
+    #[cfg(test)]
+    if TEST_EXPORT_ENABLED.get() { return true; }
     EXPORT_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_EXPORT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn capture_test_spans(work: impl FnOnce()) -> Vec<opentelemetry_sdk::trace::SpanData> {
+    use opentelemetry::trace::TracerProvider as _;
+    #[derive(Clone, Debug)]
+    struct Exporter(std::sync::mpsc::Sender<Vec<opentelemetry_sdk::trace::SpanData>>);
+    impl opentelemetry_sdk::trace::SpanExporter for Exporter {
+        async fn export(&self, batch: Vec<opentelemetry_sdk::trace::SpanData>) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.send(batch).expect("the capture receiver stays open");
+            Ok(())
+        }
+    }
+    struct Enabled;
+    impl Drop for Enabled {
+        fn drop(&mut self) { TEST_EXPORT_ENABLED.set(false); }
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let exporter = Exporter(sender);
+    let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("st3.test")));
+    TEST_EXPORT_ENABLED.set(true);
+    let _enabled = Enabled;
+    tracing::subscriber::with_default(subscriber, work);
+    provider.force_flush().unwrap();
+    receiver.try_iter().flatten().collect()
 }
 
 /// Whether a meter provider was installed. Independent of trace export: the RED metrics
@@ -215,6 +249,8 @@ const DURATION_BUCKET_BOUNDARIES: [f64; 14] = [
 fn duration_view(instrument: &Instrument) -> Option<Stream> {
     if instrument.unit() != "s"
         || instrument.kind() != opentelemetry_sdk::metrics::InstrumentKind::Histogram
+        // Startup owns longer, explicit boundaries rather than the request-duration view.
+        || instrument.name() == "st.startup.duration"
     {
         return None;
     }
@@ -228,8 +264,8 @@ fn duration_view(instrument: &Instrument) -> Option<Stream> {
     Some(stream.build().expect("seconds histogram view is valid"))
 }
 
-/// The request-duration histogram instrument, so every second-bucketed histogram shares
-/// the st2 view (30 s and 60 s buckets included for long-polls and replay).
+/// The request-duration histogram shares the st2 view (30 s and 60 s buckets
+/// included for long-polls and replay); startup owns its longer bucket range.
 const HTTP_SERVER_DURATION_INSTRUMENT: &str = "http.server.request.duration";
 
 /// O11Y-R14 active-series budget for the request-duration histogram. The raw label
@@ -254,8 +290,8 @@ impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
 
 /// The remote span context from `traceparent`/`tracestate`, or an empty context when the
 /// caller sent none: the request span is then a local root.
-/// Server roots record a valid parent's sampled flag as `st.parent.sampled` for the
-/// collector policy; AlwaysOn exports requests even when that flag is false.
+/// Server roots record external sampled parents as `st.parent.sampled` for the collector
+/// policy; st-marked parents record false. AlwaysOn exports either way.
 pub fn extract_remote_context(headers: &axum::http::HeaderMap) -> opentelemetry::Context {
     opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&HeaderExtractor(headers))
@@ -447,6 +483,9 @@ impl Telemetry {
                         .build();
                     opentelemetry::global::set_meter_provider(provider.clone());
                     METRICS_ENABLED.store(true, Ordering::Relaxed);
+                    if matches!(unit, Unit::Daemon) {
+                        crate::reconcile_telemetry::init();
+                    }
                     telemetry.meter_provider = Some(provider);
                 }
                 Err(error) => {
@@ -515,6 +554,9 @@ impl Telemetry {
             installed && telemetry.tracer_provider.is_some(),
             Ordering::Relaxed,
         );
+        if matches!(unit, Unit::ReplicationWorker) {
+            smallclaims::sync::telemetry::init(export_enabled(), crate::otel::metrics_enabled());
+        }
         telemetry
     }
 
@@ -526,6 +568,7 @@ impl Telemetry {
     pub fn shutdown(&mut self) {
         EXPORT_ENABLED.store(false, Ordering::Relaxed);
         METRICS_ENABLED.store(false, Ordering::Relaxed);
+        smallclaims::sync::telemetry::init(false, false);
         let tracer = self.tracer_provider.take();
         let meter = self.meter_provider.take();
         let logger = self.logger_provider.take();

@@ -52,7 +52,7 @@ serde_json = "1"
 sha2 = "0.10"
 smallclaims = { path = "../smallclaims" }
 st-runtime = { path = "../st-runtime" }
-st3-client = { path = "../st3-client" }
+st3-client = { path = "../st3-client", features = ["trace-propagation"] }
 st3-terminal-direct = { path = "../st3-terminal-direct" }
 st3-ui-model = { path = "../st3-ui-model" }
 st3-conversation-ui = { path = "../st3-conversation-ui", features = ["ratatui"] }

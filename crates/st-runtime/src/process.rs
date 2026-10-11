@@ -278,23 +278,7 @@ impl ExecRuntime {
                 ),
             }
         }
-        signal_group(id, generation.pid, signal)?;
-        if signal == libc::SIGKILL {
-            // Do not wait for reaping here. The next observation decides whether teardown
-            // finished; this one scan reports a group that still has executing members.
-            match process_group_is_live(generation.pid) {
-                Ok(true) => eprintln!(
-                    "st3: WARN exec {id}'s process group {} still has live members immediately after SIGKILL",
-                    generation.pid
-                ),
-                Ok(false) => {}
-                Err(error) => eprintln!(
-                    "st3: WARN exec {id}'s process group {} could not be checked after SIGKILL: {error:#}",
-                    generation.pid
-                ),
-            }
-        }
-        Ok(())
+        signal_group(id, generation.pid, signal)
     }
 
     pub fn signal_if(

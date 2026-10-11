@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Use a non-retaining serialized-byte counter in private output batch controls",
+  "replay": {
+    "status": "none",
+    "detail": "Private cfg(test) prototype and authored controls only; shipped SQL, schema, ownership, timeline, events, runtime adapters and public contracts unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Private cfg(test) prototype and authored controls only; shipped SQL, schema, ownership, timeline, events, runtime adapters and public contracts unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Private cfg(test) prototype and authored controls only; shipped SQL, schema, ownership, timeline, events, runtime adapters and public contracts unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Private cfg(test) prototype and authored controls only; shipped SQL, schema, ownership, timeline, events, runtime adapters and public contracts unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Private cfg(test) prototype and authored controls only; shipped SQL, schema, ownership, timeline, events, runtime adapters and public contracts unchanged."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Private cfg(test) prototype and authored controls only; shipped SQL, schema, ownership, timeline, events, runtime adapters and public contracts unchanged."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Private cfg(test) prototype and authored controls only; shipped SQL, schema, ownership, timeline, events, runtime adapters and public contracts unchanged."
+  }
+}

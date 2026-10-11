@@ -58,7 +58,7 @@
               "pty-core-0.13.0-rust" = pty.narHash;
             };
           };
-        hmModuleEval = nixpkgs.lib.evalModules {
+        mkHmModuleEval = extraConfig: nixpkgs.lib.evalModules {
           specialArgs = {
             inherit pkgs;
             lib = pkgs.lib // {
@@ -86,10 +86,11 @@
                 socket = "/tmp/smalltalk-test.sock";
                 ptyPackage = ptyPackage;
                 declarations.seats = [ ./examples/st3/seats/claude.kdl ];
-              };
+              } // extraConfig;
             })
           ];
         };
+        hmModuleEval = mkHmModuleEval { };
         providerRustToolchain = fenix.packages.${system}.combine [
           fenix.packages.${system}.stable.cargo
           fenix.packages.${system}.stable.rustc
@@ -880,6 +881,54 @@
           assert (!pkgs.stdenv.hostPlatform.isLinux)
             || rendered.systemd.user.services.smalltalk.Service.MemoryMax == "8G";
           pkgs.runCommand "smalltalk-hm-module-eval" { } "touch $out";
+        checks.hm-module-external-binary-eval =
+          let
+            executable = "/opt/smalltalk/bin/st3";
+            externalConfig = { binary.path = executable; };
+            rendered = (mkHmModuleEval externalConfig).config;
+            successor = (mkHmModuleEval (externalConfig // {
+              package = pkgs.emptyDirectory;
+              ptyPackage = null;
+            })).config;
+            units = config: builtins.toJSON {
+              inherit (config.systemd.user) services;
+              inherit (config.launchd) agents;
+            };
+            unitText = units rendered;
+            forbiddenPaths = map (package: builtins.unsafeDiscardStringContext (toString package)) [
+              rendered.services.smalltalk.package
+              rendered.services.smalltalk.ptyPackage
+              (builtins.head hmModuleEval.config.home.packages)
+            ];
+            applyScript = if pkgs.stdenv.hostPlatform.isLinux then
+              rendered.systemd.user.services.smalltalk-apply.Service.ExecStart
+            else
+              builtins.head rendered.launchd.agents.smalltalk-apply.config.ProgramArguments;
+            args = if pkgs.stdenv.hostPlatform.isLinux then
+              rendered.systemd.user.services.smalltalk.Service.ExecStart
+            else
+              builtins.concatStringsSep " " rendered.launchd.agents.smalltalk.config.ProgramArguments;
+          in
+          assert rendered.home.packages == [ ];
+          assert !(rendered.home.activation ? smalltalkBinary);
+          assert builtins.all (path: !(pkgs.lib.hasInfix path unitText)) forbiddenPaths;
+          assert !(pkgs.lib.hasInfix "X-Restart-Triggers" unitText);
+          assert !(pkgs.lib.hasInfix "SMALLTALK_PACKAGE" unitText);
+          assert pkgs.lib.hasInfix executable args;
+          assert pkgs.lib.hasInfix "${builtins.dirOf executable}/pty" args;
+          # Includes the declaration wrapper's store path: neither it nor a unit
+          # may change when the unused st3 or PTY package changes.
+          assert unitText == units successor;
+          pkgs.runCommand "smalltalk-hm-module-external-binary-eval" { } ''
+            ${pkgs.gnugrep}/bin/grep -F -- ${pkgs.lib.escapeShellArg executable} ${applyScript}
+            for package in ${pkgs.lib.escapeShellArgs forbiddenPaths}; do
+              if ${pkgs.gnugrep}/bin/grep -F -- "$package" ${applyScript}; then
+                echo "Declaration wrapper references a Home Manager-owned package" >&2
+                exit 1
+              fi
+            done
+            touch $out
+          '';
         checks.wasm-resolver-feature = st2WasmResolver;
         checks.wasip2-resource-providers = st2ProviderRuntime;
         checks.provider-components = st2ProviderComponents;
