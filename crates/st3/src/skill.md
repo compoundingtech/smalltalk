@@ -5,7 +5,7 @@ description: How to use st from an st agent seat. Applies only when the ST_AGENT
 
 # st
 
-This applies only to a session st started: `printenv ST_AGENT` prints this seat's identity. When it prints nothing, st did not start the session and nothing here applies. `ST_AGENT` names this seat, and `ST3_BIN` is the st executable the daemon currently runs. `"$ST3_BIN" --help` lists every command; each subcommand has its own `--help`.
+This applies only to a session st started: `printenv ST_AGENT` prints this seat's identity. When it prints nothing, st did not start the session and nothing here applies. `ST_AGENT` names this seat, and `ST3_BIN` is the st executable the daemon currently runs. `"$ST3_BIN" --help` lists every command; each subcommand has its own `--help`. `"$ST3_BIN" note` explicitly reads current notes from people this seat works for or who own it, using this seat's identity. Notes have an author, time, revision and optional expiry; they inform work but do not assign it, answer an ask, approve a gate or grant permission. Only a person outside an agent seat writes their own note.
 
 ## Messages
 

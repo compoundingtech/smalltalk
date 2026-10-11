@@ -34,6 +34,43 @@ The collections socket's `CollectionCommand` and `CollectionFrame` definitions l
 schema as HTTP resources. The operation manifest's `streams` section names its route, protocol,
 command/frame definitions, and subscription bound; see [collections](collections.md).
 
+### Person directive notes
+
+`GET /v1/client/notes` requires `read.projections` and an identified person or
+agent. The response is `DirectiveNotes`, not a work item, message, private glass
+or delegation: each entry has `person`, `author`, `time`, `text`, `revision` and
+optional `expires_at`. A person reads their own note. An agent reads only notes
+of people it works for or who own it, using current declaration/account ownership
+and mission requesters. Missing relationships fail closed; there is no fleet-wide
+note listing. A query `actor`, if supplied, must match the authenticated authority.
+Anonymous Unix clients cannot select an actor merely through a query parameter.
+Ownership walks stop after 16 hops. Current-work relationships use indexed,
+bounded reads; more than 64 distinct source rows fail explicitly rather than
+silently omitting notes or reporting that no note exists.
+
+The generated Rust `notes_list`, Swift `notesList` and TypeScript `notesList`
+methods use the identified local session or the paired person's read authority.
+The [wire fixture](fixtures/directive-notes.json) shows the current value. Clear
+and expiry both remove a note from reads; edits replace the current note.
+Operational repairs exclude the repaired original from current-note selection,
+even when its immutable claim row remains retained. Incremental reads and full
+replay both select the latest unrepaired revision.
+The text is advisory only: no approval, gate, ask or assignment reads it as evidence.
+The daemon cost suite measures both the populated read and a real person-authenticated
+PUT replacement over Unix transport at two generated store sizes. Its fixture passes
+anchored membership and active-peer advertisements rather than measuring a refused write.
+
+The trusted local CLI writes with `PUT /v1/notes`, using a concrete person identity
+and a body containing that same `person` and `actor`, nullable `text`, and optional
+`expires_at`. Agents and paired-client delegated writes are refused. Text is
+nonblank and bounded to 4096 UTF-8 bytes. The replicated claim
+`person.directive-note-set` is admitted only with its person as author. Publication
+requires anchored fleet membership and `person_directive_note` version 1
+advertisement from every active member. Pending unsigned local membership changes
+also block publication until the replication writer seals them. Fence legacy
+peers before enabling notes: advertisements do not discover unknown legacy peers.
+Launch delivery, change notifications, and UI authoring are outside this read-path slice.
+
 ### Phone observations
 
 Paired sessions can send bounded disjoint UTC minute diagnostics with

@@ -77,6 +77,22 @@ st conversations send agent/garden/worker --from person/ada \
 
 Attachments are fetched by the member that reads or delivers the message. Ordinary workspace files do not replicate; put longer text in a graph document or a repository and send its reference. See [message examples](../examples/st3/SEND-A-MESSAGE-PROPERLY.md).
 
+## Keep a current person note
+
+Use a note for bounded context that the agents you own or work with can explicitly read:
+
+```sh
+st note
+st note set 'Prefer a small reviewed change over a broad rewrite.' --expires-at 2099-01-01T00:00:00Z
+st note clear
+```
+
+The actor defaults to your configured person outside a harness and the harness identity inside one; `--actor person/ada` makes a human read explicit. Set and clear always target the resolved person's own note, not another person. Agents cannot set or clear notes or impersonate a person. Each note shows its author, time, optional UTC expiry and revision. Text must be nonblank and at most 4096 UTF-8 bytes; expired notes are absent.
+
+Notes inform, never assign work, approve a gate, answer an ask or grant authority. Use messages and missions for work and the actual approval or answer controls for decisions. This slice is explicit read-only delivery: no launch delivery, notifications or UI. CLI reads and writes use the authenticated trusted local Unix socket; this adds no new principal authentication system.
+
+Before publishing, fleet membership must be anchored and every active member must advertise `features.person_directive_note=1`. Fence legacy peers from replication before enabling notes: feature advertisement alone cannot prove that all legacy peers were discovered.
+
 ## Home shows your alerts
 
 An alert is anything that blocks or waits on you: an ask, a human gate, a launch or revision approval, or a harness prompt. Each alert belongs to the conversation of the agent behind it, and it clears itself when it is answered anywhere or its origin ends. Home lists your alerts, then information addressed to you (updates), which asks nothing and is not counted as an alert. An agent working normally does not need a Home card. Follow progress under **Missions** and talk under **Agents**; clearing a card does not erase its history.

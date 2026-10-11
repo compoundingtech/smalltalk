@@ -191,6 +191,7 @@ impl Runtime for SmalltalkRuntime {
         agent_messages::create_schema(connection)?;
         coordination::create_schema(connection)?;
         glass_heads::create_schema(connection)?;
+        directive_notes::create_schema(connection)?;
         limits::create_limits_schema(connection)?;
         if let Some(views) = &self.ivm_views {
             // Registered stores run this on every open; each view's schema hook must
@@ -225,6 +226,7 @@ impl Runtime for SmalltalkRuntime {
         custom::open(transaction)?;
         resources::open(transaction)?;
         glass_heads::open(transaction)?;
+        directive_notes::flush(transaction)?;
         agent_messages::open(transaction)?;
         arrangements::open(transaction)?;
         limits::open_limits(transaction)?;
@@ -342,6 +344,7 @@ impl Runtime for SmalltalkRuntime {
         custom::flush(transaction).map_err(internal)?;
         resources::flush(transaction).map_err(internal)?;
         glass_heads::flush(transaction).map_err(internal)?;
+        directive_notes::flush(transaction).map_err(internal)?;
         agent_messages::flush(transaction).map_err(internal)?;
         limits::flush_limits(transaction).map_err(internal)?;
         reapply_local_work_lease_renewals_tx(transaction)
@@ -444,7 +447,7 @@ impl Runtime for SmalltalkRuntime {
 /// at once rather than on the next read.
 const AGENT_ROSTER_READ_LATELY: std::time::Duration = std::time::Duration::from_secs(300);
 
-const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.arrangements.v2";
+const SHARED_PROJECTION_LAYOUT: &str = "st3.shared-projections.person-directive-notes.v1";
 
 /// The replication `schema_digest`: the claim vocabulary digest and the shared projection layout.
 pub(crate) fn compatibility_digest(registry_digest: &str) -> String {

@@ -734,6 +734,16 @@ async fn daemon_conversation_and_terminal_frames_conform_to_client_v0() {
 }
 
 #[test]
+fn directive_note_wire_fixture_conforms_to_typed_read_contract() {
+    let fixture = json(asset_root().join("fixtures/directive-notes.json"));
+    assert!(contract_validator("Envelope").is_valid(&fixture));
+    assert!(contract_validator("DirectiveNotes").is_valid(&fixture["value"]));
+    let mut invalid = fixture["value"].clone();
+    invalid["notes"][0]["author"] = serde_json::json!("agent/worker");
+    assert!(!contract_validator("DirectiveNotes").is_valid(&invalid));
+}
+
+#[test]
 fn manifest_names_existing_json_fixtures_and_schema_definitions() {
     let root = asset_root();
     let manifest = json(root.join("fixtures/manifest.json"));

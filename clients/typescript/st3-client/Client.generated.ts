@@ -2,7 +2,7 @@
 import { API_VERSION } from './Models.generated.ts';
 import type {
     ObservationReport, ObservationResponse, AgentDeclaration, Glass, GlassPut, GlassDelete, ActionOf, ActionRequest, ActionResult, AgentQueue, StatusHistory, BlobChunk, BlobUpload, Capabilities, DocumentContent, EnvelopeOf,
-    ResourcesFilter, ResourcesPage,
+    ResourcesFilter, ResourcesPage, DirectiveNotes,
     Arrangement, ArrangementId, ArrangementPage,
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationContentChunk, ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
@@ -429,6 +429,7 @@ export class St3Client {
         return response;
     }
 
+    async notesList(): Promise<EnvelopeOf<DirectiveNotes>> { return this.get('/v1/client/notes'); }
     async customSubjectsList(options: PageOptions & { kind?: string; version?: number } = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/custom-subjects' + query(options)); }
     async customSubjectsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/custom-subjects/${encodeURIComponent(routedId(id))}`); }
     async hostRepositories(id: string): Promise<EnvelopeOf<HostRepositories>> { return this.get(`/v1/client/hosts/${encodeURIComponent(routedId(id))}/repositories`); }

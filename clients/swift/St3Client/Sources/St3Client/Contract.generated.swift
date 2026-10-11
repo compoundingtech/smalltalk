@@ -61,6 +61,7 @@ public enum ActionType: String, Codable, CaseIterable, Sendable {
 }
 
 public enum ReadOperation: String, CaseIterable, Sendable {
+    case notesList = "notes.list"
     case customSubjectsList = "custom-subjects.list"
     case customSubjectsGet = "custom-subjects.get"
     case hostRepositories = "host.repositories"
@@ -124,6 +125,7 @@ public enum ReadOperation: String, CaseIterable, Sendable {
 }
 
 public let st3ClientReadPaths: [ReadOperation: String] = [
+    .notesList: "/v1/client/notes",
     .customSubjectsList: "/v1/client/custom-subjects",
     .customSubjectsGet: "/v1/client/custom-subjects/{id}",
     .hostRepositories: "/v1/client/hosts/{id}/repositories",

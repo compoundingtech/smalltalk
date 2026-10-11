@@ -56,6 +56,7 @@ use clap_complete::engine::ArgValueCompleter;
 use completion::{Complete, Entity, WorkFilter};
 
 mod cli_help;
+mod directive_note;
 mod completion;
 #[cfg(test)]
 mod follow_tests;
@@ -114,6 +115,8 @@ enum Command {
     Up(UpArgs),
     /// Understand what needs action now.
     Now(NowArgs),
+    /// Read current person notes; notes inform but never assign work or grant authority.
+    Note(directive_note::NoteArgs),
     /// Show token spend over a period, with the largest spenders first.
     Usage(UsageArgs),
     /// Inspect and control missions.
@@ -5169,6 +5172,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Admission { .. } => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
+        Command::Note(args) => {
+            directive_note::run(&endpoint, config.person.as_deref(), args, cli.json).await
+        }
         Command::Usage(args) => run_usage(&immediate, args, cli.json).await,
         Command::Launch { command } => {
             run_launch(&client, &endpoint, command, &config.planner, cli.json).await
@@ -6158,7 +6164,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         fields: BTreeMap::from([
             (
                 "features".into(),
-                serde_json::json!({"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1}),
+                serde_json::json!({"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1,"person_directive_note":1}),
             ),
             ("status".into(), Value::String("running".into())),
             ("pid".into(), Value::from(std::process::id())),

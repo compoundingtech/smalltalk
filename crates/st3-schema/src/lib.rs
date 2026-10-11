@@ -2,6 +2,7 @@
 
 pub mod arrangements;
 pub mod custom;
+pub mod directive_notes;
 pub mod glasses;
 pub mod owned_terminals;
 pub mod provenance;
@@ -211,6 +212,8 @@ impl Retention {
 pub struct FieldSpec {
     pub value_type: ValueType,
     pub required: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nullable: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub values: Vec<String>,
     #[serde(default)]
@@ -335,6 +338,7 @@ impl Registry {
         }
         output.push_str("\n`resource.observed` validates facts against the resource kind. Custom resource facts remain open.\n");
         output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.\n");
+        output.push_str("\n## Current person directive notes\n\n`person.directive-note-set` records the subject person's current context on `person/NAME`. Only that exact person may set or clear it, including replicated admission. Required `text` is null to clear, or nonblank text of at most 4096 UTF-8 bytes; optional `expires_at` is a valid RFC 3339 UTC timestamp. The canonical latest claim selects the current revision, with its actor as author and accepted time as creation time. A clear or expired revision hides every earlier note.\n\nNotes inform and never grant approval, gate verdicts, delegation, or person-ask answers. A person reads only their own note. An agent reads the union of known account owners, declaration authorship chains and mission-run requesters it works for; missing or cyclic ownership does not select a global operator. Ownership walks stop at 16 hops, and oversized relation sets fail closed. Exact person-key lookups read a current projection that retains clear and expired tombstones; immutable claims remain authoritative. Projection creation does not backfill existing history during migration.\n\nPublication requires anchored membership and `features.person_directive_note=1` on the latest own-origin `daemon.started` for every active member. Known unfenced legacy writers also prevent publication. Advertisements cannot prove discovery of every legacy peer: fence legacy peers from replication before enabling notes.\n");
         output.push_str("\n## Harness todo snapshots\n\n`harness.todo.observed` replaces the entire seat todo list. Session and incarnation identify its source; `observed_at` is source timestamp provenance, not an ordering clock. Keep the last snapshot until replaced, and expose stale provenance rather than presenting an old binding as current. Missing means unobserved; `phases: []`, zero totals and `truncated: false` means known empty.\n\nEach phase has `name` and `tasks`; each task has `content`, `status` (`pending`, `in_progress`, `completed`, `blocked`) and optional string `blocker`. The shared phase/task shape can also represent a future plan with one unnamed phase. Bounds are 16 phases, 100 tasks total, 128 UTF-8 bytes per phase name and 512 per content/blocker. Producers shorten at UTF-8 boundaries and omit trailing tasks/phases in source order to keep serialized claim fields within 64 KiB (including JSON escaping). Bound-driven shortening or omission sets `truncated`. `totals` contains nonnegative integer counts for all four statuses from the full source: counts equal the visible list when not truncated and cannot be less than visible counts when truncated. Unknown nested fields, invalid statuses, null blockers and oversized fields are rejected.\n");
         output.push_str("\nOMP's native `abandoned` tasks are omitted from phase tasks rather than relabeled as completed. Their enclosing phase is preserved when it fits. `totals.abandoned` counts these dropped tasks separately; it is optional on the wire and defaults to zero when absent. Totals for the four task statuses count the full source snapshot and exclude abandoned tasks from active progress. Dropping an abandoned task does not set `truncated`; that flag describes text/list/serialized-size bounds only. The OMP producer always emits the abandoned count and reserves 4 KiB of the serialized-fields budget for authenticated provenance.\n");
         output.push('\n');
@@ -488,6 +492,9 @@ impl Registry {
                 self.validate_reference(kind, name, value, field)?;
             }
         }
+        if kind == directive_notes::KIND {
+            directive_notes::validate_fields(fields)?;
+        }
         if kind == "mission.provenance" {
             provenance::validate_claim(subject, fields)?;
         }
@@ -608,6 +615,7 @@ impl Registry {
     ) -> Result<&ClaimSpec, ValidationError> {
         let spec = self.validate_claim(subject, kind, fields)?;
         arrangements::validate_actor(subject, actor)?;
+        directive_notes::validate_actor(subject, kind, actor)?;
         let allowed = spec.write_policy == WritePolicy::OrdinaryClient
             || (spec.write_policy == WritePolicy::SameSubjectActor && actor == Some(subject));
         if !allowed {
@@ -647,6 +655,7 @@ fn field_summary(fields: &BTreeMap<String, FieldSpec>) -> String {
         .iter()
         .map(|(name, spec)| {
             let required = if spec.required { "!" } else { "" };
+            let nullable = if spec.nullable { " or null" } else { "" };
             let immutable = if spec.immutable { " immutable" } else { "" };
             let value_type = enum_label(&spec.value_type);
             let value_type = if spec.reference_families.is_empty() {
@@ -654,7 +663,7 @@ fn field_summary(fields: &BTreeMap<String, FieldSpec>) -> String {
             } else {
                 format!("{value_type}({})", spec.reference_families.join("|"))
             };
-            format!("`{name}{required}:{value_type}{immutable}`",)
+            format!("`{name}{required}:{value_type}{nullable}{immutable}`",)
         })
         .collect::<Vec<_>>()
         .join(", ")
@@ -692,7 +701,7 @@ fn validate_value(
     value: &Value,
     field: &FieldSpec,
 ) -> Result<(), ValidationError> {
-    if value.is_null() && !field.required {
+    if value.is_null() && (!field.required || field.nullable) {
         return Ok(());
     }
     let valid = match field.value_type {
@@ -1176,6 +1185,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             WritePolicy::SameSubjectActor,
             Cardinality::StateTransition,
             None,
+            false,
+            &[],
+        ),
+        (
+            directive_notes::KIND,
+            &["person"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::StateTransition,
+            Some("directive-notes"),
             false,
             &[],
         ),
@@ -2526,6 +2544,10 @@ fn claim_retention(kind: &str) -> Retention {
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
     let names: &[(&str, FieldSpec)] = match kind {
         "person.delegation-set" => &[("actions", required_array())],
+        directive_notes::KIND => &[
+            ("text", FieldSpec { required: true, nullable: true, ..string() }),
+            ("expires_at", string()),
+        ],
         "workspace.observed" => &[
             ("host", required_string()),
             ("workspace", required_string()),
@@ -3751,6 +3773,7 @@ fn field(value_type: ValueType) -> FieldSpec {
     FieldSpec {
         value_type,
         required: false,
+        nullable: false,
         values: Vec::new(),
         immutable: false,
         reference: false,
@@ -4166,6 +4189,7 @@ mod tests {
                 "operational.recovered",
                 "owned-set.revised",
                 "person.delegation-set",
+                "person.directive-note-set",
                 "planning-session.approved",
                 "planning-session.cancelled",
                 "planning-session.candidate-submitted",

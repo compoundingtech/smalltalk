@@ -98,6 +98,7 @@
 "operational.recovered" = { class = "transition", window = "7d", pending = "no reader audit yet" }
 "owned-set.revised" = { class = "durable" }
 "person.delegation-set" = { class = "durable" }
+"person.directive-note-set" = { class = "durable" }
 "planning-session.approved" = { class = "durable" }
 "planning-session.cancelled" = { class = "durable" }
 "planning-session.candidate-submitted" = { class = "durable" }

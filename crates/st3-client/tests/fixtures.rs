@@ -16,6 +16,22 @@ fn decode<T: serde::de::DeserializeOwned>(name: &str) -> T {
     serde_json::from_slice(&fixture(name)).unwrap_or_else(|error| panic!("decode {name}: {error}"))
 }
 #[test]
+fn directive_notes_preserve_author_time_expiry_and_clear_as_empty() {
+    let wire: Envelope<DirectiveNotes> = decode("directive-notes.json");
+    let note = &wire.value.notes[0];
+    assert_eq!(note.person, "person/ada");
+    assert_eq!(note.author, note.person);
+    assert_eq!(note.time, "2026-10-10T09:00:00Z");
+    assert_eq!(note.expires_at.as_deref(), Some("2026-10-12T09:00:00Z"));
+    assert_eq!(note.revision, "claim/example");
+    let empty: DirectiveNotes = serde_json::from_value(serde_json::json!({"notes":[]})).unwrap();
+    assert!(empty.notes.is_empty());
+    let mut without_expiry = serde_json::to_value(note).unwrap();
+    without_expiry.as_object_mut().unwrap().remove("expires_at");
+    assert!(serde_json::from_value::<DirectiveNote>(without_expiry).unwrap().expires_at.is_none());
+}
+
+#[test]
 fn agent_lifecycle_future_value_keeps_the_roster_row() {
     let row = serde_json::json!({
         "kind": "agent", "id": "agent/example", "revision": "r1",

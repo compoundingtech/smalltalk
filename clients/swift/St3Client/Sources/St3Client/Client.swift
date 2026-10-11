@@ -179,6 +179,7 @@ public actor St3Client {
             if UInt64(whole.count) >= chunk.size { return whole }
         }
     }
+    public func notesList() async throws -> Envelope<DirectiveNotes> { try await get("v1/client/notes") }
     public func customSubjectsList(kind: String? = nil, version: Int? = nil, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ResourcePage> { var query: [URLQueryItem] = []; if let kind { query.append(.init(name: "kind", value: kind)) }; if let version { query.append(.init(name: "version", value: String(version))) }; if let cursor { query.append(.init(name: "cursor", value: cursor)) }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; return try await get("v1/client/custom-subjects", query: query) }
     public func customSubjectsGet(id: String) async throws -> Envelope<Resource> { try await resource("custom-subjects", id: id) }
     public func hostRepositories(id: String) async throws -> Envelope<HostRepositories> { try await get("v1/client/hosts/\(id)/repositories") }

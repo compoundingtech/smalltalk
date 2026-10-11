@@ -1517,6 +1517,9 @@ impl Client {
         .await
     }
 
+    pub async fn notes_list(&self) -> Result<Envelope<DirectiveNotes>, ClientError> {
+        self.get("/v1/client/notes").await
+    }
     pub async fn custom_subjects_list(
         &self,
         kind: Option<&str>,

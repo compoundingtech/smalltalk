@@ -102,6 +102,16 @@ overflow becomes visible when a slot opens. Deleted IDs remain retired.
 Historical snapshot reads retain the claim fold, as do reads while projection work is pending.
 Latest eligibility and pinned-head retrieval share one SQL snapshot so a concurrent append
 cannot leak a later head into an earlier `through` snapshot. Durable glass claims are not pruned.
+### Current person directive note heads
+
+`person_directive_notes` is a shared, rebuildable person-keyed projection of the
+latest unrepaired note revision, including clear and expired tombstones. Its
+complete logical row, including canonical head-key bytes, participates in production
+digests and shuffled-arrival/restart/replay comparisons. The audit fixture writes
+a real note revision and exercises digest coverage for every projected column.
+`local_directive_note_pending` and `local_directive_note_dirty` are local disposable
+work queues, not replicated projection outcomes.
+
 ### Arrangement heads added after the baseline audit
 
 Person arrangements are shared claim-derived projections, not local sidebar caches.

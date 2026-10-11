@@ -79,6 +79,7 @@ mod mailbox;
 mod mail_backlog;
 mod read_deadline;
 mod owned_sets;
+mod directive_notes;
 mod request_latency;
 mod client_observations;
 mod terminal_view;
@@ -497,6 +498,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route("/v1/client/notes", get(directive_notes::read))
+        .route("/v1/notes", axum::routing::put(directive_notes::write))
         .route("/v1/client/sets", get(owned_sets::list))
         .route("/v1/client/sets/{*id}", get(owned_sets::get))
         .route("/v1/client/arrangements", get(client_v0::arrangements::list))
@@ -6607,7 +6610,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "isolation": isolation_name(st_runtime::isolation_mode()),
         "store_index": state.store.index().map_err(ApiError::internal)?,
         "security": "trusted-network-no-tls-no-acls",
-        "features": {"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1,"bounded_legacy_events":1},
+        "features": {"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1,"bounded_legacy_events":1,"person_directive_note":1},
     })))
 }
 

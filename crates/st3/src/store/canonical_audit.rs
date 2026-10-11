@@ -11,6 +11,7 @@ const SHARED_TABLES: &[(&str, &[&str])] = &[
     ("message_index", &["created_index"]),
     ("resource_observations", &[]),
     ("glass_heads", &[]),
+    ("person_directive_notes", &[]),
     ("custom_registrations", &[]),
     ("custom_sources", &[]),
     ("custom_dependencies", &[]),
@@ -78,6 +79,8 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_resource_projection_pending",
         "local_glass_head_pending",
         "local_glass_head_dirty",
+        "local_directive_note_pending",
+        "local_directive_note_dirty",
         "local_custom_dirty",
         "graph_generation",
         "fleet_generation",
@@ -198,6 +201,7 @@ pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
                     if (*table == "blobs" && name == "bytes")
                         || (*table == "documents" && name == "binding_key")
                         || (*table == "glass_heads" && matches!(name.as_str(), "created_key" | "head_key"))
+                        || (*table == "person_directive_notes" && name == "head_key")
                         || (matches!(*table, "arrangements" | "arrangement_registers")
                             && name == "winner")
                     {
@@ -464,6 +468,12 @@ fn write_audit_history(source: &Store) {
         subject:"glass/person/ada/019a0000-0000-7000-8000-000000000001".into(), kind:"glass.upserted".into(), actor:Some("person/ada".into()),
         fields: serde_json::from_value(json!({"body":{"name":"Audit workspace","layout":{"tabs":[{"pane":"opaque:anything"}]}}, "base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None,
     }).unwrap();
+    source.connection.batched(|tx| -> Result<()> {
+        append_claim_record_tx(tx, &source.origin, "person/ada", st3_schema::directive_notes::KIND,
+            Some("person/ada"), &json!({"fields":{"text":"Audit current person context"}}), &[], None)?;
+        directive_notes::flush(tx)?;
+        Ok(())
+    }).unwrap().unwrap();
     source
         .append_claim(&ClaimInput {
             subject: "arrangement/person/ada/019a0000-0000-7000-8000-000000000001".into(),

@@ -1371,6 +1371,33 @@
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
     },
     {
+      "command": "st note",
+      "description": "Read current person notes without assigning work or granting authority",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::note_cli_round_trip_uses_configured_person_and_preserves_metadata",
+        "crates/st3/tests/client_v0_cli.rs::note_cli_harness_cannot_write_or_borrow_configured_person"
+      ],
+      "verification": "real CLI over private Unix socket; person-scoped JSON/human reads, clear/expiry, and harness identity refusal"
+    },
+    {
+      "command": "st note clear",
+      "description": "Clear the authenticated person's own current note",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::note_cli_round_trip_uses_configured_person_and_preserves_metadata",
+        "crates/st3/tests/client_v0_cli.rs::note_cli_harness_cannot_write_or_borrow_configured_person"
+      ],
+      "verification": "real CLI over private Unix socket; clear removes reads and harness writes are refused"
+    },
+    {
+      "command": "st note set",
+      "description": "Replace the authenticated person's own bounded note with optional expiry",
+      "tests": [
+        "crates/st3/tests/client_v0_cli.rs::note_cli_round_trip_uses_configured_person_and_preserves_metadata",
+        "crates/st3/tests/client_v0_cli.rs::note_cli_harness_cannot_write_or_borrow_configured_person"
+      ],
+      "verification": "real CLI over private Unix socket; replacement metadata, expiry and invalid inputs, with harness writes refused"
+    },
+    {
       "command": "st now",
       "description": "Understand what needs action now",
       "tests": [

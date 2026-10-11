@@ -10,6 +10,23 @@ pub const API_VERSION: &str = "st3.client.v0";
 pub const ERROR_VERSION: &str = "st3.client.error.v0";
 pub const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 
+/// Current advisory text, never an approval, grant, assignment or answer to an ask.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DirectiveNote {
+    pub person: String,
+    pub author: String,
+    pub time: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    pub revision: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DirectiveNotes {
+    pub notes: Vec<DirectiveNote>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Envelope<T> {
     pub api_version: String,
