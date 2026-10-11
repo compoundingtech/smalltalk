@@ -14,7 +14,7 @@ async fn cold_open_four_subscriptions_do_not_wait_for_slow_roster() {
     }).unwrap();
     // Hold the real store-wide cold-roster admission, not a mocked reader. Other
     // collections still use the production shared-window and SQLite snapshot path.
-    let slow_roster = state.store.admit_agent_resources().await;
+    let slow_roster = state.store.admit_agent_resources("other").await;
     let app = axum::Router::new().route("/stream", axum::routing::get(move |upgrade: WebSocketUpgrade| {
         let state = state.clone();
         async move {

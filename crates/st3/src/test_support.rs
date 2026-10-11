@@ -197,6 +197,33 @@ pub fn check_fixture_mailbox(store: &crate::store::Store, fence: &crate::mailbox
     store.check_mailbox(fence)
 }
 
+/// Drive real roster admission with isolated spans, without exposing a daemon control.
+pub async fn admit_fixture_roster(store: &crate::store::Store, class: &'static str) -> impl Send {
+    store.admit_agent_resources(class).await
+}
+
+/// Try the same labeled admission used by production multi-gate readers.
+pub fn try_admit_fixture_roster(
+    store: &crate::store::Store,
+    class: &'static str,
+) -> Option<impl Send> {
+    store.try_admit_agent_resources(class)
+}
+
+/// Force a synchronous holder handoff at the real waiter's enqueue boundary.
+pub async fn admit_fixture_roster_after_handoff(
+    store: &crate::store::Store,
+    class: &'static str,
+    before_enqueue: impl FnOnce(),
+) -> impl Send {
+    store.admit_agent_resources_before_enqueue(class, before_enqueue).await
+}
+
+/// Only this fixture thread records; production exporter state is not changed.
+pub fn roster_export_scope() -> impl Drop {
+    crate::otel::fixture_export_scope()
+}
+
 #[cfg(feature = "test-support")]
 type MailboxTransportControls = std::sync::Mutex<
     std::collections::BTreeMap<(usize, String), tokio::sync::watch::Sender<bool>>,

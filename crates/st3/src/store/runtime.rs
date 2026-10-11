@@ -36,6 +36,7 @@ pub struct SmalltalkRuntime {
     pub(crate) agent_page_refs_cache: Mutex<VecDeque<AgentResourcesEntry>>,
     /// Acquire before opening a SQLite snapshot, never while pinning a WAL read mark.
     pub(crate) agent_resources_admission: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) agent_resources_admission_state: Mutex<roster_admission::AdmissionState>,
     /// Set once a daemon keeps the complete roster published off the request path; readers
     /// wake it instead of folding cards themselves.
     pub(crate) agent_roster_refresh: std::sync::OnceLock<Arc<tokio::sync::Notify>>,

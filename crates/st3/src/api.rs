@@ -1142,7 +1142,8 @@ async fn response_envelope_unbounded(
             let server_trace = otel.clone();
             let forwarded_handler = request_path == crate::peer::CLIENT_READ_FORWARD_PATH;
             let remote = served_remote.clone();
-            match crate::api::read_deadline::spawn_handler(move || {
+            let roster_trace = (request_route == "/v1/client/agents").then(|| server_trace.clone()).flatten();
+            match crate::api::read_deadline::spawn_handler(roster_trace, move || {
                 diagnostic_queue.finish(crate::relay_trace::Outcome::Completed);
                 drop(handler_queue);
                 let queue_ms = handler_enqueued.elapsed().as_millis() as i64;
@@ -1249,63 +1250,76 @@ async fn response_envelope_unbounded(
         .extensions
         .remove::<ClientSnapshot>()
         .or(client_snapshot);
-    let raw = match to_bytes(body, usize::MAX).await {
-        Ok(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|error| {
-            json!({
-                "code": "invalid-server-json",
+    let bytes = to_bytes(body, usize::MAX).await;
+    let serialize = || {
+        let raw = match bytes {
+            Ok(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|error| {
+                json!({
+                    "code": "invalid-server-json",
+                    "message": error.to_string(),
+                })
+            }),
+            Err(error) => json!({
+                "code": "response-read-failed",
                 "message": error.to_string(),
+            }),
+        };
+        let store_index = if client_request {
+            client_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.store_index)
+                .unwrap_or_default()
+        } else {
+            // index() is an atomic load. Health must not queue behind blocking
+            // handlers just to decorate its response.
+            state.store.index().unwrap_or_default()
+        };
+        let envelope = if observation_report && status.is_success() {
+            // Local diagnostic acceptance, never a graph snapshot fence or action receipt.
+            json!({"api_version": CLIENT_API_VERSION, "request_id": request_id, "value": raw})
+        } else if client_request && status.is_success() {
+            json!({
+                "api_version": CLIENT_API_VERSION,
+                "request_id": request_id,
+                "snapshot": client_snapshot.expect("a successful client request has a snapshot"),
+                "value": raw,
             })
-        }),
-        Err(error) => json!({
-            "code": "response-read-failed",
-            "message": error.to_string(),
-        }),
+        } else if client_request {
+            client_error_envelope(status, &raw, &request_id)
+        } else if status.is_success() {
+            json!({
+                "api_version": "st3.v1",
+                "request_id": request_id,
+                "snapshot_host": state.node,
+                "store_index": store_index,
+                "value": raw,
+            })
+        } else {
+            json!({
+                "api_version": "st3.v1",
+                "request_id": request_id,
+                "snapshot_host": state.node,
+                "store_index": store_index,
+                "code": raw.get("code").and_then(Value::as_str).unwrap_or("request-failed"),
+                "message": raw.get("message").and_then(Value::as_str).unwrap_or("the request failed"),
+                "details": raw.get("details").cloned().unwrap_or_else(|| json!({})),
+            })
+        };
+        let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
+        (envelope, body)
     };
-    let store_index = if client_request {
-        client_snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.store_index)
-            .unwrap_or_default()
-    } else {
-        // index() is an atomic load. Health must not queue behind blocking
-        // handlers just to decorate its response.
-        state.store.index().unwrap_or_default()
+    // The agents roster's response parse, envelope and encoding are its serialization phase,
+    // attributed to the request's existing server span.
+    let (envelope, body) = match otel.as_ref().filter(|_| request_route == "/v1/client/agents") {
+        Some(server) => {
+            let _server = server.enter();
+            crate::otel::roster_scope(|| crate::otel::roster_phase("serialization", serialize))
+        }
+        None => serialize(),
     };
     if let Some(trace) = crate::relay_trace::current() {
         trace.response(&request_id);
     }
-    let envelope = if observation_report && status.is_success() {
-        // Local diagnostic acceptance, never a graph snapshot fence or action receipt.
-        json!({"api_version": CLIENT_API_VERSION, "request_id": request_id, "value": raw})
-    } else if client_request && status.is_success() {
-        json!({
-            "api_version": CLIENT_API_VERSION,
-            "request_id": request_id,
-            "snapshot": client_snapshot.expect("a successful client request has a snapshot"),
-            "value": raw,
-        })
-    } else if client_request {
-        client_error_envelope(status, &raw, &request_id)
-    } else if status.is_success() {
-        json!({
-            "api_version": "st3.v1",
-            "request_id": request_id,
-            "snapshot_host": state.node,
-            "store_index": store_index,
-            "value": raw,
-        })
-    } else {
-        json!({
-            "api_version": "st3.v1",
-            "request_id": request_id,
-            "snapshot_host": state.node,
-            "store_index": store_index,
-            "code": raw.get("code").and_then(Value::as_str).unwrap_or("request-failed"),
-            "message": raw.get("message").and_then(Value::as_str).unwrap_or("the request failed"),
-            "details": raw.get("details").cloned().unwrap_or_else(|| json!({})),
-        })
-    };
-    let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
     diagnostic_envelope.finish(if status.is_success() {
         crate::relay_trace::Outcome::Completed
     } else {
@@ -2568,69 +2582,74 @@ fn client_agent_page_refs(store: &Store, history: bool, index: u64) -> anyhow::R
 
 fn client_agent_page_refs_uncached(store: &Store, history: bool, index: u64) -> anyhow::Result<Vec<Value>> {
     let connection = store.readers.get();
-    let mut subjects = connection
-        .prepare_cached(crate::store::RANGE_SUBJECTS)?
-        .query_map(rusqlite::params![index, "agent/", "agent0"], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    if !history {
-        subjects = store.current_view_candidates(&connection, subjects, index, true)?;
-    }
-    let names = subjects.iter().cloned().collect::<Vec<_>>();
-    let desired = store
-        .desired_subjects_named(&names)?
-        .into_iter()
-        .map(|desired| (desired.subject.clone(), desired))
-        .collect::<BTreeMap<_, _>>();
-    let queues = store.agent_work_queues()?;
-    let steps = queues
-        .values()
-        .flat_map(|queue| {
-            queue
-                .current_work_ids
-                .iter()
-                .chain(queue.next_work_id.iter())
-                .chain(queue.upcoming_work_ids.iter())
-                .cloned()
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let labels = store.step_labels(&steps)?;
-    let label = |id: &String| {
-        labels.get(id).map(|step| json!({
-        "id":id, "mission_id":step.mission, "mission_run_id":step.run,
-        "path":step.path, "title":step.title, "goal":step.goal,
-        "state":client_work_state(&step.status), "since":client_timestamp(step.updated_at_unix_ms),
-    }))
-    };
-    let mut refs = subjects.into_iter().map(|id| {
-        let declaration = desired.get(&id);
-        let name = crate::model::effective_agent_name(&id, declaration.map(|d| &d.desired));
-        let queue = queues.get(&id).cloned().unwrap_or_default();
-        let mut reference = json!({
-            "id":id, "name":name,
-            "host_id":declaration.and_then(|d| d.member.as_ref()).map(|m| client_host_id(&m.host)),
-            "current_work_ids":queue.current_work_ids, "active_work_count":queue.active_work_count,
-            "next_work_id":queue.next_work_id, "upcoming_work_ids":queue.upcoming_work_ids,
-            "queued_work_count":queue.queued_work_count,
-            "current_work":queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
-            "next_work":queue.next_work_id.as_ref().and_then(label),
-            "upcoming_work":queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
-        });
-        if let Some(lifecycle) = crate::model::declared_agent_lifecycle(declaration.map(|d| &d.desired)) {
-            reference["lifecycle"] = json!(lifecycle);
+    let (subjects, desired) = crate::otel::roster_phase("membership", || -> anyhow::Result<_> {
+        let mut subjects = connection
+            .prepare_cached(crate::store::RANGE_SUBJECTS)?
+            .query_map(rusqlite::params![index, "agent/", "agent0"], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if !history {
+            subjects = store.current_view_candidates(&connection, subjects, index, true)?;
         }
-        reference
-    }).collect::<Vec<_>>();
-    refs.sort_by(|a, b| {
-        a["name"]
-            .as_str()
-            .cmp(&b["name"].as_str())
-            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
-    });
-    Ok(refs)
+        let names = subjects.iter().cloned().collect::<Vec<_>>();
+        let desired = store
+            .desired_subjects_named(&names)?
+            .into_iter()
+            .map(|desired| (desired.subject.clone(), desired))
+            .collect::<BTreeMap<_, _>>();
+        Ok((subjects, desired))
+    })?;
+    crate::otel::roster_phase("queue_selection", || -> anyhow::Result<Vec<Value>> {
+        let queues = store.agent_work_queues()?;
+        let steps = queues
+            .values()
+            .flat_map(|queue| {
+                queue
+                    .current_work_ids
+                    .iter()
+                    .chain(queue.next_work_id.iter())
+                    .chain(queue.upcoming_work_ids.iter())
+                    .cloned()
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let labels = store.step_labels(&steps)?;
+        let label = |id: &String| {
+            labels.get(id).map(|step| json!({
+            "id":id, "mission_id":step.mission, "mission_run_id":step.run,
+            "path":step.path, "title":step.title, "goal":step.goal,
+            "state":client_work_state(&step.status), "since":client_timestamp(step.updated_at_unix_ms),
+        }))
+        };
+        let mut refs = subjects.into_iter().map(|id| {
+            let declaration = desired.get(&id);
+            let name = crate::model::effective_agent_name(&id, declaration.map(|d| &d.desired));
+            let queue = queues.get(&id).cloned().unwrap_or_default();
+            let mut reference = json!({
+                "id":id, "name":name,
+                "host_id":declaration.and_then(|d| d.member.as_ref()).map(|m| client_host_id(&m.host)),
+                "current_work_ids":queue.current_work_ids, "active_work_count":queue.active_work_count,
+                "next_work_id":queue.next_work_id, "upcoming_work_ids":queue.upcoming_work_ids,
+                "queued_work_count":queue.queued_work_count,
+                "current_work":queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
+                "next_work":queue.next_work_id.as_ref().and_then(label),
+                "upcoming_work":queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
+            });
+            if let Some(lifecycle) = crate::model::declared_agent_lifecycle(declaration.map(|d| &d.desired)) {
+                reference["lifecycle"] = json!(lifecycle);
+            }
+            reference
+        }).collect::<Vec<_>>();
+        refs.sort_by(|a, b| {
+            a["name"]
+                .as_str()
+                .cmp(&b["name"].as_str())
+                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+        });
+        Ok(refs)
+    })
 }
 
 fn client_agent_cards_for_page(
@@ -2720,56 +2739,61 @@ fn client_agent_cards_from_cached(
 }
 
 fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Result<()> {
-    let subjects = items
-        .iter()
-        .filter_map(|item| item["id"].as_str().map(str::to_owned))
-        .collect::<Vec<_>>();
-    let observations = store.agent_todo_observations_for(&subjects, index)?;
-    for item in items {
-        let claims = observations.get(item["id"].as_str().unwrap_or_default());
-        item["todo"] = client_v0::agent_todo_value(
-            claims.and_then(|claims| claims.get("harness.todo.observed")),
-            claims.and_then(|claims| claims.get("harness.session-file")),
-            item["incarnation_id"].as_str(),
-        );
-    }
-    Ok(())
+    crate::otel::roster_phase("card_presentation", || -> anyhow::Result<()> {
+        let subjects = items
+            .iter()
+            .filter_map(|item| item["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let observations = store.agent_todo_observations_for(&subjects, index)?;
+        for item in items {
+            let claims = observations.get(item["id"].as_str().unwrap_or_default());
+            item["todo"] = client_v0::agent_todo_value(
+                claims.and_then(|claims| claims.get("harness.todo.observed")),
+                claims.and_then(|claims| claims.get("harness.session-file")),
+                item["incarnation_id"].as_str(),
+            );
+        }
+        Ok(())
+    })
 }
 
+/// Live presentation of already folded cards: freshness, delivery presence and subagents.
 fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
-    let local_host = client_host_id(store.origin());
-    for item in items.iter_mut() {
-        if item.get("updated_at").and_then(Value::as_str) == Some("") {
-            item["updated_at"] = Value::String(at.to_owned());
-        }
-        let source = item
-            .as_object_mut()
-            .unwrap()
-            .remove("_status_source")
-            .unwrap_or(Value::Null);
-        let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
-        // Freshness is approximate presentation. Use the card's already reduced observation;
-        // querying diagnostic and local-observation history here made every read grow with it.
-        let observation = match harness {
-            None => "missing",
-            Some(harness)
-                if client_now_ms().saturating_sub(harness.observed_at_unix_ms) > 90_000 =>
-            {
-                "stale"
+    crate::otel::roster_phase("card_presentation", || -> anyhow::Result<()> {
+        let local_host = client_host_id(store.origin());
+        for item in items.iter_mut() {
+            if item.get("updated_at").and_then(Value::as_str) == Some("") {
+                item["updated_at"] = Value::String(at.to_owned());
             }
-            Some(_) => "current",
-        };
-        item["observation"] = json!(observation);
-        if observation == "stale" && matches!(item["harness_state"].as_str(), Some("ready" | "idle" | "working")) {
-            item["harness_state"] = json!("indeterminate");
-            if item["state"] == "running" {
-                item["state"] = json!("waiting");
+            let source = item
+                .as_object_mut()
+                .unwrap()
+                .remove("_status_source")
+                .unwrap_or(Value::Null);
+            let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
+            // Freshness is approximate presentation. Use the card's already reduced observation;
+            // querying diagnostic and local-observation history here made every read grow with it.
+            let observation = match harness {
+                None => "missing",
+                Some(harness)
+                    if client_now_ms().saturating_sub(harness.observed_at_unix_ms) > 90_000 =>
+                {
+                    "stale"
+                }
+                Some(_) => "current",
+            };
+            item["observation"] = json!(observation);
+            if observation == "stale" && matches!(item["harness_state"].as_str(), Some("ready" | "idle" | "working")) {
+                item["harness_state"] = json!("indeterminate");
+                if item["state"] == "running" {
+                    item["state"] = json!("waiting");
+                }
             }
+            overlay_delivery_presence(item, &local_host);
         }
-        overlay_delivery_presence(item, &local_host);
-    }
-    overlay_subagents(store, items)?;
-    Ok(())
+        overlay_subagents(store, items)?;
+        Ok(())
+    })
 }
 
 /// A seat's latest suspend or resume as client-v0 shows it.
@@ -2882,18 +2906,20 @@ pub(crate) fn agent_queue_metadata(
     store: &Store,
     subjects: &BTreeSet<String>,
 ) -> anyhow::Result<Vec<Value>> {
-    let queues = store.agent_work_queues()?;
-    let steps = queues.values().flat_map(|queue| {
-        queue.current_work_ids.iter().chain(queue.next_work_id.iter())
-            .chain(queue.upcoming_work_ids.iter()).cloned()
-    }).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
-    let labels = store.step_labels(&steps)?;
-    let empty = crate::store::AgentWorkQueue::default();
-    Ok(subjects.iter().map(|subject| {
-        let mut fields = agent_queue_fields(queues.get(subject).unwrap_or(&empty), &labels);
-        fields["id"] = json!(subject);
-        fields
-    }).collect())
+    crate::otel::roster_phase("queue_selection", || -> anyhow::Result<Vec<Value>> {
+        let queues = store.agent_work_queues()?;
+        let steps = queues.values().flat_map(|queue| {
+            queue.current_work_ids.iter().chain(queue.next_work_id.iter())
+                .chain(queue.upcoming_work_ids.iter()).cloned()
+        }).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
+        let labels = store.step_labels(&steps)?;
+        let empty = crate::store::AgentWorkQueue::default();
+        Ok(subjects.iter().map(|subject| {
+            let mut fields = agent_queue_fields(queues.get(subject).unwrap_or(&empty), &labels);
+            fields["id"] = json!(subject);
+            fields
+        }).collect())
+    })
 }
 
 #[cfg(test)]
@@ -2912,9 +2938,9 @@ fn client_agent_resources_selected(
     snapshot_index: u64,
     changed: Option<(&BTreeSet<String>, &[Value])>,
 ) -> anyhow::Result<Vec<Value>> {
-    let status = store.agent_card_status_at(
+    let status = crate::otel::roster_phase("status_fold", || store.agent_card_status_at(
         changed.map(|(subjects, _)| subjects), snapshot_index, history,
-    )?;
+    ))?;
     client_agent_resources_from_status(store, history, snapshot_index, changed, status)
 }
 
@@ -2944,11 +2970,51 @@ fn client_agent_resources_from_status(
                 .any(|item| item["id"].as_str() == Some(subject.as_str()))
         })
     });
-    let work_queues = if retain_queues {
-        BTreeMap::new()
-    } else {
-        store.agent_work_queues()?
-    };
+    let queues = crate::otel::roster_phase("queue_selection", || -> anyhow::Result<_> {
+        let queues = if retain_queues {
+            BTreeMap::new()
+        } else {
+            store.agent_work_queues()?
+        };
+        let queued_steps = queues
+            .values()
+            .flat_map(|queue| {
+                queue
+                    .current_work_ids
+                    .iter()
+                    .chain(queue.next_work_id.iter())
+                    .chain(queue.upcoming_work_ids.iter())
+                    .cloned()
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let labels = store.step_labels(&queued_steps)?;
+        Ok(CardQueues {
+            retained: changed.filter(|_| retain_queues).map(|(_, previous)| previous),
+            queues,
+            labels,
+        })
+    })?;
+    crate::otel::roster_phase("card_presentation", || {
+        client_agent_cards_presented(store, history, snapshot_index, status, &queues)
+    })
+}
+
+/// Queue fields for folded cards: retained from unchanged previous cards, or freshly selected.
+struct CardQueues<'a> {
+    retained: Option<&'a [Value]>,
+    queues: BTreeMap<String, crate::store::AgentWorkQueue>,
+    labels: BTreeMap<String, crate::store::StepLabel>,
+}
+
+fn client_agent_cards_presented(
+    store: &Store,
+    history: bool,
+    snapshot_index: u64,
+    status: StatusResponse,
+    queues: &CardQueues<'_>,
+) -> anyhow::Result<Vec<Value>> {
     let agent_subjects = status
         .subjects
         .iter()
@@ -2991,20 +3057,6 @@ fn client_agent_resources_from_status(
             .filter_map(|subject| subject.actual_claim.as_deref())
             .collect::<Vec<_>>(),
     );
-    let queued_steps = work_queues
-        .values()
-        .flat_map(|queue| {
-            queue
-                .current_work_ids
-                .iter()
-                .chain(queue.next_work_id.iter())
-                .chain(queue.upcoming_work_ids.iter())
-                .cloned()
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let step_labels = store.step_labels(&queued_steps)?;
     let mut agents = status
         .subjects
         .into_iter()
@@ -3168,7 +3220,7 @@ fn client_agent_resources_from_status(
                 .clone()
                 .or_else(|| subject.claims.last().cloned())
                 .unwrap_or_else(|| format!("agent/{}", subject.subject));
-            let queue = work_queues
+            let queue = queues.queues
                 .get(&subject.subject)
                 .cloned()
                 .unwrap_or_default();
@@ -3223,12 +3275,12 @@ fn client_agent_resources_from_status(
             if let Some(lifecycle) = crate::model::declared_agent_lifecycle(subject.desired.as_ref()) {
                 value["lifecycle"] = json!(lifecycle);
             }
-            if let Some((_, previous)) = changed.filter(|_| retain_queues)
+            if let Some(previous) = queues.retained
                 && let Some(old) = previous.iter().find(|item| item["id"] == value["id"]) {
                 for field in AGENT_QUEUE_FIELDS {
                     value[field] = old[field].clone();
                 }
-            } else if let Value::Object(fields) = agent_queue_fields(&queue, &step_labels) {
+            } else if let Value::Object(fields) = agent_queue_fields(&queue, &queues.labels) {
                 value.as_object_mut().unwrap().extend(fields);
             }
             Ok((name, value))
@@ -4752,16 +4804,19 @@ async fn client_agents(
     }
     // A warm request never queues behind a cold projection. Drop the probe's SQLite
     // snapshot before waiting, then recheck all cache fences in the admitted snapshot.
+    let requested = snapshot.store_index;
+    let fresh = query.fresh;
     for admitted in [false, true] {
         let admission = if admitted {
-            Some(state.store.admit_agent_resources().await)
+            Some(state.store.admit_agent_resources("http").await)
         } else {
             None
         };
         let reader = state.clone();
         let snapshot = snapshot.clone();
         let query = query.clone();
-        let result = blocking_store(move || {
+        let filtered = query.status.is_some();
+        let result = blocking_roster(move || {
             let _admission = admission;
             reader.store.clone().read_snapshot(|index| {
                 let snapshot = if query.cursor.is_some() {
@@ -4775,6 +4830,12 @@ async fn client_agents(
             })
         }).await??;
         if let Some(page) = result {
+            let path = match (filtered, admitted) {
+                (true, _) => "filtered_full",
+                (false, true) => "exact_cold",
+                (false, false) => "exact_warm",
+            };
+            crate::otel::record_roster_read(path, requested, Some(page.0.0.store_index), fresh);
             return Ok(page);
         }
     }
@@ -4792,10 +4853,13 @@ async fn client_agents_published(
     query: ClientListQuery,
 ) -> Result<ClientPageResponse, ApiError> {
     state.store.note_agent_roster_read();
+    let requested = snapshot.store_index;
     if query.cursor.is_some() {
         let reader = state.clone();
-        return blocking_store(move || Ok(client_agents_published_continuation(&reader, snapshot, &query)))
-            .await?;
+        return blocking_roster(move || {
+            Ok(client_agents_published_continuation(&reader, snapshot, &query))
+        })
+        .await?;
     }
     let fresh = query.fresh;
     if fresh {
@@ -4806,13 +4870,14 @@ async fn client_agents_published(
     let reader = state.clone();
     let history = query.history;
     let built = Instant::now();
-    let page = blocking_store(move || Ok(client_agents_published_page(&reader, &query))).await;
+    let page = blocking_roster(move || Ok(client_agents_published_page(&reader, &query, requested))).await;
     if fresh {
         record_roster_stage(request_latency::RosterStage::FreshPage, built.elapsed());
     }
     match page?? {
         Some(page) => Ok(page),
         None => {
+            crate::otel::record_roster_read("not_ready", requested, None, fresh);
             if history {
                 state.store.request_agent_roster_history();
             } else {
@@ -4840,14 +4905,19 @@ const AGENT_ROSTER_WARM_CHUNK: usize = 250;
 /// they depend on arrives, so the folds that follow at one cut read them instead of the log.
 fn warm_agent_roster(store: &Store) -> anyhow::Result<()> {
     let subjects = store.read_snapshot(|index| {
-        Ok(store.readers.get()
-            .prepare_cached(crate::store::RANGE_SUBJECTS)?
-            .query_map(rusqlite::params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?)
+        let connection = store.readers.get();
+        crate::otel::roster_phase("membership", || -> anyhow::Result<Vec<String>> {
+            Ok(connection
+                .prepare_cached(crate::store::RANGE_SUBJECTS)?
+                .query_map(rusqlite::params![index, "agent/", "agent0"], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?)
+        })
     })?;
     for chunk in subjects.chunks(AGENT_ROSTER_WARM_CHUNK) {
         let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
-        store.read_snapshot(|index| store.agent_card_status_at(Some(&names), index, false).map(drop))?;
+        store.read_snapshot(|index| crate::otel::roster_phase("status_fold", || {
+            store.agent_card_status_at(Some(&names), index, false).map(drop)
+        }))?;
     }
     Ok(())
 }
@@ -4948,9 +5018,11 @@ fn roster_snapshot(state: &AppState, cut: u64, published_at_unix_ms: u128) -> Cl
 }
 
 /// A first page of the newest published roster, under the snapshot it was folded at.
+/// `requested` is the request's own cut, recorded beside the publication cut it was served.
 fn client_agents_published_page(
     state: &AppState,
     query: &ClientListQuery,
+    requested: u64,
 ) -> Result<Option<ClientPageResponse>, ApiError> {
     let store = &state.store;
     let current = store.index().map_err(ApiError::internal)?;
@@ -4966,6 +5038,7 @@ fn client_agents_published_page(
             return Ok(None);
         };
         store.request_agent_roster_refresh();
+        crate::otel::record_roster_read("published_head", requested, Some(index), query.fresh);
         let snapshot = roster_snapshot(state, index, published_at);
         let mut page = client_page_read(state, &snapshot, "agents", (*refs).clone(), query, true)?;
         page.items = client_agent_cards_from_cached(
@@ -4983,6 +5056,8 @@ fn client_agents_published_page(
         }
     }
     let snapshot = roster_snapshot(state, index, published_at);
+    let path = if query.status.is_some() { "filtered_full" } else { "published_complete" };
+    crate::otel::record_roster_read(path, requested, Some(index), query.fresh);
     if let Some(status) = query.status.as_deref() {
         let mut cards = (*cards).clone();
         overlay_agent_resources(store, &mut cards, &snapshot.created_at)
@@ -4993,13 +5068,13 @@ fn client_agents_published_page(
     }
     // Continuations keep the same membership, order and queue metadata as the exact path's
     // refs, and read their cards from this same publication.
-    let refs = cards.iter().map(|card| {
+    let refs = crate::otel::roster_phase("membership", || cards.iter().map(|card| {
         let mut reference = serde_json::Map::new();
         for field in ["id", "name", "host_id"].into_iter().chain(AGENT_QUEUE_FIELDS) {
             reference.insert(field.to_owned(), card[field].clone());
         }
         Value::Object(reference)
-    }).collect();
+    }).collect::<Vec<_>>());
     let mut page = client_page_read(state, &snapshot, "agents", refs, query, true)?;
     page.items = client_agent_cards_from_cached(
         store, page_cards(&cards, &page.items), &page.items, &snapshot.created_at,
@@ -5017,6 +5092,9 @@ fn client_agents_published_continuation(
     let store = &state.store;
     let mut page = client_page_read(state, &snapshot, "agents", Vec::new(), query, true)?;
     let published = store.published_agent_roster_at(snapshot.store_index, query.history);
+    let path = if query.status.is_some() { "filtered_full" } else { "published_complete" };
+    let served = published.as_ref().map(|_| snapshot.store_index);
+    crate::otel::record_roster_read(path, snapshot.store_index, served, query.fresh);
     let snapshot = match &published {
         Some((_, published_at)) => roster_snapshot(state, snapshot.store_index, *published_at),
         None => snapshot,
@@ -5834,6 +5912,29 @@ async fn client_history_detail(
         .ok_or_else(|| ApiError::not_found(format!("history `{id}` does not exist")))
 }
 
+/// A roster operation on a blocking worker. Its submission-to-start wait is recorded apart
+/// from its execution, and its reader timing is attributed, only when `traced`.
+fn roster_worker<T>(traced: bool, submitted: Option<Instant>, seed: Option<crate::otel::RosterAttributes>, work: impl FnOnce() -> T) -> T {
+    if !traced {
+        return work();
+    }
+    crate::otel::roster_scope(|| {
+        crate::otel::seed_roster_attributes(seed);
+        crate::otel::roster_worker_started(submitted);
+        work()
+    })
+}
+
+/// [`blocking_store`] for an HTTP roster read: worker queue wait, then the attributed read.
+async fn blocking_roster<T, F>(operation: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    let submitted = crate::otel::export_enabled().then(Instant::now);
+    blocking_store(move || roster_worker(true, submitted, None, operation)).await
+}
+
 async fn blocking_store<T, F>(operation: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
@@ -5989,26 +6090,36 @@ pub fn start_agent_roster(state: &AppState) {
         let mut head = true;
         loop {
             let started = tokio::time::Instant::now();
-            let mut admission = store.admit_agent_resources().await;
+            let mut admission = store.admit_agent_resources("refresher").await;
             let first = std::mem::take(&mut head);
             if !first {
-                record_roster_stage(request_latency::RosterStage::RefreshAdmission, started.elapsed());
+                record_roster_stage(request_latency::RosterStage::RefreshAdmission, admission.waited());
             }
             let reader = store.clone();
+            let mut warm_attributes = None;
             if first {
                 // Warm without admission: nothing is published, and no reader folds.
                 drop(admission);
                 let reader = store.clone();
-                match tokio::task::spawn_blocking(move || {
-                    crate::performance::task("roster/warm", || warm_agent_roster(&reader))
-                }).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => eprintln!("st3: agents roster warm-up failed: {error:#}"),
+                let submitted = crate::otel::export_enabled().then(Instant::now);
+                match tokio::task::spawn_blocking(move || crate::otel::roster_collect_warm(|| {
+                    roster_worker(true, submitted, None, || {
+                        let result = crate::performance::task("roster/warm", || warm_agent_roster(&reader));
+                        (result, crate::otel::take_roster_attributes())
+                    })
+                })).await {
+                    Ok((result, attributes)) => {
+                        warm_attributes = attributes;
+                        if let Err(error) = result {
+                            eprintln!("st3: agents roster warm-up failed: {error:#}");
+                        }
+                    }
                     Err(error) => eprintln!("st3: agents roster warm-up stopped: {error}"),
                 }
-                admission = store.admit_agent_resources().await;
+                admission = store.admit_agent_resources("refresher").await;
             }
-            let refreshed = tokio::task::spawn_blocking(move || {
+            let submitted = crate::otel::export_enabled().then(Instant::now);
+            let refreshed = tokio::task::spawn_blocking(move || roster_worker(true, submitted, warm_attributes, || {
                 let _admission = admission;
                 // The first fold publishes only what windows and first pages show; the rest
                 // follows at once.
@@ -6032,7 +6143,7 @@ pub fn start_agent_roster(state: &AppState) {
                     }, folded.elapsed());
                     refreshed
                 })
-            })
+            }))
             .await;
             match refreshed {
                 Ok(Ok(())) => {}
@@ -24266,7 +24377,7 @@ mission "wake" state="ready" {
             Query(ClientListQuery::default()),
         ).await.unwrap();
         assert_eq!(cold.items.len(), 1);
-        let admission = state.store.admit_agent_resources().await;
+        let admission = state.store.admit_agent_resources("other").await;
         let started = Instant::now();
         let (_, Json(warm)) = tokio::time::timeout(
             Duration::from_secs(2),

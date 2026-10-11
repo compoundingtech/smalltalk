@@ -389,8 +389,9 @@ attributes on the root instead.
 | `st.page.rows` | Number of rows in the returned page, after truncation |
 | `st.page.bytes` | Serialized response envelope bytes for a returned page |
 
-Phase durations and card/page counts are integers; `st.request.id` and `st.roster.mode`
-are strings. Attributes are absent when the corresponding stage did not run.
+The stage durations in this table and card/page counts are integers; `st.request.id` and
+`st.roster.mode` are strings. Roster phase and wait durations below use doubles.
+Attributes are absent when the corresponding stage did not run.
 The collector's slow-request and error policies key on the server span's duration and status.
 
 The root attributes are `http.request.method`, `http.route`, `http.response.status_code`,
@@ -411,7 +412,7 @@ HTTP upgrade SERVER span (ends at 101)
     <link> st.subscription.first_frame INTERNAL root (subscribe -> first frame sent)
 HTTP receive SERVER span
     <link> st.replication.projection INTERNAL root (new or deferred data only)
-st.roster.rebuild INTERNAL root (cold build only, no parent or link)
+st.roster.rebuild INTERNAL root (cold build only; optional admission-holder link)
 ```
 
 All four client stream socket tasks carry the upgrade's `SpanContext`, not a live server
@@ -436,8 +437,12 @@ labels, collections, or counts are inspected (O11Y-R02, O11Y-R18).
 | `span.label` | Bounded collection/projection description, never an identity or path |
 
 `st.roster.rebuild` surrounds only cold roster builds, including cold historical pages.
-It is detached, with no parent or link, `span.label=cold`, `st.roster.mode=cold`, and
+It is detached, with no parent, `span.label=cold`, `st.roster.mode=cold`, and
 integer `st.roster.cards`. Cache hits and incremental refolds create no rebuild roots.
+It has a link only when its admission waited behind a holder with a valid existing span.
+A root started under roster admission ends when that admission is released.
+Its duration runs from cold-build start to release; `st.roster.admission.hold_ms`
+separately covers the full acquisition-to-release interval.
 Roster and page stage attributes on requests remain on the SERVER span, not children.
 
 `st.replication.projection` surrounds the post-receive projection attempt only when
@@ -452,6 +457,91 @@ not emit it either.
 All identities and numeric stage attributes above are span-only, never metric labels.
 The frame-level trace field, writer-wait instrumentation, WAL checkpoints, and reconcile
 roots are separate instrumentation surfaces, not part of these stage roots.
+
+#### Roster attribution
+
+Roster latency is attributed by attributes on spans that already exist: the request
+SERVER span or `st.subscription.first_frame` root that performed the read, and the
+detached `st.roster.rebuild` root when the read rebuilt cold. No admission, phase,
+worker, reader, or per-frame span is constructed. Every recorder returns before work when
+trace export is disabled (O11Y-R02, O11Y-R18). With export enabled, attribute construction
+and phase clocks additionally require a recording destination. Only the preparatory
+warm worker explicitly collects attributes before its cold publication span exists.
+Before a cold root exists, queue and reader waits occupy fixed scalar slots, not an
+allocated attribute map. Values recorded while a rebuild runs are written to the current
+span and copied to the active rebuild root.
+
+```text
+GET /v1/client/agents SERVER / first_frame     st.roster.rebuild INTERNAL root (cold only)
+  st.roster.path, *_cut, fresh_requested          st.roster.invalidation, changed/covered/refolded
+  st.roster.invalidation (incremental reasons)    st.roster.admission.id, holder_class
+  st.roster.admission.* (own acquisition)         st.roster.phase.<sync phase>.*
+  st.roster.worker_queue_ms, reader_acquire_ms    st.roster.worker_queue_ms, reader_acquire_ms
+  <link> blocking holder (contended waiter only)
+```
+
+| Attribute | Type | Vocabulary / meaning |
+| --- | --- | --- |
+| `st.roster.path` | string enum | `published_complete`, `published_head`, `exact_warm`, `exact_cold`, `filtered_full`, `not_ready`; any status-filtered read is `filtered_full` |
+| `st.roster.fresh_requested` | boolean | The HTTP agents query's `fresh` value, including exact reads, published first pages, continuations and `not_ready`; WebSocket reads and background rebuild roots report `false` because they have no freshness query |
+| `st.roster.requested_cut` | integer | Store index of the read's snapshot |
+| `st.roster.publication_cut` | integer | Store index of the publication served; absent for `not_ready` |
+| `st.roster.worker_queue_ms` | double | Cumulative submission-to-start time of the read's blocking workers, excluding reader acquisition and execution |
+| `st.roster.reader_acquire_ms` | double | Cumulative SQLite reader acquisition, connection opening, `BEGIN`, and first index read |
+| `st.roster.admission.id` | integer | Process-local sequence number of this admission acquisition |
+| `st.roster.admission.holder_id` | integer | Acquisition id that held admission while this waiter queued |
+| `st.roster.admission.holder_age_ms` | double | Blocking holder's age at wait start, measured from its monotonic acquisition instant |
+| `st.roster.admission.waiter_class` | string enum | Class of this acquisition: `http`, `ws`, `refresher`, `other` |
+| `st.roster.admission.holder_class` | string enum | Blocking holder's class: `http`, `ws`, `refresher`, `other`, or `unknown` when admission is reserved but its holder metadata is unpublished; on an uncontended rebuild root, class of its own admission |
+| `st.roster.admission.wait_ms` | double | Enqueue to acquire |
+| `st.roster.admission.hold_ms` | double | Acquire to release |
+| `st.roster.invalidation` | string enum | `cold`, `unknown_kind`, `structural_claim`, `missing_message`, `membership`, `local_frontier`, `queue_deadline`, `coverage_gap`, `safe_delta`, `historical_snapshot` |
+| `st.roster.changed`, `st.roster.covered`, `st.roster.refolded` | integer | Changed agents, resulting subject coverage (card count for a complete roster), and cards refolded |
+| `st.roster.phase.<phase>.wall_ms`, `st.roster.phase.<phase>.cpu_ms` | double | Wall and calling-thread CPU time; `<phase>` is `membership`, `status_fold`, `card_presentation`, `queue_selection`, or `serialization` |
+
+Phases are synchronous sections measured on the thread that runs them, so `cpu_ms` is
+that section's own thread CPU rather than a share of an outer task. Durations keep
+sub-millisecond precision as doubles. Repeated phases within one read accumulate.
+Worker queue and reader acquisition totals survive a WS probe and its admitted retry.
+The first publication includes its preparatory warm worker's measurements, moved into
+the cold root without creating another span. Those sections can precede root start.
+Each CPU sample surrounds only a synchronous section on one thread; both ending clocks
+are sampled before recording attributes. The handoff's async join contributes no CPU
+time. Admission, worker queue, and reader acquisition are wall-only waits, not CPU phases.
+
+The rebuild root carries `cold`, `unknown_kind`, `structural_claim`, `missing_message`,
+or `historical_snapshot`. A read that refolds a prior projection records `membership`,
+`local_frontier`, `queue_deadline`, `coverage_gap`, or `safe_delta` on its current span
+without constructing a root.
+
+Every acquisition begins as a waiter: it records its own `id`, `waiter_class`, `wait_ms`,
+and, on release, `hold_ms`. The first contended mutex poll and blocking-holder snapshot
+are synchronized with holder publication and release under one metadata lock. The
+snapshot is frozen across later polls. A known blocker contributes `holder_id`,
+`holder_class`, and `holder_age_ms`; an unpublished reserved holder contributes only
+`holder_class=unknown`, never a guessed id, age, event, or link. A known blocker carries one
+link to its span context only when that existing context is valid, with the
+`st.roster.admission.holder_id` link attribute. At acquisition, waits of at least 1 ms
+emit `st.roster.admission.wait` on the current waiter span when one exists, with holder
+id, both classes, and `wait_ms`. `holder_id` is separate from the waiter's own `id`
+because the waiter becomes the next holder. A holder without a span of its own takes
+the context of a cold rebuild
+root it starts, so waiters can link to that root. Incremental refresher refolds have no
+existing span: they are attributed by class, admission id, wait duration, and holder age,
+not by a link. No root is added for those refolds. A cold root records the admission `id`
+and class, and retains any blocker link when it was itself a waiter.
+The aggregate `roster/admission-wait` accounting is unchanged.
+Nonblocking try-admission uses the same holder registration and release contract, with
+zero `wait_ms` on success and no attributes on a miss. Collection readers retain their
+release-before-queue, try-before-admit gate ordering, so roster attribution never causes
+them to retain reader capacity or unrelated gates while queuing. RosterStage performance
+metrics remain alongside span attribution; admission wait accounting and the refresher's
+admission metric reuse the guard's single monotonic wait measurement.
+
+Privacy contract: every value above is an enum, a boolean, a process-local sequence
+number, a store index, a count, or a duration. Subject ids, agent names, paths,
+selectors, filter values, and claim bodies are never recorded. All roster attribution
+is span-only and never a metric label or `span.label`.
 
 
 ### Metric naming and cardinality
