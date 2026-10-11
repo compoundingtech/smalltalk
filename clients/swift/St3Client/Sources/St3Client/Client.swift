@@ -110,6 +110,32 @@ public actor St3Client {
     public func getGlass(id: String) async throws -> Envelope<Glass> { try await get("v1/client/glasses/\(Self.routedSessionID(id.split(separator: "/").last.map(String.init) ?? id))") }
     public func putGlass(id: String, body: GlassPut, idempotencyKey: String) async throws -> Envelope<Glass> { try await request("v1/client/glasses/\(Self.routedSessionID(id.split(separator: "/").last.map(String.init) ?? id))", query: [], method: "PUT", body: try JSONEncoder().encode(body), idempotencyKey: idempotencyKey) }
     public func deleteGlass(id: String, body: GlassDelete, idempotencyKey: String) async throws -> Envelope<Glass> { try await request("v1/client/glasses/\(Self.routedSessionID(id.split(separator: "/").last.map(String.init) ?? id))", query: [], method: "DELETE", body: try JSONEncoder().encode(body), idempotencyKey: idempotencyKey) }
+    /// Complete revisioned roster frames. Stage chunks and apply deltas atomically in the caller.
+    public func agentsPublicationStream(subscriptionID: String = "agents") -> AsyncThrowingStream<AgentsCollectionEvent, Error> {
+        var components = URLComponents(url: baseURL.appending(path: "v1/client/collections/stream"), resolvingAgainstBaseURL: false)!
+        components.scheme = components.scheme == "https" ? "wss" : "ws"
+        var request = URLRequest(url: components.url!)
+        request.setValue("st3.client.collections.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol")
+        if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        if let client { request.setValue(client, forHTTPHeaderField: "x-st3-client") }
+        applyTraceContext(to: &request)
+        let task = session.webSocketTask(with: request)
+        return AsyncThrowingStream { continuation in
+            task.resume()
+            continuation.onTermination = { @Sendable _ in task.cancel(with: .normalClosure, reason: nil) }
+            Task {
+                do {
+                    let command = try JSONEncoder().encode(AgentsPublicationSubscribe(id: subscriptionID))
+                    try await task.send(.string(String(decoding: command, as: UTF8.self)))
+                    while true {
+                        let data = try Self.websocketData(from: try await task.receive())
+                        continuation.yield(try JSONDecoder().decode(AgentsCollectionEvent.self, from: data))
+                    }
+                } catch { continuation.finish(throwing: error) }
+            }
+        }
+    }
+
     public func glassesStream(subscriptionID: String = "glasses") -> AsyncThrowingStream<GlassCollectionFrame, Error> {
         var components = URLComponents(url: baseURL.appending(path: "v1/client/collections/stream"), resolvingAgainstBaseURL: false)!
         components.scheme = components.scheme == "https" ? "wss" : "ws"

@@ -648,6 +648,7 @@ fn validate_surfaces(
         "SubjectDefinition",
         "PublicationDefinition",
         "AgentsStatusWatermark",
+        "Snapshot",
         "AgentsPublicationMetadata",
         "AgentsPublication",
         "UsagePeriod",
@@ -706,9 +707,42 @@ fn validate_surfaces(
     ] {
         validate_model(schema, definition, definition, definition, rust, swift)?;
     }
+    for definition in ["AgentsSnapshotChunk", "AgentsChanges"] {
+        let properties = schema_properties(&schema["$defs"][definition])
+            .with_context(|| format!("{definition} properties"))?;
+        let rust_variant = rust_client
+            .split(&format!("    {definition} {{"))
+            .nth(1)
+            .and_then(|rest| rest.split("\n    }").next())
+            .with_context(|| format!("Rust CollectionEvent::{definition}"))?;
+        let swift_variant = struct_block(swift, &format!("public struct {definition}:"))?;
+        for property in properties.keys().filter(|name| name.as_str() != "kind") {
+            if !rust_variant.contains(&format!("{property}:"))
+                || !swift_variant.contains(&lower_camel_snake(property))
+            {
+                bail!("revisioned `{definition}` loses schema field `{property}`");
+            }
+        }
+    }
+    for code in schema["$defs"]["ErrorCode"]["anyOf"][0]["enum"]
+        .as_array().context("ErrorCode known values")?
+    {
+        let code = code.as_str().context("ErrorCode string")?;
+        if !rust.contains(&format!("    {},", pascal(code)))
+            || !swift.contains(&format!("\"{code}\""))
+        {
+            bail!("known ErrorCode `{code}` is missing from a typed client");
+        }
+    }
+    if rust_client.contains("pub async fn send(")
+        || !rust_client.contains("async fn send(&mut self, command:")
+    {
+        bail!("CollectionStream raw send must remain private");
+    }
     for token in [
         "pub async fn pairing_begin",
         "pub async fn pairing_complete",
+        "pub async fn subscribe_agents_publication(",
         "pub async fn terminal_stream",
         "pub async fn terminal_screen_change",
         "Endpoint::Unix",
@@ -720,6 +754,7 @@ fn validate_surfaces(
     }
     for token in [
         "func capabilities(",
+        "func agentsPublicationStream(",
         "func timeline(",
         "cursor: String?",
         "func events(",
@@ -1081,6 +1116,30 @@ fn ts_conditional_body(value: &Value) -> Result<Option<String>> {
     }
 }
 
+/// Closed same-kind branches must stay disjoint in TypeScript too: an ordinary union
+/// otherwise accepts a mix of a legacy window and publication-only fields.
+fn ts_closed_union(definition: &Value, defs: &serde_json::Map<String, Value>) -> Result<String> {
+    let branches = definition["oneOf"].as_array().context("closed union branches")?;
+    let properties = branches.iter().map(|branch| {
+        let resolved = if let Some(reference) = branch["$ref"].as_str() {
+            defs.get(reference.rsplit('/').next().context("union reference")?)
+                .context("union definition")?
+        } else { branch };
+        if resolved["additionalProperties"] != false {
+            bail!("closed union contains an open branch");
+        }
+        resolved["properties"].as_object().context("closed union properties")
+    }).collect::<Result<Vec<_>>>()?;
+    let all_fields: std::collections::BTreeSet<_> = properties.iter()
+        .flat_map(|fields| fields.keys()).collect();
+    let members = branches.iter().zip(&properties).map(|(branch, fields)| {
+        let forbidden = all_fields.iter().filter(|name| !fields.contains_key(name.as_str()))
+            .map(|name| format!("{name}?: never;")).collect::<Vec<_>>().join(" ");
+        Ok(format!("({} & {{ {forbidden} }})", ts_type(branch)?))
+    }).collect::<Result<Vec<_>>>()?;
+    Ok(format!("({})", members.join(" | ")))
+}
+
 fn typescript_models(schema: &Value, operations: &Value) -> Result<String> {
     let defs = schema["$defs"].as_object().context("schema definitions")?;
     let mut out = format!(
@@ -1098,6 +1157,8 @@ fn typescript_models(schema: &Value, operations: &Value) -> Result<String> {
                 branches.retain(|branch| branch["$ref"] != "#/$defs/UnknownResource");
             }
             ts_type(&known)?
+        } else if matches!(name.as_str(), "CollectionCommand" | "CollectionFrame") {
+            ts_closed_union(definition, defs)?
         } else {
             ts_conditional_body(definition)?.unwrap_or(ts_type(definition)?)
         };
@@ -1300,6 +1361,55 @@ mod tests {
             "st3-client-codegen-{}-{nonce}-{name}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn revisioned_collection_contract_is_disjoint_and_templates_keep_every_field() -> Result<()> {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/schemas/client-v0.schema.json"
+        ))?;
+        let operations: Value = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/schemas/operations.json"
+        ))?;
+        let actions = operations["actions"].as_object().context("actions")?;
+        let reads = operations["reads"].as_array().context("reads")?;
+        let rust = render_marker(RUST_MODELS_TEMPLATE, "    // @st3-codegen:rust-action-constructors", &rust_action_constructors(actions)?)?;
+        let rust_client = render_marker(RUST_CLIENT_TEMPLATE, "    // @st3-codegen:rust-operation-methods", &rust_operation_methods(reads, actions)?)?;
+        let swift = render_marker(SWIFT_MODELS_TEMPLATE, "    // @st3-codegen:swift-action-constructors", &swift_action_constructors(actions)?)?;
+        let swift_client = render_marker(SWIFT_CLIENT_TEMPLATE, "    // @st3-codegen:swift-operation-methods", &swift_operation_methods(reads, actions)?)?;
+        validate_surfaces(&schema, &operations, &rust, &rust_client, &swift, &swift_client)?;
+        let command = &schema["$defs"]["AgentsPublicationSubscribe"];
+        assert_eq!(command["additionalProperties"], false);
+        assert_eq!(command["properties"]["agents_publication_version"]["const"], 1);
+        assert_eq!(command["properties"].as_object().unwrap().len(), 4);
+        for definition in ["AgentsSnapshotChunk", "AgentsChanges"] {
+            let branch = &schema["$defs"][definition];
+            assert_eq!(branch["additionalProperties"], false);
+            assert_eq!(branch["properties"]["collection"]["const"], "agents");
+            assert_eq!(branch["properties"]["has_more"]["const"], false);
+            assert_eq!(branch["properties"]["publication"]["$ref"], "#/$defs/AgentsPublicationMetadata");
+        }
+        for branch in schema["$defs"]["CollectionFrame"]["oneOf"].as_array().unwrap() {
+            if branch.get("$ref").is_some() { continue; }
+            let fields = branch["properties"].as_object().unwrap();
+            for name in ["publication", "chunk_index", "chunk_count", "base_revision"] {
+                assert!(!fields.contains_key(name), "legacy frame acquired {name}");
+            }
+        }
+        let ts = typescript_models(&schema, &operations)?;
+        for name in ["AgentsPublicationSubscribe", "AgentsSnapshotChunk", "AgentsChanges"] {
+            assert!(ts.contains(&format!("export type {name} =")));
+        }
+        assert!(ts.contains("published_at: Timestamp;"));
+        assert!(TYPESCRIPT_CLIENT_TEMPLATE.contains("subscribeAgentsPublication:"));
+        assert!(TYPESCRIPT_CLIENT_TEMPLATE.contains("agents_publication_version: 1"));
+        assert!(SWIFT_CLIENT_TEMPLATE.contains("AgentsPublicationSubscribe(id:"));
+        let rich = rich::models(&schema)?;
+        assert!(rich.contains("agents-publication-row-too-large"));
+        assert!(rich.contains("chunk_count"));
+        assert!(rich.contains("\"publication\": Schema.optionalKey(Schema.Never)"));
+        assert!(rich.contains("\"agents_publication_version\": Schema.optionalKey(Schema.Never)"));
+        Ok(())
     }
 
     #[test]

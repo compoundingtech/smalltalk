@@ -49,7 +49,7 @@
     "AgentLifecycle": {"anyOf": [{"enum": ["standing", "owner", "bounded"]}, {"type": "string"}], "description": "Declared agent lifecycle. Publication accepts standing, owner, or bounded; clients retain future values as Unknown."},
     "AgentReachability": {"anyOf": [{"enum": ["local", "remote", "unreachable", "unknown", "reachable", "indeterminate"]}, {"type": "string"}], "description": "Whether the daemon can currently reach the agent runtime."},
     "TimelineStatus": {"anyOf": [{"enum": ["queued", "running", "waiting", "completed", "failed", "cancelled"]}, {"type": "string"}], "description": "Run status reported in a timeline `status` entry."},
-    "ErrorCode": {"anyOf": [{"enum": ["attention-migrated", "arrangement-exists", "arrangement-folder-exists", "arrangement-retired", "arrangement-limit", "arrangement-folder-deleted", "arrangement-cycle", "arrangement-body-too-large", "arrangement-owner-forbidden", "invalid-arrangement-subject", "invalid-arrangement-action", "invalid-arrangement-operations", "invalid-arrangement-folder", "invalid-arrangement-name", "invalid-arrangement-key", "invalid-subject-reference", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "issuer-required", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "projection-detail-too-large", "projection-detail-invalid-source", "conversation-content-invalidated", "transcript-unavailable", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer."},
+    "ErrorCode": {"anyOf": [{"enum": ["agents-publication-row-too-large", "attention-migrated", "arrangement-exists", "arrangement-folder-exists", "arrangement-retired", "arrangement-limit", "arrangement-folder-deleted", "arrangement-cycle", "arrangement-body-too-large", "arrangement-owner-forbidden", "invalid-arrangement-subject", "invalid-arrangement-action", "invalid-arrangement-operations", "invalid-arrangement-folder", "invalid-arrangement-name", "invalid-arrangement-key", "invalid-subject-reference", "not-found", "forbidden", "unsupported-capability", "validation-failed", "idempotency-conflict", "issuer-required", "stale-fence", "cursor-gap", "page-cursor-expired", "rate-limited", "runtime-not-local", "runtime-authority-indeterminate", "remote-unavailable", "terminal-unavailable", "terminal-ended", "timeline-history-incomplete", "projection-detail-too-large", "projection-detail-invalid-source", "conversation-content-invalidated", "transcript-unavailable", "blob-too-large", "unsupported-media-type", "blob-content-mismatch", "blob-quota-exceeded", "blob-not-found", "blob-expired", "internal"]}, {"type": "string"}], "description": "Versioned safe error code; unknown codes fall back to `retryable`. Arrangement admission and validation refusals are non-retryable. issuer-required is a non-retryable HTTP 409 pairing revocation refusal; details.issuer_host_id identifies the authoritative issuer."},
     "UnknownResource": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "properties": {"kind": {"type": "string", "not": {"enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass", "arrangement", "owned-set", "summary"]}}}}]},
     "OwnedSet": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "claim", "receipt", "blockers", "members_status", "visibility"], "properties": {"kind": {"const": "owned-set"}, "claim": {"type": "string"}, "receipt": {"type": "object"}, "blockers": {"type": "array", "items": {"type": "string"}}, "members_status": {"type": "array", "items": {"type": "object"}}, "visibility": {"type": "object"}, "commit_status": {"type": ["object", "null"]}}}]},
     "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["tabs"], "properties": {"tabs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "ratio": {"type": "number", "minimum": 0.1, "maximum": 0.9, "description": "First child share; absent means 0.5. Requires glasses capability version 2."}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
@@ -2452,8 +2452,57 @@
       }
     },
     "CollectionName": { "enum": ["missions", "attention", "agents", "work", "glasses", "arrangements", "summary"] },
+    "AgentsPublicationSubscribe": {
+      "description": "Opt into complete revisioned agents publications, without a limit, window or filters. Legacy subscribe commands remain unchanged.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "collection", "agents_publication_version"],
+      "properties": {
+        "kind": { "const": "subscribe" },
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "collection": { "const": "agents" },
+        "agents_publication_version": { "const": 1 }
+      }
+    },
+    "AgentsSnapshotChunk": {
+      "description": "One contiguous whole-row chunk. Every chunk repeats identical snapshot/publication/count. Order contains only this chunk's item IDs. Install only after the final chunk; an empty roster has one empty chunk.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "collection", "snapshot", "publication", "chunk_index", "chunk_count", "items", "order", "has_more"],
+      "properties": {
+        "kind": { "const": "snapshot" },
+        "id": { "type": "string" },
+        "collection": { "const": "agents" },
+        "snapshot": { "allOf": [{ "$ref": "#/$defs/Snapshot" }, { "type": "object", "required": ["published_at"], "properties": { "published_at": { "$ref": "#/$defs/Timestamp" } } }] },
+        "publication": { "$ref": "#/$defs/AgentsPublicationMetadata" },
+        "chunk_index": { "type": "integer", "minimum": 0 },
+        "chunk_count": { "type": "integer", "minimum": 1 },
+        "items": { "type": "array", "items": { "$ref": "#/$defs/Agent" } },
+        "order": { "type": "array", "items": { "$ref": "#/$defs/Id" }, "uniqueItems": true },
+        "has_more": { "const": false }
+      }
+    },
+    "AgentsChanges": {
+      "description": "One atomic complete-target delta. Apply only with matching node_epoch and applied base_revision. Oversized deltas are replaced by a full chunked snapshot, never split.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "collection", "snapshot", "publication", "base_revision", "upserts", "removes", "order", "has_more"],
+      "properties": {
+        "kind": { "const": "changes" },
+        "id": { "type": "string" },
+        "collection": { "const": "agents" },
+        "snapshot": { "allOf": [{ "$ref": "#/$defs/Snapshot" }, { "type": "object", "required": ["published_at"], "properties": { "published_at": { "$ref": "#/$defs/Timestamp" } } }] },
+        "publication": { "$ref": "#/$defs/AgentsPublicationMetadata" },
+        "base_revision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "upserts": { "type": "array", "items": { "$ref": "#/$defs/Agent" } },
+        "removes": { "type": "array", "items": { "$ref": "#/$defs/Id" }, "uniqueItems": true },
+        "order": { "type": "array", "items": { "$ref": "#/$defs/Id" }, "uniqueItems": true },
+        "has_more": { "const": false }
+      }
+    },
     "CollectionCommand": {
       "oneOf": [
+        { "$ref": "#/$defs/AgentsPublicationSubscribe" },
         {
           "type": "object",
           "additionalProperties": false,
@@ -2515,6 +2564,8 @@
     },
     "CollectionFrame": {
       "oneOf": [
+        { "$ref": "#/$defs/AgentsSnapshotChunk" },
+        { "$ref": "#/$defs/AgentsChanges" },
         {
           "type": "object",
           "additionalProperties": false,
@@ -2578,7 +2629,7 @@
             "kind": { "const": "resync" },
             "id": { "type": "string" },
             "collection": { "type": "string" },
-            "code": { "type": "string" },
+            "code": { "$ref": "#/$defs/ErrorCode" },
             "message": { "type": "string" },
             "retryable": { "type": "boolean" }
           }
@@ -2591,7 +2642,7 @@
             "kind": { "const": "error" },
             "id": { "type": "string" },
             "collection": { "type": "string" },
-            "code": { "type": "string" },
+            "code": { "$ref": "#/$defs/ErrorCode" },
             "message": { "type": "string" },
             "retryable": { "type": "boolean" }
           }

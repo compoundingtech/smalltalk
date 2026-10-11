@@ -580,10 +580,7 @@ fn emit(value: &Value, cx: &mut Cx) -> Result<String> {
         }) {
             break;
         }
-        let members = branches
-            .iter()
-            .map(|branch| emit(branch, cx))
-            .collect::<Result<Vec<_>>>()?;
+        let members = union_members(branches, combinator == "oneOf", cx)?;
         let mode = if combinator == "oneOf" {
             ", { mode: \"oneOf\" }"
         } else {
@@ -824,6 +821,37 @@ fn emit_object(object: &Map<String, Value>, cx: &mut Cx, indent: &str) -> Result
     })
 }
 
+/// Closed oneOf branches must also remain disjoint when Effect encoding ignores excess
+/// properties. Explicitly forbid known sibling fields, without changing tolerant handling
+/// of unrelated future fields or the canonical wire schema.
+fn union_members(branches: &[Value], exclusive: bool, cx: &mut Cx) -> Result<Vec<String>> {
+    let resolved = branches.iter().map(|branch| match branch.get("$ref").and_then(Value::as_str) {
+        Some(reference) => cx.normalized.get(reference.trim_start_matches("#/$defs/")).unwrap_or(branch),
+        None => branch,
+    }).collect::<Vec<_>>();
+    let fields = if exclusive {
+        resolved.iter().filter(|branch| branch["additionalProperties"] == false)
+            .filter_map(|branch| branch["properties"].as_object())
+            .flat_map(|properties| properties.keys().map(String::as_str)).collect::<BTreeSet<_>>()
+    } else { BTreeSet::new() };
+    branches.iter().zip(resolved.iter().copied()).map(|(branch, resolved)| {
+        if exclusive && resolved["additionalProperties"] == false
+            && let Some(object) = resolved.as_object()
+            && let Some(properties) = object.get("properties").and_then(Value::as_object)
+        {
+            let mut forbidden = fields.iter().filter(|field| !properties.contains_key(**field)).peekable();
+            if forbidden.peek().is_some() {
+                let mut built = emit_object(object, cx, "")?;
+                built.fields.extend(forbidden.map(|field| {
+                    format!("{}: Schema.optionalKey(Schema.Never)", js(&json!(field)))
+                }));
+                return Ok(built.expression());
+            }
+        }
+        emit(branch, cx)
+    }).collect()
+}
+
 /// The single-const discriminator shared by every branch, if all values are unique.
 fn tagged_by(branches: &[Value], cx: &Cx) -> Option<String> {
     let resolved: Vec<&Value> = branches
@@ -1059,10 +1087,7 @@ fn def_decl(name: &str, value: &Value, cx: &mut Cx) -> Result<String> {
         .and_then(Value::as_array)
         .filter(|b| b.len() > 2 || b.iter().all(|x| x.get("type") != Some(&json!("null"))));
     if let Some(branches) = branches.filter(|_| open_enum(value).is_none()) {
-        let members = branches
-            .iter()
-            .map(|branch| emit(branch, cx))
-            .collect::<Result<Vec<_>>>()?;
+        let members = union_members(branches, true, cx)?;
         let tag = tagged_by(branches, cx);
         let mut union = format!(
             "Schema.Union([\n  {}\n], {{ mode: \"oneOf\" }})",

@@ -408,6 +408,10 @@ impl Heard {
 
 
 impl CollectionStream {
+    /// Follow the complete unfiltered roster as version-1 publications, not a held window.
+    pub async fn subscribe_agents_publication(&mut self, id: &str) -> Result<(), ClientError> {
+        self.send(&agents_publication_command(id)).await
+    }
     pub async fn subscribe_glasses(&mut self, id: &str) -> Result<(), ClientError> { self.subscribe(id, "glasses", 100, None, None).await }
     /// Select the owner's fleet explicitly; agent identity is not an owner selector.
     pub async fn subscribe_arrangements(&mut self, id: &str, person: &str, limit: usize, subject: Option<&str>) -> Result<(), ClientError> {
@@ -560,12 +564,18 @@ impl ConversationStream {
     }
 }
 
+fn agents_publication_command(id: &str) -> serde_json::Value {
+    serde_json::json!({"kind":"subscribe", "id":id, "collection":"agents", "agents_publication_version":1})
+}
+
 /// One frame from a collection socket.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CollectionEvent {
     /// A subscription's first window, and the window again after a resubscribe.
     Snapshot {
         id: String,
+        collection: String,
         snapshot: Snapshot,
         items: Vec<Resource>,
         order: Vec<String>,
@@ -574,8 +584,33 @@ pub enum CollectionEvent {
     /// What changed in the window since the last frame, with its complete new order.
     Changes {
         id: String,
+        collection: String,
         snapshot: Snapshot,
         upserts: Vec<Resource>,
+        removes: Vec<String>,
+        order: Vec<String>,
+        has_more: bool,
+    },
+    /// Stage contiguous chunks privately; install only after the final chunk.
+    AgentsSnapshotChunk {
+        id: String,
+        collection: String,
+        snapshot: Snapshot,
+        publication: AgentsPublicationMetadata,
+        chunk_index: u64,
+        chunk_count: u64,
+        items: Vec<Agent>,
+        order: Vec<String>,
+        has_more: bool,
+    },
+    /// Apply atomically only when epoch and the applied base revision match.
+    AgentsChanges {
+        id: String,
+        collection: String,
+        snapshot: Snapshot,
+        publication: AgentsPublicationMetadata,
+        base_revision: u64,
+        upserts: Vec<Agent>,
         removes: Vec<String>,
         order: Vec<String>,
         has_more: bool,
@@ -583,12 +618,14 @@ pub enum CollectionEvent {
     /// A terminal subscription's whole current screen; it replaces every earlier one.
     Screen {
         id: String,
+        collection: String,
         screen: Box<Envelope<TerminalScreen>>,
     },
     /// A conversation's entries. `replace` means these are its newest page and every earlier
     /// entry is gone; otherwise they are new or revised entries, matched by ID.
     Conversation {
         id: String,
+        collection: String,
         session_id: String,
         replace: bool,
         items: Vec<TimelineEntry>,
@@ -600,15 +637,26 @@ pub enum CollectionEvent {
     /// whose owner cannot be reached; the server keeps retrying.
     Resync {
         id: String,
+        collection: Option<String>,
+        retryable: Option<bool>,
         code: Option<ErrorCode>,
         message: Option<String>,
     },
     /// The subscription failed or ended; the socket and other subscriptions continue.
     Error {
         id: String,
+        collection: Option<String>,
+        retryable: Option<bool>,
         code: Option<ErrorCode>,
         message: String,
     },
+}
+
+impl<'de> serde::Deserialize<'de> for CollectionEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::from_frame(serde_json::Value::deserialize(deserializer)?)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl CollectionEvent {
@@ -617,9 +665,59 @@ impl CollectionEvent {
             serde_json::from_value(frame.get(name).cloned().unwrap_or(serde_json::Value::Null))
                 .map_err(|error| ClientError::Protocol(format!("collection frame `{name}`: {error}")))
         }
-        let id = field::<String>(&frame, "id")?;
+        let kind = frame.get("kind").and_then(serde_json::Value::as_str);
+        let publication_frame = frame.get("publication").is_some();
+        let allowed: &[&str] = match (kind, publication_frame) {
+            (Some("snapshot"), true) => &["kind", "id", "collection", "snapshot", "publication", "chunk_index", "chunk_count", "items", "order", "has_more"],
+            (Some("changes"), true) => &["kind", "id", "collection", "snapshot", "publication", "base_revision", "upserts", "removes", "order", "has_more"],
+            (Some("snapshot"), false) => &["kind", "id", "collection", "snapshot", "items", "order", "has_more"],
+            (Some("changes"), false) => &["kind", "id", "collection", "snapshot", "upserts", "removes", "order", "has_more"],
+            (Some("screen"), false) => &["kind", "id", "collection", "snapshot", "value"],
+            (Some("conversation"), false) => &["kind", "id", "collection", "session_id", "replace", "items", "has_more"],
+            (Some("resync" | "error"), false) => &["kind", "id", "collection", "code", "message", "retryable"],
+            _ => return Err(ClientError::Protocol(format!("unknown collection frame kind {kind:?}"))),
+        };
+        let object = frame.as_object().ok_or_else(|| ClientError::Protocol("collection frame is not an object".into()))?;
+        if let Some(name) = object.keys().find(|name| !allowed.contains(&name.as_str())) {
+            return Err(ClientError::Protocol(format!("unexpected collection frame field `{name}`")));
+        }
+        let id = if kind == Some("error") {
+            field::<Option<String>>(&frame, "id")?.unwrap_or_default()
+        } else {
+            field::<String>(&frame, "id")?
+        };
+        if publication_frame {
+            let collection: String = field(&frame, "collection")?;
+            let snapshot: Snapshot = field(&frame, "snapshot")?;
+            let has_more: bool = field(&frame, "has_more")?;
+            if collection != "agents" || has_more || snapshot.published_at.is_none() {
+                return Err(ClientError::Protocol("invalid agents publication envelope".into()));
+            }
+            let publication = field(&frame, "publication")?;
+            return match kind {
+                Some("snapshot") => {
+                    let chunk_index = field::<u64>(&frame, "chunk_index")?;
+                    let chunk_count = field::<u64>(&frame, "chunk_count")?;
+                    if chunk_count == 0 || chunk_index >= chunk_count {
+                        return Err(ClientError::Protocol("invalid agents snapshot chunk index/count".into()));
+                    }
+                    Ok(Self::AgentsSnapshotChunk {
+                        id, collection, snapshot, publication, chunk_index, chunk_count,
+                        items: field(&frame, "items")?, order: field(&frame, "order")?, has_more,
+                    })
+                }
+                Some("changes") => Ok(Self::AgentsChanges {
+                    id, collection, snapshot, publication,
+                    base_revision: field(&frame, "base_revision")?,
+                    upserts: field(&frame, "upserts")?, removes: field(&frame, "removes")?,
+                    order: field(&frame, "order")?, has_more,
+                }),
+                _ => unreachable!("publication kinds checked above"),
+            };
+        }
         match frame.get("kind").and_then(serde_json::Value::as_str) {
             Some("snapshot") => Ok(Self::Snapshot {
+                collection: field(&frame, "collection")?,
                 snapshot: field(&frame, "snapshot")?,
                 items: field(&frame, "items")?,
                 order: field(&frame, "order")?,
@@ -627,6 +725,7 @@ impl CollectionEvent {
                 id,
             }),
             Some("changes") => Ok(Self::Changes {
+                collection: field(&frame, "collection")?,
                 snapshot: field(&frame, "snapshot")?,
                 upserts: field(&frame, "upserts")?,
                 removes: field(&frame, "removes")?,
@@ -635,6 +734,7 @@ impl CollectionEvent {
                 id,
             }),
             Some("screen") => Ok(Self::Screen {
+                collection: field(&frame, "collection")?,
                 screen: Box::new(Envelope {
                     api_version: API_VERSION.into(),
                     request_id: String::new(),
@@ -644,6 +744,7 @@ impl CollectionEvent {
                 id,
             }),
             Some("conversation") => Ok(Self::Conversation {
+                collection: field(&frame, "collection")?,
                 session_id: field(&frame, "session_id")?,
                 replace: field(&frame, "replace")?,
                 items: field(&frame, "items")?,
@@ -651,22 +752,17 @@ impl CollectionEvent {
                 id,
             }),
             Some("resync") => Ok(Self::Resync {
-                code: frame
-                    .get("code")
-                    .cloned()
-                    .and_then(|code| serde_json::from_value(code).ok()),
-                message: frame
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
+                collection: field(&frame, "collection")?,
+                retryable: field(&frame, "retryable")?,
+                code: field(&frame, "code")?,
+                message: field(&frame, "message")?,
                 id,
             }),
             Some("error") => Ok(Self::Error {
-                code: frame
-                    .get("code")
-                    .cloned()
-                    .and_then(|code| serde_json::from_value(code).ok()),
-                message: field::<Option<String>>(&frame, "message")?.unwrap_or_default(),
+                collection: field(&frame, "collection")?,
+                retryable: field(&frame, "retryable")?,
+                code: field(&frame, "code")?,
+                message: field(&frame, "message")?,
                 id,
             }),
             other => Err(ClientError::Protocol(format!(
@@ -840,6 +936,7 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         }
         ErrorCode::ValidationFailed
         | ErrorCode::ProjectionDetailTooLarge
+        | ErrorCode::AgentsPublicationRowTooLarge
         | ErrorCode::ProjectionDetailInvalidSource
         | ErrorCode::AttentionMigrated
         | ErrorCode::IssuerRequired
@@ -2614,6 +2711,15 @@ fn percent_encode_segment(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agents_publication_subscribe_has_only_the_opt_in_grammar() {
+        let expected: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/fixtures/agents-publication-subscribe.json"
+        )).unwrap();
+        assert_eq!(agents_publication_command("roster"), expected);
+        assert_eq!(agents_publication_command("other")["id"], "other");
+    }
+
     fn api(code: ErrorCode, message: &str) -> ClientError {
         ClientError::Api(
             code.clone(),

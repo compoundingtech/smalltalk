@@ -3162,7 +3162,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        let st3_client::CollectionEvent::Resync { id, code, message } = event else {
+        let st3_client::CollectionEvent::Resync { id, code, message, .. } = event else {
             panic!("expected a resync, got {event:?}");
         };
         assert_eq!(id, "conversation");

@@ -8,7 +8,7 @@
     "remote_mode": "online-thin-client"
   },
   "agents_publication_contract": {
-    "description": "Transport-neutral complete current view definition only. No endpoint, transport opt-in or capability availability is added.",
+    "description": "Complete current agents publications with an explicit version-1 collections-stream opt-in. No HTTP endpoint or capability availability is added.",
     "metadata": "AgentsPublicationMetadata",
     "watermark": "AgentsStatusWatermark",
     "view": "AgentsPublication",
@@ -16,6 +16,12 @@
     "replacement": "atomic-latest-value",
     "history": "not-included",
     "replay": "not-provided",
+    "subscribe": "AgentsPublicationSubscribe",
+    "snapshot_chunk": "AgentsSnapshotChunk",
+    "delta": "AgentsChanges",
+    "frame_budget_bytes": 1048576,
+    "snapshot_sequence_timeout_ms": 8000,
+    "oversized_row_error": "agents-publication-row-too-large",
     "legacy_http_and_websocket_grammar": "unchanged"
   },
   "streams": [

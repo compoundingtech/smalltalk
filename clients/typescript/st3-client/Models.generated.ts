@@ -256,6 +256,21 @@ export type AgentWorkspace = {
   workspace: string;
 };
 
+export type AgentsChanges = {
+  base_revision: number;
+  collection: "agents";
+  has_more: false;
+  id: string;
+  kind: "changes";
+  order: Array<Id>;
+  publication: AgentsPublicationMetadata;
+  removes: Array<Id>;
+  snapshot: Snapshot & {
+  published_at: Timestamp;
+};
+  upserts: Array<Agent>;
+};
+
 export type AgentsPublication = {
   has_more: false;
   items: Array<Agent>;
@@ -268,6 +283,28 @@ export type AgentsPublicationMetadata = {
   node_epoch: string;
   revision: number;
   status_watermark: AgentsStatusWatermark;
+};
+
+export type AgentsPublicationSubscribe = {
+  agents_publication_version: 1;
+  collection: "agents";
+  id: string;
+  kind: "subscribe";
+};
+
+export type AgentsSnapshotChunk = {
+  chunk_count: number;
+  chunk_index: number;
+  collection: "agents";
+  has_more: false;
+  id: string;
+  items: Array<Agent>;
+  kind: "snapshot";
+  order: Array<Id>;
+  publication: AgentsPublicationMetadata;
+  snapshot: Snapshot & {
+  published_at: Timestamp;
+};
 };
 
 export type AgentsStatusWatermark = {
@@ -553,7 +590,7 @@ export type ClientConnections = {
   member: string;
 };
 
-export type CollectionCommand = ({
+export type CollectionCommand = ((AgentsPublicationSubscribe & { actor?: never; capability?: never; conversation?: never; incarnation?: never; limit?: never; person?: never; status?: never; subject?: never; terminal?: never; }) | ({
   actor?: string | null;
   collection: "missions" | "attention" | "agents" | "work" | "glasses" | "summary";
   id: string;
@@ -561,31 +598,31 @@ export type CollectionCommand = ({
   limit?: number;
   person?: string | null;
   status?: string | null;
-} | {
+} & { agents_publication_version?: never; capability?: never; conversation?: never; incarnation?: never; subject?: never; terminal?: never; }) | ({
   collection: "arrangements";
   id: string;
   kind: "subscribe";
   limit?: number;
   person: ArrangementPerson;
   subject?: ArrangementId;
-} | {
+} & { actor?: never; agents_publication_version?: never; capability?: never; conversation?: never; incarnation?: never; status?: never; terminal?: never; }) | ({
   capability: string;
   collection: "terminal";
   id: string;
   incarnation?: string | null;
   kind: "subscribe";
   terminal: Id;
-} | {
+} & { actor?: never; agents_publication_version?: never; conversation?: never; limit?: never; person?: never; status?: never; subject?: never; }) | ({
   collection: "conversation";
   conversation: Id;
   id: string;
   kind: "subscribe";
-} | {
+} & { actor?: never; agents_publication_version?: never; capability?: never; incarnation?: never; limit?: never; person?: never; status?: never; subject?: never; terminal?: never; }) | ({
   id: string;
   kind: "unsubscribe";
-});
+} & { actor?: never; agents_publication_version?: never; capability?: never; collection?: never; conversation?: never; incarnation?: never; limit?: never; person?: never; status?: never; subject?: never; terminal?: never; }));
 
-export type CollectionFrame = ({
+export type CollectionFrame = ((AgentsSnapshotChunk & { base_revision?: never; code?: never; message?: never; removes?: never; replace?: never; retryable?: never; session_id?: never; upserts?: never; value?: never; }) | (AgentsChanges & { chunk_count?: never; chunk_index?: never; code?: never; items?: never; message?: never; replace?: never; retryable?: never; session_id?: never; value?: never; }) | ({
   collection: CollectionName;
   has_more: boolean;
   id: string;
@@ -593,7 +630,7 @@ export type CollectionFrame = ({
   kind: "snapshot";
   order: Array<Id>;
   snapshot: Snapshot;
-} | {
+} & { base_revision?: never; chunk_count?: never; chunk_index?: never; code?: never; message?: never; publication?: never; removes?: never; replace?: never; retryable?: never; session_id?: never; upserts?: never; value?: never; }) | ({
   collection: CollectionName;
   has_more: boolean;
   id: string;
@@ -602,13 +639,13 @@ export type CollectionFrame = ({
   removes: Array<Id>;
   snapshot: Snapshot;
   upserts: Array<Resource>;
-} | {
+} & { base_revision?: never; chunk_count?: never; chunk_index?: never; code?: never; items?: never; message?: never; publication?: never; replace?: never; retryable?: never; session_id?: never; value?: never; }) | ({
   collection: "terminal";
   id: string;
   kind: "screen";
   snapshot: Snapshot;
   value: TerminalScreen;
-} | {
+} & { base_revision?: never; chunk_count?: never; chunk_index?: never; code?: never; has_more?: never; items?: never; message?: never; order?: never; publication?: never; removes?: never; replace?: never; retryable?: never; session_id?: never; upserts?: never; }) | ({
   collection: "conversation";
   has_more?: boolean;
   id: string;
@@ -616,21 +653,21 @@ export type CollectionFrame = ({
   kind: "conversation";
   replace: boolean;
   session_id: Id;
-} | {
-  code?: string;
+} & { base_revision?: never; chunk_count?: never; chunk_index?: never; code?: never; message?: never; order?: never; publication?: never; removes?: never; retryable?: never; snapshot?: never; upserts?: never; value?: never; }) | ({
+  code?: ErrorCode;
   collection?: string;
   id: string;
   kind: "resync";
   message?: string;
   retryable?: boolean;
-} | {
-  code?: string;
+} & { base_revision?: never; chunk_count?: never; chunk_index?: never; has_more?: never; items?: never; order?: never; publication?: never; removes?: never; replace?: never; session_id?: never; snapshot?: never; upserts?: never; value?: never; }) | ({
+  code?: ErrorCode;
   collection?: string;
   id?: string;
   kind: "error";
   message: string;
   retryable?: boolean;
-});
+} & { base_revision?: never; chunk_count?: never; chunk_index?: never; has_more?: never; items?: never; order?: never; publication?: never; removes?: never; replace?: never; session_id?: never; snapshot?: never; upserts?: never; value?: never; }));
 
 export type CollectionName = "missions" | "attention" | "agents" | "work" | "glasses" | "arrangements" | "summary";
 
@@ -749,7 +786,7 @@ export type Envelope = {
   value: (Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
-export type ErrorCode = ("attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "issuer-required" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "projection-detail-too-large" | "projection-detail-invalid-source" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
+export type ErrorCode = ("agents-publication-row-too-large" | "attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "issuer-required" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "projection-detail-too-large" | "projection-detail-invalid-source" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "internal" | string);
 
 export type ErrorEnvelope = {
   api_version: "st3.client.v0";

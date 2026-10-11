@@ -1,0 +1,6 @@
+{
+  "kind": "changes", "id": "roster", "collection": "agents",
+  "snapshot": {"id":"snapshot/host-a/1843/2fc9","host_id":"host/host-a","store_index":1843,"projection_version":"client-projection.v0","created_at":"2026-10-10T12:00:01.000Z","published_at":"2026-10-10T12:00:01.000Z"},
+  "publication": {"node_epoch":"019a0000-0000-7000-8000-000000000001","revision":43,"status_watermark":{"store_index":1843,"local_frontier":17},"materialized_at_ms":1791633601000},
+  "base_revision": 42, "upserts": [], "removes": ["agent/b"], "order": ["agent/a"], "has_more": false
+}

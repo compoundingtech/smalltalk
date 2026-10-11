@@ -15,6 +15,119 @@ fn fixture(name: &str) -> Vec<u8> {
 fn decode<T: serde::de::DeserializeOwned>(name: &str) -> T {
     serde_json::from_slice(&fixture(name)).unwrap_or_else(|error| panic!("decode {name}: {error}"))
 }
+
+#[test]
+fn revisioned_agents_frames_keep_typed_publication_and_snapshot_provenance() {
+    let CollectionEvent::AgentsSnapshotChunk {
+        id, collection, snapshot, publication, chunk_index, chunk_count, items, order, has_more,
+    } = decode("agents-publication-chunk.json") else { panic!("expected typed chunk"); };
+    assert_eq!(id, "roster");
+    assert_eq!(collection, "agents");
+    assert_eq!(snapshot.published_at.as_deref(), Some("2026-10-10T12:00:00.000Z"));
+    assert_eq!(publication.revision, 42);
+    assert_eq!(publication.status_watermark.store_index, snapshot.store_index);
+    assert_eq!(publication.status_watermark.local_frontier, 17);
+    assert_eq!(publication.materialized_at_ms, 1791633600000);
+    assert_eq!((chunk_index, chunk_count), (0, 2));
+    assert_eq!(items[0].header.id, "agent/a");
+    assert_eq!(order, ["agent/a"]);
+    assert!(!has_more);
+    let CollectionEvent::AgentsChanges {
+        id, collection, snapshot, publication, base_revision, upserts, removes, order, has_more,
+    } = decode("agents-publication-changes.json") else { panic!("expected typed delta"); };
+    assert_eq!(id, "roster");
+    assert_eq!(collection, "agents");
+    assert_eq!(snapshot.published_at.as_deref(), Some("2026-10-10T12:00:01.000Z"));
+    assert_eq!(publication.revision, 43);
+    assert_eq!(base_revision, 42);
+    assert!(upserts.is_empty());
+    assert_eq!(removes, ["agent/b"]);
+    assert_eq!(order, ["agent/a"]);
+    assert!(!has_more);
+}
+
+#[test]
+fn collection_errors_keep_distinct_permanent_code_and_optional_legacy_metadata() {
+    let CollectionEvent::Error { id, collection, code, retryable, .. } =
+        decode("agents-publication-row-too-large.json") else { panic!("expected error"); };
+    assert_eq!(id, "roster");
+    assert_eq!(collection.as_deref(), Some("agents"));
+    assert_eq!(code, Some(ErrorCode::AgentsPublicationRowTooLarge));
+    assert_eq!(retryable, Some(false));
+    let legacy: CollectionEvent = serde_json::from_value(serde_json::json!({
+        "kind":"resync", "id":"roster"
+    })).unwrap();
+    assert!(matches!(legacy, CollectionEvent::Resync { collection: None, retryable: None, .. }));
+    let notice: CollectionEvent = serde_json::from_value(serde_json::json!({
+        "kind":"resync", "id":"talk", "collection":"conversation", "retryable":true, "code":"remote-unavailable"
+    })).unwrap();
+    assert!(matches!(notice, CollectionEvent::Resync { collection: Some(collection), retryable: Some(true), .. } if collection == "conversation"));
+    let error: CollectionEvent = serde_json::from_value(serde_json::json!({
+        "kind":"error", "message":"legacy refusal"
+    })).unwrap();
+    assert!(matches!(error, CollectionEvent::Error { collection: None, retryable: None, .. }));
+}
+
+#[test]
+fn collection_publication_grammar_cannot_leak_into_legacy_events() {
+    let chunk: serde_json::Value = serde_json::from_slice(&fixture("agents-publication-chunk.json")).unwrap();
+    let mut legacy = chunk.clone();
+    for key in ["publication", "chunk_index", "chunk_count"] { legacy.as_object_mut().unwrap().remove(key); }
+    let event: CollectionEvent = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(matches!(event, CollectionEvent::Snapshot { collection, snapshot, .. } if collection == "agents" && snapshot.published_at.is_some()));
+    for key in ["chunk_index", "chunk_count", "base_revision"] {
+        let mut invalid = legacy.clone();
+        invalid[key] = serde_json::json!(1);
+        assert!(serde_json::from_value::<CollectionEvent>(invalid).is_err(), "{key}");
+    }
+    for key in ["publication", "chunk_index", "chunk_count"] {
+        let mut invalid = chunk.clone();
+        invalid.as_object_mut().unwrap().remove(key);
+        assert!(serde_json::from_value::<CollectionEvent>(invalid).is_err(), "{key}");
+    }
+    for (key, value) in [
+        ("chunk_count", serde_json::json!(0)),
+        ("chunk_index", serde_json::json!(2)),
+        ("collection", serde_json::json!("work")),
+        ("has_more", serde_json::json!(true)),
+    ] {
+        let mut invalid = chunk.clone();
+        invalid[key] = value;
+        assert!(serde_json::from_value::<CollectionEvent>(invalid).is_err(), "{key}");
+    }
+    let mut unpublished = chunk.clone();
+    unpublished["snapshot"].as_object_mut().unwrap().remove("published_at");
+    assert!(serde_json::from_value::<CollectionEvent>(unpublished).is_err());
+    let mut delta: serde_json::Value = serde_json::from_slice(&fixture("agents-publication-changes.json")).unwrap();
+    delta["chunk_index"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<CollectionEvent>(delta).is_err());
+    let legacy_snapshot: Snapshot = serde_json::from_value(serde_json::json!({
+        "id":"snapshot/host-a/1/fence", "host_id":"host/host-a", "store_index":1,
+        "projection_version":"client-projection.v0", "created_at":"2026-10-10T12:00:00.000Z"
+    })).unwrap();
+    assert!(legacy_snapshot.published_at.is_none());
+    assert!(serde_json::to_value(legacy_snapshot).unwrap().get("published_at").is_none());
+}
+
+#[test]
+fn terminal_conversation_and_legacy_changes_keep_collection_names() {
+    let envelope: serde_json::Value = serde_json::from_slice(&fixture("terminal-screen.json")).unwrap();
+    let screen: CollectionEvent = serde_json::from_value(serde_json::json!({
+        "kind":"screen", "id":"term", "collection":"terminal",
+        "snapshot":envelope["snapshot"], "value":envelope["value"],
+    })).unwrap();
+    assert!(matches!(screen, CollectionEvent::Screen { collection, .. } if collection == "terminal"));
+    let conversation: CollectionEvent = serde_json::from_value(serde_json::json!({
+        "kind":"conversation", "id":"talk", "collection":"conversation",
+        "session_id":"session/a", "replace":false, "items":[],
+    })).unwrap();
+    assert!(matches!(conversation, CollectionEvent::Conversation { collection, has_more: None, .. } if collection == "conversation"));
+    let changes: CollectionEvent = serde_json::from_value(serde_json::json!({
+        "kind":"changes", "id":"window", "collection":"agents", "snapshot":envelope["snapshot"],
+        "upserts":[], "removes":[], "order":[], "has_more":false,
+    })).unwrap();
+    assert!(matches!(changes, CollectionEvent::Changes { collection, .. } if collection == "agents"));
+}
 #[test]
 fn agent_lifecycle_future_value_keeps_the_roster_row() {
     let row = serde_json::json!({

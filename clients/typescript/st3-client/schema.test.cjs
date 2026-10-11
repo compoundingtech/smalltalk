@@ -4,6 +4,52 @@ const assert = require('node:assert/strict');
 // Node 24 loads the generated TypeScript directly, without a transpilation copy.
 const modules = Promise.all([import('effect'), import('./Schema.generated.ts')]);
 
+test('revisioned agents opt-in and frames are strict disjoint branches with lossless provenance', async () => {
+    const [{ Schema }, Rich] = await modules;
+    const command = require('../../../docs/st3/client-v0/fixtures/agents-publication-subscribe.json');
+    const chunk = require('../../../docs/st3/client-v0/fixtures/agents-publication-chunk.json');
+    const delta = require('../../../docs/st3/client-v0/fixtures/agents-publication-changes.json');
+    const error = require('../../../docs/st3/client-v0/fixtures/agents-publication-row-too-large.json');
+    const decodeCommand = Rich.decodeUnknownSync(Rich.CollectionCommand, 'strict');
+    const decodeFrame = Rich.decodeUnknownSync(Rich.CollectionFrame, 'strict');
+    assert.deepEqual(Schema.encodeSync(Rich.CollectionCommand)(decodeCommand(command)), command);
+    for (const field of ['limit', 'window', 'person', 'actor', 'status', 'filters']) {
+        assert.throws(() => decodeCommand({ ...command, [field]: field === 'limit' ? 100 : null }));
+    }
+    assert.throws(() => decodeCommand({ ...command, agents_publication_version: 2 }));
+    assert.throws(() => decodeCommand({ ...command, collection: 'work' }));
+    const legacyCommand = { kind: 'subscribe', id: 'legacy', collection: 'agents', limit: 100 };
+    assert.deepEqual(Schema.encodeSync(Rich.CollectionCommand)(decodeCommand(legacyCommand)),
+        { ...legacyCommand, actor: null, person: null, status: null });
+    // Existing nullable Agent fields encode omitted values as null; frame provenance stays exact.
+    const normalizedRows = Schema.encodeSync(Schema.Array(Rich.Agent))(
+        Rich.decodeUnknownSync(Schema.Array(Rich.Agent), 'strict')(chunk.items));
+    const normalizedChunk = { ...chunk, items: normalizedRows };
+    for (const wire of [normalizedChunk, delta, error]) {
+        assert.deepEqual(Schema.encodeSync(Rich.CollectionFrame)(decodeFrame(wire)), wire);
+    }
+    assert.equal(Rich.decodeUnknownSync(Rich.ErrorCode, 'strict')(error.code), error.code);
+    const { publication, chunk_index, chunk_count, ...legacy } = normalizedChunk;
+    assert.deepEqual(Schema.encodeSync(Rich.CollectionFrame)(decodeFrame(legacy)), legacy);
+    for (const field of ['publication', 'chunk_index', 'chunk_count']) {
+        const invalid = { ...chunk };
+        delete invalid[field];
+        assert.throws(() => decodeFrame(invalid));
+    }
+    assert.throws(() => decodeFrame({ ...chunk, chunk_count: 0 }));
+    assert.throws(() => decodeFrame({ ...chunk, base_revision: 42 }));
+    assert.throws(() => decodeFrame({ ...chunk, has_more: true }));
+    assert.throws(() => decodeFrame({ ...chunk, collection: 'missions' }));
+    assert.throws(() => decodeFrame({ ...delta, chunk_index: 0 }));
+    assert.throws(() => decodeFrame({ ...delta, base_revision: 0 }));
+    const unpublished = structuredClone(chunk);
+    delete unpublished.snapshot.published_at;
+    assert.throws(() => decodeFrame(unpublished));
+    for (const field of ['chunk_index', 'chunk_count', 'base_revision']) {
+        assert.throws(() => decodeFrame({ ...legacy, [field]: 1 }));
+    }
+});
+
 test('person-ask mission rows retain actor references through the generated decoder', async () => {
     const [{ Schema }, Rich] = await modules;
     const wire = require('../../../docs/st3/client-v0/fixtures/person-ask-mission.json');

@@ -25,6 +25,8 @@ pub struct Snapshot {
     pub store_index: u64,
     pub projection_version: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
 }
 
 /// Node-local source cut; do not compare across nodes or publication epochs.
@@ -95,6 +97,7 @@ pub enum ErrorCode {
     CursorGap,
     PageCursorExpired,
     ProjectionDetailTooLarge,
+    AgentsPublicationRowTooLarge,
     ProjectionDetailInvalidSource,
     RateLimited,
     RuntimeNotLocal,

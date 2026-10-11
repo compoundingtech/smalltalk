@@ -566,7 +566,7 @@ async fn connected(
                 };
                 *failures = 0;
                 match event {
-                    CollectionEvent::Snapshot { id, snapshot, items, order, has_more } => {
+                    CollectionEvent::Snapshot { id, snapshot, items, order, has_more, .. } => {
                         let Some(window) = Window::from_id(&id) else { continue };
                         // A frame already on its way when the window was left: the socket was
                         // heard from, but nothing of the window comes back.
@@ -583,7 +583,7 @@ async fn connected(
                             return Ended::Closed;
                         }
                     }
-                    CollectionEvent::Changes { id, snapshot, upserts, removes, order, has_more } => {
+                    CollectionEvent::Changes { id, snapshot, upserts, removes, order, has_more, .. } => {
                         let Some(window) = Window::from_id(&id) else { continue };
                         if left(window, *missions) {
                             continue;
@@ -601,7 +601,7 @@ async fn connected(
                     }
                     // st keeps a conversation's subscription and retries it itself; it says why
                     // so the last copy shown can say it is stale (the owner's host is away).
-                    CollectionEvent::Resync { id, code, message: Some(message) } if id.starts_with(CONVERSATION) => {
+                    CollectionEvent::Resync { id, code, message: Some(message), .. } if id.starts_with(CONVERSATION) => {
                         let Some(current) = conversing.iter().find(|current| current.id == id) else { continue };
                         let message = st3_client::plain_message(code.as_ref(), &message);
                         if updates.send(Update::ConversationFailed { target: current.target.clone(), message, permanent: false }).is_err() {
@@ -612,7 +612,7 @@ async fn connected(
                     // under it). Asked at once and again on every resync, that is a loop and, at an
                     // upgrade, a herd; so each is asked after a wait that grows and is jittered, and
                     // one good snapshot resets the wait.
-                    CollectionEvent::Resync { id, code, message } => {
+                    CollectionEvent::Resync { id, code, message, .. } => {
                         if let Some(window) = Window::from_id(&id)
                             && !left(window, *missions)
                         {
@@ -625,14 +625,14 @@ async fn connected(
                             }
                         }
                     }
-                    CollectionEvent::Conversation { id, session_id, replace, items, has_more } => {
+                    CollectionEvent::Conversation { id, session_id, replace, items, has_more, .. } => {
                         let Some(current) = conversing.iter_mut().find(|current| current.id == id) else { continue };
                         current.failures = 0;
                         if updates.send(Update::Conversation { target: current.target.clone(), session_id, replace, has_more, items }).is_err() {
                             return Ended::Closed;
                         }
                     }
-                    CollectionEvent::Error { id, code, message } if id.starts_with(CONVERSATION) => {
+                    CollectionEvent::Error { id, code, message, .. } if id.starts_with(CONVERSATION) => {
                         let message = st3_client::plain_message(code.as_ref(), &message);
                         let Some(current) = conversing.iter_mut().find(|current| current.id == id) else { continue };
                         let permanent = !conversation_may_clear(code.as_ref());
@@ -646,7 +646,7 @@ async fn connected(
                             return Ended::Closed;
                         }
                     }
-                    CollectionEvent::Error { id, code, message } => {
+                    CollectionEvent::Error { id, code, message, .. } => {
                         if let Some(window) = Window::from_id(&id) {
                             if left(window, *missions) {
                                 continue;
@@ -662,7 +662,7 @@ async fn connected(
                             terminal_failed(updates, following, code, message);
                         }
                     }
-                    CollectionEvent::Screen { id, screen } => {
+                    CollectionEvent::Screen { id, screen, .. } => {
                         if id != TERMINAL {
                             continue;
                         }
@@ -673,6 +673,12 @@ async fn connected(
                             return Ended::Closed;
                         }
                     }
+                    // The feed opts into legacy windows only; never mistake one chunk for
+                    // a complete visible roster if a server violates that negotiation.
+                    CollectionEvent::AgentsSnapshotChunk { .. } | CollectionEvent::AgentsChanges { .. } => {
+                        return Ended::Dropped("st sent revisioned agents data to a legacy subscription".into());
+                    }
+                    _ => return Ended::Dropped("st sent an unsupported collection frame".into()),
                 }
             }
             command = commands.recv() => match command {

@@ -6,6 +6,46 @@ import FoundationNetworking
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
+    func testRevisionedAgentsCommandAndGoldenFrames() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        func fixture(_ name: String) throws -> Data {
+            try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/agents-publication-\(name).json"))
+        }
+        let command = try JSONEncoder().encode(AgentsPublicationSubscribe(id: "roster"))
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: command) as? NSDictionary,
+            try JSONSerialization.jsonObject(with: fixture("subscribe")) as? NSDictionary)
+        guard case .snapshotChunk(let chunk) = try JSONDecoder().decode(AgentsCollectionEvent.self, from: fixture("chunk")) else {
+            return XCTFail("Expected snapshot chunk")
+        }
+        XCTAssertEqual(chunk.collection, "agents")
+        XCTAssertEqual(chunk.snapshot.publishedAt, "2026-10-10T12:00:00.000Z")
+        XCTAssertEqual(chunk.publication.revision, 42)
+        XCTAssertEqual(chunk.publication.statusWatermark.localFrontier, 17)
+        XCTAssertEqual(chunk.chunkIndex, 0)
+        XCTAssertEqual(chunk.chunkCount, 2)
+        XCTAssertEqual(chunk.order, ["agent/a"])
+        XCTAssertFalse(chunk.hasMore)
+        guard case .changes(let delta) = try JSONDecoder().decode(AgentsCollectionEvent.self, from: fixture("changes")) else {
+            return XCTFail("Expected delta")
+        }
+        XCTAssertEqual(delta.collection, "agents")
+        XCTAssertEqual(delta.snapshot.publishedAt, "2026-10-10T12:00:01.000Z")
+        XCTAssertEqual(delta.publication.revision, 43)
+        XCTAssertEqual(delta.baseRevision, 42)
+        XCTAssertEqual(delta.removes, ["agent/b"])
+        XCTAssertFalse(delta.hasMore)
+        guard case .error(let error) = try JSONDecoder().decode(AgentsCollectionEvent.self, from: fixture("row-too-large")) else {
+            return XCTFail("Expected permanent error")
+        }
+        XCTAssertEqual(error.collection, "agents")
+        XCTAssertEqual(error.code, .agentsPublicationRowTooLarge)
+        XCTAssertEqual(error.retryable, false)
+        let legacy = try JSONDecoder().decode(CollectionNotice.self, from: Data(#"{"kind":"resync","id":"roster"}"#.utf8))
+        XCTAssertNil(legacy.collection)
+        XCTAssertNil(legacy.retryable)
+    }
+
     func testCreationActionFixtures() throws {
         var root = URL(fileURLWithPath: #filePath)
         for _ in 0..<6 { root.deleteLastPathComponent() }

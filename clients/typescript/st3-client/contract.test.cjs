@@ -6,6 +6,8 @@ const path = require('node:path');
 const ts = require('typescript');
 
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'st3-ts-client-'));
+// Keep the transpiled fixture independent of a surrounding temporary directory's module mode.
+fs.writeFileSync(path.join(temporary, 'package.json'), JSON.stringify({ type: 'commonjs' }));
 for (const name of ['Models.generated', 'Client.generated', 'fetch-receiver.test']) {
     const source = fs.readFileSync(path.join(__dirname, `${name}.ts`), 'utf8');
     const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, rewriteRelativeImportExtensions: true } }).outputText;
@@ -245,6 +247,23 @@ test('conversation stream opens at a cursor and delivers bounded changes', async
 function collectionSocket() {
     return { onopen: null, onmessage: null, onclose: null, onerror: null, sent: [], closed: [], send(text) { this.sent.push(JSON.parse(text)); }, close(code) { this.closed.push(code); } };
 }
+
+test('agents publication subscription serializes exact opt-in and keeps golden frames intact', async () => {
+    const socket = collectionSocket();
+    const frames = [];
+    const client = new St3Client({ baseUrl: 'https://example.test' });
+    const stream = await client.collectionStream({ onFrame: frame => frames.push(frame), socket: () => socket });
+    stream.subscribeAgentsPublication('roster');
+    socket.onopen();
+    assert.deepEqual(socket.sent, [require('../../../docs/st3/client-v0/fixtures/agents-publication-subscribe.json')]);
+    for (const name of ['chunk', 'changes', 'row-too-large']) {
+        const wire = require(`../../../docs/st3/client-v0/fixtures/agents-publication-${name}.json`);
+        socket.onmessage({ data: JSON.stringify(wire) });
+        assert.deepEqual(frames.at(-1), wire);
+        if (wire.kind !== 'error') assert.throws(() => applyWindow(undefined, wire), /atomic/);
+    }
+    stream.close();
+});
 const mission = (id, title) => ({ kind: 'mission', id, revision: `${id}@1`, updated_at: snapshot.created_at, title, state: 'running', runs: [], run_generations: {}, mission_revision: 'r' });
 
 test('collection stream holds commands until the socket opens and passes frames through', async () => {

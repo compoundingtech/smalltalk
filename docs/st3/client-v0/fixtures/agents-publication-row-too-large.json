@@ -1,0 +1,1 @@
+{"kind":"error","id":"roster","collection":"agents","code":"agents-publication-row-too-large","message":"a complete agents row cannot fit in the frame budget","retryable":false}
