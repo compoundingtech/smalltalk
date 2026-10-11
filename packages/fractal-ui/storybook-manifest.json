@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "exceptions": [
+    {
+      "book": "kit",
+      "title": "Fractal/Explore/Content network safety",
+      "classification": "explore",
+      "owner": "fractal",
+      "reason": "T102/B1, T009/T017/B7: retain the unmounted EmbraceThread and EmbraceMarkdownPreview alternatives' network-safety assertions separately from the production Transcript boundary."
+    },
+    {
+      "book": "kit",
+      "title": "Fractal/Explore/Composer",
+      "classification": "explore",
+      "owner": "fractal-web-live",
+      "reason": "T101/B2/J2: ComposerSession's C2 policy is not the production ConversationPane C1 boundary; retain its regression states until the app-owned composer cutover."
+    },
+    {
+      "book": "kit",
+      "title": "Fractal/Explore/Workbench",
+      "classification": "explore",
+      "owner": "fractal-web-live",
+      "reason": "T113/B4/J1: the kit split/drag/terminal harness is not mounted by LiveAgentWorkspace; app adoption and real terminal bindings remain undecided."
+    },
+    {
+      "book": "kit",
+      "title": "Fractal/Explore/Component families",
+      "classification": "explore",
+      "owner": "fractal",
+      "reason": "T105/B7: superseded Folio/Relay/Orbit gallery, retained only for explicit token and primitive exploration until canonical primitive convergence."
+    },
+    {
+      "book": "kit",
+      "title": "Fractal/Explore/Visual language",
+      "classification": "explore",
+      "owner": "fractal",
+      "reason": "T114/B7: superseded whole-look directions are exploratory, not the decided semantic production theme; retire after preserving unique states."
+    }
+  ]
+}

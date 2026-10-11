@@ -4,7 +4,7 @@ import { Families } from './Families'
 import type { Theme } from './kit'
 
 const meta = {
-  title: 'Fractal UI/Component families',
+  title: 'Fractal/Explore/Component families',
   component: Families,
   args: { direction: 'folio', scheme: 'light', density: 'comfortable' },
   parameters: {

@@ -79,7 +79,7 @@ function MarkdownCanvas({ scenario = 'rich-text', scheme = 'dark' }: { scenario?
   </ThemePortal></main>
 }
 const meta = {
-  title: 'Fractal UI/Markdown', component: MarkdownCanvas,
+  title: 'Fractal/Kit/Markdown', component: MarkdownCanvas,
   parameters: { layout: 'fullscreen', docs: { description: { component: 'CommonMark + GFM prose with semantic emphasis, nested lists, aligned scrollable tables, titled links, and preserved resource references. Code fences retain local wrap/copy state across streamed updates, copy unformatted source through the Clipboard API, and lazily load explicit refractor grammars whose tokens use the existing semantic theme. Unknown languages remain plain text. Streaming mode completes unfinished inline prose without changing settled literal punctuation or fenced source.' } } },
   args: { scenario: 'rich-text', scheme: 'dark' },
   argTypes: { scenario: { options: ['rich-text', 'languages', 'streaming', 'inline-streaming', 'all'], control: 'radio' }, scheme: { options: ['dark', 'light'], control: 'radio' } },

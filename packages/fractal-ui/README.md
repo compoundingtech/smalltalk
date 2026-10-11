@@ -17,7 +17,24 @@ pnpm --filter @smalltalk/fractal-ui typecheck
 pnpm --filter @smalltalk/fractal-ui build-storybook  # packages/fractal-ui/storybook-static/
 ```
 
-The package is an explicit member of the root pnpm workspace and uses its pinned toolchain, frozen lockfile and lifecycle-script suppression. `bash scripts/ci-fractal-web` runs its typecheck and the static Storybook build after the shared install.
+The package is an explicit member of the root pnpm workspace and uses its pinned toolchain, frozen lockfile and lifecycle-script suppression. `bash scripts/ci-fractal-web` runs its typecheck and the composed static Storybook lane after the shared install.
+
+### Composed review landing
+
+The kit is the landing book. Its suites use `Fractal/Kit/*` for reusable production leaves, `Fractal/Explore/*` for unresolved or superseded compositions, and `Fractal/Perf/*` for generated scale probes. The current main kit has no scale-generator suite; do not add placeholder Perf stories. Kit stories are not proof of app integration. The app owns `Fractal/App/*` in `apps/fractal-web/.storybook` and must use its actual production modules and Vite/StyleX configuration.
+
+The network-safety inventory is deliberately split: the real `Transcript` cases live in Kit, while unmounted `EmbraceThread` and `EmbraceMarkdownPreview` alternatives live in Explore. Both suites reuse the original renderer harness and play factories from `ContentNetwork.fixtures.tsx`; classification does not duplicate their JSX or drop any assertions.
+
+The landing composes that book as ref **`fractal-app`**, titled **Fractal App**. In local development set `FRACTAL_APP_STORYBOOK_URL` to the app book's devnet-assigned URL. Without that variable the ref points to `./apps/fractal-web/storybook-static`; when neither a local URL nor the app's static output exists, Storybook's supported `disable` flag prevents missing-ref network requests and the toolbar explicitly labels the ref unavailable. An absent app book does not prevent opening or building the kit. The toolbar identifies the selected book/ref and the exact landing Git revision (not an assertion of the referenced app's revision).
+
+Build the publication unit with `bash scripts/ci-fractal-web-storybooks`. The existing web CI lane calls it after installation and typechecking. It builds the app **first** when its `.storybook` directory exists, checks the app's index, then builds and checks the kit. The kit embeds the app static output at `storybook-static/apps/fractal-web/storybook-static`, so publishing only `packages/fractal-ui/storybook-static` preserves the relative ref. Build/CI ignores the local URL. Once the app book exists, missing `index.json` or `index.html` fails the landing build and CI; there is no fallback to a stale or remote book. Before its introduction only the kit is built.
+
+Storybook 10's manager probes `index.json`, `stories.json` and `metadata.json` for each ref, although its builder emits only the first. The serial script publishes the validated real app index at both index endpoints and writes metadata with the actual build revision and story count before embedding the app. A local app dev server must serve the same composition endpoints; do not exempt their 404s from the strict browser gate.
+
+`storybook-manifest.json` is the single exceptions manifest, strictly decoded by the Effect `ManifestSchema` in `scripts/check-storybook-index.mjs`. Each entry names an exact suite title, book, classification, owner and reason; that title covers every exported story in the suite, with no wildcard exemptions. Explore and Perf suites always require entries. Any non-canonical library/app suite must carry the Storybook `noncanonical` tag and a `library` entry. App owners add their App rows here rather than creating another manifest. Duplicate, stale, empty-owned, malformed and misclassified entries fail. Remove the entry when an exploration is retired or promoted.
+
+Run `node --test packages/fractal-ui/scripts/check-storybook-index.test.mjs` from the root for the positive witnesses and planted failing controls (non-conforming title, removed exception, unlisted generator, malformed manifest and missing app output). Run `node packages/fractal-ui/scripts/check-storybook-index.mjs kit packages/fractal-ui/storybook-static/index.json` to reconcile the real built index. These checks do not replace the strict browser story gate: `storyFinished` must succeed without play/story exceptions, page errors or console errors.
+
 The kit keeps TypeScript 6.0.3 and declares the Node types used by its Storybook configuration explicitly.
 
 The dev server binds to localhost on a fixed port (53705). To view it from another machine, forward the port, for example `ssh -L 53705:localhost:53705 <host>`, and open http://localhost:53705.

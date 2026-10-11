@@ -54,7 +54,7 @@ function TranscriptStory({ scheme = 'dark', state = 'settled', availability, his
   const retry = React.useCallback(() => setRetried(true), [])
   return <section aria-label={`${state} conversation example`} data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><div {...stylex.props(styles.frame)}><RuntimeTranscript data={cases[state]} onOpenTool={setOpened} onRetry={retry} availability={availability} history={history} emptyState={emptyState} /></div>{opened !== undefined && <section aria-label="Opened tool detail" {...stylex.props(styles.detail)}><strong>{opened.title} {opened.argsSummary}</strong><pre>{opened.detail}</pre></section>}{retried && <p role="status">Retry requested by the host.</p>}</section>
 }
-const meta = { title: 'Fractal UI/Transcript', component: TranscriptStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', state: 'settled' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, state: { options: Object.keys(cases), control: 'select' } } } satisfies Meta<typeof TranscriptStory>
+const meta = { title: 'Fractal/Kit/Transcript', component: TranscriptStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', state: 'settled' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, state: { options: Object.keys(cases), control: 'select' } } } satisfies Meta<typeof TranscriptStory>
 export default meta
 type Story = StoryObj<typeof meta>
 export const Settled: Story = { play: async ({ canvasElement }) => {

@@ -10,7 +10,7 @@ import { surfaceVars as surface, textVars as ink, spaceVars as s, typeVars as t 
 function ThinkingStory({ scheme = 'dark', streaming = false }: { scheme?: Scheme; streaming?: boolean }) {
   return <main data-scheme={scheme} {...stylex.props(styles.root, ...baselineTheme, scheme === 'light' && lightTheme)}><ThinkingEntry text="Compare **reported rows** with the input, then ask a second worker to *review* the change." streaming={streaming} /></main>
 }
-const meta = { title: 'Fractal UI/Thinking Entry', component: ThinkingStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', streaming: false }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof ThinkingStory>
+const meta = { title: 'Fractal/Kit/Thinking Entry', component: ThinkingStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', streaming: false }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' } } } satisfies Meta<typeof ThinkingStory>
 export default meta
 type Story = StoryObj<typeof meta>
 export const Settled: Story = { play: async ({ canvasElement }) => {

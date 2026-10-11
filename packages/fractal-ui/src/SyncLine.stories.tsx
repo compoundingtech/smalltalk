@@ -64,7 +64,7 @@ const subscriptionLimitPlay: NonNullable<StoryObj<SyncArgs>['play']> = async ({ 
   }
 }
 const meta = {
-  title: 'Fractal UI/Sync Line',
+  title: 'Fractal/Kit/Sync Line',
   render: StoryRender,
   parameters: { layout: 'fullscreen', docs: { description: { component: 'Portable SyncStatus tagged union with epoch-ms timestamps and the syncLine vocabulary. Every status/stage, derived stalled observations, both themes, and fixed-height existing header/status slots. Last-known content remains present. Local and Server subscription-limit failures share plain vocabulary; only reported caps appear, including zero. HTTP Usage reads exclude subscription-limit failures and their actions. Dedicated dark/light stories cover those exclusions and the full transition sequence. No byte-progress or invented stage is shown.' } } },
   args: { scheme: 'dark', sequence: 0 }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, sequence: { control: { type: 'number', min: 0, max: syncObservations.length - 1 } } },
