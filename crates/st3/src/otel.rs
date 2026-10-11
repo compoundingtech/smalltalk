@@ -28,10 +28,17 @@ use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::{Layer as _, SubscriberExt};
 
 static EXPORT_ENABLED: AtomicBool = AtomicBool::new(false);
+static METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
 pub fn export_enabled() -> bool {
     EXPORT_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Whether a meter provider was installed. Independent of trace export: the RED metrics
+/// are recorded whenever metrics are on, whatever sampling and the trace signal do.
+pub fn metrics_enabled() -> bool {
+    METRICS_ENABLED.load(Ordering::Relaxed)
 }
 
 /// Shared by the SDK resource and the daemon's observations exporter.
@@ -206,17 +213,100 @@ const DURATION_BUCKET_BOUNDARIES: [f64; 14] = [
 ];
 
 fn duration_view(instrument: &Instrument) -> Option<Stream> {
-    (instrument.unit() == "s"
-        && instrument.kind() == opentelemetry_sdk::metrics::InstrumentKind::Histogram)
-        .then(|| {
-            Stream::builder()
-                .with_aggregation(Aggregation::ExplicitBucketHistogram {
-                    boundaries: DURATION_BUCKET_BOUNDARIES.into(),
-                    record_min_max: true,
-                })
-                .build()
-                .expect("seconds histogram view is valid")
-        })
+    if instrument.unit() != "s"
+        || instrument.kind() != opentelemetry_sdk::metrics::InstrumentKind::Histogram
+    {
+        return None;
+    }
+    let mut stream = Stream::builder().with_aggregation(Aggregation::ExplicitBucketHistogram {
+        boundaries: DURATION_BUCKET_BOUNDARIES.into(),
+        record_min_max: true,
+    });
+    if instrument.name() == HTTP_SERVER_DURATION_INSTRUMENT {
+        stream = stream.with_cardinality_limit(HTTP_SERVER_DURATION_CARDINALITY_LIMIT);
+    }
+    Some(stream.build().expect("seconds histogram view is valid"))
+}
+
+/// The request-duration histogram instrument, so every second-bucketed histogram shares
+/// the st2 view (30 s and 60 s buckets included for long-polls and replay).
+const HTTP_SERVER_DURATION_INSTRUMENT: &str = "http.server.request.duration";
+
+/// O11Y-R14 active-series budget for the request-duration histogram. The raw label
+/// product is 237 real (route, method) pairs from the router x 12 client classes x
+/// 5 status classes = 14,220, above the 2,000-series per-daemon budget, so the SDK view
+/// caps this stream and folds anything beyond into the `otel.metric.overflow` series.
+const HTTP_SERVER_DURATION_CARDINALITY_LIMIT: usize = 1_500;
+
+/// Extractor over the request's headers, so W3C `traceparent`/`tracestate` extraction
+/// needs no header copy and no extra dependency.
+struct HeaderExtractor<'a>(&'a axum::http::HeaderMap);
+
+impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|key| key.as_str()).collect()
+    }
+}
+
+/// The remote span context from `traceparent`/`tracestate`, or an empty context when the
+/// caller sent none: the request span is then a local root.
+/// Server roots record a valid parent's sampled flag as `st.parent.sampled` for the
+/// collector policy; AlwaysOn exports requests even when that flag is false.
+pub fn extract_remote_context(headers: &axum::http::HeaderMap) -> opentelemetry::Context {
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&HeaderExtractor(headers))
+    })
+}
+
+static HTTP_DURATION: OnceLock<opentelemetry::metrics::Histogram<f64>> = OnceLock::new();
+
+/// The five status classes the request-duration histogram labels; 101 WebSocket upgrades
+/// count as `1xx`.
+fn status_class(status: axum::http::StatusCode) -> &'static str {
+    match status.as_u16() / 100 {
+        1 => "1xx",
+        2 => "2xx",
+        3 => "3xx",
+        4 => "4xx",
+        _ => "5xx",
+    }
+}
+
+/// Record one request on the `http.server.request.duration` histogram, next to the
+/// in-memory latency meter so both describe the same measurement. Unsampled and
+/// independent of the trace signal: early-outs when no meter provider is installed.
+pub fn record_http_request_duration(
+    method: &str,
+    route: &str,
+    client_class: crate::otel_client_class::ClientClass,
+    status: axum::http::StatusCode,
+    elapsed: Duration,
+) {
+    if !metrics_enabled() {
+        return;
+    }
+    let histogram = HTTP_DURATION.get_or_init(|| {
+        opentelemetry::global::meter("st3.http")
+            .f64_histogram(HTTP_SERVER_DURATION_INSTRUMENT)
+            .with_unit("s")
+            .with_description(
+                "st3 HTTP server request duration by route, method, client class and status class",
+            )
+            .build()
+    });
+    histogram.record(
+        elapsed.as_secs_f64(),
+        &[
+            KeyValue::new("http.request.method", method.to_owned()),
+            KeyValue::new("http.route", route.to_owned()),
+            KeyValue::new("st3.client.class", client_class.as_str()),
+            KeyValue::new("http.response.status_class", status_class(status)),
+        ],
+    );
 }
 
 pub struct Telemetry {
@@ -285,6 +375,11 @@ impl Telemetry {
                         .with_resource(resource.clone())
                         .build();
                     opentelemetry::global::set_tracer_provider(provider.clone());
+                    // Inbound W3C traceparent/tracestate extraction for every request
+                    // surface (HTTP and WebSocket upgrades alike).
+                    opentelemetry::global::set_text_map_propagator(
+                        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+                    );
                     telemetry.tracer_provider = Some(provider);
                 }
                 Err(error) => {
@@ -307,6 +402,7 @@ impl Telemetry {
                         .with_resource(resource.clone())
                         .build();
                     opentelemetry::global::set_meter_provider(provider.clone());
+                    METRICS_ENABLED.store(true, Ordering::Relaxed);
                     telemetry.meter_provider = Some(provider);
                 }
                 Err(error) => {
@@ -385,6 +481,7 @@ impl Telemetry {
     /// One deadline covers every signal, including provider destruction.
     pub fn shutdown(&mut self) {
         EXPORT_ENABLED.store(false, Ordering::Relaxed);
+        METRICS_ENABLED.store(false, Ordering::Relaxed);
         let tracer = self.tracer_provider.take();
         let meter = self.meter_provider.take();
         let logger = self.logger_provider.take();
@@ -634,5 +731,58 @@ mod tests {
                 assert_eq!(resource.get(&Key::new(key)), Some(Value::from(expected)));
             }
         }
+    }
+
+    #[test]
+    fn http_duration_view_caps_active_series() {
+        use super::{
+            HTTP_SERVER_DURATION_CARDINALITY_LIMIT, HTTP_SERVER_DURATION_INSTRUMENT, duration_view,
+        };
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .with_view(duration_view)
+            .build();
+        let histogram = provider
+            .meter("st3.http")
+            .f64_histogram(HTTP_SERVER_DURATION_INSTRUMENT)
+            .with_unit("s")
+            .with_description("test")
+            .build();
+        let limit = HTTP_SERVER_DURATION_CARDINALITY_LIMIT;
+        for series in 0..limit + 25 {
+            histogram.record(0.1, &[KeyValue::new("series", series.to_string())]);
+        }
+        provider.force_flush().unwrap();
+        let finished = exporter.get_finished_metrics().unwrap();
+        let histogram = finished
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+            .find(|metric| metric.name() == HTTP_SERVER_DURATION_INSTRUMENT)
+            .and_then(|metric| match metric.data() {
+                AggregatedMetrics::F64(MetricData::Histogram(histogram)) => Some(histogram),
+                _ => None,
+            })
+            .expect("the duration histogram is exported");
+        assert_eq!(
+            histogram.data_points().count(),
+            limit + 1,
+            "capped series plus the single otel.metric.overflow series"
+        );
+        assert!(
+            histogram.data_points().any(|point| {
+                point
+                    .attributes()
+                    .any(|attribute| attribute.key.as_str() == "otel.metric.overflow")
+            }),
+            "series beyond the cap fold into otel.metric.overflow"
+        );
     }
 }

@@ -59,6 +59,7 @@ pub mod node_identity;
 pub mod omp_ask_resume;
 // LIVE-MIGRATION END arn:lmig:smalltalk:2026-10-02-omp-ask-resume-bridge
 pub mod otel;
+pub mod otel_client_class;
 pub mod otlp;
 pub mod peer;
 pub mod placement;

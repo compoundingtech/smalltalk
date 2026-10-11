@@ -84,6 +84,21 @@ fn string_attribute<'a>(record: &'a Value, name: &str) -> Option<&'a str> {
         .as_str()
 }
 
+fn int_attribute(record: &Value, name: &str) -> Option<i64> {
+    record["attributes"]
+        .as_array()?
+        .iter()
+        .find_map(|attribute| {
+            if attribute["key"] != name {
+                return None;
+            }
+            let value = &attribute["value"]["intValue"];
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        })
+}
+
 fn command_roots(traces: &str) -> Vec<(Value, Value)> {
     let mut roots = Vec::new();
     for line in traces.lines() {
@@ -320,5 +335,354 @@ fn otel_sdk_disabled_and_st3_cli_off_disable_export() {
             }
         }
         assert!(!root.path().join("run/st3/otel-cli-backoff").exists());
+    }
+}
+
+// The production daemon does not yet handle termination signals gracefully. Observe
+// periodic exports before stopping it; these tests must not depend on shutdown flush.
+#[cfg(target_os = "linux")]
+struct ExportDaemon {
+    collector: std::process::Child,
+    socket: PathBuf,
+    log: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl ExportDaemon {
+    fn start(collector: &Path, root: &Path) -> Self {
+        use std::os::unix::process::CommandExt as _;
+        let socket = root.join("run/api.sock");
+        let log = root.join("daemon.log");
+        let output = std::fs::File::create(&log).unwrap();
+        let mut command = isolated_command(collector, root);
+        // Own a process group so failed startup also cannot orphan otelite's child.
+        command.process_group(0);
+        command
+            // SDK 0.30 reads all three intervals in milliseconds from the environment.
+            .env("OTEL_BSP_SCHEDULE_DELAY", "100")
+            .env("OTEL_BLRP_SCHEDULE_DELAY", "100")
+            .env("OTEL_METRIC_EXPORT_INTERVAL", "250")
+            .args(["run", "--out"])
+            .arg(root.join("capture"))
+            .args(["--protocol", "http/json", "--"])
+            .arg(st3())
+            .args(["up", "--node", "otel-test", "--state-dir"])
+            .arg(root.join("daemon-state"))
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--client-gateway-socket")
+            .arg(root.join("run/client.sock"))
+            // Health requests never launch a PTY. Like DaemonConfig test fixtures,
+            // supply its name explicitly instead of requiring login-PATH discovery.
+            .args(["--pty-binary", "pty"])
+            .stdout(output.try_clone().unwrap())
+            .stderr(output);
+        let mut daemon = Self {
+            collector: command.spawn().expect("run real st3 daemon under otelite"),
+            socket,
+            log,
+        };
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if st3::startup::read(&daemon.socket)
+                .is_some_and(|readiness| readiness.phase == "ready")
+            {
+                return daemon;
+            }
+            assert!(
+                daemon.collector.try_wait().unwrap().is_none(),
+                "daemon/collector exited before readiness: {}",
+                daemon.diagnostics()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "daemon readiness timed out: {}",
+                daemon.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn diagnostics(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn health(&self, traceparent: Option<&str>) {
+        use std::io::{Read as _, Write as _};
+        let mut socket = std::os::unix::net::UnixStream::connect(&self.socket).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let trace_header = traceparent
+            .map(|value| format!("traceparent: {value}\r\n"))
+            .unwrap_or_default();
+        write!(
+            socket,
+            "GET /v1/health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nx-st3-client: fractal\r\n{trace_header}\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        socket.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200 "),
+            "health request failed: {response}\n{}",
+            self.diagnostics()
+        );
+    }
+
+    fn await_export(&mut self, path: &Path, matches: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let capture = std::fs::read_to_string(path).unwrap_or_default();
+            // A reader may race a line append. Revisit the incomplete final line
+            // on the next poll rather than treating it as malformed OTLP.
+            for line in capture
+                .split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+            {
+                let request: Value = serde_json::from_str(line).expect("valid OTLP JSON request");
+                if matches(&request) {
+                    return request;
+                }
+            }
+            assert!(
+                self.collector.try_wait().unwrap().is_none(),
+                "daemon/collector exited while awaiting export: {}",
+                self.diagnostics()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "expected export missing from {}:\n{capture}\n{}",
+                path.display(),
+                self.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ExportDaemon {
+    fn drop(&mut self) {
+        if let Some(readiness) = st3::startup::read(&self.socket)
+            && let Ok(pid) = libc::pid_t::try_from(readiness.pid)
+        {
+            // otelite remains alive to drain the exports already observed.
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.collector.try_wait().ok().flatten().is_none() {
+            if Instant::now() >= deadline {
+                if let Ok(pid) = libc::pid_t::try_from(self.collector.id()) {
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = self.collector.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_request_span_continues_caller_trace() {
+    let Some(collector) = otelite("daemon_request_span_continues_caller_trace") else {
+        return;
+    };
+    const TRACE_ID: &str = "1234567890abcdef1234567890abcdef";
+    const PARENT_ID: &str = "1234567890abcdef";
+    let root = tempfile::tempdir().unwrap();
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    for sampled in [true, false] {
+        let flags = if sampled { "01" } else { "00" };
+        daemon.health(Some(&format!("00-{TRACE_ID}-{PARENT_ID}-{flags}")));
+        daemon.await_export(&root.path().join("capture/traces.ndjson"), |request| {
+            request["resourceSpans"].as_array().is_some_and(|batches| {
+                batches.iter().any(|batch| {
+                    string_attribute(&batch["resource"], "service.name") == Some("st-daemon")
+                        && batch["scopeSpans"].as_array().is_some_and(|scopes| {
+                            scopes.iter().any(|scope| {
+                                scope["spans"].as_array().is_some_and(|spans| {
+                                    spans.iter().any(|span| {
+                                        span["traceId"].as_str() == Some(TRACE_ID)
+                                            && span["parentSpanId"].as_str() == Some(PARENT_ID)
+                                            && span["name"].as_str() == Some("GET /v1/health")
+                                            && string_attribute(span, "http.route")
+                                                == Some("/v1/health")
+                                            && string_attribute(span, "st3.client.class")
+                                                == Some("fractal")
+                                            && span["attributes"].as_array().is_some_and(
+                                                |attributes| {
+                                                    attributes.iter().any(|attribute| {
+                                                        attribute["key"] == "st.parent.sampled"
+                                                            && attribute["value"]["boolValue"]
+                                                                == sampled
+                                                    })
+                                                },
+                                            )
+                                            // One server span per request: phase durations
+                                            // are attributes, child spans must not exist.
+                                            && int_attribute(span, "st.handler.duration_ms")
+                                                .is_some()
+                                    })
+                                })
+                            })
+                        })
+                })
+            })
+        });
+        // The single-span shape exports no admission/handler child spans.
+        let request = daemon.await_export(&root.path().join("capture/traces.ndjson"), |r| {
+            r["resourceSpans"].as_array().is_some_and(|batches| {
+                batches.iter().any(|batch| {
+                    string_attribute(&batch["resource"], "service.name") == Some("st-daemon")
+                })
+            })
+        });
+        let span_names: Vec<&str> = request["resourceSpans"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|batch| batch["scopeSpans"].as_array().into_iter().flatten())
+            .flat_map(|scope| scope["spans"].as_array().into_iter().flatten())
+            .filter_map(|span| span["name"].as_str())
+            .collect();
+        assert!(
+            span_names.iter().all(|name| {
+                !matches!(
+                    *name,
+                    "admission.queue"
+                        | "admission.authenticate"
+                        | "admission.snapshot"
+                        | "handler.queue"
+                        | "handler"
+                )
+            }),
+            "child spans leaked into the export: {span_names:?}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_request_metric_recorded_without_trace_sampling() {
+    let Some(collector) = otelite("daemon_request_metric_recorded_without_trace_sampling") else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    daemon.health(None);
+    // HTTP-JSON capture stores ExportMetricsServiceRequest verbatim: resourceMetrics
+    // -> scopeMetrics -> metrics -> histogram -> dataPoints. SDK 0.30 serializes
+    // histogram count as a JSON number; also accept the OTLP decimal-string form.
+    daemon.await_export(&root.path().join("capture/metrics.ndjson"), |request| {
+        request["resourceMetrics"]
+            .as_array()
+            .is_some_and(|batches| {
+                batches.iter().any(|batch| {
+                    string_attribute(&batch["resource"], "service.name") == Some("st-daemon")
+                        && batch["scopeMetrics"].as_array().is_some_and(|scopes| {
+                            scopes.iter().any(|scope| {
+                                scope["metrics"].as_array().is_some_and(|metrics| {
+                                    metrics.iter().any(|metric| {
+                                        metric["name"].as_str()
+                                            == Some("http.server.request.duration")
+                                            && metric["histogram"]["dataPoints"]
+                                                .as_array()
+                                                .is_some_and(|points| {
+                                                    points.iter().any(|point| {
+                                                        string_attribute(point, "http.route")
+                                                            == Some("/v1/health")
+                                                            && string_attribute(
+                                                                point,
+                                                                "st3.client.class",
+                                                            ) == Some("fractal")
+                                                            && point["count"]
+                                                                .as_u64()
+                                                                .or_else(|| {
+                                                                    point["count"]
+                                                                        .as_str()
+                                                                        .and_then(|count| {
+                                                                            count
+                                                                                .parse::<u64>()
+                                                                                .ok()
+                                                                        })
+                                                                })
+                                                                .is_some_and(|count| count > 0)
+                                                    })
+                                                })
+                                    })
+                                })
+                            })
+                        })
+                })
+            })
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn daemon_normal_request_exports_no_log_stream() {
+    let Some(collector) = otelite("daemon_normal_request_exports_no_log_stream") else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let mut daemon = ExportDaemon::start(&collector, root.path());
+    daemon.health(None);
+    // The request's span reaching the collector proves the export path ran; the log
+    // bridge's 100 ms batch delay (set above) flushes any queued log record long
+    // before this returns, so the grace period below closes the race.
+    daemon.await_export(&root.path().join("capture/traces.ndjson"), |request| {
+        request["resourceSpans"].as_array().is_some_and(|batches| {
+            batches.iter().any(|batch| {
+                string_attribute(&batch["resource"], "service.name") == Some("st-daemon")
+                    && batch["scopeSpans"].as_array().is_some_and(|scopes| {
+                        scopes.iter().any(|scope| {
+                            scope["spans"].as_array().is_some_and(|spans| {
+                                spans
+                                    .iter()
+                                    .any(|span| span["name"].as_str() == Some("GET /v1/health"))
+                            })
+                        })
+                    })
+            })
+        })
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let logs = std::fs::read_to_string(root.path().join("capture/logs.ndjson")).unwrap_or_default();
+    // resourceLogs -> scopeLogs -> logRecords; WARN starts at severityNumber 13.
+    // A healthy request must export no below-WARN record: per-request framework
+    // events are DEBUG and stay on stderr.
+    for line in logs
+        .split_inclusive('\n')
+        .filter(|line| line.ends_with('\n'))
+    {
+        let record: Value = serde_json::from_str(line).expect("valid OTLP JSON log request");
+        let below_warn = record["resourceLogs"].as_array().is_some_and(|resources| {
+            resources.iter().any(|resource| {
+                resource["scopeLogs"].as_array().is_some_and(|scopes| {
+                    scopes.iter().any(|scope| {
+                        scope["logRecords"].as_array().is_some_and(|entries| {
+                            entries.iter().any(|entry| {
+                                let severity = entry["severityNumber"].as_u64().or_else(|| {
+                                    entry["severityNumber"]
+                                        .as_str()
+                                        .and_then(|value| value.parse().ok())
+                                });
+                                severity.is_some_and(|severity| severity < 13)
+                            })
+                        })
+                    })
+                })
+            })
+        });
+        assert!(
+            !below_warn,
+            "a non-diagnostic (below-WARN) log record was exported:\n{line}"
+        );
     }
 }
