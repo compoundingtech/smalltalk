@@ -1,6 +1,8 @@
 import type { Args, Meta, StoryObj } from '@storybook/react-vite'
 import { useScenarioSlice } from '@smalltalk/st3-scenarios/react'
 import { scenarioArgTypes } from '@smalltalk/st3-scenarios/storybook'
+import * as stylex from '@stylexjs/stylex'
+import { geometryVars } from './composition-tokens.stylex'
 import { EmbraceThread } from './EmbraceThread'
 import { EmbraceRuntimeProvider } from './EmbraceRuntime'
 import { projectConversation } from './scenario-projections'
@@ -17,7 +19,7 @@ function ScenarioConversation({ scheme }: { readonly scheme: 'light' | 'dark' })
         isRunning: thread.items.some(item => item._tag === 'Text' && item.streaming),
         onNew: async () => { throw new Error('Scenario conversations are read-only') },
       }}>
-        <EmbraceThread items={thread.items} composer={false} embrace="E3" />
+        <EmbraceThread items={thread.items} composer={false} embrace="E3" style={styles.thread} />
       </EmbraceRuntimeProvider>
     </section>)}
   </ScenarioPresentation>
@@ -37,3 +39,7 @@ const meta = {
 export default meta
 export const Explore = {} satisfies StoryObj<Args>
 export const Pinned = { parameters: { scenario: { world: 'fleet-mid-refactor' } } } satisfies StoryObj<Args>
+
+const styles = stylex.create({
+  thread: { height: geometryVars.transcriptFrameHeight, flex: '0 0 auto' },
+})

@@ -55,6 +55,8 @@ The projections use the same strict native codecs as the application. The conver
 uses the package's existing four-kind fold (message, content, tool call and tool result), not a
 copy of the app's timeline fold. Other present wire kinds are explicitly listed as **Not yet
 projected**; status, usage, error, redaction and truncation are not silently represented as prose.
+The conversation canvas uses the existing bounded transcript-frame token, so the actual scroll
+viewport has visible space after the runtime adopts its messages.
 The existing visual-language and component-family stories keep their independent fixtures.
 
 
