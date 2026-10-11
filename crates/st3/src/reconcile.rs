@@ -760,6 +760,36 @@ type WorkWakeObserveHook = Box<dyn FnOnce(&crate::incremental::Incremental, bool
 type BackgroundEntryHook =
     Arc<dyn Fn(bool, Option<tokio::time::Instant>, smallclaims::sqlite::work::SqliteWork) + Send + Sync>;
 
+/// Local observation retries never turn unreadable process state into a completed stop.
+struct StopObservationRetry {
+    started_at: u128,
+    retry_at: u128,
+    delay_ms: u128,
+    fault_reported: bool,
+}
+
+impl StopObservationRetry {
+    fn new(now: u128) -> Self {
+        Self { started_at: now, retry_at: now, delay_ms: 100, fault_reported: false }
+    }
+
+    fn poll(&mut self, now: u128) -> (u128, bool) {
+        if now >= self.retry_at {
+            self.retry_at = now.saturating_add(self.delay_ms);
+            self.delay_ms = self.delay_ms.saturating_mul(2).min(30_000);
+        }
+        let report = !self.fault_reported && now.saturating_sub(self.started_at) >= 600_000;
+        (self.retry_at, report)
+    }
+}
+
+/// Older peers validate claim subjects against their own registry, and the registry digest is
+/// part of replication compatibility. Gate operations are not runtime decision subjects, so their
+/// stop faults use daemon diagnostics and logs only.
+fn reconcile_decision_admitted(subject: &str) -> bool {
+    !subject.starts_with("gate-operation/")
+}
+
 pub struct Reconciler<R = NativeRuntime> {
     store: Arc<Store>,
     runtime: Arc<R>,
@@ -802,6 +832,9 @@ pub struct Reconciler<R = NativeRuntime> {
     observer_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     observer_cursors: Arc<Mutex<HashMap<String, Option<String>>>>,
     delayed_restarts: Arc<Mutex<HashMap<String, u128>>>,
+    stop_observation_retries: Mutex<HashMap<String, StopObservationRetry>>,
+    /// The kill deadline already logged for each active stop operation.
+    reported_kill_survivors: Mutex<HashMap<String, String>>,
     /// When each batched subscription may next send what it collected.
     batch_deadlines: Arc<Mutex<HashMap<String, u128>>>,
     /// When a failed `checkout` may run Git again, and why it failed, by agent subject.
@@ -958,6 +991,8 @@ impl Reconciler<NativeRuntime> {
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
+            stop_observation_retries: Mutex::new(HashMap::new()),
+            reported_kill_survivors: Mutex::new(HashMap::new()),
             batch_deadlines: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
             checkout_conflicts: Mutex::new(HashMap::new()),
@@ -1035,6 +1070,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             observer_deadlines: Arc::new(Mutex::new(HashMap::new())),
             observer_cursors: Arc::new(Mutex::new(HashMap::new())),
             delayed_restarts: Arc::new(Mutex::new(HashMap::new())),
+            stop_observation_retries: Mutex::new(HashMap::new()),
+            reported_kill_survivors: Mutex::new(HashMap::new()),
             batch_deadlines: Arc::new(Mutex::new(HashMap::new())),
             checkout_retries: Arc::new(Mutex::new(HashMap::new())),
             checkout_conflicts: Mutex::new(HashMap::new()),
@@ -1231,6 +1268,7 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     pub async fn run(self: Arc<Self>) {
         self.notify.notify_one();
+        let mut wake_cause = crate::reconcile_telemetry::WakeCause::Startup;
         // When the last pass began, and whether it changed nothing.
         let mut quiet_pass_started = None;
         // Whether a successful pass must close this host's reconciler item. The first pass after a
@@ -1239,9 +1277,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mut first_wake = true;
         loop {
             let trigger = match self
-                .blocking(|this| {
+                .blocking(move |this| {
                     crate::profile::task("task reconcile-deadline", || {
-                        this.next_reconcile_deadline()
+                        this.next_reconcile_deadline_with_cause(wake_cause)
                     })
                 })
                 .await
@@ -1251,7 +1289,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     tokio::select! {
                         _ = self.notify.notified() => "trigger/notification",
                         _ = tokio::time::sleep(Duration::from_millis(delay)) => {
-                            crate::performance::record_wake("deadline", None);
+                            crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::Deadline, None);
                             "trigger/deadline"
                         }
                     }
@@ -1266,7 +1304,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             } else {
                 trigger
             };
+            wake_cause = crate::reconcile_telemetry::take_wake();
             for pass in 0..64 {
+                let cause = if pass == 0 { wake_cause } else { crate::reconcile_telemetry::WakeCause::Continuation };
                 let check_recovery = may_have_failed;
                 let pass_trigger = if pass == 0 {
                     trigger
@@ -1294,7 +1334,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         let before = this.store.index().ok();
                         let failed = match crate::profile::task("task reconcile-pass", || {
                             let _trigger_span = crate::profile::span(pass_trigger);
-                            this.reconcile_once()
+                            this.reconcile_once_with_cause(cause)
                         }) {
                             Err(error) => {
                                 let _ = this.record_once(
@@ -1805,6 +1845,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn record_fault(&self, subject: &str, scope: &str, outcome: Result<()>) -> Result<()> {
         match outcome {
             Err(error) => {
+                crate::reconcile_telemetry::record_error();
                 let reason = format!("{error:#}");
                 let mut faults = self.open_faults()?;
                 let open = faults.get_or_insert_with(BTreeMap::new);
@@ -1885,10 +1926,19 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// that fails records a fault on the daemon and asks to be read again shortly, so the other
     /// sources keep their deadlines.
     fn next_reconcile_deadline(&self) -> Option<u128> {
+        self.next_reconcile_deadline_with_cause(crate::reconcile_telemetry::WakeCause::Other)
+    }
+
+    fn next_reconcile_deadline_with_cause(&self, cause: crate::reconcile_telemetry::WakeCause) -> Option<u128> {
+        let telemetry = crate::reconcile_telemetry::Operation::new(true, cause);
+        let _entered = telemetry.span.enter();
         let daemon = format!("daemon/{}", self.host);
         let retry = now_ms().saturating_add(DEADLINE_SOURCE_RETRY_MS);
         let read = |scope: &str, source: &dyn Fn() -> Result<Option<u128>>| {
-            self.isolate(scope, &daemon, source).unwrap_or(Some(retry))
+            self.isolate(scope, &daemon, source).unwrap_or_else(|| {
+                telemetry.error();
+                Some(retry)
+            })
         };
         [
             read("deadline/missions", &|| {
@@ -2044,7 +2094,35 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
-        self.recording_writes(|| self.reconcile_pass())
+        self.reconcile_once_with_cause(crate::reconcile_telemetry::WakeCause::Other)
+    }
+
+    fn reconcile_once_with_cause(&self, cause: crate::reconcile_telemetry::WakeCause) -> Result<()> {
+        let telemetry = crate::reconcile_telemetry::Operation::new(false, cause);
+        let _entered = telemetry.span.enter();
+        let result = self.recording_writes(|| self.reconcile_pass());
+        if result.is_err() { telemetry.error(); }
+        result
+    }
+
+    fn prune_stop_state(
+        &self,
+        gates: &[crate::store::MissionGateRunner],
+        eligible: &BTreeSet<String>,
+    ) {
+        let mut retries = self.stop_observation_retries.lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut survivors = self.reported_kill_survivors.lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if retries.is_empty() && survivors.is_empty() {
+            return;
+        }
+        let active = eligible.iter().map(String::as_str)
+            .chain(gates.iter().filter(|gate| gate.retired && gate.host == self.host)
+                .map(|gate| gate.subject.as_str()))
+            .collect::<BTreeSet<_>>();
+        retries.retain(|subject, _| active.contains(subject.as_str()));
+        survivors.retain(|subject, _| active.contains(subject.as_str()));
     }
 
     fn reconcile_pass(&self) -> Result<()> {
@@ -2052,7 +2130,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.incremental.observe(&self.store)?;
         drop(observe_span);
         let _runners_span = crate::profile::span("pass/gate-runners");
-        for runner in self.gate_runners()? {
+        let gate_runners = self.gate_runners()?;
+        for runner in &gate_runners {
             if runner.retired && runner.host == self.host {
                 let _ = self.isolate("gate", &runner.subject, || {
                     let runtime_id = runner.subject.replace('/', ".");
@@ -2084,6 +2163,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
+        if crate::otel::export_enabled() {
+            tracing::Span::current().record("st.reconcile.items", desired.len() as i64);
+        }
         self.incoming_resumes(&desired)?;
         let terminal_owned = self.store.terminal_owned_runtime_subjects()?;
         drop(desired_span);
@@ -2108,6 +2190,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .collect::<HashMap<_, _>>(),
             ),
             Err(error) => {
+                crate::reconcile_telemetry::record_error();
                 // An unavailable snapshot is unknown, not an empty runtime set. Treating it as
                 // empty could finish run cleanup while a PTY lives, so terminal members wait for
                 // the next snapshot. Every other part of the pass still runs.
@@ -2143,7 +2226,10 @@ impl<R: RuntimeControl> Reconciler<R> {
 
         let active = desired.iter().collect::<Vec<_>>();
         let eligible = match self.store.owned_desired_subjects(&desired) {
-            Ok(eligible) => eligible,
+            Ok(eligible) => {
+                self.prune_stop_state(&gate_runners, &eligible);
+                eligible
+            }
             Err(error) => {
                 self.report_ownership_error("snapshot", &self.host, &error);
                 BTreeSet::new()
@@ -3067,6 +3153,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let previous = self.store.member_reconcile_fault(subject, None)?;
         let (decision, reason) = match result {
             Err(error) => {
+                crate::reconcile_telemetry::record_error();
                 let reason = format!("{error:#}");
                 if previous.as_deref() == Some(reason.as_str()) {
                     return Ok(());
@@ -5133,10 +5220,52 @@ impl<R: RuntimeControl> Reconciler<R> {
         if observation.is_some_and(|observation| {
             matches!(observation.status.as_str(), "unknown" | "indeterminate")
         }) {
-            self.arm_restart(&format!("stop:{subject}"), now_ms().saturating_add(100));
+            let now = now_ms();
+            let (due, report, episode_started_at) = {
+                let mut retries = self.stop_observation_retries
+                    .lock().unwrap_or_else(PoisonError::into_inner);
+                let retry = retries.entry(subject.into())
+                    .or_insert_with(|| StopObservationRetry::new(now));
+                let (due, report) = retry.poll(now);
+                (due, report, retry.started_at)
+            };
+            self.arm_restart(&format!("stop:{subject}"), due);
+            if report {
+                self.record_diagnostic_once(subject, BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("code".into(), Value::String("stop-observation-unreadable".into())),
+                    ("reason".into(), Value::String(format!("stop for {subject} (runtime {runtime_id}) remains pending: runtime state was unreadable for ten minutes (episode started at {episode_started_at})"))),
+                ]))?;
+                if reconcile_decision_admitted(subject) {
+                    self.record_once(subject, "runtime.reconcile-decision", BTreeMap::from([
+                        ("key".into(), Value::String("stop-observation".into())),
+                        ("decision".into(), Value::String("raise".into())),
+                        ("reachability".into(), Value::String("unreachable".into())),
+                        ("reason".into(), Value::String("runtime state remained unreadable for ten minutes; stop is still pending".into())),
+                    ]))?;
+                }
+                eprintln!("st3: WARN stop for {subject} remains pending: runtime state was unreadable for ten minutes");
+                if let Some(retry) = self.stop_observation_retries
+                    .lock().unwrap_or_else(PoisonError::into_inner).get_mut(subject)
+                {
+                    retry.fault_reported = true;
+                }
+            }
             return Ok(false);
         }
+        let recovered_fault = self.stop_observation_retries.lock()
+            .unwrap_or_else(PoisonError::into_inner).remove(subject)
+            .is_some_and(|retry| retry.fault_reported);
+        if recovered_fault && reconcile_decision_admitted(subject) {
+            self.record_once(subject, "runtime.reconcile-decision", BTreeMap::from([
+                ("key".into(), Value::String("stop-observation".into())),
+                ("decision".into(), Value::String("hold".into())),
+                ("reachability".into(), Value::String("reachable".into())),
+                ("reason".into(), Value::Null),
+            ]))?;
+        }
         if observation.is_none_or(|observation| observation.status != "running") {
+            self.reported_kill_survivors.lock().unwrap_or_else(PoisonError::into_inner).remove(subject);
             // A harness that ended before the stop, or a stop that could not finish, can leave
             // processes in the runtime's work scope. They end with it.
             self.runtime.end_leftovers(runtime_id, terminal);
@@ -5256,18 +5385,39 @@ impl<R: RuntimeControl> Reconciler<R> {
                     == Some(deadline_key.as_str())
             })
         {
-            self.record_once(
-                subject,
-                "runtime.reconcile-decision",
-                BTreeMap::from([
-                    ("decision".into(), Value::String("raise".into())),
-                    ("reachability".into(), Value::String("unreachable".into())),
-                    (
-                        "reason".into(),
-                        Value::String("the recorded incarnation survived SIGKILL".into()),
-                    ),
-                ]),
-            )?;
+            let report_survivor = {
+                let mut reported = self.reported_kill_survivors.lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if reported.get(subject) == Some(&deadline_key) {
+                    false
+                } else {
+                    reported.insert(subject.into(), deadline_key.clone());
+                    true
+                }
+            };
+            if report_survivor {
+                eprintln!("st3: WARN runtime {runtime_id} remains live on the observation after SIGKILL");
+            }
+            if reconcile_decision_admitted(subject) {
+                self.record_once(
+                    subject,
+                    "runtime.reconcile-decision",
+                    BTreeMap::from([
+                        ("decision".into(), Value::String("raise".into())),
+                        ("reachability".into(), Value::String("unreachable".into())),
+                        (
+                            "reason".into(),
+                            Value::String("the recorded incarnation survived SIGKILL".into()),
+                        ),
+                    ]),
+                )?;
+            } else {
+                self.record_diagnostic_once(subject, BTreeMap::from([
+                    ("severity".into(), Value::String("warning".into())),
+                    ("code".into(), Value::String("kill-survivor".into())),
+                    ("reason".into(), Value::String(format!("{subject} (runtime {runtime_id}) remained live after SIGKILL"))),
+                ]))?;
+            }
             return Ok(false);
         }
         self.runtime.kill(runtime_id, terminal, Some(incarnation))?;
@@ -6057,7 +6207,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             Vec::new(),
                         ),
                         None => {
-                            self.arm_deadline_at(agent, due, "timer resume-verification");
+                            self.arm_deadline_at(agent, due, crate::reconcile_telemetry::WakeCause::TimerResumeVerification);
                             Ok(())
                         }
                     }
@@ -6156,7 +6306,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         Vec::new(),
                     )
                 } else {
-                    self.arm_deadline_at(agent, due, "timer resume-verification");
+                    self.arm_deadline_at(agent, due, crate::reconcile_telemetry::WakeCause::TimerResumeVerification);
                     Ok(())
                 }
             }
@@ -6919,7 +7069,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&subject);
-            crate::performance::record_wake("timer restart", Some(restart_wake_kind(&subject)));
+            crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::TimerRestart, Some(restart_wake_kind(&subject)));
             notify.notify_one();
         });
     }
@@ -9015,12 +9165,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                     return Ok(Some(value));
                 }
                 _ => {
-                    self.arm_deadline_at(
-                        &subject,
-                        request.accepted_at_unix_ms
-                            .saturating_add(u128::from(*time_limit_ms)),
-                        "timer gate-timeout",
-                    );
+                    self.arm_deadline_at(&subject, request.accepted_at_unix_ms
+                        .saturating_add(u128::from(*time_limit_ms)), crate::reconcile_telemetry::WakeCause::TimerGateTimeout);
                     self.arm_gate_poll(&runtime_id);
                     return Ok(None);
                 }
@@ -9073,12 +9219,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             &member,
             "the loop metric was requested",
         )?;
-        self.arm_deadline_at(
-            &subject,
-            request.accepted_at_unix_ms
-                .saturating_add(u128::from(*time_limit_ms)),
-            "timer gate-timeout",
-        );
+        self.arm_deadline_at(&subject, request.accepted_at_unix_ms
+            .saturating_add(u128::from(*time_limit_ms)), crate::reconcile_telemetry::WakeCause::TimerGateTimeout);
         self.arm_gate_poll(&member.runtime_id);
         Ok(None)
     }
@@ -11529,11 +11671,11 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// left every pass a wake per running step minutes later, so passes kept themselves going
     /// (1,585 wakes in five minutes on a member with fourteen running steps).
     fn arm_step_deadline(&self, handle: &tokio::runtime::Handle, step: &str, remaining: u64) {
-        self.arm_deadline(handle, step, remaining, "timer step-timeout");
+        self.arm_deadline(handle, step, remaining, crate::reconcile_telemetry::WakeCause::TimerStepTimeout);
     }
 
     /// Record the exact clock dependency even when no runtime can spawn its wake.
-    fn arm_deadline_at(&self, key: &str, deadline: u128, wake: &'static str) {
+    fn arm_deadline_at(&self, key: &str, deadline: u128, wake: crate::reconcile_telemetry::WakeCause) {
         smallclaims::touched::note_due(deadline);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let remaining = deadline.saturating_sub(now_ms()).min(u128::from(u64::MAX)) as u64;
@@ -11548,7 +11690,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         handle: &tokio::runtime::Handle,
         key: &str,
         remaining: u64,
-        wake: &'static str,
+        wake: crate::reconcile_telemetry::WakeCause,
     ) {
         let now = now_ms();
         let deadline = now.saturating_add(u128::from(remaining));
@@ -11577,7 +11719,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     armed.remove(&key);
                 }
             }
-            crate::performance::record_wake(wake, None);
+            crate::reconcile_telemetry::record_wake(wake, None);
             notify.notify_one();
         });
     }
@@ -13453,7 +13595,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         let remaining = (*duration_ms as u128).saturating_sub(elapsed) as u64;
                         handle.spawn(async move {
                             tokio::time::sleep(Duration::from_millis(remaining)).await;
-                            crate::performance::record_wake("timer gate", None);
+                            crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::TimerGate, None);
                             notify.notify_one();
                         });
                     }
@@ -13619,7 +13761,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .saturating_add(self.gate_recheck_delay_ms(previous));
                     let now = now_ms();
                     if !started && now < due {
-                        self.arm_deadline_at(&result_subject, due, "timer gate-recheck");
+                        self.arm_deadline_at(&result_subject, due, crate::reconcile_telemetry::WakeCause::TimerGateRecheck);
                         return Ok(GateOutcome::NotYet);
                     }
                     next
@@ -13713,12 +13855,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                     self.record_gate_check(stage, check)
                 }
                 _ => {
-                    self.arm_deadline_at(
-                        &operation,
-                        requested.accepted_at_unix_ms
-                            .saturating_add(u128::from(time_limit_ms)),
-                        "timer gate-timeout",
-                    );
+                    self.arm_deadline_at(&operation, requested.accepted_at_unix_ms
+                        .saturating_add(u128::from(time_limit_ms)), crate::reconcile_telemetry::WakeCause::TimerGateTimeout);
                     self.arm_gate_poll(&runtime_id);
                     Ok(GateOutcome::Pending)
                 }
@@ -13792,12 +13930,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             );
             return self.record_gate_check(stage, check);
         }
-        self.arm_deadline_at(
-            &operation,
-            requested.accepted_at_unix_ms
-                .saturating_add(u128::from(time_limit_ms)),
-            "timer gate-timeout",
-        );
+        self.arm_deadline_at(&operation, requested.accepted_at_unix_ms
+            .saturating_add(u128::from(time_limit_ms)), crate::reconcile_telemetry::WakeCause::TimerGateTimeout);
         self.arm_gate_poll(&member.runtime_id);
         Ok(GateOutcome::Pending)
     }
@@ -13866,12 +14000,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .store
                     .latest_claim(check.result_subject, Some("gate.result"))?
                     .context("the mechanical gate result disappeared")?;
-                self.arm_deadline_at(
-                    check.result_subject,
-                    result.accepted_at_unix_ms
-                        .saturating_add(self.gate_recheck_delay_ms(check.check)),
-                    "timer gate-recheck",
-                );
+                self.arm_deadline_at(check.result_subject, result.accepted_at_unix_ms
+                    .saturating_add(self.gate_recheck_delay_ms(check.check)), crate::reconcile_telemetry::WakeCause::TimerGateRecheck);
                 GateOutcome::NotYet
             }
             _ => {
@@ -14062,7 +14192,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .unwrap_or_else(PoisonError::into_inner)
                     .clear();
                 armed.store(false, Ordering::Release);
-                crate::performance::record_wake("timer gate-poll", None);
+                crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::TimerGatePoll, None);
                 notify.notify_one();
             });
         }
@@ -14135,7 +14265,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         let notify = self.notify.clone();
                         handle.spawn(async move {
                             tokio::time::sleep(Duration::from_millis(100)).await;
-                            crate::performance::record_wake("timer llm-gate", None);
+                            crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::TimerLlmGate, None);
                             notify.notify_one();
                         });
                     }
@@ -14225,7 +14355,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let remaining = (time_limit_ms as u128).saturating_sub(elapsed) as u64;
                 handle.spawn(async move {
                     tokio::time::sleep(Duration::from_millis(remaining)).await;
-                    crate::performance::record_wake("timer llm-gate", None);
+                    crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::TimerLlmGate, None);
                     notify.notify_one();
                 });
             }
@@ -14535,7 +14665,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .remove(&watched_subject);
                     // A file change is not a claim: mark what read the file.
                     incremental.touch(&watched_subject);
-                    crate::performance::record_wake("file watch", None);
+                    crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::FileWatch, None);
                     notify.notify_one();
                 }
             })?;
@@ -15094,7 +15224,7 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 }
 
 fn signal_changed(reconcile_notify: &Notify, event_notify: &watch::Sender<u64>) {
-    crate::performance::record_wake("reconciler", None);
+    crate::reconcile_telemetry::record_wake(crate::reconcile_telemetry::WakeCause::Reconciler, None);
     reconcile_notify.notify_one();
     event_notify.send_modify(|generation| *generation = generation.saturating_add(1));
 }
@@ -16196,6 +16326,189 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
 
     use super::*;
     use crate::graph::parse_test_intent as parse_intent;
+
+    #[test]
+    fn stop_observation_diagnostics_are_deduplicated_per_unreadable_episode() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let reconciler = Reconciler::new(
+            store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+        );
+        let subject = "gate-operation/test";
+        let mut observation = RuntimeObservation {
+            runtime_id: "runtime.test".into(), terminal: false, status: "indeterminate".into(),
+            exit_code: None, incarnation_id: Some("generation".into()),
+        };
+        let first_start = now_ms() - 600_001;
+        for (episode, started_at) in [first_start, first_start + 1].into_iter().enumerate() {
+            reconciler.stop_observation_retries.lock().unwrap_or_else(PoisonError::into_inner)
+                .insert(subject.into(), StopObservationRetry {
+                    started_at, retry_at: now_ms(),
+                    delay_ms: 30_000, fault_reported: false,
+                });
+            observation.status = "indeterminate".into();
+            for _ in 0..3 {
+                assert!(!reconciler.reconcile_runtime_stop(
+                    subject, "runtime.test", false, Some("generation"), 0, Some(&observation),
+                ).unwrap());
+            }
+            let diagnostics = store.observations_for("daemon/node", "daemon.diagnostic").unwrap();
+            assert_eq!(diagnostics.len(), episode + 1);
+            observation.status = "running".into();
+            assert!(!reconciler.reconcile_runtime_stop(
+                subject, "runtime.test", false, Some("generation"), 0, Some(&observation),
+            ).unwrap());
+            assert!(reconciler.stop_observation_retries.lock()
+                .unwrap_or_else(PoisonError::into_inner).is_empty());
+        }
+        let diagnostics = store.observations_for("daemon/node", "daemon.diagnostic").unwrap();
+        assert_ne!(diagnostics[0].body["fields"]["reason"], diagnostics[1].body["fields"]["reason"]);
+    }
+
+    #[test]
+    fn stop_observation_survivor_state_is_released_after_completed_episodes() {
+        let reconciler = Reconciler::new(
+            Arc::new(Store::open_memory("node").unwrap()),
+            Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+        );
+        let subject = "gate-operation/test";
+        for episode in 0..32 {
+            let incarnation = format!("generation-{episode}");
+            let mut observation = RuntimeObservation {
+                runtime_id: "runtime.test".into(), terminal: false, status: "running".into(),
+                exit_code: None, incarnation_id: Some(incarnation.clone()),
+            };
+            for _ in 0..3 {
+                assert!(!reconciler.reconcile_runtime_stop(
+                    subject, "runtime.test", false, Some(&incarnation), 0, Some(&observation),
+                ).unwrap());
+            }
+            assert_eq!(reconciler.reported_kill_survivors.lock()
+                .unwrap_or_else(PoisonError::into_inner).len(), 1);
+            observation.status = "exited".into();
+            assert!(reconciler.reconcile_runtime_stop(
+                subject, "runtime.test", false, Some(&incarnation), 0, Some(&observation),
+            ).unwrap());
+            assert!(reconciler.reported_kill_survivors.lock()
+                .unwrap_or_else(PoisonError::into_inner).is_empty());
+        }
+    }
+
+    #[test]
+    fn stop_observation_state_is_pruned_when_operations_leave_the_active_roster() {
+        let reconciler = Reconciler::new(
+            Arc::new(Store::open_memory("node").unwrap()),
+            Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+        );
+        for subject in ["exec/active", "gate-operation/retired"] {
+            reconciler.reported_kill_survivors.lock().unwrap_or_else(PoisonError::into_inner)
+                .insert(subject.into(), format!("stop-deadline:{subject}:generation"));
+            reconciler.stop_observation_retries.lock().unwrap_or_else(PoisonError::into_inner)
+                .insert(subject.into(), StopObservationRetry::new(now_ms()));
+        }
+        reconciler.prune_stop_state(&[], &BTreeSet::from(["exec/active".into()]));
+        assert_eq!(reconciler.reported_kill_survivors.lock()
+            .unwrap_or_else(PoisonError::into_inner).len(), 1);
+        assert_eq!(reconciler.stop_observation_retries.lock()
+            .unwrap_or_else(PoisonError::into_inner).len(), 1);
+        // The real pass has no declared members or gate operations and must prune the remainder.
+        reconciler.reconcile_once().unwrap();
+        assert!(reconciler.reported_kill_survivors.lock()
+            .unwrap_or_else(PoisonError::into_inner).is_empty());
+        assert!(reconciler.stop_observation_retries.lock()
+            .unwrap_or_else(PoisonError::into_inner).is_empty());
+    }
+
+    #[test]
+    fn stop_observation_retry_backs_off_and_caps_without_postponing_due_work() {
+        let mut retry = StopObservationRetry::new(1_000);
+        let mut now = 1_000;
+        for delay in [100, 200, 400, 800, 1_600, 3_200, 6_400, 12_800, 25_600, 30_000, 30_000] {
+            let (due, fault) = retry.poll(now);
+            assert_eq!(due, now + delay);
+            assert!(!fault);
+            assert_eq!(retry.poll(now), (due, false));
+            now = due;
+        }
+        assert!(retry.poll(601_000).1);
+        retry.fault_reported = true;
+        assert!(!retry.poll(631_000).1);
+    }
+
+    #[test]
+    fn stop_observation_fault_is_visible_and_never_completes_the_stop() {
+        for (subject, decision) in [("gate-operation/test", false), ("agent/node.test", true)] {
+            for status in ["unknown", "indeterminate"] {
+                let store = Arc::new(Store::open_memory("node").unwrap());
+                let runtime = Arc::new(FakeRuntime::default());
+                let reconciler = Reconciler::new(store.clone(), runtime.clone(), "node".into(), Arc::new(Notify::new()));
+                let now = now_ms();
+                reconciler.stop_observation_retries.lock().unwrap_or_else(PoisonError::into_inner).insert(subject.into(), StopObservationRetry {
+                    started_at: now - 600_000, retry_at: now, delay_ms: 30_000, fault_reported: false,
+                });
+                let mut observation = RuntimeObservation {
+                    runtime_id: "runtime.test".into(), terminal: false, status: status.into(),
+                    exit_code: None, incarnation_id: Some("generation".into()),
+                };
+                for _ in 0..2 {
+                    assert!(!reconciler.reconcile_runtime_stop(subject, "runtime.test", false, Some("generation"), 0, Some(&observation)).unwrap());
+                }
+                assert!(store.observations_for(subject, "runtime.observed").unwrap().is_empty());
+                assert!(runtime.stops.lock().unwrap_or_else(PoisonError::into_inner).is_empty());
+                let diagnostics = store.observations_for("daemon/node", "daemon.diagnostic").unwrap();
+                assert_eq!(diagnostics.len(), 1);
+                assert_eq!(diagnostics[0].body["fields"]["code"], "stop-observation-unreadable");
+                assert!(diagnostics[0].body["fields"]["reason"].as_str().unwrap().contains(subject));
+                let decisions = store.observations_for(subject, "runtime.reconcile-decision").unwrap();
+                assert_eq!(decisions.len(), usize::from(decision));
+                if decision {
+                    let status = store.status(Some(subject)).unwrap();
+                    assert_eq!(status.subjects[0].reachability, "unreachable");
+                    assert!(status.subjects[0].reason.as_deref().unwrap().contains("still pending"));
+                }
+                observation.status = "running".into();
+                assert!(!reconciler.reconcile_runtime_stop(subject, "runtime.test", false, Some("generation"), 0, Some(&observation)).unwrap());
+                assert!(reconciler.stop_observation_retries.lock().unwrap_or_else(PoisonError::into_inner).is_empty());
+                if decision {
+                    assert_eq!(store.status(Some(subject)).unwrap().subjects[0].reachability, "reachable");
+                } else {
+                    assert!(store.observations_for(subject, "runtime.reconcile-decision").unwrap().is_empty());
+                }
+                assert_eq!(runtime.stops.lock().unwrap_or_else(PoisonError::into_inner).len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn killed_runtime_is_reported_only_if_the_next_observation_is_live() {
+        for (subject, decision) in [("gate-operation/test", false), ("agent/node.test", true)] {
+            for next_status in ["running", "exited"] {
+                let store = Arc::new(Store::open_memory("node").unwrap());
+                let runtime = Arc::new(FakeRuntime::default());
+                let reconciler = Reconciler::new(store.clone(), runtime.clone(), "node".into(), Arc::new(Notify::new()));
+                let mut observation = RuntimeObservation {
+                    runtime_id: "runtime.test".into(), terminal: false, status: "running".into(),
+                    exit_code: None, incarnation_id: Some("generation".into()),
+                };
+                for _ in 0..2 {
+                    assert!(!reconciler.reconcile_runtime_stop(subject, "runtime.test", false, Some("generation"), 0, Some(&observation)).unwrap());
+                }
+                assert_eq!(runtime.kills.lock().unwrap_or_else(PoisonError::into_inner).len(), 1);
+                assert!(reconciler.reported_kill_survivors.lock().unwrap_or_else(PoisonError::into_inner).is_empty());
+                observation.status = next_status.into();
+                for _ in 0..2 {
+                    let stopped = reconciler.reconcile_runtime_stop(subject, "runtime.test", false, Some("generation"), 0, Some(&observation)).unwrap();
+                    assert_eq!(stopped, next_status == "exited");
+                }
+                let survived = next_status == "running";
+                assert_eq!(reconciler.reported_kill_survivors.lock().unwrap_or_else(PoisonError::into_inner).len(), usize::from(survived));
+                let decisions = store.observations_for(subject, "runtime.reconcile-decision").unwrap();
+                assert_eq!(decisions.len(), usize::from(survived && decision));
+                let survivor_diagnostics = store.observations_for("daemon/node", "daemon.diagnostic").unwrap()
+                    .into_iter().filter(|claim| claim.body["fields"]["code"] == "kill-survivor").count();
+                assert_eq!(survivor_diagnostics, usize::from(survived && !decision));
+            }
+        }
+    }
 
     #[cfg(unix)]
     #[test]
@@ -17895,6 +18208,51 @@ version 2
             fault.starts_with("this build cannot read the member declaration: "),
             "{fault}"
         );
+    }
+
+    #[test]
+    fn otel_reconcile_roots_detach_ambient_context_and_member_faults_export_error() {
+        use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt as _, TraceFlags, TraceId, TraceState};
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store,
+            "version 2\nexec \"odd\" { workspace \"/tmp\"; command \"true\"; restart \"never\" }\nexec \"fine\" { workspace \"/tmp\"; command \"true\"; restart \"never\" }\n",
+            "otel-member-fault");
+        store.replace_desired_member_for_test("exec/odd", r#"{"kind":"exec","sandbox":"strict"}"#);
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(store.clone(), runtime.clone(), "node".into(), Arc::new(Notify::new()));
+        let ambient_trace = TraceId::from(123_u128);
+        let spans = crate::otel::capture_test_spans(|| {
+            let context = opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+                ambient_trace, SpanId::from(456_u64), TraceFlags::SAMPLED, true, TraceState::default()));
+            let _attached = context.attach();
+            let request = tracing::info_span!("request");
+            let _entered = request.enter();
+            reconciler.reconcile_once().unwrap();
+            // Exercise the duplicate member-fault early return on a continuing pass.
+            reconciler.reconcile_once().unwrap();
+            reconciler.next_reconcile_deadline();
+        });
+        let request = spans.iter().find(|span| span.name == "request").unwrap();
+        assert_eq!(request.span_context.trace_id(), ambient_trace);
+        assert_eq!(request.parent_span_id, SpanId::from(456_u64));
+        assert_eq!(*runtime.starts.lock().unwrap(), vec!["exec.fine".to_owned()]);
+        assert!(store.member_reconcile_fault("exec/odd", None).unwrap().is_some());
+        let mut passes = 0;
+        let mut deadlines = 0;
+        for span in &spans {
+            match span.name.as_ref() {
+                "st.reconcile_pass" => {
+                    passes += 1;
+                    assert!(matches!(span.status, opentelemetry::trace::Status::Error { .. }), "{span:?}");
+                }
+                "st.reconcile_deadline" => deadlines += 1,
+                _ => continue,
+            }
+            assert_eq!(span.parent_span_id, SpanId::INVALID, "{span:?}");
+            assert_ne!(span.span_context.trace_id(), ambient_trace, "{span:?}");
+        }
+        assert_eq!(passes, 2);
+        assert_eq!(deadlines, 1);
     }
 
     #[test]

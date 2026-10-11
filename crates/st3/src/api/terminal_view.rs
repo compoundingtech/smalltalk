@@ -19,6 +19,7 @@ use pty_terminal::{TerminalActor, TerminalEvent};
 use pty_core::protocol::{MessageType, PacketReader, decode_geometry, encode_peek};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+use smallclaims::fifo::{Kind, Queue};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::watch;
 
@@ -111,7 +112,7 @@ pub(super) fn subscribe(
         sender: sender.clone(),
         fallback_title: runtime_id.to_owned(),
     };
-    if EMULATION.send(job).is_err() {
+    if EMULATION.1.send(|| EMULATION.0.send(job)).is_err() {
         sender.send_replace(ViewState::Ended(ViewEnd::Unavailable(
             "the terminal emulation thread stopped".to_owned(),
         )));
@@ -131,8 +132,11 @@ struct WatchJob {
 /// libghostty's terminal is `!Send`, so no watcher may live on the shared multi-threaded
 /// runtime. Every watcher runs on this one thread, which owns a current-thread runtime and a
 /// `LocalSet`; `subscribe` only hands the job over.
-static EMULATION: LazyLock<tokio::sync::mpsc::UnboundedSender<WatchJob>> = LazyLock::new(|| {
-    let (jobs, mut incoming) = tokio::sync::mpsc::unbounded_channel::<WatchJob>();
+static EMULATION: LazyLock<(tokio::sync::mpsc::UnboundedSender<WatchJob>, Arc<Queue>)> = LazyLock::new(|| {
+    let (jobs, incoming) = tokio::sync::mpsc::unbounded_channel::<WatchJob>();
+    let queue = Queue::new(Kind::TerminalEmulation);
+    let incoming_queue = queue.clone();
+    let mut incoming = queue.receiver(incoming);
     let started = std::thread::Builder::new()
         .name("st3-terminal-view".to_owned())
         .spawn(move || {
@@ -145,6 +149,7 @@ static EMULATION: LazyLock<tokio::sync::mpsc::UnboundedSender<WatchJob>> = LazyL
             let local = tokio::task::LocalSet::new();
             local.block_on(&runtime, async move {
                 while let Some(job) = incoming.recv().await {
+                    incoming_queue.dequeued();
                     tokio::task::spawn_local(run_watcher(job));
                 }
             });
@@ -152,7 +157,7 @@ static EMULATION: LazyLock<tokio::sync::mpsc::UnboundedSender<WatchJob>> = LazyL
     if let Err(error) = started {
         tracing::error!(%error, "start the terminal emulation thread");
     }
-    jobs
+    (jobs, queue)
 });
 
 async fn run_watcher(job: WatchJob) {

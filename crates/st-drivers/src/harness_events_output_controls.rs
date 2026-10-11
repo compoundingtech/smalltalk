@@ -18,6 +18,36 @@ const SNAPSHOT_KIND: &str = "harness-output";
 const MAX_BATCH: usize = 128;
 const MAX_BATCH_BYTES: usize = 256 * 1024;
 
+// Count serializer output without retaining an encoded copy of each operation.
+// This bounds accepted serialized bytes, not the already allocated input Value,
+// serializer scan work, recursion, later admitted serialization or native input.
+#[derive(Default)]
+struct SerializedByteCounter {
+    used: usize,
+}
+
+impl std::io::Write for SerializedByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > MAX_BATCH_BYTES - self.used {
+            return Err(std::io::Error::other("native output batch is too wide"));
+        }
+        self.used += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_batch_size(operations: &[Operation]) -> Result<usize> {
+    let mut counter = SerializedByteCounter::default();
+    for operation in operations {
+        serde_json::to_writer(&mut counter, operation)?;
+    }
+    Ok(counter.used)
+}
+
 /// Proposed producer-callback input, authored directly by these controls.
 /// A future adapter must establish its provenance before normalization/queueing.
 /// Hydration/replay supplies no progress. Unknown raw tool IDs remain incomplete
@@ -101,16 +131,7 @@ pub(crate) fn write_timeline_with_output(
         }),
         "output progress must belong to the same admitted timeline batch"
     );
-    new_operations
-        .iter()
-        .try_fold(0_usize, |bytes, operation| {
-            let operation_bytes = serde_json::to_vec(operation)?.len();
-            let total = bytes
-                .checked_add(operation_bytes)
-                .ok_or_else(|| anyhow::anyhow!("native output batch byte count overflow"))?;
-            anyhow::ensure!(total <= MAX_BATCH_BYTES, "native output batch is too wide");
-            Ok::<_, anyhow::Error>(total)
-        })?;
+    serialized_batch_size(new_operations)?;
     crate::harness_state::with_current_ownership(
         agent_dir,
         batch.provider_incarnation,
@@ -483,6 +504,129 @@ mod tests {
         operation.body = serde_json::json!({"text":"x".repeat(size - overhead)});
         assert_eq!(serde_json::to_vec(&operation).unwrap().len(), size);
         operation
+    }
+
+    #[test]
+    fn serialized_batch_counter_matches_utf8_and_escaped_json_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, _, template, _) = prepare(root.path(), "omp");
+        let mut first = retention_operation(&template, 1);
+        first.body = serde_json::json!({
+            "text": "λ🙂\n\"\\\t", "nested": [null, true, 123, {"key": "多字节"}]
+        });
+        first.entry_id = "entry-λ\n\"".into();
+        let mut second = retention_operation(&template, 2);
+        second.body = serde_json::json!({"text": "\u{0000}\r\n".repeat(64)});
+        let operations = [first, second];
+        let expected = operations
+            .iter()
+            .map(|operation| serde_json::to_vec(operation).unwrap().len())
+            .sum::<usize>();
+        assert_eq!(serialized_batch_size(&operations).unwrap(), expected);
+        let first_json = serde_json::to_string(&operations[0]).unwrap();
+        assert!(first_json.len() > first_json.chars().count());
+    }
+
+    #[test]
+    fn private_output_batch_byte_limit_is_inclusive_and_one_extra_byte_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut record, template, seq) = prepare(root.path(), "omp");
+        let oversized = operation_with_serialized_size(&template, MAX_BATCH_BYTES + 1);
+        record.operations = vec![oversized.clone()];
+        let before = spool_image(root.path());
+        let error = write_timeline_with_output(
+            root.path(),
+            &record,
+            std::slice::from_ref(&oversized),
+            &batch(&record, seq, &[]),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("native output batch is too wide")
+        );
+        assert_eq!(spool_image(root.path()), before);
+
+        // A same-owner batch at the exact limit must still be accepted; refusing
+        // every large operation would otherwise satisfy the negative assertion.
+        let exact = operation_with_serialized_size(&template, MAX_BATCH_BYTES);
+        record.operations = vec![exact.clone()];
+        let progress = [OutputProgress {
+            operation: &exact,
+            original_at_ms: 10,
+            body_changed: true,
+            tool_identity_complete: true,
+        }];
+        assert_eq!(
+            serialized_batch_size(std::slice::from_ref(&exact)).unwrap(),
+            MAX_BATCH_BYTES
+        );
+        write_timeline_with_output(
+            root.path(),
+            &record,
+            std::slice::from_ref(&exact),
+            &batch(&record, seq, &progress),
+        )
+        .unwrap();
+        assert_eq!(
+            retained_timeline_sizes(root.path()),
+            vec![(1, MAX_BATCH_BYTES as u64, MAX_BATCH_BYTES as u64)]
+        );
+        let image: Envelope = serde_json::from_slice(
+            &super::super::read_snapshot(root.path(), SNAPSHOT_KIND)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(image.output.last_output.unwrap().at_unix_ms, 10);
+    }
+
+    #[test]
+    fn private_output_batch_byte_limit_is_cumulative_across_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut record, template, seq) = prepare(root.path(), "omp");
+        let oversized = [1, 2].map(|sequence| {
+            operation_with_serialized_size(
+                &retention_operation(&template, sequence),
+                MAX_BATCH_BYTES / 2 + 1,
+            )
+        });
+        for operation in &oversized {
+            assert_eq!(
+                serialized_batch_size(std::slice::from_ref(operation)).unwrap(),
+                MAX_BATCH_BYTES / 2 + 1
+            );
+        }
+        record.next_sequence = 3;
+        record.operations = oversized.to_vec();
+        let before = spool_image(root.path());
+        let error =
+            write_timeline_with_output(root.path(), &record, &oversized, &batch(&record, seq, &[]))
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("native output batch is too wide")
+        );
+        assert_eq!(spool_image(root.path()), before);
+
+        let exact = [1, 2].map(|sequence| {
+            operation_with_serialized_size(
+                &retention_operation(&template, sequence),
+                MAX_BATCH_BYTES / 2,
+            )
+        });
+        record.operations = exact.to_vec();
+        assert_eq!(serialized_batch_size(&exact).unwrap(), MAX_BATCH_BYTES);
+        write_timeline_with_output(root.path(), &record, &exact, &batch(&record, seq, &[]))
+            .unwrap();
+        let sizes = retained_timeline_sizes(root.path());
+        assert_eq!(sizes.len(), 2);
+        assert_eq!(
+            sizes.iter().map(|row| row.1).sum::<u64>(),
+            MAX_BATCH_BYTES as u64
+        );
     }
 
     #[test]

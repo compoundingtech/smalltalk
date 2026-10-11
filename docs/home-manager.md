@@ -35,6 +35,40 @@ Package references in the systemd unit or launchd plist still trigger daemon res
 Seats started from store paths before this change remain stale until restarted; see
 [seats across deploys](st3/seat-deploys.md).
 
+## Externally deployed binary
+
+If another deployer updates your Nix profile or installs the executable, set
+`binary.path` to its stable absolute path:
+
+```nix
+services.smalltalk = {
+  enable = true;
+  person = "person/ada";
+  binary.path = "/opt/smalltalk/bin/st3";
+};
+```
+
+The default is `null`, which keeps the installation and restart behavior above.
+When a path is set, Home Manager does not install `package`, copy an executable
+to `stateDir/bin`, or create the `st` alias there. The daemon and declaration
+commands execute `binary.path`, and their PATH starts with its containing
+directory. The daemon's `--pty-binary` also selects `pty` in that directory.
+The systemd units and launchd agents omit the Smalltalk and PTY package store
+paths and the package restart trigger. Changing only `package` or `ptyPackage`
+therefore does not restart the daemon on a Home Manager switch.
+
+The external deployer must install the executable before the service starts,
+provide any CLI aliases (such as `st`), install `pty` beside the configured
+executable, and restart the daemon when an upgrade needs it. `ptyPackage` is
+ignored in this mode, so a profile update selects both tools from the same
+stable directory.
+For running seats to follow replacements, use a real executable at a stable
+path: a Nix-profile symlink alone resolves to the package's store executable
+and does not provide the replaceable executable described in
+[seats across deploys](st3/seat-deploys.md).
+
+## Host setup
+
 Linux user-manager lingering and macOS `st service permissions` remain host
 setup prerequisites. Fleet/replication setup is not managed by this module.
 

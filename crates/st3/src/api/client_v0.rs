@@ -79,6 +79,7 @@ fn record_subscription_page(value: &Value, bytes: usize) {
     crate::otel::record_page(rows, bytes);
     span.record("span.label", format!("{collection} {rows}"));
 }
+use smallclaims::fifo::{Kind, Queue};
 
 pub(super) mod raw_terminal;
 pub(super) mod resources;
@@ -1170,12 +1171,13 @@ async fn follow_conversation(
     generation: u64,
     (session_id, remote): (String, Option<String>),
     outbox: tokio::sync::mpsc::UnboundedSender<(String, u64, Value)>,
+    queue: Arc<Queue>,
     first_frame: (
         Option<opentelemetry::trace::SpanContext>, Option<tracing::Span>,
     ),
 ) {
     follow_conversation_since(
-        state, session, id, generation, session_id, remote, outbox, None, first_frame,
+        state, session, id, generation, session_id, remote, outbox, None, queue, first_frame,
     )
     .await;
 }
@@ -1192,6 +1194,7 @@ async fn follow_conversation_since(
     remote: Option<String>,
     outbox: tokio::sync::mpsc::UnboundedSender<(String, u64, Value)>,
     mut subscribed: Option<std::time::Instant>,
+    queue: Arc<Queue>,
     (_upgrade, mut first_read): (
         Option<opentelemetry::trace::SpanContext>, Option<tracing::Span>,
     ),
@@ -1224,11 +1227,11 @@ async fn follow_conversation_since(
             Err(error) => {
                 if client_error_retryable(error.status, Some(&error.code)) {
                     // Say why, so a client showing its last copy can say that copy is stale.
-                    if outbox.send((id.clone(), generation, json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true, "code":error.code, "message":error.message}))).is_err() { return; }
+                    if queue.send(|| outbox.send((id.clone(), generation, json!({"kind":"resync", "id":id, "collection":"conversation", "retryable":true, "code":error.code, "message":error.message})))).is_err() { return; }
                     tokio::time::sleep(COLLECTION_REREAD_INTERVAL).await;
                     continue;
                 }
-                let _ = outbox.send((id.clone(), generation, failed(&error)));
+                let _ = queue.send(|| outbox.send((id.clone(), generation, failed(&error))));
                 return;
             }
         };
@@ -1248,7 +1251,7 @@ async fn follow_conversation_since(
             items.drain(..drop);
             frame["has_more"] = Value::Bool(true);
         }
-        if outbox.send((id.clone(), generation, frame)).is_err() {
+        if queue.send(|| outbox.send((id.clone(), generation, frame))).is_err() {
             return;
         }
         if let Some(subscribed) = subscribed.take() {
@@ -1280,7 +1283,7 @@ async fn follow_conversation_since(
                         if frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
                             break;
                         }
-                        if outbox.send((id.clone(), generation, frame)).is_err() {
+                        if queue.send(|| outbox.send((id.clone(), generation, frame))).is_err() {
                             return;
                         }
                     }
@@ -1296,7 +1299,7 @@ async fn follow_conversation_since(
                     break;
                 }
                 Err(error) => {
-                    let _ = outbox.send((id.clone(), generation, failed(&error)));
+                    let _ = queue.send(|| outbox.send((id.clone(), generation, failed(&error))));
                     return;
                 }
             }
@@ -1453,8 +1456,10 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
     let mut terminals_opened = BTreeMap::<String, std::time::Instant>::new();
     let mut conversations = ConversationFollowers::default();
     let mut first_frames = BTreeMap::<String, FirstFrame>::new();
-    let (conversation_outbox, mut conversation_frames) =
+    let (conversation_outbox, conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, u64, Value)>();
+    let conversation_queue = Queue::new(Kind::Conversation);
+    let mut conversation_frames = conversation_queue.receiver(conversation_frames);
     // The commits already weighed, the windows due for a reread, and when the last reread ran.
     let mut attention_clock = tokio::time::interval_at(
         tokio::time::Instant::now() + ATTENTION_CLOCK_INTERVAL,
@@ -1548,6 +1553,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                             let opened = std::time::Instant::now();
                             let first_read = first_frames.get(&request.id).map(|first| first.span.clone());
                             let upgrade = upgrade.clone();
+                            let queue = conversation_queue.clone();
                             let follower = tokio::spawn(async move {
                                 let permits = ConversationAdmissionPermits {
                                     _socket: admission_slots.acquire_owned().await.expect("socket admission slots stay open"),
@@ -1555,11 +1561,11 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                                 };
                                 match admit(state.clone(), session.clone(), request, permits).await {
                                     Ok((session_id, remote)) => {
-                                        follow_conversation_since(state, session, id, generation, session_id, remote, outbox, Some(opened), (upgrade, first_read)).await;
+                                        follow_conversation_since(state, session, id, generation, session_id, remote, outbox, Some(opened), queue, (upgrade, first_read)).await;
                                     }
                                     Err(error) => {
                                         let frame = json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message});
-                                        let _ = outbox.send((id, generation, frame));
+                                        let _ = queue.send(|| outbox.send((id, generation, frame)));
                                     }
                                 }
                             });
@@ -1730,6 +1736,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                 continue;
             }
             Some((id, frame_generation, frame)) = conversation_frames.recv(), if !command_waiting => {
+                conversation_queue.dequeued();
                 // Replaced or unsubscribed admissions/followers may still have a frame queued.
                 if conversations.0.get(&id).is_none_or(|(generation, _)| *generation != frame_generation) { continue; }
                 if frame["kind"] == "error" { conversations.0.remove(&id); }
@@ -13130,6 +13137,7 @@ mission "queue-parity" state="ready" {
                 1,
                 ("session/missing".into(), remote.map(str::to_owned)),
                 sender,
+                Queue::new(Kind::Conversation),
                 (None, None),
             ));
             let (_, generation, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
@@ -17541,6 +17549,7 @@ mission "example/zero-run" state="ready" {
             let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
             let follower = tokio::spawn(follow_conversation(
                 state.clone(), session, "chat".into(), 1, (session_id.clone(), None), sender,
+                Queue::new(Kind::Conversation),
                 (None, None),
             ));
             let (_, _, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();

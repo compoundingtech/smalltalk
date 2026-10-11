@@ -69,6 +69,7 @@ pub use smallclaims::{performance, profile};
 pub mod projection;
 pub mod provenance;
 pub mod reconcile;
+mod reconcile_telemetry;
 mod relay_trace;
 pub mod rules;
 /// Observes git and gh calls without changing their command behavior.
@@ -92,6 +93,7 @@ pub mod service;
 pub mod skill;
 pub mod slo;
 pub mod startup;
+pub mod startup_telemetry;
 pub mod store;
 pub mod subagents;
 /// Suspends a quiet seat and resumes its own native session.
