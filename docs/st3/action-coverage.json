@@ -2214,6 +2214,19 @@
   ],
   "stui_effects": [
     {
+      "effect": "LoadContent",
+      "tests": [
+        "crates/stui/src/ui/mod.rs::content_controls_emit_load_effects_once_and_release_on_collapse_or_hide",
+        "crates/stui/src/ui/mod.rs::expand_all_loads_visible_clipped_blocks_sequentially_and_collapse_releases",
+        "crates/stui/src/ui/mod.rs::automatic_images_use_visible_image_lines_graphics_and_one_read_at_a_time",
+        "crates/stui/src/ui/content.rs::chunks_assemble_the_entire_original_json_from_zero",
+        "crates/stui/src/ui/content.rs::chunks_reject_changed_identity_and_non_progressing_offsets",
+        "crates/st3/src/api/client_v0/conversation_blocks.rs::truncated_tool_output_http_chunks_return_complete_native_body_without_writes",
+        "crates/st3/src/api/client_v0/conversation_blocks.rs::http_owner_chunks_negotiate_bound_bytes_and_visibly_invalidate_without_writes"
+      ],
+      "verification": "content-control reducer and viewport queue; chunk assembly and identity checks; real owner HTTP chunk transport returns complete content without durable writes"
+    },
+    {
       "effect": "OpenImage",
       "tests": [
         "crates/stui/src/ui/attach.rs::an_image_read_from_st_is_kept_once_by_its_hash",

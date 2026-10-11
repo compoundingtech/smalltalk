@@ -722,6 +722,20 @@ the normalized `tool_output` block's optional open `metadata`, preserving `wallT
 `source_record` block. Legacy tool-result blocks inside message content remain supported and
 use the same block metadata shape.
 
+Native block `view` and `metadata` (including assistant text/reasoning metadata) use
+the same bounded open-value display convention on full reads and native keyset pages:
+the outer object and its keys survive, oversized strings gain the visible
+`[st truncated this native timeline value: size limit; … bytes]` marker, and oversized
+nested objects or arrays may become marked JSON-preview strings. A clipped `view`
+keeps its `type` discriminator; clients must check field shapes before rendering
+collections, as the Rust and TypeScript conversation renderers do. These are display
+previews, not lossless native values. A size-limit block `continuation` fetches the
+original `/body/blocks/{index}/view` or `/body/blocks/{index}/metadata` subtree when it
+is the only remainder; if the payload or another open field also needs a continuation,
+the same ref fetches the complete original `/body`, including its unbounded blocks.
+The final per-entry size guard remains authoritative and can replace an entry with a
+`native-entry-too-large` error whose continuation fetches its original body.
+
 External process sessions remain listed even when st cannot identify a native transcript.
 Opening their timeline returns a non-retryable `unsupported-capability` error with
 `details.reason: native-session-unidentified` and `details.session_id`, explaining that the
@@ -1014,6 +1028,18 @@ oldest scroll-back boundary when local observations have advanced independently.
 Conversation changes carry these projection notices when managed history changes, including
 the first operation that crosses the bound. An updated entry outside the materialized window
 causes the ordinary cursor-gap/newest-page refresh instead of an incomplete revision delta.
+Conversation cursors also bind the native line transcript's content generation.
+Local conversation OPEN captures the page and its native generation in one bounded
+read. Its local-observation high-water precedes the graph snapshot, so concurrent
+rows remain replayable rather than being skipped by the initial cursor.
+If a managed native transcript cannot be read, OPEN keeps the stored timeline and
+its transcript-availability notice without retrying the native read. This fallback
+uses generation zero; native change reads still surface the read error.
+Appends preserve the native generation. Settling an already-delivered OMP turn's `retryRecovery`
+rewrites its native record and moves the generation; the next change read returns
+`cursor-gap` with `full_resync: true`, so followers reload the newest page with the
+updated error presentation. OpenCode's append-changing generation is not used as
+this fence. Old-format conversation cursors similarly require a fresh page.
 Changes to typed truncation entries also refresh the authoritative newest page, clearing an
 obsolete prefix-unavailable notice when an interval establishes complete prefix coverage.
 These session-stable projection notices are not evidence of overlap between a refreshed newest
@@ -1088,6 +1114,9 @@ The first envelope has a `ConversationChanges` value with an empty `items`
 array and a `next_cursor` when opening at the live edge. Later envelopes contain
 new chronological `TimelineEntry` values, including st messages, and a cursor to
 save after applying the batch. The owner sends no WebSocket data while idle.
+Clients load existing rows from the timeline endpoint, not from this live-edge envelope.
+After a `cursor-gap`, reload that authoritative timeline page and reopen at the live edge
+to obtain a fresh change cursor; reopening alone does not replay the page's rows.
 
 The gateway routes managed sessions to their owning host using the authenticated
 daemon relay. The owner holds a bounded change read for up to ten seconds. A
@@ -1765,6 +1794,37 @@ without secret or token filtering. Without the feature, the server returns known
 text/tool/status bodies with visible size-limit notices. Old clients can read those
 fallbacks but do not fetch images or expand a chunked remainder.
 
+A block MAY also carry `view: {type, ...}`, a parsed typed projection discriminated by
+the open `type` string. The schema defines one closed definition per known type
+(`TimelineView*` under `TimelineView`, including `SubagentSummary` and `JobSummary`)
+and a fallback branch for any other type; a renderer that does not know a type renders
+the block as without a view, and the full native arguments or output stay in `payload`.
+The block kinds add `irc` for `custom_message` `irc:incoming` records, and assistant
+`text`/`reasoning` blocks may carry `model`, `provider`, `usage`, `context_tokens`,
+`stop_reason`, `ttft_ms` and `duration_ms` in `metadata`. Timeline pages, conversation
+changes and timeline deltas MAY carry a `header` object whose fields are each
+`{value, source: register|transcript, as_of}`; a field is absent when neither source
+has it, and `working` comes only from the register. The full mapping tables live in
+[conversation normalization design](../conversation-normalization-design.md). Generated
+clients model `view` and `header` as optional loose JSON; `timeline-views.json` is the
+wire fixture.
+
+The pre-approval parity audit adds these parsed contract fields explicitly:
+`TimelineViewTask.context`, `SubagentSummary.name` (OMP name, distinct from agent
+type), `TimelineViewWrite.content` and `line_count`, search flags `case`, `hidden`,
+`gitignore`, `limit`, `skip` and output fields `call_id`, `is_error`, `match_count`,
+`file_count`, `truncated`, `file_limit_reached`, `per_file_limit_reached`, `warning`;
+ask option `description`; hub `message`; eval `code`, `timeout_s`, `reset`; and
+compaction `summary`. Existing bash `cwd` and `timeout_s` now render on both clients.
+Assistant session errors add `TimelineViewAssistantError` with `status`,
+`presentation`, `is_error`, `label`, original `message`, optional `stop_reason`,
+`error_id`, `api`, `provider`, `model`, and optional persisted `retry`
+(`kind`, `status`, `attempt`, `recovery`, `note`, ISO-string `recovered_at`,
+`superseded_by` with epoch-ms `timestamp`, `response_id`, `provider`, `model`).
+Recovery markers do not invent live retry state. Recovered errors start compact,
+retain original errors on expansion, and superseded errors are not drawn.
+
+
 `read.projections` authorizes **raw native conversation content**, including full
 arguments, output, reasoning shown by the harness, unknown JSON and images. It is
 the existing scope for pages, deltas and owner forwarding, and also governs
@@ -1783,6 +1843,43 @@ chunk contains base64 `data`, `media_type`, `offset`, total `size` and nullable
 limited to 32 MiB, with explicit errors. Transcript URLs are never fetched by the owner. Oversized JSON
 payloads show an 8 KiB UTF-8 prefix labelled as truncated JSON text, and a reference
 recovers the full valid JSON. The existing 1 MB page bound still applies.
+
+Current stui and phone views use these existing references for explicit full-content
+loading. Expansion starts at offset zero and follows `next_offset` until it is null;
+the assembled JSON is the complete original value, not a suffix to splice into the
+clipped preview. A ref may cover a payload, an open metadata/view subtree, or the
+complete native body. An identifiable full tool body (same call identity), or a
+payload whose preview was clipped while metadata/view were not, uses the existing
+typed output adapter without its preview line limit. Identifiable view-only refs
+are reattached to the original block and use that same adapter, including written
+content and compaction summaries. Metadata and unknown values keep a lossless raw
+JSON fallback. Loading non-image content is explicit for that block or through
+stui's expand-all keypress. Expand-all loads only visible
+clipped tool values, with one owner content read active at a time; newly visible
+rows load next without prefetching offscreen rows. Loaded values remain in memory
+when scrolled away and are released on collapse. Restoring saved expansion state
+does not fetch full native values automatically.
+`continuation.size`, when present, describes that original value's encoded byte size.
+Native image refs initially use `application/octet-stream` and may omit size; the
+fetched chunks report the detected passive image media type and exact byte count.
+Clients keep expanded values, image bytes and inline image data URIs/protocols in
+memory only, scoped to the conversation and reference. Loading does not create a
+temporary file, persistent cache, stored conversation history or outbox.
+
+Native images load automatically when their image box is visible on the phone, or
+their image label is visible in a graphics-capable stui terminal. Phone overscan,
+inactive screens, offscreen terminal entries and covered panes do not authorize
+automatic reads. stui uses the same one-read-at-a-time queue, and Ctrl+U explicitly
+hides/shows a tool's images; hidden images stay hidden through redraws and scrolls.
+Unsupported terminals retain explicit loading instead of automatic fetching.
+Phone shows a Load/Retry action only after failure. Its viewport owns one sequential
+image-read queue through all chunks. Offscreen/re-entry reuses a pending request
+instead of starting a duplicate; revoked or disposed requests hold the slot until
+they settle because the content transport has no abort capability. Queued invisible
+images never fetch. Image reads and decoded pixels remain memory-only and are
+released with their retained timeline entries; late responses cannot resurrect a
+hidden or discarded image.
+
 
 Edited records, replacement, managed binding changes and owner restarts invalidate references;
 append-only growth preserves existing refs:

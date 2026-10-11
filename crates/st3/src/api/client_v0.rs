@@ -1039,14 +1039,28 @@ fn conversation_open_local_marked(
     BEFORE_CONVERSATION_PAGE.with(|pause| {
         if let Some(pause) = pause.borrow_mut().take() { pause(); }
     });
-    let page = timeline_value(
-        state, &snapshot, session, session_id,
-        &ClientListQuery { limit: Some(200), ..Default::default() },
-    )?.0;
-    let native = native_latest_sequence(&page);
-    let cursor = conversation_cursor(
-        state, session_id, snapshot.store_index, local_position, native,
-    );
+    let (page, source_generation) =
+        match conversation_first_page_at_generation(state, &snapshot, session, session_id) {
+            Ok(page) => page,
+            Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
+            // OPEN keeps the established managed-transcript availability notice and stored
+            // fallback. Successful native reads still capture page and generation together;
+            // change replay deliberately continues to surface native-read failures.
+            Err(error) => {
+                require_scope(session, "read.projections")?;
+                (timeline_first_page(
+                    state, &snapshot, session, session_id.to_owned(),
+                    &ClientListQuery { limit: Some(200), ..Default::default() },
+                    Some(error),
+                )?.0, 0)
+            }
+        };
+    let cursor = conversation_cursor(state, session_id, ConversationPosition {
+        store_index: snapshot.store_index,
+        local_position,
+        native_sequence: native_latest_sequence(&page),
+        source_generation,
+    });
     remember_cursor(&cursor, mark.transcript_seen);
     Ok((json!({"next_cursor":cursor}), page, mark))
 }
@@ -1129,6 +1143,9 @@ async fn follow_conversation_since(
             }
         };
         let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":true, "items":page["items"], "has_more":page["page"]["has_more"]});
+        if let Some(header) = page.get("header") {
+            frame["header"] = header.clone();
+        }
         // A page of long tool output can outgrow one frame: keep its newest entries.
         while frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
             let Some(items) = frame["items"]
@@ -1165,7 +1182,10 @@ async fn follow_conversation_since(
                         .as_array()
                         .is_some_and(|items| !items.is_empty())
                     {
-                        let frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":false, "items":changes["items"]});
+                        let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":false, "items":changes["items"]});
+                        if let Some(header) = changes.get("header") {
+                            frame["header"] = header.clone();
+                        }
                         // Too much changed for one frame: send the newest page instead.
                         if frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
                             break;
@@ -4968,6 +4988,63 @@ fn timeline_order(a: &Value, b: &Value) -> std::cmp::Ordering {
         .then_with(|| a["sequence"].as_u64().cmp(&b["sequence"].as_u64()))
 }
 
+/// The conversation header (client contract `conversation-blocks.v1` §3): derived from a
+/// normalized bounded window, with live register values winning once the register (#1583)
+/// exists. Native keyset pages pass their newest bounded head, not an offset page cache.
+fn conversation_page_header(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    items: &[Value],
+    window_truncated: bool,
+) -> Option<Value> {
+    if !session.conversation_blocks {
+        return None;
+    }
+    let derived = crate::conversation_header::derive(
+        items,
+        window_truncated || crate::conversation_header::window_truncated(items),
+    );
+    crate::conversation_header::merge_register(
+        derived,
+        crate::conversation_header::register_value(state, session_id).as_ref(),
+    )
+}
+
+/// Only offset continuations (OpenCode and claim timelines) retain their original window
+/// in the page cache. Native keyset continuations derive a bounded head in native_slice_page.
+fn offset_continuation_header(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    snapshot: &ClientSnapshot,
+    cursor: &str,
+) -> Option<Value> {
+    if !session.conversation_blocks {
+        return None;
+    }
+    let cursor = super::decode_client_cursor(cursor).ok()?;
+    let collection = format!("timeline/{session_id}");
+    if cursor.collection != collection || cursor.snapshot.id != snapshot.id {
+        return None;
+    }
+    let items = {
+        let cache = super::client_page_cache()
+            .lock()
+            .expect("client page cache poisoned");
+        cache
+            .iter()
+            .find(|entry| {
+                entry.snapshot_id == cursor.snapshot.id
+                    && entry.collection == collection
+                    && entry.items_digest == cursor.items_digest
+            })?
+            .items
+            .clone()
+    };
+    conversation_page_header(state, session, session_id, &items, false)
+}
+
 fn native_session_messages(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -5007,6 +5084,7 @@ fn native_session_messages(
 fn native_timeline_page(
     state: &AppState,
     snapshot: &ClientSnapshot,
+    session: &ClientSession,
     session_id: &str,
     query: &ClientListQuery,
     mut items: Vec<Value>,
@@ -5027,6 +5105,7 @@ fn native_timeline_page(
     }
     keyed.sort_by(|(_, a), (_, b)| a.cmp_in(b, order));
     items = keyed.into_iter().rev().map(|(item, _)| item).collect();
+    let header = conversation_page_header(state, session, session_id, &items, false);
     let mut page = client_page(
         state,
         snapshot,
@@ -5035,12 +5114,16 @@ fn native_timeline_page(
         query,
     )?;
     page.items.reverse();
-    Ok(Json(json!({
+    let mut page_value = json!({
         "kind": "timeline-page",
         "session_id": session_id,
         "items": page.items,
         "page": page.page
-    })))
+    });
+    if let Some(header) = header {
+        page_value["header"] = header;
+    }
+    Ok(Json(page_value))
 }
 
 fn native_timeline_order(
@@ -5142,6 +5225,19 @@ fn native_slice_page(
     query: &ClientListQuery,
     source: &crate::external_sessions::ExternalSession,
 ) -> Result<Json<Value>, ApiError> {
+    native_slice_page_at_generation(state, snapshot, session, session_id, query, source)
+        .map(|(page, _)| page)
+}
+
+/// [`native_slice_page`] together with the source content generation it was read at.
+fn native_slice_page_at_generation(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    session: &ClientSession,
+    session_id: &str,
+    query: &ClientListQuery,
+    source: &crate::external_sessions::ExternalSession,
+) -> Result<(Json<Value>, u64), ApiError> {
     let cursor = query.cursor.as_deref().map(decode_native_page_cursor).transpose()?;
     let source_basis = conversation_blocks::basis(source)?;
     let order = native_timeline_order(state, snapshot, session_id)?;
@@ -5176,7 +5272,17 @@ fn native_slice_page(
         |cursor| cursor.expires_at_unix_ms,
     );
     let before = cursor.as_ref().map(|cursor| &cursor.boundary);
-    let native = conversation_blocks::read_slice(source, session, session_id, order, before, limit + 1)?;
+    // A keyset header summarizes the newest 200 native items, not the older page being
+    // served. Reuse the first-page read for that head; continuations read a bounded head
+    // separately. Derive once per request, never scan the whole window or use the offset cache.
+    let read_limit = if session.conversation_blocks && before.is_none() {
+        (limit + 1).max(CLIENT_MAX_PAGE_ITEMS)
+    } else {
+        limit + 1
+    };
+    let mut native = conversation_blocks::read_slice(
+        source, session, session_id, order, before, read_limit,
+    )?;
     if native.basis != source_basis {
         return Err(client_page_expired("the transcript changed while reading the page"));
     }
@@ -5187,6 +5293,28 @@ fn native_slice_page(
             "the transcript was replaced while paging; restart pagination",
         ));
     }
+    let header = if session.conversation_blocks {
+        let head = if before.is_some() {
+            Some(conversation_blocks::read_slice(
+                source, session, session_id, order, None, CLIENT_MAX_PAGE_ITEMS,
+            )?)
+        } else {
+            None
+        };
+        let head = head.as_ref().unwrap_or(&native);
+        if head.basis != source_basis {
+            return Err(client_page_expired("the transcript changed while reading the header"));
+        }
+        let count = head.items.len().min(CLIENT_MAX_PAGE_ITEMS);
+        conversation_page_header(
+            state, session, session_id, &head.items[..count],
+            head.has_more || head.items.len() > count,
+        )
+    } else {
+        None
+    };
+    native.has_more |= native.items.len() > limit + 1;
+    native.items.truncate(limit + 1);
     let messages = if order == crate::external_sessions::TimelineOrder::TimestampSequence {
         native_session_messages(state, snapshot, session_id)?
     } else {
@@ -5238,7 +5366,7 @@ fn native_slice_page(
         None
     };
     let items: Vec<_> = items.into_iter().rev().map(|(item, _)| item).collect();
-    Ok(Json(json!({
+    let mut page_value = json!({
         "kind": "timeline-page",
         "session_id": session_id,
         "items": items,
@@ -5246,7 +5374,11 @@ fn native_slice_page(
             limit, has_more, next_cursor,
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
-    })))
+    });
+    if let Some(header) = header {
+        page_value["header"] = header;
+    }
+    Ok((Json(page_value), native.generation))
 }
 
 /// What st3 established about a managed seat's native transcript.
@@ -5691,21 +5823,29 @@ pub(super) fn timeline_value(
             Vec::new(),
             query,
         )?;
+        let header = query
+            .cursor
+            .as_deref()
+            .and_then(|cursor| offset_continuation_header(state, session, &session_id, snapshot, cursor));
         for item in &mut page.items {
             if !session.conversation_blocks && let Some(body) = item["body"].as_object_mut() {
                 body.remove("blocks");
             }
         }
         page.items.reverse();
-        return Ok(Json(json!({
+        let mut page_value = json!({
             "kind": "timeline-page",
             "session_id": session_id,
             "items": page.items,
             "page": page.page
-        })));
+        });
+        if let Some(header) = header {
+            page_value["header"] = header;
+        }
+        return Ok(Json(page_value));
     }
     crate::performance::task("conversation/first-page", || {
-        timeline_first_page(state, snapshot, session, session_id, query)
+        timeline_first_page(state, snapshot, session, session_id, query, None)
     })
 }
 
@@ -5715,6 +5855,7 @@ fn timeline_first_page(
     session: &ClientSession,
     session_id: String,
     query: &ClientListQuery,
+    native_read_error: Option<ApiError>,
 ) -> Result<Json<Value>, ApiError> {
     #[cfg(test)]
     if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
@@ -5723,6 +5864,9 @@ fn timeline_first_page(
     let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
         .map_err(ApiError::internal)?;
     let Some((owner, incarnation, _)) = managed else {
+        if let Some(error) = native_read_error {
+            return Err(error);
+        }
         let conversation = crate::external_sessions::find_conversation(
             state.native_session_home.as_deref(),
             &session_id,
@@ -5736,9 +5880,23 @@ fn timeline_first_page(
                 }
                 conversation_blocks::read(&external, session, &session_id)?
             }
-            other => external_conversation_items(other, &session_id)?,
+            // A subagent conversation id resolves beside its parent before it is unknown.
+            other => match crate::subagent_sessions::resolve_child(
+                state.native_session_home.as_deref(),
+                &session_id,
+            )
+            .map_err(ApiError::internal)?
+            {
+                Some(child) => {
+                    if child.driver != crate::external_sessions::ExternalDriver::OpenCode {
+                        return native_slice_page(state, snapshot, session, &session_id, query, &child);
+                    }
+                    conversation_blocks::read(&child, session, &session_id)?
+                }
+                None => external_conversation_items(other, &session_id)?,
+            },
         };
-        return native_timeline_page(state, snapshot, &session_id, query, items);
+        return native_timeline_page(state, snapshot, session, &session_id, query, items);
     };
     let owner = owner.as_str();
     let incarnation = incarnation.as_deref();
@@ -5748,14 +5906,16 @@ fn timeline_first_page(
     if let Some(incarnation) = incarnation
         && let Some(managed) = managed_transcript(state, owner, incarnation)?
     {
-        let read = {
+        let read = if let Some(error) = native_read_error.as_ref() {
+            Err(format!("the transcript could not be read: {}", error.message))
+        } else {
             let _span = crate::profile::span("timeline/native-read");
             match managed.transcript.as_ref() {
                 Ok(external) => match if external.driver != crate::external_sessions::ExternalDriver::OpenCode {
                     native_slice_page(state, snapshot, session, &session_id, query, external)
                 } else {
                     conversation_blocks::read(external, session, &session_id)
-                        .and_then(|items| native_timeline_page(state, snapshot, &session_id, query, items))
+                        .and_then(|items| native_timeline_page(state, snapshot, session, &session_id, query, items))
                 } {
                     Ok(page) => Ok(page),
                     Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
@@ -6148,6 +6308,7 @@ fn timeline_first_page(
         items.extend([query_notice, prefix_notice].into_iter().flatten());
     }
     items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
+    let header = conversation_page_header(state, session, &session_id, &items, false);
     // A conversation opens at its newest bounded window. The cursor walks toward older
     // windows, while each individual page remains chronological for straightforward rendering.
     items.reverse();
@@ -6159,12 +6320,16 @@ fn timeline_first_page(
         query,
     )?;
     page.items.reverse();
-    Ok(Json(json!({
+    let mut page_value = json!({
         "kind": "timeline-page",
         "session_id": session_id,
         "items": page.items,
         "page": page.page
-    })))
+    });
+    if let Some(header) = header {
+        page_value["header"] = header;
+    }
+    Ok(Json(page_value))
 }
 
 #[derive(Default, Deserialize)]
@@ -6173,20 +6338,27 @@ pub(super) struct ConversationQuery {
     wait_ms: Option<u64>,
 }
 
-fn conversation_cursor(
-    state: &AppState,
-    session_id: &str,
+/// Where a conversation follower stands. `source_generation` fences the native transcript:
+/// appends keep it, while an in-place rewrite of already-delivered records (for example an
+/// OMP retry settling a failed turn's `retryRecovery`) moves it. Such a rewrite changes
+/// entries the follower already holds without a new sequence, so the follower must reload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConversationPosition {
     store_index: u64,
     local_position: u64,
     native_sequence: u64,
-) -> String {
+    source_generation: u64,
+}
+
+fn conversation_cursor(state: &AppState, session_id: &str, position: ConversationPosition) -> String {
     format!(
-        "conversation-cursor/{}/{}/{}.{}.{}",
+        "conversation-cursor/{}/{}/{}.{}.{}.{}",
         state.node,
         session_id.trim_start_matches("session/"),
-        store_index,
-        local_position,
-        native_sequence
+        position.store_index,
+        position.local_position,
+        position.native_sequence,
+        position.source_generation
     )
 }
 
@@ -6222,7 +6394,7 @@ fn conversation_position(
     state: &AppState,
     session_id: &str,
     after: &str,
-) -> Result<(u64, u64, u64), ApiError> {
+) -> Result<ConversationPosition, ApiError> {
     let prefix = format!(
         "conversation-cursor/{}/{}/",
         state.node,
@@ -6232,11 +6404,12 @@ fn conversation_position(
         .strip_prefix(&prefix)
         .and_then(|part| {
             let mut parts = part.split('.');
-            let result = (
-                parts.next()?.parse().ok()?,
-                parts.next()?.parse().ok()?,
-                parts.next()?.parse().ok()?,
-            );
+            let result = ConversationPosition {
+                store_index: parts.next()?.parse().ok()?,
+                local_position: parts.next()?.parse().ok()?,
+                native_sequence: parts.next()?.parse().ok()?,
+                source_generation: parts.next()?.parse().ok()?,
+            };
             parts.next().is_none().then_some(result)
         })
         .ok_or_else(|| ApiError {
@@ -6261,15 +6434,16 @@ fn conversation_read_now(
     })
 }
 
-fn conversation_read_now_unbounded(
+/// Read OPEN and change-replay pages through the same bounded fold, retaining the generation
+/// of the returned page without a second native read.
+fn conversation_first_page_at_generation(
     state: &AppState,
+    snapshot: &ClientSnapshot,
     session: &ClientSession,
     session_id: &str,
-    after: Option<&str>,
-) -> Result<Value, ApiError> {
-    let snapshot = new_client_snapshot(state);
+) -> Result<(Value, u64), ApiError> {
     let query = ClientListQuery { limit: Some(200), ..Default::default() };
-    let page = match conversation_blocks::source(state, session_id) {
+    match conversation_blocks::source(state, session_id) {
         // Replay selects only its newest bounded projection, including for OpenCode.
         Ok(source) => {
             // Native replay bypasses timeline_first_page after the incremental-fold cutover.
@@ -6277,10 +6451,31 @@ fn conversation_read_now_unbounded(
             if let Ok(mut rebuilds) = timeline_rebuilds().lock() {
                 *rebuilds.entry(session_id.to_owned()).or_default() += 1;
             }
-            native_slice_page(state, &snapshot, session, session_id, &query, &source)
-        },
-        Err(_) => timeline_value(state, &snapshot, session, session_id, &query),
-    }?.0;
+            let (page, generation) = native_slice_page_at_generation(
+                state, snapshot, session, session_id, &query, &source,
+            )?;
+            // OpenCode's generation moves on every append, so it cannot fence rewrites
+            // without turning each append into a full reload.
+            let fence = if source.driver == crate::external_sessions::ExternalDriver::OpenCode {
+                0
+            } else {
+                generation
+            };
+            Ok((page.0, fence))
+        }
+        Err(_) => Ok((timeline_value(state, snapshot, session, session_id, &query)?.0, 0)),
+    }
+}
+
+fn conversation_read_now_unbounded(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    after: Option<&str>,
+) -> Result<Value, ApiError> {
+    let snapshot = new_client_snapshot(state);
+    let (page, source_generation) =
+        conversation_first_page_at_generation(state, &snapshot, session, session_id)?;
     let all = page["items"]
         .as_array()
         .ok_or_else(|| ApiError::internal("the timeline has no items"))?;
@@ -6298,10 +6493,10 @@ fn conversation_read_now_unbounded(
     let position = after
         .map(|cursor| conversation_position(state, session_id, cursor))
         .transpose()?;
-    if let Some((store_index, local_position, native_sequence)) = position {
-        if store_index > snapshot.store_index
-            || local_position > local_latest
-            || native_sequence > native_latest
+    if let Some(position) = position {
+        if position.store_index > snapshot.store_index
+            || position.local_position > local_latest
+            || position.native_sequence > native_latest
         {
             return Err(ApiError {
                 status: StatusCode::GONE,
@@ -6313,12 +6508,25 @@ fn conversation_read_now_unbounded(
                 )])),
             });
         }
+        if position.source_generation != source_generation {
+            // Already-delivered entries changed in place under unchanged sequences, which a
+            // sequence-filtered delta cannot carry: send the authoritative newest page.
+            return Err(ApiError {
+                status: StatusCode::GONE,
+                code: "cursor-gap".into(),
+                message: "the transcript was rewritten in place; refresh the newest conversation page".into(),
+                details: Box::new(serde_json::Map::from_iter([(
+                    "full_resync".into(),
+                    Value::Bool(true),
+                )])),
+            });
+        }
     }
     let mut changed_indexes = BTreeSet::new();
     let mut explicit_ids = BTreeSet::new();
     let mut message_indexes = BTreeSet::new();
     let mut retention_changed = false;
-    if let Some((store_index, local_position, _)) = position {
+    if let Some(ConversationPosition { store_index, local_position, .. }) = position {
         let owner = super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
             .map(|managed| managed.0);
@@ -6388,7 +6596,7 @@ fn conversation_read_now_unbounded(
     let mut items = all
         .iter()
         .filter(|item| {
-            let Some((_, _, native_sequence)) = position else {
+            let Some(ConversationPosition { native_sequence, .. }) = position else {
                 return false;
             };
             let id = item["id"].as_str().unwrap_or_default();
@@ -6433,7 +6641,7 @@ fn conversation_read_now_unbounded(
         .iter()
         .any(|id| !items.iter().any(|item| item["id"].as_str() == Some(id)))
         || (all.len() == 200
-            && position.is_some_and(|(_, _, native)| {
+            && position.is_some_and(|ConversationPosition { native_sequence: native, .. }| {
                 native_oldest.is_some_and(|first| first > native)
             }))
     {
@@ -6447,9 +6655,17 @@ fn conversation_read_now_unbounded(
             )])),
         });
     }
-    Ok(
-        json!({"kind":"conversation-changes", "session_id":session_id, "items":items, "next_cursor":conversation_cursor(state, session_id, snapshot.store_index, local_latest, native_latest)}),
-    )
+    let next_cursor = conversation_cursor(state, session_id, ConversationPosition {
+        store_index: snapshot.store_index,
+        local_position: local_latest,
+        native_sequence: native_latest,
+        source_generation,
+    });
+    let mut value = json!({"kind":"conversation-changes", "session_id":session_id, "items":items, "next_cursor":next_cursor});
+    if let Some(header) = page.get("header") {
+        value["header"] = header.clone();
+    }
+    Ok(value)
 }
 
 /// What a conversation read last saw, so a wake-up can tell cheaply whether anything that
@@ -6549,7 +6765,12 @@ impl ConversationMark {
             (Some(owner), Some(incarnation)) => managed_transcript(state, owner, incarnation)?
                 .and_then(|managed| managed.transcript.ok()),
             _ => crate::external_sessions::find(state.native_session_home.as_deref(), session_id)
-                .map_err(ApiError::internal)?,
+                .map_err(ApiError::internal)?
+                .or(crate::subagent_sessions::resolve_child(
+                    state.native_session_home.as_deref(),
+                    session_id,
+                )
+                .map_err(ApiError::internal)?),
         }
         .map(|external| external.transcript);
         Ok(Self {
@@ -6640,7 +6861,7 @@ async fn conversation_changes_local_marked(
     let mut quiet = None;
     if let Some(cursor) = after
         && let Some(seen) = issued_transcript(cursor)
-        && let Ok((store_index, local_position, _)) =
+        && let Ok(ConversationPosition { store_index, local_position, .. }) =
             conversation_position(state, session_id, cursor)
     {
         let mut since = ConversationMark {
@@ -6685,14 +6906,12 @@ async fn conversation_changes_local_marked(
                 // Nothing concerned it: move the cursor past what was checked without a read.
                 let mut value = value;
                 if let Some(cursor) = value["next_cursor"].as_str() {
-                    let (_, _, native) = conversation_position(state, session_id, cursor)?;
-                    let next = conversation_cursor(
-                        state,
-                        session_id,
-                        mark.store_index,
-                        mark.local_position,
-                        native,
-                    );
+                    let checked = ConversationPosition {
+                        store_index: mark.store_index,
+                        local_position: mark.local_position,
+                        ..conversation_position(state, session_id, cursor)?
+                    };
+                    let next = conversation_cursor(state, session_id, checked);
                     remember_cursor(&next, mark.transcript_seen);
                     value["next_cursor"] = Value::String(next);
                 }
@@ -17258,11 +17477,14 @@ mission "example/zero-run" state="ready" {
             .any(|item| item["id"] == "timeline-entry/open-local-frontier");
         assert!(!contains_local(&page));
         let cursor = start["next_cursor"].as_str().unwrap();
-        let (graph, local, native) = conversation_position(&state, &session_id, cursor).unwrap();
+        let position = conversation_position(&state, &session_id, cursor).unwrap();
         let latest_local = local_latest_position(&state).unwrap();
-        assert!(latest_local > local);
+        assert!(latest_local > position.local_position);
         // Control: the former post-snapshot local high-water silently skips this exact row.
-        let skipped = conversation_cursor(&state, &session_id, graph, latest_local, native);
+        let skipped = conversation_cursor(&state, &session_id, ConversationPosition {
+            local_position: latest_local,
+            ..position
+        });
         remember_cursor(&skipped, issued_transcript(cursor).unwrap());
         let lost = conversation_changes_local(&state, &session, &session_id, Some(&skipped), 0).await.unwrap();
         assert!(!contains_local(&lost));
@@ -17359,7 +17581,12 @@ mission "example/zero-run" state="ready" {
         assert_eq!(rebuilds(), 2);
         // A cursor this member did not give out (another member's, or one from before a
         // restart) is read as before.
-        let unknown = conversation_cursor(&owner, &session_id, 0, 0, 0);
+        let unknown = conversation_cursor(&owner, &session_id, ConversationPosition {
+            store_index: 0,
+            local_position: 0,
+            native_sequence: 0,
+            source_generation: 0,
+        });
         conversation_changes_local(&owner, &session, &session_id, Some(&unknown), 0)
             .await
             .unwrap();
@@ -18173,6 +18400,96 @@ mission "example/zero-run" state="ready" {
     }
 
     #[test]
+    fn conversation_followers_reload_when_retry_recovery_rewrites_a_delivered_error() {
+        use std::io::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state_named(root.path(), "retry-recovery-follower");
+        state.native_session_home = Some(root.path().to_path_buf());
+        let path = root.path().join(".omp/agent/sessions/example/retry-follow.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let session_id = format!(
+            "session/external-{}",
+            &hex::encode(Sha256::digest(b"omp:retry-follow"))[..24]
+        );
+        let header = json!({"type":"session","id":"retry-follow","cwd":"/work/example","timestamp":"2026-10-06T12:00:00Z"});
+        let question = json!({"type":"message","id":"question","timestamp":"2026-10-06T12:00:01Z",
+            "message":{"role":"user","content":[{"type":"text","text":"synthetic question"}]}});
+        let failed = |retry: Option<Value>| {
+            let mut record = json!({"type":"message","id":"failed-turn","timestamp":"2026-10-06T12:00:02Z",
+                "message":{"role":"assistant","content":[{"type":"text","text":"synthetic partial answer"}],
+                    "provider":"synthetic-provider","model":"synthetic-model",
+                    "stopReason":"error","errorMessage":"synthetic socket closed"}});
+            if let Some(retry) = retry {
+                record["message"]["retryRecovery"] = retry;
+            }
+            record
+        };
+        let reply = json!({"type":"message","id":"retried-turn","timestamp":"2026-10-06T12:00:03Z",
+            "message":{"role":"assistant","content":[{"type":"text","text":"synthetic retried answer"}],"stopReason":"stop"}});
+        std::fs::write(&path, format!("{header}\n{question}\n{}\n", failed(None))).unwrap();
+        let mut session = ClientSession::local(Some("person/alex")).unwrap();
+        session.conversation_blocks = true;
+        let error_view = |value: &Value| {
+            value["items"].as_array().unwrap().iter().find_map(|item| {
+                item["body"]["blocks"].as_array()?.iter()
+                    .find(|block| block["view"]["type"] == "assistant_error")
+                    .map(|block| (item["sequence"].as_u64().unwrap(), block["view"].clone()))
+            })
+        };
+        let newest_page = || timeline_value(
+            &state, &new_client_snapshot(&state), &session, &session_id,
+            &ClientListQuery { limit: Some(200), ..Default::default() },
+        ).unwrap().0;
+        // Local OPEN captures the initial page and its generation-fenced cursor together.
+        let (opened, page) = conversation_open_local(&state, &session, &session_id).unwrap();
+        let (failed_sequence, view) = error_view(&page).expect("the failed turn renders an error");
+        assert_eq!(view["status"], "failed");
+        assert_eq!(view["presentation"], "full");
+        assert_ne!(
+            conversation_position(&state, &session_id, opened["next_cursor"].as_str().unwrap())
+                .unwrap().source_generation,
+            0,
+            "OPEN must fence the exact native page it delivered",
+        );
+        // The retry's answer is a pure append: it stays an incremental delta.
+        writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(), "{reply}").unwrap();
+        let appended = conversation_read_now(
+            &state, &session, &session_id, opened["next_cursor"].as_str(),
+        ).unwrap();
+        assert!(appended["items"].as_array().unwrap().iter()
+            .any(|item| item.to_string().contains("synthetic retried answer")), "{appended}");
+        assert!(error_view(&appended).is_none(), "an append does not resend the failed turn");
+        // Settling the retry rewrites the already-delivered failed record in place; its
+        // sequence does not move, so a sequence-filtered delta could never carry it.
+        let mut cursor = appended["next_cursor"].as_str().unwrap().to_owned();
+        for (status, presentation) in [("recovered", "compact-recovered"), ("superseded", "none")] {
+            let retry = json!({"kind":"auto-retry","status":status,"attempt":1,
+                "recovery":"plain","note":"error; retried"});
+            std::fs::write(
+                &path,
+                format!("{header}\n{question}\n{}\n{reply}\n", failed(Some(retry))),
+            ).unwrap();
+            let gap = conversation_read_now(&state, &session, &session_id, Some(&cursor))
+                .unwrap_err();
+            assert_eq!(gap.status, StatusCode::GONE);
+            assert_eq!(gap.code, "cursor-gap");
+            assert_eq!(gap.details["full_resync"], true);
+            // The follower's reload carries the updated presentation under the same sequence.
+            let reloaded = newest_page();
+            let (sequence, view) = error_view(&reloaded).expect("the settled turn keeps its error block");
+            assert_eq!(sequence, failed_sequence);
+            assert_eq!(view["status"], status);
+            assert_eq!(view["presentation"], presentation);
+            assert_eq!(view["message"], "synthetic socket closed");
+            let (reopened, _) = conversation_open_local(&state, &session, &session_id).unwrap();
+            cursor = reopened["next_cursor"].as_str().unwrap().to_owned();
+        }
+        // With nothing rewritten since the reload, the follower resumes incrementally.
+        let quiet = conversation_read_now(&state, &session, &session_id, Some(&cursor)).unwrap();
+        assert!(quiet["items"].as_array().unwrap().is_empty(), "{quiet}");
+    }
+
+    #[test]
     fn native_keyset_pages_exclude_newer_appends_between_pages() {
         use std::io::Write as _;
         let root = tempfile::tempdir().unwrap();
@@ -18438,6 +18755,38 @@ mission "example/zero-run" state="ready" {
                         .starts_with("transcript not bound: the transcript could not be read"),
                     "{notice:#}"
                 );
+                let (start, opened) =
+                    conversation_open_local(&state, &session, &session_id).unwrap();
+                let items = opened["items"].as_array().unwrap();
+                assert!(items.iter().any(|item|
+                    item["type"] == "message"
+                        && item["body"]["message_id"] == "message/managed-native"),
+                    "OPEN keeps the stored timeline: {opened:#}");
+                let opened_notice = items.iter()
+                    .find(|item| item["body"]["code"] == "transcript-not-bound")
+                    .expect("OPEN explains the unreadable managed transcript");
+                assert_eq!(opened_notice["body"], notice["body"]);
+                assert_eq!(
+                    conversation_position(&state, &session_id, start["next_cursor"].as_str().unwrap())
+                        .unwrap().source_generation,
+                    0,
+                    "a stored fallback must not claim a native generation",
+                );
+                let native_error = conversation_read_now(&state, &session, &session_id, None)
+                    .expect_err("change reads keep surfacing the native-read failure");
+                // Even if the file becomes readable after the failed native read, OPEN's
+                // fallback path must not retry it and deliver a native page with generation zero.
+                std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600)).unwrap();
+                let fallback = timeline_first_page(
+                    &state, &new_client_snapshot(&state), &session, session_id.clone(),
+                    &ClientListQuery { limit: Some(200), ..Default::default() },
+                    Some(native_error),
+                ).unwrap().0;
+                assert!(!fallback["items"].as_array().unwrap().iter()
+                    .any(|item| item["body"]["text"] == "Exact managed transcript"
+                        || item["body"]["text"] == "Native reply"));
+                assert!(fallback["items"].as_array().unwrap().iter()
+                    .any(|item| item["body"]["code"] == "transcript-not-bound"));
             }
             std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
