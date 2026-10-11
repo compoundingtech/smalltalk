@@ -12,3 +12,7 @@ clients/swift/St3Client/Sources/St3Client/Client.swift linguist-generated=true
 # side and re-emit (clients/typescript/st3-scenarios/spec.md).
 fixtures/scenarios/** linguist-generated=true
 fixtures/scenarios/huge/** -diff
+# Written by apps/fractal-web/src/terminal/generateGhosttyEncoder.mjs; after a merge conflict, take
+# either side and regenerate. The wasm hash is pinned in the provenance json.
+apps/fractal-web/src/terminal/ghosttyKeyCodes.generated.ts linguist-generated=true
+apps/fractal-web/src/terminal/assets/ghostty-key-encoder.generated.* linguist-generated=true

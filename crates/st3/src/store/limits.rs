@@ -18,7 +18,7 @@ use serde::Deserialize;
 /// The actor st records for what its limits policy does.
 pub const LIMITS_ACTOR: &str = "daemon/limits";
 
-const ACCOUNT_READING_WINDOW_MS: u64 = 3_600_000;
+pub(crate) const ACCOUNT_READING_WINDOW_MS: u64 = 3_600_000;
 
 fn select_account_reading(readings: Vec<AccountLimit>) -> AccountLimit {
     // A partial snapshot after a relaunch can know only the five-hour window. It is not a
@@ -158,7 +158,7 @@ pub struct LimitsOutcome {
     pub notified: Vec<String>,
 }
 
-fn reading(origin: &str, body: &Value) -> Option<(AccountLimit, String)> {
+pub(crate) fn reading(origin: &str, body: &Value) -> Option<(AccountLimit, String)> {
     let fields = body.get("fields")?;
     let driver = fields["driver"].as_str()?.to_owned();
     let identity = fields["account"]
@@ -407,6 +407,16 @@ pub(crate) fn flush_limits_page(transaction: &Transaction<'_>, limit: usize) -> 
         }
     }
     Ok(claims.len())
+}
+
+/// Empty the projection and fold every `harness.limits` claim into it again, in one
+/// transaction: what a checkpoint proof's copy reads, as a node that never trimmed would.
+pub(crate) fn refold_limits_tx(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute("DELETE FROM account_limit_readings", [])?;
+    transaction.execute("DELETE FROM account_limit_seats", [])?;
+    transaction.execute("DELETE FROM meta WHERE key=?1", [LIMITS_CURSOR])?;
+    while flush_limits_page(transaction, LIMITS_CATCH_UP_PAGE)? == LIMITS_CATCH_UP_PAGE {}
+    Ok(())
 }
 
 pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLimit>> {

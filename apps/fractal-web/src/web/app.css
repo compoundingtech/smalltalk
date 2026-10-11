@@ -1,0 +1,12 @@
+@import '@smalltalk/fractal-ui/tokens.css';
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* Reserve the HUD's own strip without subscribing the workbench to its preference. */
+body:has([data-testid='wf-devbar']:not([hidden])) {
+  --wf-devbar-space: 24px;
+}

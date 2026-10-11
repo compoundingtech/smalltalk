@@ -288,6 +288,9 @@ public actor St3Client {
     public func workRelease(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) async throws -> Envelope<ActionResult> { try await submit(try .workRelease(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func workRenew(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) async throws -> Envelope<ActionResult> { try await submit(try .workRenew(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func workRetry(id: String, idempotencyKey: String, fence: Fence, parameters: WorkRetryParameters) async throws -> Envelope<ActionResult> { try await submit(try .workRetry(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
+    /// Diagnostic local acceptance: no graph receipt or snapshot fence.
+    public func observationsReport(_ report: ObservationReport) async throws -> ObservationResponse { try await post("v1/client/observations", report) }
+
     public func beginPairing(deviceName: String, personID: String) async throws -> Envelope<PairingChallenge> { try await post("v1/client/pairings", PairingBegin(apiVersion: st3ClientAPIVersion, deviceName: deviceName, personID: personID)) }
     public func completePairing(pairingID: String, code: String, devicePublicKey: String) async throws -> Envelope<PairedSession> { try await post("v1/client/pairings/\(pairingID.replacingOccurrences(of: "pairing/", with: ""))/complete", PairingComplete(apiVersion: st3ClientAPIVersion, code: code, devicePublicKey: devicePublicKey)) }
     public func terminalScreen(_ id: String) async throws -> Envelope<TerminalScreen> { try await get("v1/client/terminals/\(id.replacingOccurrences(of: "terminal/", with: ""))/screen") }

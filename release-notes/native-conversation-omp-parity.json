@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Native conversations show everything OMP shows: typed views for every OMP tool family and extension record, an irc kind, a conversation header with provenance, and subagent cards that open the child transcript as its own conversation in stui and on the phone.",
+  "replay": {
+    "status": "none",
+    "detail": "Views and headers are derived on read from the transcript; no claim replay or projection rebuild is added."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, triggers or migrations change. Conversation content stays volatile and is never stored."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules, digests or fleet coordination requirements change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Additive client-v0 fields: optional block view (open view.type), optional entry header, the irc block kind, and session/external-child-... session ids. Clients without conversation-blocks.v1 receive neither blocks nor header and decode as before. Developer-role OMP messages become system text instead of unknown, and entries whose blocks are all internal are hidden by default."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration or recovery wait is added."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual action or configuration change is required. Older stui and phone builds keep working and ignore the new fields."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Swapping back to the previous binary is supported; no stored state changes."
+  }
+}

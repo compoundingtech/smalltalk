@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "fractal-web displays the selected conversation with the UI kit transcript and sync line. The visible pane holds its conversation follow interest.",
+  "replay": {"status": "none", "detail": "No runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "No server protocol change. The pane is read-only and shows unavailable, waiting, stale, failed, empty, and older-history states."},
+  "downtime": {"status": "none", "detail": "No service interruption required."},
+  "manual": {"status": "none", "detail": "No installation action required. Route navigation follows the selected conversation and releases the previous interest."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

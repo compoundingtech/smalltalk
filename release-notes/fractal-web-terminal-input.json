@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web types into the shown live terminal through fenced gateway terminal.input actions when the device holds the terminal input grant: named control keys use key mode and other bytes use raw mode, one action is in flight at a time in order, a stale fence, refusal or unconfirmed delivery stops the session and drops queued keys without resending, closing a session while a write is unanswered reports that the last input may have arrived, and switching, restarting, hiding or losing the grant posts nothing further; pastes follow bracketed paste with embedded bracket markers removed, convert CRLF to CR, ask for confirmation above 4 KB and are refused above 64 KB, IME commits and inserted text with a line break, a control character or more than 128 bytes take the same paste path, and dropped text is refused",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only change; no runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Client-only change against the existing gateway terminal.input action and terminal input capability."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; the app is not deployed by this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

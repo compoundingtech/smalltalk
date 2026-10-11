@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "summary": "Conversation cursors now contain four numbers instead of three. Existing cursors take one cursor-gap resync on upgrade; the refreshed conversation then follows normally. Native assistant cost is counted once per message and loaded stui content stays on its individual Simple-density tool row.",
+  "commits": [
+    "0548835cae27d174f51e743ae4ffe434e9f2aaa1",
+    "2c455bc13843118d3bac2e6fff8f6d3221018732",
+    "6ae4c586ee6d62162042b334b5ccec0d651a50af",
+    "f0b90c69cde0a75a7c0fd4259c1b588e9d348178"
+  ],
+  "replay": {
+    "status": "none",
+    "detail": "The cursor resync refreshes the conversation view, not the claim log. No claim replay or projection rebuild is added. Content loading and usage metadata remain memory-only read projections."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database tables, indexes, migrations or client schema fields change. The cursor remains an opaque string in the existing contract."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint, retention or fleet coordination rules change."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "The numeric conversation-cursor suffix changes from store_index.local_position.native_sequence to store_index.local_position.native_sequence.source_generation. Three-number cursors receive cursor-gap with full_resync=true on upgrade. Clients reload the newest authorized conversation page once and continue using its four-number cursor. The added source generation fences in-place transcript rewrites. Assistant message metadata uses one existing block metadata field, including for tool-call-only messages; no schema fields are added, removed or renamed."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No coordinated outage or migration wait is added; an existing conversation follower performs one cursor-gap refresh after upgrade."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No configuration or manual data migration is required. Clients use the existing cursor-gap resync path and must treat conversation cursors as opaque strings."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No durable state changes. Swapping binaries requires only the existing conversation resync path when a retained cursor is incompatible; fetched JSON, images and usage projections stay in memory."
+  }
+}

@@ -44,6 +44,15 @@ run no commands.
 notice on stderr naming `st apply` as its replacement. Both accept `--dry-run` and `--preview`.
 The agent command keeps its previous behavior of publishing without gate checks.
 
+Migrate mission callers to `st apply FILE` with the same publication options. Migrate seat
+callers to `st apply FILE --no-gate-check` to preserve the implicit gate-check bypass,
+including previews. Keep global options and the explicit `--as ACTOR`. Unified seat
+publication adds `published_missions` (normally an empty array) to the existing JSON receipt;
+mission receipts and preview JSON keep their shape. The legacy stderr notice disappears,
+while successful commands still exit zero and publication failures still exit nonzero.
+The aliases stay available during caller rollout and are removed only after installed
+consumers have independently been observed using the unified command.
+
 ## Definitions do not start work
 
 This publication creates or updates one immutable mission revision. It does not start a run.

@@ -18,10 +18,10 @@ version 2
 //
 // The run workspace is a clone of the invented project.
 //
-//   st agents apply examples/st3/seats/omp.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/omp.kdl --as person/operator
 //   st missions check examples/st3/land-and-verify.kdl --workspace /srv/example/app \
 //     --input pull_request=example/app#42
-//   st missions publish examples/st3/land-and-verify.kdl --workspace /srv/example/app \
+//   st apply examples/st3/land-and-verify.kdl --workspace /srv/example/app \
 //     --as person/operator
 //   st missions start example/app/land-and-verify --id example/app/land-and-verify/42 \
 //     --input pull_request=example/app#42 --workspace /srv/example/app --as person/operator

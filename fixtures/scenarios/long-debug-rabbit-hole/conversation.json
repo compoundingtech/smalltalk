@@ -1,0 +1,3183 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "conversation",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 22
+  },
+  "state": {
+    "threads": [
+      {
+        "agent": "agent/example/atlas/builder",
+        "has_more": true,
+        "items": [
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-1",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-1",
+            "revision": 1,
+            "role": "user",
+            "sequence": 1,
+            "timestamp": "2030-01-01T11:20:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Investigate wrong hypothesis 1: network retry latency. Keep the failing shuffle seeds."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-2",
+            "revision": 1,
+            "role": "user",
+            "sequence": 2,
+            "timestamp": "2030-01-01T11:20:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Wrong hypothesis 1: network retry latency"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-3",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 3,
+            "timestamp": "2030-01-01T11:20:02.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=1 --repeat=12"
+              },
+              "call_id": "call-builder-4",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-4",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 4,
+            "timestamp": "2030-01-01T11:20:04.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-4",
+              "content": "seed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-5",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 5,
+            "timestamp": "2030-01-01T11:20:05.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "2 of 12 orders still fail. All responses come from the in-memory transport; failing seeds make zero network requests. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-6",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 6,
+            "timestamp": "2030-01-01T11:20:06.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-7",
+            "revision": 1,
+            "role": "system",
+            "sequence": 7,
+            "timestamp": "2030-01-01T11:20:08.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-8",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-8",
+            "revision": 1,
+            "role": "user",
+            "sequence": 8,
+            "timestamp": "2030-01-01T11:21:40.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for network; compare it with batch 1."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-9",
+            "revision": 1,
+            "role": "user",
+            "sequence": 9,
+            "timestamp": "2030-01-01T11:21:40.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 2/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-10",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 10,
+            "timestamp": "2030-01-01T11:21:42.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=13 --repeat=12"
+              },
+              "call_id": "call-builder-11",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-11",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 11,
+            "timestamp": "2030-01-01T11:21:44.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-11",
+              "content": "seed 013: PASS search before cancellation: 12 assertions\nseed 014: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 015: PASS search before cancellation: 12 assertions\nseed 016: PASS search before cancellation: 12 assertions\nseed 017: PASS search before cancellation: 12 assertions\nseed 018: PASS search before cancellation: 12 assertions\nseed 019: PASS search before cancellation: 12 assertions\nseed 020: PASS search before cancellation: 12 assertions\nseed 021: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 022: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 023: PASS search before cancellation: 12 assertions\nseed 024: PASS search before cancellation: 12 assertions\nbatch 2: 9 passed, 3 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-12",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 12,
+            "timestamp": "2030-01-01T11:21:45.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. All responses come from the in-memory transport; failing seeds make zero network requests. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-13",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 13,
+            "timestamp": "2030-01-01T11:21:46.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-14",
+            "revision": 1,
+            "role": "system",
+            "sequence": 14,
+            "timestamp": "2030-01-01T11:21:48.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-15",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-15",
+            "revision": 1,
+            "role": "user",
+            "sequence": 15,
+            "timestamp": "2030-01-01T11:23:20.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for network; compare it with batch 2."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-16",
+            "revision": 1,
+            "role": "user",
+            "sequence": 16,
+            "timestamp": "2030-01-01T11:23:20.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 3/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-17",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 17,
+            "timestamp": "2030-01-01T11:23:22.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=25 --repeat=12"
+              },
+              "call_id": "call-builder-18",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-18",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 18,
+            "timestamp": "2030-01-01T11:23:24.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-18",
+              "content": "seed 025: PASS search before cancellation: 12 assertions\nseed 026: PASS search before cancellation: 12 assertions\nseed 027: PASS search before cancellation: 12 assertions\nseed 028: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 029: PASS search before cancellation: 12 assertions\nseed 030: PASS search before cancellation: 12 assertions\nseed 031: PASS search before cancellation: 12 assertions\nseed 032: PASS search before cancellation: 12 assertions\nseed 033: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 034: PASS search before cancellation: 12 assertions\nseed 035: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 036: PASS search before cancellation: 12 assertions\nbatch 3: 9 passed, 3 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-19",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 19,
+            "timestamp": "2030-01-01T11:23:25.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. All responses come from the in-memory transport; failing seeds make zero network requests. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-20",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 20,
+            "timestamp": "2030-01-01T11:23:26.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-21",
+            "revision": 1,
+            "role": "system",
+            "sequence": 21,
+            "timestamp": "2030-01-01T11:23:28.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-22",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-22",
+            "revision": 1,
+            "role": "user",
+            "sequence": 22,
+            "timestamp": "2030-01-01T11:25:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for network; compare it with batch 3."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-23",
+            "revision": 1,
+            "role": "user",
+            "sequence": 23,
+            "timestamp": "2030-01-01T11:25:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 4/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-24",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 24,
+            "timestamp": "2030-01-01T11:25:02.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=37 --repeat=12"
+              },
+              "call_id": "call-builder-25",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-25",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 25,
+            "timestamp": "2030-01-01T11:25:04.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-25",
+              "content": "seed 037: PASS search before cancellation: 12 assertions\nseed 038: PASS search before cancellation: 12 assertions\nseed 039: PASS search before cancellation: 12 assertions\nseed 040: PASS search before cancellation: 12 assertions\nseed 041: PASS search before cancellation: 12 assertions\nseed 042: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 043: PASS search before cancellation: 12 assertions\nseed 044: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 045: PASS search before cancellation: 12 assertions\nseed 046: PASS search before cancellation: 12 assertions\nseed 047: PASS search before cancellation: 12 assertions\nseed 048: PASS search before cancellation: 12 assertions\nbatch 4: 10 passed, 2 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-26",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 26,
+            "timestamp": "2030-01-01T11:25:05.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "2 of 12 orders still fail. All responses come from the in-memory transport; failing seeds make zero network requests. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-27",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 27,
+            "timestamp": "2030-01-01T11:25:06.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-28",
+            "revision": 1,
+            "role": "system",
+            "sequence": 28,
+            "timestamp": "2030-01-01T11:25:08.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-29",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-29",
+            "revision": 1,
+            "role": "user",
+            "sequence": 29,
+            "timestamp": "2030-01-01T11:26:40.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for network; compare it with batch 4."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-30",
+            "revision": 1,
+            "role": "user",
+            "sequence": 30,
+            "timestamp": "2030-01-01T11:26:40.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 5/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-31",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 31,
+            "timestamp": "2030-01-01T11:26:42.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=49 --repeat=12"
+              },
+              "call_id": "call-builder-32",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-32",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 32,
+            "timestamp": "2030-01-01T11:26:44.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-32",
+              "content": "seed 049: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 050: PASS search before cancellation: 12 assertions\nseed 051: PASS search before cancellation: 12 assertions\nseed 052: PASS search before cancellation: 12 assertions\nseed 053: PASS search before cancellation: 12 assertions\nseed 054: PASS search before cancellation: 12 assertions\nseed 055: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 056: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 057: PASS search before cancellation: 12 assertions\nseed 058: PASS search before cancellation: 12 assertions\nseed 059: PASS search before cancellation: 12 assertions\nseed 060: PASS search before cancellation: 12 assertions\nbatch 5: 9 passed, 3 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-33",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 33,
+            "timestamp": "2030-01-01T11:26:45.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. All responses come from the in-memory transport; failing seeds make zero network requests. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-34",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 34,
+            "timestamp": "2030-01-01T11:26:46.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-35",
+            "revision": 1,
+            "role": "system",
+            "sequence": 35,
+            "timestamp": "2030-01-01T11:26:48.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-36",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-36",
+            "revision": 1,
+            "role": "user",
+            "sequence": 36,
+            "timestamp": "2030-01-01T11:28:20.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for network; compare it with batch 5."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-37",
+            "revision": 1,
+            "role": "user",
+            "sequence": 37,
+            "timestamp": "2030-01-01T11:28:20.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 6/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-38",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 38,
+            "timestamp": "2030-01-01T11:28:22.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=61 --repeat=12"
+              },
+              "call_id": "call-builder-39",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-39",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 39,
+            "timestamp": "2030-01-01T11:28:24.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-39",
+              "content": "seed 061: PASS search before cancellation: 12 assertions\nseed 062: PASS search before cancellation: 12 assertions\nseed 063: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 064: PASS search before cancellation: 12 assertions\nseed 065: PASS search before cancellation: 12 assertions\nseed 066: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 067: PASS search before cancellation: 12 assertions\nseed 068: PASS search before cancellation: 12 assertions\nseed 069: PASS search before cancellation: 12 assertions\nseed 070: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 071: PASS search before cancellation: 12 assertions\nseed 072: PASS search before cancellation: 12 assertions\nbatch 6: 9 passed, 3 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-40",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 40,
+            "timestamp": "2030-01-01T11:28:25.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. All responses come from the in-memory transport; failing seeds make zero network requests. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-41",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 41,
+            "timestamp": "2030-01-01T11:28:26.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-42",
+            "revision": 1,
+            "role": "system",
+            "sequence": 42,
+            "timestamp": "2030-01-01T11:28:28.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-43",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-43",
+            "revision": 1,
+            "role": "user",
+            "sequence": 43,
+            "timestamp": "2030-01-01T11:30:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for network; compare it with batch 6."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-44",
+            "revision": 1,
+            "role": "user",
+            "sequence": 44,
+            "timestamp": "2030-01-01T11:30:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 7/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-45",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 45,
+            "timestamp": "2030-01-01T11:30:02.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=73 --repeat=12"
+              },
+              "call_id": "call-builder-46",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-46",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 46,
+            "timestamp": "2030-01-01T11:30:04.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-46",
+              "content": "seed 073: PASS search before cancellation: 12 assertions\nseed 074: PASS search before cancellation: 12 assertions\nseed 075: PASS search before cancellation: 12 assertions\nseed 076: PASS search before cancellation: 12 assertions\nseed 077: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 078: PASS search before cancellation: 12 assertions\nseed 079: PASS search before cancellation: 12 assertions\nseed 080: PASS search before cancellation: 12 assertions\nseed 081: PASS search before cancellation: 12 assertions\nseed 082: PASS search before cancellation: 12 assertions\nseed 083: PASS search before cancellation: 12 assertions\nseed 084: FAIL search after cancellation: AbortError, signal.aborted=true\nbatch 7: 10 passed, 2 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-47",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 47,
+            "timestamp": "2030-01-01T11:30:05.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "2 of 12 orders still fail. All responses come from the in-memory transport; failing seeds make zero network requests. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-48",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 48,
+            "timestamp": "2030-01-01T11:30:06.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-49",
+            "revision": 1,
+            "role": "system",
+            "sequence": 49,
+            "timestamp": "2030-01-01T11:30:08.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-50",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-50",
+            "revision": 1,
+            "role": "user",
+            "sequence": 50,
+            "timestamp": "2030-01-01T11:31:40.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for network; compare it with batch 7."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-51",
+            "revision": 1,
+            "role": "user",
+            "sequence": 51,
+            "timestamp": "2030-01-01T11:31:40.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 8/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-52",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 52,
+            "timestamp": "2030-01-01T11:31:42.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=85 --repeat=12"
+              },
+              "call_id": "call-builder-53",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-53",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 53,
+            "timestamp": "2030-01-01T11:31:44.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-53",
+              "content": "seed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-54",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 54,
+            "timestamp": "2030-01-01T11:31:45.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Rejected hypothesis 1: the same AbortError occurs with a stubbed network. Increasing the retry timeout changes nothing."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-55",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 55,
+            "timestamp": "2030-01-01T11:31:46.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-56",
+            "revision": 1,
+            "role": "system",
+            "sequence": 56,
+            "timestamp": "2030-01-01T11:31:48.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-57",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-57",
+            "revision": 1,
+            "role": "user",
+            "sequence": 57,
+            "timestamp": "2030-01-01T11:33:20.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Investigate wrong hypothesis 2: fake timers leave a pending microtask. Keep the failing shuffle seeds."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-58",
+            "revision": 1,
+            "role": "user",
+            "sequence": 58,
+            "timestamp": "2030-01-01T11:33:20.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Wrong hypothesis 2: fake timers leave a pending microtask"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-59",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 59,
+            "timestamp": "2030-01-01T11:33:22.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=1 --repeat=12"
+              },
+              "call_id": "call-builder-60",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-60",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 60,
+            "timestamp": "2030-01-01T11:33:24.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-60",
+              "content": "seed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-61",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 61,
+            "timestamp": "2030-01-01T11:33:25.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "2 of 12 orders still fail. The test still fails with real timers and a drained microtask queue; no timer remains pending. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-62",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 62,
+            "timestamp": "2030-01-01T11:33:26.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-63",
+            "revision": 1,
+            "role": "system",
+            "sequence": 63,
+            "timestamp": "2030-01-01T11:33:28.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-64",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-64",
+            "revision": 1,
+            "role": "user",
+            "sequence": 64,
+            "timestamp": "2030-01-01T11:35:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for timers; compare it with batch 1."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-65",
+            "revision": 1,
+            "role": "user",
+            "sequence": 65,
+            "timestamp": "2030-01-01T11:35:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 2/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-66",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 66,
+            "timestamp": "2030-01-01T11:35:02.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=13 --repeat=12"
+              },
+              "call_id": "call-builder-67",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-67",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 67,
+            "timestamp": "2030-01-01T11:35:04.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-67",
+              "content": "seed 013: PASS search before cancellation: 12 assertions\nseed 014: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 015: PASS search before cancellation: 12 assertions\nseed 016: PASS search before cancellation: 12 assertions\nseed 017: PASS search before cancellation: 12 assertions\nseed 018: PASS search before cancellation: 12 assertions\nseed 019: PASS search before cancellation: 12 assertions\nseed 020: PASS search before cancellation: 12 assertions\nseed 021: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 022: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 023: PASS search before cancellation: 12 assertions\nseed 024: PASS search before cancellation: 12 assertions\nbatch 2: 9 passed, 3 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-68",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 68,
+            "timestamp": "2030-01-01T11:35:05.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. The test still fails with real timers and a drained microtask queue; no timer remains pending. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-69",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 69,
+            "timestamp": "2030-01-01T11:35:06.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-70",
+            "revision": 1,
+            "role": "system",
+            "sequence": 70,
+            "timestamp": "2030-01-01T11:35:08.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-71",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-71",
+            "revision": 1,
+            "role": "user",
+            "sequence": 71,
+            "timestamp": "2030-01-01T11:36:40.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for timers; compare it with batch 2."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-72",
+            "revision": 1,
+            "role": "user",
+            "sequence": 72,
+            "timestamp": "2030-01-01T11:36:40.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 3/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-73",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 73,
+            "timestamp": "2030-01-01T11:36:42.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=25 --repeat=12"
+              },
+              "call_id": "call-builder-74",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-74",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 74,
+            "timestamp": "2030-01-01T11:36:44.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-74",
+              "content": "seed 025: PASS search before cancellation: 12 assertions\nseed 026: PASS search before cancellation: 12 assertions\nseed 027: PASS search before cancellation: 12 assertions\nseed 028: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 029: PASS search before cancellation: 12 assertions\nseed 030: PASS search before cancellation: 12 assertions\nseed 031: PASS search before cancellation: 12 assertions\nseed 032: PASS search before cancellation: 12 assertions\nseed 033: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 034: PASS search before cancellation: 12 assertions\nseed 035: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 036: PASS search before cancellation: 12 assertions\nbatch 3: 9 passed, 3 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-75",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 75,
+            "timestamp": "2030-01-01T11:36:45.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. The test still fails with real timers and a drained microtask queue; no timer remains pending. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-76",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 76,
+            "timestamp": "2030-01-01T11:36:46.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-77",
+            "revision": 1,
+            "role": "system",
+            "sequence": 77,
+            "timestamp": "2030-01-01T11:36:48.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-78",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-78",
+            "revision": 1,
+            "role": "user",
+            "sequence": 78,
+            "timestamp": "2030-01-01T11:38:20.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for timers; compare it with batch 3."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-79",
+            "revision": 1,
+            "role": "user",
+            "sequence": 79,
+            "timestamp": "2030-01-01T11:38:20.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 4/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-80",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 80,
+            "timestamp": "2030-01-01T11:38:22.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=37 --repeat=12"
+              },
+              "call_id": "call-builder-81",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-81",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 81,
+            "timestamp": "2030-01-01T11:38:24.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-81",
+              "content": "seed 037: PASS search before cancellation: 12 assertions\nseed 038: PASS search before cancellation: 12 assertions\nseed 039: PASS search before cancellation: 12 assertions\nseed 040: PASS search before cancellation: 12 assertions\nseed 041: PASS search before cancellation: 12 assertions\nseed 042: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 043: PASS search before cancellation: 12 assertions\nseed 044: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 045: PASS search before cancellation: 12 assertions\nseed 046: PASS search before cancellation: 12 assertions\nseed 047: PASS search before cancellation: 12 assertions\nseed 048: PASS search before cancellation: 12 assertions\nbatch 4: 10 passed, 2 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-82",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 82,
+            "timestamp": "2030-01-01T11:38:25.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "2 of 12 orders still fail. The test still fails with real timers and a drained microtask queue; no timer remains pending. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-83",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 83,
+            "timestamp": "2030-01-01T11:38:26.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-84",
+            "revision": 1,
+            "role": "system",
+            "sequence": 84,
+            "timestamp": "2030-01-01T11:38:28.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-85",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-85",
+            "revision": 1,
+            "role": "user",
+            "sequence": 85,
+            "timestamp": "2030-01-01T11:40:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for timers; compare it with batch 4."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-86",
+            "revision": 1,
+            "role": "user",
+            "sequence": 86,
+            "timestamp": "2030-01-01T11:40:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 5/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-87",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 87,
+            "timestamp": "2030-01-01T11:40:02.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=49 --repeat=12"
+              },
+              "call_id": "call-builder-88",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-88",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 88,
+            "timestamp": "2030-01-01T11:40:04.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-88",
+              "content": "seed 049: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 050: PASS search before cancellation: 12 assertions\nseed 051: PASS search before cancellation: 12 assertions\nseed 052: PASS search before cancellation: 12 assertions\nseed 053: PASS search before cancellation: 12 assertions\nseed 054: PASS search before cancellation: 12 assertions\nseed 055: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 056: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 057: PASS search before cancellation: 12 assertions\nseed 058: PASS search before cancellation: 12 assertions\nseed 059: PASS search before cancellation: 12 assertions\nseed 060: PASS search before cancellation: 12 assertions\nbatch 5: 9 passed, 3 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-89",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 89,
+            "timestamp": "2030-01-01T11:40:05.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. The test still fails with real timers and a drained microtask queue; no timer remains pending. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-90",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 90,
+            "timestamp": "2030-01-01T11:40:06.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-91",
+            "revision": 1,
+            "role": "system",
+            "sequence": 91,
+            "timestamp": "2030-01-01T11:40:08.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-92",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-92",
+            "revision": 1,
+            "role": "user",
+            "sequence": 92,
+            "timestamp": "2030-01-01T11:41:40.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for timers; compare it with batch 5."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-93",
+            "revision": 1,
+            "role": "user",
+            "sequence": 93,
+            "timestamp": "2030-01-01T11:41:40.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 6/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-94",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 94,
+            "timestamp": "2030-01-01T11:41:42.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=61 --repeat=12"
+              },
+              "call_id": "call-builder-95",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-95",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 95,
+            "timestamp": "2030-01-01T11:41:44.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-95",
+              "content": "seed 061: PASS search before cancellation: 12 assertions\nseed 062: PASS search before cancellation: 12 assertions\nseed 063: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 064: PASS search before cancellation: 12 assertions\nseed 065: PASS search before cancellation: 12 assertions\nseed 066: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 067: PASS search before cancellation: 12 assertions\nseed 068: PASS search before cancellation: 12 assertions\nseed 069: PASS search before cancellation: 12 assertions\nseed 070: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 071: PASS search before cancellation: 12 assertions\nseed 072: PASS search before cancellation: 12 assertions\nbatch 6: 9 passed, 3 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-96",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 96,
+            "timestamp": "2030-01-01T11:41:45.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. The test still fails with real timers and a drained microtask queue; no timer remains pending. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-97",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 97,
+            "timestamp": "2030-01-01T11:41:46.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-98",
+            "revision": 1,
+            "role": "system",
+            "sequence": 98,
+            "timestamp": "2030-01-01T11:41:48.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-99",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-99",
+            "revision": 1,
+            "role": "user",
+            "sequence": 99,
+            "timestamp": "2030-01-01T11:43:20.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for timers; compare it with batch 6."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-100",
+            "revision": 1,
+            "role": "user",
+            "sequence": 100,
+            "timestamp": "2030-01-01T11:43:20.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 7/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-101",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 101,
+            "timestamp": "2030-01-01T11:43:22.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=73 --repeat=12"
+              },
+              "call_id": "call-builder-102",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-102",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 102,
+            "timestamp": "2030-01-01T11:43:24.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-102",
+              "content": "seed 073: PASS search before cancellation: 12 assertions\nseed 074: PASS search before cancellation: 12 assertions\nseed 075: PASS search before cancellation: 12 assertions\nseed 076: PASS search before cancellation: 12 assertions\nseed 077: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 078: PASS search before cancellation: 12 assertions\nseed 079: PASS search before cancellation: 12 assertions\nseed 080: PASS search before cancellation: 12 assertions\nseed 081: PASS search before cancellation: 12 assertions\nseed 082: PASS search before cancellation: 12 assertions\nseed 083: PASS search before cancellation: 12 assertions\nseed 084: FAIL search after cancellation: AbortError, signal.aborted=true\nbatch 7: 10 passed, 2 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-103",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 103,
+            "timestamp": "2030-01-01T11:43:25.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "2 of 12 orders still fail. The test still fails with real timers and a drained microtask queue; no timer remains pending. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-104",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 104,
+            "timestamp": "2030-01-01T11:43:26.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-105",
+            "revision": 1,
+            "role": "system",
+            "sequence": 105,
+            "timestamp": "2030-01-01T11:43:28.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-106",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-106",
+            "revision": 1,
+            "role": "user",
+            "sequence": 106,
+            "timestamp": "2030-01-01T11:45:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for timers; compare it with batch 7."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-107",
+            "revision": 1,
+            "role": "user",
+            "sequence": 107,
+            "timestamp": "2030-01-01T11:45:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 8/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-108",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 108,
+            "timestamp": "2030-01-01T11:45:02.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=85 --repeat=12"
+              },
+              "call_id": "call-builder-109",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-109",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 109,
+            "timestamp": "2030-01-01T11:45:04.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-109",
+              "content": "seed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-110",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 110,
+            "timestamp": "2030-01-01T11:45:05.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Rejected hypothesis 2: real timers fail with the same seeds. The abort is already set before the search starts, not during a timer callback."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-111",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 111,
+            "timestamp": "2030-01-01T11:45:06.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-112",
+            "revision": 1,
+            "role": "system",
+            "sequence": 112,
+            "timestamp": "2030-01-01T11:45:08.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-113",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-113",
+            "revision": 1,
+            "role": "user",
+            "sequence": 113,
+            "timestamp": "2030-01-01T11:46:40.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Investigate wrong hypothesis 3: stale search cache. Keep the failing shuffle seeds."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-114",
+            "revision": 1,
+            "role": "user",
+            "sequence": 114,
+            "timestamp": "2030-01-01T11:46:40.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Wrong hypothesis 3: stale search cache"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-115",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 115,
+            "timestamp": "2030-01-01T11:46:42.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=1 --repeat=12"
+              },
+              "call_id": "call-builder-116",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-116",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 116,
+            "timestamp": "2030-01-01T11:46:44.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-116",
+              "content": "seed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nA new empty cache for every trial still fails when cancellation runs before search.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-117",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 117,
+            "timestamp": "2030-01-01T11:46:45.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "2 of 12 orders still fail. A new empty cache for every trial still fails when cancellation runs before search. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-118",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 118,
+            "timestamp": "2030-01-01T11:46:46.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-119",
+            "revision": 1,
+            "role": "system",
+            "sequence": 119,
+            "timestamp": "2030-01-01T11:46:48.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-120",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-120",
+            "revision": 1,
+            "role": "user",
+            "sequence": 120,
+            "timestamp": "2030-01-01T11:48:20.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for cache; compare it with batch 1."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-121",
+            "revision": 1,
+            "role": "user",
+            "sequence": 121,
+            "timestamp": "2030-01-01T11:48:20.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 2/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-122",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 122,
+            "timestamp": "2030-01-01T11:48:22.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=13 --repeat=12"
+              },
+              "call_id": "call-builder-123",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-123",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 123,
+            "timestamp": "2030-01-01T11:48:24.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-123",
+              "content": "seed 013: PASS search before cancellation: 12 assertions\nseed 014: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 015: PASS search before cancellation: 12 assertions\nseed 016: PASS search before cancellation: 12 assertions\nseed 017: PASS search before cancellation: 12 assertions\nseed 018: PASS search before cancellation: 12 assertions\nseed 019: PASS search before cancellation: 12 assertions\nseed 020: PASS search before cancellation: 12 assertions\nseed 021: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 022: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 023: PASS search before cancellation: 12 assertions\nseed 024: PASS search before cancellation: 12 assertions\nbatch 2: 9 passed, 3 failed\nA new empty cache for every trial still fails when cancellation runs before search.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-124",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 124,
+            "timestamp": "2030-01-01T11:48:25.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. A new empty cache for every trial still fails when cancellation runs before search. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-125",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 125,
+            "timestamp": "2030-01-01T11:48:26.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-126",
+            "revision": 1,
+            "role": "system",
+            "sequence": 126,
+            "timestamp": "2030-01-01T11:48:28.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-127",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-127",
+            "revision": 1,
+            "role": "user",
+            "sequence": 127,
+            "timestamp": "2030-01-01T11:50:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for cache; compare it with batch 2."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-128",
+            "revision": 1,
+            "role": "user",
+            "sequence": 128,
+            "timestamp": "2030-01-01T11:50:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 3/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-129",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 129,
+            "timestamp": "2030-01-01T11:50:02.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=25 --repeat=12"
+              },
+              "call_id": "call-builder-130",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-130",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 130,
+            "timestamp": "2030-01-01T11:50:04.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-130",
+              "content": "seed 025: PASS search before cancellation: 12 assertions\nseed 026: PASS search before cancellation: 12 assertions\nseed 027: PASS search before cancellation: 12 assertions\nseed 028: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 029: PASS search before cancellation: 12 assertions\nseed 030: PASS search before cancellation: 12 assertions\nseed 031: PASS search before cancellation: 12 assertions\nseed 032: PASS search before cancellation: 12 assertions\nseed 033: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 034: PASS search before cancellation: 12 assertions\nseed 035: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 036: PASS search before cancellation: 12 assertions\nbatch 3: 9 passed, 3 failed\nA new empty cache for every trial still fails when cancellation runs before search.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-131",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 131,
+            "timestamp": "2030-01-01T11:50:05.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. A new empty cache for every trial still fails when cancellation runs before search. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-132",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 132,
+            "timestamp": "2030-01-01T11:50:06.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-133",
+            "revision": 1,
+            "role": "system",
+            "sequence": 133,
+            "timestamp": "2030-01-01T11:50:08.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-134",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-134",
+            "revision": 1,
+            "role": "user",
+            "sequence": 134,
+            "timestamp": "2030-01-01T11:51:40.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for cache; compare it with batch 3."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-135",
+            "revision": 1,
+            "role": "user",
+            "sequence": 135,
+            "timestamp": "2030-01-01T11:51:40.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 4/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-136",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 136,
+            "timestamp": "2030-01-01T11:51:42.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=37 --repeat=12"
+              },
+              "call_id": "call-builder-137",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-137",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 137,
+            "timestamp": "2030-01-01T11:51:44.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-137",
+              "content": "seed 037: PASS search before cancellation: 12 assertions\nseed 038: PASS search before cancellation: 12 assertions\nseed 039: PASS search before cancellation: 12 assertions\nseed 040: PASS search before cancellation: 12 assertions\nseed 041: PASS search before cancellation: 12 assertions\nseed 042: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 043: PASS search before cancellation: 12 assertions\nseed 044: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 045: PASS search before cancellation: 12 assertions\nseed 046: PASS search before cancellation: 12 assertions\nseed 047: PASS search before cancellation: 12 assertions\nseed 048: PASS search before cancellation: 12 assertions\nbatch 4: 10 passed, 2 failed\nA new empty cache for every trial still fails when cancellation runs before search.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-138",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 138,
+            "timestamp": "2030-01-01T11:51:45.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "2 of 12 orders still fail. A new empty cache for every trial still fails when cancellation runs before search. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-139",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 139,
+            "timestamp": "2030-01-01T11:51:46.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-140",
+            "revision": 1,
+            "role": "system",
+            "sequence": 140,
+            "timestamp": "2030-01-01T11:51:48.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-141",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-141",
+            "revision": 1,
+            "role": "user",
+            "sequence": 141,
+            "timestamp": "2030-01-01T11:53:20.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for cache; compare it with batch 4."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-142",
+            "revision": 1,
+            "role": "user",
+            "sequence": 142,
+            "timestamp": "2030-01-01T11:53:20.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 5/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-143",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 143,
+            "timestamp": "2030-01-01T11:53:22.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=49 --repeat=12"
+              },
+              "call_id": "call-builder-144",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-144",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 144,
+            "timestamp": "2030-01-01T11:53:24.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-144",
+              "content": "seed 049: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 050: PASS search before cancellation: 12 assertions\nseed 051: PASS search before cancellation: 12 assertions\nseed 052: PASS search before cancellation: 12 assertions\nseed 053: PASS search before cancellation: 12 assertions\nseed 054: PASS search before cancellation: 12 assertions\nseed 055: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 056: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 057: PASS search before cancellation: 12 assertions\nseed 058: PASS search before cancellation: 12 assertions\nseed 059: PASS search before cancellation: 12 assertions\nseed 060: PASS search before cancellation: 12 assertions\nbatch 5: 9 passed, 3 failed\nA new empty cache for every trial still fails when cancellation runs before search.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-145",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 145,
+            "timestamp": "2030-01-01T11:53:25.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. A new empty cache for every trial still fails when cancellation runs before search. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-146",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 146,
+            "timestamp": "2030-01-01T11:53:26.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-147",
+            "revision": 1,
+            "role": "system",
+            "sequence": 147,
+            "timestamp": "2030-01-01T11:53:28.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-148",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-148",
+            "revision": 1,
+            "role": "user",
+            "sequence": 148,
+            "timestamp": "2030-01-01T11:55:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for cache; compare it with batch 5."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-149",
+            "revision": 1,
+            "role": "user",
+            "sequence": 149,
+            "timestamp": "2030-01-01T11:55:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 6/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-150",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 150,
+            "timestamp": "2030-01-01T11:55:02.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=61 --repeat=12"
+              },
+              "call_id": "call-builder-151",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-151",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 151,
+            "timestamp": "2030-01-01T11:55:04.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-151",
+              "content": "seed 061: PASS search before cancellation: 12 assertions\nseed 062: PASS search before cancellation: 12 assertions\nseed 063: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 064: PASS search before cancellation: 12 assertions\nseed 065: PASS search before cancellation: 12 assertions\nseed 066: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 067: PASS search before cancellation: 12 assertions\nseed 068: PASS search before cancellation: 12 assertions\nseed 069: PASS search before cancellation: 12 assertions\nseed 070: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 071: PASS search before cancellation: 12 assertions\nseed 072: PASS search before cancellation: 12 assertions\nbatch 6: 9 passed, 3 failed\nA new empty cache for every trial still fails when cancellation runs before search.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-152",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 152,
+            "timestamp": "2030-01-01T11:55:05.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "3 of 12 orders still fail. A new empty cache for every trial still fails when cancellation runs before search. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-153",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 153,
+            "timestamp": "2030-01-01T11:55:06.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-154",
+            "revision": 1,
+            "role": "system",
+            "sequence": 154,
+            "timestamp": "2030-01-01T11:55:08.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-155",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-155",
+            "revision": 1,
+            "role": "user",
+            "sequence": 155,
+            "timestamp": "2030-01-01T11:56:40.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for cache; compare it with batch 6."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-156",
+            "revision": 1,
+            "role": "user",
+            "sequence": 156,
+            "timestamp": "2030-01-01T11:56:40.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 7/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-157",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 157,
+            "timestamp": "2030-01-01T11:56:42.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=73 --repeat=12"
+              },
+              "call_id": "call-builder-158",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-158",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 158,
+            "timestamp": "2030-01-01T11:56:44.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-158",
+              "content": "seed 073: PASS search before cancellation: 12 assertions\nseed 074: PASS search before cancellation: 12 assertions\nseed 075: PASS search before cancellation: 12 assertions\nseed 076: PASS search before cancellation: 12 assertions\nseed 077: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 078: PASS search before cancellation: 12 assertions\nseed 079: PASS search before cancellation: 12 assertions\nseed 080: PASS search before cancellation: 12 assertions\nseed 081: PASS search before cancellation: 12 assertions\nseed 082: PASS search before cancellation: 12 assertions\nseed 083: PASS search before cancellation: 12 assertions\nseed 084: FAIL search after cancellation: AbortError, signal.aborted=true\nbatch 7: 10 passed, 2 failed\nA new empty cache for every trial still fails when cancellation runs before search.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-159",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 159,
+            "timestamp": "2030-01-01T11:56:45.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "2 of 12 orders still fail. A new empty cache for every trial still fails when cancellation runs before search. Next batch narrows the ordering evidence; this is not a green rerun."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-160",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 160,
+            "timestamp": "2030-01-01T11:56:46.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-161",
+            "revision": 1,
+            "role": "system",
+            "sequence": 161,
+            "timestamp": "2030-01-01T11:56:48.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-long-debug-rabbit-hole-builder-162",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-162",
+            "revision": 1,
+            "role": "user",
+            "sequence": 162,
+            "timestamp": "2030-01-01T11:58:20.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Run the next shuffled batch for cache; compare it with batch 7."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-163",
+            "revision": 1,
+            "role": "user",
+            "sequence": 163,
+            "timestamp": "2030-01-01T11:58:20.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Batch 8/8: preserve the seed and whether cancellation precedes search."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-164",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 164,
+            "timestamp": "2030-01-01T11:58:22.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=85 --repeat=12"
+              },
+              "call_id": "call-builder-165",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-165",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 165,
+            "timestamp": "2030-01-01T11:58:24.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-165",
+              "content": "seed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nA new empty cache for every trial still fails when cancellation runs before search.",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-166",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 166,
+            "timestamp": "2030-01-01T11:58:25.000Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Rejected hypothesis 3: cache disabled, same failure. Test ordering, not cached results, controls the AbortError."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-167",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 167,
+            "timestamp": "2030-01-01T11:58:26.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-168",
+            "revision": 1,
+            "role": "system",
+            "sequence": 168,
+            "timestamp": "2030-01-01T11:58:28.000Z",
+            "type": "status"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Forty minutes of evidence: network, fake timers and cache are ruled out. The cancellation test aborts sharedController; shuffled search tests inherit its already-aborted signal. A fresh AbortController in beforeEach is the one-line fix."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-169",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 169,
+            "timestamp": "2030-01-01T11:59:52.000Z",
+            "type": "content"
+          }
+        ],
+        "page_size": 25,
+        "session_id": "session/example-atlas-builder"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 4000,
+      "items": [
+        {
+          "body": {
+            "arguments": {
+              "new_string": "client = createClient(new AbortController().signal);",
+              "old_string": "client = createClient(sharedController.signal);",
+              "path": "packages/web/test/searchClient.test.ts"
+            },
+            "call_id": "call-builder-170",
+            "name": "edit"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-170",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 170,
+          "timestamp": "2030-01-01T12:00:04.000Z",
+          "type": "tool_call"
+        }
+      ],
+      "store": 2
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 4300,
+      "items": [
+        {
+          "body": {
+            "call_id": "call-builder-170",
+            "content": "--- a/packages/web/test/searchClient.test.ts\n+++ b/packages/web/test/searchClient.test.ts\n@@ -1,1 +1,1 @@\n-client = createClient(sharedController.signal);\n+client = createClient(new AbortController().signal);\n",
+            "media_type": "text/plain",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-171",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 171,
+          "timestamp": "2030-01-01T12:00:04.300Z",
+          "type": "tool_result"
+        }
+      ],
+      "store": 3
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 12000,
+      "items": [
+        {
+          "body": {
+            "arguments": {
+              "command": "pnpm --filter @atlas/web test searchClient -- --sequence.shuffle --repeat=100"
+            },
+            "call_id": "call-builder-172",
+            "name": "shell"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-172",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 172,
+          "timestamp": "2030-01-01T12:00:12.000Z",
+          "type": "tool_call"
+        }
+      ],
+      "store": 6
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 20000,
+      "items": [
+        {
+          "body": {
+            "call_id": "call-builder-172",
+            "content": "100 shuffled orders passed; 0 AbortError failures\nCancellation still aborts its own request; search uses a fresh signal.\n1 file changed, 1 insertion(+), 1 deletion(-)",
+            "media_type": "text/plain",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-173",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 173,
+          "timestamp": "2030-01-01T12:00:20.000Z",
+          "type": "tool_result"
+        }
+      ],
+      "store": 7
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 22000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Fixed: each test gets a fresh abort signal. All 100 shuffled orders pass, cancellation coverage is intact, and no production code changed."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-174",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 174,
+          "timestamp": "2030-01-01T12:00:22.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 11
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 22000,
+      "items": [
+        {
+          "body": {
+            "status": "completed"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-long-debug-rabbit-hole-builder-175",
+          "revision": 1,
+          "role": "system",
+          "sequence": 175,
+          "timestamp": "2030-01-01T12:00:22.000Z",
+          "type": "status"
+        }
+      ],
+      "store": 12
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/2/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/3/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/4/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/5/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/6/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/7/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/8/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/9/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/10/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/11/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/12/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/13/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/14/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/15/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/16/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/17/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/18/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/19/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/20/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/21/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/22/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/23/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/24/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/25/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/26/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/27/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/28/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/29/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/30/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/31/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/32/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/33/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/34/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/35/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/36/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/37/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/38/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/39/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/40/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/41/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/42/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/43/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/44/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/45/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/46/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/47/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/48/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/49/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/50/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/51/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/52/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/53/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/54/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/55/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/56/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/57/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/58/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/59/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/60/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/61/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/62/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/63/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/64/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/65/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/66/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/67/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/68/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/69/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/70/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/71/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/72/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/73/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/74/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/75/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/76/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/77/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/78/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/79/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/80/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/81/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/82/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/83/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/84/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/85/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/86/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/87/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/88/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/89/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/90/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/91/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/92/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/93/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/94/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/95/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/96/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/97/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/98/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/99/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/100/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/101/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/102/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/103/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/104/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/105/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/106/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/107/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/108/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/109/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/110/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/111/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/112/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/113/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/114/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/115/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/116/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/117/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/118/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/119/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/120/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/121/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/122/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/123/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/124/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/125/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/126/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/127/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/128/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/129/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/130/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/131/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/132/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/133/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/134/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/135/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/136/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/137/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/138/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/139/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/140/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/141/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/142/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/143/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/144/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/145/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/146/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/147/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/148/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/149/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/150/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/151/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/152/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/153/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/154/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/155/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/156/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/157/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/158/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/159/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/160/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/161/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/162/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/163/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/164/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/165/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/166/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/167/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/168/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/3/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/4/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/5/items/0/timestamp"
+    }
+  ],
+  "variant": "default",
+  "world": "long-debug-rabbit-hole"
+}

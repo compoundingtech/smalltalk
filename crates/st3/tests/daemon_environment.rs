@@ -97,7 +97,7 @@ mission "hermetic" state="ready" {
         .arg(env).args(["-u", "ST_AGENT"])
         .arg(test_env!("CARGO_BIN_EXE_st3-fixture"))
         .arg("--endpoint").arg(&socket)
-        .args(["missions", "publish"]).arg(source)
+        .args(["apply"]).arg(source)
         .args(["--as", "person/pat", "--no-gate-check"])
         .output().unwrap();
     assert!(output.status.success(), "{output:?}");

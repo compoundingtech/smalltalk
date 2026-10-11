@@ -523,8 +523,9 @@ fs.rmSync(delayedHelloPath, { force: true });
 
 // omp loads this extension into every in-process subagent, as a second instance sharing the
 // process-wide stash (compoundingtech/smalltalk#852). A subagent's lifecycle must leave the seat's
-// channel alone: no channel of its own, no frames from its turns, and its shutdown does not close
-// the seat's channel. Mail that arrives afterwards still reaches the top-level session.
+// channel alone: no channel of its own, and its shutdown does not close the seat's channel. Mail
+// that arrives afterwards still reaches the top-level session. st's asset reports the subagent's
+// runs on the seat's channel and nothing else of it; the legacy asset sends no frame at all.
 const subHandlers = new Map();
 const subHandedOver = [];
 mod.default({
@@ -544,11 +545,156 @@ await subHandlers.get("session_start")({}, subCtx);
 await subHandlers.get("agent_start")({}, subCtx);
 await subHandlers.get("tool_call")({ toolName: "bash", toolCallId: "sub-call", input: {} }, subCtx);
 await subHandlers.get("message_end")(messageEvent, subCtx);
+await subHandlers.get("turn_end")(messageEvent, subCtx);
+await subHandlers.get("agent_end")({ ...successfulEnd, willContinue: true }, subCtx);
 await subHandlers.get("agent_end")(successfulEnd, subCtx);
+// Delayed completion of a turn is not a new run after the run has ended.
+await subHandlers.get("turn_end")(messageEvent, subCtx);
 await subHandlers.get("session_shutdown")({}, subCtx);
+// A second run fails; a third is cut short when its session shuts down first.
+await subHandlers.get("agent_start")({}, subCtx);
+await subHandlers.get("agent_end")({ messages: [{ role: "assistant", stopReason: "error" }] }, subCtx);
+await subHandlers.get("agent_start")({}, subCtx);
+await subHandlers.get("session_shutdown")({}, subCtx);
+// A subagent omp does not name reports nothing.
+await subHandlers.get("agent_start")({}, { ...subCtx, agent: { kind: "sub", depth: 1 } });
 await pause(300);
 assert.strictEqual(fs.readFileSync(pidPath, "utf8"), pidsBeforeSubagent, "a subagent opens no channel");
-assert.deepStrictEqual(readFrames().slice(framesBeforeSubagent), [], "a subagent's events reach no channel");
+const run = (event, outcome) => ({ type: "subagent", id: "0-Review", name: "task", event,
+  ...(outcome ? { outcome } : {}) });
+assert.deepStrictEqual(
+  readFrames().slice(framesBeforeSubagent),
+  process.argv[2]?.includes("st-omp-channel")
+    ? [run("start"), run("progress"), run("end", "completed"), run("start"), run("end", "failed"),
+      run("start"), run("end", "interrupted")]
+    : [],
+  "a subagent's events reach the channel only as its runs",
+);
+// While its runs last, st's asset reports each minute every subagent omp says is busy, as in a long
+// tool call. A subagent whose session went idle without its end reports nothing, so st ends it once
+// it has been quiet long enough.
+const heartbeats = [];
+const realSetInterval = globalThis.setInterval;
+globalThis.setInterval = (callback, ms) => {
+  heartbeats.push({ callback, ms });
+  return realSetInterval(() => {}, 2 ** 30);
+};
+const busyCtx = { ...subCtx, isIdle: () => false };
+const quietCtx = { ...subCtx, isIdle: () => true, agent: { ...subCtx.agent, id: "1-Quiet" } };
+const framesBeforeHeartbeat = readFrames().length;
+await subHandlers.get("agent_start")({}, busyCtx);
+await subHandlers.get("agent_start")({}, quietCtx);
+globalThis.setInterval = realSetInterval;
+assert.deepStrictEqual(
+  heartbeats.map(({ ms }) => ms),
+  process.argv[2]?.includes("st-omp-channel") ? [60_000] : [],
+  "one heartbeat serves every running subagent",
+);
+heartbeats[0]?.callback();
+await subHandlers.get("agent_end")(successfulEnd, busyCtx);
+await subHandlers.get("session_shutdown")({}, quietCtx);
+await pause(300);
+const quiet = (event, outcome) => ({ ...run(event, outcome), id: "1-Quiet" });
+assert.deepStrictEqual(
+  readFrames().slice(framesBeforeHeartbeat).filter((frame) => frame.type === "subagent"),
+  process.argv[2]?.includes("st-omp-channel")
+    ? [run("start"), quiet("start"), run("progress"), run("end", "completed"),
+      quiet("end", "interrupted")]
+    : [],
+  "a heartbeat reports only the subagents whose sessions are busy",
+);
+
+// A foreground human wait stays busy in omp. Cached waits must stop reporting as soon as the
+// live session becomes idle, even if the extension lost the matching result or resolution.
+globalThis.setInterval = (callback, ms) => {
+  heartbeats.push({ callback, ms });
+  return realSetInterval(() => {}, 2 ** 30);
+};
+let waitIdle = false;
+const waitCtx = { ...quietCtx, isIdle: () => waitIdle };
+const framesBeforeWait = readFrames().length;
+await subHandlers.get("agent_start")({}, waitCtx);
+globalThis.setInterval = realSetInterval;
+if (process.argv[2]?.includes("st-omp-channel")) {
+  for (const name of ["tool_execution_start", "tool_approval_requested", "tool_approval_resolved"]) {
+    assert.strictEqual(typeof subHandlers.get(name), "function", `${name} is registered`);
+  }
+}
+const tickWait = async (expected, label) => {
+  const before = readFrames().filter((frame) => frame.type === "subagent").length;
+  heartbeats.at(-1)?.callback();
+  await pause(30);
+  const after = readFrames().filter((frame) => frame.type === "subagent").length;
+  assert.strictEqual(after - before, process.argv[2]?.includes("st-omp-channel") ? expected : 0, label);
+};
+await pause(100);
+await subHandlers.get("tool_call")({ toolName: "ask", toolCallId: "ask-child" }, waitCtx);
+await subHandlers.get("tool_execution_start")?.({ toolName: "ask", toolCallId: "ask-child" }, waitCtx);
+await subHandlers.get("agent_end")(successfulEnd, waitCtx);
+await subHandlers.get("tool_result")({ toolCallId: "unrelated" }, waitCtx);
+const realNow = Date.now;
+let waitNow = realNow();
+Date.now = () => waitNow;
+for (let minute = 0; minute < 6; minute += 1) {
+  waitNow += 60_000;
+  await tickWait(1, "a live busy ask reports beyond the silence bound");
+}
+// The tool actually finished, but the extension never received its result.
+waitIdle = true;
+await tickWait(0, "a lost ask result and idle child stop reporting at the next heartbeat");
+waitIdle = false;
+await subHandlers.get("tool_call")({ toolName: "ask", toolCallId: "ask-next" }, waitCtx);
+await tickWait(1, "a new live ask reports");
+await subHandlers.get("tool_result")({ toolCallId: "ask-next" }, waitCtx);
+waitIdle = true;
+await tickWait(0, "a resolved and idle ask stops reporting");
+waitIdle = false;
+await subHandlers.get("tool_approval_requested")?.({ toolName: "bash" }, waitCtx);
+await tickWait(1, "a live approval reports");
+waitIdle = true;
+await tickWait(0, "a lost approval resolution and idle child stop reporting at the next heartbeat");
+waitIdle = false;
+await subHandlers.get("tool_approval_requested")?.({ toolName: "bash" }, waitCtx);
+await tickWait(1, "a new live approval reports");
+await subHandlers.get("tool_approval_resolved")?.({}, waitCtx);
+waitIdle = true;
+await tickWait(0, "a resolved and idle approval stops reporting");
+await tickWait(0, "a resolved idle child stays quiet");
+Date.now = realNow;
+await subHandlers.get("session_shutdown")({}, waitCtx);
+await pause(300);
+assert.deepStrictEqual(
+  readFrames().slice(framesBeforeWait).filter((frame) => frame.type === "subagent"),
+  process.argv[2]?.includes("st-omp-channel")
+    ? [quiet("start"), ...Array.from({ length: 9 }, () => quiet("progress")), quiet("end", "interrupted")]
+    : [],
+  "human waits renew only while their own session has live busy evidence",
+);
+
+// Bounds are UTF-8 bytes, not characters. Oversized IDs are rejected, not truncated into an
+// existing identity; oversized names are omitted. Exact-limit values still work.
+const framesBeforeBounds = readFrames().length;
+const boundedCtx = { ...subCtx, agent: { ...subCtx.agent, id: "é".repeat(128), name: "é".repeat(64) } };
+await subHandlers.get("agent_start")({}, boundedCtx);
+await subHandlers.get("agent_end")(successfulEnd, boundedCtx);
+const oversizedIdCtx = { ...boundedCtx, agent: { ...boundedCtx.agent, id: `${boundedCtx.agent.id}x` } };
+await subHandlers.get("agent_start")({}, oversizedIdCtx);
+await subHandlers.get("agent_end")(successfulEnd, oversizedIdCtx);
+const oversizedNameCtx = { ...subCtx, agent: { ...subCtx.agent, name: `${boundedCtx.agent.name}x` } };
+await subHandlers.get("agent_start")({}, oversizedNameCtx);
+await subHandlers.get("agent_end")(successfulEnd, oversizedNameCtx);
+await pause(300);
+const boundedRun = (event) => ({ type: "subagent", id: boundedCtx.agent.id, name: boundedCtx.agent.name, event,
+  ...(event === "end" ? { outcome: "completed" } : {}) });
+const unnamedRun = (event) => ({ type: "subagent", id: subCtx.agent.id, event,
+  ...(event === "end" ? { outcome: "completed" } : {}) });
+assert.deepStrictEqual(
+  readFrames().slice(framesBeforeBounds).filter((frame) => frame.type === "subagent"),
+  process.argv[2]?.includes("st-omp-channel")
+    ? [boundedRun("start"), boundedRun("end"), unnamedRun("start"), unnamedRun("end")]
+    : [],
+  "subagent identity and name are bounded without merging identities",
+);
 // Still mid-turn from the subagent's point of view; the seat's session is idle, so mail goes now.
 fs.appendFileSync(outboxPath, JSON.stringify({
   type: "message",

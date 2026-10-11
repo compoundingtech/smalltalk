@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Extend the st3 scenario catalog to all 24 worlds with the matching variants, sync-matrix rows and replay fault policies",
+  "replay": {"status": "none", "detail": "Development and test package only; no runtime replay change."},
+  "schema": {"status": "none", "detail": "No database schema change."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "No client protocol or deployed runtime compatibility change; fixtures decode against the existing client-v0 schema."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No deployed installation action required; identity and state are unchanged."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

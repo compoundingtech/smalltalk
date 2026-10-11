@@ -367,6 +367,18 @@ pub fn watch_events(
     events
 }
 
+/// Whether an observed pull request is in its base's merge queue.
+pub fn in_merge_queue(facts: &Value) -> bool {
+    facts.get("merge_queue").is_some_and(|queue| !queue.is_null())
+}
+
+/// Whether an observed pull request is open, unmerged and outside the merge queue.
+pub fn open_outside_merge_queue(facts: &Value) -> bool {
+    facts.get("state").and_then(Value::as_str) == Some("open")
+        && facts.get("merged").and_then(Value::as_bool) != Some(true)
+        && !in_merge_queue(facts)
+}
+
 /// One wake: its message subject, the key it was decided by, title, content and tags.
 pub struct Wake {
     pub subject: String,
