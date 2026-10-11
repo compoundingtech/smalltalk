@@ -114,6 +114,15 @@ pub use smallclaims::store::{
     newest_seals, stable_checkpoints, valid_fleet_node_name, verify_checkpoint_manifest,
 };
 
+fn finish_roster_rebuild(span: Option<&mut opentelemetry::global::BoxedSpan>, cards: usize) {
+    use opentelemetry::trace::Span as _;
+    if let Some(span) = span {
+        span.set_attribute(opentelemetry::KeyValue::new("st.roster.mode", "cold"));
+        span.set_attribute(opentelemetry::KeyValue::new("st.roster.cards", cards as i64));
+        span.end();
+    }
+}
+
 mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
@@ -3631,7 +3640,10 @@ impl Store {
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index <= index)
             .max_by_key(|entry| (entry.index, entry.local))
-            .map(|entry| (entry.index, Arc::clone(&entry.items), entry.published_at_unix_ms))
+            .map(|entry| {
+                crate::otel::record_roster("hit", entry.items.len());
+                (entry.index, Arc::clone(&entry.items), entry.published_at_unix_ms)
+            })
     }
 
     /// The complete roster published at exactly `cut`, for a page continuing from a first page
@@ -3646,7 +3658,10 @@ impl Store {
             .expect("agent resources cache poisoned").iter()
             .filter(|entry| entry.history == history && entry.covered.is_none() && entry.index == cut)
             .max_by_key(|entry| entry.local)
-            .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms))
+            .map(|entry| {
+                crate::otel::record_roster("hit", entry.items.len());
+                (Arc::clone(&entry.items), entry.published_at_unix_ms)
+            })
     }
 
     /// When no complete roster is published yet: the newest current refs at or before `index`
@@ -3677,6 +3692,7 @@ impl Store {
                     .collect::<Option<Vec<_>>>()
                     .map(|head| (head, entry.published_at_unix_ms))
             })?;
+        crate::otel::record_roster("hit", head.0.len());
         Some((cut, refs, head.0, head.1))
     }
 
@@ -3782,12 +3798,15 @@ impl Store {
         // Cold presentation reads current desired/queue tables even for historical status
         // cuts. Do not reuse rows from an older physical projection for those requests.
         if index < current_index(&self.readers.get())? {
+            let mut rebuild = crate::otel::stage_root("st.roster.rebuild", "cold", None);
             let mut items = crate::performance::task("roster/card-projection",
                 || build(selected.map(|names| (names, &[][..]))))?;
             #[cfg(test)]
             self.count_refolded_cards_for_test(items.len());
             items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                 .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+            crate::otel::record_roster("cold", items.len());
+            finish_roster_rebuild(rebuild.as_mut(), items.len());
             return Ok(items);
         }
         let now = now_ms();
@@ -3811,7 +3830,11 @@ impl Store {
         }) {
             let items = Arc::clone(&entry.items);
             drop(cache);
-            return crate::performance::task("roster/cache-hit", || Ok(select(&items)));
+            return crate::performance::task("roster/cache-hit", || {
+                let items = select(&items);
+                crate::otel::record_roster("hit", items.len());
+                Ok(items)
+            });
         }
         // Expired entries are diff sources only, never hits: refreshing their queue metadata
         // is sufficient to discover the cards moved by a deadline without dropping the fleet.
@@ -3913,6 +3936,7 @@ impl Store {
                 // moved at all: the previous rows already are this cut's projection, and the
                 // heartbeat or fleet-only claim between two reads costs no clone, sort or build.
                 if changed.is_empty() && deferred.is_empty() {
+                    crate::otel::record_roster("incremental", previous.items.len());
                     return Ok(runtime::AgentResourcesEntry {
                         index, local, history, covered,
                         valid_until_unix_ms,
@@ -3935,6 +3959,7 @@ impl Store {
                 items.extend(rebuilt);
                 items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+                crate::otel::record_roster("incremental", items.len());
                 Ok(runtime::AgentResourcesEntry {
                     index, local, history, covered,
                     valid_until_unix_ms,
@@ -3943,6 +3968,7 @@ impl Store {
                 })
             }
             None => {
+                let mut rebuild = crate::otel::stage_root("st.roster.rebuild", "cold", None);
                 #[cfg(test)]
                 self.smalltalk.agent_resources_builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut items = crate::performance::task("roster/card-projection",
@@ -3951,6 +3977,8 @@ impl Store {
                 self.count_refolded_cards_for_test(items.len());
                 items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                     .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+                crate::otel::record_roster("cold", items.len());
+                finish_roster_rebuild(rebuild.as_mut(), items.len());
                 Ok(runtime::AgentResourcesEntry {
                     index, local, history, covered: selected.cloned(),
                     valid_until_unix_ms: self.agent_queue_valid_until(now)?,
@@ -4025,7 +4053,10 @@ impl Store {
             .find(|entry| agent_resources_entry_hits(entry, now, index, local, history, selected))
             .map(|entry| (Arc::clone(&entry.items), entry.published_at_unix_ms));
         drop(cache);
-        Ok(hit.map(|hit| crate::performance::task("roster/cache-hit", || hit)))
+        Ok(hit.map(|hit| crate::performance::task("roster/cache-hit", || {
+            crate::otel::record_roster("hit", hit.0.len());
+            hit
+        })))
     }
 
     /// The matching warm pin for page refs: membership, ordering and queue metadata for exactly

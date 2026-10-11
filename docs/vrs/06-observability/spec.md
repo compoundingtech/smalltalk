@@ -383,19 +383,76 @@ attributes on the root instead.
 | `st.admission.snapshot_ms` | Cursor snapshot duration (client requests) |
 | `st.handler.queue_ms` | Wait for the handler `spawn_blocking` slot (non-health routes) |
 | `st.handler.duration_ms` | Handler duration, including `/v1/health` |
+| `st.request.id` | Generated before the handler; identical to the envelope's `request_id` |
+| `st.roster.mode` | `hit`, `incremental`, or `cold` for the roster projection read |
+| `st.roster.cards` | Number of cards in that roster projection |
+| `st.page.rows` | Number of rows in the returned page, after truncation |
+| `st.page.bytes` | Serialized response envelope bytes for a returned page |
 
-Each is an integer count of milliseconds recorded when its phase ends; an attribute is
-absent when the phase did not run for that request. The collector's slow-request and
-error policies key on the root span's duration and status, which the single span preserves.
+Phase durations and card/page counts are integers; `st.request.id` and `st.roster.mode`
+are strings. Attributes are absent when the corresponding stage did not run.
+The collector's slow-request and error policies key on the server span's duration and status.
 
 The root attributes are `http.request.method`, `http.route`, `http.response.status_code`,
 `st3.client.class`, and `span.label` equal to the route. A 5xx response or a handler error
 sets status `ERROR`; a 4xx response alone does not. WebSocket routes end the server span at
 the 101 response, not when the socket closes.
+Upgrade handlers accept absent telemetry context: an unset exporter never changes
+handshake authorization or first-frame delivery.
 
 The server extracts W3C `traceparent` and `tracestate` from HTTP request and WebSocket
 upgrade headers and uses the extracted context as the parent. The sampled-caller signal
 follows the collector sampling policy above; the process exports every span.
+
+### Subscription first frames and slow-path roots
+
+```text
+HTTP upgrade SERVER span (ends at 101)
+    <link> st.subscription.first_frame INTERNAL root (subscribe -> first frame sent)
+HTTP receive SERVER span
+    <link> st.replication.projection INTERNAL root (new or deferred data only)
+st.roster.rebuild INTERNAL root (cold build only, no parent or link)
+```
+
+All four client stream socket tasks carry the upgrade's `SpanContext`, not a live server
+span. The context is captured before handler dispatch because the handler constructs the
+`on_upgrade` closure before returning 101; it is also cloned into conversation followers
+and terminal pumps. W3C context on the upgrade therefore survives task boundaries without
+extending the request span's lifetime.
+
+Each accepted subscribe constructs one `st.subscription.first_frame` root with an empty
+parent context and a link to the valid upgrade span context. It ends after the first
+frame is sent. Later rereads, resyncs, and changes construct no spans; there are no
+per-frame child spans. Construction is gated by the trace-export `AtomicBool`, before
+labels, collections, or counts are inspected (O11Y-R02, O11Y-R18).
+
+| First-frame attribute | Type / vocabulary |
+| --- | --- |
+| `st.collection` | String: `missions`, `attention`, `agents`, `work`, `glasses`, `arrangements`, `conversation`, `terminal` |
+| `st.subscription.id` | String: protocol subscription identity, span-only |
+| `st.projection.hit`, `st.projection.cold`, `st.projection.incremental`, `st.projection.shared` | Boolean: projection path used by the initial read |
+| `st.page.rows` | Integer: initial frame rows after truncation |
+| `st.page.bytes` | Integer: serialized initial frame bytes |
+| `span.label` | Bounded collection/projection description, never an identity or path |
+
+`st.roster.rebuild` surrounds only cold roster builds, including cold historical pages.
+It is detached, with no parent or link, `span.label=cold`, `st.roster.mode=cold`, and
+integer `st.roster.cards`. Cache hits and incremental refolds create no rebuild roots.
+Roster and page stage attributes on requests remain on the SERVER span, not children.
+
+`st.replication.projection` surrounds the post-receive projection attempt only when
+new data arrived or previously deferred data remains. It uses an empty parent context,
+links to the receive SERVER span, and records `span.label=receive`,
+string `st.replication.peer`, integer `st.replication.moved_envelopes`, and
+`st.replication.outcome` equal to
+`projected`, `unchanged`, `deferred`, or `error`. A failed projection has ERROR status.
+Other projection callers do not emit this receive-specific root; empty heartbeats do
+not emit it either.
+
+All identities and numeric stage attributes above are span-only, never metric labels.
+The frame-level trace field, writer-wait instrumentation, WAL checkpoints, and reconcile
+roots are separate instrumentation surfaces, not part of these stage roots.
+
 
 ### Metric naming and cardinality
 
@@ -780,6 +837,12 @@ checks the 1 ms attribute boundary and unchanged operation counts, and forces a 
 TRUNCATE using unpinned WAL frames in an isolated store. It checks ordinary passes emit
 no root, abnormal/failure results are ERROR, and roots remain parentless even with
 both an entered tracing span and an attached OTel context.
+
+The stage-span receiver proof compares `st.request.id` with the HTTP envelope, checks
+roster/page stage values, and links first-frame roots to the exported upgrade trace/span
+ids. It asserts that repeated rereads or changes produce no additional first-frame
+roots, cold roster builds are detached and unlinked, and receive projection roots are
+detached but linked to the receive request. Empty receives produce no projection root.
 
 The CLI-to-daemon receiver proof runs a real command with both processes exporting,
 asserts the daemon SERVER span has the CLI root's trace id and a CLI parent span id,

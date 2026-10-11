@@ -964,6 +964,15 @@ async fn response_envelope_unbounded(
         .into_response();
     }
     let started = Instant::now();
+    let client_request = request.uri().path().starts_with("/v1/client/");
+    let request_id = if client_request {
+        crate::relay_trace::current().map_or_else(
+            || format!("request/{}", new_request_id()),
+            |trace| trace.id().to_owned(),
+        )
+    } else {
+        new_request_id()
+    };
     let request_path = request.uri().path().to_owned();
     let request_query = request.uri().query().map(str::to_owned);
     let long_poll = request_query.as_deref().is_some_and(asks_to_wait);
@@ -992,12 +1001,21 @@ async fn response_envelope_unbounded(
         &request_route,
         client_class,
         request.headers(),
+        &request_id,
     );
+    if let Some(server) = otel.as_ref()
+        && request.headers().contains_key(axum::http::header::UPGRADE)
+    {
+        use opentelemetry::trace::TraceContextExt as _;
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+        request.extensions_mut().insert(crate::otel::UpgradeContext(
+            Some(server.context().span().span_context().clone()),
+        ));
+    }
     let profile = crate::profile::Op::start(
         format!("{} {request_route}", request.method()),
         Some(caller.clone()),
     );
-    let client_request = request.uri().path().starts_with("/v1/client/");
     let observation_report = request_route == "/v1/client/observations";
     // These point readers admit snapshot metadata inside their pinned read before
     // formatting it. Authentication still runs here; their response extension
@@ -1251,14 +1269,6 @@ async fn response_envelope_unbounded(
         // handlers just to decorate its response.
         state.store.index().unwrap_or_default()
     };
-    let request_id = if client_request {
-        crate::relay_trace::current().map_or_else(
-            || format!("request/{}", new_request_id()),
-            |trace| trace.id().to_owned(),
-        )
-    } else {
-        new_request_id()
-    };
     if let Some(trace) = crate::relay_trace::current() {
         trace.response(&request_id);
     }
@@ -1299,6 +1309,12 @@ async fn response_envelope_unbounded(
     } else {
         crate::relay_trace::Outcome::Failed
     });
+    if let Some(server) = otel.as_ref()
+        && let Some(items) = envelope["value"]["items"].as_array()
+    {
+        server.record("st.page.rows", items.len() as i64);
+        server.record("st.page.bytes", body.len() as i64);
+    }
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     record_request_latency(
         &request_method,
@@ -1341,6 +1357,7 @@ fn request_trace(
     route: &str,
     client_class: crate::otel_client_class::ClientClass,
     headers: &axum::http::HeaderMap,
+    request_id: &str,
 ) -> Option<tracing::Span> {
     if !crate::otel::export_enabled() {
         return None;
@@ -1357,6 +1374,7 @@ fn request_trace(
         "http.request.method" = method.as_str(),
         "http.route" = route,
         "st3.client.class" = client_class.as_str(),
+        "st.request.id" = request_id,
         "http.response.status_code" = tracing::field::Empty,
         "st.parent.sampled" = tracing::field::Empty,
         "st.admission.queue_ms" = tracing::field::Empty,
@@ -1364,6 +1382,10 @@ fn request_trace(
         "st.admission.snapshot_ms" = tracing::field::Empty,
         "st.handler.queue_ms" = tracing::field::Empty,
         "st.handler.duration_ms" = tracing::field::Empty,
+        "st.roster.mode" = tracing::field::Empty,
+        "st.roster.cards" = tracing::field::Empty,
+        "st.page.rows" = tracing::field::Empty,
+        "st.page.bytes" = tracing::field::Empty,
         "st.writer.wait_ms" = tracing::field::Empty,
         "st.writer.ops" = tracing::field::Empty,
     );
@@ -5817,8 +5839,10 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
+    let trace = crate::otel::export_enabled().then(tracing::Span::current);
     let writer_wait = smallclaims::sqlite::telemetry::current_request();
     crate::api::read_deadline::spawn_blocking(move || {
+        let _trace = trace.as_ref().map(tracing::Span::enter);
         let _writer_scope = smallclaims::sqlite::telemetry::enter_request(writer_wait);
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
@@ -5835,8 +5859,10 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
+    let trace = crate::otel::export_enabled().then(tracing::Span::current);
     let writer_wait = smallclaims::sqlite::telemetry::current_request();
     crate::api::read_deadline::spawn_blocking(move || {
+        let _trace = trace.as_ref().map(tracing::Span::enter);
         let _writer_scope = smallclaims::sqlite::telemetry::enter_request(writer_wait);
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
@@ -5855,8 +5881,10 @@ where
 {
     let profile = crate::profile::current();
     let cpu_kind = crate::performance::current();
+    let trace = crate::otel::export_enabled().then(tracing::Span::current);
     let writer_wait = smallclaims::sqlite::telemetry::current_request();
     crate::api::read_deadline::spawn_blocking(move || {
+        let _trace = trace.as_ref().map(tracing::Span::enter);
         let _writer_scope = smallclaims::sqlite::telemetry::enter_request(writer_wait);
         let _entered = crate::profile::enter(profile.as_ref());
         crate::performance::with_charged(cpu_kind, operation)
@@ -8414,7 +8442,39 @@ async fn replication_receive(
         // with or without new data, projects what it admitted meanwhile.
         let was_deferred = store.replication_projection_deferred();
         let projection = if new_data || was_deferred {
-            admitted_projection_result(store.project_replication_backlog_unless_catching_up())?
+            use opentelemetry::trace::{Span as _, TraceContextExt as _};
+            use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+            let receive = crate::otel::export_enabled().then(|| {
+                tracing::Span::current().context().span().span_context().clone()
+            });
+            let mut span = crate::otel::stage_root(
+                "st.replication.projection", "receive", receive,
+            );
+            let result = admitted_projection_result(
+                store.project_replication_backlog_unless_catching_up(),
+            );
+            if let Some(span) = span.as_mut() {
+                span.set_attribute(opentelemetry::KeyValue::new(
+                    "st.replication.peer", request.peer.clone(),
+                ));
+                span.set_attribute(opentelemetry::KeyValue::new(
+                    "st.replication.moved_envelopes", receipt.received as i64,
+                ));
+                span.set_attribute(opentelemetry::KeyValue::new(
+                    "st.replication.outcome",
+                    match &result {
+                        Ok(Some(true)) => "projected",
+                        Ok(Some(false)) => "unchanged",
+                        Ok(None) => "deferred",
+                        Err(_) => "error",
+                    },
+                ));
+                if result.is_err() {
+                    span.set_status(opentelemetry::trace::Status::error("projection failed"));
+                }
+                span.end();
+            }
+            result?
         } else {
             Some(true)
         };
