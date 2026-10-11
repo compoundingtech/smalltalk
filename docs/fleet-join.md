@@ -39,7 +39,7 @@ This design replaces each step:
 
 ## What a person types
 
-On any listening member, or on a machine that is not in a fleet yet (which then creates its first fleet):
+On an existing listening member with a running daemon and replication worker:
 
 ```sh
 st fleet invite laptop
@@ -257,8 +257,8 @@ Or, if laptop is a Fabric peer of this machine, send the code instead of showing
 A dial-out member cannot sponsor, because nothing can connect to it. `st fleet invite` there
 fails and names the listening members.
 
-On a machine that is not in a fleet yet, `st fleet invite` first creates a fleet; see
-[Creating your first fleet](#creating-your-first-fleet).
+On a machine that is not in a fleet, `st fleet invite` refuses with `not-in-a-fleet`.
+Run `st fleet create` first; see [Creating your first fleet](#creating-your-first-fleet).
 
 ### What the sponsor stores
 
@@ -425,8 +425,10 @@ Each step records a checkpoint in `STATE/fleet/join.json`, so running `st fleet 
 continues from the last completed step:
 
 1. **Check.** Parse the code. Refuse if this store is bound to another fleet, or this machine is
-   already a member. Choose the name: `--name`, else the code's pinned name, else the configured
-   node name, else the short host name (`scutil --get LocalHostName` on macOS). Refuse the name
+   already a member. Choose the name: `--name`, else the code's pinned name, else the
+   resolved node name from configuration and stable node identity. Join does not call
+   `scutil`; macOS first-run setup uses it to suggest the machine name
+   and persists that choice in config. Pass `--name` when the default is unsuitable. Refuse the name
    `local`. Names match `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`.
 2. **Key.** Create `STATE/fleet/node.key` if it does not exist, and sync it to disk before any
    request. Checkpoint `key-created`.
@@ -517,7 +519,14 @@ seats first.
 
 ### Creating your first fleet
 
-`st fleet invite` on a machine that is not in a fleet creates one, and says so:
+Create a fleet explicitly on the first machine:
+
+```sh
+st fleet create
+```
+
+Use `--name studio` if you need to select its member name. The command creates local
+membership; `st fleet invite` only issues invitations for an existing fleet. Creation:
 
 1. Generate a random fleet ID (UUID v4), a 32-byte secret, and the member key.
 2. Write `STATE/fleet/` with `anchor_key` set to this node's own key, bind the store to the fleet
@@ -528,7 +537,8 @@ seats first.
 4. Install or refresh the replication service if the daemon runs as a service. Otherwise print
    the foreground worker command. The worker serves the join route, so a code works once the
    worker runs.
-5. Continue with the invite.
+5. Start or refresh the daemon and replication worker as directed, then issue an invite
+   from this listening member with `st fleet invite NAME`.
 
 A local-only store keeps its history when it creates a fleet, and that history replicates to
 every member that joins.
@@ -1051,7 +1061,7 @@ PEER  beacon  last-seen
 
 `current` is the member's admission state, not a claim that it is online. Use
 `st replication status` for each peer's last exchange time, envelope backlog and divergence;
-`st machines` and stui also show last contact. A member never seen has no successful exchange
+`st machines` and the terminal UI also show last contact. A member never seen has no successful exchange
 time yet. An absent listening member, which is meant to answer, makes doctor warn; an absent
 dial-out member is only named, and neither produces delivery-probe attention. Invalid
 authentication, conflicting membership, rejected envelopes and projection faults remain
