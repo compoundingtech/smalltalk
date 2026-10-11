@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Serve missions and work collection windows from published lists that background refreshers fold incrementally",
+  "replay": {"status": "none", "detail": "No claim replay or stored history changes."},
+  "schema": {"status": "none", "detail": "No database schema, version or stored data changes; the lists live in memory."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or coordination changes; no coordinated upgrade required."},
+  "compatibility": {"status": "none", "detail": "Frames keep their shape. A missions or work window's snapshot names the published list's cut and published_at, about a second plus one fold behind at most; before the first publication, and while a refresher keeps failing, a window folds on read as before. HTTP pages are unchanged. ST3_PUBLISHED_LISTS=off restores folding on read."},
+  "downtime": {"status": "none", "detail": "No additional service interruption; the first lists fold in short snapshots after start."},
+  "manual": {"status": "none", "detail": "No action is required."},
+  "recovery": {"status": "none", "detail": "Only volatile in-memory lists change; restart with ST3_PUBLISHED_LISTS=off to fold on read."}
+}

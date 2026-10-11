@@ -64,7 +64,10 @@ path, title, first goal, and state, and the `subagents` its harness runs now.
 A work row names its `mission_id`.
 
 Each window is read inside one SQLite snapshot, and its fence names that
-snapshot's store index, so rows always match their fence. Commits that land
+snapshot's store index, so rows always match their fence. Agents, missions and
+work windows serve lists a background refresher keeps published: their fence
+names the published list's own cut and `published_at` (see the client README's
+freshness sections). Commits that land
 while a window is read neither tear it nor delay it; they arrive in the next
 `changes` frame.
 
