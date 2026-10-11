@@ -1164,6 +1164,7 @@ fn conversation_stream_error(id: &str, error: &ApiError) -> Value {
 /// Follow a conversation with no subscription time. The collections socket calls
 /// [`follow_conversation_since`]; this form is for the tests that exercise the follower itself.
 #[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 async fn follow_conversation(
     state: AppState,
     session: ClientSession,
