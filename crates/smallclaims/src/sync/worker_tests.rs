@@ -2487,6 +2487,7 @@ async fn overload_requires_authentication_and_clamps_signed_retry_delays() {
             EXCHANGE_PATH,
             &query,
             false,
+            None,
         )
         .await
         .unwrap_err();

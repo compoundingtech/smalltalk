@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Recheck advanced retry permission on every checkpoint manifest page",
+  "replay": {
+    "status": "none",
+    "detail": "Envelope receipt, duplicate handling, projection and replay are unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No durable table, index or data-format changes; retry credit is private task-local state."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim or checkpoint rule changes."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Public and ordinary checkpoint fetching preserve their existing behavior. Advanced retry submission checks now also cover every manifest page; a full exchange may include compact, follow-up, overload polls and manifest pagination. The permission bounds one exchange opportunity, not its total POST count."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No migration or additional service interruption beyond a normal binary swap."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No new configuration or manual action."
+  },
+  "recovery": {
+    "status": "changed",
+    "detail": "An advanced exchange carries admission through checkpoint need and every page submission. Changed authority, routes, removal or monotonic expiry stops further pages without imposing an adoption-failure cooldown. Ordinary checkpoint authentication, certificate validation and adoption remain intact. Source-only draft; no recovery or performance qualification."
+  }
+}
