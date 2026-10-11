@@ -33,7 +33,7 @@ function ContentNetworkStory({ boundary, source, allow = false, hostOpens = fals
   const onLoadImage = hostOpens ? openImage : undefined
   return <main {...stylex.props(styles.root, ...baselineTheme, embraceDarkTheme)}><EmbraceRuntimeProvider options={options}>{boundary === 'ToolPreview' ? <EmbraceMarkdownPreview markdown={text} resolveImage={resolveImage} onLoadImage={onLoadImage} /> : boundary === 'Embrace' ? <EmbraceThread items={items} embrace="E3" composer={false} resolveImage={resolveImage} onLoadImage={onLoadImage} /> : <Transcript turns={[{ id: 'network', items, work }]} title="Image privacy" sync={{ _tag: 'Live', since: 0 }} now={0} observedAt={0} resolveImage={resolveImage} onLoadImage={onLoadImage} />}</EmbraceRuntimeProvider></main>
 }
-type Story = StoryObj<typeof ContentNetworkStory>
+type Story = StoryObj<{ component: typeof ContentNetworkStory }>
 const deferredStory = (boundary: Boundary, source: string): Story => ({
   args: { boundary, source },
   play: async ({ canvasElement }) => {
