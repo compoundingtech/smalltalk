@@ -4,6 +4,12 @@
 display cache used by stui. It depends on the generated `st3-client` and the conversation model;
 its normal dependencies contain no terminal renderer. It changes no server protocol.
 
+`run_members_with_sidebar` additionally takes an explicit person selector. It follows
+that person's existing `arrangements` collection only when both arrangements and
+sixteen-slot collections are granted, keeping the three conversation slots on older
+daemons. Its authoritative windows arrive as `Window::Arrangements`, including retirement
+removals and remote register edits; it never creates or edits an arrangement.
+
 ## Start a feed
 
 Supply a `Client` for each member, already configured with that member's identity and credentials.

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Type the test-only health reduction closure and clarify expiry boundaries",
+  "replay": {
+    "status": "none",
+    "detail": "Pure test-only reduction; no provider callback, output publication or mailbox replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, index or schema change; controls use in-memory typed inputs."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim admission, checkpoint or fleet rule change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Both modules are cfg(test); no public health field, client schema or production type change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No shipped runtime caller, service lifecycle, timer or cache change."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No installation or operator action."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Native recovery acceptance remains separate; modeled tuples are not admitted source authority."
+  }
+}

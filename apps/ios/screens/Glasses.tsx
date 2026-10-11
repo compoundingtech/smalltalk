@@ -36,7 +36,7 @@ function paneGlyph(pane: PaneTarget): { glyph: string; color: string } {
 
 function paneDetail(pane: PaneTarget): string {
   if (pane.gone) return 'gone';
-  if (pane.needsYou) return `${pane.kind} · needs you`;
+  if (pane.needsYou) return `${pane.kind} · alert`;
   if (pane.status) return `${pane.kind} · ${pane.status.word}`;
   return pane.kind === 'other' ? 'this app cannot show it yet' : pane.kind;
 }

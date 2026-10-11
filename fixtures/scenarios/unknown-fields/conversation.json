@@ -1,0 +1,169 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "tolerant",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "conversation",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 19
+  },
+  "state": {
+    "threads": [
+      {
+        "agent": "agent/example/atlas/builder",
+        "has_more": false,
+        "items": [
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-unknown-fields-builder-1",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-unknown-fields-builder-1",
+            "revision": 1,
+            "role": "user",
+            "sequence": 1,
+            "timestamp": "2030-01-01T11:58:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Check that the older client keeps the newer daemon observations without treating them as known states."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-unknown-fields-builder-2",
+            "revision": 1,
+            "role": "user",
+            "sequence": 2,
+            "timestamp": "2030-01-01T11:58:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "The daemon reports reconciling and a compatibility-probe resource. I am checking HTTP reads and collection frames before retiring the transient probe."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-unknown-fields-builder-3",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 3,
+            "timestamp": "2030-01-01T11:58:04.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "checks": [
+                "agent-extra-key",
+                "agent-state",
+                "resource-kind",
+                "timeline-type"
+              ],
+              "probe_id": "compatibility-probe/scenario-unknown-fields-builder",
+              "status": "running"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-unknown-fields-builder-4",
+            "revision": 1,
+            "role": "system",
+            "sequence": 4,
+            "timestamp": "2030-01-01T11:59:58.000Z",
+            "type": "diagnostic_summary"
+          }
+        ],
+        "page_size": 100,
+        "session_id": "session/example-atlas-builder"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 2000,
+      "items": [
+        {
+          "body": {
+            "checks": [
+              "agent-extra-key",
+              "agent-state",
+              "resource-kind",
+              "timeline-type"
+            ],
+            "probe_id": "compatibility-probe/scenario-unknown-fields-builder",
+            "status": "passed"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-unknown-fields-builder-5",
+          "revision": 1,
+          "role": "system",
+          "sequence": 5,
+          "timestamp": "2030-01-01T12:00:02.000Z",
+          "type": "diagnostic_summary"
+        }
+      ],
+      "store": 3
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/2/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/3/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/items/0/timestamp"
+    }
+  ],
+  "unknown": [
+    {
+      "known_value": {
+        "body": {
+          "media_type": "text/plain",
+          "text": "Compatibility probe started; future fields are preserved."
+        },
+        "final": true,
+        "id": "timeline-entry/scenario-unknown-fields-builder-4",
+        "revision": 1,
+        "role": "system",
+        "sequence": 4,
+        "timestamp": "2030-01-01T11:59:58.000Z",
+        "type": "content"
+      },
+      "pointer": "/state/threads/0/items/3"
+    },
+    {
+      "known_value": {
+        "body": {
+          "media_type": "text/plain",
+          "text": "Compatibility probe passed on HTTP and collection streams."
+        },
+        "final": true,
+        "id": "timeline-entry/scenario-unknown-fields-builder-5",
+        "revision": 1,
+        "role": "system",
+        "sequence": 5,
+        "timestamp": "2030-01-01T12:00:02.000Z",
+        "type": "content"
+      },
+      "pointer": "/timeline/0/items/0"
+    }
+  ],
+  "variant": "default",
+  "world": "unknown-fields"
+}

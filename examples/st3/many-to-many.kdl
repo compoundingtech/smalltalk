@@ -21,10 +21,10 @@ version 2
 // Each seat has its own checkout of the invented repository, so one seat's branch never disturbs
 // another's. Apply the three seats, publish both missions, and start one run of each:
 //
-//   st agents apply examples/st3/seats/planner.kdl --as person/operator
-//   st agents apply examples/st3/seats/claude.kdl --as person/operator
-//   st agents apply examples/st3/seats/reviewer.kdl --as person/operator
-//   st missions publish examples/st3/many-to-many.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/planner.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/claude.kdl --as person/operator
+//   st apply --no-gate-check examples/st3/seats/reviewer.kdl --as person/operator
+//   st apply examples/st3/many-to-many.kdl --as person/operator
 //   st missions start example/greeting-option --id example/greeting-option/2026-10-01 \
 //     --workspace /srv/example/app --as person/operator
 //   st missions start example/usage-typo --id example/usage-typo/2026-10-01 \

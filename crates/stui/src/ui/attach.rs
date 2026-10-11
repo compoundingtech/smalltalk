@@ -268,7 +268,6 @@ fn png_size(path: &Path) -> Option<(u32, u32)> {
     Some((number(16), number(20)))
 }
 
-/// An image file's media type, by its extension: one st accepts (png, jpeg, gif, webp).
 /// Keep an image a message carried, read from st, under `dir/received`, named by its hash so a
 /// second open reuses it.
 pub fn received(
@@ -313,6 +312,7 @@ pub fn show(path: &Path) -> bool {
         .is_ok()
 }
 
+/// An image file's media type, by its extension: one st accepts (png, jpeg, gif, webp).
 pub fn media_type(path: &Path) -> &'static str {
     match path
         .extension()

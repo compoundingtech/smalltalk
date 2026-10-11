@@ -1,0 +1,19 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "attention",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 24
+  },
+  "state": {
+    "attention": [],
+    "messages": []
+  },
+  "timeline": [],
+  "times": [],
+  "variant": "default",
+  "world": "huge"
+}

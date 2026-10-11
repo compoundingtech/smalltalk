@@ -17,6 +17,7 @@ const KEYWORDS: &[&str] = &[
     "required",
     "additionalProperties",
     "items",
+    "prefixItems",
     "enum",
     "const",
     "oneOf",
@@ -168,7 +169,7 @@ fn normalize(value: &Value, defs: &Defs) -> Result<Value> {
                     .collect::<Result<Map<_, _>>>()?,
             ),
             "items" | "additionalProperties" | "contains" | "then" => normalize(child, defs)?,
-            "oneOf" | "anyOf" | "allOf" => Value::Array(
+            "oneOf" | "anyOf" | "allOf" | "prefixItems" => Value::Array(
                 child
                     .as_array()
                     .context("combinator")?
@@ -612,6 +613,10 @@ fn emit(value: &Value, cx: &mut Cx) -> Result<String> {
         Some("number") => with_checks("Schema.Number".into(), number_checks(value)),
         Some("boolean") => "Schema.Boolean".into(),
         Some("null") => "Schema.Null".into(),
+        Some("array") if object.contains_key("prefixItems") => {
+            let fields = object["prefixItems"].as_array().context("tuple items")?.iter().map(|item| emit(item,cx)).collect::<Result<Vec<_>>>()?;
+            format!("Schema.Tuple([{}])", fields.join(", "))
+        }
         Some("array") => {
             let items = object
                 .get("items")
@@ -971,6 +976,7 @@ fn recursive_type(value: &Value, encoded: bool) -> Result<String> {
         Some("integer" | "number") => "number".into(),
         Some("boolean") => "boolean".into(),
         Some("null") => "null".into(),
+        Some("array") if object.contains_key("prefixItems") => format!("readonly [{}]", object["prefixItems"].as_array().context("tuple items")?.iter().map(|item| recursive_type(item,encoded)).collect::<Result<Vec<_>>>()?.join(", ")),
         Some("array") => format!(
             "ReadonlyArray<{}>",
             object

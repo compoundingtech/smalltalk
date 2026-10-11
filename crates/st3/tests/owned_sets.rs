@@ -882,6 +882,437 @@ async fn manual_rollout_publishes_with_automatic_member_and_only_moves_on_explic
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_authored_resume_initial_adoption_preserves_the_incumbent() {
+    manual_authored_selection_publication(
+        "--resume",
+        "\"authored-session\"",
+        ManualPublicationCase::Adoption,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_authored_continue_initial_adoption_preserves_the_incumbent() {
+    manual_authored_selection_publication("--continue", "", ManualPublicationCase::Adoption).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_authored_selection_metadata_only_publish_preserves_the_incumbent() {
+    for (selector, argument) in [("--resume", "\"authored-session\""), ("--continue", "")] {
+        manual_authored_selection_publication(selector, argument, ManualPublicationCase::Metadata)
+            .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_authored_selection_launch_change_is_pending_and_cli_rollout_refuses_before_cutover() {
+    for (selector, argument) in [("--resume", "\"authored-session\""), ("--continue", "")] {
+        manual_authored_selection_publication(selector, argument, ManualPublicationCase::LaunchChange)
+            .await;
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManualPublicationCase {
+    Adoption,
+    Metadata,
+    LaunchChange,
+}
+
+async fn manual_authored_selection_publication(
+    selector: &'static str,
+    argument: &str,
+    case: ManualPublicationCase,
+) {
+    use st3::reconcile::{Reconciler, RuntimeControl, RuntimeObservation};
+
+    let root = tempfile::tempdir().unwrap();
+    let anchor = Arc::new(MemberKey::generate().unwrap().0);
+    let d = daemon(root.path(), "amber", anchor.clone(), &anchor).await;
+    append(
+        &d.store,
+        "daemon/amber",
+        "daemon.started",
+        json!({"status":"running", "features":{"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1}}),
+    );
+    let subject = "agent/garden/orchard";
+    let workspace = root.path().join("orchard");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let bundle = |model: &str, name: &str, manual: bool, authored: bool| {
+        format!(
+            "version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace {:?}; name {name:?}; {} harness \"claude\" {{ model {model:?}; {} }}; render {{ file \"active-model\" {model:?}; }} }}\n",
+            workspace.display().to_string(),
+            if manual { "rollout \"manual\";" } else { "" },
+            if authored {
+                format!("args {selector:?} {argument};")
+            } else {
+                String::new()
+            },
+        )
+    };
+    let authored_adoption = case == ManualPublicationCase::Adoption;
+    let unmanaged = st3::parse_intent(
+        &bundle("first", "unmanaged", false, authored_adoption),
+        "amber",
+    )
+    .unwrap();
+    d.store
+        .apply_internal(&unmanaged, "unmanaged-fixture")
+        .unwrap();
+    let member = unmanaged.subjects[subject].member.as_ref().unwrap();
+    let mut incarnation = "original-orchard";
+    let mut launched_token = d.store.selected_desired_token(subject).unwrap().unwrap();
+    let runtime = Arc::new(RolloutRuntime::default());
+    runtime.observations.lock().unwrap().insert(
+        member.runtime_id.clone(),
+        RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            incarnation_id: Some(incarnation.into()),
+            exit_code: None,
+        },
+    );
+    append(
+        &d.store,
+        subject,
+        "runtime.action.succeeded",
+        json!({"action":"start","desired_token":launched_token,"incarnation_id":incarnation}),
+    );
+    append(
+        &d.store,
+        subject,
+        "runtime.observed",
+        json!({"status":"running","host":"amber","runtime_id":member.runtime_id,"terminal":true,"incarnation_id":incarnation}),
+    );
+    native_observation(&d.store, subject, incarnation);
+    let reconciler = Reconciler::new(
+        d.store.clone(),
+        runtime.clone(),
+        "amber".into(),
+        Arc::new(Notify::new()),
+    );
+    reconciler.reconcile_once().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("active-model")).unwrap(),
+        "first"
+    );
+
+    // Adoption adds ownership and manual policy without replacing the authored launch.
+    let mut adoption = request(&d, 1, bundle("first", "managed", true, authored_adoption)).await;
+    adoption.options.adopt.insert(subject.into());
+    let adoption_preview = preview(&d, &mut adoption).await;
+    assert_eq!(adoption_preview.changes[subject], "added");
+    let applied: Value = d
+        .client
+        .post("/v1/sets/apply", &adoption)
+        .await
+        .unwrap();
+    assert_eq!(applied["publication"]["changed"], true);
+    assert!(d.store.owned_sets().unwrap()[0].receipt.adoptions.contains_key(subject));
+    reconciler.reconcile_once().unwrap();
+    let adopted = d
+        .store
+        .desired_subject_with_writer(subject)
+        .unwrap()
+        .unwrap()
+        .0;
+    assert!(st3::rollout::manual(&adopted));
+    assert_eq!(adopted.member.as_ref().unwrap().launch, member.launch);
+    assert!(runtime.starts.lock().unwrap().is_empty());
+    assert!(runtime.stops.lock().unwrap().is_empty());
+    assert!(d.store.rollout(subject).unwrap().is_none());
+    if case == ManualPublicationCase::Adoption {
+        let observations = runtime.snapshot_ptys().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].status, "running");
+        assert_eq!(observations[0].incarnation_id.as_deref(), Some(incarnation));
+        return;
+    }
+
+    if case == ManualPublicationCase::Metadata {
+        // Begin with a resumable owned set so this publication has its own negative control.
+        let mut authored = request(&d, 2, bundle("first", "managed", true, true)).await;
+        preview(&d, &mut authored).await;
+        d.client
+            .post::<_, Value>("/v1/sets/apply", &authored)
+            .await
+            .unwrap();
+        // Independent runtime evidence supplies the authored-selector incumbent for the
+        // metadata-only assertion, without pretending the reconciler rolled it out.
+        incarnation = "authored-orchard";
+        launched_token = d.store.selected_desired_token(subject).unwrap().unwrap();
+        let authored_member = d
+            .store
+            .desired_subject_with_writer(subject)
+            .unwrap()
+            .unwrap()
+            .0
+            .member
+            .unwrap();
+        runtime
+            .observations
+            .lock()
+            .expect("fixture mutex")
+            .remove(&member.runtime_id);
+        runtime.observations.lock().expect("fixture mutex").insert(
+            authored_member.runtime_id.clone(),
+            RuntimeObservation {
+                runtime_id: authored_member.runtime_id.clone(),
+                terminal: authored_member.terminal,
+                status: "running".into(),
+                incarnation_id: Some(incarnation.into()),
+                exit_code: None,
+            },
+        );
+        append(
+            &d.store,
+            subject,
+            "runtime.action.succeeded",
+            json!({"action":"start","desired_token":launched_token,"incarnation_id":incarnation}),
+        );
+        append(
+            &d.store,
+            subject,
+            "runtime.observed",
+            json!({"status":"running","host":authored_member.host,"runtime_id":authored_member.runtime_id,"terminal":authored_member.terminal,"incarnation_id":incarnation}),
+        );
+        native_observation(&d.store, subject, incarnation);
+        reconciler.reconcile_once().unwrap();
+
+        // Only the presentation name changes, which shares launch lineage with its
+        // predecessor; the authored selector and launch remain unchanged.
+        let mut metadata = request(&d, 3, bundle("first", "metadata-only", true, true)).await;
+        let metadata_preview = preview(&d, &mut metadata).await;
+        assert_eq!(metadata_preview.changes[subject], "changed");
+        assert!(metadata_preview.effects[subject].contains("launch unchanged"));
+        d.client
+            .post::<_, Value>("/v1/sets/apply", &metadata)
+            .await
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        let metadata_status: Value = d
+            .client
+            .get(&format!("/v1/client/sets/garden?sha={:040x}", 3))
+            .await
+            .unwrap();
+        assert_eq!(metadata_status["commit_status"]["published"], true);
+        assert_eq!(metadata_status["commit_status"]["running"], true);
+        let metadata_member = &metadata_status["members_status"][0];
+        assert_eq!(metadata_member["launch_current"], true);
+        assert_eq!(metadata_member["incarnation"], incarnation);
+        assert_eq!(metadata_member["launched_token"], launched_token);
+        assert_ne!(
+            metadata_member["desired_token"],
+            metadata_member["launched_token"]
+        );
+        assert!(d.store.rollout(subject).unwrap().is_none());
+        assert!(runtime.starts.lock().expect("fixture mutex").is_empty());
+        assert!(runtime.stops.lock().expect("fixture mutex").is_empty());
+        return;
+    }
+
+    let mut launch_change = request(&d, 2, bundle("second", "managed", true, true)).await;
+    let change_preview = preview(&d, &mut launch_change).await;
+    assert!(change_preview.effects[subject].contains("pending (manual)"));
+    d.client
+        .post::<_, Value>("/v1/sets/apply", &launch_change)
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        reconciler.reconcile_once().unwrap();
+    }
+    let pending: Value = d
+        .client
+        .get(&format!("/v1/client/sets/garden?sha={:040x}", 2))
+        .await
+        .unwrap();
+    assert_eq!(pending["commit_status"]["published"], true);
+    assert_eq!(pending["commit_status"]["satisfied"], true);
+    assert_eq!(pending["commit_status"]["running"], false);
+    assert_eq!(pending["members_status"][0]["rollout"], "pending");
+    assert_eq!(
+        pending["members_status"][0]["publication_status"],
+        "published, rollout pending (manual)"
+    );
+    assert_eq!(pending["members_status"][0]["incarnation"], incarnation);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("active-model")).unwrap(),
+        "first"
+    );
+    assert!(d.store.rollout(subject).unwrap().is_none());
+    assert!(runtime.starts.lock().unwrap().is_empty());
+    assert!(runtime.stops.lock().unwrap().is_empty());
+
+    let socket = d.client.socket_path().unwrap().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        st3::test_support::command(test_bin!("st3-fixture"))
+            .env_remove("ST_AGENT")
+            .env_remove("ST_MISSION_RUN")
+            .args(["--endpoint"])
+            .arg(socket)
+            .args(["agents", "rollout", subject, "--as", "person/operator"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("authored-session-selection"), "{error}");
+    assert!(error.contains("cannot resume"), "{error}");
+    assert!(error.contains(selector), "{error}");
+    let api_error = d
+        .client
+        .post::<_, Value>(
+            "/v1/agents/rollout",
+            &json!({
+                "subject":subject,
+                "actor":"person/operator",
+                "expected_desired":d.store.selected_desired_token(subject).unwrap().unwrap(),
+                "expected_incarnation":incarnation,
+                "policy":st3::rollout::Policy::when_idle(1_800_000, false),
+                "idempotency_key":"unsupported-manual-rollout",
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(api_error.to_string().contains("authored-session-selection"), "{api_error}");
+    assert!(api_error.to_string().contains("cannot resume"), "{api_error}");
+    assert!(api_error.to_string().contains(selector), "{api_error}");
+
+    // A refused request must not leave a durable drain or action for reconciliation.
+    assert!(
+        d.store
+            .latest_claim(subject, Some("runtime.action.requested"))
+            .unwrap()
+            .is_none()
+    );
+    for _ in 0..3 {
+        reconciler.reconcile_once().unwrap();
+    }
+    assert!(d.store.rollout(subject).unwrap().is_none());
+    assert!(runtime.starts.lock().unwrap().is_empty());
+    assert!(runtime.stops.lock().unwrap().is_empty());
+    let observations = runtime.snapshot_ptys().unwrap();
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].status, "running");
+    assert_eq!(observations[0].incarnation_id.as_deref(), Some(incarnation));
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("active-model")).unwrap(),
+        "first"
+    );
+    let agent: Value = d
+        .client
+        .get(&format!("/v1/client/agents/{subject}"))
+        .await
+        .unwrap();
+    assert_eq!(agent["state"], "running");
+    assert_eq!(agent["rollout"]["status"], "published, rollout pending (manual)");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_publication_preserves_suspension_and_requires_resume_before_rollout() {
+    let root = tempfile::tempdir().unwrap();
+    let anchor = Arc::new(MemberKey::generate().unwrap().0);
+    let d = daemon(root.path(), "amber", anchor.clone(), &anchor).await;
+    append(
+        &d.store,
+        "daemon/amber",
+        "daemon.started",
+        json!({"status":"running", "features":{"owned_sets":1,"seat_rollout":1,"seat_rollout_manual":1}}),
+    );
+    let subject = "agent/garden/orchard";
+    let workspace = root.path().join("orchard");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let bundle = |model: &str| {
+        format!("version 2\nagent \"garden/orchard\" {{ host \"amber\"; workspace {:?}; rollout \"manual\"; harness \"claude\" {{ model {model:?}; }} }}\n",
+            workspace.display().to_string())
+    };
+    let mut initial = request(&d, 1, bundle("first")).await;
+    preview(&d, &mut initial).await;
+    d.client.post::<_, Value>("/v1/sets/apply", &initial).await.unwrap();
+    let incumbent = d.store.selected_desired_token(subject).unwrap().unwrap();
+    let member = d.store.desired_subject_with_writer(subject).unwrap().unwrap().0.member.unwrap();
+    append(&d.store, subject, "runtime.action.succeeded",
+        json!({"action":"start","desired_token":incumbent,"incarnation_id":"original"}));
+    append(&d.store, subject, "runtime.observed",
+        json!({"status":"running","host":"amber","runtime_id":member.runtime_id,"terminal":true,"incarnation_id":"original"}));
+    native_observation(&d.store, subject, "original");
+    d.client.post::<_, Value>("/v1/agents/suspend",
+        &json!({"subject":subject,"actor":"person/operator","idempotency_key":"suspend-before-publication"}))
+        .await.unwrap();
+    let operation = st3::suspension::current(&d.store, subject).unwrap().unwrap();
+    assert_eq!(operation.phase, "quiescing");
+
+    // Publish while suspend is in flight. Owner acknowledgements model the stopped
+    // runtime boundary; native process continuity is covered by the lifecycle tests.
+    let mut changed = request(&d, 2, bundle("second")).await;
+    preview(&d, &mut changed).await;
+    d.client.post::<_, Value>("/v1/sets/apply", &changed).await.unwrap();
+    assert_eq!(st3::suspension::current(&d.store, subject).unwrap().unwrap().operation_id, operation.operation_id);
+    for (key, phase) in [
+        (st3::suspension::suspend_snapshot_key(&operation.operation_id), "snapshotting"),
+        (st3::suspension::suspend_completed_key(&operation.operation_id), "suspended"),
+    ] {
+        d.store.append_claim(&ClaimInput {
+            subject: subject.into(),
+            kind: "runtime.action.succeeded".into(),
+            actor: Some("person/operator".into()),
+            fields: serde_json::from_value(json!({"action":"suspend","operation_status":phase,"harness":"claude","native_session_id":"native-agent-garden-orchard"})).unwrap(),
+            evidence: vec![operation.operation_id.clone()],
+            expected_subject: None,
+            idempotency_key: Some(key),
+        }).unwrap();
+    }
+    append(&d.store, subject, "runtime.observed",
+        json!({"status":"exited","host":"amber","runtime_id":member.runtime_id,"terminal":true,"incarnation_id":"original","exit_code":0}));
+    let runtime = Arc::new(RolloutRuntime::default());
+    let reconciler = st3::reconcile::Reconciler::new(
+        d.store.clone(), runtime.clone(), "amber".into(), Arc::new(Notify::new()));
+    reconciler.reconcile_once().unwrap();
+    assert!(runtime.starts.lock().unwrap().is_empty());
+    let shown: Value = d.client.get(&format!("/v1/client/agents/{subject}")).await.unwrap();
+    assert_eq!(shown["state"], "suspended");
+    assert_eq!(shown["rollout"]["mode"], "manual");
+    assert_eq!(shown["rollout"]["status"], "published, rollout pending (manual)");
+    let refused = d.client.post::<_, Value>("/v1/agents/rollout",
+        &json!({"subject":subject,"actor":"person/operator","expected_desired":d.store.selected_desired_token(subject).unwrap().unwrap(),"expected_incarnation":"original","policy":st3::rollout::Policy::when_idle(1_800_000, false),"idempotency_key":"rollout-while-suspended"}))
+        .await.unwrap_err();
+    assert!(refused.to_string().contains("rollout-suspended"), "{refused}");
+    assert!(d.store.rollout(subject).unwrap().is_none());
+    d.client.post::<_, Value>("/v1/agents/resume",
+        &json!({"subject":subject,"actor":"person/operator","idempotency_key":"resume-incumbent"}))
+        .await.unwrap();
+    let resumed = st3::suspension::current(&d.store, subject).unwrap().unwrap();
+    assert_eq!(resumed.phase, "restoring");
+    assert_eq!(resumed.native_session_id.as_deref(), Some("native-agent-garden-orchard"));
+    assert_ne!(d.store.selected_desired_token(subject).unwrap().unwrap(), incumbent);
+    assert!(d.store.rollout(subject).unwrap().is_none());
+    d.store.append_claim(&ClaimInput {
+        subject: subject.into(),
+        kind: "runtime.action.succeeded".into(),
+        actor: Some("person/operator".into()),
+        fields: serde_json::from_value(json!({"action":"resume","operation_status":"resumed","harness":"claude","native_session_id":"native-agent-garden-orchard","incarnation_id":"resumed-incumbent"})).unwrap(),
+        evidence: vec![resumed.operation_id.clone()],
+        expected_subject: None,
+        idempotency_key: Some(st3::suspension::resume_completed_key(&resumed.operation_id)),
+    }).unwrap();
+    append(&d.store, subject, "runtime.action.succeeded",
+        json!({"action":"start","desired_token":incumbent,"incarnation_id":"resumed-incumbent"}));
+    append(&d.store, subject, "runtime.observed",
+        json!({"status":"running","host":"amber","runtime_id":member.runtime_id,"terminal":true,"incarnation_id":"resumed-incumbent"}));
+    native_observation(&d.store, subject, "resumed-incumbent");
+    let shown: Value = d.client.get(&format!("/v1/client/agents/{subject}")).await.unwrap();
+    assert_eq!(shown["state"], "running");
+    assert_eq!(shown["rollout"]["status"], "published, rollout pending (manual)");
+    d.client.post::<_, Value>("/v1/agents/rollout",
+        &json!({"subject":subject,"actor":"person/operator","expected_desired":d.store.selected_desired_token(subject).unwrap().unwrap(),"expected_incarnation":"resumed-incumbent","policy":st3::rollout::Policy::when_idle(1_800_000, false),"idempotency_key":"rollout-after-resume"}))
+        .await.unwrap();
+    assert_eq!(d.store.rollout(subject).unwrap().unwrap().phase, "draining");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_declaration_diffs_match_publication_reads_and_mission_previews() {
     use st3::model::{MissionRequest, MissionResponse};
     let root = tempfile::tempdir().unwrap();

@@ -12,7 +12,7 @@ stui
 
 stui opens a space with tabs and splits. **Ctrl+S** shows or hides the sidebar; choose **Agents** or **Missions** there. **Ctrl+K** finds an agent, mission, machine, space, or text in conversations; type a name and press **Enter** to open it.
 
-- **Home** shows attention items: decisions, requests, unread messages, and failures that need you. Open it with **Ctrl+H** when you are not typing, or click the need-you count. Follow each card's displayed actions; opening a card does not approve it.
+- **Home** (Now) lists your alerts, then updates that ask nothing. An alert is anything waiting on your answer: an ask, a review gate, a launch or revision approval, a harness prompt or login. Open it with **Ctrl+H** when you are not typing, or click the alert count in the top bar; the bar prints nothing when there are none. Each alert also shows in its agent's conversation, above the message box, with one-tap answers (a Claude permission prompt's allow and deny beside the call it would make, a request's named answers) and **open in Now** for the whole card. Follow each card's displayed actions; opening a card does not approve it.
 - **Agents** opens a seat's conversation, with messages, the harness transcript, and tool output. Scroll to read earlier entries; type in the message box and press **Enter** to reply.
 - **Missions** shows each run's steps, progress, waiting reason, and who is working on it.
 - **Usage** shows observed tokens, estimated cost, and account limits. Click **$ usage** in the top bar (widen the terminal if needed); **b** changes grouping and **p** changes the period.

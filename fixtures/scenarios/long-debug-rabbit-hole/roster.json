@@ -1,0 +1,393 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "roster",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 22
+  },
+  "state": {
+    "agents": [
+      {
+        "active_work_count": 1,
+        "ask": null,
+        "blocked_on": null,
+        "checkout": {
+          "base": "origin/main",
+          "branch": "builder/search-test-flake",
+          "repository": "~/src/atlas"
+        },
+        "current_session_id": "session/example-atlas-builder",
+        "current_work": [
+          {
+            "id": "step-run/example/atlas/search-test-flake/1/step-2",
+            "mission_id": "mission/example/atlas/search-test-flake",
+            "mission_run_id": "mission-run/example/atlas/search-test-flake/1",
+            "path": "step-2",
+            "since": "2030-01-01T11:20:00.000Z",
+            "state": "claimed",
+            "title": "Isolate the test abort signal"
+          }
+        ],
+        "current_work_ids": [
+          "step-run/example/atlas/search-test-flake/1/step-2"
+        ],
+        "driver": "claude",
+        "fault": null,
+        "harness_state": "busy",
+        "host_id": "host/lantern",
+        "id": "agent/example/atlas/builder",
+        "incarnation_id": "rt-atlas-builder-750:4",
+        "kind": "agent",
+        "last_activity_at": "2030-01-01T11:59:52.000Z",
+        "name": "Atlas Builder",
+        "next_work": {
+          "id": "step-run/example/atlas/search-test-flake/1/step-3",
+          "mission_id": "mission/example/atlas/search-test-flake",
+          "mission_run_id": "mission-run/example/atlas/search-test-flake/1",
+          "path": "step-3",
+          "since": "2030-01-01T11:20:00.000Z",
+          "state": "ready",
+          "title": "Verify shuffled test orders"
+        },
+        "next_work_id": "step-run/example/atlas/search-test-flake/1/step-3",
+        "owner_run_id": "mission-run/example/atlas/search-test-flake/1",
+        "queued_work_count": 1,
+        "reachability": "local",
+        "revision": "ag29",
+        "runtime_ids": [
+          "runtime/example-atlas-builder"
+        ],
+        "since": "2030-01-01T11:20:00.000Z",
+        "state": "running",
+        "subagents": [],
+        "under": [],
+        "upcoming_work": [
+          {
+            "id": "step-run/example/atlas/search-test-flake/1/step-3",
+            "mission_id": "mission/example/atlas/search-test-flake",
+            "mission_run_id": "mission-run/example/atlas/search-test-flake/1",
+            "path": "step-3",
+            "since": "2030-01-01T11:20:00.000Z",
+            "state": "ready",
+            "title": "Verify shuffled test orders"
+          }
+        ],
+        "upcoming_work_ids": [
+          "step-run/example/atlas/search-test-flake/1/step-3"
+        ],
+        "updated_at": "2030-01-01T11:59:52.000Z",
+        "workspace": "~/src/atlas/.worktrees/builder"
+      }
+    ],
+    "machines": [
+      {
+        "capacity": {
+          "reason": "no capacity observation",
+          "state": "unknown"
+        },
+        "fleet_id": "fleet/example-atlas",
+        "host_id": "host/lantern",
+        "id": "machine/lantern",
+        "kind": "machine",
+        "name": "lantern",
+        "occupancy": {
+          "running_runtimes": 2
+        },
+        "projects": [
+          "~/src/atlas"
+        ],
+        "revision": "mh-lantern",
+        "runtime_ids": [
+          "runtime/example-atlas-builder",
+          "runtime/example-atlas-builder-shell"
+        ],
+        "state": "local",
+        "transports": [
+          {
+            "last_success_at": "2030-01-01T11:59:30.000Z",
+            "protocol": "unix",
+            "status": "local"
+          }
+        ],
+        "updated_at": "2030-01-01T11:59:30.000Z",
+        "work": [
+          "work/example/atlas/search-test-flake/1/step-2"
+        ]
+      }
+    ],
+    "order": [
+      "agent/example/atlas/builder"
+    ],
+    "runtimes": [
+      {
+        "desired_revision": "desired-1",
+        "id": "runtime/example-atlas-builder",
+        "incarnation_id": "rt-atlas-builder-750:4",
+        "kind": "runtime",
+        "owner_host_id": "host/lantern",
+        "owner_id": "agent/example/atlas/builder",
+        "owner_run_id": "mission-run/example/atlas/search-test-flake/1",
+        "revision": "rt30",
+        "runtime_id": "rt-atlas-builder-750",
+        "runtime_kind": "agent",
+        "state": "running",
+        "updated_at": "2030-01-01T11:20:00.000Z"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 6000,
+      "removes": [],
+      "store": 4,
+      "upserts": [
+        {
+          "active_work_count": 1,
+          "ask": null,
+          "blocked_on": null,
+          "checkout": {
+            "base": "origin/main",
+            "branch": "builder/search-test-flake",
+            "repository": "~/src/atlas"
+          },
+          "current_session_id": "session/example-atlas-builder",
+          "current_work": [
+            {
+              "id": "step-run/example/atlas/search-test-flake/1/step-3",
+              "mission_id": "mission/example/atlas/search-test-flake",
+              "mission_run_id": "mission-run/example/atlas/search-test-flake/1",
+              "path": "step-3",
+              "since": "2030-01-01T12:00:06.000Z",
+              "state": "verifying",
+              "title": "Verify shuffled test orders"
+            }
+          ],
+          "current_work_ids": [
+            "step-run/example/atlas/search-test-flake/1/step-3"
+          ],
+          "driver": "claude",
+          "fault": null,
+          "harness_state": "busy",
+          "host_id": "host/lantern",
+          "id": "agent/example/atlas/builder",
+          "incarnation_id": "rt-atlas-builder-750:4",
+          "kind": "agent",
+          "last_activity_at": "2030-01-01T12:00:06.000Z",
+          "name": "Atlas Builder",
+          "next_work": null,
+          "next_work_id": null,
+          "owner_run_id": "mission-run/example/atlas/search-test-flake/1",
+          "queued_work_count": 0,
+          "reachability": "local",
+          "revision": "ag8",
+          "runtime_ids": [
+            "runtime/example-atlas-builder"
+          ],
+          "since": "2030-01-01T12:00:06.000Z",
+          "state": "running",
+          "subagents": [],
+          "under": [],
+          "upcoming_work": [],
+          "upcoming_work_ids": [],
+          "updated_at": "2030-01-01T12:00:06.000Z",
+          "workspace": "~/src/atlas/.worktrees/builder"
+        },
+        {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-atlas-builder",
+          "incarnation_id": "rt-atlas-builder-750:4",
+          "kind": "runtime",
+          "owner_host_id": "host/lantern",
+          "owner_id": "agent/example/atlas/builder",
+          "owner_run_id": "mission-run/example/atlas/search-test-flake/1",
+          "revision": "rt18",
+          "runtime_id": "rt-atlas-builder-750",
+          "runtime_kind": "agent",
+          "state": "running",
+          "updated_at": "2030-01-01T12:00:06.000Z"
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 22000,
+      "removes": [],
+      "store": 8,
+      "upserts": [
+        {
+          "active_work_count": 0,
+          "ask": null,
+          "blocked_on": null,
+          "checkout": {
+            "base": "origin/main",
+            "branch": "builder/search-test-flake",
+            "repository": "~/src/atlas"
+          },
+          "current_session_id": "session/example-atlas-builder",
+          "current_work": [],
+          "current_work_ids": [],
+          "driver": "claude",
+          "fault": null,
+          "harness_state": "idle",
+          "host_id": "host/lantern",
+          "id": "agent/example/atlas/builder",
+          "incarnation_id": "rt-atlas-builder-750:4",
+          "kind": "agent",
+          "last_activity_at": "2030-01-01T12:00:22.000Z",
+          "name": "Atlas Builder",
+          "next_work": null,
+          "next_work_id": null,
+          "owner_run_id": "mission-run/example/atlas/search-test-flake/1",
+          "queued_work_count": 0,
+          "reachability": "local",
+          "revision": "ag7",
+          "runtime_ids": [
+            "runtime/example-atlas-builder"
+          ],
+          "since": "2030-01-01T12:00:22.000Z",
+          "state": "waiting",
+          "subagents": [],
+          "under": [],
+          "upcoming_work": [],
+          "upcoming_work_ids": [],
+          "updated_at": "2030-01-01T12:00:22.000Z",
+          "workspace": "~/src/atlas/.worktrees/builder"
+        },
+        {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-atlas-builder",
+          "incarnation_id": "rt-atlas-builder-750:4",
+          "kind": "runtime",
+          "owner_host_id": "host/lantern",
+          "owner_id": "agent/example/atlas/builder",
+          "owner_run_id": "mission-run/example/atlas/search-test-flake/1",
+          "revision": "rt11",
+          "runtime_id": "rt-atlas-builder-750",
+          "runtime_kind": "agent",
+          "state": "running",
+          "updated_at": "2030-01-01T12:00:22.000Z"
+        },
+        {
+          "capacity": {
+            "reason": "no capacity observation",
+            "state": "unknown"
+          },
+          "fleet_id": "fleet/example-atlas",
+          "host_id": "host/lantern",
+          "id": "machine/lantern",
+          "kind": "machine",
+          "name": "lantern",
+          "occupancy": {
+            "running_runtimes": 2
+          },
+          "projects": [
+            "~/src/atlas"
+          ],
+          "revision": "mh-verified",
+          "runtime_ids": [
+            "runtime/example-atlas-builder",
+            "runtime/example-atlas-builder-shell"
+          ],
+          "state": "local",
+          "transports": [
+            {
+              "last_success_at": "2030-01-01T11:59:30.000Z",
+              "protocol": "unix",
+              "status": "local"
+            }
+          ],
+          "updated_at": "2030-01-01T12:00:22.000Z",
+          "work": []
+        }
+      ]
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/next_work/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/agents/0/upcoming_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/runtimes/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/machines/0/transports/0/last_success_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/current_work/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/since"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/last_activity_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/2/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/2/transports/0/last_success_at"
+    }
+  ],
+  "variant": "default",
+  "world": "long-debug-rabbit-hole"
+}

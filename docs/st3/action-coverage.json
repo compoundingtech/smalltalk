@@ -1,5 +1,8 @@
 {
   "version": 1,
+  "client_commands": [
+    {"command":"observations.report","tests":["crates/st3/src/api/client_observations.rs::observation_paired_session_transport_reader_doctor_and_body_limits","crates/st3/src/api/client_observations.rs::observation_dedup_conflict_overlap_and_history_failure_have_no_partial_acceptance","crates/st3/src/api/client_observations.rs::observation_history_is_bounded_rotates_expires_and_survives_restart"],"behavior":"Paired-only local diagnostics; no graph mutation, snapshot fence, replicated ACK or durable receipt. Memory dedup/overlap survives identical retries only within bounded process retention; JSONL history persists independently."}
+  ],
   "typed_actions": [
     {
       "action": "agent.create",
@@ -78,9 +81,12 @@
       "action": "prompt.respond",
       "tests": [
         "crates/st3/src/store.rs::a_claude_permission_prompt_is_answered_once_by_its_person_while_it_waits",
-        "crates/st3/src/driver_hook.rs::a_permission_hook_returns_the_persons_answer_and_nothing_else"
+        "crates/st3/src/driver_hook.rs::a_permission_hook_returns_the_persons_answer_and_nothing_else",
+        "crates/st3/src/store.rs::a_codex_permission_prompt_is_answered_and_records_its_driver",
+        "crates/st-drivers/src/codex_app_server/tests.rs::an_approval_answered_in_st_is_sent_once_and_only_for_this_thread",
+        "crates/st-drivers/src/codex_app_server/tests.rs::a_persons_answer_takes_each_approval_methods_own_decision_words"
       ],
-      "behavior": "store and hook tests: only the seat's person answers, only the prompt still waiting (stale or terminal-only prompts refused), once; the answered alert disappears; the waiting hook returns the answer, stops when the prompt is gone and says nothing when time runs out"
+      "behavior": "store, hook and Codex driver tests: only the seat's person answers, only the prompt still waiting (stale or terminal-only prompts refused), once; the answered alert disappears; the waiting hook returns the answer, stops when the prompt is gone and says nothing when time runs out; the Codex driver sends the answer once in the request method's decision words, only for its own thread, and forgets a request resolved in the TUI or left behind"
     },
     {
       "action": "lane.approve",
@@ -758,6 +764,7 @@
       "command": "st conversations reply",
       "description": "Reply to one canonical message ID while preserving its thread",
       "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_silent_kinds_and_count_reads_survive_restart",
         "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -774,6 +781,7 @@
       "command": "st conversations send",
       "description": "Send one durable normalized message to an agent",
       "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_silent_kinds_and_count_reads_survive_restart",
         "crates/st3/tests/action_coverage.rs::cli_send_reply_read_archive_search_and_attachments_survive_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -1341,6 +1349,7 @@
       "command": "st missions show",
       "description": "Explain one mission run, its goals, state, work, and usage",
       "tests": [
+        "crates/st3/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -1984,6 +1993,7 @@
       "command": "st usage",
       "description": "Show token spend over a period, with the largest spenders first",
       "tests": [
+        "crates/st3/tests/action_coverage.rs::cli_silent_kinds_and_count_reads_survive_restart",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -2074,6 +2084,7 @@
       "command": "st work ls",
       "description": "List current actionable work; use --as to filter one agent or --all for history",
       "tests": [
+        "crates/st3/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -2170,6 +2181,7 @@
       "command": "st work show",
       "description": "Explain one work item, its owner, readiness, lease, and evidence",
       "tests": [
+        "crates/st3/src/api/client_v0.rs::mission_detail_and_the_tree_read_no_step_history",
         "crates/st3/tests/action_coverage.rs::cli_reads_preserve_operational_views_after_restart"
       ],
       "verification": "real CLI over private Unix socket; disk store reopened between actions"
@@ -2201,6 +2213,19 @@
     }
   ],
   "stui_effects": [
+    {
+      "effect": "LoadContent",
+      "tests": [
+        "crates/stui/src/ui/mod.rs::content_controls_emit_load_effects_once_and_release_on_collapse_or_hide",
+        "crates/stui/src/ui/mod.rs::expand_all_loads_visible_clipped_blocks_sequentially_and_collapse_releases",
+        "crates/stui/src/ui/mod.rs::automatic_images_use_visible_image_lines_graphics_and_one_read_at_a_time",
+        "crates/stui/src/ui/content.rs::chunks_assemble_the_entire_original_json_from_zero",
+        "crates/stui/src/ui/content.rs::chunks_reject_changed_identity_and_non_progressing_offsets",
+        "crates/st3/src/api/client_v0/conversation_blocks.rs::truncated_tool_output_http_chunks_return_complete_native_body_without_writes",
+        "crates/st3/src/api/client_v0/conversation_blocks.rs::http_owner_chunks_negotiate_bound_bytes_and_visibly_invalidate_without_writes"
+      ],
+      "verification": "content-control reducer and viewport queue; chunk assembly and identity checks; real owner HTTP chunk transport returns complete content without durable writes"
+    },
     {
       "effect": "OpenImage",
       "tests": [

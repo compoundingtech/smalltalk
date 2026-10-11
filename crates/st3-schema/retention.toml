@@ -1,0 +1,348 @@
+# How long st keeps each claim kind, and which claims a checkpoint may drop.
+#
+# docs/st3/retention.md explains the classes and how to change this file. The daemon reads it when
+# it builds the schema registry (`st3_schema::retention`), so every build carries exactly one
+# policy. The rules below are hashed into the checkpoint rules digest: members agree on a
+# checkpoint only when they run the same rules, so a member with a different policy waits instead
+# of dropping something its peers keep.
+#
+# Every registered claim kind is named once under [kinds]. A custom kind (`custom.*`) is durable.
+#
+#   class   current     only the latest state matters; a checkpoint keeps the newest per slot
+#           transition  status changes and deliveries; kept for `window`, then dropped
+#           durable     missions, decisions, messages, reviews, evidence, receipts; kept forever
+#           otel        an observation series; history goes to OpenTelemetry through
+#                       [observations.otlp], and the graph keeps the latest per slot
+#   log     claims      every write is a replicated claim (the default)
+#           on-change   every write goes to the local observation log, and a replicated claim is
+#                       written only when the state changes
+#           local       only the local observation log of the node that made it
+#           system-local  local when the system writes it without an actor; replicated when a
+#                       person or agent writes it as its actor
+#   window  for a transition, how long it stays in the replicated log
+#   pending why a kind whose class allows dropping has no checkpoint rule yet; it is kept whole
+#           until one exists
+
+[kinds]
+"agent.account" = { class = "durable" }
+"agent.placement.source-offline" = { class = "transition", window = "7d", pending = "no reader audit yet" }
+"agent.presence" = { class = "current", pending = "no reader audit yet" }
+"agent.queue.moved" = { class = "durable" }
+"arrangement.edited" = { class = "durable" }
+"attention.requested" = { class = "durable" }
+"attention.resolved" = { class = "durable" }
+"checkpoint.excused" = { class = "durable" }
+"checkpoint.sealed" = { class = "durable" }
+"checkpoint.verified" = { class = "durable" }
+"daemon.diagnostic" = { class = "current" }
+"daemon.started" = { class = "transition", window = "7d", pending = "restart windows read every start" }
+"delivery.hold" = { class = "durable" }
+"doc.bound" = { class = "durable" }
+"eval.verdict" = { class = "durable" }
+"file.observed" = { class = "durable" }
+"fleet.invite-created" = { class = "durable" }
+"fleet.invite-redeemed" = { class = "durable" }
+"fleet.invite-revoked" = { class = "durable" }
+"fleet.member-admitted" = { class = "durable" }
+"fleet.member-endpoints" = { class = "current", pending = "the membership fold reads every endpoint claim" }
+"fleet.member-left" = { class = "durable" }
+"fleet.member-removed" = { class = "durable" }
+"gate.requested" = { class = "durable" }
+"gate.result" = { class = "durable" }
+"github.posted" = { class = "durable" }
+"glass.deleted" = { class = "durable" }
+"glass.upserted" = { class = "durable" }
+"harness.context-clear.requested" = { class = "transition", window = "7d", pending = "no reader audit yet" }
+"harness.context-clear.result" = { class = "transition", window = "7d", pending = "no reader audit yet" }
+"harness.diagnostic" = { class = "transition", window = "7d", pending = "only the seat status history rule retains its sources" }
+"harness.limits" = { class = "current" }
+# Other nodes read the current harness state: step readiness is judged on the mission's node and
+# fleet views run anywhere. Nothing reads a heartbeat, so only changes replicate.
+"harness.observed" = { class = "current", log = "on-change" }
+"harness.session-file" = { class = "durable" }
+# The owner reads a transcript from the harness's own session file, or from the local log when
+# there is none. Other nodes relay timeline reads to the owner.
+"harness.telemetry" = { class = "otel", log = "local" }
+"harness.timeline" = { class = "transition", window = "7d", log = "local" }
+"harness.todo.observed" = { class = "current", log = "on-change" }
+# Every response goes to OpenTelemetry through [observations.otlp]. The replicated rollups keep
+# the last snapshot of each UTC hour for seven days, then each series' newest: account allowances
+# are weekly, so those seven days are usage's current window, which `st usage` and budget
+# forecasting read across the fleet, not old history. On a 14 GB production member this kind is
+# about 450 MB with its overhead, and checkpoints already drop 88% of its claims.
+"harness.usage" = { class = "otel", log = "on-change" }
+"intent.desired" = { class = "durable" }
+"lane.approved" = { class = "durable" }
+"lane.joined" = { class = "transition", window = "7d", pending = "lane order folds every join and leave" }
+"lane.left" = { class = "transition", window = "7d", pending = "lane order folds every join and leave" }
+"lane.marked" = { class = "transition", window = "7d", pending = "lane order folds every mark" }
+"lane.moved" = { class = "transition", window = "7d", pending = "lane order folds every move" }
+"loop.round-dispatch" = { class = "durable" }
+"loop.round-result" = { class = "durable" }
+"loop.state" = { class = "transition", window = "7d" }
+"message.closed" = { class = "durable" }
+"message.delivered" = { class = "transition", window = "7d", pending = "delivery state reads it until the message closes" }
+"message.read" = { class = "transition", window = "7d", pending = "unread state reads it until the message closes" }
+"message.sent" = { class = "durable" }
+"message.staged" = { class = "transition", window = "7d", pending = "delivery state reads it until the message closes" }
+"mission-run.created" = { class = "durable" }
+"mission-run.report-to" = { class = "durable" }
+"mission-run.state" = { class = "durable" }
+"mission.produced" = { class = "durable" }
+"mission.provenance" = { class = "durable" }
+"mission.published" = { class = "durable" }
+"observer.observed" = { class = "current" }
+"observer.refresh-requested" = { class = "transition", window = "7d", pending = "no reader audit yet" }
+"observer.state" = { class = "current", pending = "no reader audit yet" }
+"operational.failure" = { class = "transition", window = "7d", pending = "no reader audit yet" }
+"operational.recovered" = { class = "transition", window = "7d", pending = "no reader audit yet" }
+"owned-set.revised" = { class = "durable" }
+"person.delegation-set" = { class = "durable" }
+"planning-session.approved" = { class = "durable" }
+"planning-session.cancelled" = { class = "durable" }
+"planning-session.candidate-submitted" = { class = "durable" }
+"planning-session.previewed" = { class = "durable" }
+"planning-session.question-answered" = { class = "durable" }
+"planning-session.question-requested" = { class = "durable" }
+"planning-session.revision-requested" = { class = "durable" }
+"planning-session.started" = { class = "durable" }
+"principal.key-granted" = { class = "durable" }
+"principal.key-revoked" = { class = "durable" }
+"publication.operation" = { class = "durable" }
+"reconcile.fault" = { class = "transition", window = "7d", pending = "no reader audit yet" }
+"record.repaired" = { class = "durable" }
+# Only the node that made them reads render receipts and the readiness deadline, whose attention
+# request replicates.
+"render.applied" = { class = "transition", window = "7d", log = "local" }
+"repair.applied" = { class = "durable" }
+"resource.observed" = { class = "current" }
+"revision-proposal.applied" = { class = "durable" }
+"revision-proposal.approved" = { class = "durable" }
+"revision-proposal.cancelled" = { class = "durable" }
+"revision-proposal.created" = { class = "durable" }
+"rule.audited" = { class = "durable" }
+"rule.set" = { class = "durable" }
+"run-generation.created" = { class = "durable" }
+"run-generation.state" = { class = "durable" }
+"run-generation.superseded" = { class = "durable" }
+# The owner's reconciler records its own starts, stops and kills: the stop deadline fence, restart
+# windows and adoption read them on that node only. Another node stops a runtime through a
+# replicated `stop` intent. A person's signal names its requester and replicates.
+"runtime.action.deadline-reached" = { class = "transition", window = "7d", log = "system-local" }
+"runtime.action.failed" = { class = "transition", window = "7d", log = "system-local" }
+"runtime.action.requested" = { class = "transition", window = "7d", log = "system-local" }
+"runtime.action.succeeded" = { class = "transition", window = "7d", log = "system-local" }
+"runtime.observed" = { class = "current", pending = "only the seat status history rule retains its sources" }
+"runtime.readiness-deadline-reached" = { class = "transition", window = "7d", log = "local" }
+"runtime.reconcile-decision" = { class = "current" }
+"runtime.restart-window-reset" = { class = "transition", window = "7d", pending = "restart windows read every reset" }
+"schedule.occurrence-cancelled" = { class = "durable" }
+"schedule.occurrence-reached" = { class = "durable" }
+"schedule.occurrence-scheduled" = { class = "durable" }
+"schedule.work-failed" = { class = "durable" }
+"schedule.work-requested" = { class = "durable" }
+"schedule.work-started" = { class = "durable" }
+# A host's sekrets gateway is that host's: its calls, refusals and changes age out with the local
+# log (seven days by default) and go to OpenTelemetry for anything longer.
+"sekret.called" = { class = "transition", window = "7d", log = "local" }
+"sekret.changed" = { class = "transition", window = "7d", log = "local" }
+"sekret.exited" = { class = "transition", window = "7d", log = "local" }
+"sekret.refused" = { class = "transition", window = "7d", log = "local" }
+"step-run.carried" = { class = "durable" }
+"step-run.retried" = { class = "durable" }
+"step-run.state" = { class = "durable" }
+"subagent.appeared" = { class = "transition", window = "7d", pending = "the subagent lease fold reads it" }
+"subagent.ended" = { class = "transition", window = "7d", pending = "the subagent lease fold reads it" }
+"subagent.renewed" = { class = "current", pending = "the subagent lease fold reads every renewal" }
+"subscription.batch-sent" = { class = "transition", window = "7d", pending = "batch delivery reads it" }
+"subscription.batched" = { class = "transition", window = "7d", pending = "batch delivery reads it" }
+"subscription.mission-deferred" = { class = "transition", window = "7d" }
+"subscription.mission-failed" = { class = "transition", window = "7d", pending = "it closes a mission request" }
+"subscription.mission-request-cancelled" = { class = "transition", window = "7d", pending = "it closes a mission request" }
+"subscription.mission-request-released" = { class = "transition", window = "7d", pending = "no reader audit yet" }
+"subscription.mission-requested" = { class = "transition", window = "7d", pending = "pending requests read it" }
+"subscription.mission-started" = { class = "transition", window = "7d", pending = "it closes a mission request" }
+"subscription.state" = { class = "current", pending = "no reader audit yet" }
+"subscription.watch-ended" = { class = "transition", window = "7d", pending = "no reader audit yet" }
+"terminal.input.requested" = { class = "transition", window = "7d", pending = "no reader audit yet" }
+"terminal.input.result" = { class = "transition", window = "7d", pending = "no reader audit yet" }
+"terminal.launch-geometry" = { class = "current", pending = "no reader audit yet" }
+"transport.observed" = { class = "current" }
+"work.claimed" = { class = "durable" }
+"work.extended" = { class = "durable" }
+"work.failed" = { class = "durable" }
+"work.nudged" = { class = "durable" }
+"work.person-asked" = { class = "durable" }
+"work.person-cancelled" = { class = "durable" }
+"work.person-done" = { class = "durable" }
+"work.progress" = { class = "durable" }
+"work.released" = { class = "durable" }
+"work.renewed" = { class = "current", pending = "the step timing fold reads every renewal" }
+"work.submitted" = { class = "durable" }
+"workspace.observed" = { class = "current", log = "on-change", pending = "no reader audit yet" }
+
+# The checkpoint rules, in order. Each names the kind it applies to, the conditions under which it
+# applies (`when`), the fields besides subject and kind that make up a slot (`slot`; `claim.origin`
+# is the writer, not a field), what it keeps, and how old a claim must be before the cut
+# (`min_age`). A claim no rule applies to is kept. Each rule renders as one line of the rules
+# description, which the rules digest hashes; `keep` names the planner function that implements
+# it. docs/st3/checkpoints.md explains each one.
+
+[[rules]]
+kind = "harness.observed"
+slot = ["incarnation_id"]
+require_slot = true
+keep = "first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field,current-native-auth-run-start"
+
+[[rules]]
+kind = "seat.status-history"
+slot = []
+after_slot = ["sources=exclude-status_transition-false-or-numeric-zero-heartbeats"]
+keep = "last-200-transition-including-native-auth-and-runtime-reset-sources-within-7d-before-cut,previous-transition-per-visible-incarnation-even-before-window,current-state-run-start"
+
+# A kind that became a local observation is dropped from the replicated log only when it is dated
+# at least five days before the cut. A checkpoint is due two days after its cut, so such a claim
+# is seven days old by then, which matches the local observation log's default retention.
+[[rules]]
+kind = "harness.timeline"
+slot = ["incarnation_id"]
+keep = "newest"
+min_age = "5d"
+
+[[rules]]
+kind = "loop.state"
+slot = []
+keep = "first-and-last-of-each-run-of-status-and-round,first-with-items"
+
+[[rules]]
+kind = "subscription.mission-deferred"
+slot = ["request"]
+keep = "all-while-open,newest"
+
+[[rules]]
+kind = "observer.observed"
+slot = []
+keep = "newest,newest-carrier-of-each-field"
+
+[[rules]]
+kind = "daemon.diagnostic"
+slot = ["code"]
+keep = "newest,newest-carrier-of-each-field"
+
+[[rules]]
+kind = "transport.observed"
+slot = ["claim.origin"]
+keep = "newest,newest-carrier-of-each-field"
+
+[[rules]]
+kind = "runtime.action.requested"
+when = ["actor=null"]
+slot = ["action", "incarnation_id", "operation_status"]
+keep = "newest"
+min_age = "5d"
+
+[[rules]]
+kind = "runtime.action.succeeded"
+when = ["actor=null"]
+slot = ["action", "incarnation_id", "operation_status"]
+keep = "newest"
+min_age = "5d"
+
+[[rules]]
+kind = "runtime.action.failed"
+when = ["actor=null"]
+slot = ["action", "incarnation_id", "operation_status"]
+keep = "newest"
+min_age = "5d"
+
+[[rules]]
+kind = "runtime.action.deadline-reached"
+when = ["actor=null"]
+slot = ["action", "incarnation_id", "operation_status"]
+keep = "newest"
+min_age = "5d"
+
+[[rules]]
+kind = "harness.usage"
+when = ["semantics=response_rollup"]
+slot = ["incarnation_id", "model", "account", "owner_run", "owner_step", "host"]
+keep = "newest,last-of-each-utc-hour-by-observed_at-within-7d-before-cut,newest-before-that"
+
+[[rules]]
+kind = "harness.usage"
+when = ["semantics=session_cumulative"]
+slot = ["incarnation_id"]
+keep = "newest,largest-total_tokens"
+
+[[rules]]
+kind = "harness.usage"
+when = ["semantics=context_occupancy"]
+slot = ["incarnation_id"]
+keep = "newest"
+
+# The account fold reads, for each account group (driver, account, declared account, weekly or
+# five-hour only), the readings measured within an hour of the group's newest, and each seat's
+# newest reading. A group's newest only moves forward, so a reading older than that hour is
+# never read again, whatever arrives later.
+[[rules]]
+kind = "harness.limits"
+slot = []
+keep = "newest,newest-reading,every-reading-within-1h-of-its-account-group-newest-measured_at"
+
+# The reconciler writes a decision only when it differs from the subject's newest, and reads
+# whether a decision with a given key was recorded, the newest member-reconcile decision, and the
+# subject's newest decision. Each key keeps its newest.
+[[rules]]
+kind = "runtime.reconcile-decision"
+slot = ["key"]
+keep = "newest,newest-carrier-of-each-field"
+
+[[rules]]
+kind = "resource.observed"
+when = ["actor=null", "observer=set"]
+slot = []
+keep = "newest"
+
+[[rules]]
+kind = "render.applied"
+slot = []
+keep = "newest"
+min_age = "5d"
+
+[[rules]]
+kind = "runtime.readiness-deadline-reached"
+slot = []
+keep = "newest"
+min_age = "5d"
+
+[[rules]]
+kind = "sekret.called"
+slot = []
+keep = "newest"
+min_age = "5d"
+
+[[rules]]
+kind = "sekret.exited"
+slot = []
+keep = "newest"
+min_age = "5d"
+
+[[rules]]
+kind = "sekret.refused"
+slot = []
+keep = "newest"
+min_age = "5d"
+
+[[rules]]
+kind = "sekret.changed"
+slot = []
+keep = "newest"
+min_age = "5d"
+
+# The newest todo snapshot replaces the older ones. This rule predates its description line;
+# describing it changes the rules digest, so it is described with the next rules version.
+[[rules]]
+kind = "harness.todo.observed"
+slot = []
+keep = "newest"
+undescribed = true

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Delivery probes publish a report on an outcome change or a five-minute heartbeat, not on every state save",
+  "replay": {"status": "none", "detail": "No replay or rebuild."},
+  "schema": {"status": "none", "detail": "No database change."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "The report format and doctor's check are unchanged. Doctor's latency for a passing route can be up to five minutes old; overdue results, late reads, alerts and recoveries still publish at once, and a published send in flight is replaced when it resolves."},
+  "downtime": {"status": "none", "detail": "The installed probe script takes effect when its seat restarts."},
+  "manual": {"status": "changed", "detail": "Reinstall scripts/st3-delivery-probe on each node and restart the probe seats, as for any probe update."},
+  "recovery": {"status": "none", "detail": "Reinstalling the previous script restores the old cadence."}
+}

@@ -29,6 +29,18 @@ const replaced = applyConversation(changed, { replace: true, items: [content(50,
 assert.deepEqual(texts(replaced), ['Fresh']);
 assert.equal(replaced.hasOlder, false);
 
+// The conversation header a page carries stays until a newer one arrives; a page without one
+// keeps the last, as it keeps the session id.
+{
+  const header = { model: { value: 'synthetic/model', source: 'transcript', as_of: '2026-10-06T12:00:00Z' } };
+  const withHeader = applyConversation(undefined, { replace: true, items: [content(60, 'm60')], hasMore: false, sessionId: 'session/one', header });
+  assert.deepEqual(withHeader.header, header);
+  assert.deepEqual(applyConversation(withHeader, { replace: false, items: [content(61, 'm61')], hasMore: false, sessionId: 'session/one' }).header, header, 'a change keeps the last header');
+  const next = { cost: { value: { usd: 1.5 }, source: 'register', as_of: '2026-10-06T12:01:00Z' } };
+  assert.deepEqual(applyConversation(withHeader, { replace: true, items: [content(62, 'm62')], hasMore: false, sessionId: 'session/one', header: next }).header, next, 'a newer header replaces it');
+  assert.equal(applyConversation(withHeader, { replace: true, items: [content(63, 'm63')], hasMore: false, sessionId: 'session/two' }).header, undefined, 'another session starts without one');
+}
+
 // Bounded: only the newest entries are kept, and the rest are marked as older history.
 const chatty = applyConversation(undefined, { replace: true, items: Array.from({ length: 150 }, (_, index) => content(index, `m${index}`)), hasMore: false }, 50);
 assert.equal(chatty.entries.length, 50);

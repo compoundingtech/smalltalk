@@ -5,6 +5,7 @@ pub mod custom;
 pub mod glasses;
 pub mod owned_terminals;
 pub mod provenance;
+pub mod retention;
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -1528,6 +1529,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "work.nudged",
+            &["step-run"],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
+        ),
+        (
             "gate.requested",
             &["gate-operation"],
             WritePolicy::SystemOnly,
@@ -2507,34 +2517,10 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
     claims
 }
 
-/// Observations that only the node that made them reads. See
-/// `docs/st3/data-authority.md` for the local observation log.
+/// Where a kind's writes go, as `retention.toml` names it. See `docs/st3/data-authority.md` for
+/// the local observation log.
 fn claim_retention(kind: &str) -> Retention {
-    match kind {
-        // The owner reads a transcript from the harness's own session file, or from this log
-        // when there is none. Other nodes relay timeline reads to the owner.
-        "harness.timeline" | "harness.telemetry" => Retention::Local,
-        // Only the node that made them reads these: render receipts and the readiness
-        // deadline, whose attention request replicates.
-        "render.applied" | "runtime.readiness-deadline-reached" => Retention::Local,
-        // A host's sekrets gateway is that host's: its calls, refusals and changes age out with
-        // the local log (seven days by default) and go to OpenTelemetry for anything longer.
-        "sekret.called" | "sekret.exited" | "sekret.refused" | "sekret.changed" => Retention::Local,
-        // The owner's reconciler records its own starts, stops and kills: the stop deadline
-        // fence, restart windows and adoption read them on that node only. Another node
-        // stops a runtime through a replicated `stop` intent. A person's signal names its
-        // requester and replicates.
-        "runtime.action.requested"
-        | "runtime.action.succeeded"
-        | "runtime.action.failed"
-        | "runtime.action.deadline-reached" => Retention::SystemLocal,
-        // Other nodes read the current harness state and usage: step readiness is judged on
-        // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
-        "harness.observed" | "harness.usage" | "harness.todo.observed" | "workspace.observed" => {
-            Retention::Latest
-        }
-        _ => Retention::Durable,
-    }
+    retention::policy().kind(kind).log.retention()
 }
 
 fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
@@ -2776,6 +2762,14 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("handoff_to", reference()),
             ("handoff_message", reference()),
             ("handoff_acknowledged", reference()),
+        ],
+        "work.nudged" => &[
+            ("attempt", integer()),
+            ("agent", reference()),
+            ("message", reference()),
+            ("idle_since_unix_ms", string()),
+            ("reason", string()),
+            ("waits", array()),
         ],
         "gate.requested" => &[
             ("status", string()),
@@ -4238,6 +4232,7 @@ mod tests {
                 "work.claimed",
                 "work.extended",
                 "work.failed",
+                "work.nudged",
                 "work.person-asked",
                 "work.person-cancelled",
                 "work.person-done",

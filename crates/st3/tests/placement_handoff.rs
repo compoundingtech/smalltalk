@@ -978,13 +978,9 @@ agent "example/mover" {{
     )
     .unwrap();
     let result = cobalt
-        .cli(&[
-            "agents",
-            "apply",
-            path.to_str().unwrap(),
-            "--as",
-            "person/avery",
-        ])
+        .cli(&["apply", "--no-gate-check", path.to_str().unwrap(),
+        "--as",
+        "person/avery",])
         .await;
     assert!(
         result.status.success(),

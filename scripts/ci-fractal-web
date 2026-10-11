@@ -33,6 +33,13 @@ toolchain() {
   pnpm --version && node --version && buck2 --version
 }
 
+production_build() (
+  local out_dir
+  out_dir=$(mktemp -d "${TMPDIR:-/tmp}/fractal-web-build.XXXXXX")
+  trap 'rm -rf "$out_dir"' EXIT
+  pnpm --dir apps/fractal-web exec vite build --config vite.config.ts --configLoader runner --outDir "$out_dir"
+)
+
 lane "Toolchain and Buck root" toolchain
 lane "Frozen install" pnpm install --frozen-lockfile
 lane "Dependency licenses" python3 scripts/ci-fractal-web-licenses --check
@@ -42,3 +49,15 @@ lane "Scenario tests" pnpm --filter @smalltalk/st3-scenarios test
 lane "Scenario freshness" pnpm --filter @smalltalk/st3-scenarios emit:check
 lane "Scenario decode" pnpm --filter @smalltalk/st3-scenarios decode
 lane "Scenario privacy" pnpm --filter @smalltalk/st3-scenarios scan
+lane "Measurement contracts" node --experimental-strip-types --test apps/fractal-web/src/telemetry/measurement/measurement.node-test.ts
+lane "Measurement bundle exclusion" bun apps/fractal-web/src/telemetry/measurement/check-bundles.mjs
+lane "Synthetic fixtures" bash apps/fractal-web/scripts/ci/fixtures-gate.sh
+lane "Extension registry" node --experimental-strip-types --test apps/fractal-web/src/extensions/registry.unit.test.ts
+lane "Folders core" node --test apps/fractal-web/src/folders/core.node-test.mjs
+lane "App typecheck" pnpm --filter fractal-web typecheck
+lane "App production build" production_build
+lane "App unit tests" pnpm --filter fractal-web test
+lane "SDK unit tests" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.config.ts
+lane "SDK frame CPU budgets" pnpm --dir apps/fractal-web/packages/st3-sdk exec vitest run --config vitest.perf.config.ts
+lane "UI kit typecheck" pnpm --filter @smalltalk/fractal-ui typecheck
+lane "UI kit Storybook" pnpm --filter @smalltalk/fractal-ui build-storybook

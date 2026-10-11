@@ -290,6 +290,7 @@
         "age": "33m",
         "agent": "agent/example/atlas/builder",
         "blocked": null,
+        "conversations": [],
         "id": "attention/1",
         "kind": {
           "because": "cut-over cannot start until you answer; the old store stays read-only meanwhile",
@@ -324,6 +325,7 @@
         "age": "12m",
         "agent": "agent/example/docs/writer",
         "blocked": null,
+        "conversations": [],
         "id": "attention/2",
         "kind": {
           "excerpt": [
@@ -352,6 +354,7 @@
         "age": "1h",
         "agent": "agent/example/planner",
         "blocked": null,
+        "conversations": [],
         "id": "attention/3",
         "kind": {
           "kind": "launch",
@@ -425,6 +428,7 @@
         "age": "8m",
         "agent": "agent/example/release/captain",
         "blocked": null,
+        "conversations": [],
         "id": "attention/4",
         "kind": {
           "because": "the weekly release cannot tag until this seat is back",
@@ -445,6 +449,7 @@
         "age": "19m",
         "agent": "agent/example/rekey/worker",
         "blocked": null,
+        "conversations": [],
         "id": "attention/5",
         "kind": {
           "changes": [
@@ -472,6 +477,7 @@
         "age": "2h",
         "agent": "agent/example/cos",
         "blocked": null,
+        "conversations": [],
         "id": "attention/6",
         "kind": {
           "body": "Usage this week is **up 18%**, almost all from the atlas store move (reruns of the compare step).\n\nNo action needed; it should fall back once the cut-over is done.",

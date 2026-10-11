@@ -328,6 +328,13 @@ type ProofSources = BTreeMap<(String, String), Vec<CheckpointItemSource>>;
 // No source/subject IDs are keys, and suppressed failures have no flush, queue or retry.
 static CHECKPOINT_DIAGNOSTICS: std::sync::OnceLock<std::sync::Mutex<super::ProjectionDiagnosticState>> = std::sync::OnceLock::new();
 
+/// The tombstones a sealed set reads: those before the cut, but none of a checkpoint whose trim
+/// is still recording them. A trim records tombstones in chunks, so after a crash part way
+/// through, the plan made again reads only what earlier checkpoints dropped, as it did the first
+/// time, and records the rest.
+const RECORDED_TOMBSTONE_FILTER: &str = "accepted_at_unix_ms < ?3
+    AND checkpoint NOT IN (SELECT id FROM checkpoints WHERE state='recording')";
+
 /// Record the tombstones of a checkpoint's drop. Recording them again changes nothing.
 pub fn record_checkpoint_tombstones_tx(
     transaction: &Transaction<'_>,
@@ -619,6 +626,9 @@ fn open_checkpoint_copy(copy: &Path) -> Result<Connection> {
 
 /// Project a copy of the sealed set with and without the drop, and compare the graph and every
 /// reader answer. `copy` is a store file holding at least the sealed set; it is changed.
+/// The key a proof compares the runtime's global answers under, beside the subjects' answers.
+pub const GLOBAL_ANSWERS: &str = "fleet";
+
 pub fn prove_on_copy(
     runtime: &dyn Runtime,
     copy: &Path,
@@ -688,7 +698,10 @@ pub fn prove_on_copy(
     runtime.replay_checkpoint_projections(&transaction)?;
     let graph_digest_before = graph_digest(&transaction)?;
     let digests_before = projection_digest::tables(&transaction)?;
-    let (before, before_sources) = reader_answers_with_sources(runtime, &transaction, &subjects, sealed.cut_unix_ms)?;
+    let (mut before, before_sources) = reader_answers_with_sources(runtime, &transaction, &subjects, sealed.cut_unix_ms)?;
+    if let Some(answers) = runtime.checkpoint_global_answers(&transaction)? {
+        before.insert(GLOBAL_ANSWERS.into(), answers);
+    }
     // As a trim does: tombstones first, which readers that walk ancestry pass through.
     record_checkpoint_tombstones_tx(
         &transaction,
@@ -699,7 +712,10 @@ pub fn prove_on_copy(
     delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims)?;
     runtime.replay_checkpoint_projections(&transaction)?;
     let graph_digest_after = graph_digest(&transaction)?;
-    let (after, after_sources) = reader_answers_with_sources(runtime, &transaction, &subjects, sealed.cut_unix_ms)?;
+    let (mut after, after_sources) = reader_answers_with_sources(runtime, &transaction, &subjects, sealed.cut_unix_ms)?;
+    if let Some(answers) = runtime.checkpoint_global_answers(&transaction)? {
+        after.insert(GLOBAL_ANSWERS.into(), answers);
+    }
     let mut mismatches = answer_mismatches(&before, &after);
     if graph_digest_before != graph_digest_after {
         mismatches.splice(
@@ -1026,7 +1042,7 @@ impl Store {
             CheckpointCaptureQuery {
                 table: "checkpoint_envelopes",
                 columns: "writer, sequence, envelope_hash, accepted_at_unix_ms",
-                filter: "accepted_at_unix_ms < ?3",
+                filter: RECORDED_TOMBSTONE_FILTER,
             },
             cut, record_page, |row| {
                 Ok(EnvelopeTombstone {
@@ -1043,7 +1059,7 @@ impl Store {
                 table: "checkpoint_claims",
                 columns: "id, writer, sequence, envelope_hash, subject, kind, actor, predecessors,
                           operation_id, request_digest, accepted_at_unix_ms",
-                filter: "accepted_at_unix_ms < ?3",
+                filter: RECORDED_TOMBSTONE_FILTER,
             },
             cut, record_page, |row| {
                 Ok(ClaimTombstone {

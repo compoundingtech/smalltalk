@@ -156,7 +156,10 @@ impl Store {
                 },
                 conversation: Some(seat.clone()),
                 title: format!("{seat} is waiting for {what}"),
-                detail: if answerable(&harness) {
+                // Codex names no tool: its reason only says it waits on an approval.
+                detail: if answerable(&harness) && harness["driver"] == "codex" {
+                    "Codex asks for approval; what it would do is the pending request in the seat's conversation. Allow or deny it here, or answer it in the seat's terminal (Ctrl+] in stui). This alert clears when the prompt is gone, however it was answered.".into()
+                } else if answerable(&harness) {
                     format!(
                         "Claude asks to use {prompt}; the call it would make is the pending one in the seat's conversation. Allow or deny it here, or answer it in the seat's terminal (Ctrl+] in stui). This alert clears when the prompt is gone, however it was answered."
                     )
@@ -1409,14 +1412,15 @@ fn native_prompt_gone_operation(observation: &str) -> String {
     smallclaims::store::operation_id_for_key(&native_prompt_gone_key(observation))
 }
 
-/// Whether st can answer the prompt `harness` reports from a client: a Claude permission prompt,
-/// whose hook waits for the answer, that names its tool. The call's input is conversation content
-/// a client reads from the seat's conversation and shows beside the answers; it is never stored
-/// here. Other prompts are answered in the seat's terminal.
+/// Whether st can answer the prompt `harness` reports from a client: a permission prompt of
+/// Claude, whose hook waits for the answer, or of Codex, whose control connection sends it, that
+/// names its reason (Claude's tool; Codex's `waitingOnApproval`). The call's input is conversation
+/// content a client reads from the seat's conversation and shows beside the answers; it is never
+/// stored here. Other prompts are answered in the seat's terminal.
 fn answerable(harness: &Value) -> bool {
     harness["blocked_on"] == "human"
         && harness["ask"] == "permission"
-        && harness["driver"] == "claude"
+        && matches!(harness["driver"].as_str(), Some("claude" | "codex"))
         && harness["reason"]
             .as_str()
             .is_some_and(|reason| !reason.is_empty() && reason != "permissionRequest")
@@ -1515,9 +1519,9 @@ impl Store {
                 NativePromptState::Open
             });
         };
-        // Claude shows one prompt at a time: while every observation since the hook's own still
-        // waits on that permission, it is the same prompt, and an answer to any of them is the
-        // hook's. Anything else in between means the prompt is gone.
+        // Claude and Codex show one prompt at a time: while every observation since the waiter's
+        // own still waits on that permission, it is the same prompt, and an answer to any of them
+        // is the waiter's. Anything else in between means the prompt is gone.
         let mut chain = Vec::new();
         for (claim, body) in &recent[..=own] {
             let body: Value = serde_json::from_str(body)?;
@@ -1578,6 +1582,7 @@ impl Store {
             ));
         }
         let incarnation = harness["incarnation_id"].as_str().unwrap_or_default();
+        let driver = harness["driver"].as_str().unwrap_or_default();
         self.append_claim(&ClaimInput {
             subject: seat.to_owned(),
             kind: "harness.diagnostic".into(),
@@ -1585,7 +1590,7 @@ impl Store {
             fields: BTreeMap::from([
                 ("code".into(), Value::String("native-prompt-answered".into())),
                 ("status".into(), Value::String(answer.into())),
-                ("driver".into(), Value::String("claude".into())),
+                ("driver".into(), Value::String(driver.into())),
                 ("incarnation_id".into(), Value::String(incarnation.into())),
             ]),
             evidence: vec![claim.clone()],
