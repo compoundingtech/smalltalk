@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Tool previews show human summaries and status before raw input/output. Failed transcript tool previews add one compact reason line with path segments abbreviated; full diagnostics remain behind the raw disclosure.",
+  "replay": {
+    "status": "none",
+    "detail": "No replay or rebuild."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, columns, indexes or triggers."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint rules and digests are unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "packages/fractal-ui and the fractal-web transcript projection change; no protocol, harness or CLI change. Hosts keep the same tool-call props."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "None."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Nothing to recover."
+  }
+}

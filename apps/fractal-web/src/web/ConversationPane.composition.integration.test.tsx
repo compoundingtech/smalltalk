@@ -462,6 +462,8 @@ describe('ConversationPane composition activation', () => {
     const fold = container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')
     expect(fold?.textContent).toContain('Worked for 7s')
     await act(async () => { fold!.click() })
+    const raw = [...container.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Show raw input/output')
+    await act(async () => { raw!.click() })
     const open = await act(async () => {
       const button = container.querySelector<HTMLButtonElement>('button[aria-label="Open Reading information tool detail"]')
       button?.click()
@@ -485,7 +487,100 @@ describe('ConversationPane composition activation', () => {
     await act(async () => { fold!.click() })
     const log = container.querySelector('[data-testid="work-log"]')!
     expect(log.querySelector('[data-tool-status="success"]')?.textContent).not.toContain('No output')
+    const preview = log.querySelector('[data-testid="tool-detail-preview"]')!
+    expect(preview.textContent).not.toContain(output)
+    expect(preview.querySelector('pre')).toBeNull()
+    const raw = [...preview.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Show raw input/output')
+    expect(raw?.getAttribute('aria-expanded')).toBe('false')
+    await act(async () => { raw!.click() })
     expect(log.querySelector('[data-testid="tool-detail-preview"]')?.textContent).toContain('export const rows = []')
+  })
+
+  it('keeps failed command diagnostics behind the banner raw disclosure', async () => {
+    const diagnostic = '/tmp/example/ready-step-test.fixture\nTraceback (most recent call last):\n  File "/tmp/example/check.py", line 4\nAssertionError: expected ready state'
+    source.feed = { _tag: 'Observed', freshness: 'live', value: {
+      items: [scenario[0]!, { _tag: 'ToolCall', id: 'failed-run', callId: 'failed-call', name: 'run',
+        input: { command: 'python check.py', summary: 'Checking ready state' }, status: 'error', callSeen: true, at: at(1),
+        result: { content: diagnostic, isError: true, at: at(3) } }],
+      hasOlder: false, observation: { empty: false },
+    } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    const banner = container.querySelector<HTMLElement>('[data-error-overlay]')!
+    expect(banner.textContent).toContain('Command did not complete')
+    expect(banner.textContent).toContain('AssertionError: expected ready state')
+    expect(banner.textContent).not.toContain('/tmp/example')
+    expect(banner.textContent).not.toContain('Traceback')
+    const raw = [...banner.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Show raw input/output')!
+    expect(raw.getAttribute('aria-expanded')).toBe('false')
+    await act(async () => { raw.click() })
+    expect(banner.textContent).toContain(diagnostic)
+  })
+
+  it.each([
+    ['/tmp/example/ready-step-test.fixture\nPermissionError: cannot read /tmp/example/check.py', 'PermissionError: cannot read …/check.py'],
+    ['/tmp/example/ready-step-test.fixture', 'Tool failed; no readable reason was recorded.'],
+    ['Traceback (most recent call last):\n  File "/app/command.py", line 571, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\nsubprocess.TimeoutExpired: Command \'sleep 60\' timed out after 30 seconds', 'Command timed out after 30s'],
+    ['Traceback (most recent call last):\n  File "/app/check.py", line 4\n    run_check()\nProcess exited with code 2', 'Exited with code 2'],
+  ])('uses a readable failed tool reason instead of a path tail: %s', async (diagnostic, reason) => {
+    source.feed = { _tag: 'Observed', freshness: 'live', value: {
+      items: [scenario[0]!, { _tag: 'ToolCall', id: 'failed-run', callId: 'failed-call', name: 'run',
+        input: { command: 'check' }, status: 'error', callSeen: true, at: at(1),
+        result: { content: diagnostic, isError: true, at: at(3) } }],
+      hasOlder: false, observation: { empty: false },
+    } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    expect(container.querySelector('[data-error-overlay]')?.textContent).toContain(reason)
+    const fold = container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')!
+    await act(async () => { fold.click() })
+    const row = container.querySelector<HTMLElement>('[data-tool-status="error"]')!
+    const open = row.querySelector<HTMLButtonElement>('button')
+    if (open !== null) await act(async () => { open.click() })
+    expect(row.querySelector('[data-testid="tool-error-reason"]')?.textContent).toBe(reason)
+    expect(row.querySelector('pre')).toBeNull()
+  })
+
+  it('shows a subprocess script only as unescaped code in the raw disclosure', async () => {
+    const diagnostic = "Traceback (most recent call last):\n    raise TimeoutExpired(\nsubprocess.TimeoutExpired: Command '['sh', '-c', '\\nset -eu\\necho \\'ready\\'\\n']' timed out after 30 seconds"
+    source.feed = { _tag: 'Observed', freshness: 'live', value: {
+      items: [scenario[0]!, { _tag: 'ToolCall', id: 'failed-run', callId: 'failed-call', name: 'run',
+        input: { command: 'check' }, status: 'error', callSeen: true, at: at(1),
+        result: { content: diagnostic, isError: true, at: at(3) } }],
+      hasOlder: false, observation: { empty: false },
+    } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    const banner = container.querySelector<HTMLElement>('[data-error-overlay]')!
+    expect(banner.textContent).toContain('Command timed out after 30s')
+    expect(banner.textContent).not.toContain('set -eu')
+    const raw = [...banner.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Show raw input/output')!
+    await act(async () => { raw.click() })
+    expect(banner.querySelector('[data-testid="error-overlay-command"] code')?.textContent).toBe("set -eu\necho 'ready'\n")
+  })
+
+  it.each([
+    ['its own source when the failure names no command', { command: 'pnpm test --filter app' }, 'Process exited with code 2', 'Exited with code 2', 'pnpm test --filter app'],
+    ['the subprocess command a timeout names', { code: 'run_step()' }, "subprocess.TimeoutExpired: Command '['sh', '-c', '\\nset -eu\\nmake check\\n']' timed out after 30 seconds", 'Command timed out after 30s', 'set -eu\nmake check\n'],
+  ])('shows a failed row its readable command: %s', async (_name, input, diagnostic, reason, command) => {
+    source.feed = { _tag: 'Observed', freshness: 'live', value: {
+      items: [scenario[0]!, { _tag: 'ToolCall', id: 'failed-run', callId: 'failed-call', name: 'run',
+        input, status: 'error', callSeen: true, at: at(1),
+        result: { content: diagnostic, isError: true, at: at(3) } }],
+      hasOlder: false, observation: { empty: false },
+    } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    const fold = container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')!
+    await act(async () => { fold.click() })
+    const row = container.querySelector<HTMLElement>('[data-tool-status="error"]')!
+    const open = row.querySelector<HTMLButtonElement>('button')
+    if (open !== null) await act(async () => { open.click() })
+    const preview = container.querySelector<HTMLElement>('[data-testid="tool-detail-preview"]')!
+    expect(preview.querySelector('[data-testid="tool-error-reason"]')?.textContent).toBe(reason)
+    const raw = [...preview.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Show raw input/output')!
+    await act(async () => { raw.click() })
+    expect(preview.querySelector('[data-testid="tool-command"] code')?.textContent).toBe(command)
   })
 
   it('keeps optimistic send state visible on its prompt', async () => {

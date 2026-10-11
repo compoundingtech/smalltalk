@@ -142,7 +142,7 @@ export const prepareTranscriptTurns = (
       items: turnItems,
       work: { ...work, calls: work.calls.map(call => {
         const item = tools.get(call.id)
-        return { ...call, title: item === undefined ? 'Working' : toolSummary(item), argsSummary: undefined }
+        return { ...call, title: item === undefined ? 'Working' : toolSummary(item), summary: item === undefined ? 'Working' : toolSummary(item), argsSummary: undefined }
       }) },
       ...(Object.keys(senderCaptions).length === 0 ? {} : { senderCaptions }),
     })

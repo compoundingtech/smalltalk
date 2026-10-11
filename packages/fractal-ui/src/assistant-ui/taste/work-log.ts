@@ -1,12 +1,13 @@
 /** Controlled presentation types for the work log. */
 import type { ConversationItem } from '../embrace-data/model'
-import { toolOutput } from '../embrace-tool-preview'
+import { toolHumanSummary, toolOutput } from '../embrace-tool-preview'
 export type WorkKind = 'read' | 'run' | 'edit'
 export interface WorkLogCall {
   readonly id: string
   readonly kind: WorkKind
   readonly title: string
   readonly argsSummary?: string
+  readonly summary?: string
   readonly status: 'running' | 'success' | 'error' | 'interrupted'
   readonly startedAt: string
   readonly endedAt?: string
@@ -14,6 +15,8 @@ export interface WorkLogCall {
   readonly outputLanguage?: string
   /** Observed edit/write path, not a guessed title. */
   readonly changedPath?: string
+  /** A run's own command or script source; display it only as code inside the raw disclosure. */
+  readonly command?: string
 }
 export interface WorkLogTurn {
   readonly calls: readonly WorkLogCall[]
@@ -45,6 +48,82 @@ const summarizeArgs = (input: unknown): string | undefined => {
   }
   return undefined
 }
+/** A traceback's last exception is the reason, never its frame or source statements. */
+export function errorReason(detail: string): string {
+  const rawLines = detail.split('\n')
+  // Python exception names need not end in Error/Exception (e.g. TimeoutExpired).
+  // Source is indented; retain indentation until after selecting an exception.
+  let exception: string | undefined
+  for (let index = rawLines.length - 1; index >= 0; index--) {
+    const line = rawLines[index]!
+    if (/^(?:[A-Za-z_]\w*\.)*[A-Z]\w*:\s*/.test(line)) { exception = line; break }
+  }
+  const exit = detail.match(/\b(?:exited with code|exit code|exit status)\s*:?\s*(-?\d+)\b/i)
+  const traceback = rawLines.some(line => /^\s*(?:Traceback\b|File ["'])/.test(line))
+  const lines = traceback ? [] : rawLines.map(line => line.trim()).filter(line =>
+    line !== '' &&
+    !/^(?:at\s+\S+|[\^~]+$)/.test(line) &&
+    !/^["']?(?:[A-Za-z]:[\\/]|[~/\\]|\.{1,2}[\\/]|…[\\/])\S*["']?$/.test(line),
+  )
+  const reason = (exception === undefined ? undefined : subprocessSummary(exception, exit?.[1]) ?? exception) ??
+    (exit === null ? undefined : `Exited with code ${exit[1]}`) ??
+    lines.find(line => /^(?:[\w.]+(?:Error|Exception)|error|fatal|failed|failure)\b/i.test(line)) ?? lines[0]
+  if (reason === undefined) return 'Tool failed; no readable reason was recorded.'
+  const line = reason.replace(/(?:~|[A-Za-z]:)?(?:[\\/][^\s\\/:'"`]+){2,}[\\/]([^\s\\/:'"`]+)/g, '…/$1')
+  return line.length > REASON_MAX ? `${line.slice(0, REASON_MAX - 1).trimEnd()}…` : line
+}
+
+/** First-level reasons are one short line; full diagnostics stay behind the raw disclosure. */
+const REASON_MAX = 160
+
+/**
+ * Python subprocess exceptions embed the whole argv (often a multi-line shell script) in their message,
+ * so the reason states only the outcome; `failedCommandSource` recovers the command for the disclosure.
+ */
+function subprocessSummary(exception: string, exitCode: string | undefined): string | undefined {
+  const match = exception.match(/^(?:[A-Za-z_]\w*\.)*(TimeoutExpired|CalledProcessError):/)
+  if (match === null) return undefined
+  if (match[1] === 'TimeoutExpired') {
+    const seconds = exception.match(/timed out after (\d+(?:\.\d+)?) seconds?\s*$/)?.[1]
+    return seconds === undefined ? 'Command timed out' : `Command timed out after ${seconds}s`
+  }
+  const code = exception.match(/non-zero exit status (-?\d+)\.?\s*$/)?.[1] ?? exitCode
+  return code === undefined ? 'Command failed' : `Command exited with code ${code}`
+}
+
+const unescapePython = (literal: string) => literal.replace(/\\(?:x([0-9a-fA-F]{2})|(.))/gs, (_, hex: string | undefined, char: string) =>
+  hex !== undefined ? String.fromCharCode(parseInt(hex, 16)) : ({ n: '\n', t: '\t', r: '\r', '0': '\0' } as Record<string, string>)[char] ?? char)
+
+/** Python string literals in a list repr; an unterminated (truncated) final literal is kept as is. */
+const pythonListItems = (repr: string): string[] => {
+  const items: string[] = []
+  const literal = /(['"])((?:\\.|(?!\1)[^\\])*)(\1|$)/gs
+  for (const match of repr.matchAll(literal)) items.push(unescapePython(match[2]!))
+  return items
+}
+
+/**
+ * The command embedded in a Python subprocess exception, unescaped for display as code.
+ * `sh -c SCRIPT` yields the script itself; other argv lists are space-joined.
+ */
+export function failedCommandSource(detail: string): string | undefined {
+  const lines = detail.split('\n')
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const match = lines[index]!.match(/^(?:[A-Za-z_]\w*\.)*(?:TimeoutExpired|CalledProcessError): Command '(.*)$/s)
+    if (match === null) continue
+    const body = match[1]!.replace(/' (?:timed out after|returned non-zero exit status) .*$/, '')
+    if (!body.startsWith('[')) return unescapePython(body.replace(/'$/, ''))
+    const argv = pythonListItems(body)
+    const script = argv.length === 3 && /^(?:\/\S*\/)?(?:ba|z|da)?sh$/.test(argv[0]!) && argv[1] === '-c' ? argv[2]!.replace(/^\n+/, '') : undefined
+    return script ?? (argv.length > 0 ? argv.join(' ') : undefined)
+  }
+  return undefined
+}
+
+/** The command a failure reason stands in for: a subprocess command named by the failure, else the run's own source. */
+export const readableCommand = (call: WorkLogCall): string | undefined =>
+  (call.detail === undefined ? undefined : failedCommandSource(call.detail)) ?? call.command
+
 /** Selected workshop call projection; the host owns classification, lifecycle and timing. */
 export function workLogTurnFromItems(items: readonly ConversationItem[], facts: {
   readonly kindFor: (name: string) => WorkKind
@@ -66,11 +145,12 @@ export function workLogTurnFromItems(items: readonly ConversationItem[], facts: 
     const dot = filename.lastIndexOf('.')
     const extension = dot > 0 ? filename.slice(dot + 1).toLowerCase() : undefined
     return [{
-      id: call.id, kind, title: call.name, argsSummary: summarizeArgs(call.input),
+      id: call.id, kind, title: call.name, summary: toolHumanSummary(call.input, call.name), argsSummary: summarizeArgs(call.input),
       status: call.status, startedAt: call.at, endedAt: call.result?.at,
       detail: toolOutput(call.result?.content) || undefined,
       outputLanguage: (media === undefined ? undefined : outputMediaLanguages[media]) ?? (kind === 'run' ? 'bash' : kind === 'read' ? extension : undefined),
       changedPath: kind === 'edit' && call.callSeen && call.status === 'success' ? path : undefined,
+      command: kind === 'run' ? ['command', 'code', 'script'].map(key => input?.[key]).find((value): value is string => typeof value === 'string' && value.trim().length > 0) : undefined,
     }]
   })
   const complete = facts.completeHistory === true

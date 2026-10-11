@@ -71,9 +71,12 @@ export const Expanded: Story = { args: { state: 'expanded' }, play: async ({ can
   const fold = await canvas.findByRole('button', { name: /Worked for 24s/ })
   await userEvent.click(fold)
   await expect(fold).toHaveAttribute('aria-expanded', 'true')
-  await expect(canvas.getByTestId('tool-preview-remaining')).toHaveTextContent('+2 lines')
+  await expect(canvas.queryByTestId('tool-preview-remaining')).toBeNull()
   const previews = canvas.getAllByTestId('tool-detail-preview')
   await expect(previews).toHaveLength(2)
+  await expect(previews[0]!.querySelector('pre')).toBeNull()
+  for (const preview of previews) await userEvent.click(within(preview).getByRole('button', { name: 'Show raw input/output' }))
+  await expect(canvas.getByTestId('tool-preview-remaining')).toHaveTextContent('+2 lines')
   await waitFor(() => expect(previews[0]!.querySelector('[data-syntax-token~="keyword"]')).not.toBeNull())
   await expect(previews[0]).toHaveTextContent('export const visibleRows')
   await expect(previews[1]).toHaveTextContent('selection retained')
@@ -487,9 +490,18 @@ export const MidTurnHistoryLight: Story = { ...MidTurnHistory, args: { scheme: '
 export const ReadOnlyTools: Story = { render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={cases.settled} onRetry={() => {}} /></main>, play: async ({ canvasElement }) => {
   const work = await within(canvasElement).findByTestId('work-log')
   await expect(work.querySelector(':scope > button, :scope > [role="button"]')).toBeNull()
-  const rows = work.querySelectorAll('[data-tool-status]')
+  const rows = work.querySelectorAll<HTMLElement>('[data-tool-status]')
   await expect(rows).toHaveLength(3)
-  for (const row of rows) await expect(row.querySelector('button, [role="button"], [data-row-disclosure]')).toBeNull()
+  for (const row of rows) {
+    await expect(row.querySelector('[data-row-disclosure]')).toBeNull()
+    await expect(row.querySelector('button[aria-label^="Open "]')).toBeNull()
+    const raw = within(row).queryByRole('button', { name: 'Show raw input/output' })
+    if (raw !== null) {
+      await expect(raw).toHaveAttribute('aria-expanded', 'false')
+      await userEvent.click(raw)
+      await expect(raw).toHaveAttribute('aria-expanded', 'true')
+    } else await expect(row).toHaveTextContent('No output')
+  }
   await expect(within(work).getByRole('button', { name: 'Thinking' })).toBeVisible()
   await expect(work).toHaveTextContent('export const last = visibleRows.at(-1)')
   await expect(work).toHaveTextContent('selection retained')
@@ -559,6 +571,7 @@ export const SemanticItems: Story = { render: args => <main {...stylex.props(sty
   await userEvent.click(await canvas.findByRole('button', { name: /Worked for 24s/ }))
   await userEvent.click(canvas.getByRole('button', { name: 'Thinking' }))
   await expect(canvas.getByTestId('tool-detail-preview')).toBeVisible()
+  await userEvent.click(canvas.getByRole('button', { name: 'Show raw input/output' }))
   await expect(canvas.getByTestId('tool-detail-preview')).toHaveTextContent('export const semantic = true')
   for (const text of ['User content retained.', 'System context retained.', 'Notice content retained.', 'Error notice retained.', 'Error detail retained.', 'Message handoff retained.', 'Message untitled-handoff', 'Event title retained.', 'Event body retained.', 'future.semantic.event', 'Status detail retained.', 'Usage · response · 123 input · 45 output', 'Reasoning content retained.', 'Assistant content retained.']) {
     await expect(canvas.getByText(text, { exact: false })).toBeVisible()

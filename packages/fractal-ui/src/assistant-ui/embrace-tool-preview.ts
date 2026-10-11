@@ -27,6 +27,10 @@ export const toolString = (value: unknown, keys: readonly string[]): string => {
   return ''
 }
 
+/** Observed human intent takes precedence over command and result diagnostics. */
+export const toolHumanSummary = (input: unknown, name: string): string =>
+  toolString(input, ['i', 'description', 'summary']) || name
+
 /** Extract supported textual output, never substitute a JSON dump for a preview. */
 export const toolOutput = (value: unknown): string => {
   if (typeof value === 'string') return value

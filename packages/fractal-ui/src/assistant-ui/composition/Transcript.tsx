@@ -6,7 +6,7 @@ import type { ConversationItem, MessageItem, TextItem } from '../embrace-data/mo
 import { EmbraceScrollViewport } from '../EmbraceScrollViewport'
 import { RuntimeAdoptedIds } from '../EmbraceRuntime'
 import { WorkLogV1 } from '../taste/WorkLogV1'
-import { formatWorkDuration, workLogOutputLanguage, type WorkLogCall, type WorkLogTurn } from '../taste/work-log'
+import { errorReason, formatWorkDuration, readableCommand, workLogOutputLanguage, type WorkLogCall, type WorkLogTurn } from '../taste/work-log'
 import { SyncLine } from '../st3-views/SyncLine'
 import { syncLine } from '../st3-views/sync-line'
 import type { SyncStatus } from '../st3-views/sync-status'
@@ -80,12 +80,25 @@ export function AgentMessage({ item, senderLine }: { readonly item: (TextItem & 
     {!streaming && <div data-testid="answer-meta" {...stylex.props(styles.answerMeta)}><ActionBarPrimitive.Copy aria-label="Copy answer" {...stylex.props(styles.copy)}><Icon name="copy" size={14} /></ActionBarPrimitive.Copy>{Number.isFinite(completed) && <time dateTime={new Date(completed).toISOString()}>{new Date(completed).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>}</div>}
   </MessagePrimitive.Root>
 }
-/** F3: four observed output lines, remaining count and a host-owned Open action. */
+/** Human intent first; a failure shows its one-line reason, the diagnostic itself requires a second disclosure. */
 export function ToolDetailPreview({ call, onOpen }: { readonly call: WorkLogCall; readonly onOpen?: (call: WorkLogCall) => void }) {
+  const [rawOpen, setRawOpen] = React.useState(false)
   const output = call.detail ?? (call.status === 'running' ? 'No output received yet.' : 'No output recorded.')
   const lines = output.split('\n')
   const remaining = Math.max(0, lines.length - Number(output.endsWith('\n')) - 4)
-  return <div data-testid="tool-detail-preview" {...stylex.props(styles.preview)}><pre {...stylex.props(styles.output)}><code {...stylex.props(styles.outputCode)}><HighlightedSource code={onOpen === undefined ? output : lines.slice(0, 4).join('\n')} language={workLogOutputLanguage(call)} /></code></pre>{onOpen !== undefined && <div data-testid="tool-preview-actions" {...stylex.props(styles.previewActions)}>{remaining > 0 && <><span data-testid="tool-preview-remaining">+{remaining} {remaining === 1 ? 'line' : 'lines'}</span><span aria-hidden="true">·</span></>}<Button aria-label={`Open ${call.title} tool detail`} onPress={() => onOpen(call)} {...stylex.props(styles.previewOpen)}>Open</Button></div>}</div>
+  const command = readableCommand(call)
+  return <div data-testid="tool-detail-preview" {...stylex.props(styles.preview)}>
+    <p>{call.summary ?? call.title} · {call.status}</p>
+    {call.status === 'error' && call.detail !== undefined && <p data-testid="tool-error-reason" {...stylex.props(styles.errorReason)}>{errorReason(call.detail)}</p>}
+    <Disclosure isExpanded={rawOpen} onExpandedChange={setRawOpen}>
+      <Button slot="trigger" {...stylex.props(styles.previewOpen)}>Show raw input/output</Button>
+      <DisclosurePanel>{rawOpen && <>
+        {command !== undefined ? <pre data-testid="tool-command" {...stylex.props(styles.output, styles.command)}><code>{command}</code></pre> : call.argsSummary !== undefined && <pre {...stylex.props(styles.output)}>{call.argsSummary}</pre>}
+        <pre {...stylex.props(styles.output)}><code {...stylex.props(styles.outputCode)}><HighlightedSource code={onOpen === undefined ? output : lines.slice(0, 4).join('\n')} language={workLogOutputLanguage(call)} /></code></pre>
+        {onOpen !== undefined && <div data-testid="tool-preview-actions" {...stylex.props(styles.previewActions)}>{remaining > 0 && <><span data-testid="tool-preview-remaining">+{remaining} {remaining === 1 ? 'line' : 'lines'}</span><span aria-hidden="true">·</span></>}<Button aria-label={`Open ${call.title} tool detail`} onPress={() => onOpen(call)} {...stylex.props(styles.previewOpen)}>Open</Button></div>}
+      </>}</DisclosurePanel>
+    </Disclosure>
+  </div>
 }
 /** Source text an unadopted item can show without the runtime; absent when the item carries none. */
 const strandedText = (item: ConversationItem): string | undefined => {
@@ -236,6 +249,8 @@ const styles = stylex.create({
   liveActivity: { display: 'flex', alignItems: 'center', gap: s.sm, minHeight: g.toolRow, color: ink.fgMuted, fontSize: t.uiSize },
   preview: { display: 'flex', flexDirection: 'column', alignItems: 'flex-start', marginBlock: s.sm, marginInlineStart: s.md, backgroundColor: surface.codeBg, borderRadius: r.sm, padding: s.md, gap: s.xs },
   output: { margin: 0, width: '100%', minWidth: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontFamily: t.fontMono, fontSize: t.codeSize, lineHeight: t.metaLeading, color: ink.fgSoft }, outputCode: { fontFamily: t.fontMono, fontSize: t.codeSize },
+  command: { boxSizing: 'border-box', marginBlockEnd: s.sm, padding: s.sm, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.codeBg, color: ink.fg },
+  errorReason: { margin: 0, maxWidth: '100%', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', color: ink.fgSoft, fontSize: t.metaSize },
   previewActions: { display: 'flex', alignItems: 'center', gap: s.xs, minHeight: g.toolRow, color: ink.fgMuted, fontSize: t.metaSize }, previewOpen: { minHeight: g.toolRow, padding: 0, borderWidth: 0, backgroundColor: surface.transparent, color: ink.fgSoft, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { color: ink.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
   placeholder: { display: 'flex', flexDirection: 'column', gap: s.lg }, skeletonPrompt: { width: '100%', height: `calc(${t.bodyLeading} + ${s.md})`, borderLeftWidth: g.focusRing, borderLeftStyle: 'solid', borderLeftColor: accent.primary, backgroundColor: surface.rowActive }, skeletonWork: { height: g.toolRow, width: '30%', borderRadius: r.sm, backgroundColor: surface.rowActive }, skeletonAnswer: { height: g.resourceCard, width: '80%', borderRadius: r.sm, backgroundColor: surface.rowHover },
   empty: { backgroundColor: surface.washSubtle },

@@ -3,10 +3,10 @@ import * as stylex from '@stylexjs/stylex'
 import { Button, Tooltip, TooltipTrigger } from 'react-aria-components'
 import { surfaceVars as surface, textVars as ink, borderVars as border, accentVars as accent, statusVars as status, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g } from '../composition-tokens.stylex'
 import { Icon } from '../composition/Icons'
-import { ErrorOverlay, useErrorOverlaySurface } from '../composition/ErrorOverlay'
+import { ErrorOverlay } from '../composition/ErrorOverlay'
 import { HighlightedSource } from '../composition/Markdown'
 import type { WorkLogCall, WorkLogTurn } from './work-log'
-import { formatWorkDuration, workLogOutputLanguage } from './work-log'
+import { errorReason, failedCommandSource, formatWorkDuration, readableCommand, workLogOutputLanguage } from './work-log'
 
 export type WorkLogCallDetailRenderer = (call: WorkLogCall) => React.ReactNode
 const CallDetailRenderer = React.createContext<WorkLogCallDetailRenderer | undefined>(undefined)
@@ -25,7 +25,6 @@ export function WorkLogV1({ turn, listStyle, renderCallDetail, previewCallDetail
   readonly onRetry?: () => void
   readonly onOpenOutput?: (call: WorkLogCall) => void
 }) {
-  const overlayLayer = useErrorOverlaySurface()
   const settled = !turn.running && !turn.failed && !turn.interrupted && turn.foldable !== false
   const durationLabel = formatWorkDuration(turn.durationMs)
   const [open, setOpen] = React.useState(false)
@@ -41,7 +40,7 @@ export function WorkLogV1({ turn, listStyle, renderCallDetail, previewCallDetail
     {turn.running && !hideLiveRow && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.live)}><Icon name="spinner" spinning /><span>Working</span></div>}
     {interactiveCalls ? <Button isDisabled={!settled} aria-expanded={!settled || open} onPress={() => setOpen(value => !value)} {...stylex.props(styles.summary, failed && styles.failureInk)}><Icon name={!settled || open ? 'chevron-down' : 'chevron-right'} size={12} />{summaryContent}</Button> : <div {...stylex.props(styles.summary, styles.staticCall, failed && styles.failureInk)}>{summaryContent}</div>}
     {(!interactiveCalls || !settled || open) && <><div {...stylex.props(styles.list, listStyle)}>{turn.calls.map(call => <TimelineCall key={call.id} call={call} />)}</div>{expandedBody}<hr data-testid="work-log-divider" {...stylex.props(styles.divider)} /></>}
-    {failed && (overlayLayer !== null ? <ErrorOverlay id={`work-failure-${turn.calls[0]?.id ?? 'turn'}`} title={failedCommand === undefined ? 'Run failed.' : 'Command did not complete'} detail={detail} onRetry={onRetry} onOpenOutput={failedCall === undefined || onOpenOutput === undefined ? undefined : () => onOpenOutput(failedCall)} /> : <div role="alert" {...stylex.props(styles.promoted, styles.failed)}><Icon name="x" size={14} /><span>{failedCall?.detail ?? turn.failureNote ?? 'Run failed.'}</span></div>)}
+    {failed && <ErrorOverlay id={`work-failure-${turn.calls[0]?.id ?? 'turn'}`} title={failedCommand === undefined ? 'Run failed.' : 'Command did not complete'} detail={errorReason(failedCall?.detail ?? turn.failureNote ?? '')} rawDetail={detail} command={failedCall === undefined ? failedCommandSource(turn.failureNote ?? '') : readableCommand(failedCall)} onRetry={onRetry} onOpenOutput={failedCall === undefined || onOpenOutput === undefined ? undefined : () => onOpenOutput(failedCall)} />}
     {turn.interrupted && <div {...stylex.props(styles.promoted)}><Icon name="stop" size={14} /><span>Run interrupted.</span></div>}
   </section></CallPresentation.Provider></CallDetailRenderer.Provider>
 }
@@ -72,6 +71,6 @@ const styles = stylex.create({
   time: { flexShrink: 0, color: ink.fgMuted, fontSize: t.metaSize, marginLeft: 'auto' },
   live: { minHeight: g.toolRow, display: 'flex', alignItems: 'center', gap: s.md, color: ink.fgMuted, fontSize: t.metaSize },
   promoted: { display: 'flex', alignItems: 'center', gap: s.md, marginTop: s.md, padding: s.md, backgroundColor: surface.washSubtle, borderRadius: r.md, color: ink.fgSoft, fontSize: t.metaSize, lineHeight: t.uiLeading },
-  failed: { backgroundColor: status.diffRemovedWash, color: status.dangerFg }, failureInk: { color: status.dangerFg },
+  failureInk: { color: status.dangerFg },
   hover: { maxWidth: g.tooltipMax, padding: s.md, borderRadius: r.md, backgroundColor: surface.raised, color: ink.fg, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.uiLeading, zIndex: 10 },
 })
