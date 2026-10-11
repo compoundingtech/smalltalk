@@ -119,6 +119,36 @@ fn assert_conforms(validator: &jsonschema::Validator, context: &str, value: &Val
 }
 
 #[test]
+fn agents_publication_contract_is_complete_and_unbounded() {
+    let validator = contract_validator("AgentsPublication");
+    let resources = fixture("resources.json");
+    let agent = resources.as_array().unwrap().iter()
+        .find(|row| row["kind"] == "agent").unwrap();
+    let rows = (0..401).map(|index| {
+        let mut row = agent.clone();
+        row["id"] = serde_json::json!(format!("agent/publication-{index}"));
+        row
+    }).collect::<Vec<_>>();
+    let order = rows.iter().map(|row| row["id"].clone()).collect::<Vec<_>>();
+    let mut publication = serde_json::json!({
+        "publication": {
+            "node_epoch": "18a992c2-f834-4946-b412-211f358ff531",
+            "revision": 9_007_199_254_740_991_u64,
+            "status_watermark": {"store_index": 8, "local_frontier": 3},
+            "materialized_at_ms": 1_700_000_000_000_u64
+        },
+        "items": rows, "order": order, "has_more": false
+    });
+    assert_conforms(&validator, "401 complete current agents", &publication);
+    publication["has_more"] = serde_json::json!(true);
+    assert!(!validator.is_valid(&publication), "a partial head cannot be complete");
+    publication["has_more"] = serde_json::json!(false);
+    publication["publication"]["revision"] = serde_json::json!(9_007_199_254_740_992_u64);
+    assert!(!validator.is_valid(&publication), "revision exhaustion requires another epoch");
+}
+
+
+#[test]
 fn consumers_accept_future_enum_cases_but_producers_reject_them() {
     for (definition, known) in [
         ("MissionState", "running"),

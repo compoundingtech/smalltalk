@@ -14,7 +14,7 @@
 //! binary or needs a seat restart.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -64,16 +64,22 @@ struct Presence {
     image: Option<String>,
     beats: Mutex<HashMap<String, Beat>>,
     monitors: Mutex<HashMap<String, Beat>>,
+    changes: tokio::sync::watch::Sender<()>,
 }
 
-fn presence() -> &'static Presence {
-    static PRESENCE: OnceLock<Presence> = OnceLock::new();
-    PRESENCE.get_or_init(|| Presence {
-        started: Instant::now(),
-        image: st_drivers::reexec::running_identity().map(|identity| identity.token()),
-        beats: Mutex::new(HashMap::new()),
-        monitors: Mutex::new(HashMap::new()),
-    })
+static PRESENCE: LazyLock<Presence> = LazyLock::new(|| Presence {
+    started: Instant::now(),
+    image: st_drivers::reexec::running_identity().map(|identity| identity.token()),
+    beats: Mutex::new(HashMap::new()),
+    monitors: Mutex::new(HashMap::new()),
+    changes: tokio::sync::watch::channel(()).0,
+});
+
+fn presence() -> &'static Presence { &PRESENCE }
+
+/// One presentation-input observer per publication owner, never one per subscriber.
+pub(super) fn subscribe_changes() -> tokio::sync::watch::Receiver<()> {
+    presence().changes.subscribe()
 }
 
 /// Start the startup grace window now. The daemon calls this once when it serves its API.
@@ -96,6 +102,7 @@ pub(crate) fn record(recipient: &str, report: &str) {
                 fence: None,
             },
         );
+        presence.changes.send_replace(());
     }
 }
 
@@ -126,6 +133,8 @@ pub(super) fn record_fenced(fence: &crate::mailbox::Fence, raw: &str) -> bool {
                 fence: Some(fence.clone()),
             },
         );
+        drop(beats);
+        presence().changes.send_replace(());
         return true;
     }
     false
@@ -166,6 +175,7 @@ pub(crate) fn record_legacy(recipient: &str, transport: &str, pid: u32) {
             },
         );
     }
+    presence().changes.send_replace(());
 }
 
 /// How one seat's delivery path looks from this daemon.
@@ -201,24 +211,131 @@ pub(crate) fn assess_current(recipient: &str, driver: &str, incarnation: Option<
     assess_selected(recipient, driver, incarnation, true)
 }
 
+pub(super) fn native_driver_transport(driver: &str) -> Option<(&'static str, &'static str)> {
+    match driver {
+        "claude" => Some(("claude", "claude-channel")),
+        "codex" => Some(("codex", "app-server")),
+        "opencode" => Some(("opencode", "opencode-server")),
+        "omp" => Some(("omp", "omp-channel")),
+        "pi" => Some(("pi", "pi-channel")),
+        _ => None,
+    }
+}
+
+fn eligible_current(beat: &Beat, driver: &str, incarnation: Option<&str>) -> bool {
+    native_driver_transport(driver).is_some_and(|(_, transport)| {
+        beat.report.transport.as_deref() == Some(transport)
+            && beat.fence.as_ref().is_none_or(|fence|
+                incarnation.is_none_or(|incarnation| fence.incarnation == incarnation))
+    })
+}
+
+fn captured_report(beat: &Beat, current: bool) -> Report {
+    let mut report = beat.report.clone();
+    if current && beat.fence.is_none() && report.ready != Some(false) { report.legacy = true; }
+    report
+}
+
+struct CapturedBeat {
+    recipient: String,
+    driver: &'static str,
+    beat: Option<(Instant, Report)>,
+}
+
+/// Process-local input captured with one wall-clock/monotonic-clock pair and one map sample.
+pub(super) struct Captured {
+    at_ms: u64,
+    instant: Instant,
+    uptime: Duration,
+    daemon_image: Option<&'static str>,
+    beats: Vec<CapturedBeat>,
+}
+
+pub(super) struct Snapshot {
+    assessments: HashMap<String, Assessment>,
+    valid_until_ms: Option<u64>,
+}
+
+impl Snapshot {
+    pub(super) fn assessment(&self, recipient: &str) -> Option<&Assessment> {
+        self.assessments.get(recipient)
+    }
+
+    pub(super) fn valid_until_ms(&self) -> Option<u64> { self.valid_until_ms }
+}
+
+pub(super) fn capture_current<'a>(
+    selected: impl Iterator<Item = (&'a str, &'a str, Option<&'a str>)>,
+) -> anyhow::Result<Captured> {
+    let presence = presence();
+    let beats = presence.beats.lock().map_err(|_| anyhow::anyhow!("delivery presence poisoned"))?;
+    let monitors = presence.monitors.lock().map_err(|_| anyhow::anyhow!("delivery monitors poisoned"))?;
+    let instant = Instant::now();
+    let at_ms = u64::try_from(super::client_now_ms())?;
+    let captured = selected.filter_map(|(recipient, driver, incarnation)| {
+        let (driver, _) = native_driver_transport(driver)?;
+        let eligible = |beat: &&Beat| eligible_current(beat, driver, incarnation);
+        let mut beat = beats.get(recipient).filter(eligible);
+        if driver == "claude"
+            && let Some(monitor) = monitors.get(recipient).filter(eligible)
+            && monitor.report.ready == Some(false) {
+            beat = Some(monitor);
+        }
+        Some(CapturedBeat {
+            recipient: recipient.to_owned(), driver,
+            beat: beat.map(|beat| (beat.at, captured_report(beat, true))),
+        })
+    }).collect();
+    Ok(Captured {
+        at_ms, instant, uptime: instant.saturating_duration_since(presence.started),
+        daemon_image: presence.image.as_deref(), beats: captured,
+    })
+}
+
+impl Captured {
+    pub(super) fn at_ms(&self) -> u64 { self.at_ms }
+
+    /// Filesystem image checks and assessment construction run after the SQLite pin is dropped.
+    pub(super) fn assess(self) -> Snapshot {
+        let mut assessments = HashMap::with_capacity(self.beats.len());
+        let mut followed_images = HashMap::<String, Option<String>>::new();
+        let mut valid_until_ms = None;
+        for captured in self.beats {
+            let beat = captured.beat.map(|(at, mut report)| {
+                if let Some(path) = report.follows.as_deref() {
+                    report.follows_image = if let Some(image) = followed_images.get(path) {
+                        image.clone()
+                    } else {
+                        let image = st_drivers::reexec::ImageIdentity::of(std::path::Path::new(path))
+                            .ok().map(|identity| identity.token());
+                        followed_images.insert(path.to_owned(), image.clone());
+                        image
+                    };
+                }
+                (self.instant.saturating_duration_since(at), report)
+            });
+            let remaining = match beat.as_ref() {
+                Some((age, _)) if *age <= POLL_STALE_AFTER =>
+                    Some(POLL_STALE_AFTER - *age + Duration::from_millis(1)),
+                None if self.uptime < STARTUP_GRACE =>
+                    Some(STARTUP_GRACE - self.uptime + Duration::from_millis(1)),
+                _ => None,
+            };
+            if let Some(remaining) = remaining {
+                let deadline = self.at_ms.saturating_add(remaining.as_millis() as u64);
+                valid_until_ms = Some(valid_until_ms.map_or(deadline, |old: u64| old.min(deadline)));
+            }
+            assessments.insert(captured.recipient,
+                assess_beat(self.uptime, self.daemon_image, beat, captured.driver));
+        }
+        Snapshot { assessments, valid_until_ms }
+    }
+}
+
 fn assess_selected(recipient: &str, driver: &str, incarnation: Option<&str>, current: bool) -> Assessment {
     let presence = presence();
-    let eligible = |beat: &&Beat| {
-        if !current { return true; }
-        let transport = match driver {
-            "claude" => "claude-channel", "codex" => "app-server", "opencode" => "opencode-server",
-            "omp" => "omp-channel", "pi" => "pi-channel", _ => return false,
-        };
-        beat.report.transport.as_deref() == Some(transport)
-            && beat.fence.as_ref().is_none_or(|fence| incarnation.is_none_or(|incarnation| fence.incarnation == incarnation))
-    };
-    let captured = |beat: &Beat| {
-        let mut report = beat.report.clone();
-        if current && beat.fence.is_none() && report.ready != Some(false) {
-            report.legacy = true;
-        }
-        (beat.at, report)
-    };
+    let eligible = |beat: &&Beat| !current || eligible_current(beat, driver, incarnation);
+    let captured = |beat: &Beat| (beat.at, captured_report(beat, current));
     let mut beat = presence.beats.lock().ok().and_then(|beats| {
         beats
             .get(recipient)

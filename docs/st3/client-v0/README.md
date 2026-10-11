@@ -1723,6 +1723,39 @@ are current; each affected card keeps its previous `fault`, including a known nu
 A card with no previous value reports `"fault status unknown"` in that same field. The next
 refresh retries those faults even if no claim changed.
 
+### Immutable current publications
+
+The background roster refresher owns one latest immutable complete current publication.
+It replaces that value and notifies readers atomically. Rows, order, metadata and the complete
+encoded body belong to the same publication. Startup chunks and history rosters do not obtain
+a current publication revision. A failed refresh retains the previous publication and its
+original metadata. The failed-only `fresh=true` fallback described above is unchanged.
+
+An active revisioned subscription or a recent agents list read keeps source, presence and
+presentation-deadline refreshes active. A new revisioned subscription requests a complete view.
+Without that demand, inputs remain dirty but catch-up and trim do not refold the roster.
+Full projection reset clears the current publication and changes its epoch even while idle.
+
+`AgentsPublicationMetadata` identifies the publication with an opaque UUID `node_epoch` and
+an increasing epoch-local `revision`. Restart, full projection reset or revision exhaustion starts a new epoch;
+no current publication is available until a complete roster is ready. Revisions can skip
+numbers. They are not history positions or replay cursors and cannot be compared across epochs.
+The `status_watermark` contains the node-local graph `store_index` and the roster-relevant
+`local_frontier`. It is not a cross-node freshness measure.
+
+The server captures the presentation clock and presence once. It reads graph-backed subagents
+at the final pinned source cut. Later clock, presence or graph changes do not alter published
+rows. `materialized_at_ms` is that server presentation time in Unix milliseconds. It is not
+producer observation time, evidence receipt time or proof of row age.
+
+The canonical `AgentsPublication` definition contains `publication`, `items`, `order` and
+`has_more: false`. It is a complete current view, with no core row-count or encoded-byte cap.
+Legacy HTTP response budgets, pagination and HTTP and WebSocket wire grammars are unchanged.
+These definitions add no endpoint, WebSocket field or transport opt-in. The future descriptor
+name `collections.agents.revisioned.v1` does not announce availability and is not advertised.
+Atomic WebSocket snapshot chunking is separate work. No history, replay or producer-age
+transport is provided by these definitions.
+
 ## Exact terminal lookup
 
 `GET /v1/client/terminals?owner=agent%2Fexample%2Fworker&state=running` matches the

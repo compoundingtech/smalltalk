@@ -2480,27 +2480,34 @@ fn client_agent_cards_selected(
     chunk: bool,
 ) -> anyhow::Result<Vec<Value>> {
     let build = |changed: Option<(&BTreeSet<String>, &[Value])>| {
-        let (subjects, previous) = changed.expect("a selected page always names its missing cards");
-        // Delta metadata is current and already diffed; only cold pages need shallow refs.
-        // Frozen continuation refs remain response metadata, never shared cache inputs.
-        let metadata = if previous.is_empty() {
-            Some(if index < store.index()? {
-                agent_queue_metadata(store, subjects)?
-            } else {
-                client_agent_page_refs(store, history, index)?
-            })
-        } else { None };
-        let mut cards = client_agent_resources_selected(
-            store, history, index, Some((subjects, metadata.as_deref().unwrap_or(previous))),
-        )?;
-        add_agent_todos(store, &mut cards, index)?;
-        Ok(cards)
+        build_client_agent_cards_selected(store, history, index, changed)
     };
     if chunk {
         store.cached_agent_resources_chunk(index, history, selected, build)
     } else {
         store.cached_agent_resources_for(index, history, Some(selected), build)
     }
+}
+
+fn build_client_agent_cards_selected(
+    store: &Store, history: bool, index: u64,
+    changed: Option<(&BTreeSet<String>, &[Value])>,
+) -> anyhow::Result<Vec<Value>> {
+    let (subjects, previous) = changed.expect("a selected page always names its missing cards");
+    // Delta metadata is current and already diffed; only cold pages need shallow refs.
+    // Frozen continuation refs remain response metadata, never shared cache inputs.
+    let metadata = if previous.is_empty() {
+        Some(if index < store.index()? {
+            agent_queue_metadata(store, subjects)?
+        } else {
+            client_agent_page_refs(store, history, index)?
+        })
+    } else { None };
+    let mut cards = client_agent_resources_selected(
+        store, history, index, Some((subjects, metadata.as_deref().unwrap_or(previous))),
+    )?;
+    add_agent_todos(store, &mut cards, index)?;
+    Ok(cards)
 }
 
 fn client_agent_cards_from_cached(
@@ -2559,38 +2566,35 @@ fn add_agent_todos(store: &Store, items: &mut [Value], index: u64) -> anyhow::Re
 
 fn overlay_agent_resources(store: &Store, items: &mut [Value], at: &str) -> anyhow::Result<()> {
     let local_host = client_host_id(store.origin());
+    let now = client_now_ms();
     for item in items.iter_mut() {
-        if item.get("updated_at").and_then(Value::as_str) == Some("") {
-            item["updated_at"] = Value::String(at.to_owned());
-        }
-        let source = item
-            .as_object_mut()
-            .unwrap()
-            .remove("_status_source")
-            .unwrap_or(Value::Null);
-        let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
-        // Freshness is approximate presentation. Use the card's already reduced observation;
-        // querying diagnostic and local-observation history here made every read grow with it.
-        let observation = match harness {
-            None => "missing",
-            Some(harness)
-                if client_now_ms().saturating_sub(harness.observed_at_unix_ms) > 90_000 =>
-            {
-                "stale"
-            }
-            Some(_) => "current",
-        };
-        item["observation"] = json!(observation);
-        if observation == "stale" && matches!(item["harness_state"].as_str(), Some("ready" | "idle" | "working")) {
-            item["harness_state"] = json!("indeterminate");
-            if item["state"] == "running" {
-                item["state"] = json!("waiting");
-            }
-        }
+        let _ = overlay_agent_status(item, at, now)?;
         overlay_delivery_presence(item, &local_host);
     }
     overlay_subagents(store, items)?;
     Ok(())
+}
+
+fn overlay_agent_status(item: &mut Value, at: &str, now: u128) -> anyhow::Result<Option<u64>> {
+    if item.get("updated_at").and_then(Value::as_str) == Some("") {
+        item["updated_at"] = Value::String(at.to_owned());
+    }
+    let source = item.as_object_mut().unwrap().remove("_status_source").unwrap_or(Value::Null);
+    let harness: Option<crate::model::CurrentHarnessView> = serde_json::from_value(source)?;
+    // Presentation consumes the already reduced source, never per-request diagnostic history.
+    let (observation, deadline) = match harness {
+        None => ("missing", None),
+        Some(harness) if now.saturating_sub(harness.observed_at_unix_ms) > 90_000 =>
+            ("stale", None),
+        Some(harness) => ("current", Some(
+            harness.observed_at_unix_ms.saturating_add(90_001).min(u128::from(u64::MAX)) as u64)),
+    };
+    item["observation"] = json!(observation);
+    if observation == "stale" && matches!(item["harness_state"].as_str(), Some("ready" | "idle" | "working")) {
+        item["harness_state"] = json!("indeterminate");
+        if item["state"] == "running" { item["state"] = json!("waiting"); }
+    }
+    Ok(deadline)
 }
 
 /// A seat's latest suspend or resume as client-v0 shows it.
@@ -2615,10 +2619,15 @@ fn client_suspension(suspension: &crate::suspension::Suspension) -> Value {
 /// Each seat's running subagents: open, with a lease that runs past this read. A lease runs out
 /// without a claim, so this is read per request rather than cached with the agents.
 fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
+    overlay_subagent_rows(items, store.running_subagents(client_now_ms() as u64)?);
+    Ok(())
+}
+
+fn overlay_subagent_rows(items: &mut [Value], subagents: Vec<crate::store::SubagentView>) {
     let mut running = BTreeMap::<String, Vec<Value>>::new();
-    for subagent in store.running_subagents(client_now_ms() as u64)? {
+    for subagent in subagents {
         running
-            .entry(subagent.agent.clone())
+            .entry(subagent.agent)
             .or_default()
             .push(json!({
                 "id": subagent.subagent_id,
@@ -2637,37 +2646,31 @@ fn overlay_subagents(store: &Store, items: &mut [Value]) -> anyhow::Result<()> {
         let subagents = running.remove(id).unwrap_or_default();
         item["subagents"] = Value::Array(subagents);
     }
-    Ok(())
 }
 
 /// Delivery presence is independent of harness readiness: a local native seat waiting on a human
 /// still has a transport to assess. A running seat with a stale path becomes `waiting`; an
 /// already-waiting seat retains its harness block and ask details.
+fn agent_delivery_selection<'a>(
+    item: &'a Value, local_host: &str,
+) -> Option<(&'a str, &'a str, Option<&'a str>)> {
+    let driver = item.get("driver").and_then(Value::as_str)?;
+    delivery_presence::native_driver_transport(driver)?;
+    if item.get("host_id").and_then(Value::as_str) != Some(local_host)
+        || !matches!(item.get("state").and_then(Value::as_str), Some("running" | "waiting")) {
+        return None;
+    }
+    Some((item.get("id").and_then(Value::as_str)?, driver, item["incarnation_id"].as_str()))
+}
+
 fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
-    const NATIVE_DRIVERS: [&str; 5] = ["claude", "codex", "opencode", "pi", "omp"];
-    let Some(driver) = item
-        .get("driver")
-        .and_then(Value::as_str)
-        .filter(|driver| NATIVE_DRIVERS.contains(driver))
-        .map(str::to_owned)
-    else {
-        return;
-    };
-    let local = item.get("host_id").and_then(Value::as_str) == Some(local_host);
-    let live = matches!(
-        item.get("state").and_then(Value::as_str),
-        Some("running" | "waiting")
-    );
-    if !local || !live {
-        return;
-    }
-    let Some(recipient) = item.get("id").and_then(Value::as_str) else {
-        return;
-    };
-    let assessment = delivery_presence::assess_current(recipient, &driver, item["incarnation_id"].as_str());
-    if assessment.stale() {
-        item["state"] = Value::String("waiting".into());
-    }
+    let Some((recipient, driver, incarnation)) = agent_delivery_selection(item, local_host) else { return };
+    let assessment = delivery_presence::assess_current(recipient, driver, incarnation);
+    apply_delivery_assessment(item, &assessment);
+}
+
+fn apply_delivery_assessment(item: &mut Value, assessment: &delivery_presence::Assessment) {
+    if assessment.stale() { item["state"] = Value::String("waiting".into()); }
     item["delivery"] = assessment.to_value();
 }
 
@@ -4698,20 +4701,40 @@ const AGENT_ROSTER_ASSEMBLY_ROUNDS: usize = 3;
 /// refresh fails and is tried again on the next request.
 fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
     store.begin_agent_roster_fault_retries(history);
-    if store.read_snapshot(|index| store.agent_roster_current(index, history))? {
-        return Ok(());
+    delivery_presence::start();
+    let build = (!history).then(|| store.agents_publication_build());
+    let current = store.read_snapshot(|index| {
+        if !store.agent_roster_current(index, history)? { return Ok((false, None)); }
+        let captured = build.map(|_| capture_current_agents(store, index)).transpose()?;
+        Ok((true, captured))
+    })?;
+    if current.0 {
+        return match (build, current.1) {
+            (Some(build), Some(captured)) => publish_current_agents(store, build, captured),
+            _ => Ok(()),
+        };
     }
     let complete = |store: &Store| store.read_snapshot(|index| {
         if let Some(reason) =
             store.agent_roster_unbounded_because(index, history, AGENT_ROSTER_WARM_CHUNK)?
         {
-            return Ok(Some(reason));
+            return Ok((Some(reason), None));
         }
-        client_agent_resources_cached(store, history, index).map(|_| None)
+        store.ensure_agent_resources_cached(index, history, None, false, |changed| {
+            let mut items = client_agent_resources_selected(store, history, index, changed)?;
+            add_agent_todos(store, &mut items, index)?;
+            Ok(items)
+        })?;
+        let captured = build.map(|_| capture_current_agents(store, index)).transpose()?;
+        Ok((None, captured))
     });
     for _ in 0..AGENT_ROSTER_ASSEMBLY_ROUNDS {
-        let Some(reason) = complete(store)? else {
-            return Ok(());
+        let (reason, captured) = complete(store)?;
+        let Some(reason) = reason else {
+            return match (build, captured) {
+                (Some(build), Some(captured)) => publish_current_agents(store, build, captured),
+                _ => Ok(()),
+            };
         };
         store.note_agent_roster_chunked(&reason);
         let order = store.read_snapshot(|index| {
@@ -4722,12 +4745,17 @@ fn refresh_agent_roster(store: &Store, history: bool) -> anyhow::Result<()> {
         for chunk in order.chunks(AGENT_ROSTER_WARM_CHUNK) {
             let chunk = chunk.iter().cloned().collect::<BTreeSet<_>>();
             store.read_snapshot(|index| {
-                client_agent_cards_selected(store, history, index, &chunk, true).map(drop)
+                store.ensure_agent_resources_cached(index, history, Some(&chunk), true,
+                    |changed| build_client_agent_cards_selected(store, history, index, changed))
             })?;
         }
     }
-    if complete(store)?.is_none() {
-        return Ok(());
+    let (reason, captured) = complete(store)?;
+    if reason.is_none() {
+        return match (build, captured) {
+            (Some(build), Some(captured)) => publish_current_agents(store, build, captured),
+            _ => Ok(()),
+        };
     }
     anyhow::bail!("the agents roster kept changing in ways no short fold can follow; keeping the previous one")
 }
@@ -4738,7 +4766,54 @@ fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
     let head = refs.iter().take(CLIENT_MAX_PAGE_ITEMS + 1)
         .filter_map(|reference| reference["id"].as_str().map(str::to_owned))
         .collect::<BTreeSet<_>>();
-    client_agent_cards_selected(store, false, index, &head, false).map(drop)
+    store.ensure_agent_resources_cached(index, false, Some(&head), false,
+        |changed| build_client_agent_cards_selected(store, false, index, changed))
+}
+
+struct CapturedAgentsPublication {
+    source: crate::store::AgentsPublicationSource,
+    presence: delivery_presence::Captured,
+    subagents: Vec<crate::store::SubagentView>,
+}
+
+fn capture_current_agents(store: &Store, index: u64) -> anyhow::Result<CapturedAgentsPublication> {
+    let source = store.agents_publication_source(index)?;
+    let local_host = client_host_id(store.origin());
+    let presence = delivery_presence::capture_current(source.rows.iter()
+        .filter_map(|row| agent_delivery_selection(row, &local_host)))?;
+    let subagents = store.running_subagents(presence.at_ms())?;
+    Ok(CapturedAgentsPublication { source, presence, subagents })
+}
+
+fn publish_current_agents(
+    store: &Store, build: crate::store::agents_publication::Build,
+    captured: CapturedAgentsPublication,
+) -> anyhow::Result<()> {
+    // Rows, image checks, public JSON construction and serialization happen after releasing
+    // the final graph/local source pin, and before taking the publication owner's lock.
+    let now = captured.presence.at_ms();
+    let at = client_timestamp(u128::from(now));
+    let presence = captured.presence.assess();
+    let mut valid_until = captured.source.valid_until_ms;
+    let mut add_deadline = |deadline: Option<u64>| {
+        if let Some(deadline) = deadline {
+            valid_until = Some(valid_until.map_or(deadline, |old: u64| old.min(deadline)));
+        }
+    };
+    add_deadline(presence.valid_until_ms());
+    add_deadline(captured.subagents.iter().map(|subagent| subagent.lease_expires_at_unix_ms).min());
+    let mut rows = (*captured.source.rows).clone();
+    for row in &mut rows {
+        add_deadline(overlay_agent_status(row, &at, u128::from(now))?);
+        if let Some(assessment) = row["id"].as_str().and_then(|id| presence.assessment(id)) {
+            apply_delivery_assessment(row, assessment);
+        }
+    }
+    overlay_subagent_rows(&mut rows, captured.subagents);
+    let prepared = crate::store::agents_publication::Prepared::new(
+        captured.source.watermark, now, valid_until, rows,
+    )?;
+    store.finish_agents_publication(build, prepared)
 }
 
 /// For a read that asked to see what was written before it: wait, briefly, for the refresher
@@ -5799,9 +5874,19 @@ pub fn start_agent_roster(state: &AppState) {
         return;
     };
     let store = state.store.clone();
+    let mut presentation_changes = delivery_presence::subscribe_changes();
+    let weak = Arc::downgrade(&store);
+    let source_observer = store.observe_commits(move |_| {
+        if let Some(store) = weak.upgrade() { store.note_agents_source_change(); }
+    });
     tokio::spawn(async move {
+        use futures_util::FutureExt as _;
+        let _source_observer = source_observer;
         let mut head = true;
         loop {
+            // Consume only work answered by this attempt. Inputs arriving during preparation
+            // keep their dirty flag and permit for a later complete publication.
+            let _ = wake.notified().now_or_never();
             let started = tokio::time::Instant::now();
             let mut admission = store.admit_agent_resources().await;
             let first = std::mem::take(&mut head);
@@ -5864,10 +5949,39 @@ pub fn start_agent_roster(state: &AppState) {
             let pause = started.elapsed().max(AGENT_ROSTER_FRESH_PAUSE);
             tokio::time::sleep(pause).await;
             tokio::select! {
-                () = tokio::time::sleep(AGENT_ROSTER_REFRESH_PAUSE.saturating_sub(pause)) => {}
-                () = store.fresh_agent_roster_wanted() => {}
+                () = async {
+                    tokio::select! {
+                        () = tokio::time::sleep(AGENT_ROSTER_REFRESH_PAUSE.saturating_sub(pause)) => {}
+                        () = store.fresh_agent_roster_wanted() => {}
+                    }
+                    let now = client_now_ms().min(u128::from(u64::MAX)) as u64;
+                    if !store.agents_publication_demand()
+                        || !store.agents_publication_needed(now) || store.agent_roster_refresh_failed() {
+                        wake.notified().await;
+                    }
+                } => {}
+                () = async {
+                    loop {
+                        if presentation_changes.changed().await.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                        // Keep inactive inputs dirty without waking a catch-up/trim refold.
+                        store.note_agents_source_change();
+                        if store.agents_publication_demand() { return; }
+                    }
+                } => store.request_agent_roster_refresh(),
+                () = async {
+                    if !store.agents_publication_demand() || store.agent_roster_refresh_failed() {
+                        std::future::pending::<()>().await;
+                    }
+                    if let Some(deadline) = store.agents_publication_deadline() {
+                        let now = client_now_ms().min(u128::from(u64::MAX)) as u64;
+                        tokio::time::sleep(Duration::from_millis(deadline.saturating_sub(now))).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => store.request_agent_roster_refresh(),
             }
-            wake.notified().await;
         }
     });
 }
@@ -15859,6 +15973,8 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
+    include!("api/agents_publication_tests.rs");
+
 
     #[tokio::test]
     async fn resources_page_keeps_rows_when_sync_forecast_is_unrepresentable() {

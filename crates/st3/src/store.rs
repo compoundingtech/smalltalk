@@ -1,5 +1,6 @@
 pub mod custom;
 pub mod declarations;
+pub mod agents_publication;
 pub(crate) mod observer_subscription_detail;
 mod glass_heads;
 mod arrangements;
@@ -1264,6 +1265,28 @@ const AGENT_CARD_STATUS_LIMIT: usize = 4096;
 
 /// A roster head: its cut, every agent's refs, the first cards in order, and when published.
 pub(crate) type PublishedRosterHead = (u64, Arc<Vec<Value>>, Vec<Value>, u128);
+
+pub(crate) struct AgentsPublicationSource {
+    pub(crate) watermark: agents_publication::AgentsStatusWatermark,
+    pub(crate) rows: Arc<Vec<Value>>,
+    pub(crate) valid_until_ms: Option<u64>,
+}
+
+enum FoldedAgentRows {
+    Owned(Vec<Value>),
+    Cached(Arc<Vec<Value>>),
+}
+
+impl FoldedAgentRows {
+    fn into_selected(self, selected: Option<&BTreeSet<String>>) -> Vec<Value> {
+        match self {
+            Self::Owned(rows) => rows,
+            Self::Cached(rows) => rows.iter().filter(|row| {
+                selected.is_none_or(|names| names.contains(row["id"].as_str().unwrap_or_default()))
+            }).cloned().collect(),
+        }
+    }
+}
 
 /// How long a roster refresh request may go unanswered before the daemon warns about it.
 const AGENT_ROSTER_OVERDUE_MS: u64 = 30_000;
@@ -3393,6 +3416,88 @@ impl Store {
         self.smalltalk.agent_resources_refolded_cards.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The authoritative complete current view: rows and metadata are captured in one Arc.
+    /// Subscribe before loading when a caller also needs publication notifications.
+    pub fn agents_publication(&self) -> Option<Arc<agents_publication::AgentsPublication>> {
+        self.smalltalk.agents_publication.current()
+    }
+
+    pub fn subscribe_agents_publications(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<Arc<agents_publication::AgentsPublication>>> {
+        let receiver = self.smalltalk.agents_publication.subscribe();
+        // Register before requesting, so the source owner cannot miss new demand.
+        self.request_agent_roster_refresh();
+        receiver
+    }
+
+    pub(crate) fn agents_publication_build(&self) -> agents_publication::Build {
+        self.smalltalk.agents_publication.begin()
+    }
+
+    pub(crate) fn agents_publication_needed(&self, now_ms: u64) -> bool {
+        self.smalltalk.agents_publication.needed(now_ms)
+    }
+
+    pub(crate) fn agents_publication_deadline(&self) -> Option<u64> {
+        self.smalltalk.agents_publication.deadline()
+    }
+
+    pub(crate) fn agents_publication_demand(&self) -> bool {
+        self.smalltalk.agents_publication_demand()
+    }
+
+    pub(crate) fn note_agents_source_change(&self) {
+        self.smalltalk.agents_publication.source_changed();
+        if self.agents_publication_demand()
+            && let Some(wake) = self.smalltalk.agent_roster_refresh.get() { wake.notify_one(); }
+    }
+
+    /// Capture only complete current rows and graph-backed presentation in the caller's pin.
+    /// The relevant local frontier is the one incorporated by those exact cached rows.
+    pub(crate) fn agents_publication_source(
+        &self, index: u64,
+    ) -> Result<AgentsPublicationSource> {
+        let local = roster_local_frontier(&self.readers.get(), index)?;
+        let cache = self.smalltalk.agent_resources_cache.lock()
+            .map_err(|_| anyhow::anyhow!("agent resources cache poisoned"))?;
+        let (rows, valid_until) = cache.iter().rev()
+            .find(|entry| entry.index == index && entry.local == local
+                && !entry.history && entry.covered.is_none())
+            .map(|entry| (Arc::clone(&entry.items), entry.valid_until_unix_ms))
+            .context("the complete current agents source is unavailable")?;
+        drop(cache);
+        Ok(AgentsPublicationSource {
+            watermark: agents_publication::AgentsStatusWatermark {
+                store_index: index, local_frontier: local,
+            },
+            rows,
+            valid_until_ms: valid_until.map(|deadline| deadline.min(u128::from(u64::MAX)) as u64),
+        })
+    }
+
+    pub(crate) fn finish_agents_publication(
+        &self, build: agents_publication::Build, prepared: agents_publication::Prepared,
+    ) -> Result<()> {
+        match self.smalltalk.agents_publication.finish(build, prepared) {
+            Ok(completed) => {
+                if completed.changed {
+                    // Freeze the shared encoding outside the publication owner's lock.
+                    let _ = completed.publication.encoded();
+                }
+                if completed.dirty && self.agents_publication_demand()
+                    && let Some(wake) = self.smalltalk.agent_roster_refresh.get() {
+                    wake.notify_one();
+                }
+                Ok(())
+            }
+            Err(agents_publication::Discarded::Superseded) => Ok(()),
+            Err(agents_publication::Discarded::Reset) => {
+                anyhow::bail!("the agents publication source reset while materializing it")
+            }
+        }
+    }
+
     pub(crate) fn cached_agent_resources(
         &self,
         index: u64,
@@ -3598,6 +3703,7 @@ impl Store {
     /// Ask the refresher, if one runs, to publish the roster at the newest cut. Requests made
     /// while it folds coalesce into one more refresh.
     pub(crate) fn request_agent_roster_refresh(&self) {
+        self.smalltalk.agents_publication.dirty();
         if let Some(wake) = self.smalltalk.agent_roster_refresh.get() {
             let _ = self.smalltalk.agent_roster_requested_at.compare_exchange(
                 0, now_ms() as u64, std::sync::atomic::Ordering::AcqRel,
@@ -3820,6 +3926,7 @@ impl Store {
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
         self.cached_agent_resources_folding(index, history, selected, false, build)
+            .map(|rows| rows.into_selected(selected))
     }
 
     /// [`Self::cached_agent_resources_for`] for one chunk of a roster assembled in short folds:
@@ -3833,6 +3940,15 @@ impl Store {
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
         self.cached_agent_resources_folding(index, history, Some(selected), true, build)
+            .map(|rows| rows.into_selected(Some(selected)))
+    }
+
+    /// Warm shared rows without copying a complete or chunked roster merely to discard it.
+    pub(crate) fn ensure_agent_resources_cached(
+        &self, index: u64, history: bool, selected: Option<&BTreeSet<String>>, chunk: bool,
+        build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
+    ) -> Result<()> {
+        self.cached_agent_resources_folding(index, history, selected, chunk, build).map(drop)
     }
 
     fn cached_agent_resources_folding(
@@ -3842,7 +3958,7 @@ impl Store {
         selected: Option<&BTreeSet<String>>,
         chunk: bool,
         build: impl FnOnce(Option<(&BTreeSet<String>, &[Value])>) -> Result<Vec<Value>>,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<FoldedAgentRows> {
         // Cold presentation reads current desired/queue tables even for historical status
         // cuts. Do not reuse rows from an older physical projection for those requests.
         if index < current_index(&self.readers.get())? {
@@ -3852,7 +3968,7 @@ impl Store {
             self.count_refolded_cards_for_test(items.len());
             items.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str())
                 .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
-            return Ok(items);
+            return Ok(FoldedAgentRows::Owned(items));
         }
         let now = now_ms();
         let valid = |entry: &&runtime::AgentResourcesEntry| {
@@ -3865,9 +3981,6 @@ impl Store {
         let local = crate::performance::task("roster/frontier-read", || {
             roster_local_frontier(&self.readers.get(), index)
         })?;
-        let select = |items: &[Value]| items.iter().filter(|item| {
-            selected.is_none_or(|names| names.contains(item["id"].as_str().unwrap_or_default()))
-        }).cloned().collect::<Vec<_>>();
         let fault_retries = self.agent_roster_fault_retries(history);
         let cache = self.smalltalk.agent_resources_cache.lock()
             .expect("agent resources cache poisoned");
@@ -3877,7 +3990,7 @@ impl Store {
             && selected.map_or(fault_retries.is_empty(), |names| names.is_disjoint(&fault_retries)) {
             let items = Arc::clone(&entry.items);
             drop(cache);
-            return crate::performance::task("roster/cache-hit", || Ok(select(&items)));
+            return crate::performance::task("roster/cache-hit", || Ok(FoldedAgentRows::Cached(items)));
         }
         // Expired entries are diff sources only, never hits: refreshing their queue metadata
         // is sufficient to discover the cards moved by a deadline without dropping the fleet.
@@ -4060,7 +4173,7 @@ impl Store {
         if complete {
             self.smalltalk.agent_roster_published.send_modify(|revision| *revision += 1);
         }
-        Ok(select(&items))
+        Ok(FoldedAgentRows::Cached(items))
     }
 
     /// The warm pin a shared roster read checks before it admits a builder: the exact cached
