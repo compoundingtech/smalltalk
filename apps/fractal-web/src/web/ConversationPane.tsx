@@ -107,7 +107,12 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
     refusal, onRefused: setRefusal,
   })
   const retryConversation = source.retryConversation
-  return <EmbraceRuntimeProvider key={agentRef} options={{ ...binding.runtime, isRunning: state._tag === 'Observed' && state.isRunning }}>
+  // The first readable snapshot initializes the runtime together with its send binding.
+  // A runtime born empty adopts later in a passive effect, painting a partial transcript
+  // and a temporary read-only composer before the same snapshot is ready.
+  const [initialized, setInitialized] = React.useState(state._tag !== 'Waiting')
+  if (!initialized && state._tag !== 'Waiting') setInitialized(true)
+  return <EmbraceRuntimeProvider key={`${agentRef}:${initialized}`} options={{ ...binding.runtime, isRunning: state._tag === 'Observed' && state.isRunning }}>
     {/* Bound the 100%-height kit frame to the space left above the composer. */}
     <div data-testid="conversation-history-host" style={{ flex: '1 1 0', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
     <Transcript
