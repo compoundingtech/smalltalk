@@ -38,6 +38,18 @@ pub trait Backend: Clone + Send + Sync + 'static {
         signature_requests: &[ReplicaEnvelopeId],
     ) -> impl Future<Output = Result<ReplicationExportResponse>> + Send;
 
+    /// Export for a peer using projection digests. Implementations that have not opted in
+    /// still send the exact legacy digest, preserving the old exchange contract.
+    fn export_modern(
+        &self,
+        fleet_id: &str,
+        inventory: &ReplicationInventory,
+        summary_only: bool,
+        signature_requests: &[ReplicaEnvelopeId],
+    ) -> impl Future<Output = Result<ReplicationExportResponse>> + Send {
+        self.export(fleet_id, inventory, summary_only, signature_requests)
+    }
+
     /// Store a peer's exchange, then admit and project what it carried. `round_trip` is how
     /// long this worker's request that returned it took, when the exchange is a response.
     fn receive(
@@ -155,6 +167,36 @@ impl<S> Backend for Local<S>
 where
     S: Borrow<Store> + Send + Sync + 'static,
 {
+    async fn export_modern(
+        &self,
+        fleet_id: &str,
+        inventory: &ReplicationInventory,
+        summary_only: bool,
+        signature_requests: &[ReplicaEnvelopeId],
+    ) -> Result<ReplicationExportResponse> {
+        let backend = self.clone();
+        let fleet_id = fleet_id.to_owned();
+        let inventory = inventory.clone();
+        let signature_requests = signature_requests.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let store = backend.store();
+            let exchange = if summary_only {
+                store.export_replication_summary_modern(&fleet_id)?
+            } else {
+                store.export_replication_exchange_answering_modern(
+                    &fleet_id,
+                    &inventory,
+                    &signature_requests,
+                )?
+            };
+            Ok(ReplicationExportResponse {
+                exchange,
+                store_index: store.index()?,
+            })
+        })
+        .await?
+    }
+
     async fn export(
         &self,
         fleet_id: &str,

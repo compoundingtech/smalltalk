@@ -46578,6 +46578,130 @@ version 2
     }
 
     #[test]
+    fn modern_export_defers_legacy_scan_until_an_older_peer_needs_it() {
+        let store = Store::open_memory("example-linux").unwrap();
+        store.connection.lock().unwrap().execute(
+            "INSERT INTO mission_runs(id, mission_id, initial_revision, current_generation_id,
+                root_revision, root_run_id, workspace, requester, inputs, mode, status, phase,
+                created_at_unix_ms, updated_at_unix_ms)
+             VALUES ('run-example', 'mission/example', 'revision', 'generation', 'revision',
+                'run-example', '/tmp/example', 'person/example', '{}', 'normal', 'running',
+                'normal', '1', '1')",
+            [],
+        ).unwrap();
+        GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(0));
+        let modern = store.export_replication_summary_modern("fleet/example").unwrap();
+        assert!(modern.graph_digest.is_empty());
+        assert!(!modern.projection_digests.is_empty());
+        assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 0);
+
+        let legacy = store.export_replication_summary("fleet/example").unwrap();
+        assert!(!legacy.graph_digest.is_empty());
+        assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 1);
+        assert_eq!(legacy.authority_digest, modern.authority_digest);
+        assert_eq!(legacy.projection_digests, modern.projection_digests);
+
+        store.connection.lock().unwrap().execute(
+            "UPDATE mission_runs SET status='completed' WHERE id='run-example'", []
+        ).unwrap();
+        let updated = store.export_replication_summary_modern("fleet/example").unwrap();
+        assert!(updated.graph_digest.is_empty());
+        assert_ne!(updated.projection_digests, modern.projection_digests);
+        assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 1);
+    }
+
+    #[test]
+    fn modern_export_sql_work_does_not_follow_projection_history() {
+        let measure = |count: usize| {
+            let store = Store::open_memory("example-linux").unwrap();
+            {
+                let mut connection = store.connection.lock().unwrap();
+                let transaction = connection.transaction().unwrap();
+                for index in 0..count {
+                    transaction.execute(
+                        "INSERT INTO mission_runs(id, mission_id, initial_revision,
+                            current_generation_id, root_revision, root_run_id, workspace,
+                            requester, inputs, mode, status, phase, created_at_unix_ms,
+                            updated_at_unix_ms)
+                         VALUES (?1, 'mission/example', 'revision', 'generation', 'revision',
+                            ?1, '/tmp/example', 'person/example', '{}', 'normal', 'running',
+                            'normal', '1', '1')",
+                        [format!("run-{index}")],
+                    ).unwrap();
+                }
+                transaction.commit().unwrap();
+            }
+            GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(0));
+            let before = smallclaims::sqlite::work::total();
+            let summary = store.export_replication_summary_modern("fleet/example").unwrap();
+            let work = smallclaims::sqlite::work::total() - before;
+            assert!(summary.graph_digest.is_empty());
+            assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 0);
+            work
+        };
+        let small = measure(64);
+        let large = measure(1024);
+        assert!(
+            large.vm_steps <= small.vm_steps + 500,
+            "modern export scanned projection history: small={small:?} large={large:?}"
+        );
+    }
+
+    #[test]
+    fn modern_receipt_uses_projection_snapshot_without_legacy_scan() {
+        let fleet = "fleet/example";
+        let source = Store::open_memory("source").unwrap();
+        let target = Store::open_memory("target").unwrap();
+        source
+            .append_client_claim(&ClaimInput {
+                subject: "resource/modern-receipt".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("modern-receipt".into()),
+            })
+            .unwrap();
+        source.bind_fleet(fleet).unwrap();
+        target.bind_fleet(fleet).unwrap();
+        let exchange = source
+            .export_replication_exchange_answering_modern(
+                fleet,
+                &target.replication_inventory().unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert!(exchange.graph_digest.is_empty());
+        assert!(!exchange.projection_digests.is_empty());
+        assert_eq!(exchange.envelopes.len(), 1);
+        GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(0));
+        let receipt = target
+            .receive_replication_exchange("source", fleet, &exchange)
+            .unwrap();
+        assert_eq!(receipt.received, 1);
+        let admission = target.validate_replication_backlog().unwrap();
+        assert!(admission.changed);
+        assert_eq!(GRAPH_DIGESTS_COMPUTED.with(std::cell::Cell::get), 0);
+        target.project_replication_backlog().unwrap();
+        assert_eq!(
+            target.claims_for("resource/modern-receipt", None).unwrap().len(),
+            1
+        );
+        let legacy = target.export_replication_summary(fleet).unwrap();
+        assert!(!legacy.graph_digest.is_empty());
+        let full = legacy_graph_digest(
+            &target.connection.lock().unwrap(),
+            target.runtime.legacy_digest_tables(),
+        )
+        .unwrap();
+        assert_eq!(legacy.graph_digest, full);
+    }
+
+    #[test]
     fn response_idempotency_caches_never_store_caller_keys() {
         let store = Store::open_memory("node").unwrap();
         let caller_key = "caller-visible-secret-key";
@@ -57492,7 +57616,7 @@ fn replication_snapshot_inserts_new_envelopes_in_canonical_order() {
         incremental.inventory.digest,
         replication_inventory_digest(&full)
     );
-    assert_eq!(incremental.buckets, test_replication_buckets(&full));
+    assert_eq!(incremental.buckets.as_ref(), &test_replication_buckets(&full));
 }
 
 #[cfg(test)]

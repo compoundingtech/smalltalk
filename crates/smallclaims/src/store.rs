@@ -1043,10 +1043,10 @@ pub struct ReplicationSnapshot {
     pub envelope_rows: usize,
     /// Changes to an existing inventory prefix or its checkpoint tombstones.
     pub inventory_generation: i64,
-    pub inventory: CompactReplicationInventory,
-    pub buckets: Vec<ReplicationInventoryBucket>,
+    pub inventory: Arc<CompactReplicationInventory>,
+    pub buckets: Arc<Vec<ReplicationInventoryBucket>>,
     /// The inventory digest state before each range in `buckets`.
-    pub digest_prefixes: Vec<Sha256>,
+    pub digest_prefixes: Arc<Vec<Sha256>>,
     pub authority_digest: String,
     pub graph_generation: i64,
     pub projection_generation: i64,
@@ -1880,7 +1880,8 @@ impl Store {
             }
         }
         // A local claim counts only once its batch is an envelope with this node's signature.
-        self.replication_snapshot()?;
+        // Membership needs that seal, but not the old six-table compatibility digest.
+        self.replication_snapshot_modern()?;
         let connection = self.readers.get();
         let folded_at = generation(&connection)?;
         let membership = fleet_membership_tx(&connection)?;
@@ -5433,6 +5434,16 @@ impl Store {
     /// The replication snapshot with every local batch sealed into a signed envelope first. The
     /// exchange paths use it; they must offer peers everything this node wrote.
     pub fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
+        self.replication_snapshot_with_legacy(true)
+    }
+
+    /// A modern peer compares the transactional projection digests. Its first exchange can
+    /// leave the six-table compatibility digest empty until an older peer is identified.
+    pub fn replication_snapshot_modern(&self) -> Result<Arc<ReplicationSnapshot>> {
+        self.replication_snapshot_with_legacy(false)
+    }
+
+    fn replication_snapshot_with_legacy(&self, legacy: bool) -> Result<Arc<ReplicationSnapshot>> {
         // A write that lands between sealing and reading would be counted by the projection
         // digests but not by the inventory, and a peer comparing graphs at equal inventories
         // would heal for nothing. Seal again until the snapshot holds no unsealed batch.
@@ -5440,7 +5451,7 @@ impl Store {
         let mut attempts = 0;
         loop {
             self.seal_local_batches()?;
-            snapshot = self.sealed_replication_snapshot()?;
+            snapshot = self.sealed_replication_snapshot_with_legacy(legacy)?;
             attempts += 1;
             if !snapshot.unsealed || attempts == 8 {
                 break;
@@ -5499,6 +5510,13 @@ impl Store {
     /// read such as `st replication status` uses it and never waits for the writer; a batch
     /// written since the last exchange shows once the next exchange seals it.
     pub fn sealed_replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
+        self.sealed_replication_snapshot_with_legacy(true)
+    }
+
+    fn sealed_replication_snapshot_with_legacy(
+        &self,
+        legacy: bool,
+    ) -> Result<Arc<ReplicationSnapshot>> {
         let current = |store: &Self| -> Result<Option<Arc<ReplicationSnapshot>>> {
             let store_index = store.index()?;
             let replica_generation = store.replica_generation.load(Ordering::Acquire);
@@ -5523,6 +5541,7 @@ impl Store {
                         && snapshot.projection_generation == current_projection_generation
                         && snapshot.max_envelope_rowid == envelope_rowid
                         && snapshot.inventory_generation == inventory_generation
+                        && (!legacy || !snapshot.legacy_graph_digest.is_empty())
                 })
                 .cloned())
         };
@@ -5539,13 +5558,21 @@ impl Store {
         let _timing = time_stage(&self.replication_timers.snapshot);
         self.read_snapshot(|_| {
             let connection = self.readers.get();
-            self.build_replication_snapshot(&connection)
+            self.build_replication_snapshot_with_legacy(&connection, legacy)
         })
     }
 
     pub fn build_replication_snapshot(
         &self,
         connection: &Connection,
+    ) -> Result<Arc<ReplicationSnapshot>> {
+        self.build_replication_snapshot_with_legacy(connection, true)
+    }
+
+    fn build_replication_snapshot_with_legacy(
+        &self,
+        connection: &Connection,
+        legacy: bool,
     ) -> Result<Arc<ReplicationSnapshot>> {
         let previous = self
             .replication_snapshot
@@ -5557,21 +5584,31 @@ impl Store {
         let graph_generation = graph_generation(connection)?;
         let reusable_graph_digest = previous
             .as_ref()
-            .filter(|previous| previous.graph_generation == graph_generation)
+            .filter(|previous| {
+                previous.graph_generation == graph_generation
+                    && !previous.legacy_graph_digest.is_empty()
+            })
             .map(|previous| previous.legacy_graph_digest.clone());
         let inventory_generation = inventory_generation::current(connection)?;
         let full = |connection: &Connection| -> Result<_> {
-            let (inventory, max_rowid, envelope_rows) =
+            let (mut inventory, max_rowid, envelope_rows) =
                 load_compact_replication_inventory(connection)?;
             let buckets = inventory.buckets();
-            Ok((inventory, max_rowid, buckets, Vec::new(), 0, envelope_rows))
+            let mut digest_prefixes = Vec::new();
+            inventory.resume_digest(&buckets, &mut digest_prefixes, 0);
+            Ok((
+                Arc::new(inventory),
+                max_rowid,
+                Arc::new(buckets),
+                Arc::new(digest_prefixes),
+                envelope_rows,
+            ))
         };
         let (
-            mut inventory,
+            inventory,
             max_envelope_rowid,
             buckets,
-            mut digest_prefixes,
-            resume_from,
+            digest_prefixes,
             envelope_count,
         ) = if let Some(previous) = previous {
             let mut statement = connection.prepare(
@@ -5593,10 +5630,9 @@ impl Store {
             if inventory_generation == previous.inventory_generation {
                 let envelope_rows = previous.envelope_rows + additions.len();
                 let mut max_rowid = previous.max_envelope_rowid;
-                // Most snapshots are owned only by this cache. Move their inventory
-                // into the successor so a graph write does not allocate and free
-                // every envelope ID. Keep the old snapshot intact for concurrent
-                // callers that still hold it.
+                // A graph-only change keeps these immutable values shared even when a
+                // concurrent reader still holds the previous snapshot. Additions copy on
+                // write so that reader retains its exact inventory and digest prefixes.
                 let (mut inventory, mut buckets, digest_prefixes) = match Arc::try_unwrap(previous)
                 {
                     Ok(snapshot) => (
@@ -5610,42 +5646,52 @@ impl Store {
                         shared.digest_prefixes.clone(),
                     ),
                 };
-                let mut touched = BTreeSet::new();
-                for (rowid, identity) in additions {
-                    max_rowid = max_rowid.max(rowid);
-                    touched.insert((
-                        identity.writer.clone(),
-                        replication_bucket_start(identity.sequence),
-                    ));
-                    inventory.insert(identity);
-                }
-                // Only the ranges that gained an envelope need a new digest.
-                for (writer, start) in &touched {
-                    let bucket = inventory.bucket(inventory.range(writer, *start));
-                    match buckets.binary_search_by(|existing| {
-                        (existing.writer.as_str(), existing.start).cmp(&(writer.as_str(), *start))
-                    }) {
-                        Ok(position) => buckets[position] = bucket,
-                        Err(position) => buckets.insert(position, bucket),
+                let mut digest_prefixes = digest_prefixes;
+                if !additions.is_empty() {
+                    let mut touched = BTreeSet::new();
+                    let current = Arc::make_mut(&mut inventory);
+                    for (rowid, identity) in additions {
+                        max_rowid = max_rowid.max(rowid);
+                        touched.insert((
+                            identity.writer.clone(),
+                            replication_bucket_start(identity.sequence),
+                        ));
+                        current.insert(identity);
                     }
-                }
-                // Every range before the first one that gained an envelope is unchanged, so
-                // the inventory digest resumes there instead of hashing every identity again.
-                let resume_from = touched
-                    .iter()
-                    .map(|(writer, start)| {
-                        buckets.partition_point(|existing| {
-                            (existing.writer.as_str(), existing.start) < (writer.as_str(), *start)
+                    // Only the ranges that gained an envelope need a new digest.
+                    let ranges = Arc::make_mut(&mut buckets);
+                    for (writer, start) in &touched {
+                        let bucket = current.bucket(current.range(writer, *start));
+                        match ranges.binary_search_by(|existing| {
+                            (existing.writer.as_str(), existing.start)
+                                .cmp(&(writer.as_str(), *start))
+                        }) {
+                            Ok(position) => ranges[position] = bucket,
+                            Err(position) => ranges.insert(position, bucket),
+                        }
+                    }
+                    // Every range before the first addition is unchanged.
+                    let resume_from = touched
+                        .iter()
+                        .map(|(writer, start)| {
+                            ranges.partition_point(|existing| {
+                                (existing.writer.as_str(), existing.start)
+                                    < (writer.as_str(), *start)
+                            })
                         })
-                    })
-                    .min()
-                    .unwrap_or(buckets.len());
+                        .min()
+                        .unwrap_or(ranges.len());
+                    current.resume_digest(
+                        ranges,
+                        Arc::make_mut(&mut digest_prefixes),
+                        resume_from,
+                    );
+                }
                 (
                     inventory,
                     max_rowid,
                     buckets,
                     digest_prefixes,
-                    resume_from,
                     envelope_rows,
                 )
             } else {
@@ -5654,14 +5700,14 @@ impl Store {
         } else {
             full(connection)?
         };
-        inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
         // Envelope hashes already commit the complete payload (and chain metadata). The
         // inventory digest therefore commits the authority log without hex-encoding and hashing
         // every payload again on each graph change.
         let authority_digest = inventory.digest.clone();
         let legacy_graph_digest = match reusable_graph_digest {
             Some(digest) => digest,
-            None => legacy_graph_digest(connection, self.runtime.legacy_digest_tables())?,
+            None if legacy => legacy_graph_digest(connection, self.runtime.legacy_digest_tables())?,
+            None => String::new(),
         };
         let projection_generation = projection_digest::generation(connection)?;
         let projection_digests = projection_digest::tables(connection)?;
@@ -5698,7 +5744,19 @@ impl Store {
     }
 
     pub fn export_replication_summary(&self, fleet_id: &str) -> Result<ReplicationExchange> {
-        let snapshot = self.replication_snapshot()?;
+        self.export_replication_summary_with_legacy(fleet_id, true)
+    }
+
+    pub fn export_replication_summary_modern(&self, fleet_id: &str) -> Result<ReplicationExchange> {
+        self.export_replication_summary_with_legacy(fleet_id, false)
+    }
+
+    fn export_replication_summary_with_legacy(
+        &self,
+        fleet_id: &str,
+        legacy: bool,
+    ) -> Result<ReplicationExchange> {
+        let snapshot = self.replication_snapshot_with_legacy(legacy)?;
         let _timing = time_stage(&self.replication_timers.export);
         let signature_requests = self.replication_signature_requests()?;
         Ok(ReplicationExchange {
@@ -5706,12 +5764,16 @@ impl Store {
             fleet_id: fleet_id.to_owned(),
             schema_digest: self.runtime.schema_digest(),
             authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: snapshot.legacy_graph_digest.clone(),
+            graph_digest: if legacy {
+                snapshot.legacy_graph_digest.clone()
+            } else {
+                String::new()
+            },
             projection_digests: snapshot.projection_digests.clone(),
             inventory: ReplicationInventory {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
-                buckets: snapshot.buckets.clone(),
+                buckets: snapshot.buckets.as_ref().clone(),
                 accepts: Some(replication_accepts()),
                 checkpoint: self.trimmed_checkpoint()?,
             },
@@ -5737,7 +5799,36 @@ impl Store {
         remote: &ReplicationInventory,
         signature_requests: &[ReplicaEnvelopeId],
     ) -> Result<ReplicationExchange> {
-        let mut exchange = self.export_replication_difference(fleet_id, remote)?;
+        self.export_replication_exchange_answering_with_legacy(
+            fleet_id,
+            remote,
+            signature_requests,
+            true,
+        )
+    }
+
+    pub fn export_replication_exchange_answering_modern(
+        &self,
+        fleet_id: &str,
+        remote: &ReplicationInventory,
+        signature_requests: &[ReplicaEnvelopeId],
+    ) -> Result<ReplicationExchange> {
+        self.export_replication_exchange_answering_with_legacy(
+            fleet_id,
+            remote,
+            signature_requests,
+            false,
+        )
+    }
+
+    fn export_replication_exchange_answering_with_legacy(
+        &self,
+        fleet_id: &str,
+        remote: &ReplicationInventory,
+        signature_requests: &[ReplicaEnvelopeId],
+        legacy: bool,
+    ) -> Result<ReplicationExchange> {
+        let mut exchange = self.export_replication_difference_with_legacy(fleet_id, remote, legacy)?;
         let _timing = time_stage(&self.replication_timers.export);
         exchange.signatures = self.replication_signatures_for(signature_requests)?;
         exchange.signature_requests = self.replication_signature_requests()?;
@@ -5749,7 +5840,16 @@ impl Store {
         fleet_id: &str,
         remote: &ReplicationInventory,
     ) -> Result<ReplicationExchange> {
-        let snapshot = self.replication_snapshot()?;
+        self.export_replication_difference_with_legacy(fleet_id, remote, true)
+    }
+
+    fn export_replication_difference_with_legacy(
+        &self,
+        fleet_id: &str,
+        remote: &ReplicationInventory,
+        legacy: bool,
+    ) -> Result<ReplicationExchange> {
+        let snapshot = self.replication_snapshot_with_legacy(legacy)?;
         let _timing = time_stage(&self.replication_timers.export);
         let same = !remote.digest.is_empty() && remote.digest == snapshot.inventory.digest;
         if !same && !remote.buckets.is_empty() {
@@ -5765,12 +5865,16 @@ impl Store {
                 fleet_id: fleet_id.to_owned(),
                 schema_digest: self.runtime.schema_digest(),
                 authority_digest: snapshot.authority_digest.clone(),
-                graph_digest: snapshot.legacy_graph_digest.clone(),
+                graph_digest: if legacy {
+                    snapshot.legacy_graph_digest.clone()
+                } else {
+                    String::new()
+                },
                 projection_digests: snapshot.projection_digests.clone(),
                 inventory: ReplicationInventory {
                     digest: snapshot.inventory.digest.clone(),
                     envelopes: listed,
-                    buckets: snapshot.buckets.clone(),
+                    buckets: snapshot.buckets.as_ref().clone(),
                     accepts: Some(replication_accepts()),
                     checkpoint: self.trimmed_checkpoint()?,
                 },
@@ -5807,7 +5911,11 @@ impl Store {
             fleet_id: fleet_id.to_owned(),
             schema_digest: self.runtime.schema_digest(),
             authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: snapshot.legacy_graph_digest.clone(),
+            graph_digest: if legacy {
+                snapshot.legacy_graph_digest.clone()
+            } else {
+                String::new()
+            },
             projection_digests: snapshot.projection_digests.clone(),
             inventory: ReplicationInventory {
                 accepts: Some(replication_accepts()),
@@ -6054,7 +6162,24 @@ impl Store {
         if received != 0 {
             self.replica_generation.fetch_add(1, Ordering::AcqRel);
         }
-        let snapshot = self.replication_snapshot().map_err(internal)?;
+        let mut snapshot = if input.projection_digests.is_empty() {
+            self.replication_snapshot()
+        } else {
+            self.replication_snapshot_modern()
+        }
+        .map_err(internal)?;
+        let modern_comparable = comparable_projection_digest_domains(
+            &snapshot.projection_digests,
+            &input.projection_digests,
+        );
+        if !modern_comparable
+            && !input.graph_digest.is_empty()
+            && snapshot.legacy_graph_digest.is_empty()
+        {
+            // A mixed build supplied an exact old digest with an incomplete modern map.
+            // Compute the matching old digest only for that compatibility comparison.
+            snapshot = self.replication_snapshot().map_err(internal)?;
+        }
         let difference = replication_inventory_difference(
             &snapshot.inventory,
             &snapshot.buckets,
@@ -6063,15 +6188,15 @@ impl Store {
         // Each graph projects the envelopes its node holds, so the digests are comparable only
         // while both nodes hold the same ones, and only once this node has projected them all:
         // nothing new arrived that still waits for admission, and no projection is deferred.
-        let (local_graph, remote_graph) = if input.projection_digests.is_empty() {
-            (
-                snapshot.legacy_graph_digest.clone(),
-                input.graph_digest.clone(),
-            )
-        } else {
+        let (local_graph, remote_graph) = if modern_comparable {
             (
                 snapshot.graph_digest.clone(),
                 projection_digest::root(&input.projection_digests),
+            )
+        } else {
+            (
+                snapshot.legacy_graph_digest.clone(),
+                input.graph_digest.clone(),
             )
         };
         // Registries from different builds may legitimately produce different projections.
@@ -6090,7 +6215,7 @@ impl Store {
             && !waiting
             && !input.inventory.digest.is_empty()
             && input.inventory.digest == snapshot.inventory.digest
-            && (!input.projection_digests.is_empty() || !input.graph_digest.is_empty())
+            && (modern_comparable || !input.graph_digest.is_empty())
             && received == 0
             && signatures == 0
             && !self.replication_projection_deferred())
@@ -6187,7 +6312,7 @@ impl Store {
 
     pub fn validate_replication_backlog(&self) -> Result<ReplicationAdmission> {
         // Seed and sign local batches first, so local membership claims decide admission.
-        self.replication_snapshot()?;
+        self.replication_snapshot_modern()?;
         // Admission lends the writer back between chunks, so two must not run at once and
         // admit the same pending envelopes.
         let _admitting = self

@@ -34,6 +34,7 @@ use crate::fleet::{Acceptance, FleetFile, FleetView, MemberKey, PeerConfig, Refu
 use crate::replication::{
     InventoryCheckpoint, ReplicationExchange, ReplicationHealAnswer, ReplicationHealQuery,
     ReplicationHealRequest, ReplicationHealStep, ReplicationInventory,
+    comparable_projection_digest_domains, valid_projection_digest_map,
 };
 use crate::store::{CheckpointManifest, CheckpointManifestPage, CheckpointManifestRequest};
 
@@ -1599,15 +1600,29 @@ async fn receive_exchange<B: Backend>(
                             .outbound_notify
                             .send_modify(|generation| *generation = generation.saturating_add(1));
                     }
-                    let response = state
-                        .backend
-                        .export(
-                            state.auth.fleet_id(),
-                            &request.inventory,
-                            false,
-                            &request.signature_requests,
-                        )
-                        .await?;
+                    let response = if !request.graph_digest.is_empty()
+                        || !valid_projection_digest_map(&request.projection_digests)
+                    {
+                        state
+                            .backend
+                            .export(
+                                state.auth.fleet_id(),
+                                &request.inventory,
+                                false,
+                                &request.signature_requests,
+                            )
+                            .await?
+                    } else {
+                        state
+                            .backend
+                            .export_modern(
+                                state.auth.fleet_id(),
+                                &request.inventory,
+                                false,
+                                &request.signature_requests,
+                            )
+                            .await?
+                    };
 
                     Ok::<_, anyhow::Error>(response)
                 }
@@ -2122,6 +2137,26 @@ pub fn signed_error_response_for<B: Backend>(
     Ok(response)
 }
 
+/// Empty compatibility digests opt into the current projection-digest domain. Exact table keys
+/// and valid SHA-256 values make the two advertised roots comparable; a mixed build falls back.
+fn comparable_modern_exchange(local: &ReplicationExchange, remote: &ReplicationExchange) -> bool {
+    local.graph_digest.is_empty()
+        && remote.graph_digest.is_empty()
+        && local.schema_digest == remote.schema_digest
+        && comparable_projection_digest_domains(
+            &local.projection_digests,
+            &remote.projection_digests,
+        )
+}
+
+fn needs_legacy_retry(
+    local: &ReplicationExchange,
+    answer: &Result<(ReplicationExchange, bool)>,
+) -> bool {
+    local.graph_digest.is_empty()
+        && matches!(answer, Ok((remote, _)) if !comparable_modern_exchange(local, remote))
+}
+
 /// Run one exchange with `peer`: send this node's summary, take what the peer sends, push what
 /// it lacks, and adopt a checkpoint it advertises. Returns whether envelopes moved either way and
 /// whether a heal is due.
@@ -2137,11 +2172,13 @@ pub async fn exchange<B: Backend>(
     // One compact round, then at most one full-inventory round if the compact prefix
     // cannot make progress. Payloadless checkpoint identities can differ indefinitely.
     for full_inventory in [false, true] {
+        let deadline = tokio::time::Instant::now() + EXCHANGE_POLL_BUDGET;
+        let mut polls = MAX_OVERLOAD_POLLS;
         let first = backend
-            .export(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
+            .export_modern(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
             .await?
             .exchange;
-        let own_checkpoint = first.inventory.checkpoint.clone();
+        let mut own_checkpoint = first.inventory.checkpoint.clone();
         let mut query = ReplicationExchange {
             envelopes: Vec::new(),
             ..first
@@ -2152,9 +2189,32 @@ pub async fn exchange<B: Backend>(
             query.inventory.buckets.clear();
         }
         let started = std::time::Instant::now();
-        let (remote, peer_inflates) =
-            post_signed(http, backend, peer, node, auth, fleet, &query, false).await?;
-        let round_trip = started.elapsed();
+        let first_answer =
+            post_signed_budgeted(http, backend, peer, node, auth, fleet, &query, false, deadline, &mut polls)
+                .await;
+        let (remote, peer_inflates, round_trip) = if needs_legacy_retry(&query, &first_answer) {
+            // A peer without the exact projection domain may compare only the old digest.
+            // Its first answer is provisional: retry with the exact digest before accepting
+            // its receipt, a heal decision, or a completed round. Refusals, authentication
+            // errors and lost responses remain errors, never downgrade signals.
+            query = backend
+                .export(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
+                .await?
+                .exchange;
+            own_checkpoint = query.inventory.checkpoint.clone();
+            if full_inventory {
+                query.inventory.buckets.clear();
+            }
+            let started = std::time::Instant::now();
+            let (answer, inflates) = post_signed_budgeted(
+                http, backend, peer, node, auth, fleet, &query, false, deadline, &mut polls,
+            )
+            .await?;
+            (answer, inflates, started.elapsed())
+        } else {
+            let (answer, inflates) = first_answer?;
+            (answer, inflates, started.elapsed())
+        };
         let different = remote.inventory.digest != query.inventory.digest;
         let received = backend
             .receive(&peer.name, auth.fleet_id(), &remote, Some(round_trip))
@@ -2171,20 +2231,61 @@ pub async fn exchange<B: Backend>(
         // A follow-up also carries the signatures the peer asked for, even when both sides hold
         // the same envelopes.
         if different || !remote.signature_requests.is_empty() {
-            let push = backend
-                .export(
-                    auth.fleet_id(),
-                    &remote.inventory,
-                    false,
-                    &remote.signature_requests,
-                )
-                .await?
-                .exchange;
+            let deadline = tokio::time::Instant::now() + EXCHANGE_POLL_BUDGET;
+            let mut polls = MAX_OVERLOAD_POLLS;
+            let modern_peer = comparable_modern_exchange(&query, &remote);
+            let mut push = if !modern_peer {
+                backend
+                    .export(
+                        auth.fleet_id(),
+                        &remote.inventory,
+                        false,
+                        &remote.signature_requests,
+                    )
+                    .await?
+                    .exchange
+            } else {
+                backend
+                    .export_modern(
+                        auth.fleet_id(),
+                        &remote.inventory,
+                        false,
+                        &remote.signature_requests,
+                    )
+                    .await?
+                    .exchange
+            };
             let started = std::time::Instant::now();
             // A peer that says it takes compressed requests gets a large push compressed.
-            let (response, _) =
-                post_signed(http, backend, peer, node, auth, fleet, &push, peer_inflates).await?;
-            let round_trip = started.elapsed();
+            let first_answer = post_signed_budgeted(
+                http, backend, peer, node, auth, fleet, &push, peer_inflates, deadline, &mut polls,
+            )
+            .await;
+            let (response, round_trip) = if modern_peer && needs_legacy_retry(&push, &first_answer)
+            {
+                // A restarted or mixed-version peer may have accepted the envelopes but
+                // cannot certify this modern comparison. Repeat the idempotent push with
+                // the exact legacy digest under the same deadline and overload poll budget.
+                push = backend
+                    .export(
+                        auth.fleet_id(),
+                        &remote.inventory,
+                        false,
+                        &remote.signature_requests,
+                    )
+                    .await?
+                    .exchange;
+                let started = std::time::Instant::now();
+                let (answer, _) = post_signed_budgeted(
+                    http, backend, peer, node, auth, fleet, &push, peer_inflates, deadline,
+                    &mut polls,
+                )
+                .await?;
+                (answer, started.elapsed())
+            } else {
+                let (answer, _) = first_answer?;
+                (answer, started.elapsed())
+            };
             // The peer stores a push before it answers, so its inventory moved if the push landed.
             pushed =
                 !push.envelopes.is_empty() && response.inventory.digest != remote.inventory.digest;
@@ -2363,6 +2464,7 @@ impl std::error::Error for PeerOverloaded {}
 
 /// Send one signed exchange, compressed when `compress` is set and the body is large, and return
 /// the peer's verified answer and whether the peer takes compressed requests.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn post_signed<B: Backend>(
     http: &reqwest::Client,
@@ -2375,8 +2477,29 @@ async fn post_signed<B: Backend>(
     compress: bool,
 ) -> Result<(ReplicationExchange, bool)> {
     let deadline = tokio::time::Instant::now() + EXCHANGE_POLL_BUDGET;
+    let mut polls = MAX_OVERLOAD_POLLS;
+    post_signed_budgeted(
+        http, backend, peer, node, auth, fleet, exchange, compress, deadline, &mut polls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn post_signed_budgeted<B: Backend>(
+    http: &reqwest::Client,
+    backend: &B,
+    peer: &PeerConfig,
+    node: &str,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    exchange: &ReplicationExchange,
+    compress: bool,
+    deadline: tokio::time::Instant,
+    polls_remaining: &mut usize,
+) -> Result<(ReplicationExchange, bool)> {
     let attempted = crate::store::now_ms();
-    for _ in 0..MAX_OVERLOAD_POLLS {
+    while *polls_remaining != 0 {
+        *polls_remaining -= 1;
         record_worker(backend, &peer.name, "exchange", attempted, None).await;
         let result = match tokio::time::timeout_at(
             deadline,

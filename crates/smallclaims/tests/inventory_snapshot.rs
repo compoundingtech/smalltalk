@@ -24,7 +24,7 @@ fn check(store: &Store) -> Arc<smallclaims::store::ReplicationSnapshot> {
     assert_eq!(snapshot.envelope_rows, held);
     assert_eq!(snapshot.max_envelope_rowid, max_rowid);
     assert_eq!(snapshot.inventory.digest, full.digest);
-    assert_eq!(snapshot.buckets, full.buckets());
+    assert_eq!(snapshot.buckets.as_ref(), &full.buckets());
     for envelope in &snapshot.inventory.envelopes {
         let identity = snapshot.inventory.identity(envelope);
         let corresponding = full
@@ -38,6 +38,35 @@ fn check(store: &Store) -> Arc<smallclaims::store::ReplicationSnapshot> {
         );
     }
     snapshot
+}
+
+#[test]
+fn graph_only_rebuild_shares_inventory_with_retained_reader() {
+    let store = Store::open_memory("alder", Arc::new(Plain)).unwrap();
+    insert(&store, 1, 1);
+    insert(&store, 2, 2);
+    let retained = check(&store);
+
+    // Model a committed projection change without changing the envelope inventory.
+    store
+        .connection
+        .write()
+        .execute("UPDATE graph_generation SET value=value+1 WHERE id=1", [])
+        .unwrap();
+    let rebuilt = check(&store);
+    assert!(!Arc::ptr_eq(&retained, &rebuilt));
+    assert!(Arc::ptr_eq(&retained.inventory, &rebuilt.inventory));
+    assert!(Arc::ptr_eq(&retained.buckets, &rebuilt.buckets));
+    assert!(Arc::ptr_eq(
+        &retained.digest_prefixes,
+        &rebuilt.digest_prefixes
+    ));
+
+    insert(&store, 3, 3);
+    let appended = check(&store);
+    assert_eq!(retained.inventory.envelopes.len(), 2);
+    assert_eq!(appended.inventory.envelopes.len(), 3);
+    assert_ne!(retained.inventory.digest, appended.inventory.digest);
 }
 
 #[test]
