@@ -314,7 +314,8 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     const scroller = scrollerOf(timeline.current)
     if (start > 0 && scroller instanceof HTMLElement && hasVisibleBox(scroller) && scroller.clientHeight > 0 && scroller.scrollHeight <= scroller.clientHeight) setMounted({ _tag: 'From', id: source[Math.max(0, start - backfillChunkRows)]!.id })
   }, [start, source, visibleTurns])
-  React.useEffect(() => {
+  // Native find must work as soon as the first bounded page can paint.
+  React.useLayoutEffect(() => {
     const scroller = scrollerOf(timeline.current)
     if (!backfilling || scroller == null) return
     const nearTop = () => { if (scroller instanceof HTMLElement && scroller.dataset.followState === 'detached' && scroller.scrollTop < scroller.clientHeight) mountOlder(false) }
