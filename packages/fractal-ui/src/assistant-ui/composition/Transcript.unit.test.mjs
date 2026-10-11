@@ -22,9 +22,13 @@ const turn = { id: 'turn/example', prompt, items: [], work: { calls: [], duratio
 
 for (const turns of [[], [turn]]) test(`Transcript server-renders ${turns.length === 0 ? 'empty history' : 'an unpublished prompt'} without throwing`, () => {
   const element = React.createElement(EmbraceRuntimeProvider, {
-    options: { messages: turns.flatMap(entry => [entry.prompt]), isRunning: false, onNew: async () => {} },
+    options: { messages: [], isRunning: false, onNew: async () => {} },
   }, React.createElement(Transcript, { turns, title: 'Row projection', sync: { _tag: 'Live', since: now }, now, observedAt: now }))
   let markup
   assert.doesNotThrow(() => { markup = renderToStaticMarkup(element) })
   assert.match(markup, /Row projection/)
+  if (turns.length > 0) {
+    assert.doesNotMatch(markup, /data-testid="transcript-empty"/)
+    assert.match(markup, /data-testid="transcript-placeholder"/)
+  }
 })

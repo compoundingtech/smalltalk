@@ -4,7 +4,7 @@ import { flushSync } from 'react-dom'
 import { ActionBarPrimitive, MessagePrimitive, ThreadPrimitive, useAuiState } from '@assistant-ui/react'
 import { Button, Disclosure, DisclosurePanel, ProgressBar } from 'react-aria-components'
 import type { ConversationItem, MessageItem, TextItem } from '../embrace-data/model'
-import { EmbraceScrollViewport, type ViewportAnchorHistory } from '../EmbraceScrollViewport'
+import { EmbraceScrollViewport, type EmbraceScrollViewportHandle, type ViewportAnchorHistory } from '../EmbraceScrollViewport'
 import { RuntimeAdoptedIds } from '../EmbraceRuntime'
 import { WorkLogV1 } from '../taste/WorkLogV1'
 import { formatWorkDuration, workLogOutputLanguage, type WorkLogCall, type WorkLogTurn } from '../taste/work-log'
@@ -49,6 +49,8 @@ export interface TranscriptProps {
   readonly availability?: TranscriptAvailability
   readonly history?: TranscriptHistory
   readonly emptyState?: React.ReactNode | TranscriptEmptyState
+  /** Host-owned first-publication body; an empty body can keep a switch lane stable. */
+  readonly loadingState?: React.ReactNode
   /** Workbench conversation key for the owning surface's scroll memory. */
   readonly viewportKey?: string
   /** Host command, e.g. the newest own pending send: a changed key brings the latest turn into view. */
@@ -142,7 +144,8 @@ const turnGroupSize = 16
  * turn while it stays in the transcript, so neither prepended history nor new turns move an existing turn to another
  * group: turns keep their React identity, disclosure state and focus. A distant full group skips as one box:
  * revealing a pane styles the groups, not every turn. A partial group (the oldest one while older turns backfill or
- * history is prepended, the newest one while turns arrive) is not observed, so it never skips as a whole; once full
+ * history is prepended, the newest one while turns arrive) is not observed and has no layout box: its children
+ * participate in the outer timeline, avoiding a moving aggregate box during bounded prefix backfill. Once full
  * it renders a frame at its full height before its first report can mark it distant.
  */
 const turnGroups = (turns: readonly TranscriptTurn[], start: number, origin: number) => {
@@ -152,7 +155,7 @@ const turnGroups = (turns: readonly TranscriptTurn[], start: number, origin: num
 }
 function TurnGroup({ full, children }: { readonly full: boolean; readonly children: React.ReactNode }) {
   const observe = React.useContext(TurnProximityRef)
-  return <div ref={full ? observe : undefined} {...stylex.props(styles.timeline, styles.turnSkip)}>{children}</div>
+  return <div ref={full ? observe : undefined} {...stylex.props(styles.timeline, styles.turnSkip, !full && styles.partialGroup)}>{children}</div>
 }
 /** Fallback for an item the runtime never adopted: visible in place, never silently dropped. */
 function StrandedItem({ item }: { readonly item: ConversationItem }) {
@@ -185,55 +188,79 @@ const contentVersion = (item: ConversationItem): string => {
   contentVersions.set(item, version)
   return version
 }
-/** Which committed turns are mounted: the newest page first, then older turns from a kept turn id, then all. */
+/** The window is counted in source rows, not turns: a single agent turn can contain thousands of entries. */
 type MountedTurns = { readonly _tag: 'NewestPage' } | { readonly _tag: 'From'; readonly id: string } | { readonly _tag: 'All' }
-const newestPageTurns = 6
-const backfillChunkTurns = 4
-/** Index of the oldest mounted turn. A kept id that left the transcript mounts everything. */
-const mountedStart = (mounted: MountedTurns, turns: readonly TranscriptTurn[]) =>
-  mounted._tag === 'All' ? 0 : mounted._tag === 'NewestPage' ? Math.max(0, turns.length - newestPageTurns) : Math.max(0, turns.findIndex(turn => turn.id === mounted.id))
-const whenIdle = (task: () => void): (() => void) => {
-  if (typeof requestIdleCallback === 'function') {
-    const handle = requestIdleCallback(task, { timeout: 250 })
-    return () => cancelIdleCallback(handle)
-  }
-  const handle = setTimeout(task, 16)
-  return () => clearTimeout(handle)
+const newestPageRows = 6
+const backfillChunkRows = 4
+const mountedStart = (mounted: MountedTurns, rows: readonly ConversationItem[]) =>
+  mounted._tag === 'All' ? 0 : mounted._tag === 'NewestPage' ? Math.max(0, rows.length - newestPageRows) : Math.max(0, rows.findIndex(row => row.id === mounted.id))
+/** Keep the owning turn's identity and summary, and the newest prompt even outside the source-row suffix. */
+const windowTurns = (turns: readonly TranscriptTurn[], start: number): readonly TranscriptTurn[] => {
+  let offset = 0
+  return turns.flatMap((turn, index) => {
+    const length = turn.items.length + (turn.prompt === undefined ? 0 : 1)
+    const skip = Math.max(0, start - offset)
+    offset += length
+    if (length > 0 && skip >= length) return []
+    if (skip === 0) return [turn]
+    let itemStart = skip - (turn.prompt === undefined ? 0 : 1)
+    // Keep a contiguous reasoning disclosure whole, including its first-item key, across prefix reveals.
+    while (itemStart > 0 && turn.items[itemStart]?._tag === 'Reasoning' && turn.items[itemStart - 1]?._tag === 'Reasoning') itemStart--
+    const items = turn.items.slice(itemStart)
+    const ids = new Set(items.map(item => item.id))
+    return [{ ...turn, prompt: index === turns.length - 1 ? turn.prompt : undefined, items, work: { ...turn.work, calls: turn.work.calls.filter(call => ids.has(call.id)) } }]
+  })
 }
+/** Older engines and non-layout DOMs lack checkVisibility; retained hidden ancestors still must not backfill. */
+const hasVisibleBox = (element: HTMLElement): boolean => {
+  if (typeof element.checkVisibility === 'function') return element.checkVisibility()
+  for (let ancestor: HTMLElement | null = element; ancestor !== null; ancestor = ancestor.parentElement) {
+    const style = element.ownerDocument.defaultView?.getComputedStyle(ancestor)
+    if (style?.display === 'none' || style?.contentVisibility === 'hidden') return false
+  }
+  return true
+}
+/** Growing a partial turn must not re-render the already mounted message subtrees. */
+const PreparedMessage = React.memo(function PreparedMessage({ item, stranded, caption }: { readonly item: ConversationItem; readonly stranded: boolean; readonly caption?: string }) {
+  return stranded ? <StrandedItem item={item} /> : <SenderCaption.Provider value={caption}><ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} /></SenderCaption.Provider>
+})
 const PreparedTurn = React.memo(function PreparedTurn({ turn, stranded, onOpenTool, onRetryRun, landmarkContext }: { turn: TranscriptTurn; stranded?: ReadonlySet<string>; onOpenTool: TranscriptProps['onOpenTool']; onRetryRun?: () => void; landmarkContext?: string }) {
   const detail = React.useCallback((call: WorkLogCall) => <ToolDetailPreview call={call} onOpen={onOpenTool} />, [onOpenTool])
   const reasoning = turn.items.filter(item => item._tag === 'Reasoning')
   return <section ref={React.useContext(TurnProximityRef)} data-testid="transcript-turn" data-item-id={turn.id} {...stylex.props(styles.turn, styles.turnSkip)}>
-    {turn.prompt !== undefined && (stranded?.has(turn.prompt.id) ? <StrandedItem item={turn.prompt} /> : <ThreadPrimitive.Unstable_MessageById messageId={turn.prompt.id} components={messageComponents} />)}
+    {turn.prompt !== undefined && <PreparedMessage item={turn.prompt} stranded={stranded?.has(turn.prompt.id) ?? false} />}
     {(turn.work.calls.length > 0 || reasoning.length > 0) && <WorkLogV1 turn={turn.work} summaryAnchorId={JSON.stringify(['work-summary', turn.id])} ariaLabel={`Work log ${turn.id}${landmarkContext ? `, ${landmarkContext}` : ''}`} listStyle={styles.workList} renderCallDetail={detail} previewCallDetail={!turn.work.running} interactiveCalls={onOpenTool !== undefined} hideLiveRow onRetry={onRetryRun} onOpenOutput={onOpenTool} expandedBody={reasoning.map(item => <ThinkingEntry key={item.id} itemId={item.id} text={item.text} streaming={item.streaming} />)} />}
-    {turn.items.filter(item => item._tag !== 'ToolCall' && item._tag !== 'Reasoning').map(item => stranded?.has(item.id) ? <StrandedItem key={item.id} item={item} /> : <SenderCaption.Provider key={item.id} value={turn.senderCaptions?.[item.id]}><ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} /></SenderCaption.Provider>)}
+    {turn.items.filter(item => item._tag !== 'ToolCall' && item._tag !== 'Reasoning').map(item => <PreparedMessage key={item.id} item={item} stranded={stranded?.has(item.id) ?? false} caption={turn.senderCaptions?.[item.id]} />)}
     {turn.work.running && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.liveActivity)}><span aria-hidden="true">◌</span></div>}
   </section>
 })
 // Hosts using AssistantRuntimeProvider directly expose no adoption store; its absence never changes.
 const staticSubscription = () => () => undefined
 /** Locked U2·F3·Y3 presentation under the host's AssistantRuntimeProvider. */
-export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, onRetrySync, onRetryRun, onRetrySend, resolveImage, onLoadImage, availability = { _tag: 'Available' }, history = { _tag: 'Complete' }, emptyState, viewportKey, scrollToBottomKey, landmarkContext }: TranscriptProps) {
+export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, onRetrySync, onRetryRun, onRetrySend, resolveImage, onLoadImage, availability = { _tag: 'Available' }, history = { _tag: 'Complete' }, emptyState, loadingState, viewportKey, scrollToBottomKey, landmarkContext }: TranscriptProps) {
   const messages = useAuiState(state => state.thread.messages)
   // External-store runtimes adopt each snapshot in a passive effect, and the store publishes the
-  // adopted messages a task later. Recording the snapshot after its commit is the adoption epoch.
-  // An id is pending (deferred so the turn stays mounted) while its snapshot has not been through a
-  // commit or while the runtime holds it and the store has yet to publish it; once committed and
-  // absent from the runtime, it is stranded. Only unpublished ids depend on the epoch or on runtime
-  // adoption, so neither is recorded while every id is published: a freshly mounted pane commits once.
+  // adopted messages a task later. A child effect runs before its provider's adoption effect, so
+  // a host render alone cannot classify missing ids as stranded. The adoption store first confirms
+  // the source snapshot reached the runtime; ids it holds remain pending until publication, while
+  // ids it did not adopt may render their fallback. Only unpublished ids subscribe to this seam.
   const [adoptionEpoch, setAdoptionEpoch] = React.useState<readonly TranscriptTurn[]>()
   const published = React.useMemo(() => new Set(messages.map(message => message.id)), [messages])
   const unpublished = React.useMemo(() => turns.flatMap(turn => [...(turn.prompt === undefined ? [] : [turn.prompt.id]), ...turn.items.map(item => item.id)]).filter(id => !published.has(id)), [turns, published])
   const adoption = React.useContext(RuntimeAdoptedIds)
   const getHeldKey = () => {
     const held = adoption?.get()
-    return JSON.stringify(held === undefined ? [] : unpublished.filter(id => held.has(id)))
+    const source = adoption?.getSourceIds()
+    return JSON.stringify({ held: held === undefined ? [] : unpublished.filter(id => held.has(id)), sourceAdopted: adoption === undefined || source !== undefined && unpublished.every(id => source.has(id)) })
   }
   const heldKey = React.useSyncExternalStore(adoption?.subscribe ?? staticSubscription, getHeldKey, getHeldKey)
-  const runtimeIds = React.useMemo(() => new Set<string>(JSON.parse(heldKey)), [heldKey])
+  const { runtimeIds, sourceAdopted } = React.useMemo(() => {
+    const snapshot = JSON.parse(heldKey)
+    return { runtimeIds: new Set<string>(snapshot.held), sourceAdopted: snapshot.sourceAdopted === true }
+  }, [heldKey])
   React.useEffect(() => {
-    if (adoptionEpoch !== turns && unpublished.some(id => !runtimeIds.has(id))) setAdoptionEpoch(turns)
-  }, [turns, unpublished, runtimeIds, adoptionEpoch])
+    if (sourceAdopted && adoptionEpoch !== turns && unpublished.some(id => !runtimeIds.has(id))) setAdoptionEpoch(turns)
+  }, [turns, unpublished, runtimeIds, adoptionEpoch, sourceAdopted])
   const { committed, stranded } = React.useMemo(() => {
     const settled = new Set(adoptionEpoch?.flatMap(turn => [...(turn.prompt === undefined ? [] : [turn.prompt.id]), ...turn.items.map(item => item.id)]))
     const stranded = new Set<string>()
@@ -260,13 +287,16 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     if (strandedIds !== '' && process.env.NODE_ENV !== 'production') console.warn(`Transcript: the runtime never adopted ${strandedIds}; showing a fallback row.`)
   }, [strandedIds])
   const timeline = React.useRef<HTMLDivElement>(null)
+  const viewport = React.useRef<EmbraceScrollViewportHandle>(null)
   const [proximity] = React.useState(() => new TurnProximity())
   React.useLayoutEffect(() => proximity.attach(scrollerOf(timeline.current)), [proximity, committed.length === 0])
-  // First open commits only the newest page. Older turns backfill in capped chunks while the main thread is idle,
-  // and all at once when the reader nears the top or searches the page (Mod+F), so find and the accessibility
-  // tree see every turn.
+  // Mount a bounded suffix, filling the visible lane before paint. Older rows are
+  // demanded by history-top navigation or browser find, not idle-time visible growth.
   const [mounted, setMounted] = React.useState<MountedTurns>({ _tag: 'NewestPage' })
-  const start = mountedStart(mounted, committed)
+  const source = React.useMemo(() => committed.flatMap(turn => turn.prompt === undefined ? turn.items : [turn.prompt, ...turn.items]), [committed])
+  const start = mountedStart(mounted, source)
+  const visibleTurns = React.useMemo(() => windowTurns(committed, start), [committed, start])
+  const turnStart = committed.length - visibleTurns.length
   // The group grid hangs off the first turn this transcript showed, for as long as that turn stays in it.
   const [gridTurn, setGridTurn] = React.useState<string | undefined>(undefined)
   let gridOrigin = committed.findIndex(turn => turn.id === gridTurn)
@@ -274,41 +304,26 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     gridOrigin = 0
     setGridTurn(committed[0]!.id)
   }
-  const latest = React.useRef({ committed, start })
-  React.useLayoutEffect(() => { latest.current = { committed, start } })
+  const latest = React.useRef({ source, start })
+  React.useLayoutEffect(() => { latest.current = { source, start } })
   const mountOlder = React.useCallback((all: boolean) => {
-    const { committed, start } = latest.current
+    const { source, start } = latest.current
     if (start === 0) return
-    const first = timeline.current?.querySelector('[data-testid="transcript-turn"]')
-    const scroller = scrollerOf(timeline.current)
-    const before = first?.getBoundingClientRect().top
-    // A reader already near the top gets every turn, before compensation moves them away from it.
-    const everything = all || scroller != null && scroller.scrollTop < scroller.clientHeight
-    flushSync(() => setMounted(everything ? { _tag: 'All' } : { _tag: 'From', id: committed[Math.max(0, start - backfillChunkTurns)]!.id }))
-    // Turns land above the reader: the previously oldest turn stays where it was on screen.
-    if (first?.isConnected && scroller != null && before !== undefined) scroller.scrollTop += first.getBoundingClientRect().top - before
+    const update = () => flushSync(() => setMounted(all ? { _tag: 'All' } : { _tag: 'From', id: source[Math.max(0, start - backfillChunkRows)]!.id }))
+    // The lane owns compensation: followers stay at the end, readers keep their row.
+    if (viewport.current === null) update()
+    else viewport.current.preserveLayout(update)
   }, [])
   const backfilling = start > 0
-  React.useEffect(() => {
-    if (start === 0) return
-    // Each chunk waits for a painted frame, then for idle time. A retained pane under `content-visibility: hidden`
-    // has no geometry to keep; it backfills once shown.
-    let cancel = () => {}
-    const frame = requestAnimationFrame(() => {
-      cancel = whenIdle(function step() {
-        if (timeline.current?.checkVisibility() === false) cancel = whenIdle(step)
-        else mountOlder(false)
-      })
-    })
-    return () => {
-      cancelAnimationFrame(frame)
-      cancel()
-    }
-  }, [start, mountOlder])
-  React.useEffect(() => {
+  React.useLayoutEffect(() => {
+    const scroller = scrollerOf(timeline.current)
+    if (start > 0 && scroller instanceof HTMLElement && hasVisibleBox(scroller) && scroller.clientHeight > 0 && scroller.scrollHeight <= scroller.clientHeight) setMounted({ _tag: 'From', id: source[Math.max(0, start - backfillChunkRows)]!.id })
+  }, [start, source, visibleTurns])
+  // Native find must work as soon as the first bounded page can paint.
+  React.useLayoutEffect(() => {
     const scroller = scrollerOf(timeline.current)
     if (!backfilling || scroller == null) return
-    const nearTop = () => { if (scroller.scrollTop < scroller.clientHeight) mountOlder(true) }
+    const nearTop = () => { if (scroller instanceof HTMLElement && scroller.dataset.followState === 'detached' && scroller.scrollTop < scroller.clientHeight) mountOlder(false) }
     const find = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key.toLowerCase() === 'f') mountOlder(true) }
     const view = scroller.ownerDocument.defaultView
     scroller.addEventListener('scroll', nearTop, { passive: true })
@@ -343,18 +358,21 @@ export function Transcript({ turns, title, sync, now, observedAt, onOpenTool, on
     {availability.action !== undefined && <Button data-testid="transcript-unavailable-action" onPress={availability.action.onPress} {...stylex.props(styles.unavailableAction)}>{availability.action.label}</Button>}
     {availability.detail !== undefined && <Disclosure {...stylex.props(styles.unavailableDetails)}><Button slot="trigger" {...stylex.props(styles.historyLoad)}>Show details</Button><DisclosurePanel><p data-testid="transcript-unavailable-detail" {...stylex.props(styles.unavailableDetail)}>{availability.detail}</p></DisclosurePanel></Disclosure>}
   </div></section>
-  const empty = committed.length === 0 && sync._tag === 'Live'
+  const empty = committed.length === 0 && turns.length === 0 && sync._tag === 'Live'
     ? <div aria-label="Empty conversation" data-testid="transcript-empty" {...stylex.props(styles.emptyBody)}><TranscriptEmptyContent emptyState={emptyState} /></div>
-    : <TranscriptSkeleton sync={sync} now={now} observedAt={observedAt} onRetrySync={onRetrySync} />
+    : loadingState ?? <TranscriptSkeleton sync={sync} now={now} observedAt={observedAt} onRetrySync={onRetrySync} />
   return <MarkdownImagePolicy.Provider value={imageOptions}><RetrySend.Provider value={onRetrySend}><ThreadPrimitive.Root aria-label={`Transcript${landmarkContext ? `, ${landmarkContext}` : ''}`} {...stylex.props(styles.frame)}>
     <header data-testid="transcript-header" {...stylex.props(styles.header)}><strong {...stylex.props(styles.title)}>{title}</strong>
       {progress !== undefined && <ProgressBar aria-label="Thread synchronization" value={progress.done} maxValue={progress.total} {...stylex.props(styles.progress)}><div {...stylex.props(styles.track)}><div {...stylex.props(styles.fill(`${progress.total === 0 ? 0 : progress.done! / progress.total! * 100}%`))} /></div></ProgressBar>}
       {committed.length > 0 && <SyncLine status={sync} label="conversation" now={now} observedAt={observedAt} onRetry={onRetrySync} />}
       {running !== undefined && <><div role="progressbar" aria-label="Run in progress" aria-valuetext="Running" data-testid="run-progress" {...stylex.props(styles.runningProgress)}><span {...stylex.props(styles.runningSegment)} /></div><span data-testid="run-elapsed">Running{Number.isFinite(started) && started <= now ? ` · ${formatWorkDuration(now - started) || '<1s'}` : ''}</span></>}
     </header>
-    <ErrorOverlayHost lane><EmbraceScrollViewport items={rows} anchorHistory={anchorHistory} stateKey={viewportKey} scrollToBottomKey={scrollToBottomKey} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
-      {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
-      {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(committed, start, gridOrigin).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
+    <ErrorOverlayHost lane><EmbraceScrollViewport ref={viewport} items={rows} anchorHistory={anchorHistory} stateKey={viewportKey} scrollToBottomKey={scrollToBottomKey} data-testid="transcript-scroll" aria-label="Conversation history" tabIndex={0} {...stylex.props(styles.lane)} contentProps={stylex.props(readingColumnStyles.column, styles.content)}>
+      <div data-testid="transcript-history-slot" {...stylex.props(styles.historyBoundary)}>
+        {start > 0 && <Button data-testid="transcript-reveal-earlier" onPress={() => mountOlder(true)} {...stylex.props(styles.historyLoad)}>Show earlier messages</Button>}
+        {history._tag === 'HasOlder' && <div data-testid="history-boundary" {...stylex.props(styles.historyBoundary)}><span {...stylex.props(styles.historyNote)}>Earlier messages not loaded</span>{history.onLoadEarlier !== undefined && <Button onPress={history.onLoadEarlier} {...stylex.props(styles.historyLoad)}>Load earlier messages</Button>}</div>}
+      </div>
+      {committed.length === 0 ? empty : <div ref={timeline} {...stylex.props(styles.timeline)}><TurnProximityRef.Provider value={proximity.observe}>{turnGroups(visibleTurns, 0, gridOrigin - turnStart).map(group => <TurnGroup key={group.key} full={group.turns.length === turnGroupSize}>{group.turns.map(turn => <PreparedTurn key={turn.id} turn={turn} stranded={turn.prompt !== undefined && stranded.has(turn.prompt.id) || turn.items.some(item => stranded.has(item.id)) ? stranded : undefined} onOpenTool={onOpenTool} onRetryRun={onRetryRun} landmarkContext={landmarkContext} />)}</TurnGroup>)}</TurnProximityRef.Provider></div>}
     </EmbraceScrollViewport>{failure?.tone === 'error' && <ErrorOverlay id={`sync-${failure.text}`} title={failure.text} detail="History stays on screen." onRetry={onRetrySync} />}</ErrorOverlayHost>
   </ThreadPrimitive.Root></RetrySend.Provider></MarkdownImagePolicy.Provider>
 }
@@ -366,6 +384,7 @@ const styles = stylex.create({
   lane: { flex: '1 1 0', minHeight: 0, minWidth: 0, overflowY: 'auto', overflowX: 'hidden', overflowAnchor: 'none' },
   // The shared reading column keeps rows and a reading-column composer on the same bounds.
   content: { paddingBlock: s.lg }, timeline: { display: 'flex', flexDirection: 'column', gap: s.xl, minWidth: 0 }, turn: { display: 'flex', flexDirection: 'column', gap: s.md, minWidth: 0 },
+  partialGroup: { display: 'contents' },
   workList: { maxHeight: 'none', overflowY: 'visible', overscrollBehavior: 'auto' },
   // Turns and full turn groups far from the reader skip style, layout and paint; `auto` keeps each box's last rendered
   // height as its placeholder, recorded while the box renders.

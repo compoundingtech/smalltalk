@@ -206,7 +206,8 @@ describe('ConversationPane kit composition', () => {
       ts.forEachChild(node, visit)
     }
     visit(tree)
-    expect(intrinsicElements).toEqual(['div', 'div', 'div'])
+    // Structural host, history frame, empty publication body and reserved composer dock.
+    expect(intrinsicElements).toEqual(['div', 'div', 'div', 'div'])
     expect(pane).toContain("style={{ display: 'contents' }}")
     const workspace = readFileSync(new URL('./LiveAgentWorkspace.tsx', import.meta.url), 'utf8')
     expect(workspace).toContain('createPortal(<WorkspaceBody current={current} rosterRefs={agents.map(agent => agent.ref)} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />, paneHost)')

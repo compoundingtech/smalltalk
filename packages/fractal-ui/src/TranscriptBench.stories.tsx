@@ -64,9 +64,15 @@ const benchTurns = (count: number) => {
 
 const frame = () => new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
 const turnCount = (root: ParentNode) => root.querySelectorAll('[data-testid="transcript-turn"]').length
-/** Resolves once every turn is in the DOM, fonts are loaded and two frames have painted. */
+const completeTurnCount = (root: ParentNode) => root.querySelectorAll('[data-testid="user-message"]').length
+/** Resolves once explicit native find mounts every turn, fonts load and two frames paint. */
 async function settled(root: ParentNode, count: number): Promise<void> {
-  while (turnCount(root) < count) await frame()
+  // Initial runtime adoption can commit the bounded suffix after the story's first frame.
+  // Wait for that mounted lane before exercising its native-find navigation.
+  while (completeTurnCount(root) === 0) await frame()
+  await frame()
+  window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true }))
+  while (completeTurnCount(root) < count) await frame()
   await document.fonts.ready
   await frame()
   await frame()
@@ -113,7 +119,7 @@ function TranscriptBench({ turns: count, scheme, history, earlier = 0, onOpenToo
         if (generation !== sampling) return
         const present = turnCount(pane)
         if (!first && present > 0) { first = true; performance.mark('bench:turns') }
-        if (present >= count) { performance.mark('bench:all-turns'); return }
+        if (completeTurnCount(pane) >= count) { performance.mark('bench:all-turns'); return }
         requestAnimationFrame(step)
       }
       requestAnimationFrame(step)
@@ -167,14 +173,16 @@ function centerTurn(scroll: HTMLElement): { readonly element: Element; readonly 
 async function anchorDrift(root: ParentNode, scroll: HTMLElement, total: number): Promise<number> {
   const anchor = centerTurn(scroll)
   let drift = 0
-  while (turnCount(root) < total) {
+  let samples = 0
+  window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true }))
+  while (completeTurnCount(root) < total || samples++ < 2) {
     await frame()
     drift = Math.max(drift, Math.abs(anchor.element.getBoundingClientRect().top - scroll.getBoundingClientRect().top - anchor.offset))
   }
   return drift
 }
 
-/** First open commits only the newest page, follows the bottom, and backfills every turn without moving it. */
+/** First open commits a stable newest page; native find exposes every turn without moving it. */
 export const NewestPageFirst: Story = { play: async ({ canvasElement }) => {
   const first = await reopen(canvasElement)
   await expect(first).toBeGreaterThan(0)
@@ -192,9 +200,14 @@ export const NewestPageFirst: Story = { play: async ({ canvasElement }) => {
 export const BackfillKeepsReaderAnchor: Story = { play: async ({ canvasElement }) => {
   await expect(await reopen(canvasElement)).toBeLessThan(200)
   const scroll = scroller(canvasElement)
-  await frame()
+  while (completeTurnCount(canvasElement) < 6) {
+    await frame()
+    scroll.dispatchEvent(new WheelEvent('wheel', { deltaY: -scroll.scrollHeight }))
+    scroll.scrollTop = 0
+    scroll.dispatchEvent(new Event('scroll'))
+  }
   scroll.dispatchEvent(new WheelEvent('wheel', { deltaY: -scroll.clientHeight / 2 }))
-  scroll.scrollTop -= scroll.clientHeight / 2
+  scroll.scrollTop = scroll.scrollHeight - scroll.clientHeight * 1.5
   await frame()
   await expect(turnCount(canvasElement)).toBeLessThan(200)
   await expect(scroll.scrollTop).toBeGreaterThanOrEqual(scroll.clientHeight)
@@ -228,8 +241,13 @@ export const InitialFollowWithoutLayoutShift: Story = { args: { turns: 50, initi
   layout.observe({ type: 'layout-shift' })
   const initial = new Map<Element, number>()
   const observed = new Set<Element>()
+  const zeroRects = new Set<Element>()
   const witness = new IntersectionObserver(entries => {
-    for (const entry of entries) if (!initial.has(entry.target)) initial.set(entry.target, entry.boundingClientRect.height)
+    for (const entry of entries) {
+      // A skipped ancestor can report a zero child rectangle: it is not a rendered intrinsic-height sample.
+      if (entry.boundingClientRect.height === 0) zeroRects.add(entry.target)
+      else if (!initial.has(entry.target)) initial.set(entry.target, entry.boundingClientRect.height)
+    }
   })
   let beforePaint: ResizeObserver | undefined
   let prePaintFollowGap = 0
@@ -242,7 +260,8 @@ export const InitialFollowWithoutLayoutShift: Story = { args: { turns: 50, initi
       })
       beforePaint.observe(scroll.firstElementChild)
     }
-    for (const turn of canvasElement.querySelectorAll('[data-testid="transcript-turn"]')) if (!observed.has(turn)) {
+    // Explicit history reveal grows prefixes; compare complete fixture content.
+    for (const turn of canvasElement.querySelectorAll('[data-testid="transcript-turn"]')) if (!observed.has(turn) && turn.querySelector('[data-testid="user-message"]') !== null) {
       observed.add(turn)
       witness.observe(turn)
     }
@@ -254,13 +273,14 @@ export const InitialFollowWithoutLayoutShift: Story = { args: { turns: 50, initi
     for (let index = 0; index < 8; index++) await frame()
     const scroll = scroller(canvasElement)
     const distant = [...initial.keys()].filter(turn => turn.hasAttribute('data-distant'))
-    await expect(initial.size).toBe(args.turns)
+    await expect(observed.size).toBe(args.turns)
+    await expect(initial.size).toBeGreaterThan(0)
     await expect(distant.length).toBeGreaterThan(0)
     const skipped = distant.filter(turn => !turn.checkVisibility({ contentVisibilityAuto: true }))
     await expect(skipped.length).toBeGreaterThan(0)
     const drift = Math.max(...distant.map(turn => Math.abs(turn.getBoundingClientRect().height - initial.get(turn)!)))
     recordShifts(layout.takeRecords())
-    const proof = { turns: args.turns, distantTurns: distant.length, skippedTurns: skipped.length, drift, viewportHeight: scroll.clientHeight, prePaintFollowGap, followGap: followGap(scroll), rawCls: shifts.reduce((total, value) => total + value, 0), shifts }
+    const proof = { turns: args.turns, observedTurns: observed.size, measuredTurns: initial.size, zeroRectTurns: zeroRects.size, distantTurns: distant.length, skippedTurns: skipped.length, drift, viewportHeight: scroll.clientHeight, prePaintFollowGap, followGap: followGap(scroll), rawCls: shifts.reduce((total, value) => total + value, 0), shifts }
     canvasElement.dataset.layoutProof = JSON.stringify(proof)
     console.info('transcript-initial-follow-layout', proof)
     await expect(drift).toBeLessThanOrEqual(1)
@@ -276,17 +296,20 @@ export const InitialFollowWithoutLayoutShift: Story = { args: { turns: 50, initi
   }
 } }
 const loadEarlier = fn()
-/** Reaching the top mounts the older turns at once; the history boundary above them still loads earlier history. */
+/** Reaching the top reveals a bounded older chunk; native find exposes the full boundary. */
 export const TopMountsOlderTurns: Story = { args: { history: { _tag: 'HasOlder', onLoadEarlier: loadEarlier } }, play: async ({ canvasElement }) => {
   loadEarlier.mockClear()
-  await expect(await reopen(canvasElement)).toBeLessThan(200)
+  const first = await reopen(canvasElement)
+  await expect(first).toBeLessThan(200)
   const scroll = scroller(canvasElement)
   await frame()
   scroll.dispatchEvent(new WheelEvent('wheel', { deltaY: -scroll.scrollHeight }))
   scroll.scrollTop = 0
   await frame()
   await frame()
-  await expect(turnCount(canvasElement)).toBe(200)
+  await expect(turnCount(canvasElement)).toBeGreaterThan(first)
+  await expect(turnCount(canvasElement)).toBeLessThan(200)
+  await settled(canvasElement, 200)
   scroll.scrollTop = 0
   const boundary = await within(canvasElement).findByTestId('history-boundary')
   await expect(boundary.compareDocumentPosition(canvasElement.querySelector('[data-testid="transcript-turn"]')!) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0)
@@ -303,15 +326,15 @@ export const BackfillKeepsTurnState: Story = { args: { earlier: 40, onOpenTool: 
   disclosure.focus()
   await expect(disclosure).toHaveAttribute('aria-expanded', 'true')
   await expect(disclosure).toHaveFocus()
-  while (turnCount(canvasElement) < 200) await frame()
+  await settled(canvasElement, 200)
   await expect(turn.isConnected).toBe(true)
   await expect(disclosure.isConnected).toBe(true)
   await expect(disclosure).toHaveAttribute('aria-expanded', 'true')
   await expect(disclosure).toHaveFocus()
   // A virtual click presses the boundary button without moving focus off the disclosure.
   within(await within(canvasElement).findByTestId('history-boundary')).getByRole('button', { name: 'Load earlier messages' }).click()
-  // Prepended turns backfill above the reader like the first older turns did.
-  while (turnCount(canvasElement) < 240) await frame()
+  // Explicit native find exposes prepended turns without changing mounted row state.
+  await settled(canvasElement, 240)
   await expect(canvasElement.querySelector('[data-testid="transcript-turn"]')).toHaveAttribute('data-item-id', 'bench/0')
   await expect(turn.isConnected).toBe(true)
   await expect(disclosure.isConnected).toBe(true)

@@ -6,6 +6,7 @@
  * rendered transcript reproduces the Storybook-reference structure on real components.
  */
 import * as React from 'react'
+import { useAui } from '@assistant-ui/react'
 import { createRoot, type Root } from 'react-dom/client'
 import { act } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -35,11 +36,13 @@ const source = vi.hoisted(() => ({
   feed: { _tag: 'Waiting' } as Feed<ConversationPage>,
   sync: undefined as FeedSyncObservation | undefined,
   now: 1000,
+  sendEnabled: false,
   staticWorkLog: false,
   runtimeItems: [] as NonNullable<ConversationRuntimeOptions['messages']>[],
   transcriptTurns: [] as (readonly TranscriptTurn[])[],
   scrollToBottomKeys: [] as (string | undefined)[],
   composerProps: [] as React.ComponentProps<typeof Kit.EmbraceComposer>[],
+  setDraft: undefined as ((text: string) => void) | undefined,
   viewportCommits: [] as {
     readonly anchorHistory: React.ComponentProps<typeof KitViewport.EmbraceScrollViewport>['anchorHistory']
     readonly rowIds: readonly string[]
@@ -54,21 +57,26 @@ vi.mock('../data/react.tsx', async () => {
   return ({
   useConversation: () => source.feed,
   useConversationSync: () => source.sync,
-  useDataSource: () => ({ agents, conversationInterest: undefined }),
+  useDataSource: () => ({ agents, conversationInterest: undefined, attachments: source.sendEnabled ? { send: vi.fn() } : undefined }),
   useFeedInterest: () => {},
   useNow: () => source.now,
-  useGrants: () => ({ actions: 'ungranted', messageSend: 'ungranted', terminalInput: 'ungranted' }),
+  useGrants: () => ({ actions: 'ungranted', messageSend: source.sendEnabled ? 'granted' : 'ungranted', terminalInput: 'ungranted' }),
   })
 })
 
 // Tap the input seams but keep the real kit/runtime rendering and effects.
 vi.mock('../../../../packages/fractal-ui/src/assistant-ui/EmbraceRuntime.tsx', async importOriginal => {
   const kit = await importOriginal<typeof KitRuntime>()
+  const DraftProbe = () => {
+    const aui = useAui()
+    source.setDraft = text => aui.composer().setText(text)
+    return null
+  }
   return {
     ...kit,
     EmbraceRuntimeProvider: (props: React.ComponentProps<typeof Kit.EmbraceRuntimeProvider>) => {
       source.runtimeItems.push(props.options.messages ?? [])
-      return <kit.EmbraceRuntimeProvider {...props} />
+      return <kit.EmbraceRuntimeProvider {...props}><DraftProbe />{props.children}</kit.EmbraceRuntimeProvider>
     },
   }
 })
@@ -132,6 +140,7 @@ const container = document.createElement('div')
 
 beforeEach(() => {
   source.now = 1000
+  source.sendEnabled = false
   source.staticWorkLog = false
   source.runtimeItems = []
   source.transcriptTurns = []
@@ -170,6 +179,83 @@ const mount = async (ux?: UxTelemetry) => {
 const text = () => container.textContent ?? ''
 
 describe('ConversationPane composition activation', () => {
+  it('waits for actual source adoption without painting stranded rows or replacing the composer', async () => {
+    source.sendEnabled = true
+    source.feed = { _tag: 'Waiting' }
+    source.sync = { status: { _tag: 'Requested', since: 990 }, observedAt: 990 }
+    await mount()
+    expect(container.querySelector('[data-testid="transcript-placeholder"]')?.textContent).toBe('')
+    expect(container.querySelector('[data-testid="transcript-history-slot"]')).not.toBeNull()
+    const strandedPaints: Element[] = []
+    const observer = new MutationObserver(records => {
+      for (const record of records) for (const node of record.addedNodes) if (node instanceof Element) {
+        if (node.matches('[data-testid="transcript-stranded"]')) strandedPaints.push(node)
+        strandedPaints.push(...node.querySelectorAll('[data-testid="transcript-stranded"]'))
+      }
+    })
+    observer.observe(container, { childList: true, subtree: true })
+    const loadingInput = container.querySelector('textarea')
+    await act(async () => { source.setDraft!('Retain this unsent draft') })
+    loadingInput!.setSelectionRange(7, 11)
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: true, observation: { empty: false } } }
+    source.sync = { status: { _tag: 'Live', since: 1000 }, observedAt: 1000 }
+    try { await mount() } finally { observer.disconnect() }
+    expect(strandedPaints).toHaveLength(0)
+    const readyInput = container.querySelector('textarea')
+    expect(readyInput).toBe(loadingInput)
+    expect(readyInput?.value).toBe('Retain this unsent draft')
+    expect(readyInput?.selectionStart).toBe(7)
+    expect(readyInput?.selectionEnd).toBe(11)
+    expect(container.querySelector('[data-testid="transcript-placeholder"]')).toBeNull()
+    expect(container.querySelector('[data-testid="history-boundary"]')).not.toBeNull()
+    readyInput?.focus()
+    source.feed = { ...source.feed, value: { ...source.feed.value, items: [...scenario] } }
+    await mount()
+    expect(container.querySelector('textarea')).toBe(readyInput)
+    expect(document.activeElement).toBe(readyInput)
+    expect(readyInput?.selectionStart).toBe(7)
+    expect(readyInput?.selectionEnd).toBe(11)
+  })
+
+  it('keeps an overflowing visible suffix stable instead of growing it at idle, and finds older rows on demand', async () => {
+    const rows: ConversationItem[] = Array.from({ length: 30 }, (_, index) => ({
+      _tag: 'Text', id: `long-${index}`, role: 'assistant', text: `History row ${index}`, attachments: [], streaming: false, at: at(index),
+    }))
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: rows, hasOlder: false, observation: { empty: false } } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    const height = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(function (this: HTMLElement) {
+      return this.dataset.testid === 'transcript-scroll' ? 1000 : 0
+    })
+    const client = vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(700)
+    const bounds = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+      return new DOMRect(0, 0, 700, this.dataset.testid === 'transcript-turn' ? 500 : 700)
+    })
+    const idle = vi.fn((_task: () => void) => 1)
+    vi.stubGlobal('requestIdleCallback', idle)
+    vi.stubGlobal('cancelIdleCallback', () => {})
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => setTimeout(() => callback(0), 0))
+    try {
+      await mount()
+      await act(async () => {
+        const { promise, resolve } = Promise.withResolvers<void>()
+        setTimeout(resolve, 25)
+        await promise
+      })
+      expect(text()).not.toContain('History row 0')
+      expect(text()).toContain('History row 29')
+      const before = container.querySelectorAll('[data-testid="transcript-message"]').length
+      await act(async () => { idle.mock.calls[0]?.[0]() })
+      expect(container.querySelectorAll('[data-testid="transcript-message"]')).toHaveLength(before)
+      expect(idle).not.toHaveBeenCalled()
+      const lane = container.querySelector<HTMLElement>('[data-testid="transcript-scroll"]')!
+      expect(lane.dataset.followState).toBe('attached')
+      await act(async () => { lane.dispatchEvent(new Event('scroll')) })
+      expect(container.querySelectorAll('[data-testid="transcript-message"]')).toHaveLength(before)
+      await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true })) })
+      expect(text()).toContain('History row 0')
+    } finally { height.mockRestore(); client.mockRestore(); bounds.mockRestore() }
+  })
+
   it('insets the composer dock so its focus outline stays inside the viewport', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
     await mount()
@@ -529,7 +615,8 @@ describe('ConversationPane composition activation', () => {
       await mount()
     }
     await show(items)
-    expect(container.querySelectorAll('[data-testid="transcript-turn"]')).toHaveLength(6)
+    // The bounded branch mounts six source rows, not six complete turns.
+    expect(container.querySelectorAll('[data-testid="transcript-turn"]')).toHaveLength(2)
     expect(container.querySelector('[data-testid="user-message"][data-item-id="turn/0/p1"]')).toBeNull()
     const newest = container.querySelector('[data-testid="transcript-turn"][data-item-id="turn/11/p1"]')!
     await act(async () => { newest.querySelector<HTMLButtonElement>('[data-testid="work-log"] > button')!.click() })
