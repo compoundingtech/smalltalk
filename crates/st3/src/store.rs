@@ -10815,11 +10815,11 @@ impl Store {
         input: &ClaimInput,
         desired_revision: &str,
         current: &(dyn Fn() -> bool + Sync),
-    ) -> Result<ClaimRecord, St3Error> {
+    ) -> Result<(ClaimRecord, bool), St3Error> {
         append_claim_with_subject_fences(
             &self.graph, input, None, None, None,
             Some((&input.subject, desired_revision, current)),
-        ).map(|(claim, _)| claim)
+        )
     }
 
     /// The API has verified this device signature. Stage, admit and consume it in the
@@ -14867,6 +14867,27 @@ impl Store {
         subscriptions: &[(String, SubscriptionSpec)],
         current: Option<&(dyn Fn() -> bool + Sync)>,
     ) -> Result<ResourceObservationOutcome, St3Error> {
+        self.record_resource_observation_outcome(
+            observer, desired_revision, attempt, resource, cursor, facts,
+            next_check_unix_ms, subscriptions, current,
+        ).map(|(outcome, _)| outcome)
+    }
+
+    /// The observation response and whether this transaction wrote durable state.
+    /// Keep this scheduler-only flag out of the stored and public response format.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_resource_observation_outcome(
+        &self,
+        observer: &str,
+        desired_revision: &str,
+        attempt: Option<&str>,
+        resource: &str,
+        cursor: Option<&str>,
+        facts: &Value,
+        next_check_unix_ms: u128,
+        subscriptions: &[(String, SubscriptionSpec)],
+        current: Option<&(dyn Fn() -> bool + Sync)>,
+    ) -> Result<(ResourceObservationOutcome, bool), St3Error> {
         let facts = canonical_json_value(facts);
         let operation_hash = canonical_hash(&(
             observer,
@@ -14879,12 +14900,12 @@ impl Store {
         .map_err(internal)?;
         let idempotency_key = format!("resource-observation:{operation_hash}");
         self.connection
-            .batched(|transaction| -> Result<ResourceObservationOutcome, St3Error> {
+            .batched(|transaction| -> Result<(ResourceObservationOutcome, bool), St3Error> {
                 check_observer_completion(transaction, observer, desired_revision, current)?;
                 let outcome = (|| {
                 if let Some(response) = smallclaims::store::idempotency::cached_response(transaction, &idempotency_key)?
                 {
-                    return serde_json::from_str(&response).map_err(internal);
+                    return serde_json::from_str(&response).map(|outcome| (outcome, false)).map_err(internal);
                 }
                 let mut active_subscriptions = Vec::new();
                 for (subject, expected) in subscriptions {
@@ -15057,12 +15078,12 @@ impl Store {
                     || !observer_health_is_current
                     || subscription_states.values().any(|(_, _, changed)| *changed);
                 if !should_record {
-                    return Ok(ResourceObservationOutcome {
+                    return Ok((ResourceObservationOutcome {
                         baseline,
                         changed_fields,
                         observation_claim: None,
                         message_subjects: Vec::new(),
-                    });
+                    }, false));
                 }
                 let now = write_time(transaction, &self.origin).map_err(internal)?;
                 let sequence = next_replica_sequence(transaction, &self.origin).map_err(internal)?;
@@ -15861,7 +15882,7 @@ impl Store {
                         ],
                     )
                     .map_err(internal)?;
-                Ok(outcome)
+                Ok((outcome, true))
                 })()?;
                 check_observer_completion(transaction, observer, desired_revision, current)?;
                 Ok(outcome)
@@ -37798,7 +37819,9 @@ observer "fenced/file" {
                     let receipt = store.append_observer_state(&input, &revision, &|| true).unwrap();
                     assert_eq!(store.latest_actual_value(observer).unwrap().unwrap()["state"], "unreachable");
                     let retry = store.append_observer_state(&input, &revision, &|| true).unwrap();
-                    assert_eq!(retry.id, receipt.id);
+                    assert_eq!(retry.0.id, receipt.0.id);
+                    assert!(receipt.1);
+                    assert!(!retry.1);
                 } else {
                     let outcome = store.record_resource_observation(
                         observer, &revision, Some("fenced-attempt"), resource, Some("cursor"),
@@ -37842,12 +37865,17 @@ observer "quiet/file" {
         store.apply_internal(&intent, "quiet-observer").unwrap();
         let revision = store.selected_desired_revision(&observer).unwrap().unwrap();
         let facts = json!({"status": "ready"});
-        store.record_resource_observation(&observer, &revision, None, &resource, None, &facts, 1, &[], None)
+        let (_, wrote) = store.record_resource_observation_outcome(&observer, &revision, None, &resource, None, &facts, 1, &[], None)
             .unwrap();
+        assert!(wrote);
+        let (_, wrote) = store.record_resource_observation_outcome(&observer, &revision, None, &resource, None, &facts, 1, &[], None)
+            .unwrap();
+        assert!(!wrote, "an idempotency hit is not a durable change");
         let before = store.index().unwrap();
 
-        let outcome = store.record_resource_observation(&observer, &revision, None, &resource, None, &facts, 2, &[], None)
+        let (outcome, wrote) = store.record_resource_observation_outcome(&observer, &revision, None, &resource, None, &facts, 2, &[], None)
             .unwrap();
+        assert!(!wrote);
 
         assert_eq!(store.index().unwrap(), before);
         assert!(outcome.observation_claim.is_none());

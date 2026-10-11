@@ -12972,6 +12972,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             .as_deref()
             != Some(self.host.as_str())
         {
+            let prefix = format!("{}:", observer.subject);
+            self.armed_observers.lock().unwrap_or_else(PoisonError::into_inner)
+                .retain(|operation| !operation.starts_with(&prefix));
             return Ok(());
         }
         spec.fields.extend(
@@ -13035,16 +13038,27 @@ impl<R: RuntimeControl> Reconciler<R> {
             actual["error_code"] != "rate-limited") {
             next_check = next_check.min(now_ms().saturating_add(u128::from(spec.every_ms.unwrap())));
         }
-        let operation_prefix = format!("{}:{revision}:{}:", observer.subject,
+        let observer_prefix = format!("{}:", observer.subject);
+        let operation_prefix = format!("{observer_prefix}{revision}:{}:",
             refresh_attempt.as_deref().unwrap_or("scheduled"));
-        let cadence_prefix = format!("{operation_prefix}{}:", spec.every_ms.map_or("default".into(), |ms| ms.to_string()));
-        let operation = format!("{cadence_prefix}{}", uuid::Uuid::now_v7());
-        {
+        // Idle arms live across passes. Retire them when their captured subscriptions,
+        // requested fields or opener workspaces change, not just when cadence changes.
+        let opener_workspaces = if spec.provider == "github.repository" {
+            agent_workspaces.as_slice()
+        } else {
+            &[]
+        };
+        let snapshot = smallclaims::hash::canonical_hash(&(&spec, &selected, opener_workspaces))?;
+        let snapshot_prefix = format!("{operation_prefix}{snapshot}:");
+        // A refresh or revision replacement also retires the scheduled arm.
+        let operation = {
             let mut armed = self.armed_observers.lock().unwrap_or_else(PoisonError::into_inner);
-            armed.retain(|key| !key.starts_with(&operation_prefix) || key.starts_with(&cadence_prefix));
-            if armed.iter().any(|key| key.starts_with(&cadence_prefix)) { return Ok(()); }
+            armed.retain(|key| !key.starts_with(&observer_prefix) || key.starts_with(&snapshot_prefix));
+            if armed.iter().any(|key| key.starts_with(&snapshot_prefix)) { return Ok(()); }
+            let operation = format!("{snapshot_prefix}{}", uuid::Uuid::now_v7());
             armed.insert(operation.clone());
-        }
+            operation
+        };
         let store = self.store.clone();
         let provider = self.resource_provider.clone();
         let notify = self.notify.clone();
@@ -13055,7 +13069,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let deadlines = self.observer_deadlines.clone();
         let cursors = self.observer_cursors.clone();
         let observer_subject = observer.subject.clone();
-        let previous_facts = self
+        let mut previous_facts = self
             .store
             .latest_actual_value(&spec.resource)?
             .and_then(|actual| actual.get("facts").cloned());
@@ -13075,7 +13089,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         // A repository observer that never recorded anything continues from the observer that
         // last recorded into its resource, such as the intake observer a standing observer
         // replaces, so nothing changed between their polls is missed.
-        let cursor = match cursor {
+        let mut cursor = match cursor {
             None if spec.provider == "github.repository" => self
                 .store
                 .inherited_observer_cursor(&spec.resource, &observer.subject)?,
@@ -13084,6 +13098,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let agent_workspaces = agent_workspaces.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
+                loop {
                 let delay = next_check.saturating_sub(now_ms()).min(u64::MAX as u128) as u64;
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 if store
@@ -13097,7 +13112,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&operation);
-                    signal_changed(&notify, &event_notify);
+                    // The declaration change already has its own reconcile wake.
                     return;
                 }
                 if !armed.lock().unwrap_or_else(PoisonError::into_inner).contains(&operation) { return; }
@@ -13105,7 +13120,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     provider: spec.provider.clone(),
                     locator: spec.locator.clone(),
                     fields: spec.fields.iter().cloned().collect(),
-                    cursor,
+                    cursor: cursor.clone(),
                     previous_facts: previous_facts.clone(),
                     every_ms: spec.every_ms,
                     refresh: refresh_attempt.is_some(),
@@ -13125,11 +13140,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                 if !current()
                     || store.selected_desired_revision(&observer_subject).ok().flatten().as_deref() != Some(revision.as_str()) {
                     armed.lock().unwrap_or_else(PoisonError::into_inner).remove(&operation);
-                    signal_changed(&notify, &event_notify);
                     return;
                 }
                 let mut completed_deadline = None;
                 let mut completed_cursor = None;
+                let mut durable_changed = false;
                 match observed {
                     Ok(mut observation) => {
                         if spec.provider == "github.repository" {
@@ -13155,7 +13170,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             observation.next_check_unix_ms =
                                 now_ms().saturating_add(every_ms as u128);
                         }
-                        match store.record_resource_observation(
+                        match store.record_resource_observation_outcome(
                             &observer_subject,
                             &revision,
                             refresh_attempt.as_deref(),
@@ -13166,7 +13181,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                             &selected,
                             Some(&current),
                         ) {
-                            Ok(_) => {
+                            Ok((_, wrote)) => {
+                                durable_changed = wrote;
+                                previous_facts = Some(observation.facts);
                                 completed_deadline = Some(observation.next_check_unix_ms);
                                 completed_cursor = Some(observation.cursor);
                             }
@@ -13196,7 +13213,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     ),
                                     None => format!("observer-rejected:{}", &failure_hash[..20]),
                                 };
-                                let _ = store.append_observer_state(&ClaimInput {
+                                durable_changed = store.append_observer_state(&ClaimInput {
                                     subject: observer_subject.clone(),
                                     kind: "observer.state".into(),
                                     actor: None,
@@ -13204,7 +13221,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     evidence: Vec::new(),
                                     expected_subject: None,
                                     idempotency_key: Some(key),
-                                }, &revision, &current);
+                                }, &revision, &current).is_ok_and(|(_, wrote)| wrote);
                             }
                         }
                     }
@@ -13250,7 +13267,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                             if let Some(attempt) = &refresh_attempt {
                                 fields.insert("attempt".into(), Value::String(attempt.clone()));
                             }
-                            let _ = store.append_observer_state(&ClaimInput {
+                            durable_changed = store.append_observer_state(&ClaimInput {
                                 subject: observer_subject.clone(),
                                 kind: "observer.state".into(),
                                 actor: None,
@@ -13261,7 +13278,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     "observer-failure:{}",
                                     &failure_hash[..20]
                                 )),
-                            }, &revision, &current);
+                            }, &revision, &current).is_ok_and(|(_, wrote)| wrote);
                         }
                     }
                 }
@@ -13269,24 +13286,40 @@ impl<R: RuntimeControl> Reconciler<R> {
                 // writer job waits. Publish only this still-current generation.
                 let revision_current = store.selected_desired_revision(&observer_subject)
                     .ok().flatten().as_deref() == Some(revision.as_str());
-                let mut active = armed.lock().unwrap_or_else(PoisonError::into_inner);
-                if active.contains(&operation) && revision_current {
-                    if let Some(next_check) = completed_deadline {
-                        deadlines.lock().unwrap_or_else(PoisonError::into_inner)
-                            .insert(deadline_key.clone(), next_check);
+                let keep_polling = {
+                    let mut active = armed.lock().unwrap_or_else(PoisonError::into_inner);
+                    let still_current = active.contains(&operation) && revision_current;
+                    if still_current {
+                        if let Some(next_check) = completed_deadline {
+                            deadlines.lock().unwrap_or_else(PoisonError::into_inner)
+                                .insert(deadline_key.clone(), next_check);
+                        }
+                        if let Some(next_cursor) = completed_cursor {
+                            cursors.lock().unwrap_or_else(PoisonError::into_inner)
+                                .insert(deadline_key.clone(), next_cursor.clone());
+                            cursor = next_cursor;
+                        }
                     }
-                    if let Some(cursor) = completed_cursor {
-                        cursors.lock().unwrap_or_else(PoisonError::into_inner)
-                            .insert(deadline_key.clone(), cursor);
+                    // Retain this generation across idle polls: a full pass sees the same
+                    // arm, and cancellation/cadence changes can still retire it.
+                    let keep_polling = still_current && !durable_changed && completed_deadline.is_some();
+                    if !keep_polling {
+                        active.remove(&operation);
                     }
-                }
-                active.remove(&operation);
-                drop(active);
+                    keep_polling
+                };
                 #[cfg(test)]
                 if let Some(injection) = &completion_fault {
                     injection.fault("observer-completion-finished", &observer_subject);
                 }
-                signal_changed(&notify, &event_notify);
+                if durable_changed {
+                    signal_changed(&notify, &event_notify);
+                }
+                if !keep_polling {
+                    return;
+                }
+                next_check = completed_deadline.expect("continuing polls have a deadline");
+                }
             });
         } else {
             self.armed_observers

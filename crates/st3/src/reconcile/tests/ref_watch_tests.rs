@@ -582,3 +582,268 @@ async fn observer_success_waiting_for_writer_ack_allows_rearm_and_rejects_stale_
 async fn observer_failure_waiting_for_writer_ack_allows_rearm_and_rejects_stale_state() {
     completion_during_writer_ack_does_not_block_rearming_or_publish_stale(true).await;
 }
+
+#[derive(Default)]
+struct CountingFileProvider(std::sync::atomic::AtomicUsize);
+
+impl ResourceProvider for CountingFileProvider {
+    fn observe(
+        &self,
+        request: ObservationRequest,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<crate::resource::ProviderObservation>> + Send + '_>> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            crate::resource::RegisteredResourceProvider.observe(request).await
+        })
+    }
+}
+
+async fn settle_observer_tasks() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn unchanged_file_observers_keep_polling_without_reconcile_wakes() {
+    const OBSERVERS: usize = 4;
+    const INTERVALS: usize = 3;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("watched");
+    std::fs::write(&path, "unchanged").unwrap();
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    let mut source = String::from("version 2\n");
+    for index in 0..OBSERVERS {
+        source.push_str(&format!(
+            "resource \"file-{index}\" {{ kind \"filesystem.file\" }}\nobserver \"file-{index}\" {{ resource \"resource/file-{index}\"; provider \"local.file\"; locator \"{}\"; field \"content_hash\"; every \"2s\" }}\n",
+            path.display(),
+        ));
+    }
+    apply_source(&store, &source, "files");
+    let provider = Arc::new(CountingFileProvider::default());
+    let reconciler = Reconciler::new(
+        store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+    ).with_resource_provider(provider.clone());
+    let desired = store.desired_subjects().unwrap();
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    assert_eq!(provider.0.load(Ordering::SeqCst), OBSERVERS);
+    // The initial baseline writes and wakes; the following pass arms idle polling.
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    let generation = *reconciler.event_notify.borrow();
+    let index = store.index().unwrap();
+    for interval in 1..=INTERVALS {
+        tokio::time::advance(Duration::from_millis(2001)).await;
+        settle_observer_tasks().await;
+        assert_eq!(provider.0.load(Ordering::SeqCst), OBSERVERS * (interval + 1));
+        assert_eq!(*reconciler.event_notify.borrow(), generation, "unchanged polls woke reconciliation");
+        assert_eq!(store.index().unwrap(), index);
+    }
+    // A full pass must find the existing arms rather than duplicate them.
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    assert_eq!(reconciler.armed_observers.lock().unwrap_or_else(PoisonError::into_inner).len(), OBSERVERS);
+    tokio::time::advance(Duration::from_millis(2001)).await;
+    settle_observer_tasks().await;
+    assert_eq!(provider.0.load(Ordering::SeqCst), OBSERVERS * (INTERVALS + 2));
+    apply_source(&store, "version 2\nobserver \"file-0\" { stop }\n", "stop");
+    reconciler.reconcile_resource_observers(&store.desired_subjects().unwrap(), &[]).unwrap();
+    tokio::time::advance(Duration::from_millis(2001)).await;
+    settle_observer_tasks().await;
+    assert_eq!(provider.0.load(Ordering::SeqCst), OBSERVERS * (INTERVALS + 3) - 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn changed_file_observation_wakes_reconciliation_and_delivers_once() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("watched");
+    std::fs::write(&path, "before").unwrap();
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    apply_source(&store, &format!(
+        "version 2\nagent \"example\" {{ workspace \"/tmp\"; command \"true\"; restart \"never\" }}\nresource \"file\" {{ kind \"filesystem.file\" }}\nobserver \"file\" {{ resource \"resource/file\"; provider \"local.file\"; locator \"{}\"; field \"content_hash\"; every \"2s\" }}\nsubscription \"watch\" {{ observer \"observer/file\"; on \"content_hash\"; to \"agent/node.example\"; delivery \"message\" }}",
+        path.display(),
+    ), "file");
+    let provider = Arc::new(CountingFileProvider::default());
+    let reconciler = Reconciler::new(
+        store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+    ).with_resource_provider(provider.clone());
+    let desired = store.desired_subjects().unwrap();
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    let generation = *reconciler.event_notify.borrow();
+    std::fs::write(&path, "after").unwrap();
+    tokio::time::advance(Duration::from_millis(2001)).await;
+    settle_observer_tasks().await;
+    assert_eq!(*reconciler.event_notify.borrow(), generation + 1);
+    assert_eq!(store.claims_for("resource/file", Some("resource.observed")).unwrap().len(), 2);
+    assert_eq!(store.claims_for("observer/file", Some("observer.observed")).unwrap().len(), 2);
+    assert_eq!(store.latest_actual_value("subscription/watch").unwrap().unwrap()["state"], "active");
+    assert_eq!(store.messages(Some("agent/node.example"), false).unwrap().len(), 1);
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    tokio::time::advance(Duration::from_millis(2001)).await;
+    settle_observer_tasks().await;
+    assert_eq!(*reconciler.event_notify.borrow(), generation + 1);
+    assert_eq!(store.messages(Some("agent/node.example"), false).unwrap().len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unchanged_observer_failures_keep_backoff_without_reconcile_wakes() {
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    apply_source(&store, "version 2\nresource \"ref\" { kind \"vcs.ref\" }\nobserver \"ref\" { resource \"resource/ref\"; provider \"github.ref\"; locator \"acme/garden@main\"; field \"head\" }", "ref");
+    let (send, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let reconciler = Reconciler::new(
+        store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+    ).with_resource_provider(Arc::new(CompletionProvider { requests: send }));
+    let desired = store.desired_subjects().unwrap();
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    requests.try_recv().unwrap().1.send(Err(anyhow::anyhow!("temporary failure"))).unwrap();
+    settle_observer_tasks().await;
+    assert_eq!(*reconciler.event_notify.borrow(), 1);
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    for _ in 0..3 {
+        tokio::time::advance(Duration::from_secs(59)).await;
+        settle_observer_tasks().await;
+        assert!(requests.try_recv().is_err());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle_observer_tasks().await;
+        requests.try_recv().unwrap().1.send(Err(anyhow::anyhow!("temporary failure"))).unwrap();
+        settle_observer_tasks().await;
+        assert_eq!(*reconciler.event_notify.borrow(), 1);
+        assert_eq!(store.claims_for("observer/ref", Some("observer.state")).unwrap().len(), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn restarted_file_observer_rearms_once_without_new_claims_or_wakes() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("watched");
+    std::fs::write(&path, "unchanged").unwrap();
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    apply_source(&store, &format!(
+        "version 2\nresource \"file\" {{ kind \"filesystem.file\" }}\nobserver \"file\" {{ resource \"resource/file\"; provider \"local.file\"; locator \"{}\"; field \"content_hash\"; every \"2s\" }}",
+        path.display(),
+    ), "file");
+    let provider = Arc::new(CountingFileProvider::default());
+    let desired = store.desired_subjects().unwrap();
+    let first = Reconciler::new(
+        store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+    ).with_resource_provider(provider.clone());
+    first.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    let index = store.index().unwrap();
+    assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+    let restarted = Reconciler::new(
+        store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+    ).with_resource_provider(provider.clone());
+    restarted.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    assert_eq!(provider.0.load(Ordering::SeqCst), 2);
+    assert_eq!(*restarted.event_notify.borrow(), 0);
+    restarted.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    tokio::time::advance(Duration::from_millis(2001)).await;
+    settle_observer_tasks().await;
+    assert_eq!(provider.0.load(Ordering::SeqCst), 3);
+    assert_eq!(store.index().unwrap(), index);
+    assert_eq!(*restarted.event_notify.borrow(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_observer_replaces_its_arm_when_subscriptions_change() {
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    apply_source(&store, "version 2\nagent \"example\" { workspace \"/tmp\"; command \"true\"; restart \"never\" }\nresource \"ref\" { kind \"vcs.ref\" }\nobserver \"ref\" { resource \"resource/ref\"; provider \"github.ref\"; locator \"acme/garden@main\"; field \"head\"; every \"2s\" }", "ref");
+    let (send, mut requests) = tokio::sync::mpsc::unbounded_channel();
+    let reconciler = Reconciler::new(
+        store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+    ).with_resource_provider(Arc::new(CompletionProvider { requests: send }));
+    let observation = |head: &str| Ok(crate::resource::ProviderObservation {
+        facts: serde_json::json!({"head": head}),
+        cursor: Some(head.into()),
+        next_check_unix_ms: now_ms() + 300_000,
+    });
+    let desired = store.desired_subjects().unwrap();
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    requests.try_recv().unwrap().1.send(observation("a")).unwrap();
+    settle_observer_tasks().await;
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    tokio::time::advance(Duration::from_millis(2001)).await;
+    settle_observer_tasks().await;
+    requests.try_recv().unwrap().1.send(observation("a")).unwrap();
+    settle_observer_tasks().await;
+    let generation = *reconciler.event_notify.borrow();
+    apply_source(&store, "version 2\nsubscription \"watch\" { observer \"observer/ref\"; on \"head\"; to \"agent/node.example\"; delivery \"message\" }", "watch");
+    reconciler.reconcile_resource_observers(&store.desired_subjects().unwrap(), &[]).unwrap();
+    settle_observer_tasks().await;
+    tokio::time::advance(Duration::from_millis(2001)).await;
+    settle_observer_tasks().await;
+    requests.try_recv().unwrap().1.send(observation("b")).unwrap();
+    assert!(requests.try_recv().is_err(), "a full pass double-armed the observer");
+    settle_observer_tasks().await;
+    assert_eq!(*reconciler.event_notify.borrow(), generation + 1);
+    assert_eq!(store.latest_actual_value("subscription/watch").unwrap().unwrap()["state"], "active");
+    assert_eq!(store.messages(Some("agent/node.example"), false).unwrap().len(), 1);
+    reconciler.reconcile_resource_observers(&store.desired_subjects().unwrap(), &[]).unwrap();
+    settle_observer_tasks().await;
+    apply_source(&store, "version 2\nobserver \"ref\" { stop }", "stop");
+    // Removal must fence the sleeping poll even before another pass settles it.
+    tokio::time::advance(Duration::from_millis(2001)).await;
+    settle_observer_tasks().await;
+    assert!(requests.try_recv().is_err());
+    assert_eq!(*reconciler.event_notify.borrow(), generation + 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn observer_refresh_replaces_the_idle_arm_and_wakes_for_its_receipt() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("watched");
+    std::fs::write(&path, "unchanged").unwrap();
+    let store = Arc::new(Store::open_memory("node").unwrap());
+    apply_source(&store, &format!(
+        "version 2\nresource \"file\" {{ kind \"filesystem.file\" }}\nobserver \"file\" {{ resource \"resource/file\"; provider \"local.file\"; locator \"{}\"; field \"content_hash\"; every \"2s\" }}",
+        path.display(),
+    ), "file");
+    let provider = Arc::new(CountingFileProvider::default());
+    let desired = store.desired_subjects().unwrap();
+    let reconciler = Reconciler::new(
+        store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+    ).with_resource_provider(provider.clone());
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    let generation = *reconciler.event_notify.borrow();
+    store.append_claim(&ClaimInput {
+        subject: "observer/file".into(),
+        kind: "observer.refresh-requested".into(),
+        actor: None,
+        fields: BTreeMap::from([
+            ("attempt".into(), Value::String("manual".into())),
+            ("revision".into(), Value::String(store.selected_desired_revision("observer/file").unwrap().unwrap())),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: None,
+    }).unwrap();
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    assert_eq!(reconciler.armed_observers.lock().unwrap_or_else(PoisonError::into_inner).len(), 1);
+    settle_observer_tasks().await;
+    assert_eq!(provider.0.load(Ordering::SeqCst), 2);
+    assert_eq!(*reconciler.event_notify.borrow(), generation + 1);
+    assert!(store.pending_observer_refresh_attempt("observer/file").unwrap().is_none());
+    assert_eq!(store.claims_for("resource/file", Some("resource.observed")).unwrap().len(), 1);
+    assert_eq!(store.claims_for("observer/file", Some("observer.observed")).unwrap().len(), 2);
+    reconciler.reconcile_resource_observers(&desired, &[]).unwrap();
+    settle_observer_tasks().await;
+    tokio::time::advance(Duration::from_millis(2001)).await;
+    settle_observer_tasks().await;
+    assert_eq!(provider.0.load(Ordering::SeqCst), 3);
+    assert_eq!(*reconciler.event_notify.borrow(), generation + 1);
+}
