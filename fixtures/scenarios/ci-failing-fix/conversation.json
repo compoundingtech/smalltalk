@@ -1,0 +1,512 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "conversation",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 21
+  },
+  "state": {
+    "threads": [
+      {
+        "agent": "agent/example/atlas/builder",
+        "has_more": false,
+        "items": [
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-ci-failing-fix-builder-1",
+              "to": "agent/example/atlas/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-ci-failing-fix-builder-1",
+            "revision": 1,
+            "role": "user",
+            "sequence": 1,
+            "timestamp": "2030-01-01T11:50:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "main turned red after the option-schema 4.0 to 4.1 lockfile bump. Find the first bad change and make the smallest compatible fix."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-ci-failing-fix-builder-2",
+            "revision": 1,
+            "role": "user",
+            "sequence": 2,
+            "timestamp": "2030-01-01T11:50:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "The bump installed cleanly, but parseOptions({}) no longer supplies the omitted limit. I will bisect before changing the schema."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-ci-failing-fix-builder-3",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 3,
+            "timestamp": "2030-01-01T11:50:02.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "command": "pnpm --filter @atlas/api test"
+              },
+              "call_id": "call-builder-4",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-ci-failing-fix-builder-4",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 4,
+            "timestamp": "2030-01-01T11:50:04.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-4",
+              "content": "FAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit\nTypeError: Expected a number, received undefined\nat parseOptions (packages/api/src/options.ts:18)\nTests: 1 failed, 47 passed; exit 1",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-ci-failing-fix-builder-5",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 5,
+            "timestamp": "2030-01-01T11:50:04.600Z",
+            "type": "tool_result"
+          }
+        ],
+        "page_size": 50,
+        "session_id": "session/example-atlas-builder"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 2000,
+      "items": [
+        {
+          "body": {
+            "from": "person/ada",
+            "message_id": "message/scenario-ci-failing-fix-builder-6",
+            "to": "agent/example/atlas/builder"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-6",
+          "revision": 1,
+          "role": "user",
+          "sequence": 6,
+          "timestamp": "2030-01-01T12:00:02.000Z",
+          "type": "message"
+        }
+      ],
+      "store": 2
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 2000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/plain",
+            "text": "Keep the dependency bump; bisect the red range."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-7",
+          "revision": 1,
+          "role": "user",
+          "sequence": 7,
+          "timestamp": "2030-01-01T12:00:02.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 3
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 4000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Testing the three candidates between the last green main and the red lockfile bump."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-8",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 8,
+          "timestamp": "2030-01-01T12:00:04.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 4
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 6000,
+      "items": [
+        {
+          "body": {
+            "arguments": {
+              "command": "git bisect run pnpm --filter @atlas/api test"
+            },
+            "call_id": "call-builder-9",
+            "name": "shell"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-9",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 9,
+          "timestamp": "2030-01-01T12:00:06.000Z",
+          "type": "tool_call"
+        }
+      ],
+      "store": 5
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 6600,
+      "items": [
+        {
+          "body": {
+            "call_id": "call-builder-9",
+            "content": "candidate 1: refactor request logging — good\ncandidate 2: update API fixtures — good\ncandidate 3: bump option-schema 4.0 to 4.1 — bad\nfirst bad change: option-schema now validates undefined before applying defaults",
+            "media_type": "text/plain",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-10",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 10,
+          "timestamp": "2030-01-01T12:00:06.600Z",
+          "type": "tool_result"
+        }
+      ],
+      "store": 6
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 8000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "The dependency bump is the first bad change. Make our omitted-value default explicit at the schema boundary; leave the dependency and all callers alone."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 11,
+          "timestamp": "2030-01-01T12:00:08.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 7
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 10000,
+      "items": [
+        {
+          "body": {
+            "status": "completed"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-12",
+          "revision": 1,
+          "role": "system",
+          "sequence": 12,
+          "timestamp": "2030-01-01T12:00:10.000Z",
+          "type": "status"
+        }
+      ],
+      "store": 10
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 14000,
+      "items": [
+        {
+          "body": {
+            "arguments": {
+              "new_string": "limit: number().default(20),",
+              "old_string": "limit: number().optional(),",
+              "path": "packages/api/src/options.ts"
+            },
+            "call_id": "call-builder-13",
+            "name": "edit"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-13",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13,
+          "timestamp": "2030-01-01T12:00:14.000Z",
+          "type": "tool_call"
+        }
+      ],
+      "store": 11
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 14300,
+      "items": [
+        {
+          "body": {
+            "call_id": "call-builder-13",
+            "content": "--- a/packages/api/src/options.ts\n+++ b/packages/api/src/options.ts\n@@ -1,1 +1,1 @@\n-limit: number().optional(),\n+limit: number().default(20),\n",
+            "media_type": "text/plain",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-14",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 14,
+          "timestamp": "2030-01-01T12:00:14.300Z",
+          "type": "tool_result"
+        }
+      ],
+      "store": 12
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 20000,
+      "items": [
+        {
+          "body": {
+            "arguments": {
+              "command": "pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build"
+            },
+            "call_id": "call-builder-15",
+            "name": "shell"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-15",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 15,
+          "timestamp": "2030-01-01T12:00:20.000Z",
+          "type": "tool_call"
+        }
+      ],
+      "store": 15
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 28000,
+      "items": [
+        {
+          "body": {
+            "call_id": "call-builder-15",
+            "content": "PASS packages/api/test/parseOptions.test.ts\nTests: 48 passed, 0 failed\nCI retry #2: typecheck, test, build all passed",
+            "media_type": "text/plain",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-16",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:28.000Z",
+          "type": "tool_result"
+        }
+      ],
+      "store": 16
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 29000,
+      "items": [
+        {
+          "body": {
+            "from": "person/ada",
+            "message_id": "message/scenario-ci-failing-fix-builder-17",
+            "to": "agent/example/atlas/builder"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-17",
+          "revision": 1,
+          "role": "user",
+          "sequence": 17,
+          "timestamp": "2030-01-01T12:00:29.000Z",
+          "type": "message"
+        }
+      ],
+      "store": 17
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 29000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/plain",
+            "text": "Is the retry green without a rollback?"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-18",
+          "revision": 1,
+          "role": "user",
+          "sequence": 18,
+          "timestamp": "2030-01-01T12:00:29.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 18
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 29500,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Yes. Retry #2 passed all three CI jobs and all 48 tests. option-schema 4.1 remains installed; the patch changes exactly one line."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-19",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 19,
+          "timestamp": "2030-01-01T12:00:29.500Z",
+          "type": "content"
+        }
+      ],
+      "store": 19
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/atlas/builder",
+      "at_ms": 30000,
+      "items": [
+        {
+          "body": {
+            "status": "completed"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-ci-failing-fix-builder-20",
+          "revision": 1,
+          "role": "system",
+          "sequence": 20,
+          "timestamp": "2030-01-01T12:00:30.000Z",
+          "type": "status"
+        }
+      ],
+      "store": 23
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/2/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/3/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/4/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/3/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/4/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/5/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/6/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/7/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/8/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/9/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/10/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/11/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/12/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/13/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/14/items/0/timestamp"
+    }
+  ],
+  "variant": "default",
+  "world": "ci-failing-fix"
+}

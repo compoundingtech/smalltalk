@@ -1,0 +1,653 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "conversation",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 5
+  },
+  "state": {
+    "threads": [
+      {
+        "agent": "agent/example/harbor/builder",
+        "has_more": false,
+        "items": [
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-merge-conflict-standoff-builder-1",
+              "to": "agent/example/harbor/builder"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-builder-1",
+            "revision": 1,
+            "role": "user",
+            "sequence": 1,
+            "timestamp": "2030-01-01T11:58:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Increase the cache TTL to 300 seconds."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-builder-2",
+            "revision": 1,
+            "role": "user",
+            "sequence": 2,
+            "timestamp": "2030-01-01T11:58:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "new_string": "export const cachePolicy = { ttl: 300, stale: false };\n",
+                "old_string": "export const cachePolicy = { ttl: 60, stale: false };\n",
+                "path": "packages/cache/policy.ts"
+              },
+              "call_id": "call-builder-3",
+              "name": "edit"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-builder-3",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 3,
+            "timestamp": "2030-01-01T11:58:10.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-3",
+              "content": "--- a/packages/cache/policy.ts\n+++ b/packages/cache/policy.ts\n@@ -1,1 +1,1 @@\n-export const cachePolicy = { ttl: 60, stale: false };\n+export const cachePolicy = { ttl: 300, stale: false };\n",
+              "media_type": "text/plain",
+              "status": "success"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-builder-4",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 4,
+            "timestamp": "2030-01-01T11:58:10.300Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "arguments": {
+                "base": "export const cachePolicy = { ttl: 60, stale: false };\n",
+                "command": "git merge cache-policy",
+                "ours": "export const cachePolicy = { ttl: 300, stale: false };\n",
+                "path": "packages/cache/policy.ts",
+                "theirs": "export const cachePolicy = { ttl: 60, stale: true };\n"
+              },
+              "call_id": "call-builder-5",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-builder-5",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 5,
+            "timestamp": "2030-01-01T11:58:20.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-builder-5",
+              "content": "CONFLICT (content): Merge conflict in packages/cache/policy.ts\n<<<<<<< ours\nexport const cachePolicy = { ttl: 300, stale: false };\n||||||| base\nexport const cachePolicy = { ttl: 60, stale: false };\n=======\nexport const cachePolicy = { ttl: 60, stale: true };\n>>>>>>> theirs\n",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-builder-6",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 6,
+            "timestamp": "2030-01-01T11:58:20.500Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Both edits change the same line. I sent the shared base/ours/theirs conflict for review; neither branch is landed."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-builder-7",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 7,
+            "timestamp": "2030-01-01T11:58:30.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-builder-8",
+            "revision": 1,
+            "role": "system",
+            "sequence": 8,
+            "timestamp": "2030-01-01T11:58:40.000Z",
+            "type": "status"
+          }
+        ],
+        "page_size": 50,
+        "session_id": "session/example-harbor-builder"
+      },
+      {
+        "agent": "agent/example/harbor/reviewer",
+        "has_more": false,
+        "items": [
+          {
+            "body": {
+              "from": "person/ada",
+              "message_id": "message/scenario-merge-conflict-standoff-reviewer-1",
+              "to": "agent/example/harbor/reviewer"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-1",
+            "revision": 1,
+            "role": "user",
+            "sequence": 1,
+            "timestamp": "2030-01-01T11:58:00.000Z",
+            "type": "message"
+          },
+          {
+            "body": {
+              "media_type": "text/plain",
+              "text": "Allow stale reads without changing the TTL."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-2",
+            "revision": 1,
+            "role": "user",
+            "sequence": 2,
+            "timestamp": "2030-01-01T11:58:00.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "arguments": {
+                "new_string": "export const cachePolicy = { ttl: 60, stale: true };\n",
+                "old_string": "export const cachePolicy = { ttl: 60, stale: false };\n",
+                "path": "packages/cache/policy.ts"
+              },
+              "call_id": "call-reviewer-3",
+              "name": "edit"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-3",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 3,
+            "timestamp": "2030-01-01T11:58:10.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-reviewer-3",
+              "content": "--- a/packages/cache/policy.ts\n+++ b/packages/cache/policy.ts\n@@ -1,1 +1,1 @@\n-export const cachePolicy = { ttl: 60, stale: false };\n+export const cachePolicy = { ttl: 60, stale: true };\n",
+              "media_type": "text/plain",
+              "status": "success"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-4",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 4,
+            "timestamp": "2030-01-01T11:58:10.300Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "arguments": {
+                "base": "export const cachePolicy = { ttl: 60, stale: false };\n",
+                "command": "git merge cache-policy",
+                "ours": "export const cachePolicy = { ttl: 300, stale: false };\n",
+                "path": "packages/cache/policy.ts",
+                "theirs": "export const cachePolicy = { ttl: 60, stale: true };\n"
+              },
+              "call_id": "call-reviewer-5",
+              "name": "shell"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-5",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 5,
+            "timestamp": "2030-01-01T11:58:20.000Z",
+            "type": "tool_call"
+          },
+          {
+            "body": {
+              "call_id": "call-reviewer-5",
+              "content": "CONFLICT (content): Merge conflict in packages/cache/policy.ts\n<<<<<<< ours\nexport const cachePolicy = { ttl: 300, stale: false };\n||||||| base\nexport const cachePolicy = { ttl: 60, stale: false };\n=======\nexport const cachePolicy = { ttl: 60, stale: true };\n>>>>>>> theirs\n",
+              "media_type": "text/plain",
+              "status": "error"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-6",
+            "revision": 1,
+            "role": "tool",
+            "sequence": 6,
+            "timestamp": "2030-01-01T11:58:20.500Z",
+            "type": "tool_result"
+          },
+          {
+            "body": {
+              "media_type": "text/markdown",
+              "text": "Both edits change the same line. I sent the shared base/ours/theirs conflict for review; neither branch is landed."
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-7",
+            "revision": 1,
+            "role": "assistant",
+            "sequence": 7,
+            "timestamp": "2030-01-01T11:58:30.000Z",
+            "type": "content"
+          },
+          {
+            "body": {
+              "status": "waiting"
+            },
+            "final": true,
+            "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-8",
+            "revision": 1,
+            "role": "system",
+            "sequence": 8,
+            "timestamp": "2030-01-01T11:58:40.000Z",
+            "type": "status"
+          }
+        ],
+        "page_size": 50,
+        "session_id": "session/example-harbor-reviewer"
+      }
+    ]
+  },
+  "timeline": [
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 2000,
+      "items": [
+        {
+          "body": {
+            "from": "person/ada",
+            "message_id": "message/scenario-merge-conflict-standoff-builder-9",
+            "to": "agent/example/harbor/builder"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-builder-9",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9,
+          "timestamp": "2030-01-01T12:00:02.000Z",
+          "type": "message"
+        }
+      ],
+      "store": 3
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 2000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/plain",
+            "text": "Keep the 300-second TTL from builder and stale reads from reviewer. Combine both changes, run the cache tests, then land the patch."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-builder-10",
+          "revision": 1,
+          "role": "user",
+          "sequence": 10,
+          "timestamp": "2030-01-01T12:00:02.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 4
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/reviewer",
+      "at_ms": 2000,
+      "items": [
+        {
+          "body": {
+            "from": "person/ada",
+            "message_id": "message/scenario-merge-conflict-standoff-reviewer-9",
+            "to": "agent/example/harbor/reviewer"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-9",
+          "revision": 1,
+          "role": "user",
+          "sequence": 9,
+          "timestamp": "2030-01-01T12:00:02.000Z",
+          "type": "message"
+        }
+      ],
+      "store": 5
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/reviewer",
+      "at_ms": 2000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/plain",
+            "text": "Keep the 300-second TTL from builder and stale reads from reviewer. Combine both changes, run the cache tests, then land the patch."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-10",
+          "revision": 1,
+          "role": "user",
+          "sequence": 10,
+          "timestamp": "2030-01-01T12:00:02.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 6
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 5000,
+      "items": [
+        {
+          "body": {
+            "arguments": {
+              "new_string": "export const cachePolicy = { ttl: 300, stale: true };\n",
+              "old_string": "<<<<<<< ours\nexport const cachePolicy = { ttl: 300, stale: false };\n||||||| base\nexport const cachePolicy = { ttl: 60, stale: false };\n=======\nexport const cachePolicy = { ttl: 60, stale: true };\n>>>>>>> theirs\n",
+              "path": "packages/cache/policy.ts"
+            },
+            "call_id": "call-builder-11",
+            "name": "edit"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-builder-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 11,
+          "timestamp": "2030-01-01T12:00:05.000Z",
+          "type": "tool_call"
+        }
+      ],
+      "store": 7
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/reviewer",
+      "at_ms": 5000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "Reviewed the combined policy: ttl 300 and stale true preserve both goals. Builder can land the approved patch."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-11",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 11,
+          "timestamp": "2030-01-01T12:00:05.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 8
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 5300,
+      "items": [
+        {
+          "body": {
+            "call_id": "call-builder-11",
+            "content": "--- a/packages/cache/policy.ts\n+++ b/packages/cache/policy.ts\n@@ -1,7 +1,1 @@\n-<<<<<<< ours\n-export const cachePolicy = { ttl: 300, stale: false };\n-||||||| base\n-export const cachePolicy = { ttl: 60, stale: false };\n-=======\n-export const cachePolicy = { ttl: 60, stale: true };\n->>>>>>> theirs\n+export const cachePolicy = { ttl: 300, stale: true };\n",
+            "media_type": "text/plain",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-builder-12",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 12,
+          "timestamp": "2030-01-01T12:00:05.300Z",
+          "type": "tool_result"
+        }
+      ],
+      "store": 9
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 8000,
+      "items": [
+        {
+          "body": {
+            "arguments": {
+              "command": "pnpm test cache && git add packages/cache/policy.ts && git commit -m \"Combine cache TTL and stale reads\""
+            },
+            "call_id": "call-builder-13",
+            "name": "shell"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-builder-13",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 13,
+          "timestamp": "2030-01-01T12:00:08.000Z",
+          "type": "tool_call"
+        }
+      ],
+      "store": 11
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/reviewer",
+      "at_ms": 8000,
+      "items": [
+        {
+          "body": {
+            "status": "completed"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-reviewer-12",
+          "revision": 1,
+          "role": "system",
+          "sequence": 12,
+          "timestamp": "2030-01-01T12:00:08.000Z",
+          "type": "status"
+        }
+      ],
+      "store": 12
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 10000,
+      "items": [
+        {
+          "body": {
+            "call_id": "call-builder-13",
+            "content": "12 cache tests passed; 0 failures\n[cache-policy c0ffee1] Combine cache TTL and stale reads",
+            "media_type": "text/plain",
+            "status": "success"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-builder-14",
+          "revision": 1,
+          "role": "tool",
+          "sequence": 14,
+          "timestamp": "2030-01-01T12:00:10.000Z",
+          "type": "tool_result"
+        }
+      ],
+      "store": 14
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 11000,
+      "items": [
+        {
+          "body": {
+            "media_type": "text/markdown",
+            "text": "The combined patch landed as c0ffee1: ttl 300, stale true. All 12 cache tests passed."
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-builder-15",
+          "revision": 1,
+          "role": "assistant",
+          "sequence": 15,
+          "timestamp": "2030-01-01T12:00:11.000Z",
+          "type": "content"
+        }
+      ],
+      "store": 15
+    },
+    {
+      "_tag": "entries",
+      "agent": "agent/example/harbor/builder",
+      "at_ms": 14000,
+      "items": [
+        {
+          "body": {
+            "status": "completed"
+          },
+          "final": true,
+          "id": "timeline-entry/scenario-merge-conflict-standoff-builder-16",
+          "revision": 1,
+          "role": "system",
+          "sequence": 16,
+          "timestamp": "2030-01-01T12:00:14.000Z",
+          "type": "status"
+        }
+      ],
+      "store": 16
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/2/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/3/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/4/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/5/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/6/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/0/items/7/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/1/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/2/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/3/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/4/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/5/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/6/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/threads/1/items/7/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/2/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/3/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/4/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/5/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/6/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/7/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/8/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/9/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/10/items/0/timestamp"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/11/items/0/timestamp"
+    }
+  ],
+  "variant": "default",
+  "world": "merge-conflict-standoff"
+}

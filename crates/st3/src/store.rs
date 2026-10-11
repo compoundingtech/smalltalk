@@ -134,10 +134,15 @@ pub(crate) use mission_eligibility::MISSING_AGENT_CONDITION;
 mod revision_seats;
 pub(crate) mod delegation;
 mod limits;
+mod database_size;
+pub use database_size::DatabaseSize;
 mod person_work;
 pub(crate) mod work_summaries_ivm;
 mod subagents;
 mod watches;
+mod idle_holds;
+mod idle_mail;
+pub use idle_holds::WORK_NUDGED_KIND;
 pub use checkpoint_rules::{RULES_VERSION, plan_drops, rules_digest};
 pub use limits::{AccountLimit, LIMITS_ACTOR, LIMITS_CATCH_UP_PAGE, LimitsOutcome, LimitsPolicy};
 pub use subagents::{
@@ -163,6 +168,7 @@ pub(crate) mod mission_ivm;
 pub(crate) mod client_summary;
 mod unread_mail;
 mod agent_messages;
+mod coordination;
 pub mod agent_view;
 mod conversation_reads;
 mod usage_period;
@@ -520,6 +526,9 @@ WHERE kind='custom.client.terminal-attached';
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
+CREATE INDEX IF NOT EXISTS claims_run_report_to_index
+ON claims(json_extract(body, '$.fields.report_to'), subject)
+WHERE kind IN ('mission-run.created','mission-run.report-to');
 CREATE INDEX IF NOT EXISTS claims_message_from_index
 ON claims(json_extract(body, '$.fields.from'), store_index)
 WHERE kind='message.sent';
@@ -711,6 +720,11 @@ CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject
 CREATE INDEX IF NOT EXISTS desired_claim_index ON desired(claim_id);
 CREATE INDEX IF NOT EXISTS desired_agent_subject_index ON desired(subject) WHERE kind='agent';
 CREATE INDEX IF NOT EXISTS desired_agent_host_index ON desired(json_extract(member, '$.host'), subject) WHERE kind='agent';
+
+-- Watch subjects encode OWNER/REPO/NUMBER followed by the recipient (which may contain slashes).
+-- Seek that suffix so an idle seat never scans the fleet's declarations.
+CREATE INDEX IF NOT EXISTS desired_watch_agent_index ON desired(substr(substr(substr(substr(subject, 20), instr(substr(subject, 20), '/') + 1), instr(substr(substr(subject, 20), instr(substr(subject, 20), '/') + 1), '/') + 1), instr(substr(substr(substr(subject, 20), instr(substr(subject, 20), '/') + 1), instr(substr(substr(subject, 20), instr(substr(subject, 20), '/') + 1), '/') + 1), '/') + 1))
+WHERE subject >= 'subscription/watch/' AND subject < 'subscription/watch0';
 
 -- A replicated projection finds a mission run tree's runs, generations and proposals from the
 -- claims that create them, without reading every such claim.
@@ -3516,6 +3530,11 @@ impl Store {
             Ok(delta) => delta.subjects.is_empty() && !delta.queues && !delta.membership,
             Err(_) => false,
         })
+    }
+
+    /// Note that an agents list read asked for the roster now, so a forget refolds it at once.
+    pub(crate) fn note_agent_roster_read(&self) {
+        self.smalltalk.agent_roster_read_at.store(now_ms() as u64, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether a refresher keeps the roster published, so readers must never fold it.
@@ -13363,6 +13382,34 @@ impl Store {
         Ok(count)
     }
 
+    pub fn held_mail_count_before(&self, before: u128) -> Result<u64> {
+        Ok(self.readers.get().query_row(
+            "SELECT COUNT(*) FROM coordination_sends INDEXED BY coordination_sends_held WHERE held=1 AND sent_ms<?1",
+            [i64::try_from(before).unwrap_or(i64::MAX)], |row| row.get(0))?)
+    }
+
+    /// Each seat's unread held mail sent before the cutoff: its count and oldest send time.
+    /// A read: it never folds the unread queue, and reads the queued subjects as they stand.
+    pub fn held_mail_before(&self, before_unix_ms: u128) -> Result<Vec<(String, u64, u128)>> {
+        let mut seats = BTreeMap::<String, (u64, u128)>::new();
+        for sent in unread_mail::sent_before(&self.readers.get(), before_unix_ms)? {
+            if sent
+                .tags
+                .iter()
+                .any(|tag| crate::silent::is_silent_tag(tag))
+                && !crate::silent::always_wakes(&sent.from, &sent.tags)
+            {
+                let seat = seats.entry(sent.to).or_insert((0, sent.sent_unix_ms));
+                seat.0 += 1;
+                seat.1 = seat.1.min(sent.sent_unix_ms);
+            }
+        }
+        Ok(seats
+            .into_iter()
+            .map(|(seat, (count, oldest))| (seat, count, oldest))
+            .collect())
+    }
+
     pub fn messages(
         &self,
         recipient: Option<&str>,
@@ -13379,6 +13426,24 @@ impl Store {
         include_closed: bool,
         through: u64,
     ) -> Result<Vec<MessageView>> {
+        self.messages_through_inner(recipient, include_closed, through, false)
+    }
+
+    pub(crate) fn messages_for_delivery_through(
+        &self,
+        recipient: &str,
+        through: u64,
+    ) -> Result<Vec<MessageView>> {
+        self.messages_through_inner(Some(recipient), false, through, true)
+    }
+
+    fn messages_through_inner(
+        &self,
+        recipient: Option<&str>,
+        include_closed: bool,
+        through: u64,
+        delivery: bool,
+    ) -> Result<Vec<MessageView>> {
         smallclaims::touched::note_read(|| match recipient {
             Some(recipient) => format!("mailbox:{recipient}"),
             None => "kind:message.sent".to_owned(),
@@ -13387,7 +13452,7 @@ impl Store {
         let mut all = Vec::new();
         loop {
             let (items, next) =
-                self.messages_page(recipient, include_closed, after, through, 200)?;
+                self.messages_page_inner(recipient, include_closed, after, through, 200, delivery)?;
             all.extend(items);
             match next {
                 Some(cursor) => after = Some(cursor),
@@ -13555,6 +13620,28 @@ impl Store {
         through: u64,
         limit: usize,
     ) -> Result<(Vec<MessageView>, Option<u64>)> {
+        self.messages_page_inner(recipient, include_closed, after, through, limit, false)
+    }
+
+    pub(crate) fn messages_page_for_delivery(
+        &self,
+        recipient: &str,
+        after: Option<u64>,
+        through: u64,
+        limit: usize,
+    ) -> Result<(Vec<MessageView>, Option<u64>)> {
+        self.messages_page_inner(Some(recipient), false, after, through, limit, true)
+    }
+
+    fn messages_page_inner(
+        &self,
+        recipient: Option<&str>,
+        include_closed: bool,
+        after: Option<u64>,
+        through: u64,
+        limit: usize,
+        delivery: bool,
+    ) -> Result<(Vec<MessageView>, Option<u64>)> {
         let recipient = recipient.map(normalize_message_party);
         let connection = self.readers.get();
         // Native harnesses repeatedly ask for their complete durable mailbox so
@@ -13568,7 +13655,7 @@ impl Store {
                 .unwrap_or(value)
         });
         if let (Some(recipient), Some(bare_recipient)) = (fast_recipient, bare_recipient) {
-            let mut statement = connection.prepare(
+            let mut statement = connection.prepare(if delivery {
                 "WITH candidates(subject) AS (
                      SELECT subject FROM claims INDEXED BY claims_message_to_index
                      WHERE kind='message.sent'
@@ -13585,14 +13672,46 @@ impl Store {
                              WHERE claims.subject=candidates.subject) created_index
                      FROM candidates
                  )
-                 SELECT subject, created_index FROM created
+                 , ranked AS (
+                     SELECT created.*, COALESCE(meta.held,0) held,
+                            ROW_NUMBER() OVER (PARTITION BY COALESCE(meta.held,0) ORDER BY created_index DESC,created.subject DESC) held_rank,
+                            SUM(COALESCE(meta.held,0)) OVER () held_total
+                     FROM created LEFT JOIN coordination_sends meta ON meta.subject=created.subject
+                     WHERE created_index<=?4
+                 )
+                 SELECT subject, created_index, CASE WHEN ?7 THEN MAX(held_total-8,0) ELSE 0 END FROM ranked
                  WHERE created_index>?3 AND created_index<=?4
+                   AND (NOT ?7 OR held=0 OR held_rank<=8)
+                   AND (?6 OR NOT EXISTS (
+                     SELECT 1 FROM claims closed
+                     WHERE closed.subject=ranked.subject AND closed.kind='message.closed'
+                   ))
+                 ORDER BY created_index, subject LIMIT ?5"
+            } else {
+                "WITH candidates(subject) AS (
+                     SELECT subject FROM claims INDEXED BY claims_message_to_index
+                     WHERE kind='message.sent'
+                       AND json_extract(body, '$.fields.to') IN (?1, ?2)
+                     UNION
+                     SELECT desired.subject FROM desired,
+                            json_each(desired.body, '$.children') child
+                     WHERE desired.kind='message'
+                       AND json_extract(child.value, '$.name')='to'
+                       AND json_extract(child.value, '$.arguments[0]') IN (?1, ?2)
+                 ), created AS (
+                     SELECT subject,
+                            (SELECT MIN(store_index) FROM claims
+                             WHERE claims.subject=candidates.subject) created_index
+                     FROM candidates
+                 )
+                 SELECT subject, created_index, 0 FROM created
+                 WHERE (?7 OR NOT ?7) AND created_index>?3 AND created_index<=?4
                    AND (?6 OR NOT EXISTS (
                      SELECT 1 FROM claims closed
                      WHERE closed.subject=created.subject AND closed.kind='message.closed'
                    ))
-                 ORDER BY created_index, subject LIMIT ?5",
-            )?;
+                 ORDER BY created_index, subject LIMIT ?5"
+            })?;
             let mut subjects = statement
                 .query_map(
                     params![
@@ -13602,19 +13721,31 @@ impl Store {
                         through,
                         limit.saturating_add(1),
                         include_closed,
+                        delivery,
                     ],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, usize>(2)?,
+                        ))
+                    },
                 )?
                 .collect::<Result<Vec<_>, _>>()?;
             let has_more = subjects.len() > limit;
             subjects.truncate(limit);
             let next_after = has_more
-                .then(|| subjects.last().map(|(_, index)| *index))
+                .then(|| subjects.last().map(|(_, index, _)| *index))
                 .flatten();
             let mut output = Vec::new();
-            for (subject, created_index) in subjects {
-                let message = self.message_view_cached(&connection, &subject, created_index)?;
+            for (subject, created_index, remaining) in subjects {
+                let mut message = self.message_view_cached(&connection, &subject, created_index)?;
                 if message.to == recipient && (include_closed || message.status != "closed") {
+                    if remaining > 0 && crate::silent::waits_for_turn(&message) {
+                        message
+                            .tags
+                            .push(format!("{}{remaining}", crate::silent::REMAINING_PREFIX));
+                    }
                     output.push(message);
                 }
             }
@@ -14583,6 +14714,11 @@ impl Store {
     pub fn launch_lineage(&self, subject: &str) -> Result<Vec<String>> {
         let connection = self.readers.get();
         launch_lineage_tx(&connection, subject)
+    }
+
+    /// Presentation-only lineage of a recorded launch, even when it is no longer desired.
+    pub(crate) fn launch_lineage_from(&self, token: &str) -> Result<Vec<String>> {
+        launch_lineage_from_tx(&self.readers.get(), token.to_owned())
     }
 
     /// Only seats whose durable resume requests name this host need transfer reconciliation.
@@ -21202,8 +21338,11 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
     let Some(row) = current_desired_row(connection, subject)? else {
         return Ok(Vec::new());
     };
-    let mut lineage = vec![row.claim_id.clone()];
-    let mut current = row.claim_id;
+    launch_lineage_from_tx(connection, row.claim_id)
+}
+
+fn launch_lineage_from_tx(connection: &Connection, mut current: String) -> Result<Vec<String>> {
+    let mut lineage = vec![current.clone()];
     while let Some(claim) = claim_by_id_tx(connection, &current)? {
         // A claim that merges concurrent revisions has one predecessor per fork; follow the
         // first one that is still the same launch.
@@ -21214,7 +21353,7 @@ fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<Strin
             }
             if let Some(previous) = claim_by_id_tx(connection, predecessor)?
                 && previous.kind == "intent.desired"
-                && previous.subject == subject
+                && previous.subject == claim.subject
                 && presentation_only_change(&previous.body, &claim.body)
             {
                 next = Some(previous.id);
@@ -22232,13 +22371,20 @@ fn message_view_tx(
                 values
                     .iter()
                     .filter_map(Value::as_str)
-                    .map(str::to_owned)
+                    .filter(|tag| !crate::silent::is_remaining_tag(tag))
+                    .map(crate::silent::view_tag)
                     .collect()
             })
             .unwrap_or_else(|| {
                 desired
                     .as_ref()
-                    .map(|value| canonical_child_strings(value, "tag"))
+                    .map(|value| {
+                        canonical_child_strings(value, "tag")
+                            .into_iter()
+                            .filter(|tag| !crate::silent::is_remaining_tag(tag))
+                            .map(|tag| crate::silent::view_tag(&tag))
+                            .collect()
+                    })
                     .unwrap_or_default()
             }),
         // A replicated claim is another member's word: keep only references a file name can be
@@ -31626,6 +31772,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         blocked_reason: row.get(15)?,
         blockers: Vec::new(),
         not_before_unix_ms: not_before.and_then(|value| value.parse().ok()),
+        nudged_at_unix_ms: None,
         created_at_unix_ms: created.parse().unwrap_or(0),
         updated_at_unix_ms: updated.parse().unwrap_or(0),
         person_answers: Vec::new(),
@@ -31684,10 +31831,38 @@ fn enrich_step_queue_at(
     view.timeout_extension_ms =
         step_timeout_extension_at(connection, &view.subject, view.attempt, snapshot_unix_ms)?;
     enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
+    enrich_step_nudge_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
     enrich_step_definition(connection, view)?;
     adhoc_work::enrich_handoff(connection, view, snapshot_unix_ms)?;
     person_work::enrich_responses(connection, view)
+}
+
+/// When st last nudged a held step's holder in this attempt: one indexed lookup of the step's
+/// newest `work.nudged` claim.
+fn enrich_step_nudge_at(
+    connection: &Connection,
+    view: &mut StepRunView,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<()> {
+    if !matches!(view.status.as_str(), "claimed" | "working") {
+        return Ok(());
+    }
+    let snapshot = snapshot_unix_ms.to_string();
+    view.nudged_at_unix_ms = connection
+        .prepare_cached(
+            "SELECT accepted_at_unix_ms FROM claims
+             WHERE subject=?1 AND kind='work.nudged'
+               AND json_extract(body, '$.fields.attempt')=?2
+               AND (length(accepted_at_unix_ms), accepted_at_unix_ms) <= (length(?3), ?3)
+             ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC LIMIT 1",
+        )?
+        .query_row(params![view.subject, view.attempt, snapshot], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .and_then(|at| at.parse().ok());
+    Ok(())
 }
 
 /// Copies the worker's latest progress summary and its completion summary for the
@@ -41305,7 +41480,7 @@ version 2
         let mut legacy_digest = Sha256::new();
         legacy_digest.update(b"st3-checkpoint-rules-v1\0");
         legacy_digest.update(5_u32.to_be_bytes());
-        legacy_digest.update(checkpoint_rules::RULES_DESCRIPTION.as_bytes());
+        legacy_digest.update(checkpoint_rules::rules_description().as_bytes());
         let legacy_digest = hex::encode(legacy_digest.finalize());
         assert_ne!(legacy_digest, rules_digest());
         let sealed = controller.checkpoint_sealed_identities(cut, None).unwrap();
@@ -55268,6 +55443,114 @@ agent "third" {{ workspace {workspace:?}; harness "claude" {{ account "avery/two
             "harness.observed",
             json!({"state":"working", "driver":"claude", "incarnation_id":"one",
                 "blocked_on":"human", "ask":"question"}),
+        );
+        assert!(prompt().unwrap().answers.is_empty());
+        assert_eq!(
+            store
+                .answer_native_prompt(seat, &question.id, "allow", "person/avery")
+                .unwrap_err()
+                .code,
+            "stale-fence"
+        );
+    }
+
+    /// A Codex approval prompt is answered the same way. The answer names the Codex driver, whose
+    /// control connection reads it and answers the app-server; a Codex question stays terminal-only.
+    #[test]
+    fn a_codex_permission_prompt_is_answered_and_records_its_driver() {
+        let store = Store::open_memory("node").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{}} }}\n",
+            workspace.path().display().to_string()
+        );
+        let intent = parse_intent(&source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source,
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply_as(&intent, &preview.subject_tokens, "answer-seat", Some("person/avery"))
+            .unwrap();
+        let seat = "agent/node.worker";
+        let append = |kind: &str, fields: Value| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: seat.into(),
+                    kind: kind.into(),
+                    actor: Some(seat.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let prompt = || {
+            store
+                .attention_items(Some("person/avery"))
+                .unwrap()
+                .into_iter()
+                .find(|item| item.kind == "harness-prompt")
+        };
+        append("runtime.observed", json!({"status":"running", "incarnation_id":"one"}));
+        // The driver waits on the observation its approval wrote, named by the record's sequences.
+        let asked = append(
+            "harness.observed",
+            json!({"state":"working", "driver":"codex", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"waitingOnApproval",
+                "ownership_sequence":1, "transition_sequence":3}),
+        );
+        assert_eq!(
+            prompt().unwrap().answers,
+            vec!["allow".to_owned(), "deny".to_owned()]
+        );
+        assert!(prompt().unwrap().detail.starts_with("Codex asks for approval;"));
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Open
+        );
+        let answer = store
+            .answer_native_prompt(seat, &asked.id, "allow", "person/avery")
+            .unwrap();
+        assert_eq!(answer.body["fields"]["driver"], "codex");
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Answered {
+                answer: "allow".into()
+            }
+        );
+        assert!(prompt().is_none(), "an answered prompt is no longer an alert");
+        // The next approval is its own: the earlier answer never answers it.
+        append(
+            "harness.observed",
+            json!({"state":"working", "driver":"codex", "incarnation_id":"one",
+                "blocked_on":null, "ask":null, "ownership_sequence":1, "transition_sequence":4}),
+        );
+        append(
+            "harness.observed",
+            json!({"state":"working", "driver":"codex", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"permission", "reason":"waitingOnApproval",
+                "ownership_sequence":1, "transition_sequence":5}),
+        );
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 3).unwrap(),
+            NativePromptState::Gone
+        );
+        assert_eq!(
+            store.native_prompt_state(seat, 1, 5).unwrap(),
+            NativePromptState::Open
+        );
+        let question = append(
+            "harness.observed",
+            json!({"state":"working", "driver":"codex", "incarnation_id":"one",
+                "blocked_on":"human", "ask":"question", "reason":"waitingOnUserInput",
+                "ownership_sequence":1, "transition_sequence":6}),
         );
         assert!(prompt().unwrap().answers.is_empty());
         assert_eq!(

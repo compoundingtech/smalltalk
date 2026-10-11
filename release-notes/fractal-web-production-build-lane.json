@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Fractal web public CI now runs the app's production Vite build with its runner-loaded configuration, so bundler and StyleX compilation errors fail the web execution gate instead of passing typechecks and unit tests alone. Build output uses a fresh temporary directory that is removed on exit and is not cached. Production output groups React, Effect and Aria vendors without pulling unmatched lazy dependencies into the shell or fragmenting groups by source size.",
+  "replay": {
+    "status": "none",
+    "detail": "CI-only change; no replay or rebuild of runtime state."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database, claim, or browser-state schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rule or digest change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No runtime, protocol, harness, or CLI change. The existing web execution job gains a production build lane using the same pinned web toolchain and frozen dependencies."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No deployed service change or interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No installation or operator action required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No runtime recovery change. Temporary build output is removed whether the build succeeds or fails."
+  }
+}

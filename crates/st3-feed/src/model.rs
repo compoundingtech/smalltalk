@@ -55,6 +55,9 @@ pub struct Model {
     pub work: Collection,
     pub agents: Collection,
     pub sessions: Collection,
+    /// Sessions opened directly, retained when the current-session list refreshes.
+    #[serde(default)]
+    pub opened_sessions: BTreeMap<String, Session>,
     pub runtimes: Collection,
     pub machines: Collection,
     pub devices: Collection,
@@ -463,17 +466,29 @@ impl Model {
             _ => None,
         })
     }
+    pub async fn read_session(client: &Client, id: &str) -> Result<Session> {
+        match client.sessions_get(id).await?.value {
+            Resource::Session(session) => Ok(session),
+            _ => anyhow::bail!("session endpoint returned a different resource"),
+        }
+    }
+
+    pub fn add_opened_session(&mut self, session: Session) {
+        self.opened_sessions.insert(session.header.id.clone(), session);
+    }
+
     pub fn undeclared_sessions(&self) -> impl Iterator<Item = &Session> {
         self.sessions.items.iter().filter_map(|item| match item {
             Resource::Session(v)
-                if v.state == "running"
+                if !self.opened_sessions.contains_key(&v.header.id)
+                    && v.state == "running"
                     && v.extra.get("managed").and_then(serde_json::Value::as_bool)
                         == Some(false) =>
             {
                 Some(v)
             }
             _ => None,
-        })
+        }).chain(self.opened_sessions.values())
     }
     pub fn messages(&self, _session: Option<&str>, peer: &str) -> impl Iterator<Item = &Message> {
         self.messages
@@ -796,6 +811,56 @@ pub use st3_conversation_ui::clean_message_text;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn an_unknown_saved_session_is_fetched_and_retained_as_readable_history() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("session.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let resources: Vec<Resource> = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/fixtures/resources.json"
+        )).unwrap();
+        let mut session = resources.into_iter().find_map(|resource| match resource {
+            Resource::Session(session) => Some(session),
+            _ => None,
+        }).unwrap();
+        session.header.id = "session/saved-omp".into();
+        session.state = "completed".into();
+        let mut envelope: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/st3/client-v0/fixtures/events.json"
+        )).unwrap();
+        envelope["value"] = serde_json::to_value(Resource::Session(session)).unwrap();
+        let body = envelope.to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = stream.read(&mut bytes).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("GET /v1/client/sessions/"), "{request}");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = Client::unix_as(&socket, "person/alex");
+        let mut model = Model::default();
+        assert!(model.undeclared_sessions().next().is_none());
+        model.add_opened_session(Model::read_session(&client, "session/saved-omp").await.unwrap());
+        model.sessions = Collection::default();
+        assert_eq!(
+            model.undeclared_sessions().map(|session| session.header.id.as_str()).collect::<Vec<_>>(),
+            ["session/saved-omp"]
+        );
+        assert!(model.agents().next().is_none());
+        server.await.unwrap();
+    }
+
 
     #[test]
     fn mission_and_queue_events_invalidate_tree_without_a_timer() {

@@ -1,0 +1,329 @@
+{
+  "recordVersion": 1,
+  "endpoint": "https://gateway.example.invalid",
+  "hostId": "host/synthetic-138/1",
+  "projectionVersion": "client-projection.v0",
+  "capturedAt": 1958083200000,
+  "collections": {
+    "agents": {
+      "storeIndex": 100,
+      "items": [
+        {
+          "kind": "agent",
+          "id": "agent/synthetic-138/1",
+          "revision": "rev/synthetic-138-1",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "name": "Worker 1",
+          "state": "running",
+          "reachability": "reachable",
+          "runtime_ids": [
+            "runtime/synthetic-138/1"
+          ],
+          "owner_run_id": "mission-run/synthetic-138/1",
+          "driver": "omp",
+          "harness_state": "working",
+          "observation": "current",
+          "since": "2032-01-18T23:58:00.000Z",
+          "blocked_on": null,
+          "host_id": "host/synthetic-138/1",
+          "fault": null,
+          "current_session_id": "session/synthetic-138/1",
+          "last_activity_at": "2032-01-18T23:59:50.000Z",
+          "silent_since": null,
+          "delivery": {
+            "state": "live",
+            "reason": null,
+            "polled_seconds_ago": 2
+          },
+          "handoff": {
+            "phase": "running"
+          },
+          "current_work": [
+            {
+              "id": "step-run/synthetic-138/1",
+              "mission_id": "mission/synthetic-138/1",
+              "mission_run_id": "mission-run/synthetic-138/1",
+              "path": "assemble",
+              "title": "Assemble sample 1",
+              "state": "claimed",
+              "since": "2032-01-18T23:58:00.000Z"
+            }
+          ],
+          "suspension": null
+        },
+        {
+          "kind": "agent",
+          "id": "agent/synthetic-138/2",
+          "revision": "rev/synthetic-138-2",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "name": "Worker 2",
+          "state": "waiting",
+          "reachability": "reachable",
+          "runtime_ids": [
+            "runtime/synthetic-138/2"
+          ],
+          "owner_run_id": "mission-run/synthetic-138/2",
+          "driver": "omp",
+          "harness_state": "waiting",
+          "observation": "current",
+          "since": "2032-01-18T23:58:00.000Z",
+          "blocked_on": "human",
+          "host_id": "host/synthetic-138/1",
+          "fault": null,
+          "current_session_id": "session/synthetic-138/2",
+          "last_activity_at": "2032-01-18T23:59:50.000Z",
+          "silent_since": null,
+          "delivery": {
+            "state": "live",
+            "reason": null,
+            "polled_seconds_ago": 2
+          },
+          "handoff": {
+            "phase": "running"
+          },
+          "current_work": [
+            {
+              "id": "step-run/synthetic-138/2",
+              "mission_id": "mission/synthetic-138/2",
+              "mission_run_id": "mission-run/synthetic-138/2",
+              "path": "assemble",
+              "title": "Assemble sample 2",
+              "state": "waiting",
+              "since": "2032-01-18T23:58:00.000Z"
+            }
+          ],
+          "suspension": null
+        },
+        {
+          "kind": "agent",
+          "id": "agent/synthetic-138/3",
+          "revision": "rev/synthetic-138-3",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "name": "Worker 3",
+          "state": "running",
+          "reachability": "reachable",
+          "runtime_ids": [
+            "runtime/synthetic-138/3"
+          ],
+          "owner_run_id": "mission-run/synthetic-138/3",
+          "driver": "omp",
+          "harness_state": "working",
+          "observation": "stale",
+          "since": "2032-01-18T23:58:00.000Z",
+          "blocked_on": null,
+          "host_id": "host/synthetic-138/1",
+          "fault": null,
+          "current_session_id": "session/synthetic-138/3",
+          "last_activity_at": "2032-01-18T23:57:00.000Z",
+          "silent_since": null,
+          "delivery": {
+            "state": "live",
+            "reason": null,
+            "polled_seconds_ago": 2
+          },
+          "handoff": {
+            "phase": "running"
+          },
+          "current_work": [
+            {
+              "id": "step-run/synthetic-138/3",
+              "mission_id": "mission/synthetic-138/3",
+              "mission_run_id": "mission-run/synthetic-138/3",
+              "path": "assemble",
+              "title": "Assemble sample 3",
+              "state": "claimed",
+              "since": "2032-01-18T23:58:00.000Z"
+            }
+          ],
+          "suspension": null
+        },
+        {
+          "kind": "agent",
+          "id": "agent/synthetic-138/4",
+          "revision": "rev/synthetic-138-4",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "name": "Worker 4",
+          "state": "suspended",
+          "reachability": "unreachable",
+          "runtime_ids": [],
+          "owner_run_id": null,
+          "driver": null,
+          "harness_state": null,
+          "observation": "missing",
+          "since": null,
+          "blocked_on": null,
+          "host_id": "host/synthetic-138/2",
+          "fault": null,
+          "current_session_id": null,
+          "last_activity_at": null,
+          "silent_since": "2032-01-18T23:50:00.000Z",
+          "delivery": null,
+          "handoff": null,
+          "current_work": [],
+          "suspension": {
+            "action": "suspend",
+            "phase": "suspended",
+            "suspended_at": "2032-01-18T23:55:00.000Z"
+          }
+        },
+        {
+          "kind": "agent",
+          "id": "agent/synthetic-138/5",
+          "revision": "rev/synthetic-138-5",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "name": "Worker 5",
+          "state": "failed",
+          "reachability": "unreachable",
+          "runtime_ids": [],
+          "owner_run_id": null,
+          "driver": null,
+          "harness_state": null,
+          "observation": "missing",
+          "since": null,
+          "blocked_on": null,
+          "host_id": "host/synthetic-138/1",
+          "fault": "Synthetic process failure",
+          "current_session_id": null,
+          "last_activity_at": null,
+          "silent_since": "2032-01-18T23:50:00.000Z",
+          "delivery": null,
+          "handoff": null,
+          "current_work": [],
+          "suspension": null
+        }
+      ]
+    },
+    "missions": {
+      "storeIndex": 134,
+      "items": [
+        {
+          "kind": "mission",
+          "id": "mission/synthetic-138/1",
+          "revision": "rev/synthetic-138-1",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "title": "Sample assembly 1",
+          "state": "running",
+          "runs": [
+            "mission-run/synthetic-138/1"
+          ],
+          "run_details": [
+            {
+              "id": "mission-run/synthetic-138/1",
+              "status": "running"
+            }
+          ]
+        },
+        {
+          "kind": "mission",
+          "id": "mission/synthetic-138/2",
+          "revision": "rev/synthetic-138-2",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "title": "Sample assembly 2",
+          "state": "running",
+          "runs": [
+            "mission-run/synthetic-138/2"
+          ],
+          "run_details": [
+            {
+              "id": "mission-run/synthetic-138/2",
+              "status": "waiting"
+            }
+          ]
+        },
+        {
+          "kind": "mission",
+          "id": "mission/synthetic-138/3",
+          "revision": "rev/synthetic-138-3",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "title": "Sample assembly 3",
+          "state": "running",
+          "runs": [
+            "mission-run/synthetic-138/3"
+          ],
+          "run_details": [
+            {
+              "id": "mission-run/synthetic-138/3",
+              "status": "running"
+            }
+          ]
+        }
+      ]
+    },
+    "runtimes": {
+      "storeIndex": 134,
+      "items": [
+        {
+          "kind": "runtime",
+          "id": "runtime/synthetic-138/1",
+          "revision": "rev/synthetic-138-1",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "owner_id": "agent/synthetic-138/1",
+          "owner_host_id": "host/synthetic-138/1",
+          "runtime_id": "synthetic-process-138-1",
+          "terminal_id": "terminal/synthetic-138/1",
+          "incarnation_id": "incarnation/synthetic-138/1",
+          "state": "running"
+        },
+        {
+          "kind": "runtime",
+          "id": "runtime/synthetic-138/2",
+          "revision": "rev/synthetic-138-2",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "owner_id": "agent/synthetic-138/2",
+          "owner_host_id": "host/synthetic-138/1",
+          "runtime_id": "synthetic-process-138-2",
+          "terminal_id": "terminal/synthetic-138/2",
+          "incarnation_id": "incarnation/synthetic-138/2",
+          "state": "running"
+        },
+        {
+          "kind": "runtime",
+          "id": "runtime/synthetic-138/3",
+          "revision": "rev/synthetic-138-3",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "owner_id": "agent/synthetic-138/3",
+          "owner_host_id": "host/synthetic-138/1",
+          "runtime_id": "synthetic-process-138-3",
+          "terminal_id": "terminal/synthetic-138/3",
+          "incarnation_id": "incarnation/synthetic-138/3",
+          "state": "running"
+        }
+      ]
+    },
+    "attention": {
+      "storeIndex": 146,
+      "items": [
+        {
+          "kind": "attention",
+          "id": "attention/synthetic-138/1",
+          "revision": "rev/synthetic-138-1",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "state": "open",
+          "attention_kind": "agent-request",
+          "requester_id": "agent/synthetic-138/2",
+          "source_id": "agent/synthetic-138/2",
+          "targets": [
+            "person/operator"
+          ],
+          "mission_run_id": "mission-run/synthetic-138/2",
+          "mission_id": "mission/synthetic-138/2"
+        },
+        {
+          "kind": "attention",
+          "id": "attention/synthetic-138/2",
+          "revision": "rev/synthetic-138-2",
+          "updated_at": "2032-01-19T00:00:00.000Z",
+          "state": "pending",
+          "attention_kind": "unread-message",
+          "requester_id": null,
+          "source_id": "person/operator",
+          "targets": [
+            "agent/synthetic-138/1"
+          ],
+          "mission_run_id": null,
+          "mission_id": null
+        }
+      ]
+    }
+  }
+}

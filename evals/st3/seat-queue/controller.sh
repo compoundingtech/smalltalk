@@ -164,7 +164,7 @@ wait_for_worker
 checkpoint seat-idle
 
 for label in alpha bravo charlie; do
-  st3 missions publish "$GENERATED/$label.kdl" --as "$REQUESTER" >/dev/null
+  st3 apply "$GENERATED/$label.kdl" --as "$REQUESTER" >/dev/null
 done
 
 # Start order is the default queue order: alpha, then bravo, then charlie.

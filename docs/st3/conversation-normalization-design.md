@@ -25,8 +25,8 @@ preserve supplied parent/activity links; an historical ask is never a live picke
 Errors also have a known `error` block with `{body_ref:true}`, so native stop/exit
 notices from #1478 need no new kind. Optional `block.metadata` is an open JSON
 object for source-supplied timing (including `wallTimeMs` and `timeoutSeconds`),
-preserving original names, units, values and future fields. #1458 will populate
-that shape after rebasing; this PR does not duplicate its timing extraction.
+preserving original names, units, values and future fields. Native tool-result details
+and assistant text/reasoning metadata use that same shape.
 Unknown uses `payload: {raw: <original JSON>}` and retains the native type and role
 when supplied. Future fields and full structured tool arguments survive; unknown
 blocks have a readable JSON view. A `source_record` block with the `internal`
@@ -64,8 +64,9 @@ direct owner reads. Fixture provenance is in `crates/st3/fixtures/native-records
 | Claude `progress`, `file-history-snapshot`, `file-history-delta`, `queue-operation`, `permission-mode`, `mode`, `atis-latch`, `last-prompt`, `ai-title`, `custom-title`, `cost-state`, `agent-name`, `tag`, `pr-link`, `bridge-session`, `fork-context-ref` | Retain raw; no demonstrated generic harness-hidden rule. |
 | Claude attachments other than queued commands and system records without text | Retain raw; queued prompts and textual notices keep their known display shape. |
 | Pi/OMP `session` | Omit the native session setup header. |
+| OMP `reset_boundary`, `credential_pin`, `title` | Retain raw plus typed status views; reset/title are quiet events, credential pins are internal bookkeeping hidden by default. |
 | Pi/OMP `custom_message` with explicit `display: false` | Omit because the native extension explicitly marks it hidden from its terminal. |
-| Pi/OMP `custom`, `label`, `session_info`, `credential_pin`, `title`, model/thinking changes and summary records without text | Retain raw; summaries with text remain readable native notes. |
+| Pi/OMP `custom`, `label`, `session_info`, model/thinking changes and summary records without text | Retain raw; summaries with text remain readable native notes. |
 | OpenCode `snapshot` | Retain raw; visibility is not established across releases. |
 | Claude documents | Retain the complete document payload, with a readable document fallback. |
 | Malformed/partial/unknown-encoding input | Retain exact bytes as a `raw_text` block; never silently skip a tail line. |
@@ -82,6 +83,144 @@ Start in `crates/st3/src/external_sessions.rs`; use the same normalizer for owne
 side-input updates, reads and follow. Remove deliberate visible-reasoning exclusions, image
 withholding from the data. A 512-character unknown excerpt is a UI preference only. No sanitized-text payload class
 or second durable transcript is needed. Native transcript formats remain authoritative.
+
+## Typed views and conversation header
+
+Everything here is additive and optional, on top of the #1574 block contract, so an
+old client ignores the new fields and keeps the existing text fallback. A block MAY
+carry `view: {type: <string>, ...}`; `type` is an open discriminator, and the client-v0
+schema encodes one closed definition per known `view.type` (`TimelineView*` in
+`docs/st3/client-v0/schemas/client-v0.schema.json`) plus a `TimelineView` fallback
+branch that accepts any other type string. A renderer that does not know a type
+renders the block as it does a block without a view. `view` holds parsed fields only;
+the full native arguments or output stay in `payload`, exactly as in #1574. Raw JSON
+stays available for every record, `view` is computed per record and deterministic,
+and the fold caches it with the entry. Generated Rust, Swift and TypeScript clients
+carry `view` and the header below as loose JSON values (`Option<Value>`, `JSONValue?`,
+`unknown`), so no client decoder gains closed cases.
+
+`conversation_blocks::prepare_one` bounds both `view` and `metadata` after enriching
+child-session links, for full reads and native keyset pages alike. Their outer object
+and keys (including `view.type`) survive; long strings carry the visible size-limit
+marker, and oversized nested objects/arrays may become marked JSON-preview strings.
+Generated clients retain these as loose JSON, and both conversation renderers check
+string/array/object shapes rather than assuming a closed view. A single clipped open
+subtree uses a continuation to `/body/blocks/{index}/view` or `/metadata`; if another
+remainder already needs that block's continuation, it instead points to the whole
+original `/body` so owner fetch recovers every exact subtree. Clients inspect the
+returned JSON accordingly. The final entry-size guard still runs after all display
+bounding and can replace an over-budget entry with a fetchable error notice.
+
+On `tool_call` blocks, parsed from the native arguments (OMP field `i` becomes
+`intent`; every tool_call view also has `tool`, the native tool name):
+
+| view.type | fields | OMP source |
+| --- | --- | --- |
+| `bash` | command, cwd?, timeout_s?, env_keys?: string[], background: bool | tool `bash` {command,cwd,timeout,env,async} |
+| `edit` | path?, ops: number, input_bytes | tool `edit` {input} (hashline patch; path = first `[PATH#TAG]` header) |
+| `write` | path, bytes, content?, line_count? | tool `write` {path,content}; line count counts native written lines |
+| `read` | path, range?: string | tool `read` {path} (suffix after `:` = range) |
+| `search` | engine: "grep"\|"glob"\|"web", pattern?, path?, query?, case?, hidden?, gitignore?, limit?, skip? | tools `grep`, `glob`, `web_search`; flags preserve explicit false/zero values |
+| `todo` | op, items?: [{content, status}], phase?, task? | tool `todo` |
+| `ask` | questions: [{id, question, options: [{label, description?}], multi: bool, recommended?: number}] | tool `ask`; every alternative survives the selected answer |
+| `task` | context?, tasks: [{name?, agent?, task}] | tool `task`; context carries the parent context/contract |
+| `hub` | op, name?, target?, timeout_s?, message? | tool `hub`; send body remains beside its receipt |
+| `eval` | language, title?, code_bytes, code?, timeout_s?, reset? | tool `eval`; preserve explicit reset=false and timeout=0 |
+| `generic` | name | any other tool |
+
+On `tool_output` blocks, parsed from the OMP toolResult `details`; all of these also
+have `tool`, `call_id` and `is_error`:
+
+| view.type | fields |
+| --- | --- |
+| `bash` | exit_code?, wall_ms?, timeout_s?, timed_out?: bool |
+| `search` | engine, match_count?, file_count?, truncated?, file_limit_reached?, per_file_limit_reached?, warning?; counts come from native matchCount/fileCount, never inferred from bounded rows |
+| `edit` | path?, first_changed_line?, diff?: string (unified diff as given) |
+| `todo` | phases: [{name, items: [{content, status}]}] |
+| `ask` | answers: [{question, selected: string[], custom?: string, note?: string}] |
+| `task` | async: bool, total_ms?, agents: [SubagentSummary] |
+| `hub` | op, timed_out?: bool, jobs?: [JobSummary], state? |
+| `generic` | is_error: bool, wall_ms? |
+
+`SubagentSummary` = `{id, name?, agent?, status, task?, duration_ms?, tokens?, cost_usd?,
+requests?, tool_count?, conversation?: {session_id}}`. `name` preserves the OMP name
+(native `name`, otherwise `id`); `agent` is its type. `task` preserves the full native
+`assignment`, otherwise `task`. Both clients retain invocation rows when the result
+arrives and draw all assignment lines only on the invocation's expansion. Subagent
+result cards show status, usage and the child-open link, without repeating the
+assignment. The child-open row names the agent while routing to its actual session
+id. The owner fills
+`conversation.session_id` only when the child transcript exists at
+`<parent transcript without .jsonl>/<id>.jsonl` and is readable; that session id opens
+through the normal conversation routes (same fold, paging and refs), which is how a
+subagent card links to the child transcript as its own conversation.
+`JobSummary` = `{id, name?, type?, state, exit_code?, started_at?, ended_at?,
+duration_ms?, output_bytes?}`.
+
+Extension and bookkeeping records become blocks as follows; anything not listed keeps
+its #1574 shape (other `custom_message` records with display != false stay `text`):
+
+| OMP record | block kind | view |
+| --- | --- | --- |
+| custom_message `irc:incoming` | `irc` (new kind) | `{type:"irc", from, message, reply_to?, message_id}` |
+| custom_message `launch-completion` | `job` | `{type:"job", jobs: [JobSummary]}` (from details.daemons) |
+| custom_message `async-result` | `job` | `{type:"job", jobs: [JobSummary]}` (from details.jobs) |
+| custom_message `skill-prompt` | `status` | `{type:"skill", name, path?, args?}` |
+| `compaction` / `branch_summary` | `status` | `{type:"compaction", method?, tokens_before?, tokens_after?, short_summary?, summary?}`; first lines collapsed, full summary on expansion |
+| `model_change` | `status` | `{type:"model_change", model, role?, fallback?: bool}` |
+| `thinking_level_change` | `status` | `{type:"thinking_level", level, configured?}` |
+| `title_change` / `title` | `status` | `{type:"title", title, previous?, source?}` (`previous` only on title changes) |
+| `reset_boundary` | `status` | `{type:"reset_boundary"}`; quiet event `session reset` |
+| `credential_pin` | `status`, visibility `internal` | `{type:"credential_pin", provider}`; hidden by default; hash remains only in raw payload/source record |
+| custom `session_exit` | `status` | `{type:"session_exit", kind, reason}` |
+| custom `tool_execution_start` | `status`, visibility `internal` | `{type:"tool_start", call_id, tool, started_at}`; renderers attach it to the call row and do not draw it alone |
+| assistant message metadata | on its `text`/`reasoning` blocks | `metadata.model`, `metadata.provider`, `metadata.usage` {input, output, cache_read, cache_write, total, cost_usd}, `metadata.context_tokens`, `metadata.stop_reason`, `metadata.ttft_ms`, `metadata.duration_ms`; no view |
+| assistant error message | `error` | `{type:"assistant_error", status, presentation, is_error, label, message, stop_reason?, error_id?, api?, provider?, model?, retry?}` |
+
+Assistant errors come from the assistant session message, not a synthesized daemon
+failure. Persisted `retry` markers carry `{kind,status,attempt,recovery,note,
+recovered_at?,superseded_by?}`. Status is `failed`, `recovered`, or `superseded`;
+presentation is `full`, `compact-recovered`, or `none`, matching OMP's persisted
+outcome. Original error text remains available on expansion after recovery.
+Superseded errors are retained in source data but not drawn. No in-progress retry
+state is invented when the session record does not contain it.
+
+Written content, assignment/context, eval code and compaction summaries use the
+existing 8 KiB display bound and authenticated continuation. Typed view-only refs
+are reattached to their original blocks and passed through the same adapter on
+expansion; metadata and unknown subtrees keep a raw JSON fallback. The written
+line count describes the complete source, not the bounded preview.
+Simplified rendering and history auto-fill share the same bundling predicate:
+write, compaction and assistant-error preview cards remain separate rather than
+being counted as one ordinary-tool run.
+
+
+Timeline pages and delta responses (when `conversation-blocks.v1` is negotiated) MAY
+carry a `header` object. Each field is `{value, source: register|transcript, as_of}`:
+`model` (model id), `context` ({tokens, window}), `cost` ({usd}, with `window: true`
+when the fold window is truncated), `todos`, `jobs` ([JobSummary]), `subagents`
+([SubagentSummary]), `ask` (the last ask call without a matching result, or null) and
+`working` (bool). `source` is `register` for the live latest-wins value from #1583 or
+`transcript` for a value derived from the fold window; a field is absent when neither
+source has it, `working` comes only from the register, and the register wins over the
+transcript once it is live. The register adapter is one function that returns `None`
+until #1583 lands. Transcript derivation: model = last assistant `model`; context =
+last `contextSnapshot.promptTokens`; cost = sum of `usage.cost.total` in the window;
+todos = last todo tool_output view, else the last todo call; jobs = latest state per
+job id from job blocks and hub outputs, keeping non-terminal ones; subagents = task
+outputs whose status is not terminal; ask = the last ask call without a matching
+result. `docs/st3/client-v0/fixtures/timeline-views.json` fixes the wire shape with a
+synthetic page that carries views, an `irc` block and a full header.
+
+The Rust and TypeScript renderers show every populated header field in the same fixed
+order. The most common source appears once at the end (`· transcript · 2d ago`);
+ties use the first source in field order. Only fields from another source get their own
+marker (`cost $0.02 [register · 30m ago]`). The shared age uses the oldest field from
+that source, so compaction cannot hide stale data. Phone headers wrap without a line
+limit. A subagent's open-child link is an independent accessible control, outside the
+card's expand/collapse control; opening it pushes a conversation so Back restores
+the parent. Todo statuses remain distinct: `[x]` completed, `[ ]` pending, `[~]`
+in progress, `[!]` blocked and `[/]` abandoned. Only `completed` counts as done.
 
 ## UI filters and show-everything mode
 

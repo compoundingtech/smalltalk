@@ -1,0 +1,137 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "details",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 4
+  },
+  "state": {
+    "missions": [],
+    "work": []
+  },
+  "timeline": [
+    {
+      "_tag": "changes",
+      "at_ms": 5000,
+      "removes": [],
+      "store": 6,
+      "upserts": [
+        {
+          "active_runs": 1,
+          "id": "mission/example/sprout/first-smoke",
+          "kind": "mission",
+          "mission_revision": "sha256:sprout-mission-1",
+          "revision": "mr-1",
+          "run_generations": {
+            "mission-run/example/sprout/first-smoke/1": "run-generation/example/sprout/first-smoke/1/g1"
+          },
+          "runs": [
+            "mission-run/example/sprout/first-smoke/1"
+          ],
+          "state": "running",
+          "title": "Prove the first run works",
+          "total_runs": 1,
+          "updated_at": "2030-01-01T12:00:05.000Z"
+        },
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-sprout-builder-260:4",
+          "claimant": "agent/example/sprout/builder",
+          "constraints": [
+            "Keep the public API stable until the docs land"
+          ],
+          "definition_id": "def-step-1",
+          "generation_id": "run-generation/example/sprout/first-smoke/1/g1",
+          "goals": [
+            "pnpm test smoke exits successfully"
+          ],
+          "id": "work/example/sprout/first-smoke/1/step-1",
+          "kind": "work",
+          "mission_id": "mission/example/sprout/first-smoke",
+          "mission_run_id": "mission-run/example/sprout/first-smoke/1",
+          "path": "step-1",
+          "readiness_epoch": 1,
+          "revision": "w-1",
+          "state": "claimed",
+          "title": "Run the project smoke check",
+          "updated_at": "2030-01-01T12:00:05.000Z"
+        }
+      ]
+    },
+    {
+      "_tag": "changes",
+      "at_ms": 16000,
+      "removes": [],
+      "store": 19,
+      "upserts": [
+        {
+          "active_runs": 0,
+          "id": "mission/example/sprout/first-smoke",
+          "kind": "mission",
+          "mission_revision": "sha256:sprout-mission-1",
+          "revision": "mr-1",
+          "run_generations": {
+            "mission-run/example/sprout/first-smoke/1": "run-generation/example/sprout/first-smoke/1/g1"
+          },
+          "runs": [
+            "mission-run/example/sprout/first-smoke/1"
+          ],
+          "state": "completed",
+          "title": "Prove the first run works",
+          "total_runs": 1,
+          "updated_at": "2030-01-01T12:00:16.000Z"
+        },
+        {
+          "attempt": 1,
+          "blocked_reason": null,
+          "blockers": [],
+          "claim_incarnation": "rt-sprout-builder-260:4",
+          "claimant": "agent/example/sprout/builder",
+          "constraints": [
+            "Keep the public API stable until the docs land"
+          ],
+          "definition_id": "def-step-1",
+          "generation_id": "run-generation/example/sprout/first-smoke/1/g1",
+          "goals": [
+            "pnpm test smoke exits successfully"
+          ],
+          "id": "work/example/sprout/first-smoke/1/step-1",
+          "kind": "work",
+          "mission_id": "mission/example/sprout/first-smoke",
+          "mission_run_id": "mission-run/example/sprout/first-smoke/1",
+          "path": "step-1",
+          "readiness_epoch": 1,
+          "revision": "w-1",
+          "state": "completed",
+          "title": "Run the project smoke check",
+          "updated_at": "2030-01-01T12:00:16.000Z"
+        }
+      ]
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/upserts/1/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/1/upserts/1/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "first-run-onboarding"
+}

@@ -565,13 +565,9 @@ mission "harvest" state="ready" {{
                 .clone(),
         );
         fs::write(&child_file, source).unwrap();
-        node.st_ok(&[
-            "missions",
-            "publish",
-            child_file.to_str().unwrap(),
-            "--as",
-            PERSON,
-        ]);
+        node.st_ok(&["apply", child_file.to_str().unwrap(),
+        "--as",
+        PERSON,]);
     }
     let next = chrono::Utc::now() + chrono::Duration::seconds(30);
     let anchor =
@@ -598,13 +594,9 @@ mission "orchard/weekly" state="ready" {{
         )
     };
     fs::write(&parent_file, parent(&revisions[0])).unwrap();
-    node.st_ok(&[
-        "missions",
-        "publish",
-        parent_file.to_str().unwrap(),
-        "--as",
-        PERSON,
-    ]);
+    node.st_ok(&["apply", parent_file.to_str().unwrap(),
+    "--as",
+    PERSON,]);
     node.st_ok(&[
         "missions",
         "start",
@@ -625,13 +617,9 @@ mission "orchard/weekly" state="ready" {{
 
     for index in 0..4 {
         fs::write(&parent_file, parent(&revisions[index % 2])).unwrap();
-        node.st_ok(&[
-            "missions",
-            "publish",
-            parent_file.to_str().unwrap(),
-            "--as",
-            PERSON,
-        ]);
+        node.st_ok(&["apply", parent_file.to_str().unwrap(),
+        "--as",
+        PERSON,]);
         if index > 0 {
             node.st_ok(&[
                 "work",
@@ -746,7 +734,7 @@ agent "move/worker" {
 "#,
     )
     .unwrap();
-    a.st_ok(&["agents", "apply", source.to_str().unwrap(), "--as", PERSON]);
+    a.st_ok(&["apply", "--no-gate-check", source.to_str().unwrap(), "--as", PERSON]);
     let status =
         |node: &Node| node.st_json(&["subject", "show", SUBJECT])["status"]["subjects"][0].clone();
     wait_until("amber runs the seat on both replicas", 30, || async {
@@ -1325,13 +1313,9 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence_
          step \"only\" { agentless }\n}\n",
     )
     .unwrap();
-    a.st_ok(&[
-        "missions",
-        "publish",
-        mission.to_str().unwrap(),
-        "--as",
-        PERSON,
-    ]);
+    a.st_ok(&["apply", mission.to_str().unwrap(),
+    "--as",
+    PERSON,]);
     wait_until(
         "both members hold the mission and call the pair in sync",
         90,
@@ -4018,7 +4002,7 @@ async fn action_coverage_github_watch_cli_uses_private_http_and_survives_restart
     node.start().await;
     let file = node.root.join("seat.kdl");
     fs::write(&file, format!("version 2\nagent \"example/watch\" {{ host \"fixture-watch\"; workspace {:?}; command \"true\"; restart \"never\" }}\n", node.root)).unwrap();
-    node.st_ok(&["agents", "apply", file.to_str().unwrap(), "--as", PERSON]);
+    node.st_ok(&["apply", "--no-gate-check", file.to_str().unwrap(), "--as", PERSON]);
     let cli = |args: &[&str]| -> Value {
         let output = node.command(args).env("ST_AGENT", "agent/example/watch").output().unwrap();
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stderr), node.logs());
@@ -4185,13 +4169,9 @@ async fn suspended_seat_moves_between_two_daemons_with_its_workspace_and_convers
     let seat = "agent/canary/portable";
     let declaration = root.path().join("seat.kdl");
     fs::write(&declaration, format!("version 2\nagent \"canary/portable\" {{ host \"fixture-move-amber\"; workspace \"{}\"; harness \"omp\" {{}} }}", workspace.display())).unwrap();
-    amber.st_ok(&[
-        "agents",
-        "apply",
-        declaration.to_str().unwrap(),
-        "--as",
-        PERSON,
-    ]);
+    amber.st_ok(&["apply", "--no-gate-check", declaration.to_str().unwrap(),
+    "--as",
+    PERSON,]);
     let receipts = workspace.join("receipts-agent-canary-portable.jsonl");
     wait_until("source native session becomes idle", 90, || async {
         amber.st_json(&["agents", "show", seat])["value"]["harness_state"] == "idle"

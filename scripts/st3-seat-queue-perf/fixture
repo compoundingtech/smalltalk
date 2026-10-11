@@ -41,7 +41,7 @@ seat() {
       "$i" "$root/workspace"
   done
 } >"$root/kdl/seats.kdl"
-"$st3" agents apply "$root/kdl/seats.kdl" --as "$operator" >/dev/null
+"$st3" apply "$root/kdl/seats.kdl" --no-gate-check --as "$operator" >/dev/null
 
 # A direct run is ready for its seat. A relay run waits on the next seat first,
 # so every seat has both ready runs and waiting runs to pass over.
@@ -73,8 +73,8 @@ mission "perf/relay-$(printf %02d "$i")" state="ready" {
   }
 }
 KDL
-  "$st3" missions publish "$root/kdl/direct-$i.kdl" --as "$operator" >/dev/null
-  "$st3" missions publish "$root/kdl/relay-$i.kdl" --as "$operator" >/dev/null
+  "$st3" apply "$root/kdl/direct-$i.kdl" --as "$operator" >/dev/null
+  "$st3" apply "$root/kdl/relay-$i.kdl" --as "$operator" >/dev/null
 done
 
 for round in $(seq 1 "$((direct_runs > relay_runs ? direct_runs : relay_runs))"); do

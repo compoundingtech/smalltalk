@@ -1,0 +1,402 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "terminal",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 5
+  },
+  "state": {
+    "terminals": []
+  },
+  "timeline": [
+    {
+      "_tag": "terminal-create",
+      "at_ms": 8000,
+      "record": {
+        "cast": {
+          "events": [
+            [
+              0,
+              "o",
+              "\u001b[32mharbor\u001b[0m:builder $ pnpm test cache && git commit\r\n"
+            ],
+            [
+              1.066,
+              "o",
+              "\u001b[32m12 cache tests passed; 0 failures\u001b[0m\r\n"
+            ],
+            [
+              1.962,
+              "o",
+              "[cache-policy c0ffee1] Combine cache TTL and stale reads\r\n"
+            ],
+            [
+              2.012,
+              "o",
+              "\u001b[32mharbor\u001b[0m:builder $ "
+            ]
+          ],
+          "header": {
+            "height": 12,
+            "title": "pnpm test cache && git commit",
+            "version": 2,
+            "width": 100
+          },
+          "started_at_ms": 8000
+        },
+        "incarnation": "pty-65:1",
+        "owner": "agent/example/harbor/builder",
+        "runtime": {
+          "desired_revision": "desired-1",
+          "id": "runtime/example-harbor-builder-shell",
+          "incarnation_id": "pty-65:1",
+          "kind": "runtime",
+          "owner_host_id": "host/lantern",
+          "owner_id": "agent/example/harbor/builder",
+          "revision": "rt-shell-1",
+          "runtime_id": "example-harbor-builder-shell",
+          "runtime_kind": "terminal",
+          "state": "running",
+          "terminal_id": "terminal/example-harbor-builder",
+          "updated_at": "2030-01-01T12:00:08.000Z"
+        },
+        "screens": [],
+        "terminal": "terminal/example-harbor-builder"
+      },
+      "store": 13
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 8000,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 1,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 6,
+                "fg": 2,
+                "text": "harbor"
+              },
+              {
+                "cells": 40,
+                "text": ":builder $ pnpm test cache && git commit"
+              }
+            ],
+            "text": "harbor:builder $ pnpm test cache && git commit",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 1,
+        "revision": "cast-1",
+        "rows": 12,
+        "runtime_incarnation": "pty-65:1",
+        "terminal_id": "terminal/example-harbor-builder",
+        "title": "pnpm test cache && git commit",
+        "truncated": false
+      },
+      "store": 13,
+      "terminal": "terminal/example-harbor-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 9066,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 2,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 6,
+                "fg": 2,
+                "text": "harbor"
+              },
+              {
+                "cells": 40,
+                "text": ":builder $ pnpm test cache && git commit"
+              }
+            ],
+            "text": "harbor:builder $ pnpm test cache && git commit",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 33,
+                "fg": 2,
+                "text": "12 cache tests passed; 0 failures"
+              }
+            ],
+            "text": "12 cache tests passed; 0 failures",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 2,
+        "revision": "cast-2",
+        "rows": 12,
+        "runtime_incarnation": "pty-65:1",
+        "terminal_id": "terminal/example-harbor-builder",
+        "title": "pnpm test cache && git commit",
+        "truncated": false
+      },
+      "store": 13,
+      "terminal": "terminal/example-harbor-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 9962,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 0,
+          "row": 3,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 6,
+                "fg": 2,
+                "text": "harbor"
+              },
+              {
+                "cells": 40,
+                "text": ":builder $ pnpm test cache && git commit"
+              }
+            ],
+            "text": "harbor:builder $ pnpm test cache && git commit",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 33,
+                "fg": 2,
+                "text": "12 cache tests passed; 0 failures"
+              }
+            ],
+            "text": "12 cache tests passed; 0 failures",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "[cache-policy c0ffee1] Combine cache TTL and stale reads"
+              }
+            ],
+            "text": "[cache-policy c0ffee1] Combine cache TTL and stale reads",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [],
+            "text": "",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 3,
+        "revision": "cast-3",
+        "rows": 12,
+        "runtime_incarnation": "pty-65:1",
+        "terminal_id": "terminal/example-harbor-builder",
+        "title": "pnpm test cache && git commit",
+        "truncated": false
+      },
+      "store": 13,
+      "terminal": "terminal/example-harbor-builder"
+    },
+    {
+      "_tag": "screen",
+      "at_ms": 10012,
+      "screen": {
+        "columns": 100,
+        "cursor": {
+          "blinking": true,
+          "column": 17,
+          "row": 3,
+          "style": "block",
+          "visible": true
+        },
+        "kind": "terminal-screen",
+        "lines": [
+          {
+            "redacted": false,
+            "row": 0,
+            "runs": [
+              {
+                "cells": 6,
+                "fg": 2,
+                "text": "harbor"
+              },
+              {
+                "cells": 40,
+                "text": ":builder $ pnpm test cache && git commit"
+              }
+            ],
+            "text": "harbor:builder $ pnpm test cache && git commit",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 1,
+            "runs": [
+              {
+                "cells": 33,
+                "fg": 2,
+                "text": "12 cache tests passed; 0 failures"
+              }
+            ],
+            "text": "12 cache tests passed; 0 failures",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 2,
+            "runs": [
+              {
+                "cells": 56,
+                "text": "[cache-policy c0ffee1] Combine cache TTL and stale reads"
+              }
+            ],
+            "text": "[cache-policy c0ffee1] Combine cache TTL and stale reads",
+            "truncated": false,
+            "wrapped": false
+          },
+          {
+            "redacted": false,
+            "row": 3,
+            "runs": [
+              {
+                "cells": 6,
+                "fg": 2,
+                "text": "harbor"
+              },
+              {
+                "cells": 11,
+                "text": ":builder $ "
+              }
+            ],
+            "text": "harbor:builder $ ",
+            "truncated": false,
+            "wrapped": false
+          }
+        ],
+        "modes": {
+          "alternate_screen": false,
+          "application_cursor": false,
+          "application_keypad": false,
+          "bracketed_paste": false,
+          "focus_events": false,
+          "mouse_encoding": "default",
+          "mouse_tracking": "none"
+        },
+        "next_sequence": 4,
+        "revision": "cast-4",
+        "rows": 12,
+        "runtime_incarnation": "pty-65:1",
+        "terminal_id": "terminal/example-harbor-builder",
+        "title": "pnpm test cache && git commit",
+        "truncated": false
+      },
+      "store": 14,
+      "terminal": "terminal/example-harbor-builder"
+    }
+  ],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/timeline/0/record/runtime/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "merge-conflict-standoff"
+}

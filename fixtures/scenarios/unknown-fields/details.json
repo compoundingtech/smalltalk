@@ -1,0 +1,73 @@
+{
+  "anchor": "2030-01-01T12:00:00.000Z",
+  "decode": "strict",
+  "format": "st3.scenario.slice.v1",
+  "loading": false,
+  "slice": "details",
+  "source": {
+    "_tag": "synthetic",
+    "seed": 19
+  },
+  "state": {
+    "missions": [
+      {
+        "active_runs": 1,
+        "id": "mission/example/atlas/forward-compatibility",
+        "kind": "mission",
+        "mission_revision": "sha256:atlas-mission-1",
+        "revision": "mr-1",
+        "run_generations": {
+          "mission-run/example/atlas/forward-compatibility/1": "run-generation/example/atlas/forward-compatibility/1/g1"
+        },
+        "runs": [
+          "mission-run/example/atlas/forward-compatibility/1"
+        ],
+        "state": "running",
+        "title": "Check forward-compatible client reads",
+        "total_runs": 1,
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      }
+    ],
+    "work": [
+      {
+        "attempt": 1,
+        "blocked_reason": null,
+        "blockers": [],
+        "claim_incarnation": "rt-atlas-builder-645:2",
+        "claimant": "agent/example/atlas/builder",
+        "constraints": [
+          "Keep the public API stable until the docs land"
+        ],
+        "definition_id": "def-step-1",
+        "generation_id": "run-generation/example/atlas/forward-compatibility/1/g1",
+        "goals": [
+          "Unknown values survive HTTP and socket replay",
+          "Only declared contaminants fail strict decoding"
+        ],
+        "id": "work/example/atlas/forward-compatibility/1/step-1",
+        "kind": "work",
+        "mission_id": "mission/example/atlas/forward-compatibility",
+        "mission_run_id": "mission-run/example/atlas/forward-compatibility/1",
+        "path": "step-1",
+        "readiness_epoch": 1,
+        "revision": "w-1",
+        "state": "claimed",
+        "title": "Preserve future daemon observations",
+        "updated_at": "2030-01-01T11:58:00.000Z"
+      }
+    ]
+  },
+  "timeline": [],
+  "times": [
+    {
+      "codec": "timestamp",
+      "pointer": "/state/missions/0/updated_at"
+    },
+    {
+      "codec": "timestamp",
+      "pointer": "/state/work/0/updated_at"
+    }
+  ],
+  "variant": "default",
+  "world": "unknown-fields"
+}

@@ -1,0 +1,50 @@
+{
+  "mission-run/synthetic-138/1": {
+    "revision": "rev/synthetic-138-1",
+    "steps": {
+      "assemble": {
+        "id": "assemble",
+        "path": "assemble",
+        "dependencies": [],
+        "goals": [
+          "Produce four synthetic rows"
+        ]
+      }
+    },
+    "display_order": [
+      "assemble"
+    ]
+  },
+  "mission-run/synthetic-138/2": {
+    "revision": "rev/synthetic-138-2",
+    "steps": {
+      "assemble": {
+        "id": "assemble",
+        "path": "assemble",
+        "dependencies": [],
+        "goals": [
+          "Produce four synthetic rows"
+        ]
+      }
+    },
+    "display_order": [
+      "assemble"
+    ]
+  },
+  "mission-run/synthetic-138/3": {
+    "revision": "rev/synthetic-138-3",
+    "steps": {
+      "assemble": {
+        "id": "assemble",
+        "path": "assemble",
+        "dependencies": [],
+        "goals": [
+          "Produce four synthetic rows"
+        ]
+      }
+    },
+    "display_order": [
+      "assemble"
+    ]
+  }
+}

@@ -1,0 +1,70 @@
+/* Terminal-owned faces only; the shared UI/editor monospace stack belongs to the UI kit. */
+
+/*
+ * Terminal-owned JetBrains Mono v2.304, unchanged upstream WOFF2 assets.
+ * https://github.com/JetBrains/JetBrainsMono/tree/v2.304/fonts/webfonts
+ * SIL OFL 1.1 in assets/JetBrainsMono-OFL.txt. Omp's glyph bundle uses the same base face.
+ * Exclude PUA and emoji: Nerd Font Mono owns icons; platform colour emoji owns presentation.
+ * DomTerminal waits for these faces before painting or measuring the first cell grid.
+ */
+@font-face {
+  font-family: 'Wf Terminal Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/JetBrainsMono-Regular.woff2') format('woff2');
+  unicode-range: U+0000-23FF, U+2500-25FF, U+27C0-2BFF, U+2C00-D7FF, U+F900-FEFF;
+}
+
+@font-face {
+  font-family: 'Wf Terminal Mono';
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url('./assets/JetBrainsMono-Bold.woff2') format('woff2');
+  unicode-range: U+0000-23FF, U+2500-25FF, U+27C0-2BFF, U+2C00-D7FF, U+F900-FEFF;
+}
+
+@font-face {
+  font-family: 'Wf Terminal Mono';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/JetBrainsMono-Italic.woff2') format('woff2');
+  unicode-range: U+0000-23FF, U+2500-25FF, U+27C0-2BFF, U+2C00-D7FF, U+F900-FEFF;
+}
+
+@font-face {
+  font-family: 'Wf Terminal Mono';
+  font-style: italic;
+  font-weight: 700;
+  font-display: swap;
+  src: url('./assets/JetBrainsMono-BoldItalic.woff2') format('woff2');
+  unicode-range: U+0000-23FF, U+2500-25FF, U+27C0-2BFF, U+2C00-D7FF, U+F900-FEFF;
+}
+
+/*
+ * Nerd Fonts v3.5.1 JetBrainsMonoNerdFontMono-Regular.ttf, unchanged upstream asset.
+ * https://github.com/ryanoasis/nerd-fonts/releases/tag/v3.5.1
+ * SIL OFL in assets/JetBrainsMono-OFL.txt. This is omp's cell-fitted Mono glyph source:
+ * the symbols-only face advances 1em, not the base face's 0.6em, clipping full-width icons.
+ * Restrict to PUA (including supplementary icons); the base face retains text and box drawing.
+ */
+@font-face {
+  font-family: 'Wf Terminal Nerd Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('./assets/JetBrainsMonoNerdFontMono-Regular.ttf') format('truetype');
+  unicode-range: U+E000-F8FF, U+F0000-FFFFD, U+100000-10FFFD;
+}
+
+::highlight(wf-terminal-find) {
+  color: var(--ds-gray-1000);
+  background-color: var(--ds-amber-300);
+}
+
+::highlight(wf-terminal-find-active) {
+  color: var(--ds-background-100);
+  background-color: var(--ds-amber-900);
+}

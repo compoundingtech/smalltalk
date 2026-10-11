@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "fractal-web reports committed transcript paint and keeps recent conversation panes mounted so switching back only reveals them. Conversation reading positions belong to the surface and survive switches and pane eviction while the seat remains in the roster; reloading the surface starts following live. Narrow on-demand kit imports keep workbench code outside the conversation graph, and the shell acquires route follow interest before pane code loads",
+  "replay": {
+    "status": "none",
+    "detail": "Client-only change; no runtime replay change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No database schema change."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Uses the existing follow visibility; hidden panes release visible demand and retained panes live only in memory. A memory-only viewport store sits above the three-pane DOM cache, retains reading positions for up to 32 recently visited roster seats, prunes departed seats, and is disposed with the surface. Stable conversation viewport keys restore detached positions after eviction. Own sends use the retained lastSendId scroll command to resume following; no storage or wire-format change."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No service interruption introduced."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No deployed installation action required; the app is not deployed by this change."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No database or runtime recovery change."
+  }
+}

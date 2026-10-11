@@ -98,10 +98,14 @@ pub fn status(store: &Store, subject: &str) -> Result<Option<serde_json::Value>>
         return Ok(None);
     };
     if selection.manual && hold_render(store, &selection.desired)? {
+        let blocking: Vec<String> = selection.desired.member.as_ref()
+            .and_then(|member| crate::native_resume::rollout_support(member).err())
+            .map(|refusal| vec![refusal.reason])
+            .unwrap_or_default();
         return Ok(Some(
             json!({"phase":"pending", "mode":"manual", "publication":"published",
             "status":"published, rollout pending (manual)", "set":selection.set,
-            "receipt":selection.receipt, "desired_token":selection.desired_token}),
+            "receipt":selection.receipt, "desired_token":selection.desired_token, "blocking":blocking}),
         ));
     }
     operation
@@ -189,6 +193,34 @@ pub fn hold_render(store: &Store, desired: &DesiredSubject) -> Result<bool> {
     }))
 }
 
+/// The incumbent launch while a manual publication waits for an explicit cutover.
+/// Suspension and resume follow this launch, not the unapplied declaration.
+pub(crate) fn pending_manual_launch(
+    store: &Store,
+    subject: &str,
+) -> Result<Option<(String, MemberSpec)>> {
+    let Some(selected) = store.rollout_selection(subject)? else {
+        return Ok(None);
+    };
+    if !selected.manual || selected.desired.kind != "agent"
+        || store.rollout(subject)?.is_some_and(|o| o.phase != "superseded")
+    {
+        return Ok(None);
+    }
+    let Some(actual) = store.latest_actual_value(subject)? else {
+        return Ok(None);
+    };
+    let Some(incarnation) = actual["incarnation_id"].as_str() else {
+        return Ok(None);
+    };
+    let Some((token, old)) = launched_member(store, subject, incarnation)? else {
+        return Ok(None);
+    };
+    Ok(selected.desired.member.as_ref()
+        .filter(|new| !new.launch_changes(&old).is_empty())
+        .map(|_| (token, old)))
+}
+
 pub fn launched_member(
     store: &Store,
     subject: &str,
@@ -228,6 +260,7 @@ pub fn blockers(store: &Store, subject: &str, operation: &Operation) -> Result<V
     }
     if store.messages(Some(subject), false)?.iter().any(|message| {
         matches!(message.status.as_str(), "sent" | "staged" | "delivered")
+            && !crate::silent::waits_for_turn(message)
             && store.rollout_message_allowed(message).unwrap_or(true)
     }) {
         blockers.push("pending-delivery".into());

@@ -2,7 +2,7 @@
 
 The inventory covers every offered CLI command, every typed client action, every stui daemon effect, and the palette and local controls. It distinguishes real CLI/Unix transport tests, the live stui adapter, local reducer tests, and shared implementations. A test reference describes its actual layer; a shared implementation test alone is not a claim that the entire interactive UI was driven.
 
-`action-coverage.json` is the machine-readable source. Tests compare its 222 CLI rows with Clap's offered command tree, its 55 typed actions with the generated client contract and real dispatch builders, and its 19 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
+`action-coverage.json` is the machine-readable source. Tests compare its 223 CLI rows with Clap's offered command tree, its 55 typed actions with the generated client contract and real dispatch builders, and its 18 stui effects and 13 palette actions with their declarations. Every row must reference an existing test. Hidden driver/replication worker commands and help aliases are internal or alternate spellings, rather than additional person or agent actions.
 
 ## Restart and stale-state model
 
@@ -309,6 +309,7 @@ edits and removes retired subjects without changing unfiltered reads.
 
 | Effect | Verification | Test evidence |
 | --- | --- | --- |
+| `LoadContent` | content-control reducer and viewport queue; chunk assembly/identity checks; real owner HTTP chunk transport without durable writes | [`content_controls_emit_load_effects_once_and_release_on_collapse_or_hide`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/mod.rs); [`expand_all_loads_visible_clipped_blocks_sequentially_and_collapse_releases`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/mod.rs); [`automatic_images_use_visible_image_lines_graphics_and_one_read_at_a_time`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/mod.rs); [`chunks_assemble_the_entire_original_json_from_zero`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/content.rs); [`chunks_reject_changed_identity_and_non_progressing_offsets`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/content.rs); [`truncated_tool_output_http_chunks_return_complete_native_body_without_writes`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/src/api/client_v0/conversation_blocks.rs); [`http_owner_chunks_negotiate_bound_bytes_and_visibly_invalidate_without_writes`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/src/api/client_v0/conversation_blocks.rs) |
 | `OpenImage` | UI reducer and corresponding real daemon action; local effects have no graph fence | [`an_image_read_from_st_is_kept_once_by_its_hash`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/attach.rs); [`messages_survive_stale_fences_and_restarts`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
 | `Attention` | live UI adapter plus daemon restart | [`approving_a_gate_asked_again_acts_once_on_its_current_card`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/main.rs); [`human_review_actions_survive_stale_fences_and_restarts`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs); [`launch_review_uses_its_public_launch_and_selected_variant_after_restart`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/main.rs) |
 | `LaunchRevise` | live UI adapter across daemon restart | [`live_sends_retries_discussions_and_creation_survive_daemon_restarts`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/live.rs); [`launch_actions_survive_stale_fences_and_restarts`](https://github.com/compoundingtech/smalltalk/blob/main/crates/st3/tests/action_coverage.rs) |
@@ -354,3 +355,13 @@ edits and removes retired subjects without changing unfiltered reads.
 | edit or discard a draft | local UI state; no daemon mutation, restart fence not applicable | [`drafts_take_the_terminal_editing_keys`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/mod.rs) |
 | simplify or expand tool detail | local UI state; no daemon mutation, restart fence not applicable | [`shift_o_simplifies_every_conversation_and_back`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/mod.rs) |
 | dismiss/remind me later | local UI state; no daemon mutation, restart fence not applicable | [`remind_me_later_hides_a_message_and_the_badge_counts_what_is_left`](https://github.com/compoundingtech/smalltalk/blob/main/crates/stui/src/ui/mod.rs) |
+
+## Diagnostic client commands
+
+`client_commands` records `observations.report` separately from fenced graph actions.
+The real paired HTTP router control in `api/client_observations.rs` covers read-only pairing
+authorization, unpaired/revoked refusal, identical retry, conflicting reuse, body limit,
+unchanged graph index and reader/doctor population. Admission/history controls cover
+atomic validation, overlap, filesystem failure, rotation, expiry and retained files across
+fresh process-memory admission state. This is local diagnostic acceptance, without a
+replicated acknowledgement or a full-day live-phone SLO claim.
