@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "summary": "fractal-ui transcripts first mount at most six source rows plus the newest prompt and whole reasoning runs, then reveal more while idle or at the top; browser find mounts everything",
+  "summary": "fractal-ui transcripts first mount at most six source rows plus the newest prompt and whole reasoning runs, fill an underfull lane before paint, and keep that first page stable: older loaded rows appear only at the history top, through Show earlier messages, or with browser find. Switching live conversations paints no stale or partial timeline",
   "replay": {
     "status": "none",
     "detail": "No replay or rebuild."
@@ -15,7 +15,7 @@
   },
   "compatibility": {
     "status": "none",
-    "detail": "Only packages/fractal-ui changes; no protocol, harness or CLI change. Hosts pass the same props."
+    "detail": "Only packages/fractal-ui and apps/fractal-web change; no protocol, harness or CLI change. Runtime adoption records the source snapshot before Transcript may classify its missing ids as stranded. The live host keeps its lane empty while publication waits, reserves the history-control slot and composer dock, and preserves the same composer instance, draft, focus and caret. Transcript adds an optional loadingState body; hosts that omit it retain the kit skeleton. Unrevealed prefix rows are not reachable by screen readers until revealed."
   },
   "downtime": {
     "status": "none",
