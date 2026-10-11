@@ -16,6 +16,7 @@ pub mod hash;
 pub mod ivm;
 pub mod performance;
 pub mod prepared_cut;
+pub mod fifo;
 pub mod principal;
 /// Opt-in accounting of where the daemon's time goes, turned on by `ST3_PROFILE_DIR`.
 pub mod profile;

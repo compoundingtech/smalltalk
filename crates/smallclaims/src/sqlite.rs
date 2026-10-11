@@ -333,6 +333,7 @@ pub struct WriterConnection {
     /// Tests read them; `st replication status` counts every commit.
     #[cfg_attr(not(test), allow(dead_code))]
     pub batches: Arc<(AtomicU64, AtomicU64)>,
+    fifo: Arc<crate::fifo::Queue>,
 }
 
 pub enum WriterJob {
@@ -428,6 +429,8 @@ impl WriterConnection {
         let finalized = finalizers.clone();
         let background = Arc::new(writer_queue::BackgroundAdmission::default());
         let background_queue = background.clone();
+        let fifo = crate::fifo::Queue::new(crate::fifo::Kind::Writer);
+        let observed_fifo = fifo.clone();
         let thread = std::thread::Builder::new()
             .name("st3-writer".into())
             .spawn(move || {
@@ -436,9 +439,9 @@ impl WriterConnection {
                     queue,
                     &index,
                     &counted,
-                    (&observed, &finalized),
-                    mutations.as_ref(),
+                    (&observed, &finalized, mutations.as_ref()),
                     background_queue,
+                    &observed_fifo,
                 )
             })
             .expect("the writer thread starts");
@@ -452,6 +455,7 @@ impl WriterConnection {
             handler_policy,
             mutation_observer,
             batches,
+            fifo,
         })
     }
 
@@ -508,13 +512,18 @@ impl WriterConnection {
     }
 
     pub fn send(&self, job: WriterJob) {
-        self.jobs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
+        let enqueued = match &job {
+            WriterJob::Batched { enqueued, .. } | WriterJob::Lend { enqueued, .. } | WriterJob::FenceLend { enqueued, .. } => Some(*enqueued),
+            WriterJob::BackgroundReady(_) => None,
+        };
+        let jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+        let send = || jobs.as_ref()
             .expect("the writer queue is open while the store is")
-            .send(job)
-            .expect("the writer thread runs while the store is open");
+            .send(job);
+        match enqueued {
+            Some(enqueued) => self.fifo.send_at(enqueued, send),
+            None => send(),
+        }.expect("the writer thread runs while the store is open");
     }
 
     /// Borrow the foreground writer. Foreground jobs retain their arrival order and can
@@ -567,9 +576,9 @@ impl WriterConnection {
                         enqueued,
                     }
                 };
-                jobs.as_ref()
+                self.fifo.send_at(enqueued, || jobs.as_ref()
                     .expect("the writer queue is open while the store is")
-                    .send(job)
+                    .send(job))
                     .expect("the writer thread runs while the store is open");
             }
         }
@@ -600,7 +609,12 @@ impl WriterConnection {
         if self.background.closed.load(Ordering::Acquire) {
             queue.close();
         }
-        if queue.push(job) {
+        let WriterJob::Lend { enqueued, .. } = &job else {
+            unreachable!("only background loans use background admission")
+        };
+        let wake = self.fifo.send_at(*enqueued, || Ok::<_, std::convert::Infallible>(queue.push(job)))
+            .expect("background admission is infallible");
+        if wake {
             jobs.as_ref()
                 .expect("the writer queue is open while the store is")
                 .send(WriterJob::BackgroundReady(queue.clone()))
@@ -718,14 +732,15 @@ fn write_queue(
     queue: std::sync::mpsc::Receiver<WriterJob>,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
-    callbacks: (&CommitObservers, &TransactionFinalizers),
-    mutation_observer: Option<&Arc<writer_observer::MutationState>>,
+    callbacks: (&CommitObservers, &TransactionFinalizers, Option<&Arc<writer_observer::MutationState>>),
     background: Arc<writer_queue::BackgroundAdmission>,
+    fifo: &Arc<crate::fifo::Queue>,
 ) {
-    let mut admission = writer_queue::Admission::new(queue, background);
+    let mut admission = fifo.receiver(writer_queue::Admission::new(queue, background));
     while let Some(job) = admission.next() {
         match job {
             WriterJob::Lend { lent, returned, enqueued } | WriterJob::FenceLend { lent, returned, enqueued, .. } => {
+                fifo.dequeued_at(enqueued);
                 telemetry::METRICS.queue.record(enqueued.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
                 let _hold = crate::windows::Timer::start(crate::windows::StoreWork::WriterHold);
                 if let Err(std::sync::mpsc::SendError(back)) = lent.send(connection) {
@@ -746,7 +761,7 @@ fn write_queue(
                     committed_index,
                     batches,
                     callbacks,
-                    mutation_observer,
+                    fifo,
                 );
                 admission.put_back(next);
             }
@@ -764,11 +779,16 @@ fn run_write_batch(
     queue: &std::sync::mpsc::Receiver<WriterJob>,
     committed_index: &AtomicU64,
     batches: &(AtomicU64, AtomicU64),
-    callbacks: (&CommitObservers, &TransactionFinalizers),
-    mutation_observer: Option<&Arc<writer_observer::MutationState>>,
+    callbacks: (
+        &CommitObservers,
+        &TransactionFinalizers,
+        Option<&Arc<writer_observer::MutationState>>,
+    ),
+    fifo: &crate::fifo::Queue,
 ) -> Option<WriterJob> {
-    let (observers, finalizers) = callbacks;
+    let (observers, finalizers, mutation_observer) = callbacks;
     if let WriterJob::Batched { enqueued, .. } = &first {
+        fifo.dequeued_at(*enqueued);
         telemetry::METRICS.queue.record(enqueued.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
     }
     let started = std::time::Instant::now();
@@ -798,6 +818,7 @@ fn run_write_batch(
             break;
         };
         if !answers.is_empty() {
+            fifo.dequeued_at(enqueued);
             telemetry::METRICS.queue.record(enqueued.elapsed().as_secs_f64(), telemetry::SQLITE.as_slice());
         }
         match (&transaction, &failure) {
@@ -2004,6 +2025,50 @@ mod tests {
         });
     }
 
+
+    #[test]
+    fn otel_writer_taken_job_is_not_backlog_while_transaction_waits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("blocked.sqlite3");
+        let mut blocker = Connection::open(&path).unwrap();
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let transaction = blocker.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let fifo = crate::fifo::Queue::enabled_for_test();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut answers = Vec::new();
+        for expected_depth in [1, 0] {
+            let observed = fifo.clone();
+            let (done, answer) = std::sync::mpsc::sync_channel(1);
+            let enqueued = std::time::Instant::now();
+            fifo.send_at(enqueued, || sender.send(WriterJob::Batched {
+                run: Box::new(move |_| {
+                    assert_eq!(observed.depth_for_test(), expected_depth);
+                    true
+                }),
+                profile: None, wait: None, enqueued, done,
+            })).unwrap();
+            answers.push(answer);
+        }
+        let observed = fifo.clone();
+        let thread = std::thread::spawn(move || {
+            write_queue(writer, receiver, &AtomicU64::new(0),
+                &(AtomicU64::new(0), AtomicU64::new(0)),
+                (&CommitObservers::default(), &TransactionFinalizers::default(), None),
+                Arc::new(writer_queue::BackgroundAdmission::default()), &observed);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while fifo.depth_for_test() == 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(fifo.depth_for_test(), 1, "the first job is processing, only the later job is backlog");
+        assert!(matches!(answers[0].try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        transaction.commit().unwrap();
+        drop(sender);
+        thread.join().unwrap();
+        for answer in answers { answer.recv().unwrap().unwrap(); }
+        assert_eq!(fifo.depth_for_test(), 0);
+    }
 
     #[test]
     fn repeated_bursts_of_reads_reuse_connections_instead_of_opening_new_ones() {

@@ -69,6 +69,7 @@ pub use smallclaims::{performance, profile};
 pub mod projection;
 pub mod provenance;
 pub mod reconcile;
+mod reconcile_telemetry;
 mod relay_trace;
 pub mod rules;
 /// Observes git and gh calls without changing their command behavior.

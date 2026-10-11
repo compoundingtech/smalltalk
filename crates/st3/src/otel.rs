@@ -32,7 +32,41 @@ static METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 
 pub fn export_enabled() -> bool {
+    #[cfg(test)]
+    if TEST_EXPORT_ENABLED.get() { return true; }
     EXPORT_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_EXPORT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn capture_test_spans(work: impl FnOnce()) -> Vec<opentelemetry_sdk::trace::SpanData> {
+    use opentelemetry::trace::TracerProvider as _;
+    #[derive(Clone, Debug)]
+    struct Exporter(std::sync::mpsc::Sender<Vec<opentelemetry_sdk::trace::SpanData>>);
+    impl opentelemetry_sdk::trace::SpanExporter for Exporter {
+        async fn export(&self, batch: Vec<opentelemetry_sdk::trace::SpanData>) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.send(batch).expect("the capture receiver stays open");
+            Ok(())
+        }
+    }
+    struct Enabled;
+    impl Drop for Enabled {
+        fn drop(&mut self) { TEST_EXPORT_ENABLED.set(false); }
+    }
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let exporter = Exporter(sender);
+    let provider = SdkTracerProvider::builder().with_simple_exporter(exporter.clone()).build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("st3.test")));
+    TEST_EXPORT_ENABLED.set(true);
+    let _enabled = Enabled;
+    tracing::subscriber::with_default(subscriber, work);
+    provider.force_flush().unwrap();
+    receiver.try_iter().flatten().collect()
 }
 
 /// Whether a meter provider was installed. Independent of trace export: the RED metrics
@@ -403,6 +437,9 @@ impl Telemetry {
                         .build();
                     opentelemetry::global::set_meter_provider(provider.clone());
                     METRICS_ENABLED.store(true, Ordering::Relaxed);
+                    if matches!(unit, Unit::Daemon) {
+                        crate::reconcile_telemetry::init();
+                    }
                     telemetry.meter_provider = Some(provider);
                 }
                 Err(error) => {

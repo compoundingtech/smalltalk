@@ -18,6 +18,7 @@ hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
 opentelemetry = { version = "0.30", default-features = false, features = ["metrics"] }
+parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ring = "0.17"
 rusqlite = { version = "0.32", features = ["bundled", "trace", "functions", "hooks"] }

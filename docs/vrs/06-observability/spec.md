@@ -399,11 +399,11 @@ follows the collector sampling policy above; the process exports every span.
 
 ### Metric naming and cardinality
 
-The repository-local st3 instrument namespace uses lowercase dot-separated names under
-`st3.`, with storage instruments under `st.db.`; HTTP and database client instruments use
-the OpenTelemetry `http.server` and `db.client` namespaces. Duration instruments use
-seconds. Depth, size, and age gauges describe saturation. Examples are
-`http.server.request.duration`, `st.db.writer.queue.duration`, and `st3.fifo.depth`.
+The repository-local st3 instrument namespace uses lowercase dot-separated names:
+daemon work and storage instruments use `st.`, while HTTP and database client
+instruments use the OpenTelemetry `http.server` and `db.client` namespaces.
+Duration instruments use seconds. Depth, size, and age gauges describe saturation.
+Examples are `http.server.request.duration`, `st.db.writer.queue.duration`, and `st.fifo.depth`.
 Do not append Prometheus `_total` or `_seconds` suffixes to these OTLP instrument names.
 
 Label vocabularies are closed enums or bounded fleet membership. Unknown user-provided
@@ -480,6 +480,98 @@ wait in nanoseconds and count writer operations. Outer handler completion record
 accumulator, including nested blocking sections; writer calls do not create child spans
 or perform per-operation span-context lookup. This preserves the single-span request
 shape and adds no in-process sampling.
+
+### Reconciler and FIFO telemetry (O11Y-R10, O11Y-R11, O11Y-R14, O11Y-R16, O11Y-R18)
+
+```text
+wake source → last recorded cause + coalesced Notify
+                                  ↓ next outer wake
+                     st.reconcile_pass / st.reconcile_deadline
+                                  ↓ stabilization passes
+                             cause=continuation
+
+successful serialized channel send → FIFO enqueue Instant
+real item received                 → remove oldest Instant before processing
+SDK collection                     → sum live depths / max live oldest age
+```
+
+`st.reconcile_pass` and `st.reconcile_deadline` are independent root spans:
+each uses `parent: None` and an empty OpenTelemetry parent context, so neither
+inherits an ambient request or worker span. Their `span.label` values are
+`pass` and `deadline`, respectively. `st.reconcile.items` records the desired
+subject count on the span only; it is not a metric attribute. Errors set span
+status to `ERROR`. These roots have no child or per-item spans and no local
+sampling.
+
+`st.reconcile.wake_cause` uses the following closed, case-sensitive snake_case identifiers.
+The metric's `cause` attribute uses the same registry:
+
+| Wake cause |
+| --- |
+| `api` |
+| `replication_receive` |
+| `deadline` |
+| `timer_restart` |
+| `timer_step_timeout` |
+| `timer_resume_verification` |
+| `timer_gate_timeout` |
+| `timer_gate_recheck` |
+| `timer_gate` |
+| `timer_gate_poll` |
+| `timer_llm_gate` |
+| `file_watch` |
+| `reconciler` |
+| `recorder_receipts` |
+| `startup` |
+| `continuation` |
+| `other` |
+
+Notify coalesces wake requests, not an event backlog. The last recorded wake
+cause is consumed on the next outer wake; subsequent stabilization passes use
+`continuation`. Deadline inspection uses the previous outer wake cause, or
+`startup` for the first check. A direct one-shot pass or deadline uses `other`,
+as does an unknown source. These exported labels do not replace the existing
+in-memory wake labels used by `/v1/performance` and `doctor`; request/detail
+attribution also remains unchanged.
+
+| Instrument | Type | Unit | Complete attribute set |
+| --- | --- | --- | --- |
+| `st.reconcile.pass.duration` | Histogram | `s` | `task=pass` or `task=deadline` |
+| `st.reconcile.wakes` | Counter | `{wake}` | `cause` from the 17-value wake registry |
+| `st.fifo.depth` | Observable u64 gauge | `{item}` | `queue=writer`, `conversation`, or `terminal_emulation` |
+| `st.fifo.oldest_age` | Observable f64 gauge | `s` | `queue=writer`, `conversation`, or `terminal_emulation` |
+
+Every metric attribute is a constant closed value, never an identity.
+These instruments contribute at most `17 + 2 + 3 + 3 = 25` attribute series;
+histogram bucket count is separate. Duration uses the seconds buckets above,
+and metrics are independent of trace sampling.
+
+FIFO gauges describe only pending items in these in-process channels:
+
+| `queue` | Channel and pending-item boundary |
+| --- | --- |
+| `writer` | Unbounded `std::sync::mpsc` writer channel; arrival-order batching and database lending preserve the channel's order |
+| `conversation` | Unbounded WebSocket conversation channel per collection |
+| `terminal_emulation` | Process-singleton unbounded job channel; pending jobs only, not emulation jobs already running |
+
+`smallclaims::fifo` owns shared queue tracking. Each live channel owns an
+`Arc<Queue>`; the registry retains only weak references, so dropping the queue
+ends its observation. `Queue::send` serializes actual enqueue and successful
+enqueue timestamp insertion under one mutex. A failed send adds no timestamp.
+The receiver removes the oldest timestamp before processing the item. A writer
+lending job prefetched behind a batch remains pending until the batch commits
+and the connection is lent. Timestamps are `Instant` values; writer age reuses
+the job's existing enqueue timestamp.
+
+Gauges sample only at SDK collection: for each queue kind, depth is the sum
+across live queue instances and oldest age is the maximum age across those
+instances. Empty or absent queues report zero for both gauges. Collection
+reads only tracker timestamps under their mutexes, never graph, database, or
+file state. Tracking is a no-op without daemon OpenTelemetry initialization.
+
+Excluded from FIFO telemetry are coalesced Notify/watch states, caches,
+durable inbox and seat queues, driver-side mailbox `Subscription` queues, and
+ping sidecar queues.
 
 ### Attribute and context policy
 

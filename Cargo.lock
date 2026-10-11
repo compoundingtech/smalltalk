@@ -4200,6 +4200,7 @@ dependencies = [
  "libc",
  "opentelemetry",
  "opentelemetry_sdk",
+ "parking_lot",
  "proptest",
  "reqwest",
  "ring",
