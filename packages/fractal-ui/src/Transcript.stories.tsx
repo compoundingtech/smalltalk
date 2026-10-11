@@ -57,6 +57,21 @@ function TranscriptStory({ scheme = 'dark', state = 'settled', availability, his
 const meta = { title: 'Fractal UI/Transcript', component: TranscriptStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', state: 'settled' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, state: { options: Object.keys(cases), control: 'select' } } } satisfies Meta<typeof TranscriptStory>
 export default meta
 type Story = StoryObj<typeof meta>
+const adjacentReasoning = Array.from({ length: 11 }, (_, index): ConversationItem => ({
+  _tag: 'Reasoning', id: `reasoning-run/${index}`, text: `Check ${index + 1}: keep the observed reasoning in order.`, streaming: false, at,
+}))
+const adjacentReasoningData: TranscriptStoryData = {
+  sync: { _tag: 'Live', since: now },
+  turns: [{ id: 'reasoning-run', items: adjacentReasoning, work: workLogTurnFromItems(adjacentReasoning, { kindFor: () => 'read', running: false, failed: false, interrupted: false, completeHistory: true }) }],
+}
+export const AdjacentReasoning: Story = {
+  render: args => <section {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><div {...stylex.props(styles.frame)}><RuntimeTranscript data={adjacentReasoningData} onRetry={() => {}} /></div></section>,
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement)
+    await userEvent.click(await canvas.findByRole('button', { name: 'Worked' }))
+    await expect(canvas.getAllByRole('button', { name: 'Thinking' })).toHaveLength(1)
+  },
+}
 export const Settled: Story = { play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const fold = await canvas.findByRole('button', { name: /Worked for 24s/ })
@@ -369,7 +384,7 @@ export const AppendedItems: Story = { render: args => <AppendedItemsStory scheme
   try {
     for (const [index, label] of ['tool', 'reasoning', 'answer'].entries()) {
       await userEvent.click(canvas.getByRole('button', { name: `Append ${label}` }))
-      await waitFor(() => expect(index === 0 ? work.querySelector('[data-tool-status="running"]') : index === 1 ? within(work).queryAllByTestId('thinking-entry').length === 2 : within(turn).queryByText('New answer content follows the retained rows.')).toBeTruthy())
+      await waitFor(() => expect(index === 0 ? work.querySelector('[data-tool-status="running"]') : index === 1 ? within(work).queryAllByTestId('thinking-entry').length === 1 && within(work).queryByText('New reasoning follows the observed tool call.') : within(turn).queryByText('New answer content follows the retained rows.')).toBeTruthy())
       recordRemovals(observer.takeRecords())
       await expect(removed).toHaveLength(0)
       await expect(fallbacks).toHaveLength(0)

@@ -256,6 +256,29 @@ describe('ConversationPane composition activation', () => {
     } finally { height.mockRestore(); client.mockRestore(); bounds.mockRestore() }
   })
 
+  it.each([false, true])('groups all eleven reasoning entries of a work log into one disclosure (tool between=%s)', async separated => {
+    const reasoning: ConversationItem[] = Array.from({ length: 11 }, (_, index) => ({
+      _tag: 'Reasoning', id: `thought-${index}`, text: `Thought number ${index + 1}.`, streaming: false, at: at(index + 1),
+    }))
+    const items = separated ? [...reasoning.slice(0, 5), scenario[1]!, ...reasoning.slice(5)] : reasoning
+    source.feed = { _tag: 'Observed', freshness: 'live', value: { items: [scenario[0]!, ...items, scenario[3]!], hasOlder: false, observation: { empty: false } } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    // Native find exposes the complete history before asserting the full-turn grouping.
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => setTimeout(() => callback(0), 0))
+    await mount()
+    await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true })) })
+    await act(async () => { container.querySelector<HTMLButtonElement>('[data-testid="work-log"] button')!.click() })
+    // Grouping is asserted on the complete turn, including the older reasoning prefix.
+    await vi.waitFor(() => expect(container.querySelectorAll('[data-testid="thinking-entry"] button')).toHaveLength(1), { timeout: 5000 })
+    const disclosures = [...container.querySelectorAll<HTMLButtonElement>('[data-testid="thinking-entry"] button')]
+    expect(disclosures).toHaveLength(1)
+    expect(disclosures.every(button => button.getAttribute('aria-expanded') === 'false')).toBe(true)
+    expect(text()).not.toContain('Thought number 1.')
+    for (const button of disclosures) await act(async () => { button.click() })
+    expect([...container.querySelectorAll('[data-testid="thinking-entry"] [data-conversation-entry-id]')].map(element => element.textContent))
+      .toEqual(reasoning.map(item => item._tag === 'Reasoning' ? item.text : ''))
+  })
+
   it('insets the composer dock so its focus outline stays inside the viewport', async () => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: { items: scenario, hasOlder: false, observation: { empty: false } } }
     await mount()
@@ -583,11 +606,12 @@ describe('ConversationPane composition activation', () => {
     const tool = turn.querySelector('[data-tool-status]')!
     const thinking = turn.querySelector('[data-testid="thinking-entry"]')!
     expect(tool.getAttribute('data-item-id')).toBe('read')
-    expect(thinking.getAttribute('data-item-id')).toBe('reasoning')
+    expect(thinking.getAttribute('data-scroll-anchor-id')).toBe('["thinking-summary","p1"]')
     expect(tool.querySelector('[data-testid="tool-detail-preview"]')?.closest('[data-item-id]')).toBe(tool)
     await act(async () => { thinking.querySelector<HTMLButtonElement>('button')!.click() })
     expect(thinking.textContent).toContain('Compare the observed selection')
-    expect(thinking.querySelector('p')?.closest('[data-item-id]')).toBe(thinking)
+    const reasoning = thinking.querySelector('[data-item-id="reasoning"]')!
+    expect(thinking.querySelector('p')?.closest('[data-item-id]')).toBe(reasoning)
 
     // Older source turns can land above the work log without changing any nested row's identity.
     const older: readonly ConversationItem[] = [
@@ -596,7 +620,8 @@ describe('ConversationPane composition activation', () => {
     ]
     await show([...older, ...scenario.slice(0, 5)])
     expect(container.querySelector('[data-item-id="read"][data-tool-status]')).toBe(tool)
-    expect(container.querySelector('[data-item-id="reasoning"][data-testid="thinking-entry"]')).toBe(thinking)
+    expect(container.querySelector('[data-testid="thinking-entry"][data-scroll-anchor-id]')).toBe(thinking)
+    expect(container.querySelector('[data-item-id="reasoning"][data-conversation-entry-id]')).toBe(reasoning)
     expect(summary.getAttribute('data-scroll-anchor-id')).toBe('["work-summary","p1"]')
     if (presentation === 'interactive') {
       await act(async () => { summary.click() })
@@ -648,7 +673,7 @@ describe('ConversationPane composition activation', () => {
     expect(new Set(bounded.anchorHistory.ids)).toEqual(expectedIds)
     expect(bounded.anchorHistory.ids).not.toContain('missing/source-row')
     expect(container.querySelector('[data-tool-status][data-item-id="suffix/tool"]')).not.toBeNull()
-    expect(container.querySelector('[data-testid="thinking-entry"][data-item-id="suffix/thinking"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="thinking-entry"][data-scroll-anchor-id]')).not.toBeNull()
     expect(container.querySelector('[data-testid="agent-message"][data-item-id="suffix/answer"]')).not.toBeNull()
 
     await act(async () => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true })) })

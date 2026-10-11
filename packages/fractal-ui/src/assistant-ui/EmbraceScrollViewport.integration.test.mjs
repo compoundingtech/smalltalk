@@ -522,12 +522,12 @@ test('initial source window retains a whole adjacent reasoning run when its edge
   const items = [...thoughts, answer]
   const turns = [{ id: 'reasoning-turn', items, work: { calls: [], running: false, failed: false, interrupted: false } }]
   await act(async () => root.render(React.createElement(EmbraceRuntimeProvider, { options: { messages: items, isRunning: false, onNew: async () => {} } }, React.createElement(Transcript, { turns, title: 'Reasoning history', sync: { _tag: 'Live', since: now }, now, observedAt: now }))))
-  // The bounded branch retains all thoughts; grouping belongs to the thinking branch.
+  // Adjacent reasoning renders as one merged Thinking disclosure; it must hold the whole run.
   const entries = [...container.querySelectorAll('[data-testid="thinking-entry"]')]
-  assert.equal(entries.length, 11)
+  assert.equal(entries.length, 1)
   assert.equal(container.querySelectorAll('[data-testid="agent-message"]').length, 1)
-  for (const entry of entries) await act(async () => entry.querySelector('button').click())
-  const thoughtsShown = entries.map(entry => entry.textContent)
+  await act(async () => entries[0].querySelector('button').click())
+  const thoughtsShown = [...entries[0].querySelectorAll('[data-conversation-entry-id]')].map(entry => entry.textContent)
   assert.equal(thoughtsShown.length, 11, 'the source window must not truncate an adjacent reasoning run')
   for (let index = 1; index <= 11; index++) assert.ok(thoughtsShown[index - 1].includes(`Thought ${index}`))
 })

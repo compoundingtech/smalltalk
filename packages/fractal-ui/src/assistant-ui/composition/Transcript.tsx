@@ -13,7 +13,7 @@ import { syncLine } from '../st3-views/sync-line'
 import type { SyncStatus } from '../st3-views/sync-status'
 import { ErrorOverlay, ErrorOverlayHost } from './ErrorOverlay'
 import { HighlightedSource, Markdown, MarkdownImagePolicy, type MarkdownImageOpener, type MarkdownImageResolver } from './Markdown'
-import { ThinkingEntry } from './ThinkingEntry'
+import { ThinkingEntry, ThinkingRun } from './ThinkingEntry'
 import { SendFailure, TranscriptEmptyContent, type TranscriptEmptyState } from './TranscriptFeedback'
 import { TranscriptSkeleton } from './TranscriptSkeleton'
 import { Icon } from './Icons'
@@ -224,12 +224,24 @@ const hasVisibleBox = (element: HTMLElement): boolean => {
 const PreparedMessage = React.memo(function PreparedMessage({ item, stranded, caption }: { readonly item: ConversationItem; readonly stranded: boolean; readonly caption?: string }) {
   return stranded ? <StrandedItem item={item} /> : <SenderCaption.Provider value={caption}><ThreadPrimitive.Unstable_MessageById messageId={item.id} components={messageComponents} /></SenderCaption.Provider>
 })
+/** Non-reasoning entries terminate a run, even when the work log renders those entries elsewhere. */
+const reasoningRuns = (items: readonly ConversationItem[]) => {
+  const runs: Extract<ConversationItem, { _tag: 'Reasoning' }>[][] = []
+  let run: Extract<ConversationItem, { _tag: 'Reasoning' }>[] | undefined
+  for (const item of items) {
+    if (item._tag !== 'Reasoning') { run = undefined; continue }
+    if (run === undefined) { run = []; runs.push(run) }
+    run.push(item)
+  }
+  return runs
+}
 const PreparedTurn = React.memo(function PreparedTurn({ turn, stranded, onOpenTool, onRetryRun, landmarkContext }: { turn: TranscriptTurn; stranded?: ReadonlySet<string>; onOpenTool: TranscriptProps['onOpenTool']; onRetryRun?: () => void; landmarkContext?: string }) {
   const detail = React.useCallback((call: WorkLogCall) => <ToolDetailPreview call={call} onOpen={onOpenTool} />, [onOpenTool])
-  const reasoning = turn.items.filter(item => item._tag === 'Reasoning')
+  // The work log lists tool calls separately, so every thought of the turn is visually adjacent: one disclosure.
+  const reasoning = turn.items.filter((item): item is Extract<ConversationItem, { _tag: 'Reasoning' }> => item._tag === 'Reasoning')
   return <section ref={React.useContext(TurnProximityRef)} data-testid="transcript-turn" data-item-id={turn.id} {...stylex.props(styles.turn, styles.turnSkip)}>
     {turn.prompt !== undefined && <PreparedMessage item={turn.prompt} stranded={stranded?.has(turn.prompt.id) ?? false} />}
-    {(turn.work.calls.length > 0 || reasoning.length > 0) && <WorkLogV1 turn={turn.work} summaryAnchorId={JSON.stringify(['work-summary', turn.id])} ariaLabel={`Work log ${turn.id}${landmarkContext ? `, ${landmarkContext}` : ''}`} listStyle={styles.workList} renderCallDetail={detail} previewCallDetail={!turn.work.running} interactiveCalls={onOpenTool !== undefined} hideLiveRow onRetry={onRetryRun} onOpenOutput={onOpenTool} expandedBody={reasoning.map(item => <ThinkingEntry key={item.id} itemId={item.id} text={item.text} streaming={item.streaming} />)} />}
+    {(turn.work.calls.length > 0 || reasoning.length > 0) && <WorkLogV1 turn={turn.work} summaryAnchorId={JSON.stringify(['work-summary', turn.id])} ariaLabel={`Work log ${turn.id}${landmarkContext ? `, ${landmarkContext}` : ''}`} listStyle={styles.workList} renderCallDetail={detail} previewCallDetail={!turn.work.running} interactiveCalls={onOpenTool !== undefined} hideLiveRow onRetry={onRetryRun} onOpenOutput={onOpenTool} expandedBody={reasoning.length > 0 ? <ThinkingRun key="thinking" scrollAnchorId={JSON.stringify(['thinking-summary', turn.id])} items={reasoning} /> : undefined} />}
     {turn.items.filter(item => item._tag !== 'ToolCall' && item._tag !== 'Reasoning').map(item => <PreparedMessage key={item.id} item={item} stranded={stranded?.has(item.id) ?? false} caption={turn.senderCaptions?.[item.id]} />)}
     {turn.work.running && <div data-testid="live-work" role="status" aria-label="Response in progress" {...stylex.props(styles.liveActivity)}><span aria-hidden="true">◌</span></div>}
   </section>
