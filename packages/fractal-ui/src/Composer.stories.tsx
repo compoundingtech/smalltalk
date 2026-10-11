@@ -641,3 +641,11 @@ const styles = stylex.create({
   receipt: { margin: 0, padding: s.md, backgroundColor: surface.rowActive, borderRadius: r.sm, fontSize: t.metaSize, lineHeight: t.metaLeading, overflowWrap: 'anywhere' },
   text: { margin: 0, marginBlock: s.sm, whiteSpace: 'pre-wrap' },
 })
+
+export const RecallPreviousMessage: Story = {
+  render: () => <div {...stylex.props(styles.root, ...baselineTheme)}><ThemePortal><div style={{ width: 760, margin: '360px auto 0' }}>
+    <EmbraceRuntimeProvider options={{ messages: [], onNew: async () => {} }}>
+      <EmbraceComposer variant="C1" showHistory history={['Previous own message']} toolbar={<span>Model</span>} />
+    </EmbraceRuntimeProvider>
+  </div></ThemePortal></div>,
+}

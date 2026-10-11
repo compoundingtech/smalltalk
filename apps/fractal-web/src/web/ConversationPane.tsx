@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { useAtomValue } from '@effect/atom-react'
+import { RegistryContext, useAtomValue } from '@effect/atom-react'
 import { systemEventsPreference } from './conversationPreferences.ts'
 import { EmbraceComposer } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceComposer.tsx'
 import { EmbraceRuntimeProvider } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceRuntime.tsx'
@@ -10,6 +10,7 @@ import { createConversationTranscript, openableImageUrl, transcriptObservedAt, t
 import { composerSendBinding, type SendRefusal } from './composerSend.ts'
 import { geometryVars, spaceVars } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
 import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
+import { composerHistoryAtom, recallAvailable, submittedHistory } from './composerHistory.ts'
 import type { UxTelemetry } from '../telemetry/ux.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
 import type * as Atom from 'effect/reactivity/Atom'
@@ -100,11 +101,18 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
   const observation = useConversationSync(agentRef)
   const grants = useGrants()
   const [refusal, setRefusal] = React.useState<SendRefusal>()
+  const registry = React.useContext(RegistryContext)
+  const historyNamespace = `${source.gateway ?? source.mode}:${agentRef}`
+  const historySegments = useAtomValue(composerHistoryAtom(historyNamespace))
+  const history = React.useMemo(() => submittedHistory(historyNamespace, registry), [historyNamespace, registry])
+  const historyAvailable = recallAvailable(historySegments.length, state._tag === 'Observed' ? state.items : [])
+  const historySource = React.useMemo(() => ({ available: historyAvailable, get: history.get }), [historyAvailable, history])
   const binding = composerSendBinding({
     source, agentRef, grants,
     readable: state._tag === 'Observed',
     items: state._tag === 'Observed' ? state.items : [],
     refusal, onRefused: setRefusal,
+    onSending: history.capture,
   })
   const retryConversation = source.retryConversation
   return <EmbraceRuntimeProvider key={agentRef} options={{ ...binding.runtime, isRunning: state._tag === 'Observed' && state.isRunning }}>
@@ -139,7 +147,7 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
     <LiveAgentTodos agentRef={agentRef} />
     {/* An unreadable conversation keeps its composer and draft; the binding names why sending waits. */}
     <div data-testid="conversation-composer-dock" style={{ flexShrink: 0, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', minHeight: `calc(${geometryVars.controlLg} + ${geometryVars.controlMd} + 3 * ${spaceVars.md} + 2 * ${geometryVars.hairline} + ${spaceVars.lg})`, paddingBottom: spaceVars.lg }}>
-      <EmbraceComposer variant="C1" readingColumn disabledReason={binding.disabledReason} />
+      <EmbraceComposer variant="C1" readingColumn showHistory historySource={historySource} disabledReason={binding.disabledReason} />
     </div>
   </EmbraceRuntimeProvider>
 })
