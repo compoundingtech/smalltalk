@@ -16,7 +16,11 @@ export interface AppStoryArgs { readonly scheme: 'light' | 'dark'; readonly widt
  * Each specimen has its own source and registry; no session adoption leaks. */
 export const prepareAppStory = (scheme: AppStoryArgs['scheme']): void => {
   setTheme(scheme)
-  window.history.replaceState(null, '', '/iframe.html')
+  // Preserve Storybook's iframe pathname and id/refId/args/globals query.
+  // Only `open` belongs to the app router; dropping it selects the thread.
+  const url = new URL(window.location.href)
+  url.searchParams.delete('open')
+  window.history.replaceState(window.history.state, '', url)
   const registry = AtomRegistry.make()
   registry.set(persistedAtom({ key: 'round2.scheme', schema: Schema.Literals(['dark', 'light']), defaultValue: 'dark' }), scheme)
   registry.set(persistedAtom({ key: 'round2.agent', schema: Schema.String, defaultValue: '' }), '')
