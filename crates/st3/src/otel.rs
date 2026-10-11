@@ -37,6 +37,58 @@ pub fn export_enabled() -> bool {
     EXPORT_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Only the finished upgrade's identity crosses into a socket task, never its server span.
+#[derive(Clone)]
+pub struct UpgradeContext(pub Option<opentelemetry::trace::SpanContext>);
+
+/// Record the branch that produced a roster on the current request or first-frame root.
+pub fn record_roster(mode: &'static str, cards: usize) {
+    if !export_enabled() {
+        return;
+    }
+    let span = tracing::Span::current();
+    span.record("st.roster.mode", mode);
+    span.record("st.roster.cards", cards as i64);
+    for (field, selected) in [
+        ("st.projection.hit", mode == "hit"),
+        ("st.projection.cold", mode == "cold"),
+        ("st.projection.incremental", mode == "incremental"),
+        ("st.projection.shared", mode == "shared"),
+    ] {
+        span.record(field, selected);
+    }
+}
+
+pub fn record_page(rows: usize, bytes: usize) {
+    if !export_enabled() {
+        return;
+    }
+    let span = tracing::Span::current();
+    span.record("st.page.rows", rows as i64);
+    span.record("st.page.bytes", bytes as i64);
+}
+
+/// Bounded standalone work is a fresh INTERNAL trace, optionally correlated by a link.
+pub fn stage_root(
+    name: &'static str,
+    label: &'static str,
+    link: Option<opentelemetry::trace::SpanContext>,
+) -> Option<opentelemetry::global::BoxedSpan> {
+    if !export_enabled() {
+        return None;
+    }
+    use opentelemetry::trace::Tracer as _;
+    let tracer = opentelemetry::global::tracer("st3");
+    let mut builder = tracer
+        .span_builder(name)
+        .with_kind(opentelemetry::trace::SpanKind::Internal)
+        .with_attributes([KeyValue::new("span.label", label)]);
+    if let Some(link) = link.filter(opentelemetry::trace::SpanContext::is_valid) {
+        builder = builder.with_links(vec![opentelemetry::trace::Link::new(link, Vec::new(), 0)]);
+    }
+    Some(tracer.build_with_context(builder, &opentelemetry::Context::new()))
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_EXPORT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

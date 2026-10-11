@@ -191,7 +191,7 @@ async fn cold_open_remote_transient_failure_does_not_force_resubscribe() {
     let (outbox, mut frames) = tokio::sync::mpsc::unbounded_channel();
     let start = Instant::now();
     let follower = tokio::spawn(follow_conversation(state, ClientSession::local(Some("person/test")).unwrap(),
-        "chat".into(), 1, ("session/fixture".into(), Some("host/owner".into())), outbox, Queue::new(Kind::Conversation)));
+        "chat".into(), 1, ("session/fixture".into(), Some("host/owner".into())), outbox, Queue::new(Kind::Conversation), (None, None)));
     let (_, _, frame) = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await.unwrap().unwrap();
     println!("cold-open transient owner first frame: {} {:.3} ms, {} owner calls", frame["kind"], start.elapsed().as_secs_f64() * 1000.0, calls.load(Ordering::SeqCst));
     follower.abort();
@@ -208,7 +208,7 @@ async fn cold_open_remote_outage_still_reports_resync() {
     let (outbox, mut frames) = tokio::sync::mpsc::unbounded_channel();
     let start = Instant::now();
     let follower = tokio::spawn(follow_conversation(state, ClientSession::local(Some("person/test")).unwrap(),
-        "chat".into(), 1, ("session/fixture".into(), Some("host/owner".into())), outbox, Queue::new(Kind::Conversation)));
+        "chat".into(), 1, ("session/fixture".into(), Some("host/owner".into())), outbox, Queue::new(Kind::Conversation), (None, None)));
     let (_, _, frame) = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await.unwrap().unwrap();
     let elapsed = start.elapsed();
     println!("cold-open persistent outage first frame: {} {:.3} ms, {} owner calls", frame["kind"], elapsed.as_secs_f64() * 1000.0, calls.load(Ordering::SeqCst));
@@ -230,7 +230,7 @@ async fn cold_open_remote_authorization_failure_is_not_retried() {
     let (state, calls, server) = remote_fixture(root.path(), OwnerAfterFailure::Unavailable, "forbidden").await;
     let (outbox, mut frames) = tokio::sync::mpsc::unbounded_channel();
     let follower = tokio::spawn(follow_conversation(state, ClientSession::local(Some("person/test")).unwrap(),
-        "chat".into(), 1, ("session/fixture".into(), Some("host/owner".into())), outbox, Queue::new(Kind::Conversation)));
+        "chat".into(), 1, ("session/fixture".into(), Some("host/owner".into())), outbox, Queue::new(Kind::Conversation), (None, None)));
     let (_, _, frame) = tokio::time::timeout(Duration::from_secs(5), frames.recv()).await.unwrap().unwrap();
     follower.abort();
     server.abort();
@@ -246,7 +246,7 @@ async fn cold_open_remote_stalled_retry_keeps_normal_peer_read_deadline() {
     let (outbox, mut frames) = tokio::sync::mpsc::unbounded_channel();
     let start = Instant::now();
     let follower = tokio::spawn(follow_conversation(state, ClientSession::local(Some("person/test")).unwrap(),
-        "chat".into(), 1, ("session/fixture".into(), Some("host/owner".into())), outbox, Queue::new(Kind::Conversation)));
+        "chat".into(), 1, ("session/fixture".into(), Some("host/owner".into())), outbox, Queue::new(Kind::Conversation), (None, None)));
     let (_, _, frame) = tokio::time::timeout(Duration::from_secs(20), frames.recv()).await.unwrap().unwrap();
     println!("cold-open stalled retry first frame: {} {:.3} ms, {} owner calls", frame["kind"], start.elapsed().as_secs_f64() * 1000.0, calls.load(Ordering::SeqCst));
     follower.abort();
@@ -265,7 +265,7 @@ async fn cold_open_remote_slow_successful_retry_is_not_canceled() {
     let (outbox, mut frames) = tokio::sync::mpsc::unbounded_channel();
     let start = Instant::now();
     let follower = tokio::spawn(follow_conversation(state, ClientSession::local(Some("person/test")).unwrap(),
-        "chat".into(), 1, ("session/fixture".into(), Some("host/owner".into())), outbox, Queue::new(Kind::Conversation)));
+        "chat".into(), 1, ("session/fixture".into(), Some("host/owner".into())), outbox, Queue::new(Kind::Conversation), (None, None)));
     let (_, _, frame) = tokio::time::timeout(Duration::from_secs(6), frames.recv()).await.unwrap().unwrap();
     println!("cold-open slow successful retry first frame: {} {:.3} ms, {} owner calls", frame["kind"], start.elapsed().as_secs_f64() * 1000.0, calls.load(Ordering::SeqCst));
     follower.abort();

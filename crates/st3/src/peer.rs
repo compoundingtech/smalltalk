@@ -1095,7 +1095,7 @@ async fn receive_raw_terminal(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "raw terminal signature failed").into_response(),
     };
     let mut response = websocket.max_message_size(64 * 1024).max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| crate::api::raw_terminal_splice(socket, transport, None, None, None));
+        .on_upgrade(move |socket| crate::api::raw_terminal_splice(socket, transport, None, None, None, None, None));
     response.headers_mut().extend(signed);
     response
 }
