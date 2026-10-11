@@ -300,8 +300,19 @@ A stable checkpoint is trimmed in two steps, and a crash between them is safe.
    replication inventory lists for those envelopes; a tombstone and the envelope it stands for
    have one identity, so the inventory is the same while both exist.
 2. **Deletions, in chunks.** For each dropped envelope the node deletes its claims, their events,
-   records, signatures, operations and the envelope row. After the last chunk it marks the
-   checkpoint `trimmed`.
+   records, operations, the envelope's signatures and the envelope row, and each claim's signature
+   and cached verdict rows (`claim_signatures`, `claim_verdicts`, `claim_verdict_links` and the
+   verdict queues). After the last chunk it marks the checkpoint `trimmed`.
+
+The signature and verdict rows are local caches outside every digest. A nonce counts as used
+before only by a claim the store still holds, and no kind a rule drops is a delegation another
+verdict relies on, so nothing reads them once their claim is gone. Builds before this one left
+them behind: on one production copy, 315,708 signatures and verdicts and 932,387 verdict links,
+647 MB, belonged to claims trimmed earlier. Each checkpoint pass first sweeps such rows once,
+walking the claim tombstones in order one claim at a time, in transactions that stop deleting
+after 20 ms (`SWEEP_CHUNK_BUDGET`) so their commit, which writes and syncs the changed pages,
+stays well inside the writer's budget. It then records
+`checkpoint_trimmed_claim_rows_swept = done` in `meta` so later passes read one row.
 
 A crash while the checkpoint is `recording` leaves some tombstones recorded and every row still
 present. A sealed set never reads the tombstones of a checkpoint that is `recording`, so the next

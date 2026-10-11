@@ -498,6 +498,26 @@ fn write_verdict_tx(
     Ok(previous.as_ref() != Some(verdict))
 }
 
+/// Forget a claim's signature and every cached verdict row of it, when a checkpoint drops the
+/// claim. None of these rows is synced or in a digest, and nothing reads them for a claim that is
+/// gone: a nonce counts as used before only by a claim the store still holds, and a dropped claim
+/// is never a delegation another verdict relies on (those kinds are never dropped).
+pub(crate) fn forget_claim_tx(connection: &Connection, claim_id: &str) -> Result<usize> {
+    let mut rows = 0;
+    for table in [
+        "claim_signatures",
+        "claim_verdicts",
+        "claim_verdict_links",
+        "claim_verdict_queue",
+        "claim_verdict_fresh",
+    ] {
+        rows += connection
+            .prepare_cached(&format!("DELETE FROM {table} WHERE claim_id=?1"))?
+            .execute([claim_id])?;
+    }
+    Ok(rows)
+}
+
 /// Queue every verdict linked to `link`.
 fn queue_linked_tx(connection: &Connection, link: &str) -> Result<()> {
     connection

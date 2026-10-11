@@ -395,6 +395,7 @@ pub fn delete_dropped_rows_tx(
             )?;
         }
         super::events::remove_claim_tx(transaction, &claim.id)?;
+        super::principals::forget_claim_tx(transaction, &claim.id)?;
         transaction.execute("DELETE FROM claims WHERE id=?1", [&claim.id])?;
     }
     for envelope in envelopes {

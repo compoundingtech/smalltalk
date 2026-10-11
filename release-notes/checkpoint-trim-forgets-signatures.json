@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "A checkpoint trim deletes the signature and verdict rows of the claims it drops, and sweeps the ones earlier trims left behind",
+  "replay": {"status": "none", "detail": "No replay or projection rebuild. Verdicts of kept claims are unchanged; recheck_claim_verdicts reports no mismatch after a trim or the sweep."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes, triggers or schema version change. The sweep records its progress in meta under checkpoint_trimmed_claim_rows_swept."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged; the same claims are dropped. The deleted rows are local caches outside the graph, authority and checkpoint digests, so trimmed, untrimmed and swept members still agree."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change. A new CheckpointAction variant, swept-trimmed-claim-rows, appears in the daemon log once per node when the sweep deletes rows."},
+  "downtime": {"status": "none", "detail": "No restart requirement beyond the ordinary deploy. The one-time sweep runs in the background checkpoint pass in transactions that stop deleting after 20 ms. On a production copy it deleted 1,563,803 rows in 6,232 transactions over 392 s and freed 54,290 pages (222 MB of page bytes become free for reuse)."},
+  "manual": {"status": "none", "detail": "No manual step. The file does not shrink: SQLite reuses the freed pages."},
+  "recovery": {"status": "none", "detail": "Binary rollback needs no store change; an older build simply leaves such rows behind again on later trims."}
+}

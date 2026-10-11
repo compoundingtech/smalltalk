@@ -898,3 +898,151 @@ fn a_trim_never_makes_a_write_wait_long() {
         "a write waited {longest:?} for the trim"
     );
 }
+
+/// As `store_with_drops`, on a node that signs its claims, so each has a signature and verdict.
+fn signed_store_with_drops(origin: &str) -> (Store, DropPlan) {
+    let store = Store::open_memory(origin).unwrap();
+    store
+        .set_node_key(Arc::new(smallclaims::fleet::MemberKey::generate().unwrap().0))
+        .unwrap();
+    store.bind_fleet(FLEET).unwrap();
+    write_diagnostics(&store, "daemon/alder", 5);
+    let plan = plan_drops(&store.checkpoint_sealed_set(now_ms() + 1_000).unwrap());
+    assert!(plan.envelopes.len() >= 3, "{plan:?}");
+    (store, plan)
+}
+
+/// The signature and verdict rows the store holds for `ids`.
+fn signature_and_verdict_rows(store: &Store, ids: &[String]) -> usize {
+    let connection = store.readers.get();
+    ids.iter()
+        .map(|id| {
+            [
+                "claim_signatures",
+                "claim_verdicts",
+                "claim_verdict_links",
+                "claim_verdict_queue",
+                "claim_verdict_fresh",
+            ]
+            .iter()
+            .map(|table| {
+                connection
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {table} WHERE claim_id=?1"),
+                        [id],
+                        |row| row.get::<_, usize>(0),
+                    )
+                    .unwrap()
+            })
+            .sum::<usize>()
+        })
+        .sum()
+}
+
+/// The claims a trim of `dropped` keeps.
+fn kept_ids(store: &Store, dropped: &[String]) -> Vec<String> {
+    let all: Vec<String> = store
+        .readers
+        .get()
+        .prepare("SELECT id FROM claims ORDER BY id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    all.into_iter().filter(|id| !dropped.contains(id)).collect()
+}
+
+#[test]
+fn a_trim_forgets_the_signatures_and_verdicts_of_what_it_drops() {
+    let (store, plan) = signed_store_with_drops("alder");
+    store.judge_claims(true).unwrap();
+    let dropped = plan.claims.iter().map(|claim| claim.id.clone()).collect::<Vec<_>>();
+    let kept = kept_ids(&store, &dropped);
+    assert!(signature_and_verdict_rows(&store, &dropped) >= 2 * dropped.len(), "signed and judged");
+    let kept_rows = signature_and_verdict_rows(&store, &kept);
+    let before = authority(&store);
+    let graph = smallclaims::store::graph_digest(&store.readers.get()).unwrap();
+
+    trim(&store, &plan);
+    assert_eq!(signature_and_verdict_rows(&store, &dropped), 0);
+    assert_eq!(signature_and_verdict_rows(&store, &kept), kept_rows);
+    assert_eq!(authority(&store), before);
+    assert_eq!(smallclaims::store::graph_digest(&store.readers.get()).unwrap(), graph);
+    assert!(store.recheck_claim_verdicts().unwrap().is_empty());
+    assert_eq!(store.sweep_trimmed_claim_rows().unwrap(), 0, "nothing was left behind");
+}
+
+#[test]
+fn the_sweep_forgets_what_an_older_trim_left_behind_once() {
+    let (store, plan) = signed_store_with_drops("alder");
+    store.judge_claims(true).unwrap();
+    let dropped = plan.claims.iter().map(|claim| claim.id.clone()).collect::<Vec<_>>();
+    let kept = kept_ids(&store, &dropped);
+    let kept_rows = signature_and_verdict_rows(&store, &kept);
+    let left = signature_and_verdict_rows(&store, &dropped);
+    assert!(left >= 2 * dropped.len(), "signed and judged");
+    // An older build's trim deleted the claims but not these rows.
+    let saved = ["claim_signatures", "claim_verdicts", "claim_verdict_links"].map(|table| {
+        let connection = store.readers.get();
+        let mut statement = connection.prepare(&format!("SELECT * FROM {table}")).unwrap();
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                (0..columns).map(|index| row.get::<_, rusqlite::types::Value>(index)).collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        (table, columns, rows)
+    });
+    trim(&store, &plan);
+    {
+        let connection = store.connection.write();
+        for (table, columns, rows) in &saved {
+            let marks = vec!["?"; *columns].join(",");
+            for row in rows {
+                connection
+                    .execute(
+                        &format!("INSERT OR IGNORE INTO {table} VALUES ({marks})"),
+                        rusqlite::params_from_iter(row.iter()),
+                    )
+                    .unwrap();
+            }
+        }
+        connection
+            .execute("DELETE FROM meta WHERE key=?1", [smallclaims::store::checkpoint_trim::TRIMMED_CLAIM_ROWS_SWEPT])
+            .unwrap();
+    }
+    assert_eq!(signature_and_verdict_rows(&store, &dropped), left);
+    let before = authority(&store);
+    let graph = smallclaims::store::graph_digest(&store.readers.get()).unwrap();
+
+    assert_eq!(store.sweep_trimmed_claim_rows().unwrap(), left);
+    assert_eq!(signature_and_verdict_rows(&store, &dropped), 0);
+    assert_eq!(signature_and_verdict_rows(&store, &kept), kept_rows);
+    assert_eq!(authority(&store), before);
+    assert_eq!(smallclaims::store::graph_digest(&store.readers.get()).unwrap(), graph);
+    assert!(store.recheck_claim_verdicts().unwrap().is_empty());
+    let connection = store.readers.get();
+    assert_eq!(
+        smallclaims::store::fleet_meta(&connection, smallclaims::store::checkpoint_trim::TRIMMED_CLAIM_ROWS_SWEPT).unwrap().as_deref(),
+        Some("done")
+    );
+    drop(connection);
+    assert_eq!(store.sweep_trimmed_claim_rows().unwrap(), 0, "a later pass reads one row");
+}
+
+#[test]
+fn trimmed_and_untrimmed_nodes_still_agree_after_the_sweep() {
+    let (alder, plan) = signed_store_with_drops("alder");
+    let birch = Store::open_memory("birch").unwrap();
+    birch.bind_fleet(FLEET).unwrap();
+    sync(&alder, "alder", &birch, true);
+    trim(&alder, &plan);
+    alder.sweep_trimmed_claim_rows().unwrap();
+    assert_eq!(authority(&alder), authority(&birch));
+    sync(&birch, "birch", &alder, true);
+    sync(&alder, "alder", &birch, true);
+    assert_eq!(authority(&alder), authority(&birch));
+}
