@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Pin the plan of the person-step read with a test",
+  "replay": {"status": "none", "detail": "No replay or rebuild. The query text is unchanged; it moves to a constant so a test can read its plan."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover: a test asserts the person-step read searches the assignee index and never scans step_runs."}
+}
