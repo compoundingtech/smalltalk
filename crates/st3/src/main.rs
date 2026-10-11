@@ -4736,6 +4736,17 @@ fn main() -> ExitCode {
         st_drivers::reexec::unblock_stop_signals();
     }
     let arguments = std::env::args_os().collect::<Vec<_>>();
+    if let Some(stui) = bare_st_opens(
+        arguments.len(),
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        std::env::var_os("ST_AGENT").is_some(),
+        std::env::var_os("PATH").as_deref(),
+    ) {
+        use std::os::unix::process::CommandExt as _;
+        // Only returns when stui could not start; the help below is the fallback.
+        let error = std::process::Command::new(stui).exec();
+        eprintln!("st: stui did not start ({error}); here is the help instead");
+    }
     if cli_help::all_help_requested(&arguments) {
         print!("{}", cli_help::root_help(true));
         return ExitCode::SUCCESS;
@@ -4775,6 +4786,22 @@ fn main() -> ExitCode {
         cli,
         matches.subcommand_name().expect("a subcommand was parsed"),
     )
+}
+
+/// Bare `st` on a person's terminal opens stui, found on PATH; scripts, pipes and agent seats
+/// keep the help. `None` means print the help.
+fn bare_st_opens(
+    argument_count: usize,
+    interactive: bool,
+    in_seat: bool,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if argument_count != 1 || !interactive || in_seat {
+        return None;
+    }
+    std::env::split_paths(path?)
+        .map(|directory| directory.join("stui"))
+        .find(|candidate| candidate.is_file())
 }
 
 /// Export the runtime fence before any provider or runtime worker thread starts. Fresh
@@ -5872,6 +5899,30 @@ fn select_private_gateway(
         .into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod bare_st_tests {
+    use super::*;
+
+    #[test]
+    fn bare_st_opens_stui_only_for_a_person_on_a_terminal_with_stui_on_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let stui = directory.path().join("stui");
+        std::fs::write(&stui, "").unwrap();
+        let path = std::env::join_paths([directory.path()]).unwrap();
+        let path = Some(path.as_os_str());
+        assert_eq!(bare_st_opens(1, true, false, path), Some(stui));
+        // A subcommand or flag, a pipe or script, and an agent seat keep their behavior.
+        assert_eq!(bare_st_opens(2, true, false, path), None);
+        assert_eq!(bare_st_opens(1, false, false, path), None);
+        assert_eq!(bare_st_opens(1, true, true, path), None);
+        // Without stui on PATH the help is printed.
+        let empty = tempfile::tempdir().unwrap();
+        let none = std::env::join_paths([empty.path()]).unwrap();
+        assert_eq!(bare_st_opens(1, true, false, Some(none.as_os_str())), None);
+        assert_eq!(bare_st_opens(1, true, false, None), None);
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Remove a redundant closure in the operation reconciliation finalizer control",
+  "replay": {
+    "status": "none",
+    "detail": "Test-only direct function reference replaces its forwarding closure. Production operation reconciliation, control assertions, transaction/finalizer/rollback semantics, wire/schema/rules and workload budgets are unchanged. No production action or new qualification is inferred."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "Test-only direct function reference replaces its forwarding closure. Production operation reconciliation, control assertions, transaction/finalizer/rollback semantics, wire/schema/rules and workload budgets are unchanged. No production action or new qualification is inferred."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Test-only direct function reference replaces its forwarding closure. Production operation reconciliation, control assertions, transaction/finalizer/rollback semantics, wire/schema/rules and workload budgets are unchanged. No production action or new qualification is inferred."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Test-only direct function reference replaces its forwarding closure. Production operation reconciliation, control assertions, transaction/finalizer/rollback semantics, wire/schema/rules and workload budgets are unchanged. No production action or new qualification is inferred."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "Test-only direct function reference replaces its forwarding closure. Production operation reconciliation, control assertions, transaction/finalizer/rollback semantics, wire/schema/rules and workload budgets are unchanged. No production action or new qualification is inferred."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "Test-only direct function reference replaces its forwarding closure. Production operation reconciliation, control assertions, transaction/finalizer/rollback semantics, wire/schema/rules and workload budgets are unchanged. No production action or new qualification is inferred."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Test-only direct function reference replaces its forwarding closure. Production operation reconciliation, control assertions, transaction/finalizer/rollback semantics, wire/schema/rules and workload budgets are unchanged. No production action or new qualification is inferred."
+  }
+}

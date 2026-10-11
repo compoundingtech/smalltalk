@@ -31,6 +31,7 @@ pub mod layout;
 pub mod live;
 pub mod pane;
 mod prefs;
+mod resource_sidebar;
 mod pty;
 pub mod screens;
 pub mod text;
@@ -321,6 +322,7 @@ pub struct Ui {
     tick: u64,
     help: bool,
     sidebar: bool,
+    resource_sidebar: resource_sidebar::Sidebar,
     system: bool,
     frame: RefCell<FrameInfo>,
     hover: hover::Hover,
@@ -515,6 +517,8 @@ impl Ui {
         self.frame.borrow().read_messages.clone()
     }
     pub fn new(world: World) -> Self {
+        let mut resource_sidebar = resource_sidebar::Sidebar::default();
+        resource_sidebar.observe(&world);
         Self {
             world,
             tab: 0,
@@ -530,6 +534,7 @@ impl Ui {
             tick: 0,
             help: false,
             sidebar: true,
+            resource_sidebar,
             system: false,
             frame: RefCell::new(FrameInfo::default()),
             hover: hover::Hover::default(),
@@ -661,6 +666,14 @@ impl Ui {
         } else {
             Vec::new()
         };
+        self.resource_sidebar.observe(&world);
+        if world.agents.ready().is_some_and(|agents| agents.is_empty())
+            && world.missions.ready().is_some_and(|missions| missions.is_empty())
+            && world.attention.ready().is_some_and(|attention| attention.is_empty())
+            && let Some(glasses) = self.glasses.as_mut()
+            && !glasses.sidebar.configured {
+            glasses.sidebar.shown = true;
+        }
         self.world = world;
         self.keep_closed_attention(before);
         for (index, id) in chosen.into_iter().enumerate() {
@@ -763,6 +776,42 @@ impl Ui {
             || self.parked.iter().any(|view| view.agent == id);
         if still_here && !attached && !self.editing && self.terminal_first {
             self.attach_terminal(&id);
+        }
+    }
+
+    /// A terminal's tab is never left dead (Nathan, 2026-10-10): once the agents are known, each
+    /// terminal tab in front attaches (stui reopened with the tab saved, or a terminal that was
+    /// let go), or turns back into the agent's conversation when the agent has no terminal.
+    pub(crate) fn step_terminal_tabs(&mut self) {
+        if self.glasses.is_none() || self.home_open() {
+            return;
+        }
+        let Some(agents) = self.world.agents.ready() else {
+            return;
+        };
+        let loose: Vec<(usize, String)> = self
+            .shown_panes()
+            .into_iter()
+            .filter_map(|(group, pane)| match pane {
+                Pane::Terminal(id) if self.terminal_view(&id).is_none() => Some((group, id)),
+                _ => None,
+            })
+            .collect();
+        let without: Vec<(usize, String)> = loose
+            .iter()
+            .filter(|(_, id)| {
+                !id.starts_with("terminal/")
+                    && !agents.iter().any(|agent| agent.id == *id && agent.terminal)
+            })
+            .cloned()
+            .collect();
+        for (_, id) in loose {
+            if !without.iter().any(|(_, other)| *other == id) {
+                self.attach_terminal(&id);
+            }
+        }
+        for (group, id) in without {
+            self.swap_shown_pane(group, Pane::Agent(Some(id)));
         }
     }
 
@@ -3607,6 +3656,8 @@ impl Ui {
     }
 
     pub fn key(&mut self, key: KeyEvent) {
+        if self.glasses.is_none() && self.resource_sidebar.focused && self.resource_sidebar_key(key) { return; }
+
         let ctrl_t = key.code == KeyCode::Char('t') && key.modifiers == KeyModifiers::CONTROL;
         if self.terminal_hold.is_some() {
             if ctrl_t && key.kind != KeyEventKind::Press {
@@ -4307,8 +4358,14 @@ impl Ui {
         if self.glasses.is_some() {
             match self.focused_pane() {
                 Some(Pane::Terminal(id)) if id == agent.id => {}
+                // One tab for each thing: a terminal already open in a tab is focused, not
+                // opened a second time.
                 Some(Pane::Agent(Some(id))) if id == agent.id => {
-                    self.swap_focused_pane(Pane::Terminal(agent.id.clone()))
+                    if self.shows_in_glass(&Pane::Terminal(agent.id.clone())) {
+                        self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab)
+                    } else {
+                        self.swap_focused_pane(Pane::Terminal(agent.id.clone()))
+                    }
                 }
                 _ => self.open_in_glass(Pane::Terminal(agent.id.clone()), glass::Open::Tab),
             }
@@ -5041,6 +5098,18 @@ impl Ui {
     }
 
     pub fn mouse(&mut self, mouse: MouseEvent) {
+        if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+            && self.frame.borrow().hits.iter().rev().any(|(rect, hit)| {
+                contains(*rect, mouse.column, mouse.row) && matches!(hit, Hit::ResourceRow(_) | Hit::ResourceFilter)
+            }) {
+            self.resource_sidebar.selected = if mouse.kind == MouseEventKind::ScrollUp {
+                self.resource_sidebar.selected.saturating_sub(3)
+            } else {
+                (self.resource_sidebar.selected + 3).min(self.resource_sidebar.rows().len().saturating_sub(1))
+            };
+            return;
+        }
+
         if mouse.kind == MouseEventKind::Moved {
             self.mouse_moved(mouse);
             return;
@@ -5464,6 +5533,12 @@ impl Ui {
             Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
             Hit::NewTerminal => self.open_new_terminal(),
+            Hit::ResourceRow(index) => self.open_resource_row(index),
+            Hit::ResourceFilter => {
+                self.resource_sidebar.focused = true;
+                self.resource_sidebar.filtering = true;
+                if let Some(glasses) = self.glasses.as_mut() { glasses.sidebar.focused = true; }
+            }
             Hit::SidebarRow(index) => {
                 if let Some(glasses) = self.glasses.as_mut() {
                     let sidebar = &mut glasses.sidebar;

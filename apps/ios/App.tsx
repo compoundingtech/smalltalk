@@ -24,6 +24,7 @@ import { LaunchScreen, MissionScreen, MissionsScreen, NewMissionScreen } from '.
 import { SelectTextScreen } from './screens/SelectText';
 import { TerminalScreen } from './screens/Terminal';
 import { GlassesScreen, SpaceScreen } from './screens/Glasses';
+import { SidebarScreen } from './screens/Sidebar';
 import { FabricProofScreen } from './screens/FabricProof';
 import { parseFabricProofLink, type FabricProofInput } from './fabricProof';
 
@@ -58,6 +59,7 @@ function TabStack({ tab }: { tab: Tab | 'Glasses' }) {
     {tab === 'Glasses'
       ? <Stack.Screen name="GlassesRoot" component={GlassesScreen} options={{ title: 'Spaces' }} />
       : <Stack.Screen name={ROOTS[tab] as keyof typeof ROOT_SCREENS} component={ROOT_SCREENS[ROOTS[tab] as keyof typeof ROOT_SCREENS]} options={{ title: tabLabel(tab) }} />}
+    <Stack.Screen name="Sidebar" component={SidebarScreen} options={{ title: 'Resources' }} />
     <Stack.Screen name="Space" component={SpaceScreen} options={{ title: 'Space' }} />
     <Stack.Screen name="Conversation" component={ConversationScreen} options={{ title: 'Conversation' }} />
     <Stack.Screen name="SelectText" component={SelectTextScreen} options={{ title: 'Select text', presentation: 'formSheet', sheetAllowedDetents: [0.6, 1], sheetGrabberVisible: true }} />
