@@ -8,7 +8,22 @@
     "clients/typescript/st3-client",
     "clients/typescript/st3-scenarios",
     "clients/typescript/st3-views",
-    "packages/fractal-ui"
+    "packages/fractal-ui",
+    "repos/effect-utils/packages/@overeng/content-address",
+    "repos/effect-utils/packages/@overeng/devbar",
+    "repos/effect-utils/packages/@overeng/effect-distributed-lock",
+    "repos/effect-utils/packages/@overeng/effect-rpc-explorer",
+    "repos/effect-utils/packages/@overeng/effect-rpc-explorer-react",
+    "repos/effect-utils/packages/@overeng/effect-rpc-observer",
+    "repos/effect-utils/packages/@overeng/effect-rust",
+    "repos/effect-utils/packages/@overeng/meters",
+    "repos/effect-utils/packages/@overeng/otel-browser",
+    "repos/effect-utils/packages/@overeng/otel-contract",
+    "repos/effect-utils/packages/@overeng/rpc-devtools",
+    "repos/effect-utils/packages/@overeng/stylex-tokens",
+    "repos/effect-utils/packages/@overeng/utils",
+    "repos/effect-utils/packages/@overeng/utils-dev",
+    "repos/effect-utils/packages/@overeng/utils-storybook"
   ],
   "packageManager": "pnpm@12.7.0",
   "$genie": {

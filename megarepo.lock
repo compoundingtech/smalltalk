@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "members": {
+    "effect-utils": {
+      "url": "https://github.com/overengineeringstudio/effect-utils",
+      "ref": "schickling-assistant/2026-10-08-devbar",
+      "commit": "81a6527895a45d70dca7c0d1ca3a72ae76feaeb5",
+      "pinned": false,
+      "lockedAt": "2026-10-10T11:53:20.229Z"
+    }
+  }
+}

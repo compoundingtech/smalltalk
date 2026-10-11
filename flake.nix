@@ -1206,9 +1206,9 @@
         # Configuration generation must not realize the Rust/PTY/collector shell.
         devShells.genie = pkgs.mkShell {
           packages = [ effect-utils.packages.${system}.genie ];
+          # repos/effect-utils is the megarepo member (`mr apply`), not this flake input.
           shellHook = ''
-            mkdir -p repos
-            ln -sfn ${effect-utils} repos/effect-utils
+            [ -e repos/effect-utils ] || echo 'repos/effect-utils is missing: run `mr apply` first' >&2
           '';
         };
         # The web workspace's toolchain comes from effect-utils' own nixpkgs pin, not the root
@@ -1254,8 +1254,8 @@
             BUCK2_BIN = "${effectUtilsPackages.buck2}/bin/buck2";
             FRACTAL_WEB_BUCK_ROOT = "${buckRoot}";
             shellHook = ''
-              mkdir -p repos .buck2
-              ln -sfn ${effect-utils} repos/effect-utils
+              mkdir -p .buck2
+              [ -e repos/effect-utils ] || echo 'repos/effect-utils is missing: run `mr apply` first' >&2
               ln -sfn ${buckRoot}/.buck2/rules .buck2/rules
               ln -sfn ${buckRoot}/.buck2/capabilities .buck2/capabilities
             '';

@@ -9,6 +9,7 @@ import {
   linuxRunner,
   linuxStageJob,
   linuxStageRunner,
+  megarepoApplyStep,
   nixCacheStep,
   perfStoresCache,
   pnpmStoreEnv,
@@ -50,6 +51,7 @@ fi`,
     },
     ...whenMissing([
       ...setup,
+      ...(stage === 'genie' ? [megarepoApplyStep] : []),
       nixDevelopStep({ name: 'Build missing cache contents', flake: stage === 'genie' ? '.#genie' : '.', command: ['bash', 'scripts/ci-cache-warm', stage] }),
       { name: 'Save Nix outputs', run: 'bash scripts/ci-nix-cache save' },
       // PR/merge builds restore these entries and retain exact-source artifacts. Only

@@ -359,6 +359,10 @@ jobs:
         run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Check frozen workspace dependency license coverage
         run: python3 scripts/ci-fractal-web-licenses-test && python3 scripts/ci-fractal-web-licenses --check-lockfile
+      - name: Materialize megarepo members
+        env:
+          MEGAREPO_STORE: "${{ runner.temp }}/megarepo"
+        run: 'nix run "github:overengineeringstudio/effect-utils/$(jq -r ''.nodes["effect-utils"].locked.rev'' flake.lock)#megarepo" -- apply --worktree-mode commit --git-protocol https'
       - name: Check runner selection and generated files
         shell: bash
         run: "nix develop '.#genie' -c bash -c 'python3 scripts/check-ci-runner-test && python3 scripts/ci-namespace-usage-test && python3 scripts/ci-mail-redelivery-canaries-test && python3 scripts/ci-test-partitions-test && python3 scripts/ci-test-archive-test && python3 scripts/check-ci-test-paths && python3 scripts/ci-queue-watch-test && python3 scripts/check-main-ci-test && python3 scripts/ci-perf-cache-test && python3 scripts/ci-cache-audit-test && python3 scripts/ci-fractal-web-test && genie --check'"
@@ -1734,7 +1738,7 @@ jobs:
   fractal-web-execution:
     name: fractal-web-execution
     needs: [fractal-web-changes, genie-freshness]
-    if: ${{ !cancelled() && needs.fractal-web-changes.result == 'success' && needs.fractal-web-changes.outputs.relevant == 'true' && needs.genie-freshness.result == 'success' }}
+    if: ${{ !cancelled() && needs.fractal-web-changes.result == 'success' && needs.fractal-web-changes.outputs.relevant == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -1758,6 +1762,10 @@ jobs:
             extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
             access-tokens = github.com=${{ github.token }}
           summarize: true
+      - name: Materialize megarepo members
+        env:
+          MEGAREPO_STORE: "${{ runner.temp }}/megarepo"
+        run: 'nix run "github:overengineeringstudio/effect-utils/$(jq -r ''.nodes["effect-utils"].locked.rev'' flake.lock)#megarepo" -- apply --worktree-mode commit --git-protocol https'
       - name: Restore the pnpm store
         id: pnpm-store
         uses: actions/cache/restore@v4

@@ -15,7 +15,17 @@
     ],
     "types": [
       "node"
-    ]
+    ],
+    // Member sources resolve through repos/ outside this tree; give their peers this app's copies.
+    "paths": {
+      "effect": ["./node_modules/effect/dist/index.d.ts"],
+      "effect/*": ["./node_modules/effect/dist/*"],
+      "react": ["../../node_modules/@types/react/index.d.ts"],
+      "react/*": ["../../node_modules/@types/react/*"],
+      "react-dom": ["../../node_modules/@types/react-dom/index.d.ts"],
+      "react-dom/*": ["../../node_modules/@types/react-dom/*"],
+      "@stylexjs/stylex": ["../../node_modules/@stylexjs/stylex"]
+    }
   },
   "include": [
     "server/**/*.mts",
