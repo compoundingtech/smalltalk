@@ -118,6 +118,9 @@ mod accounts;
 mod adhoc_work;
 mod attention_snapshot;
 pub(crate) use attention_snapshot::{NativePromptState, native_prompt_gone_key};
+pub(crate) mod attention_list;
+pub(crate) mod owner_lists;
+pub(crate) mod summary_list;
 // Registration stays opt-in until the shared installer certifies every source family.
 #[cfg_attr(
     not(test),
@@ -174,6 +177,9 @@ mod conversation_reads;
 mod usage_period;
 mod runtime;
 pub(crate) mod published_views;
+pub(crate) mod published_list;
+pub(crate) mod mission_list;
+pub(crate) mod work_list;
 #[cfg(test)]
 mod tombstones_tests;
 #[cfg(test)]
@@ -8134,19 +8140,62 @@ impl Store {
         include_agentless: bool,
         open_only: bool,
     ) -> Result<Vec<StepRunView>> {
+        self.work_at_snapshot_selected(
+            actor,
+            include_terminal,
+            snapshot_unix_ms,
+            detailed,
+            include_agentless,
+            open_only,
+            None,
+        )
+    }
+
+    /// [`Self::work_at_snapshot_internal_with_agentless`], of only the `selected` step subjects
+    /// when given, as the published work list refolds the steps whose claims changed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn work_at_snapshot_selected(
+        &self,
+        actor: Option<&str>,
+        include_terminal: bool,
+        snapshot_unix_ms: u128,
+        detailed: bool,
+        include_agentless: bool,
+        open_only: bool,
+        selected: Option<&BTreeSet<String>>,
+    ) -> Result<Vec<StepRunView>> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
-        let query = if actor.is_some() {
-            seat_work_at_snapshot_query(open_only)
-        } else {
-            work_at_snapshot_query(open_only)
+        let views = match selected {
+            None => {
+                let query = if actor.is_some() {
+                    seat_work_at_snapshot_query(open_only)
+                } else {
+                    work_at_snapshot_query(open_only)
+                };
+                let mut statement = connection.prepare_cached(&query)?;
+                let rows = statement.query_map(
+                    params![actor.as_deref(), include_terminal, include_agentless],
+                    step_run_from_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            Some(selected) => {
+                // The same filter, over the selected steps by their subject.
+                let query = selected_work_at_snapshot_query(open_only);
+                let mut statement = connection.prepare_cached(&query)?;
+                let rows = statement.query_map(
+                    params![
+                        actor.as_deref(),
+                        include_terminal,
+                        include_agentless,
+                        serde_json::to_string(selected)?
+                    ],
+                    step_run_from_row,
+                )?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
         };
-        let mut statement = connection.prepare_cached(&query)?;
-        let rows = statement.query_map(
-            params![actor.as_deref(), include_terminal, include_agentless],
-            step_run_from_row,
-        )?;
-        let views = rows.collect::<Result<Vec<_>, _>>()?;
         let carried_claimants = carried_claimants_tx(
             &connection,
             views
@@ -30784,6 +30833,15 @@ fn seat_queue_joins_query() -> String {
 /// the finished steps are left out in SQL, word for word the predicate of
 /// `step_runs_open_index`, so the read covers the fleet's open steps and not every step it ran.
 fn work_at_snapshot_query(open_only: bool) -> String {
+    work_at_snapshot_query_of(open_only, "")
+}
+
+/// [`work_at_snapshot_query`] of only the step subjects in the JSON array `?4`, by their key.
+fn selected_work_at_snapshot_query(open_only: bool) -> String {
+    work_at_snapshot_query_of(open_only, "subject IN (SELECT value FROM json_each(?4)) AND")
+}
+
+fn work_at_snapshot_query_of(open_only: bool, selected: &str) -> String {
     let open = if open_only {
         "AND status NOT IN ('completed','failed','cancelled')"
     } else {
@@ -30793,7 +30851,7 @@ fn work_at_snapshot_query(open_only: bool) -> String {
         "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                 lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
          FROM step_runs
-         WHERE (agentless=0 OR (?3 AND ?1 IS NULL))
+         WHERE {selected} (agentless=0 OR (?3 AND ?1 IS NULL))
            AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
            AND (?1 IS NULL
                 OR assignee=?1
@@ -32309,6 +32367,33 @@ fn step_execution_timing_at(
     snapshot_unix_ms: u128,
     currently_active: bool,
 ) -> rusqlite::Result<(Option<u128>, u128)> {
+    Ok(fold_step_timing(
+        &step_timing_events(connection, subject)?,
+        attempt,
+        snapshot_unix_ms,
+        currently_active,
+    ))
+}
+
+/// The lease that bounds the open execution interval of `subject`'s `attempt` as of
+/// `snapshot_unix_ms`, as its claims last named it, when an interval is open under one. A
+/// quiet renewal moves the step's lease without a claim, never this one.
+pub(crate) fn step_timing_lease_at(
+    connection: &Connection,
+    subject: &str,
+    attempt: u32,
+    snapshot_unix_ms: u128,
+) -> rusqlite::Result<Option<u128>> {
+    let (started, _, lease) =
+        fold_step_timing_open(&step_timing_events(connection, subject)?, attempt, snapshot_unix_ms);
+    Ok(started.and(lease))
+}
+
+/// A step's step and work events in canonical order, as its execution timing folds them.
+fn step_timing_events(
+    connection: &Connection,
+    subject: &str,
+) -> rusqlite::Result<Vec<(String, Value, u128)>> {
     let mut statement = connection.prepare(&canonical_sql(
         "SELECT claims.kind, claims.body, claims.accepted_at_unix_ms
          FROM claims JOIN batches ON batches.id=claims.batch_id
@@ -32326,8 +32411,7 @@ fn step_execution_timing_at(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let events = events
+    Ok(events
         .into_iter()
         .map(|(kind, body, accepted)| {
             (
@@ -32336,13 +32420,7 @@ fn step_execution_timing_at(
                 accepted.parse::<u128>().unwrap_or(0),
             )
         })
-        .collect::<Vec<_>>();
-    Ok(fold_step_timing(
-        &events,
-        attempt,
-        snapshot_unix_ms,
-        currently_active,
-    ))
+        .collect())
 }
 
 /// Fold a step's execution timing from its step and work events in canonical order: the active
@@ -32355,6 +32433,29 @@ pub(crate) fn fold_step_timing(
     snapshot_unix_ms: u128,
     currently_active: bool,
 ) -> (Option<u128>, u128) {
+    let (mut started, mut elapsed, lease_expires) =
+        fold_step_timing_open(events, attempt, snapshot_unix_ms);
+    if let Some(interval_start) = started {
+        let interval_end =
+            lease_expires.map_or(snapshot_unix_ms, |expiry| snapshot_unix_ms.min(expiry));
+        let expired = lease_expires.is_some_and(|expiry| expiry <= snapshot_unix_ms);
+        if expired || currently_active {
+            elapsed = elapsed.saturating_add(interval_end.saturating_sub(interval_start));
+        }
+        if expired || !currently_active {
+            started = None;
+        }
+    }
+    (started, elapsed)
+}
+
+/// [`fold_step_timing`]'s events folded up to `snapshot_unix_ms`: the open interval's start,
+/// if any, the time elapsed in closed intervals, and the lease the claims last named.
+fn fold_step_timing_open(
+    events: &[(String, Value, u128)],
+    attempt: u32,
+    snapshot_unix_ms: u128,
+) -> (Option<u128>, u128, Option<u128>) {
     let mut elapsed = 0_u128;
     let mut started = None;
     let mut lease_expires = None;
@@ -32452,19 +32553,7 @@ pub(crate) fn fold_step_timing(
             _ => {}
         }
     }
-
-    if let Some(interval_start) = started {
-        let interval_end =
-            lease_expires.map_or(snapshot_unix_ms, |expiry| snapshot_unix_ms.min(expiry));
-        let expired = lease_expires.is_some_and(|expiry| expiry <= snapshot_unix_ms);
-        if expired || currently_active {
-            elapsed = elapsed.saturating_add(interval_end.saturating_sub(interval_start));
-        }
-        if expired || !currently_active {
-            started = None;
-        }
-    }
-    (started, elapsed)
+    (started, elapsed, lease_expires)
 }
 
 fn apply_effective_step_state(
@@ -46107,6 +46196,11 @@ version 2
         assert!(
             open_steps.contains("step_runs_open_index"),
             "a seat queue must read the open steps, not every step:\n{open_steps}"
+        );
+        let selected_steps = plan(&selected_work_at_snapshot_query(false));
+        assert!(
+            !selected_steps.contains("SCAN step_runs\n"),
+            "the published work list refolds its changed steps by subject, not every step:\n{selected_steps}"
         );
         for open_only in [false, true] {
             let seat_steps = plan(&seat_work_at_snapshot_query(open_only));

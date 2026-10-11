@@ -79,10 +79,16 @@ mod mailbox;
 mod mail_backlog;
 mod read_deadline;
 mod owned_sets;
+mod published_attention;
+pub use published_attention::start_attention_list;
+#[cfg(test)]
+pub(crate) use published_attention::{published_attention_rows, refresh_attention_list};
 mod request_latency;
 mod client_observations;
 mod terminal_view;
 mod work_response;
+mod published_lists;
+pub use published_lists::start_published_lists;
 
 pub(crate) use client_v0::raw_terminal::splice as raw_terminal_splice;
 pub(crate) use client_v0::raw_terminal::{
