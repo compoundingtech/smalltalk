@@ -1339,6 +1339,113 @@ fn pending_local_claims_do_not_report_divergence_at_equal_sealed_inventory() {
 }
 
 #[test]
+fn sealed_status_keeps_the_pending_guard_at_the_readers_cut() {
+    let root = tempfile::tempdir().unwrap();
+    let source = Store::open_memory("alder").unwrap();
+    let target =
+        std::sync::Arc::new(Store::open(&root.path().join("birch.sqlite"), "birch").unwrap());
+    let exchange = exchange_from(&source, &ReplicationInventory::default());
+    receive_and_project(&target, "alder", &exchange);
+    target
+        .append_claim(&ClaimInput {
+            subject: "observer/audit-pending".into(),
+            kind: "observer.state".into(),
+            actor: None,
+            fields: BTreeMap::from([("state".into(), json!("unreachable"))]),
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: Some("audit-pending-cut".into()),
+        })
+        .unwrap();
+    let (start, started) = std::sync::mpsc::sync_channel(1);
+    let (done, finished) = std::sync::mpsc::sync_channel(1);
+    let cursor_before = target
+        .seeded_batch_rowid
+        .load(std::sync::atomic::Ordering::Acquire);
+    let writer = target.clone();
+    let sealer = std::thread::spawn(move || {
+        if started.recv().is_ok() {
+            let result = writer.seal_local_batches().and_then(|_| {
+                // Publish the successor cache before the older reader asks for status.
+                let snapshot = writer.sealed_replication_snapshot()?;
+                Ok((
+                    writer
+                        .seeded_batch_rowid
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    snapshot.inventory.digest.clone(),
+                    snapshot.envelope_rows,
+                    snapshot.unsealed,
+                ))
+            });
+            let _ = done.send(result);
+        }
+    });
+    let mut newer_digest_for_fresh = None;
+    target
+        .read_snapshot(|_| {
+            let snapshot = target.sealed_replication_snapshot()?;
+            assert_eq!(snapshot.inventory.digest, exchange.inventory.digest);
+            assert!(snapshot.unsealed);
+            assert_ne!(snapshot.projection_digests, exchange.projection_digests);
+            let before =
+                target.replication_status_sealed(true, Some(TEST_FLEET), &["alder".into()])?;
+            assert_eq!(
+                before.peers[0].projection_digests,
+                exchange.projection_digests
+            );
+            assert!(before.peers[0].projection_comparison_waiting);
+            assert!(before.peers[0].differing_tables.is_empty());
+            // Seal on another thread after this reader has pinned the pre-seal cut.
+            // The writer's live cursor advances, but this reader still sees pending input.
+            start.send(()).unwrap();
+            let (cursor_after, newer_digest, newer_rows, newer_unsealed) = finished
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("sealing must complete while a WAL reader holds its earlier cut")?;
+            assert!(
+                cursor_after > cursor_before,
+                "the sealer must advance its live cursor"
+            );
+            assert_ne!(newer_digest, snapshot.inventory.digest);
+            assert!(newer_rows > snapshot.envelope_rows);
+            assert!(!newer_unsealed);
+            newer_digest_for_fresh = Some(newer_digest);
+            eprintln!("pinned pending cut: live sealing cursor {cursor_before} -> {cursor_after}");
+            let pending: bool = target.readers.get().query_row(
+                "SELECT EXISTS(SELECT 1 FROM batches WHERE origin=?1 AND rowid>COALESCE(\
+                 (SELECT CAST(value AS INTEGER) FROM meta WHERE key='seeded_batch_rowid'),0))",
+                ["birch"],
+                |row| row.get(0),
+            )?;
+            assert!(pending, "the pinned database cut still has unsealed input");
+            let pinned_after = target.sealed_replication_snapshot()?;
+            assert_eq!(pinned_after.inventory.digest, snapshot.inventory.digest);
+            assert_eq!(pinned_after.envelope_rows, snapshot.envelope_rows);
+            assert_eq!(
+                pinned_after.inventory.public().envelopes,
+                snapshot.inventory.public().envelopes
+            );
+            assert!(pinned_after.unsealed);
+            let status =
+                target.replication_status_sealed(true, Some(TEST_FLEET), &["alder".into()])?;
+            assert_eq!(status.authority_digest, snapshot.authority_digest);
+            assert_eq!(status.received_envelopes, snapshot.envelope_rows as u64);
+            assert_eq!(status.projection_digests, snapshot.projection_digests);
+            assert!(
+                status.peers[0].differing_tables.is_empty(),
+                "a later writer cursor cannot certify this older reader's projections: {:?}",
+                status.peers[0]
+            );
+            assert!(status.peers[0].projection_comparison_waiting);
+            Ok(())
+        })
+        .unwrap();
+    sealer.join().unwrap();
+    let fresh = target.sealed_replication_snapshot().unwrap();
+    assert_eq!(fresh.inventory.digest, newer_digest_for_fresh.unwrap());
+    assert_ne!(fresh.inventory.digest, exchange.inventory.digest);
+}
+
+#[test]
 fn proposal_phase_dates_match_source_replay_and_replication() {
     for reviewed in [false, true] {
         let source = Store::open_memory("alder").unwrap();

@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Keep sealed replication status comparisons on one database read cut.",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or projection rebuild is added."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No table, column, index or trigger changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Checkpoint, signature and inventory digest rules are unchanged."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "A sealed status read now evaluates pending input and its inventory from the same SQLite cut. An older pinned reader keeps pending comparison while a newer writer seals and publishes a snapshot, avoiding a false report of certified projection drift. The peer wire format is unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No planned downtime."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action is required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new persistent state or recovery procedure is introduced."
+  }
+}
