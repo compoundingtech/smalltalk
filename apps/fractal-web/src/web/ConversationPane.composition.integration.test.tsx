@@ -520,7 +520,7 @@ describe('ConversationPane composition activation', () => {
   it.each([
     ['/tmp/example/ready-step-test.fixture\nPermissionError: cannot read /tmp/example/check.py', 'PermissionError: cannot read …/check.py'],
     ['/tmp/example/ready-step-test.fixture', 'Tool failed; no readable reason was recorded.'],
-    ['Traceback (most recent call last):\n  File "/app/command.py", line 571, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\nsubprocess.TimeoutExpired: Command \'sleep 60\' timed out after 30 seconds', "subprocess.TimeoutExpired: Command 'sleep 60' timed out after 30 seconds"],
+    ['Traceback (most recent call last):\n  File "/app/command.py", line 571, in run\n    stdout, stderr = process.communicate(input, timeout=timeout)\nsubprocess.TimeoutExpired: Command \'sleep 60\' timed out after 30 seconds', 'Command timed out after 30s'],
     ['Traceback (most recent call last):\n  File "/app/check.py", line 4\n    run_check()\nProcess exited with code 2', 'Exited with code 2'],
   ])('uses a readable failed tool reason instead of a path tail: %s', async (diagnostic, reason) => {
     source.feed = { _tag: 'Observed', freshness: 'live', value: {
@@ -539,6 +539,24 @@ describe('ConversationPane composition activation', () => {
     if (open !== null) await act(async () => { open.click() })
     expect(row.querySelector('[data-testid="tool-error-reason"]')?.textContent).toBe(reason)
     expect(row.querySelector('pre')).toBeNull()
+  })
+
+  it('shows a subprocess script only as unescaped code in the raw disclosure', async () => {
+    const diagnostic = "Traceback (most recent call last):\n    raise TimeoutExpired(\nsubprocess.TimeoutExpired: Command '['sh', '-c', '\\nset -eu\\necho \\'ready\\'\\n']' timed out after 30 seconds"
+    source.feed = { _tag: 'Observed', freshness: 'live', value: {
+      items: [scenario[0]!, { _tag: 'ToolCall', id: 'failed-run', callId: 'failed-call', name: 'run',
+        input: { command: 'check' }, status: 'error', callSeen: true, at: at(1),
+        result: { content: diagnostic, isError: true, at: at(3) } }],
+      hasOlder: false, observation: { empty: false },
+    } }
+    source.sync = { status: { _tag: 'Live', since: 100 }, observedAt: 100 }
+    await mount()
+    const banner = container.querySelector<HTMLElement>('[data-error-overlay]')!
+    expect(banner.textContent).toContain('Command timed out after 30s')
+    expect(banner.textContent).not.toContain('set -eu')
+    const raw = [...banner.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Show raw input/output')!
+    await act(async () => { raw.click() })
+    expect(banner.querySelector('[data-testid="error-overlay-command"] code')?.textContent).toBe("set -eu\necho 'ready'\n")
   })
 
   it('keeps optimistic send state visible on its prompt', async () => {

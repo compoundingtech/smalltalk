@@ -18,6 +18,8 @@ export interface ErrorOverlayNotice {
   readonly detail?: string
   /** Diagnostic bytes require explicit disclosure; detail remains a compact human reason. */
   readonly rawDetail?: string
+  /** Unescaped failed command, shown as code inside the raw disclosure, never in the reason line. */
+  readonly command?: string
   readonly onRetry?: () => void
   readonly onOpenOutput?: () => void
 }
@@ -55,7 +57,7 @@ export function ErrorOverlayHost({ children, lane = false }: { readonly children
   </div>
 }
 
-export function ErrorOverlay({ id, title, detail, rawDetail, onRetry, onOpenOutput }: ErrorOverlayNotice) {
+export function ErrorOverlay({ id, title, detail, rawDetail, command, onRetry, onOpenOutput }: ErrorOverlayNotice) {
   const host = React.useContext(ErrorOverlaySurface)
   const [dismissedId, setDismissedId] = React.useState<string | null>(null)
   const [rawOpen, setRawOpen] = React.useState(false)
@@ -64,7 +66,7 @@ export function ErrorOverlay({ id, title, detail, rawDetail, onRetry, onOpenOutp
   const banner = <div role="alert" data-error-overlay data-error-overlay-id={id} onKeyDown={event => { if (host === null && event.key === 'Escape' && !event.defaultPrevented) { event.preventDefault(); setDismissedId(id) } }} {...stylex.props(styles.banner, host?.lane === true && styles.bannerLane)}>
     <Icon name="alert" size={14} />
     <div {...stylex.props(styles.text)}><strong {...stylex.props(styles.title)}>{title}</strong>{detail !== undefined && <span {...stylex.props(styles.detail, rawDetail !== undefined && styles.reason)}>{detail}</span>}
-      {rawDetail !== undefined && <Disclosure isExpanded={rawOpen} onExpandedChange={setRawOpen}><Button slot="trigger" {...stylex.props(styles.rawTrigger)}>Show raw input/output</Button><DisclosurePanel>{rawOpen && <pre {...stylex.props(styles.rawOutput)}>{rawDetail}</pre>}</DisclosurePanel></Disclosure>}
+      {rawDetail !== undefined && <Disclosure isExpanded={rawOpen} onExpandedChange={setRawOpen}><Button slot="trigger" {...stylex.props(styles.rawTrigger)}>Show raw input/output</Button><DisclosurePanel>{rawOpen && <>{command !== undefined && <pre data-testid="error-overlay-command" {...stylex.props(styles.rawOutput, styles.command)}><code>{command}</code></pre>}<pre {...stylex.props(styles.rawOutput)}>{rawDetail}</pre></>}</DisclosurePanel></Disclosure>}
     </div>
     {onRetry !== undefined && <Button onPress={onRetry} {...stylex.props(styles.action)}>Retry</Button>}
     {onOpenOutput !== undefined && <Button onPress={onOpenOutput} {...stylex.props(styles.action)}>Open output</Button>}
@@ -84,6 +86,7 @@ const styles = stylex.create({
   reason: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   rawTrigger: { minHeight: g.controlSm, padding: 0, borderWidth: 0, backgroundColor: surface.transparent, color: ink.fgSoft, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { color: ink.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: tone.danger } },
   rawOutput: { margin: 0, whiteSpace: 'pre-wrap', overflowWrap: 'anywhere', fontFamily: t.fontMono, fontSize: t.metaSize },
+  command: { marginBlockEnd: s.sm, padding: s.sm, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.codeBg },
   action: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minHeight: g.controlSm, paddingInline: s.sm, flexShrink: 0, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.sm, backgroundColor: surface.controlFill, color: ink.fg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { backgroundColor: surface.rowHover }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: tone.danger } },
   close: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: g.controlSm, minHeight: g.controlSm, padding: 0, borderWidth: 0, borderRadius: r.sm, backgroundColor: surface.transparent, color: ink.fgMuted, cursor: 'pointer', flexShrink: 0, ':hover': { color: ink.fg, backgroundColor: surface.rowActive }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: tone.danger } },
 })
