@@ -117,7 +117,9 @@ describe('red and long narrative worlds', () => {
         const fileBytes = new TextEncoder().encode(JSON.stringify(sliceFile(world, slice), null, 2) + '\n').byteLength
         sliceBytes[kind] = bytes
         fixtureBytes[kind] = fileBytes
-        // Preserve every native future window in the 22-turn recording, not a truncated fixture.
+        // Recorded replace-page growth is tracked in Smalltalk issue #2570.
+        // A server fix is in progress; a later re-record should shrink this conversation fixture.
+        // This local sanity bound is separate from the unchanged 8 MiB/file and 24 MiB/tree contract.
         const budget = world.id === longDebugRabbitHole.id && kind === 'conversation' ? 1_500_000 : 1_000_000
         expect(bytes).toBeLessThan(budget)
         expect(fileBytes).toBeLessThan(budget)
