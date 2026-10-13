@@ -1,6 +1,6 @@
 import type { WorldDefinition } from '../kit/world.ts'
 import { liveSync } from '../kit/variants.ts'
-import { fleetMidRefactor } from './fleetMidRefactor.ts'
+import { syntheticFleetMidRefactor } from './fleetMidRefactor.ts'
 
 /** Discovery is available, but the fleet has not published any resources. */
 export const empty: WorldDefinition = {
@@ -8,7 +8,7 @@ export const empty: WorldDefinition = {
   title: 'Empty fleet',
   narrative: 'A newly connected fleet has no agents, missions, messages, conversations or terminals yet.',
   seed: 21,
-  cast: fleetMidRefactor.cast,
+  cast: syntheticFleetMidRefactor.cast,
   slices: (ctx) => {
     const metadata = { variant: 'default', source: { _tag: 'synthetic' as const, seed: 21 }, decode: 'strict' as const, loading: false, timeline: [] }
     const conversation = { ...metadata, kind: 'conversation' as const, state: { threads: [] } }

@@ -9,6 +9,7 @@ import * as resources from '../kit/resources.ts'
 import type { Slice } from '../kit/slice.ts'
 import { liveSync } from '../kit/variants.ts'
 import type { WorldDefinition } from '../kit/world.ts'
+import { adoptNarrativeRecording } from './narrativeAdoption.ts'
 
 const file = 'packages/cache/policy.ts'
 const base = 'export const cachePolicy = { ttl: 60, stale: false };\n'
@@ -19,7 +20,7 @@ const conflict = `<<<<<<< ours\n${ours}||||||| base\n${base}=======\n${theirs}>>
 const decision = 'Keep the 300-second TTL from builder and stale reads from reviewer. Combine both changes, run the cache tests, then land the patch.'
 
 /** Both branches share one base; review chooses the combined behavior rather than a winner. */
-export const mergeConflictStandoff: WorldDefinition = {
+export const syntheticMergeConflictStandoff: WorldDefinition = {
   id: 'merge-conflict-standoff', title: 'Merge conflict standoff', seed: 5,
   narrative: 'Two agents change the cache policy on the same line. A person reviews the three-way conflict and approves a combined patch.',
   cast: { project: 'harbor', roles: ['builder', 'reviewer'], hosts: 1, people: 1, missions: [{ slug: 'cache-policy', title: 'Improve the cache policy', steps: ['Increase the cache TTL', 'Allow stale cache reads'] }] },
@@ -66,3 +67,5 @@ export const mergeConflictStandoff: WorldDefinition = {
     return { roster, details, attention, conversation, terminal, sync: liveSync(ctx, { conversation }) }
   },
 }
+
+export const mergeConflictStandoff: WorldDefinition = adoptNarrativeRecording(syntheticMergeConflictStandoff)

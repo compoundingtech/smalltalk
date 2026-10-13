@@ -4,9 +4,10 @@ import { entry, revise, thread, turn } from '../kit/factories/turn.ts'
 import * as resources from '../kit/resources.ts'
 import type { Slice, SyncExpectation } from '../kit/slice.ts'
 import type { WorldDefinition } from '../kit/world.ts'
+import { adoptNarrativeRecording } from './narrativeAdoption.ts'
 
 /** Offline edits accumulate on the server; each reconnect replaces the stale client window. */
-export const offlineReconnectStorm: WorldDefinition = {
+export const syntheticOfflineReconnectStorm: WorldDefinition = {
   id: 'offline-reconnect-storm',
   title: 'Offline reconnect storm',
   narrative: 'A deployment summary streams through three socket drops. Backoff preserves stale content until authoritative snapshots restore the final revisions.',
@@ -70,3 +71,5 @@ export const offlineReconnectStorm: WorldDefinition = {
     }
   },
 }
+
+export const offlineReconnectStorm: WorldDefinition = adoptNarrativeRecording(syntheticOfflineReconnectStorm)

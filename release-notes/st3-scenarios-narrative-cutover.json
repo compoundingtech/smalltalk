@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Adopt real scratch-recorded conversations and terminals in seven scenario narratives and prove replay fidelity",
+  "replay": {"status": "none", "detail": "Development/test scenario replay gains typed historical and reconnect boundaries; deployed runtime replay is unchanged."},
+  "schema": {"status": "none", "detail": "No database or client-v0 schema change; scenario-only provenance and recorded history are development data."},
+  "rules": {"status": "none", "detail": "No checkpoint rules change."},
+  "compatibility": {"status": "none", "detail": "The 24-world catalog retains its ids and cast identities; seventeen synthetic edge-world fixtures remain byte-identical. No deployed client protocol change."},
+  "downtime": {"status": "none", "detail": "No service interruption introduced."},
+  "manual": {"status": "none", "detail": "No installation action or re-recording required; existing committed scratch captures supply the narrative data."},
+  "recovery": {"status": "none", "detail": "No database or runtime recovery change."}
+}

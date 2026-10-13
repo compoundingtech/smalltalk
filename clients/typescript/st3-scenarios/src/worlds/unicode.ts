@@ -4,7 +4,7 @@ import { terminalRecord } from '../kit/factories/terminalRecord.ts'
 import { thread, turn } from '../kit/factories/turn.ts'
 import { liveSync } from '../kit/variants.ts'
 import type { WorldDefinition } from '../kit/world.ts'
-import { fleetMidRefactor } from './fleetMidRefactor.ts'
+import { syntheticFleetMidRefactor } from './fleetMidRefactor.ts'
 
 // Deliberately retain decomposed accents and the ZWJ sequence without normalization.
 export const UNICODE_LONG_NAME = '界'.repeat(200)
@@ -13,12 +13,12 @@ export const UNICODE_TEXT = `واجهة العربية — 日本語の表示 �
 
 /** Display text stresses shaping and width; public identifiers remain ASCII. */
 export const unicode: WorldDefinition = {
-  ...fleetMidRefactor,
+  ...syntheticFleetMidRefactor,
   id: 'unicode',
   title: 'Unicode display and content',
   narrative: 'An internationalization review exercises RTL, CJK, decomposed accents, emoji and unusually long labels.',
   cast: {
-    ...fleetMidRefactor.cast,
+    ...syntheticFleetMidRefactor.cast,
     roles: undefined,
     agents: [
       { key: 'builder', role: 'builder', name: UNICODE_LONG_NAME, workspace: UNICODE_PATH },
@@ -29,7 +29,7 @@ export const unicode: WorldDefinition = {
     missions: [{ slug: 'display-review', title: UNICODE_TEXT, steps: [UNICODE_TEXT, '日本語の折り返し', 'مراجعة اتجاه النص', 'Cafe\u0301 remains decomposed', UNICODE_LONG_NAME] }],
   },
   slices: (ctx) => {
-    const base = fleetMidRefactor.slices(ctx)
+    const base = syntheticFleetMidRefactor.slices(ctx)
     const member = ctx.cast.agents[0]!
     const conversation = {
       ...base.conversation,

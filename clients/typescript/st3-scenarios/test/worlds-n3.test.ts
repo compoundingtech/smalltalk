@@ -30,6 +30,8 @@ describe('n3 narrative worlds', () => {
   it('replaces stale content at all three storm recovery checkpoints', () => {
     const world = buildWorld(offlineReconnectStorm, genericVariants, anchor)
     const conversation = world.slices.conversation
+    expect(conversation.source._tag).toBe('synthetic')
+    expect(world.slices.terminal.source._tag).toBe('recorded')
     const snapshots = conversation.timeline.filter((event) => event._tag === 'replace')
     expect(snapshots.map((event) => event.at_ms)).toEqual([6_000, 13_000, 22_000])
     for (const snapshot of snapshots) {
@@ -76,7 +78,12 @@ describe('n3 narrative worlds', () => {
     expect(text).not.toContain('fetchUser')
     const terminal = world.slices.terminal.state.terminals[0]!
     expect(JSON.stringify(terminal.cast)).toContain('Matrix: 6/6 checks passed')
-    expect(terminal.runtime.state).toBe('exited')
+    // Runtime is a captured-screen-derived adapter, not a fabricated exited runtime GET.
+    expect(terminal.runtime.state).toBe('running')
+    expect(world.slices.conversation.source._tag).toBe('recorded')
+    expect(world.slices.terminal.source._tag).toBe('recorded')
+    expect(world.slices.conversation.timeline).toEqual([])
+    expect(world.slices.terminal.timeline).toEqual([])
     // Planted regression: the calm story guard rejects even one busy harness.
     const busy = world.slices.roster.state.agents.map((value, index) => index === 0 ? { ...value, harness_state: 'busy' } : value)
     expect(busy.every((value) => value.harness_state === 'idle')).toBe(false)

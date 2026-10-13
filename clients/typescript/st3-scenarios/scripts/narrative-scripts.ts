@@ -1,8 +1,26 @@
 import type { TimelineEntry } from '@smalltalk/st3-client'
-import { ANCHOR, ANCHOR_MS, loadWorld, type World } from '../src/index.ts'
+import { ANCHOR, ANCHOR_MS, buildWorld, genericVariants, type World, type WorldDefinition } from '../src/index.ts'
 import { recordingIdentities, type JsonObject, type JsonValue, type RecordingRow, type RecordingScript, type RecordingTurn } from './recordings.ts'
+import { syntheticFleetMidRefactor } from '../src/worlds/fleetMidRefactor.ts'
+import { syntheticCiFailingFix } from '../src/worlds/ciFailingFix.ts'
+import { syntheticLongDebugRabbitHole } from '../src/worlds/longDebugRabbitHole.ts'
+import { syntheticFirstRunOnboarding } from '../src/worlds/firstRunOnboarding.ts'
+import { syntheticMergeConflictStandoff } from '../src/worlds/mergeConflictStandoff.ts'
+import { syntheticOfflineReconnectStorm } from '../src/worlds/offlineReconnectStorm.ts'
+import { syntheticReleaseCandidatePolish } from '../src/worlds/releaseCandidatePolish.ts'
 
 export const NARRATIVE_RECORDINGS = ['fleet-mid-refactor', 'ci-failing-fix', 'long-debug-rabbit-hole', 'first-run-onboarding', 'merge-conflict-standoff', 'offline-reconnect-storm', 'release-candidate-polish'] as const
+
+/** Authored capture inputs stay stable after catalog worlds adopt their recordings. */
+const authoredWorlds: Record<typeof NARRATIVE_RECORDINGS[number], WorldDefinition> = {
+  'fleet-mid-refactor': syntheticFleetMidRefactor,
+  'ci-failing-fix': syntheticCiFailingFix,
+  'long-debug-rabbit-hole': syntheticLongDebugRabbitHole,
+  'first-run-onboarding': syntheticFirstRunOnboarding,
+  'merge-conflict-standoff': syntheticMergeConflictStandoff,
+  'offline-reconnect-storm': syntheticOfflineReconnectStorm,
+  'release-candidate-polish': syntheticReleaseCandidatePolish,
+}
 
 const json = (value: unknown): JsonValue => {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
@@ -65,7 +83,7 @@ const storyTurns = (world: World, owner: string): RecordingTurn[] => {
 
 /** Cast and story data stay authoritative in the existing synthetic world definitions. */
 export const narrativeScript = (id: typeof NARRATIVE_RECORDINGS[number], rows: readonly RecordingRow[] = []): RecordingScript => {
-  const world = loadWorld(id, { now: ANCHOR_MS })
+  const world = buildWorld(authoredWorlds[id], genericVariants, ANCHOR_MS)
   const terminal = world.slices.terminal.state.terminals[0] ?? world.slices.terminal.timeline.find((event) => event._tag === 'terminal-create')?.record
   const primary = terminal ? world.cast.agents.find((a) => a.id === terminal.owner) : world.cast.agents[0]
   const person = world.cast.people[0]

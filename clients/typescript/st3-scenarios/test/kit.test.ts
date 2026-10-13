@@ -12,6 +12,8 @@ import type { Asciicast } from '../src/kit/asciicast.ts'
 import { screenAt } from '../src/kit/screen.ts'
 import { canonicalJson, generate, sliceFile, sliceTimes } from '../scripts/emit.ts'
 import { rebaseVectors } from '../scripts/vectors.ts'
+import { buildWorld, genericVariants } from '../src/index.ts'
+import { syntheticFleetMidRefactor } from '../src/worlds/fleetMidRefactor.ts'
 
 const packageRoot = fileURLToPath(new URL('../', import.meta.url))
 
@@ -77,7 +79,7 @@ describe('rebase', () => {
 })
 
 describe('worlds', () => {
-  it('orders every timeline by at_ms and numbers stores from 2 upward without gaps', () => {
+  it('orders every timeline and numbers wholly synthetic world stores without gaps', () => {
     for (const { id } of catalog) {
       const world = loadWorld(id, { now: ANCHOR_MS })
       const stores = new Set<number>()
@@ -90,12 +92,14 @@ describe('worlds', () => {
         world.slices[kind].timeline.forEach((event) => stores.add(event.store))
       }
       const changed = [...stores].filter((store) => store > 1).sort((a, b) => a - b)
-      expect(changed).toEqual(changed.map((_, index) => index + 2))
+      if (SLICE_KINDS.every((kind) => world.slices[kind].source._tag === 'synthetic')) {
+        expect(changed).toEqual(changed.map((_, index) => index + 2))
+      }
     }
   })
 
-  it('derives failed-sync-socket-dropped from the default world, differing only in sync', () => {
-    const base = loadWorld('fleet-mid-refactor', { now: ANCHOR_MS })
+  it('derives failed-sync-socket-dropped from the authored synthetic fleet, differing only in sync', () => {
+    const base = buildWorld(syntheticFleetMidRefactor, genericVariants, ANCHOR_MS)
     const failed = loadWorld('failed-sync-socket-dropped', { now: ANCHOR_MS })
     for (const kind of SLICE_KINDS) {
       if (kind === 'sync') expect(failed.slices.sync).not.toEqual(base.slices.sync)

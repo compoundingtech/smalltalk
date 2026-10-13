@@ -286,7 +286,8 @@ export const importRecording = (script: Pick<RecordingScript, 'format_version' |
       store = snapshot.store_index
       const screen = screenValue(v.value)
       const selector = { collection: 'terminal', terminal: screen.terminal_id } as const
-      const runtime: Runtime = { id: `runtime/${screen.terminal_id}`, kind: 'runtime', revision: screen.revision, updated_at: snapshot.created_at, desired_revision: null, incarnation_id: screen.runtime_incarnation, owner_host_id: host, owner_id: agent, runtime_id: screen.terminal_id, runtime_kind: 'terminal', state: 'running', terminal_id: screen.terminal_id }
+      const runtimeKey = `${screen.terminal_id.slice('terminal/'.length)}-shell`
+      const runtime: Runtime = { id: `runtime/${runtimeKey}`, kind: 'runtime', revision: screen.revision, updated_at: snapshot.created_at, desired_revision: null, incarnation_id: screen.runtime_incarnation, owner_host_id: host, owner_id: agent, runtime_id: runtimeKey, runtime_kind: 'terminal', state: 'running', terminal_id: screen.terminal_id }
       const pastScreens = rows.filter((r) =>
         r.kind === 'frame' && r.receive_ms <= 0 && r.value.kind === 'screen' && object(r.value.value).terminal_id === screen.terminal_id ||
           r.kind === 'http' && r.receive_ms <= Math.max(0, row.receive_ms) && object(r.value.body).value !== undefined && object(object(r.value.body).value).kind === 'terminal-screen' && object(object(r.value.body).value).terminal_id === screen.terminal_id)

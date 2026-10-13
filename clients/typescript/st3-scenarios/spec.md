@@ -400,7 +400,8 @@ fails on any byte difference, naming each stale or missing file and the command 
 ## Recordings (D3)
 
 Synthetic data covers shape and scale; recordings supply the wire details a generator does not
-invent (field combinations, revision chains, fences, page boundaries, real `TerminalScreen` runs).
+invent (native entries, fences, page boundaries and real `TerminalScreen` runs). Numeric streaming
+revision chains remain synthetic where native ingestion only emits revision 1/final true.
 
 ```
 recordings/<name>.script.json        fake-harness script generated from the world's cast
@@ -506,9 +507,11 @@ budget; the fixtures-tree 24 MiB budget is unchanged.
 The recorded-world end state is seven story-specific narratives: `fleet-mid-refactor`,
 `ci-failing-fix`, `merge-conflict-standoff`, `long-debug-rabbit-hole`,
 `release-candidate-polish`, `offline-reconnect-storm`, and `first-run-onboarding`.
-This recording stage commits all seven scripts, raw captures and emitted normalized oracles.
-The catalog's 146 fixtures remain byte-identical: adoption of recorded conversation/terminal
-slices is the next stage, not an overlay or a change to world definitions here.
+All seven scripts, raw captures and emitted normalized oracles are committed. The seven catalog
+narratives adopt recording-derived conversation and terminal data, with the explicit synthetic
+exceptions below. Their world ids and cast identities are unchanged. The seventeen edge worlds
+retain their synthetic inputs and byte-identical fixtures; the authored synthetic story factories
+remain the stable input to script generation, not a second recording oracle.
 
 ### Narrative capture selection
 
@@ -531,7 +534,7 @@ Current Claude native ingestion emits `revision: 1` and `final: true`, even when
 same native entry is rewritten. Scripts may supply `revisions` (intermediate assistant
 texts) to capture real same-id content replacements, but the recorder preserves the
 daemon's revision/finality fields exactly. Increasing streaming revision chains for
-the migrator and reconnect story remain synthetic in the next cutover stage; these
+the migrator and reconnect story remain explicitly synthetic in the catalog cutover; these
 recordings do not claim increasing native revision numbers.
 
 The generated selection has 8/8/22/3/10/7/4 turns in the table's world order,
@@ -554,8 +557,40 @@ native insertion exhibits quadratic replacement-page growth; this is a product-w
 finding, not a reason to omit recorded frames or increase the 12 MiB budget.
 The generated capture selection therefore retains the first and final shuffled batch of
 each hypothesis, all three headings/rejections, more than 50 native entries, the full
-forty-minute timestamp span, summary, one-line fix and green run. The repeated middle
-batches remain in the unchanged synthetic catalog world, not in the smaller recording.
+forty-minute timestamp span, summary, one-line fix and green run. The catalog now uses this
+recorded 22-turn story: the repetitive middle batches are omitted, not synthetically inserted.
+All three rejected hypotheses and the causal fix survive, so the world's purpose is unchanged.
+
+### Catalog cutover provenance and splice points
+
+Each complete slice has one `source`: recorded or synthetic. A conversation that composes a
+recorded prefix with synthetic revisions is marked **synthetic**, not recorded. The table
+identifies the recorded contribution without attributing synthetic frames to the capture.
+All seven terminal slices are recorded. Roster, details, attention and sync slices remain
+synthetic: capture receipt times are not the authored product milestones, and the single-host
+daemon cannot witness remote cast activity.
+
+| World | Recorded contribution | Synthetic slices and reason | Explicit splice |
+| --- | --- | --- | --- |
+| `fleet-mid-refactor` | Builder conversation and terminal. | Conversation is synthetic composition: the entire migrator thread/diff/revision timeline retains increasing revisions absent from native ingestion. Reviewer/docs activity on `host/foundry` and roster/details/attention/sync remain synthetic. | Thread ownership: builder from recording, migrator from authored synthetic data; no within-thread revision collision. |
+| `ci-failing-fix` | Complete conversation and terminal: bisect, patch and green retry. | Roster/details/attention/sync keep the authored 10/18/30-second milestones. | Whole conversation and terminal replacement; no synthetic entries/screens inserted. |
+| `long-debug-rabbit-hole` | Complete 22-turn conversation and terminal, including three rejected hypotheses, forty-minute history and one-line fix. | Roster/details/attention/sync milestones only; repetitive middle batches are omitted rather than spliced. | Whole recorded slices; older-page history remains recorded. |
+| `first-run-onboarding` | Empty baseline and genuine future thread/terminal creation, native turns and green screen. | First mission card and roster/details/attention/sync timing remain synthetic. | Whole recorded slices; the recording's creation offsets are independent of synthetic mission/roster offsets. |
+| `merge-conflict-standoff` | Both same-host conversations, native three-way conflict tool data, adjudication and terminal verification. | Mission/card and roster/details/attention/sync milestones remain synthetic. | Whole recorded conversation and terminal; no synthetic turns inserted. |
+| `offline-reconnect-storm` | Recorded historical deployment introduction and terminal. | Conversation is synthetic composition: report revisions 1–5, transient observation and authoritative replacement windows preserve the product streaming story. Remote reviewer on `host/orchard` and roster/details/attention/sync remain synthetic, including close/backoff at 2/8/16 seconds. | Before the first assistant `Readiness: 2 of 3 replicas` content entry: recorded prefix, then the original synthetic report identity/revision chain; replacements at 6000/13000/22000 ms retain that prefix. |
+| `release-candidate-polish` | Builder/docs completed conversation history and terminal; no future captured activity. | Reviewer on `host/lantern` and completed mission/roster/details/attention/sync state remain synthetic. | Whole recorded slices; future conversation and terminal timelines stay empty. |
+
+`NARRATIVE_SPLICES` names the two composed-conversation boundaries in code. Adoption tests
+assert the selected native ids and synthetic ids, exact revision chains and replacement
+prefixes, and compare the five unspliced conversations and all seven terminals with fresh
+recording imports. Test-only fidelity worlds are separate: all six of their slices remain
+recorded, including fleet/offline native revision 1/final true and captured reconnect windows.
+
+Production conversation state accumulates recorded prebaseline entries rather than exposing only
+the last socket replacement window. Its `has_more` is true when that accumulated history exceeds
+`page_size`; this product pagination projection does not rewrite captured frame/page flags in
+the fidelity world. Generic regenerating variants are synthetic, even when their backing
+default slice is recorded; `loading` alone retains that backing source.
 
 ### Normalization
 
@@ -596,24 +631,24 @@ Each recording has a **fidelity world**, `recorded-<name>`: every slice comes fr
 none from factories. Fidelity worlds are test-only; they are not in the catalog or in
 `fixtures/scenarios`.
 
-This stage provides capture-derived test-only `recorded-<name>` imports for all seven
-narratives and checks each against its emitted normalization oracle. The existing
-proof retains independent per-frame/per-HTTP replay fidelity and mutation tests.
-Full replay fidelity for the new historical/reconnect captures is deferred to the
-cutover stage: prebaseline historical replacement windows and connection lifecycles
-need additional replay boundary representation. Import-oracle equality is not
-presented as proof that replay already reproduces those windows.
+All seven capture-derived test-only `recorded-<name>` imports independently reconstruct every
+captured frame and HTTP exchange through replay, including prebaseline history, older-page cursor
+walks, reconnect replacement windows and multiple sockets. Import-oracle equality remains a
+separate normalization assertion, never a substitute for replay fidelity.
 
 The TypeScript proof world is `recorded-fleet-mid-refactor-proof`, defined only in the test tree.
 Its six slices are imported from captured state and events. Optional typed `recording` transport
-metadata preserves frame ordinals, receive offsets, selectors, event indices (or baseline),
-replacement/`has_more` flags and fences; HTTP metadata preserves method, route, query, status,
-envelope ids, page boundaries and attach fields. Frame metadata never contains response items.
-HTTP timeline boundaries contain only entry-id selections and block-field presence: the captured
-HTTP page omitted native blocks that the socket carried for those same entries. Replay selects
-the entries from folded slice state and applies that projection without changing their other
-fields. Replay reconstructs item arrays and terminal values from the slices, not from the
-oracle's response table. The normalized oracle is a separate emitted recording input.
+metadata preserves frame ordinals, receive offsets, socket/subscription identity, selectors,
+event or historical-window references, replacement/`has_more` flags and fences; HTTP metadata
+preserves method, route, query, status, envelope ids, cursor/page boundaries and attach fields.
+Frame metadata never contains response items. Historical wire values live in typed slice
+`recorded_history`, not transport response tables, and participate in strict decode and rebasing.
+Production narrative worlds omit redundant historical wire-window archives.
+HTTP timeline boundaries select entry ids/versions and block-field presence: captured HTTP pages
+can omit native blocks that sockets carry for the same entries. Replay resolves the selected
+slice values and applies that projection without changing other fields. It reconstructs arrays
+and terminal values from slice data, never from the oracle's response table. The normalized
+oracle remains a separate emitted recording input.
 
 
 The fidelity test replays `recorded-<name>` with `now` pinned to the anchor, sends the normalized
@@ -631,14 +666,18 @@ from the recording; see [Store versions](#store-versions).
 The same `N` applies to replay outputs in normalized context: numeric slice stores become
 oracle `store#n` tokens without reranking; existing normalized tokens remain unchanged.
 Independent mutations to slice items/revisions and typed metadata `has_more`, frame boundaries,
-store fences and HTTP status must fail fidelity while leaving the oracle untouched.
+store fences and HTTP status must fail fidelity while leaving the oracle untouched. Narrative
+tests additionally drop, reorder and alter captured frame boundaries and assert failure for
+each world, including historical/reconnect windows rather than only final-state equality.
 
-The required narrative end state reuses a recording's `conversation` and `terminal` slices and
-generates other slices from the same cast. This recording stage does not perform that cutover:
-the ordinary 24 catalog worlds and their fixture bytes remain unchanged. Edge-state worlds
-remain synthetic. The proof capture has a reusable attachment; it does not prove a single-use
-capability recording or complete native PTY-server asciicast. Narrative PTY output records
-the actual scripted command stdout, not an invented full native-project scrollback.
+The seven narrative catalog worlds reuse recording-derived `conversation` and `terminal` data
+and synthesize the other slices from the unchanged cast. Required remote-host activity and
+numeric revision chains have explicit synthetic provenance; no fabricated frame is attributed to
+a recording. Edge-state worlds remain synthetic. The proof capture has a reusable attachment;
+it does not prove a single-use capability recording or complete native PTY-server asciicast.
+Narrative PTY output records actual scripted `printf` stdout, not execution of the displayed
+fictional project commands or invented full native-project scrollback. Runtime descriptions
+remain screen-derived adapters, not evidence of a captured runtime GET.
 
 ## Replay (D8)
 
@@ -878,7 +917,9 @@ and fails unless all hold:
    appear on both sides. For each side the pair defines what the render must show:
    - **expected markers:** display names or short texts from that side's data that must appear;
    - **distinguishing markers:** texts that must appear on this side and not on the other (for
-     example the names of agents `one-agent` removes);
+     example the names of agents `one-agent` removes). A marker already present elsewhere in
+     the other side's wire state is not distinguishing, including prior recorded terminal
+     commands outside the latest screen; a story may legitimately display that scrollback.
    - **counts** where a subset contrast has no unique text: the number of rendered rows of a
      declared kind (for example agent rows: 4 versus 1);
    - **states** for sides without content (`empty`, `loading`, `none`): the side shows none of
@@ -924,7 +965,7 @@ Edge states:
 | `empty` | Live connection, zero resources in every collection. |
 | `loading` | Discovery succeeds; every first reply is held. |
 | `unknown-fields` | Future enum values, extra keys, unknown resource and entry kinds. Decoded tolerant; strict decoding fails exactly at the declared paths. |
-| `failed-sync-<cause>` | One world per failed or stale [sync matrix](#sync-matrix) row that is not pending and needs no local condition: `socket-dropped`, `open-fail`, `resync-coded`, `forbidden`, `non-client-response`, `subscription-error`, `subscription-limit-legacy`, `capability-absent`, `rate-limited`, `cursor-gap`, `page-cursor-expired`. Each uses `fleet-mid-refactor`'s cast and other slices. Pending rows become worlds when their frames land. |
+| `failed-sync-<cause>` | One world per failed or stale [sync matrix](#sync-matrix) row that is not pending and needs no local condition: `socket-dropped`, `open-fail`, `resync-coded`, `forbidden`, `non-client-response`, `subscription-error`, `subscription-limit-legacy`, `capability-absent`, `rate-limited`, `cursor-gap`, `page-cursor-expired`. Each uses the authored synthetic refactor cast and slices, not the recording-adopted narrative. Pending rows become worlds when their frames land. |
 | `replication-diverged` | Healthy transport; page responses carry a `diverged` sync notice for one peer. |
 | `huge` | Full 1,000-agent roster across many hosts and missions in the normal slice; the first cast agent has 10,000 logical turns (40,000 entries). Commits the newest 400 turns (1,600 entries), including a 50-entry live window; scripted replay pages reach older entries generated deterministically from seed metadata. Native readers see committed pages only. |
 | `unicode` | RTL, CJK, emoji, combining marks, zero-width joiners, 200-character names and long paths in every slice. |

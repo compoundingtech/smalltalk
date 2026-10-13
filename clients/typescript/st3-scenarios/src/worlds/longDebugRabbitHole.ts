@@ -13,6 +13,7 @@ import type { Slice } from '../kit/slice.ts'
 import { parseTimestamp } from '../kit/time.ts'
 import { liveSync } from '../kit/variants.ts'
 import type { Slices, WorldDefinition } from '../kit/world.ts'
+import { adoptNarrativeRecording } from './narrativeAdoption.ts'
 
 const SEED = 22
 const START_MS = -40 * 60_000
@@ -49,7 +50,7 @@ const hypotheses: Record<HypothesisKey, Hypothesis> = {
 const phaseKeys: readonly HypothesisKey[] = ['network', 'timers', 'cache']
 
 /** Forty minutes of evidence, three discarded explanations, one isolated test signal. */
-export const longDebugRabbitHole: WorldDefinition = {
+export const syntheticLongDebugRabbitHole: WorldDefinition = {
   id: 'long-debug-rabbit-hole',
   title: 'Long debug rabbit hole',
   narrative: 'A forty-minute hunt through network retries, fake timers and cache state finds an order-dependent shared AbortController. Hundreds of terminal lines and multiple conversation pages end in a one-line fixture fix.',
@@ -173,3 +174,5 @@ const build = (ctx: FactoryContext): Slices => {
   }
   return { roster, details, attention, conversation, terminal, sync: { ...liveSync(ctx, { conversation }), variant: 'default', source } }
 }
+
+export const longDebugRabbitHole: WorldDefinition = adoptNarrativeRecording(syntheticLongDebugRabbitHole)

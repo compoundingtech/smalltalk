@@ -13,13 +13,14 @@ import type { ConversationEvent, Slice, TerminalRecord } from '../kit/slice.ts'
 import { liveSync } from '../kit/variants.ts'
 import * as vocabulary from '../kit/vocabulary/index.ts'
 import type { Slices, WorldDefinition } from '../kit/world.ts'
+import { adoptNarrativeRecording } from './narrativeAdoption.ts'
 
 const synthetic = (seed: number) => ({ _tag: 'synthetic' as const, seed })
 
 export const SEED = 1
 
 /** Four agents rename an API across a monorepo: blocked, waiting for review, streaming diffs, idle. */
-export const fleetMidRefactor: WorldDefinition = {
+export const syntheticFleetMidRefactor: WorldDefinition = {
   id: 'fleet-mid-refactor',
   title: 'Fleet mid-refactor',
   narrative:
@@ -303,3 +304,5 @@ const build = (ctx: FactoryContext): Slices => {
   return { roster, details, attention, conversation, terminal, sync: { ...liveSync(ctx, { conversation }), variant: 'default', source } }
 }
 
+
+export const fleetMidRefactor: WorldDefinition = adoptNarrativeRecording(syntheticFleetMidRefactor)
