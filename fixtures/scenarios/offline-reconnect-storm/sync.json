@@ -467,39 +467,39 @@
       "at_ms": 2000,
       "code": 1006,
       "reason": "",
-      "store": 2
+      "store": 9
     },
     {
       "_tag": "reopen",
       "after_ms": 3000,
       "at_ms": 2000,
-      "store": 2
+      "store": 9
     },
     {
       "_tag": "close",
       "at_ms": 8000,
       "code": 1006,
       "reason": "",
-      "store": 5
+      "store": 12
     },
     {
       "_tag": "reopen",
       "after_ms": 3000,
       "at_ms": 8000,
-      "store": 5
+      "store": 12
     },
     {
       "_tag": "close",
       "at_ms": 16000,
       "code": 1006,
       "reason": "",
-      "store": 7
+      "store": 14
     },
     {
       "_tag": "reopen",
       "after_ms": 5000,
       "at_ms": 16000,
-      "store": 7
+      "store": 14
     }
   ],
   "times": [],
