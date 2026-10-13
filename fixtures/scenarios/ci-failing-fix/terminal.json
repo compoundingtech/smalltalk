@@ -14,17 +14,17 @@
         "cast": {
           "events": [
             [
-              -0.068,
+              0,
               "o",
               "$ pnpm --filter @atlas/api test\n\u001b[31mFAIL packages/api/test/parseOptions.test.ts > accepts an omitted limit\nTypeError: Expected a number, received undefined\nat parseOptions (packages/api/src/options.ts:18)\nTests: 1 failed, 47 passed; exit 1\u001b[0m\n"
             ],
             [
-              0.206,
+              0.274,
               "o",
               "$ git bisect run pnpm --filter @atlas/api test\n\u001b[32mcandidate 1: refactor request logging — good\ncandidate 2: update API fixtures — good\ncandidate 3: bump option-schema 4.0 to 4.1 — bad\nfirst bad change: option-schema now validates undefined before applying defaults\u001b[0m\n"
             ],
             [
-              0.801,
+              0.869,
               "o",
               "$ pnpm -r typecheck && pnpm --filter @atlas/api test && pnpm -r build\n\u001b[32mPASS packages/api/test/parseOptions.test.ts\nTests: 48 passed, 0 failed\nCI retry #2: typecheck, test, build all passed\u001b[0m\n"
             ]
@@ -35,7 +35,7 @@
             "version": 2,
             "width": 80
           },
-          "started_at_ms": 0
+          "started_at_ms": -68
         },
         "incarnation": "incarnation#1",
         "owner": "agent/example/atlas/builder",

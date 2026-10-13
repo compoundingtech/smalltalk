@@ -271,6 +271,10 @@ turn (40,000 entries). It commits only the newest 400 turns (1,600 entries), inc
 
 The header omits the absolute `timestamp`; `started_at_ms` places the cast in world time
 (D5). `kit/asciicast.ts` exports a cast as NDJSON `.cast` text for asciinema-compatible players.
+Recorded casts start at their first captured PTY output offset (or zero for no output).
+Their event times are nonnegative, nondecreasing seconds since that start, not world-relative
+receive offsets: `started_at_ms + event_seconds * 1000` preserves the captured world offset.
+The catalog gate checks this relative-time contract for every emitted synthetic/recorded cast.
 
 A synthetic run produces line-oriented output only: text, `\r\n`, `\r` and SGR styles.
 `kit/screen.ts` turns such a cast into `TerminalScreen` values with a minimal line model.

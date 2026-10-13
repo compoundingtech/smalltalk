@@ -43,7 +43,7 @@ describe('production recording adoption and explicit synthetic splices', () => {
   for (const id of narratives) {
     it(`${id}: uses captured terminal values and offsets without authoring new recorded screens`, () => {
       const production = loadWorld(id, { now: ANCHOR_MS })
-      const recorded = loadRecordedWorld(id).world
+      const { world: recorded, rows } = loadRecordedWorld(id)
       expect(production.slices.terminal).toEqual({
         ...recorded.slices.terminal, state: { terminals: recorded.slices.terminal.state.terminals },
       })
@@ -53,6 +53,13 @@ describe('production recording adoption and explicit synthetic splices', () => {
         expect(owner).toBeDefined()
         expect(terminal.runtime.id).toBe(owner?.terminalRuntime)
         expect(terminal.runtime.runtime_id).toBe(owner?.terminalRuntime.slice('runtime/'.length))
+        const output = rows.filter((row) => row.kind === 'pty_output' && row.value.terminal === terminal.terminal)
+        expect(terminal.cast.events).toHaveLength(output.length)
+        for (const [index, [seconds, , text]] of terminal.cast.events.entries()) {
+          const captured = output[index]!
+          expect(terminal.cast.started_at_ms + seconds * 1000).toBeCloseTo(captured.receive_ms, 6)
+          expect(text).toBe(captured.value.text)
+        }
       }
       if (id !== 'fleet-mid-refactor' && id !== 'offline-reconnect-storm') {
         expect(production.slices.conversation).toEqual({

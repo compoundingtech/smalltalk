@@ -14,7 +14,7 @@
         "cast": {
           "events": [
             [
-              -0.334,
+              0,
               "o",
               "$ pnpm release:verify --version 0.8.4\n\u001b[32mmeadow\u001b[0m:builder $ pnpm release:verify --version 0.8.4\nRelease candidate 0.8.4\nlinux   unit tests       PASS (184 tests)\nmacos   unit tests       PASS (184 tests)\nall     typecheck        PASS\nall     lint             PASS\nall     package smoke    PASS\nall     release notes    PASS\nMatrix: 6/6 checks passed\nExit code: 0\n\u001b[32mmeadow\u001b[0m:builder $ \n"
             ]
@@ -25,7 +25,7 @@
             "version": 2,
             "width": 80
           },
-          "started_at_ms": 0
+          "started_at_ms": -334
         },
         "incarnation": "incarnation#1",
         "owner": "agent/example/meadow/builder",

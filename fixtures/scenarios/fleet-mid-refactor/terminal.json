@@ -14,7 +14,7 @@
         "cast": {
           "events": [
             [
-              -1.772,
+              0,
               "o",
               "$ pnpm -r typecheck\n\u001b[31mpackages/api typecheck: Done\npackages/web typecheck: Done\npackages/worker typecheck: src/jobs/syncAvatars.ts(41,18): error TS2554: Expected 2 arguments, but got 1.\npackages/worker typecheck: Failed\u001b[0m\n"
             ]
@@ -25,7 +25,7 @@
             "version": 2,
             "width": 80
           },
-          "started_at_ms": 0
+          "started_at_ms": -1772
         },
         "incarnation": "incarnation#1",
         "owner": "agent/example/atlas/builder",

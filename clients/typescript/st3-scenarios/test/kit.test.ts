@@ -109,6 +109,23 @@ describe('worlds', () => {
 })
 
 describe('terminal screen', () => {
+  it('keeps every emitted catalog cast nonnegative and ordered relative to its start', () => {
+    for (const { id } of catalog) {
+      const world = loadWorld(id, { now: ANCHOR_MS })
+      const terminal = world.slices.terminal
+      const records = [...terminal.state.terminals, ...terminal.timeline.flatMap((event) => event._tag === 'terminal-create' ? [event.record] : [])]
+      for (const { cast } of records) {
+        let previous = 0
+        for (const [seconds] of cast.events) {
+          expect(Number.isFinite(seconds), `${id}: cast event time`).toBe(true)
+          expect(seconds, `${id}: cast event time since start`).toBeGreaterThanOrEqual(previous)
+          previous = seconds
+        }
+      }
+      // These are the same complete records the emitter serializes, including future creations.
+      expect(sliceFile(world, terminal).state).toEqual(terminal.state)
+    }
+  })
   it('wraps a line that reaches the width onto the next row and keeps every character', () => {
     const cast = { header: { version: 2, width: 10, height: 4 }, started_at_ms: 0,
       events: [[0, 'o', 'Expected 2 arguments\r\nok\r\n']] } satisfies Asciicast

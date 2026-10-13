@@ -298,7 +298,9 @@ export const importRecording = (script: Pick<RecordingScript, 'format_version' |
         object(object(object(r.value.body).value).terminal_attachment).terminal_id === screen.terminal_id)
       const streamUrl = attached === undefined ? undefined : text(object(object(object(attached.value.body).value).terminal_attachment).stream_url)
       const terminalOwner = streamUrl === undefined ? agent : decodeURIComponent(new URL(streamUrl, 'http://scenario.invalid').pathname.slice('/v1/client/terminals/'.length, -'/stream'.length))
-      const record: TerminalRecord = { terminal: screen.terminal_id, owner: terminalOwner, runtime: { ...runtime, owner_id: terminalOwner }, incarnation: screen.runtime_incarnation, cast: { header: { version: 2, width: screen.columns, height: screen.rows, ...(screen.title === undefined ? {} : { title: screen.title }) }, started_at_ms: 0, events: rows.filter((r) => r.kind === 'pty_output' && r.value.terminal === screen.terminal_id).map((r): [number, 'o', string] => [r.receive_ms / 1000, 'o', text(r.value.text)]) }, screens: pastScreens }
+      const output = rows.filter((r) => r.kind === 'pty_output' && r.value.terminal === screen.terminal_id)
+      const started_at_ms = output[0]?.receive_ms ?? 0
+      const record: TerminalRecord = { terminal: screen.terminal_id, owner: terminalOwner, runtime: { ...runtime, owner_id: terminalOwner }, incarnation: screen.runtime_incarnation, cast: { header: { version: 2, width: screen.columns, height: screen.rows, ...(screen.title === undefined ? {} : { title: screen.title }) }, started_at_ms, events: output.map((r): [number, 'o', string] => [(r.receive_ms - started_at_ms) / 1000, 'o', text(r.value.text)]) }, screens: pastScreens }
       if (row.receive_ms <= 0) {
         const index = terminals.findIndex((item) => item.terminal === screen.terminal_id)
         if (index === -1) terminals.push(record)

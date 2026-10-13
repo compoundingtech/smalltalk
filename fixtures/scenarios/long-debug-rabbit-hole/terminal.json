@@ -14,37 +14,37 @@
         "cast": {
           "events": [
             [
-              -15.406,
+              0,
               "o",
               "$ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=1 --repeat=12\n\u001b[31mseed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.\u001b[0m\n"
             ],
             [
-              -12.588,
+              2.818,
               "o",
               "$ pnpm --filter @atlas/web test searchClient -- --network=stub --sequence.shuffle --seed-start=85 --repeat=12\n\u001b[31mseed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nAll responses come from the in-memory transport; failing seeds make zero network requests.\u001b[0m\n"
             ],
             [
-              -10.45,
+              4.956,
               "o",
               "$ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=1 --repeat=12\n\u001b[31mseed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\u001b[0m\n"
             ],
             [
-              -7.319,
+              8.087,
               "o",
               "$ pnpm --filter @atlas/web test searchClient -- --timers=real --sequence.shuffle --seed-start=85 --repeat=12\n\u001b[31mseed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nThe test still fails with real timers and a drained microtask queue; no timer remains pending.\u001b[0m\n"
             ],
             [
-              -4.365,
+              11.041,
               "o",
               "$ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=1 --repeat=12\n\u001b[31mseed 001: PASS search before cancellation: 12 assertions\nseed 002: PASS search before cancellation: 12 assertions\nseed 003: PASS search before cancellation: 12 assertions\nseed 004: PASS search before cancellation: 12 assertions\nseed 005: PASS search before cancellation: 12 assertions\nseed 006: PASS search before cancellation: 12 assertions\nseed 007: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 008: PASS search before cancellation: 12 assertions\nseed 009: PASS search before cancellation: 12 assertions\nseed 010: PASS search before cancellation: 12 assertions\nseed 011: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 012: PASS search before cancellation: 12 assertions\nbatch 1: 10 passed, 2 failed\nA new empty cache for every trial still fails when cancellation runs before search.\u001b[0m\n"
             ],
             [
-              -1.606,
+              13.8,
               "o",
               "$ pnpm --filter @atlas/web test searchClient -- --cache=off --sequence.shuffle --seed-start=85 --repeat=12\n\u001b[31mseed 085: PASS search before cancellation: 12 assertions\nseed 086: PASS search before cancellation: 12 assertions\nseed 087: PASS search before cancellation: 12 assertions\nseed 088: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 089: PASS search before cancellation: 12 assertions\nseed 090: PASS search before cancellation: 12 assertions\nseed 091: FAIL search after cancellation: AbortError, signal.aborted=true\nseed 092: PASS search before cancellation: 12 assertions\nseed 093: PASS search before cancellation: 12 assertions\nseed 094: PASS search before cancellation: 12 assertions\nseed 095: PASS search before cancellation: 12 assertions\nseed 096: PASS search before cancellation: 12 assertions\nbatch 8: 10 passed, 2 failed\nA new empty cache for every trial still fails when cancellation runs before search.\u001b[0m\n"
             ],
             [
-              3.235,
+              18.641,
               "o",
               "$ pnpm --filter @atlas/web test searchClient -- --sequence.shuffle --repeat=100\n\u001b[32m100 shuffled orders passed; 0 AbortError failures\nCancellation still aborts its own request; search uses a fresh signal.\n1 file changed, 1 insertion(+), 1 deletion(-)\u001b[0m\n"
             ]
@@ -55,7 +55,7 @@
             "version": 2,
             "width": 80
           },
-          "started_at_ms": 0
+          "started_at_ms": -15406
         },
         "incarnation": "incarnation#1",
         "owner": "agent/example/atlas/builder",

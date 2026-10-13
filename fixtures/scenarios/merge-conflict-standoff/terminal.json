@@ -14,12 +14,12 @@
         "cast": {
           "events": [
             [
-              -0.617,
+              0,
               "o",
               "$ git merge cache-policy\n\u001b[31mCONFLICT (content): Merge conflict in packages/cache/policy.ts\n<<<<<<< ours\nexport const cachePolicy = { ttl: 300, stale: false };\n||||||| base\nexport const cachePolicy = { ttl: 60, stale: false };\n=======\nexport const cachePolicy = { ttl: 60, stale: true };\n>>>>>>> theirs\n\u001b[0m\n"
             ],
             [
-              0.511,
+              1.128,
               "o",
               "$ pnpm test cache && git add packages/cache/policy.ts && git commit -m \"Combine cache TTL and stale reads\"\n\u001b[32m12 cache tests passed; 0 failures\n[cache-policy c0ffee1] Combine cache TTL and stale reads\u001b[0m\n"
             ]
@@ -30,7 +30,7 @@
             "version": 2,
             "width": 80
           },
-          "started_at_ms": 0
+          "started_at_ms": -617
         },
         "incarnation": "incarnation#1",
         "owner": "agent/example/harbor/builder",
