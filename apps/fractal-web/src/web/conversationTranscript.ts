@@ -156,6 +156,7 @@ export const prepareTranscriptTurns = (
     turnItems = []
   }
   for (const sourceItem of items) {
+    // Unsupported is always retained: F2 markers are not a system-events preference.
     if (!options.showSystemEvents && isOmittedItem(sourceItem)) continue
     // The runtime must not receive unknown protocol payloads either: its converter and fallback
     // rows render the same short notice, never a raw JSON envelope or producer-specific kind.

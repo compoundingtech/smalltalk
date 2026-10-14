@@ -234,6 +234,7 @@ export const longSessionItems: readonly ConversationItem[] = Array.from({ length
     case 'Usage':
     case 'Notice':
     case 'Event':
+    case 'Unsupported':
     case 'UnknownEvent':
       return item
     default: {

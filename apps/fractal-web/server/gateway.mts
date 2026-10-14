@@ -134,6 +134,9 @@ const makeGateway = ({ socketPath, host, authorization, timeoutMs }: { socketPat
       const cleanup = () => { socket.off('error', error); socket.off('close', clientClosed) }
       const upstream = request({ socketPath, path: withoutTraceQuery(req.url), method: req.method, headers: {
         ...cleanHeaders(req.headers, true), host, authorization, ...traceHeaders(span),
+        // Browser WebSocket cannot send SDK headers, including on the early socket.
+        // Old daemons ignore this additive feature; readers still detect optional blocks.
+        'x-st3-features': 'custom-subjects.v1, conversation-blocks.v1',
       }, agent: false })
       socket.once('error', error); socket.once('close', clientClosed)
       upstream.on('error', error)

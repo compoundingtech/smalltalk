@@ -257,6 +257,7 @@ export const senderOf = ({
       return { kind: 'system', label: 'Run' }
     case 'Notice':
     case 'UnknownEvent':
+    case 'Unsupported':
       return { kind: 'system', label: 'System' }
     case 'Event':
       return item.sender

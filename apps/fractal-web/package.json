@@ -5,6 +5,7 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "check:st-coverage": "bun scripts/check-st-coverage.ts",
     "dev": "vite --config vite.config.ts --configLoader runner"
   },
   "dependencies": {

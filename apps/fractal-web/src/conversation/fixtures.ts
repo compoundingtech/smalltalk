@@ -877,6 +877,7 @@ const toTimeline = ({
         timestamp: raw.timestamp,
         rawType: type,
         raw,
+        issue: 'Fixture citation intentionally rejected by the entry schema',
       }
     }
     return type === 'reasoning'

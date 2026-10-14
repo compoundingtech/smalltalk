@@ -1,7 +1,7 @@
 /**
  * Type-only port of conversation/model.ts's Schema.Type contract. The source app owns decoding;
  * the isolated workshop does not import Effect or the generated SDK just to render synthetic data.
- * All nine source tags, readonly fields, optionality and unknown payloads are preserved here.
+ * All source tags, readonly fields, optionality and unknown payloads are preserved here.
  */
 export type Role = 'user' | 'assistant' | 'system'
 export type Sender = {
@@ -28,7 +28,7 @@ export type NoticeKind = 'error' | 'redaction' | 'truncation' | 'event' | 'unkno
 export type HarnessNotice =
   | { readonly _tag: 'SubagentResult'; readonly taskId: string; readonly agent: string; readonly status: string; readonly duration: string; readonly payload: string; readonly raw: string; readonly lines?: number; readonly size?: string; readonly fullOutput?: string; readonly abortReason?: string; readonly error?: string; readonly mergeSummary?: string; readonly followUp?: string }
   | { readonly _tag: 'Irc'; readonly from: string; readonly to?: string; readonly replyTo?: string; readonly payload: string; readonly raw: string }
-  | { readonly _tag: 'BackgroundJob'; readonly jobId: string; readonly label?: string; readonly state: 'completed'; readonly duration?: string; readonly payload: string; readonly raw: string }
+  | { readonly _tag: 'BackgroundJob'; readonly jobId: string; readonly label?: string; readonly state: 'running' | 'completed' | 'failed' | 'cancelled' | 'unknown'; readonly duration?: string; readonly payload: string; readonly raw: string }
   | { readonly _tag: 'Compaction'; readonly payload: string; readonly raw: string }
   | { readonly _tag: 'Interjection'; readonly from: string; readonly to?: string; readonly payload: string; readonly raw: string }
   | { readonly _tag: 'SkillInvocation'; readonly skill: string; readonly by: string; readonly payload: string; readonly raw: string }
@@ -37,6 +37,20 @@ export type HarnessNotice =
 /** Visual weight of a harness event; the transcript default is one line in HarnessNotice. */
 export type HarnessWeight = 'row' | 'card'
 
+
+export type UnsupportedReason =
+  | 'unknown-entry-type'
+  | 'unknown-status'
+  | 'undecodable-entry'
+  | 'unknown-block-kind'
+  | 'unrecognized-record'
+  | 'undecodable-block'
+  | 'missing-view'
+export type InspectPreview = {
+  readonly text: string
+  readonly bytes: number
+  readonly truncated: boolean
+}
 export type ConversationItem =
   | {
       readonly _tag: 'Text'
@@ -126,6 +140,16 @@ export type ConversationItem =
       readonly at?: string
     }
   | {
+      /** Only a redacted, capped preview crosses the rendering boundary; never the raw record. */
+      readonly _tag: 'Unsupported'
+      readonly id: string
+      readonly harness: string
+      readonly recordKind: string
+      readonly reason: UnsupportedReason
+      readonly inspect: InspectPreview
+      readonly at?: string
+    }
+  | {
       readonly _tag: 'UnknownEvent'
       readonly id: string
       readonly eventType: string
@@ -143,6 +167,7 @@ export type UsageItem = Extract<ConversationItem, { _tag: 'Usage' }>
 export type NoticeItem = Extract<ConversationItem, { _tag: 'Notice' }>
 export type EventItem = Extract<ConversationItem, { _tag: 'Event' }>
 export type UnknownEventItem = Extract<ConversationItem, { _tag: 'UnknownEvent' }>
+export type UnsupportedItem = Extract<ConversationItem, { _tag: 'Unsupported' }>
 
 /** Delivery lifecycle for a user prompt, from the host's own observations. */
 export type SendState =

@@ -746,6 +746,7 @@ export const liveSource = ({
       } else changedFrom = Math.min(changedFrom, projection.changedFrom)
       return {
         items,
+        ...(timeline.header === undefined ? {} : { header: timeline.header }),
         ...(lastSendId === undefined ? {} : { lastSendId }),
         hasOlder: timeline.hasOlder,
         change: { from: publishedItems, index: changedFrom },

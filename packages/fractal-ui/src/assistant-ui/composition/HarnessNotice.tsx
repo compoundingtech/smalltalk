@@ -26,12 +26,13 @@ export function HarnessNotice({ item, weight = 'card' }: { readonly item: EventI
   const time = item.at === undefined ? NaN : Date.parse(item.at)
   const [expanded, setExpanded] = React.useState(false)
   const shown = presentation[notice._tag]
-  const failed = notice._tag === 'SubagentResult' && notice.status !== 'completed'
+  const failed = (notice._tag === 'SubagentResult' && notice.status !== 'completed')
+    || (notice._tag === 'BackgroundJob' && notice.state === 'failed')
   const noun = shown.noun
   const payload = /^[\s]*[\[{]/.test(notice.payload) ? `\`\`\`json\n${notice.payload}\n\`\`\`` : notice.payload
   const row = weight === 'row'
   return <Disclosure isExpanded={expanded} onExpandedChange={setExpanded} data-testid="harness-notice" data-harness-kind={item.kind} data-harness-weight={weight} data-item-id={item.id} {...stylex.props(styles.base, row ? styles.row : styles.card)}>
-    <div {...stylex.props(styles.header)}><Icon name={failed ? 'alert' : shown.icon} size={14} /><span {...stylex.props(styles.label)}>{item.title}</span><span data-testid="harness-kind" {...stylex.props(styles.pill, failed && styles.pillFailed)}>{notice._tag === 'SubagentResult' ? notice.status : shown.kind}</span>{Number.isFinite(time) && <time dateTime={item.at} title={new Date(time).toLocaleString()} {...stylex.props(styles.time)}>{new Date(time).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>}</div>
+    <div {...stylex.props(styles.header)}><Icon name={failed ? 'alert' : shown.icon} size={14} /><span {...stylex.props(styles.label)}>{item.title}</span><span data-testid="harness-kind" {...stylex.props(styles.pill, failed && styles.pillFailed)}>{notice._tag === 'SubagentResult' ? notice.status : notice._tag === 'BackgroundJob' ? notice.state : shown.kind}</span>{Number.isFinite(time) && <time dateTime={item.at} {...stylex.props(styles.time)}>{new Date(time).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</time>}</div>
     <p data-testid="harness-excerpt" {...stylex.props(styles.excerpt, row && styles.rowIndent)}>{item.text}</p>
     <Button slot="trigger" data-testid="harness-trigger" {...stylex.props(styles.trigger, row && styles.rowIndent)}><Icon name={expanded ? 'chevron-down' : 'chevron-right'} size={14} />{expanded ? `Hide ${noun}` : `Read ${noun}`}</Button>
     {/* The frame lives inside the panel: a collapsed hidden=until-found panel still keeps its own box in Chromium. */}
@@ -48,10 +49,10 @@ export function HarnessNotice({ item, weight = 'card' }: { readonly item: EventI
 
 const styles = stylex.create({
   base: { minWidth: 0, color: ink.fgSoft, fontFamily: t.fontSans, fontSize: t.metaSize, lineHeight: t.metaLeading },
-  card: { padding: s.md, borderWidth: 1, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.md, backgroundColor: surface.raised },
+  card: { padding: s.md, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, borderRadius: r.md, backgroundColor: surface.raised },
   row: { paddingBlock: s.xs, paddingInline: s.zero },
   rowIndent: { marginInlineStart: s.xl },
-  pill: { flexShrink: 0, paddingInline: s.sm, borderRadius: r.full, borderWidth: 1, borderStyle: 'solid', borderColor: border.borderStrong, color: ink.fgMuted, fontSize: t.denseSize },
+  pill: { flexShrink: 0, paddingInline: s.sm, borderRadius: r.full, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.borderStrong, color: ink.fgMuted, fontSize: t.denseSize },
   pillFailed: { borderColor: status.dangerMuted, color: status.dangerFg },
   header: { display: 'flex', alignItems: 'center', gap: s.sm },
   label: { minWidth: 0, flex: 1, overflowWrap: 'anywhere', fontWeight: 500 },
@@ -59,7 +60,7 @@ const styles = stylex.create({
   excerpt: { marginBlock: s.xs, color: ink.fgMuted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   trigger: { display: 'flex', alignItems: 'center', gap: s.xs, padding: 0, minHeight: g.toolRow, borderWidth: 0, backgroundColor: 'transparent', color: ink.fgSoft, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':hover': { color: ink.fg }, ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
   payload: { marginTop: s.sm, paddingBlock: s.sm, paddingInline: s.md, maxHeight: 'min(32rem, 60vh)', overflowY: 'auto', overflowWrap: 'anywhere' },
-  cardPayload: { borderRadius: r.sm, backgroundColor: surface.washSubtle, borderWidth: 1, borderStyle: 'solid', borderColor: border.border },
+  cardPayload: { borderRadius: r.sm, backgroundColor: surface.washSubtle, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.border },
   rowPayload: { marginInlineStart: s.xl, borderInlineStartWidth: 2, borderInlineStartStyle: 'solid', borderInlineStartColor: border.borderStrong },
   facts: { display: 'grid', gridTemplateColumns: 'auto 1fr', gap: s.sm, color: ink.fgMuted, marginBottom: 0, marginInline: 0 },
 })

@@ -14,6 +14,8 @@ import { ErrorOverlay, ErrorOverlayHost } from './ErrorOverlay'
 import { HighlightedSource, Markdown, MarkdownImagePolicy, type MarkdownImageOpener, type MarkdownImageResolver } from './Markdown'
 import { ThinkingEntry } from './ThinkingEntry'
 import { SendFailure, SendUnconfirmed, TranscriptEmptyContent, type TranscriptEmptyState } from './TranscriptFeedback'
+import { HarnessNotice } from './HarnessNotice'
+import { UnsupportedRecord } from './UnsupportedRecord'
 import { Icon } from './Icons'
 import { surfaceVars as surface, textVars as ink, borderVars as border, accentVars as accent, typeVars as t, radiusVars as r, spaceVars as s, geometryVars as g, motionVars as m } from '../composition-tokens.stylex'
 import { readingColumnStyles } from '../reading-column.stylex'
@@ -66,6 +68,8 @@ function TranscriptMessage() {
   if (item === undefined || item._tag === 'ToolCall' || item._tag === 'Reasoning') return null
   if (item._tag === 'Text' && item.role !== 'system') return item.role === 'user' ? <UserMessage item={{ ...item, role: 'user' }} /> : <AgentMessage item={{ ...item, role: 'assistant' }} senderLine={caption} />
   if (item._tag === 'Message') return <AgentMessage item={item} senderLine={caption ?? item.sender?.label ?? item.from} />
+  if (item._tag === 'Unsupported') return <MessagePrimitive.Root data-testid="transcript-message" data-item-id={item.id} data-item-kind={item._tag}><UnsupportedRecord item={item} /></MessagePrimitive.Root>
+  if (item._tag === 'Event' && item.notice !== undefined) return <MessagePrimitive.Root data-testid="transcript-message" data-item-id={item.id} data-item-kind={item._tag}><HarnessNotice item={{ ...item, notice: item.notice }} weight="row" /></MessagePrimitive.Root>
   return <MessagePrimitive.Root data-testid="transcript-message" data-item-id={item.id} data-item-kind={item._tag} {...stylex.props(styles.semantic)}><span {...stylex.props(styles.semanticText)}>{summary}</span></MessagePrimitive.Root>
 }
 const messageComponents = { Message: TranscriptMessage }
@@ -127,11 +131,17 @@ const strandedText = (item: ConversationItem): string | undefined => {
     case 'Notice': return item.detail === undefined ? item.text : `${item.text}\n${item.detail}`
     case 'Event': return `${item.title}\n${item.text}`
     case 'Status': return item.detail
-    default: return undefined
+    case 'ToolCall': case 'Usage': case 'UnknownEvent': case 'Unsupported': return undefined
+    default: {
+      const unhandled: never = item
+      throw new Error(`Unrecognized stranded item: ${unhandled}`)
+    }
   }
 }
 /** Fallback for an item the runtime never adopted: visible in place, never silently dropped. */
 function StrandedItem({ item }: { readonly item: ConversationItem }) {
+  if (item._tag === 'Unsupported') return <UnsupportedRecord item={item} />
+  if (item._tag === 'Event' && item.notice !== undefined) return <HarnessNotice item={{ ...item, notice: item.notice }} weight="row" />
   const text = strandedText(item)
   return <div data-testid="transcript-stranded" data-item-id={item.id} data-item-kind={item._tag} {...stylex.props(styles.semantic)}><span {...stylex.props(styles.semanticText)}>{text === undefined || text.trim() === '' ? 'Couldn\u2019t display this entry' : text}</span></div>
 }
@@ -146,6 +156,7 @@ const itemContent = (item: ConversationItem): string => {
     case 'Status': return item.detail ?? ''
     case 'ToolCall': return `${JSON.stringify(item.input) ?? ''}\u0000${item.result === undefined ? '' : JSON.stringify(item.result.content) ?? ''}`
     case 'UnknownEvent': return JSON.stringify(item.data) ?? ''
+    case 'Unsupported': return `${item.harness}\u0000${item.recordKind}\u0000${item.reason}\u0000${item.inspect.text}\u0000${item.inspect.bytes}\u0000${item.inspect.truncated}`
     case 'Usage': return ''
   }
 }

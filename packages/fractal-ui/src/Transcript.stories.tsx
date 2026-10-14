@@ -4,7 +4,7 @@ import type { Meta, StoryObj } from '@storybook/react-vite'
 import { expect, fn, spyOn, userEvent, waitFor, within } from 'storybook/test'
 import { Transcript, type TranscriptAvailability, type TranscriptHistory, type TranscriptTurn } from './assistant-ui/composition/Transcript'
 import type { TranscriptEmptyState } from './assistant-ui/composition/TranscriptFeedback'
-import { EmbraceRuntimeProvider } from './assistant-ui/EmbraceRuntime'
+import { EmbraceRuntimeProvider, RuntimeAdoptedIds } from './assistant-ui/EmbraceRuntime'
 import { EmbraceComposer } from './assistant-ui/EmbraceComposer'
 import type { ConversationItem, SendState, TextItem } from './assistant-ui/embrace-data/model'
 import { workLogTurnFromItems, type WorkLogCall } from './assistant-ui/taste/work-log'
@@ -13,6 +13,7 @@ import type { SyncStatus } from './assistant-ui/st3-views/sync-status'
 import { baselineTheme } from './assistant-ui/neutral-theme'
 import { lightTheme, type Scheme } from './assistant-ui/composition-theme'
 import { surfaceVars as surface, textVars as ink, spaceVars as s, typeVars as t, geometryVars as g } from './assistant-ui/composition-tokens.stylex'
+import { harnessWeightExamples } from './assistant-ui/composition/HarnessNotice.fixtures'
 
 const now = Date.parse('2026-01-15T12:01:00Z')
 const at = '2026-01-15T12:00:00Z'
@@ -57,6 +58,25 @@ function TranscriptStory({ scheme = 'dark', state = 'settled', availability, his
 const meta = { title: 'Fractal UI/Transcript', component: TranscriptStory, parameters: { layout: 'fullscreen' }, args: { scheme: 'dark', state: 'settled' }, argTypes: { scheme: { options: ['dark', 'light'], control: 'radio' }, state: { options: Object.keys(cases), control: 'select' } } } satisfies Meta<typeof TranscriptStory>
 export default meta
 type Story = StoryObj<typeof meta>
+const harnessEventData: TranscriptStoryData = {
+  turns: [{ id: 'harness-events', items: harnessWeightExamples, work: workLogTurnFromItems(harnessWeightExamples, { kindFor: () => 'run', running: false, failed: false, interrupted: false, completeHistory: true }) }],
+  sync: { _tag: 'Live', since: now - 5000 },
+}
+export const HarnessEvents: Story = {
+  render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><RuntimeTranscript data={harnessEventData} onRetry={() => {}} /></main>,
+  play: async ({ canvasElement }) => {
+    const notices = await within(canvasElement).findAllByTestId('harness-notice')
+    await expect(notices).toHaveLength(harnessWeightExamples.length)
+    for (const notice of notices) await expect(notice).toHaveAttribute('data-harness-weight', 'row')
+    const failed = notices.find(notice => notice.dataset.itemId === 'weight/failed-job')!
+    await expect(within(failed).getByTestId('harness-kind')).toHaveTextContent('failed')
+  },
+}
+export const HarnessEventsLight: Story = { ...HarnessEvents, args: { scheme: 'light' } }
+export const StrandedHarnessEvents: Story = {
+  ...HarnessEvents,
+  render: args => <main {...stylex.props(styles.root, ...baselineTheme, args.scheme === 'light' && lightTheme)}><EmbraceRuntimeProvider options={{ messages: [], onNew: async () => {} }}><RuntimeAdoptedIds.Provider value={undefined}><Transcript title="Harness events" turns={harnessEventData.turns} sync={harnessEventData.sync} now={now} observedAt={now - 8000} /></RuntimeAdoptedIds.Provider></EmbraceRuntimeProvider></main>,
+}
 export const Settled: Story = { play: async ({ canvasElement }) => {
   const canvas = within(canvasElement)
   const fold = await canvas.findByRole('button', { name: /Worked for 24s/ })

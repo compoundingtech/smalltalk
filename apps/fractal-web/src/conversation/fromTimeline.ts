@@ -2,12 +2,16 @@
 // LiveTimeline preserves unchanged item identities and re-projects only the touched suffix.
 
 import { TimelineEntryId, Timestamp, type TimelineEntry } from '@smalltalk/st3-client/schema'
-import type { ConversationChunk, UnrecognizedEntry } from '@st3/sdk/effect'
+import type { ConversationChunk, ConversationEntry, UnrecognizedEntry } from '@st3/sdk/effect'
 import { DateTime, Option, Schema } from 'effect'
 
-import type { ConversationItem, ToolCallItem, ToolResult } from './model.ts'
+import type { ConversationItem, ToolCallItem, ToolResult, UnsupportedReason } from './model.ts'
 import { contentEvent, proseItem, withoutShownDeliveries } from './semantics.ts'
-import { q101OmpEnvelopeStopgap } from './q101OmpEnvelopeStopgap.ts'
+import { ompNoticeExcerpt, q101OmpEnvelopeStopgap } from './q101OmpEnvelopeStopgap.ts'
+import { blockFacts, recordValue } from './blocks.ts'
+import { blockRole, isKnownView, viewMeaning } from './vocabulary.ts'
+import { inspectPreview } from './inspect.ts'
+import { recordTranscriptTelemetry } from './telemetry.ts'
 
 /**
  * Fixture-only D08 proposal, not part of the st3 wire contract.
@@ -30,7 +34,7 @@ export type FixtureConversationChunk = Omit<ConversationChunk, 'entries'> & {
   readonly entries: ReadonlyArray<ConversationChunk['entries'][number] | ProposedReasoningEntry>
 }
 
-type Entry = TimelineEntry | ProposedReasoningEntry | UnrecognizedEntry
+type Entry = ConversationEntry | ProposedReasoningEntry | UnrecognizedEntry
 type ToolResultEntry = Extract<Entry, { type: 'tool_result' }>
 type PositionedResult = { readonly entry: ToolResultEntry; readonly at: number }
 
@@ -45,12 +49,19 @@ const isActive = (lastStatus: Entry | undefined) =>
     ['completed', 'failed', 'cancelled'].includes(lastStatus.body.status)
   )
 
-const resultOf = (entry: ToolResultEntry): ToolResult => ({
-  content: entry.body.content,
-  mediaType: entry.body.media_type,
-  isError: entry.body.status === 'error',
-  at: entryTimestamp(entry),
-})
+const resultOf = (entry: ToolResultEntry): ToolResult => {
+  const facts = blockFacts(entry.body)
+  const metadata = facts.blocks?.find(block => block.kind === 'tool_output' && block.metadata !== undefined)?.metadata
+  return {
+    content: entry.body.content,
+    mediaType: entry.body.media_type,
+    isError: entry.body.status === 'error',
+    at: entryTimestamp(entry),
+    ...(facts.blocks === undefined ? {} : { blocks: facts.blocks }),
+    ...(facts.view === undefined ? {} : { view: facts.view }),
+    ...(metadata === undefined ? {} : { metadata }),
+  }
+}
 
 /** A call with its result joined (CAG.CLI.WEB.CNV-R04), or an orphan result rendered on its own. */
 const joinResult = ({
@@ -121,13 +132,7 @@ const unrecognizedOmpItem = (
   } catch {
     data = { rawText: text }
   }
-  return {
-    _tag: 'UnknownEvent',
-    id: entry.id,
-    at: entryTimestamp(entry),
-    eventType: marker[1] === 'message role' ? `message-role/${kind ?? 'untyped'}` : kind ?? 'untyped omp entry',
-    data,
-  }
+  return unsupported(entry.id, 'omp', marker[1] === 'message role' ? `message-role/${kind ?? 'untyped'}` : kind ?? 'untyped omp entry', 'unrecognized-record', data, entryTimestamp(entry))
 }
 
 /**
@@ -148,7 +153,7 @@ const parseNativeReasoning = (entry: Extract<Entry, { type: 'content' }>): Conve
 }
 
 /** Projects one entry that is not a tool result (results join their call instead). */
-const itemOf = ({
+const baseItemOf = ({
   entry,
   sessionActive,
 }: {
@@ -218,13 +223,7 @@ const itemOf = ({
       }
     case 'status':
       if (typeof entry.body.status !== 'string') {
-        return {
-          _tag: 'UnknownEvent',
-          id: entry.id,
-          eventType: `status: ${entry.body.status.raw}`,
-          data: entry.body,
-          at: entryTimestamp(entry),
-        }
+        return unsupported(entry.id, 'st', entry.body.status.raw, 'unknown-status', entry.body, entryTimestamp(entry))
       }
       return {
         _tag: 'Status',
@@ -273,21 +272,77 @@ const itemOf = ({
         at: entryTimestamp(entry),
       }
     case 'unrecognized':
-      return {
-        _tag: 'UnknownEvent',
-        id: entry.id,
-        eventType: entry.rawType,
-        data: entry,
-        ...(entry.timestamp !== undefined ? { at: entry.timestamp } : {}),
-      }
+      return unsupported(entry.id, 'st', entry.rawType, 'undecodable-entry', entry.raw, entry.timestamp)
   }
-  return {
-    _tag: 'UnknownEvent',
-    id: entry.id,
-    eventType: entry.type.raw,
-    data: entry.body,
-    at: entryTimestamp(entry),
+  return unsupported(entry.id, 'st', entry.type.raw, 'unknown-entry-type', entry.body, entryTimestamp(entry))
+}
+
+const itemOf = (args: Parameters<typeof baseItemOf>[0]): ConversationItem => {
+  const item = baseItemOf(args)
+  if (args.entry.type === 'unrecognized' || item._tag === 'Unsupported') return item
+  return { ...item, ...blockFacts(args.entry.body) }
+}
+
+const unsupported = (id: string, harness: string, recordKind: string, reason: UnsupportedReason, raw: unknown, at?: string): ConversationItem =>
+  ({ _tag: 'Unsupported', id, harness, recordKind, reason, inspect: inspectPreview(raw), ...(at === undefined ? {} : { at }) })
+
+interface BlockClassification {
+  readonly markers: readonly ConversationItem[]
+  readonly primary?: ConversationItem
+  readonly native: boolean
+  readonly fallback?: boolean
+}
+/** Block visibility and vocabulary are authoritative whenever native blocks exist. */
+const blockItems = (entry: Exclude<Entry, { type: 'truncation' }>): BlockClassification => {
+  if (entry.type === 'unrecognized' || entry.type === 'reasoning') return { markers: [], native: false }
+  const facts = blockFacts(entry.body)
+  const blocks = facts.blocks
+  const degraded = entry.degraded ?? []
+  if (blocks === undefined && degraded.length === 0) return { markers: [], native: false }
+  const harness = blocks?.find(block => block.kind === 'source_record')?.source_type
+    ?? blocks?.find(block => block.source_type.includes('/'))?.source_type.split('/')[0] ?? 'st'
+  const at = entryTimestamp(entry)
+  const markers: ConversationItem[] = []
+  let primary: ConversationItem | undefined
+  let selected = false
+  let fallback = false
+  for (const [index, block] of (blocks ?? []).entries()) {
+    if (block.visibility === 'internal' || block.visibility === 'hidden-by-harness' || blockRole(block.kind) === 'bookkeeping') continue
+    const role = blockRole(block.kind)
+    const payload = recordValue(block.payload)
+    const customType = recordValue(payload?.raw)?.customType
+    const recordKind = block.kind === 'unknown'
+      ? block.source_type === 'custom' && typeof customType === 'string' ? customType : block.source_type
+      : block.kind
+    const marker = (reason: UnsupportedReason) => markers.push(unsupported(`${entry.id}#${block.id ?? index}`, harness, recordKind, reason, block, at))
+    if (role === undefined || role === 'unsupported') { marker(role === undefined ? 'unknown-block-kind' : 'unrecognized-record'); continue }
+    const text = entry.type === 'content' ? entry.body.text ?? '' : ''
+    const ctx = { id: entry.id, at, text, harness }
+    const meaning = block.view !== undefined && isKnownView(block.view) ? viewMeaning(block.view, ctx) : undefined
+    if (meaning?._tag === 'Drop') continue
+    if (meaning?._tag === 'Item') { if (!selected) { primary = meaning.item; selected = true }; continue }
+    if (meaning?._tag === 'Tool') { if (!selected) { selected = true; fallback = entry.type !== 'content' }; continue }
+    if (role === 'typed') {
+      const parsed = entry.type === 'content' ? q101OmpEnvelopeStopgap({ id: entry.id, at, role: 'system', text }) : undefined
+      if (parsed === undefined) marker('missing-view')
+      else if (!selected) { primary = parsed; selected = true }
+      continue
+    }
+    if (selected) continue
+    selected = true
+    if (entry.type !== 'content') { fallback = true; continue }
+    if (role === 'reasoning') primary = { _tag: 'Reasoning', id: entry.id, at, text: text.startsWith('[reasoning]\n') ? text.slice(12) : text, streaming: !entry.final }
+    else if (entry.role === 'system') primary = q101OmpEnvelopeStopgap({ id: entry.id, at, role: 'system', text })
+      ?? { _tag: 'Event', id: entry.id, at, kind: 'harness-message', title: 'Harness message', text: ompNoticeExcerpt(text), sender: { kind: 'harness', label: harness }, data: {} }
+    else primary = itemOf({ entry, sessionActive: true })
   }
+  for (const [index, block] of degraded.entries()) {
+    if (block._tag !== 'BlockDropped') continue
+    const raw = recordValue(block.raw)
+    if (raw?.visibility === 'internal' || raw?.visibility === 'hidden-by-harness' || block.kind === 'source_record') continue
+    markers.push(unsupported(`${entry.id}#${block.blockId ?? `dropped-${index}`}`, harness, block.kind ?? 'unknown', 'undecodable-block', block.raw, at))
+  }
+  return { markers, ...(primary === undefined ? {} : { primary: { ...primary, ...facts } }), native: true, fallback }
 }
 
 /** Convenience for fixtures and one-shot reads, using the same fold as live chunks. */
@@ -303,7 +358,8 @@ interface CachedItem {
   readonly entry: Entry
   readonly result: ToolResultEntry | undefined
   readonly active: boolean
-  readonly item: ConversationItem
+  readonly items: readonly ConversationItem[]
+  readonly classified: BlockClassification
 }
 
 /** One projection of a `LiveTimeline`: items before `changedFrom` are the previous objects. */
@@ -341,6 +397,7 @@ export class LiveTimeline {
   private itemsBefore: Array<number> = []
   private items: Array<ConversationItem> = []
   private readonly cache = new Map<string, CachedItem>()
+  private readonly telemetryRevisions = new Map<string, number>()
   /** Presentation identities are local to this retained conversation, never wire ids. */
   private readonly ownSendIds = new Map<string, string>()
   /** Keep proven mailbox pairs after their message header leaves the loaded window. */
@@ -352,6 +409,7 @@ export class LiveTimeline {
   hasOlder = false
   /** Native replace-page evidence, never an empty filtered projection. */
   observation: { readonly empty: boolean } | undefined
+  header: FixtureConversationChunk['header']
 
   /** Optional operation counter for deterministic join-complexity tests. */
   constructor(private readonly onJoin?: () => void) {}
@@ -362,6 +420,7 @@ export class LiveTimeline {
 
   /** Applies one follow frame (CAG.CLI.WEB.CNV-R01/R02); returns whether anything changed. */
   apply(frame: FixtureConversationChunk): boolean {
+    this.header = frame.header ?? (frame.replace ? undefined : this.header)
     let changed = frame.replace
     let newCalls: Map<string, Array<number>> | undefined
     let newResults: Map<string, Map<string, PositionedResult>> | undefined
@@ -412,6 +471,15 @@ export class LiveTimeline {
         this.reindex = true
       }
       if (this.reindex) continue
+      // An earlier result row also depends on whether its owner renders a visible call.
+      // Revisions can change that classification without changing invocation segmentation.
+      if (entry.type === 'tool_call' && previous?.type === 'tool_call'
+        && (previous.body.blocks !== entry.body.blocks || previous.degraded !== entry.degraded)) {
+        for (const result of this.results.get(entry.body.call_id) ?? []) {
+          if (result.at < at && this.callFor(result.entry) === at)
+            this.dirtyFrom = Math.min(this.dirtyFrom, result.at)
+        }
+      }
       if (entry.type === 'tool_call' && previous === undefined) {
         newCalls ??= new Map()
         const calls = newCalls.get(entry.body.call_id)
@@ -640,7 +708,7 @@ export class LiveTimeline {
       // Only native harness turns repeat shown mail as delivery copies; a mailbox
       // message's own content is person-authored text that may quote anything.
       if (
-        entry.type === 'content' &&
+        entry.type === 'content' && entry.body.blocks === undefined && (entry.degraded?.length ?? 0) === 0 &&
         !MAILBOX_CONTENT_ID.test(entry.id) &&
         (entry.role === 'user' || entry.role === 'system')
       ) {
@@ -652,14 +720,20 @@ export class LiveTimeline {
         }
       }
       if (entry.type === 'tool_result') {
-        // Only a result lacking a lower-sequence invocation is orphaned, regardless of arrival order.
-        if (this.callFor(entry) === undefined)
-          items.push(this.cached({ entry, result: undefined, active: true }))
+        const projected = this.cached({ entry, result: undefined, active: true })
+        // A joined result still emits its own unsupported blocks at its entry position.
+        const owner = this.callFor(entry)
+        const call = owner === undefined ? undefined : this.ordered[owner]
+        const cachedCall = call === undefined ? undefined : this.cache.get(call.id)
+        const classification = call === undefined || call.type === 'truncation' ? undefined
+          : cachedCall?.entry === call ? cachedCall.classified : blockItems(call)
+        const visibleCall = classification !== undefined && (!classification.native || classification.fallback || classification.primary?._tag === 'ToolCall')
+        items.push(...(visibleCall ? projected.filter(item => item._tag === 'Unsupported') : projected))
         continue
       }
       if (entry.type === 'tool_call')
-        items.push(this.cached({ entry, result: this.joined.get(at), active: this.active }))
-      else items.push(this.cached({ entry, result: undefined, active: true }))
+        items.push(...this.cached({ entry, result: this.joined.get(at), active: this.active }))
+      else items.push(...this.cached({ entry, result: undefined, active: true }))
     }
     this.items = items
     this.dirtyFrom = this.ordered.length
@@ -713,24 +787,32 @@ export class LiveTimeline {
     readonly entry: Exclude<Entry, { type: 'truncation' }>
     readonly result: ToolResultEntry | undefined
     readonly active: boolean
-  }): ConversationItem {
+  }): readonly ConversationItem[] {
     const key = entry.type === 'content' && entry.role === 'user' && entry.body.media_type === 'text/plain'
       ? mailboxPairKey(entry) : undefined
     const id = (key === undefined ? undefined : this.ownSendContentIds.get(key)) ?? entry.id
     const hit = this.cache.get(entry.id)
-    if (hit !== undefined && hit.entry === entry && hit.result === result && hit.active === active && hit.item.id === id)
-      return hit.item
-    let item: ConversationItem
-    if (entry.type === 'tool_result') item = joinResult({ call: undefined, entry })
-    else {
-      const own = itemOf({ entry, sessionActive: active })
-      item =
-        result !== undefined && own._tag === 'ToolCall'
-          ? joinResult({ call: own, entry: result })
-          : own
+    if (hit !== undefined && hit.entry === entry && hit.result === result && hit.active === active && hit.items.every(item => item._tag !== 'Text' || item.id === id))
+      return hit.items
+    const classified = hit?.entry === entry ? hit.classified : blockItems(entry)
+    let item: ConversationItem | undefined
+    if (entry.type === 'tool_result') {
+      if (!classified.native || classified.fallback) item = joinResult({ call: undefined, entry })
+      else item = classified.primary
+    } else {
+      const own = classified.native && !classified.fallback ? classified.primary : itemOf({ entry, sessionActive: active })
+      const resultClassification = result === undefined ? undefined : blockItems(result)
+      item = result !== undefined && own?._tag === 'ToolCall'
+        && (!resultClassification?.native || resultClassification.fallback)
+        ? joinResult({ call: own, entry: result }) : own
     }
-    if (item._tag === 'Text' && item.id !== id) item = { ...item, id }
-    this.cache.set(entry.id, { entry, result, active, item })
-    return item
+    if (item?._tag === 'Text' && item.id !== id) item = { ...item, id }
+    const items = [...classified.markers, ...(item === undefined ? [] : [item])]
+    if (this.telemetryRevisions.get(entry.id) !== entry.revision) {
+      this.telemetryRevisions.set(entry.id, entry.revision)
+      recordTranscriptTelemetry(items, 'degraded' in entry ? entry.degraded ?? [] : [], entry.type === 'unrecognized' ? entry.issue : undefined)
+    }
+    this.cache.set(entry.id, { entry, result, active, items, classified })
+    return items
   }
 }

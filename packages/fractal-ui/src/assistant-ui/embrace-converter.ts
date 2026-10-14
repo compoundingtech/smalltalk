@@ -163,6 +163,12 @@ export const convertConversationItem = (item: ConversationItem): ThreadMessageLi
         content: [{ type: 'text', text: `${item.title}\n${item.text}` }],
       }
     }
+    case 'Unsupported':
+      diagnostics.push('semantic-row-as-text')
+      return {
+        ...common, role: 'system',
+        content: [{ type: 'text', text: `Unsupported ${item.harness} record · ${item.recordKind}` }],
+      }
     case 'UnknownEvent':
       diagnostics.push('semantic-row-as-text')
       return {

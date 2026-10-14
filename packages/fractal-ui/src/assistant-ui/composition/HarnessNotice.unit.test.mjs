@@ -20,6 +20,7 @@ globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} 
 globalThis.requestAnimationFrame = callback => setTimeout(callback, 0)
 globalThis.cancelAnimationFrame = clearTimeout
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
+Object.defineProperty(document, 'elementFromPoint', { configurable: true, value: () => null })
 const server = await createServer({ configFile: false, root: new URL('../../../', import.meta.url).pathname, plugins: [stylex.vite({ useCSSLayers: false })], server: { middlewareMode: true } })
 const { HarnessNotice } = await server.ssrLoadModule('/src/assistant-ui/composition/HarnessNotice.tsx')
 const { harnessNoticeExamples, harnessWeightExamples } = await server.ssrLoadModule('/src/assistant-ui/composition/HarnessNotice.fixtures.ts')
@@ -27,6 +28,84 @@ const { HarnessWeightComparison } = await server.ssrLoadModule('/src/HarnessWeig
 const { baselineTheme } = await server.ssrLoadModule('/src/assistant-ui/neutral-theme.ts')
 const { lightTheme } = await server.ssrLoadModule('/src/assistant-ui/composition-theme.ts')
 const sx = await server.ssrLoadModule('@stylexjs/stylex')
+const { UnsupportedRecord } = await server.ssrLoadModule('/src/assistant-ui/composition/UnsupportedRecord.tsx')
+const { Transcript } = await server.ssrLoadModule('/src/assistant-ui/composition/Transcript.tsx')
+const { EmbraceRuntimeProvider, RuntimeAdoptedIds } = await server.ssrLoadModule('/src/assistant-ui/EmbraceRuntime.tsx')
+const { convertConversationItem } = await server.ssrLoadModule('/src/assistant-ui/embrace-converter.ts')
+
+const unsupported = {
+  _tag: 'Unsupported', id: 'unsupported/example', harness: 'omp', recordKind: 'model_usage',
+  reason: 'unrecognized-record', at: '2026-01-15T12:30:00Z',
+  inspect: { text: '{\n  "token": "[redacted]",\n  "message": "capped preview…"\n}', bytes: 8192, truncated: true },
+}
+
+test('unsupported converter keeps the marker summary separate from diagnostic text', () => {
+  const message = convertConversationItem(unsupported)
+  assert.equal(message.role, 'system')
+  assert.deepEqual(message.content, [{ type: 'text', text: 'Unsupported omp record · model_usage' }])
+  assert.equal(message.metadata.custom.item, unsupported)
+  assert.doesNotMatch(message.content[0].text, /redacted|capped preview/)
+})
+
+for (const scheme of ['dark', 'light']) test(`${scheme} unsupported marker discloses only its supplied redacted preview`, async () => {
+  const container = document.createElement('section'); document.body.append(container)
+  Object.assign(container, sx.props(...baselineTheme, scheme === 'light' && lightTheme))
+  const root = createRoot(container)
+  try {
+    await act(async () => root.render(React.createElement(UnsupportedRecord, { item: unsupported })))
+    const marker = container.querySelector('[data-testid=unsupported-record]')
+    assert.equal(marker.dataset.recordKind, 'model_usage')
+    assert.equal(marker.dataset.harness, 'omp')
+    const row = marker.querySelector('[data-testid=unsupported-record-row]')
+    assert.match(row.textContent, /Unsupported omp record · model_usage.*Inspect/)
+    assert.doesNotMatch(row.textContent, /token|redacted|capped preview/)
+    assert.equal(row.querySelector('time').dateTime, unsupported.at)
+    const trigger = row.querySelector('button')
+    assert.equal(trigger.getAttribute('aria-expanded'), 'false')
+    assert.ok(marker.querySelector('[data-testid=unsupported-record-panel]').closest('[hidden]'))
+    await act(async () => trigger.click())
+    assert.equal(trigger.getAttribute('aria-expanded'), 'true')
+    assert.equal(marker.querySelector('pre').textContent, unsupported.inspect.text)
+    assert.match(marker.querySelector('p').textContent, /8,192 bytes · truncated/)
+    await act(async () => trigger.click())
+    assert.equal(trigger.getAttribute('aria-expanded'), 'false')
+  } finally { await act(async () => root.unmount()); container.remove() }
+})
+
+for (const adopted of [true, false]) test(`Transcript renders an explicit unsupported marker when ${adopted ? 'adopted' : 'stranded'}`, async () => {
+  const container = document.createElement('section'); document.body.append(container)
+  const root = createRoot(container)
+  const now = Date.parse(unsupported.at)
+  const turn = { id: 'turn/unsupported', items: [unsupported], work: { calls: [], running: false, failed: false, interrupted: false } }
+  // A host using AssistantRuntimeProvider directly has no adoption seam. Its missing runtime
+  // record is stranded; an empty EmbraceRuntimeProvider source snapshot instead remains pending.
+  const transcript = React.createElement(Transcript, { turns: [turn], title: 'Unsupported records', sync: { _tag: 'Live', since: now }, now, observedAt: now })
+  try {
+    await act(async () => root.render(React.createElement(EmbraceRuntimeProvider, {
+      options: { messages: adopted ? [unsupported] : [], isRunning: false, onNew: async () => {} },
+    }, adopted ? transcript : React.createElement(RuntimeAdoptedIds.Provider, { value: undefined }, transcript))))
+    assert.equal(container.querySelectorAll('[data-testid=unsupported-record]').length, 1)
+    assert.equal(container.querySelector('[data-testid=unsupported-record]').dataset.itemId, unsupported.id)
+    assert.equal(container.querySelectorAll('[data-testid=transcript-stranded]').length, 0)
+    assert.doesNotMatch(container.querySelector('[data-testid=unsupported-record-row]').textContent, /redacted|capped preview/)
+    if (adopted) assert.equal(container.querySelector('[data-item-kind=Unsupported]').dataset.testid, 'transcript-message')
+  } finally { await act(async () => root.unmount()); container.remove() }
+})
+for (const scheme of ['dark', 'light']) test(`${scheme} background jobs label each actual outcome`, async () => {
+  const container = document.createElement('section'); document.body.append(container)
+  Object.assign(container, sx.props(...baselineTheme, scheme === 'light' && lightTheme))
+  const root = createRoot(container)
+  try {
+    for (const state of ['running', 'completed', 'failed', 'cancelled', 'unknown']) {
+      const item = { ...harnessNoticeExamples.find(item => item.notice._tag === 'BackgroundJob'), title: `Background job ${state}` }
+      item.notice = { ...item.notice, state, payload: '', raw: '' }
+      await act(async () => root.render(React.createElement(HarnessNotice, { item })))
+      assert.equal(container.querySelector('[data-testid=harness-kind]').textContent, state)
+      assert.match(container.querySelector('[data-testid=harness-notice]').textContent, new RegExp(`Background job ${state}`))
+      assert.equal(container.querySelector('button').getAttribute('aria-expanded'), 'false')
+    }
+  } finally { await act(async () => root.unmount()); container.remove() }
+})
 
 after(async () => { await server.close(); dom.window.close(); for (const [name, descriptor] of saved) { if (descriptor === undefined) Reflect.deleteProperty(globalThis, name); else Object.defineProperty(globalThis, name, descriptor) } })
 for (const scheme of ['dark', 'light']) test(`curated ${scheme} harness cards disclose real Markdown with keyboard semantics`, async () => {
@@ -74,7 +153,7 @@ for (const scheme of ['dark', 'light']) test(`curated ${scheme} harness cards di
 })
 
 // q106: the Fractal/Explore comparison renders the production component at both weights.
-for (const scheme of ['dark', 'light']) test(`q106 ${scheme} comparison renders all eight kinds at row and card weight without transport syntax`, async () => {
+for (const scheme of ['dark', 'light']) test(`q106 ${scheme} comparison renders all specimens at row and card weight without transport syntax`, async () => {
   const container = document.createElement('div'); document.body.append(container)
   const root = createRoot(container)
   try {
@@ -82,7 +161,7 @@ for (const scheme of ['dark', 'light']) test(`q106 ${scheme} comparison renders 
     assert.equal(container.querySelector('[data-scheme]').dataset.scheme, scheme)
     const kinds = [...new Set(harnessWeightExamples.map(item => item.notice._tag))].sort()
     assert.deepEqual(kinds, ['BackgroundJob', 'Compaction', 'Delivery', 'Interjection', 'Irc', 'SkillInvocation', 'SubagentResult'])
-    assert.equal(harnessWeightExamples.length, 8)
+    assert.equal(harnessWeightExamples.length, 9)
     const transport = /<\/?(system-notice|irc|task-result|skill|output)\b|\[omp compaction\]|## Goal|"overall_correctness"/
     const collapsedText = column => { const copy = column.cloneNode(true); for (const hidden of copy.querySelectorAll('[hidden]')) hidden.remove(); return copy.textContent }
     const classes = {}
@@ -96,6 +175,10 @@ for (const scheme of ['dark', 'light']) test(`q106 ${scheme} comparison renders 
       for (const panel of column.querySelectorAll('[data-testid=harness-panel]')) assert.ok(panel.closest('[hidden]'), 'collapsed panel is hidden')
       assert.ok(column.querySelector('[data-item-id="weight/interjection"]').textContent.includes('Interjection'))
       assert.ok(column.querySelector('[data-item-id="weight/result"]').textContent.includes('completed'))
+      const failedJob = column.querySelector('[data-item-id="weight/failed-job"] [data-testid=harness-kind]')
+      const completedJob = column.querySelector('[data-item-id="weight/job"] [data-testid=harness-kind]')
+      assert.equal(failedJob.textContent, 'failed')
+      assert.notEqual(failedJob.className, completedJob.className)
       classes[weight] = notices[0].className
     }
     assert.notEqual(classes.row, classes.card)

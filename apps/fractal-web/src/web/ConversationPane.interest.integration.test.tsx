@@ -357,8 +357,10 @@ describe('ConversationPane conversation demand', () => {
     expect(container.querySelector('[data-testid="agent-message"]')?.querySelector('strong')?.textContent).toBe('visible rows')
     expect(container.querySelector('[data-testid="work-log"]')).not.toBeNull()
     expect(container.querySelector('[data-testid="history-boundary"]')?.textContent).toContain('Earlier messages not loaded')
-    // The unsupported omp event and the truncation marker never become rows or internal wording.
-    expect(paneText()).not.toContain('credential_pin')
+    // A block-less unsupported omp record remains an explicit inspectable marker.
+    expect(container.querySelector('[data-testid="unsupported-record"][data-record-kind="credential_pin"]')).not.toBeNull()
+    expect(container.querySelector('[data-testid="unsupported-record"]')?.textContent).toContain('Unsupported omp record')
+    expect(paneText()).not.toContain('[unrecognized omp')
     expect(paneText()).not.toContain('sequences')
     expect(paneText()).not.toContain('Older history unavailable')
   })
