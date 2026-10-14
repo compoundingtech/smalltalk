@@ -4,6 +4,9 @@
   "$id": "https://st3.local/schemas/client-v0.schema.json",
   "title": "st3 client v0",
   "oneOf": [
+    { "$ref": "#/$defs/PushRegistration" },
+    { "$ref": "#/$defs/PushRegistrationResponse" },
+    { "$ref": "#/$defs/PushRevocationResponse" },
     { "$ref": "#/$defs/ObservationReport" },
     { "$ref": "#/$defs/ObservationResponse" },
     { "$ref": "#/$defs/Envelope" },
@@ -14,6 +17,11 @@
     { "$ref": "#/$defs/PairingAdvertisement" }
   ],
   "$defs": {
+    "PushRegistration": {"description":"Only the paired member stores the target. The token is never a graph claim or response field.", "type":"object", "additionalProperties":false, "required":["token","environment","bundle_id","app_version"], "properties":{"token":{"type":"string","pattern":"^([0-9a-f]{2}){32,256}$"},"environment":{"enum":["development","production"]},"bundle_id":{"type":"string","pattern":"^[A-Za-z0-9.-]+$","minLength":1,"maxLength":255},"app_version":{"type":"string","pattern":"^[!-~]+$","minLength":1,"maxLength":64}}},
+    "PushRegistrationAccepted": {"type":"object", "additionalProperties":false, "required":["registered"], "properties":{"registered":{"const":true}}},
+    "PushRevocationAccepted": {"type":"object", "additionalProperties":false, "required":["revoked"], "properties":{"revoked":{"const":true}}},
+    "PushRegistrationResponse": {"type":"object", "additionalProperties":false, "required":["api_version","request_id","value"], "properties":{"api_version":{"const":"st3.client.v0"},"request_id":{"$ref":"#/$defs/RequestId"},"value":{"$ref":"#/$defs/PushRegistrationAccepted"}}},
+    "PushRevocationResponse": {"type":"object", "additionalProperties":false, "required":["api_version","request_id","value"], "properties":{"api_version":{"const":"st3.client.v0"},"request_id":{"$ref":"#/$defs/RequestId"},"value":{"$ref":"#/$defs/PushRevocationAccepted"}}},
     "DirectiveNote": {
       "description": "A person's current advisory note. It never assigns work, grants authority or satisfies a gate.",
       "type": "object", "additionalProperties": false,
