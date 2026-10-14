@@ -458,6 +458,8 @@ pub struct Ui {
     prompt_marks: HashMap<String, usize>,
     /// The prompt alert whose form has the keys (Ctrl+N in a conversation, `a` in Now).
     prompt_keys: Option<String>,
+    /// Each alert's band card from the last frame, with a hash of what it was drawn from.
+    band_cards: RefCell<HashMap<(String, usize), (u64, Doc, usize)>>,
     /// `stui --glasses`: named glasses of tabs and split panes, and a palette, in place of the
     /// sidebar layout.
     pub(crate) glasses: Option<glass::Glasses>,
@@ -763,6 +765,7 @@ impl Ui {
             question_choices: HashMap::new(),
             prompt_marks: HashMap::new(),
             prompt_keys: None,
+            band_cards: RefCell::new(HashMap::new()),
             glasses: None,
             session_focus: None,
             build: false,
@@ -891,6 +894,23 @@ impl Ui {
             && let Some(id) = self.selected_id()
         {
             targets.push(id);
+        }
+        // A prompt's card in Now shows the call it asks about, which is in its seat's
+        // conversation: follow that one too, or Now could offer only what needs no reading.
+        if self.home_in_view()
+            && let Some(seat) = self.attention_focus().and_then(|id| {
+                self.world.attention.items().iter().find_map(|item| match &item.kind {
+                    AttentionKind::Prompt { seat_id, answers, .. }
+                        if item.id == id && !answers.is_empty() =>
+                    {
+                        Some(seat_id.clone())
+                    }
+                    _ => None,
+                })
+            })
+            && !targets.contains(&seat)
+        {
+            targets.push(seat);
         }
         if let Some(glasses) = &self.glasses {
             for id in glasses.shown_agents() {
@@ -2364,10 +2384,8 @@ impl Ui {
                 })
             }),
             chat,
-            form: self
-                .attention_focus()
-                .map(|id| self.form_state(&id))
-                .unwrap_or_default(),
+            // In Now the draft's key is the alert's id: no listing is built for it per frame.
+            form: self.form_state(key),
         }
     }
 
@@ -2773,6 +2791,11 @@ impl Ui {
         for (offset, row) in band.iter().enumerate() {
             let y = body.y + body.height + offset as u16;
             buf.set_line(area.x, y, &row.line, area.width);
+            if let Some((column, edge)) = &row.edge
+                && *column < area.width
+            {
+                buf.set_span(area.x + column, y, edge, area.width - column);
+            }
             for (column, width, hit) in &row.hits {
                 self.hit(
                     Rect {

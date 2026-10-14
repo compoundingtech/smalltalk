@@ -65,12 +65,12 @@ export function offeredPromptAnswers(answers: readonly string[], calls: readonly
 }
 
 /** Enter may take it when it is marked: what is shown in full, or a safe way past. */
-export function enterAnswers(answer: string): boolean {
+export function promptAnswerTakesEnter(answer: string): boolean {
   return answer === 'allow' || answer === 'approve' || answer === 'answer' || answer === 'skip';
 }
 
 /** It refuses or ends something: never marked first, never under Enter. */
-export function refuses(answer: string): boolean {
+export function promptAnswerRefuses(answer: string): boolean {
   return answer === 'deny' || answer === 'exit' || answer === 'quit';
 }
 
@@ -153,7 +153,7 @@ export function promptForm(harness: PromptHarness, answers: readonly string[], p
   const call = calls.length === 1 ? calls[0] : null;
   const offered = offeredPromptAnswers(answers, calls);
   const ordered = [...offered.filter(answer => answer !== 'deny'), ...offered.filter(answer => answer === 'deny')];
-  const options = ordered.map(answer => ({ answer, label: promptAnswerLabel(harness, kind, call?.tool ?? null, answer), enter: enterAnswers(answer), refuses: refuses(answer) }));
+  const options = ordered.map(answer => ({ answer, label: promptAnswerLabel(harness, kind, call?.tool ?? null, answer), enter: promptAnswerTakesEnter(answer), refuses: promptAnswerRefuses(answer) }));
   let mark: number | null = options.findIndex(option => option.enter);
   if (mark < 0) mark = options.findIndex(option => !option.refuses);
   if (mark < 0) mark = null;

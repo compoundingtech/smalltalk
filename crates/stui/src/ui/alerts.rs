@@ -213,7 +213,7 @@ pub(super) fn prompt_form(
     };
     let id = &item.id;
     let harness = model.harness.name();
-    let note = |doc: &mut Doc, words: &str| doc.wrap(&text::inline(words, theme::dim()), width);
+    let note = |doc: &mut Doc, words: &str| doc.wrap(&[text::run(words.to_owned(), theme::dim())], width);
     // What it is about.
     let mut full = true;
     let mut call_shown = 0;
@@ -425,6 +425,8 @@ pub(super) fn prompt_form(
 pub(super) struct BandRow {
     pub(super) line: Line<'static>,
     pub(super) hits: Vec<(u16, u16, Hit)>,
+    /// A card's right edge, drawn at its column: the blank between is not written cell by cell.
+    pub(super) edge: Option<(u16, Span<'static>)>,
 }
 
 impl BandRow {
@@ -466,6 +468,7 @@ impl BandRow {
         Self {
             line: Line::from(spans),
             hits,
+            edge: None,
         }
     }
 
@@ -474,9 +477,26 @@ impl BandRow {
         let mut rows: Vec<Self> = doc
             .lines
             .into_iter()
-            .map(|line| Self {
-                line,
-                hits: Vec::new(),
+            .map(|mut line| {
+                // A card's inner line ends in plain padding and its border: keep the border as
+                // an edge at its column and leave the padding unwritten, since the frame starts
+                // blank.
+                let mut edge = None;
+                let count = line.spans.len();
+                if count >= 3
+                    && line.spans[count - 2].style == Style::default()
+                    && line.spans[count - 2].content.chars().all(|c| c == ' ')
+                {
+                    let column = line.width() - line.spans[count - 1].width();
+                    let border = line.spans.pop().unwrap_or_default();
+                    line.spans.pop();
+                    edge = Some((column as u16, border));
+                }
+                Self {
+                    line,
+                    hits: Vec::new(),
+                    edge,
+                }
             })
             .collect();
         for target in doc.targets {
@@ -601,6 +621,7 @@ impl Ui {
                 width as u16,
                 Hit::Alert(agent.to_owned(), AlertTap::Toggle),
             )],
+            edge: None,
         }]
     }
 
@@ -617,10 +638,62 @@ impl Ui {
         }
     }
 
+    /// One alert's card for the band, kept from the last frame while nothing it reads changed:
+    /// the alert, its seat's pending calls and harness, the form's state, the width and the
+    /// limit. Typing redraws every key, and the card should cost it nothing.
+    fn band_card(&self, item: &Attention, width: usize, limit: usize) -> (Doc, usize) {
+        use std::fmt::Write as _;
+        use std::hash::{Hash, Hasher};
+        struct Feed<'a>(&'a mut std::collections::hash_map::DefaultHasher);
+        impl std::fmt::Write for Feed<'_> {
+            fn write_str(&mut self, text: &str) -> std::fmt::Result {
+                self.0.write(text.as_bytes());
+                Ok(())
+            }
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (width, limit).hash(&mut hasher);
+        let state = self.form_state(&item.id);
+        let seat = match &item.kind {
+            AttentionKind::Prompt { seat_id, .. } => Some(seat_id.as_str()),
+            _ => None,
+        };
+        let calls = seat.and_then(|seat| self.world.pending_calls.get(seat));
+        let harness = seat.and_then(|seat| {
+            self.world
+                .agents
+                .items()
+                .iter()
+                .find(|agent| agent.id == seat)
+                .map(|agent| agent.harness)
+        });
+        let _ = write!(
+            Feed(&mut hasher),
+            "{item:?}{calls:?}{harness:?}{:?}{}{:?}",
+            state.mark,
+            state.keys,
+            state.chosen
+        );
+        let signature = hasher.finish();
+        let key = (item.id.clone(), limit);
+        if let Some((kept, doc, shown)) = self.band_cards.borrow().get(&key)
+            && *kept == signature
+        {
+            return (doc.clone(), *shown);
+        }
+        let (doc, shown) = self.draw_band_card(item, width, limit);
+        let mut cards = self.band_cards.borrow_mut();
+        if cards.len() > 32 {
+            cards.clear();
+        }
+        cards.insert(key, (signature, doc.clone(), shown));
+        (doc, shown)
+    }
+
     /// One alert's card for the band, as its card in Now draws it: its kind and age in the frame,
     /// its title, and for a prompt the same form, the call cut to `limit` lines. Also returns how
     /// many lines of the call it shows.
-    fn band_card(&self, item: &Attention, width: usize, limit: usize) -> (Doc, usize) {
+    fn draw_band_card(&self, item: &Attention, width: usize, limit: usize) -> (Doc, usize) {
         let (_, color) = screens::attention_style(&item.kind);
         let heavy = color == theme::PERSON;
         let inner = width.saturating_sub(4).max(10);
@@ -752,6 +825,7 @@ impl Ui {
                 width as u16,
                 Hit::Alert(agent.to_owned(), AlertTap::Toggle),
             )],
+            edge: None,
         }];
         // The alert with the keys comes first, so its form is the one in view.
         let mut ordered = alerts.clone();
@@ -783,6 +857,7 @@ impl Ui {
                     theme::dim(),
                 )),
                 hits: Vec::new(),
+                edge: None,
             });
         }
         rows
@@ -1508,6 +1583,30 @@ mod tests {
         let shown = render(&ui, 120, 60);
         assert!(shown.contains("Answer it in the seat's terminal"), "{shown}");
         assert!(options(&shown).is_empty());
+    }
+
+    /// The band keeps a card between frames only while nothing it was drawn from changed.
+    #[test]
+    fn a_kept_band_card_follows_its_call_its_mark_and_its_age() {
+        let mut ui = in_conversation(bash_world());
+        ui.click(Hit::Alert(SEAT.into(), AlertTap::Toggle));
+        assert!(render(&ui, 80, 40).contains("make clean"));
+        ui.world.pending_calls.insert(SEAT.into(), vec![call("Bash", serde_json::json!({"command": "make tulips"}))]);
+        let shown = render(&ui, 80, 40);
+        assert!(shown.contains("make tulips") && !shown.contains("make clean"), "{shown}");
+        ui.prompt_marks.insert("attention/one".into(), 1);
+        assert!(options(&render(&ui, 80, 40)).iter().any(|(marked, _, label)| *marked && label == "No"));
+        if let Load::Ready(items) = &mut ui.world.attention {
+            items[0].age = "7m".into();
+        }
+        assert!(render(&ui, 80, 40).contains("WAITING 7M"));
+    }
+
+    /// Now follows the conversation of the prompt it shows, where the call it asks about is.
+    #[test]
+    fn now_follows_the_seat_of_the_prompt_it_shows() {
+        let ui = in_now(bash_world());
+        assert!(ui.live_conversations().contains(&SEAT.to_owned()));
     }
 
     #[test]
