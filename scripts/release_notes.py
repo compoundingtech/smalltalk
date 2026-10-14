@@ -19,7 +19,7 @@ FIELDS = {
 }
 VERSIONS = {
     'schema': ('crates/smallclaims/src/store.rs', r'pub const SCHEMA_VERSION:.*?user_version\s*=\s*(\d+)'),
-    'rules': ('crates/st3/src/store/checkpoint_rules.rs', r'pub const RULES_VERSION:\s*u32\s*=\s*(\d+)'),
+    'rules': ('crates/st3-daemon/src/store/checkpoint_rules.rs', r'pub const RULES_VERSION:\s*u32\s*=\s*(\d+)'),
 }
 FRAGMENTS = 'release-notes/'
 SHA = re.compile(r'[0-9a-f]{40}')

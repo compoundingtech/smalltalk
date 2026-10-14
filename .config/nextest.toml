@@ -1,6 +1,6 @@
 # Start the parallel fault cases early so the two-minute outage and retries fit the CI window.
 [[profile.default.overrides]]
-filter = 'package(st3) and test(/^messaging_faults::/)'
+filter = '(package(st3) or package(st3-daemon)) and test(/^messaging_faults::/)'
 priority = 100
 
 [profile.ci]
@@ -26,7 +26,7 @@ final-status-level = "flaky"
 # Its filters control execution; Cargo still compiles excluded workspace test targets.
 default-filter = '''
 not (
-  (package(=st3) and test(/^messaging_faults::link_minutes$/))
+  ((package(=st3) or package(=st3-daemon)) and test(/^messaging_faults::link_minutes$/))
   or (package(=st2) and (
     kind(lib) or kind(bin)
     or binary(=event_e2e) or binary(=resource_profile_supervisor_e2e)
@@ -34,7 +34,7 @@ not (
   ))
   or (package(=st-drivers) and kind(lib)
     and test(/^(catalog[^:]*|resync|resource_profile_supervisor)::/))
-  or (package(=st3) and test(/^daemon_(cost|load)::/))
+  or ((package(=st3) or package(=st3-daemon)) and test(/^daemon_(cost|load)::/))
   or (package(=smallclaims) and test(/^sync::worker::tests::retry_tests::isolated_outbound_only_node_converges_after_two_minutes_and_four_hours$/))
 )
 '''
@@ -48,31 +48,31 @@ success-output = "immediate"
 # The fleet reconnect test also includes a real two-minute outage. The ci profile inherits the
 # default profile's messaging-fault priority above.
 [[profile.ci.overrides]]
-filter = 'package(st3) and test(/^fleet::outbound_only_member_returns_after_minutes_and_aged_hours_without_alerts$/)'
+filter = '(package(st3) or package(st3-daemon)) and test(/^fleet::outbound_only_member_returns_after_minutes_and_aged_hours_without_alerts$/)'
 priority = 100
 
 # A boot canary's race or a fresh-seat boundary violation must not disappear behind a retry.
 # Start these early too: five seats launch together in one case.
 [[profile.ci.overrides]]
-filter = 'package(st3) and (test(/^boot_canaries::/) or test(/^no_st2_seat::/) or test(/^daemon_restart::claude_mcp_/) or test(/^codex_bootstrap::delayed_delivery_control_holds_visible_native_input_and_recovers_once$/))'
+filter = '(package(st3) or package(st3-daemon)) and (test(/^boot_canaries::/) or test(/^no_st2_seat::/) or test(/^daemon_restart::claude_mcp_/) or test(/^codex_bootstrap::delayed_delivery_control_holds_visible_native_input_and_recovers_once$/))'
 retries = 0
 priority = 100
 
 # Product action admission and restart races must fail visibly, rather than pass on retry.
 [[profile.ci.overrides]]
-filter = 'package(st3) and (test(/^action_coverage::/) or test(/^fleet::action_coverage_/))'
+filter = '(package(st3) or package(st3-daemon)) and (test(/^action_coverage::/) or test(/^fleet::action_coverage_/))'
 retries = 0
 
 # Claim-derived state must agree on its first delivery schedule. A retry must not hide a
 # failing generated permutation; these tests run in the required PR and merge-group gate.
 [[profile.ci.overrides]]
-filter = 'package(st3) and test(/^store::tests::activity_purity_tests::/)'
+filter = '(package(st3) or package(st3-daemon)) and test(/^store::tests::activity_purity_tests::/)'
 retries = 0
 
 # Keep both measured control intervals visible even when the idle positive passes.
 # A CPU regression or a broken busy negative must remain a failure without retry.
 [[profile.ci.overrides]]
-filter = 'package(st3) and test(/^idle_budget::a_quiescent_daemon_cpu_control_accepts_idle_and_rejects_busy$/)'
+filter = '(package(st3) or package(st3-daemon)) and test(/^idle_budget::a_quiescent_daemon_cpu_control_accepts_idle_and_rejects_busy$/)'
 success-output = "immediate"
 retries = 0
 
@@ -102,23 +102,23 @@ success-output = "immediate"
 
 # Expose private native-source work tuples without changing selection or budgets.
 [[profile.ci.overrides]]
-filter = 'package(=st3) and test(/^store::terminal_gate_evidence::native_source::tests::native_gate_unrelated_and_noop_work_at_zero_1024_and_100000_rows$/)'
+filter = '(package(=st3) or package(=st3-daemon)) and test(/^store::terminal_gate_evidence::native_source::tests::native_gate_unrelated_and_noop_work_at_zero_1024_and_100000_rows$/)'
 success-output = "immediate"
 
 # Keep managed-boundary fixture tuples visible without changing selection or budgets.
 [[profile.ci.overrides]]
-filter = 'package(=st3) and test(/^store::terminal_gate_evidence::native_source::transaction_hooks::tests::managed_gate_work_at_zero_1024_and_100000_unrelated_rows$/)'
+filter = '(package(=st3) or package(=st3-daemon)) and test(/^store::terminal_gate_evidence::native_source::transaction_hooks::tests::managed_gate_work_at_zero_1024_and_100000_unrelated_rows$/)'
 success-output = "immediate"
 
 # Preserve the private FULL fixture's allocation setup and recovery diagnostics.
 # Output visibility only: no selection, retries, threads or ceiling change.
 [[profile.ci.overrides]]
-filter = 'package(=st3) and test(/^store::terminal_gate_evidence::native_source::transaction_hooks::tests::operator_errors::managed_operator_error_real_full_aborts_all_callers_and_writer_recovers$/)'
+filter = '(package(=st3) or package(=st3-daemon)) and test(/^store::terminal_gate_evidence::native_source::transaction_hooks::tests::operator_errors::managed_operator_error_real_full_aborts_all_callers_and_writer_recovers$/)'
 success-output = "immediate"
 
 # Repairs retire actual-state sources even when their local receipts have been trimmed.
 [[profile.ci.overrides]]
-filter = 'package(st3) and (test(/^store::tests::actual_purity_tests::/) or test(/^store::tests::repaired_original_sources_and_operations_ignore_local_retention_and_roll_back$/))'
+filter = '(package(st3) or package(st3-daemon)) and (test(/^store::tests::actual_purity_tests::/) or test(/^store::tests::repaired_original_sources_and_operations_ignore_local_retention_and_roll_back$/))'
 retries = 0
 # Native stop ordering must pass on the first attempt.
 [[profile.ci.overrides]]

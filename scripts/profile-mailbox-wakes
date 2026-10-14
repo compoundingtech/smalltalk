@@ -33,13 +33,13 @@ def main():
     if output.exists():
         parser.error("output must be new; existing measurements are never overwritten")
     commit = run("git", "rev-parse", "--verify", f"{args.ref}^{{commit}}", capture_output=True, text=True).stdout.strip()
-    fixture = (repo / "crates/st3/src/api/mailbox_profile.rs").read_bytes()
+    fixture = (repo / "crates/st3-daemon/src/api/mailbox_profile.rs").read_bytes()
     output.mkdir(parents=True)
     checkout = output / "checkout"
     run("git", "worktree", "add", "--detach", str(checkout), commit)
     try:
-        (checkout / "crates/st3/src/api/mailbox_profile.rs").write_bytes(fixture)
-        mailbox = checkout / "crates/st3/src/api/mailbox.rs"
+        (checkout / "crates/st3-daemon/src/api/mailbox_profile.rs").write_bytes(fixture)
+        mailbox = checkout / "crates/st3-daemon/src/api/mailbox.rs"
         source = mailbox.read_text()
         if '#[path = "mailbox_profile.rs"]' not in source:
             mailbox.write_text(source + '\n#[cfg(test)]\n#[path = "mailbox_profile.rs"]\nmod profile;\n')

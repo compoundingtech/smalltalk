@@ -235,6 +235,8 @@
           "--exclude"
           "st3"
           "--exclude"
+          "st3-daemon"
+          "--exclude"
           "st3-client"
           "--exclude"
           "st3-client-codegen"
@@ -399,7 +401,7 @@
           # Embedded hooks are published into immutable runtime hook sets. The
           # sandbox has no /usr/bin/env; patch before compilation for package/check.
           postPatch = ''
-            for hook in crates/st3/hooks/claude-observe.sh crates/st3/hooks/claude-statusline.sh; do
+            for hook in crates/st3-daemon/hooks/claude-observe.sh crates/st3-daemon/hooks/claude-statusline.sh; do
               if [ ! -f "$hook" ]; then
                 echo "Missing embedded Claude hook: $hook" >&2
                 exit 1
@@ -431,6 +433,8 @@
             "st-runtime"
             "-p"
             "st3"
+            "-p"
+            "st3-daemon"
             "-p"
             "st3-client"
             "-p"
@@ -1047,8 +1051,8 @@
           } ''
             cp -R ${self}/crates/st-drivers/hooks hooks
             chmod -R u+w hooks
-            cp ${self}/crates/st3/hooks/pi-channel.ts hooks/st-pi-channel.ts
-            cp ${self}/crates/st3/hooks/omp-channel.ts hooks/st-omp-channel.ts
+            cp ${self}/crates/st3-daemon/hooks/pi-channel.ts hooks/st-pi-channel.ts
+            cp ${self}/crates/st3-daemon/hooks/omp-channel.ts hooks/st-omp-channel.ts
 
             modules=hooks/typecheck/node_modules
             mkdir -p "$modules/@earendil-works/pi-coding-agent" "$modules/@types/node"
