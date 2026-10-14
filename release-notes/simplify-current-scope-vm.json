@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Run four current native scope controls beside the three retained st2 controls in the existing isolation VM, provisioning both selected package working directories.",
+  "replay": {
+    "status": "none",
+    "detail": "none"
+  },
+  "schema": {
+    "status": "none",
+    "detail": "none"
+  },
+  "rules": {
+    "status": "none",
+    "detail": "none"
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "none"
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "none"
+  },
+  "manual": {
+    "status": "none",
+    "detail": "none"
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "none"
+  }
+}
