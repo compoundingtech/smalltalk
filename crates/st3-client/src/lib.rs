@@ -2742,6 +2742,13 @@ impl Client {
     ) -> Result<Envelope<PairingChallenge>, ClientError> {
         self.post("/v1/client/pairings", request).await
     }
+    /// Begin a person-only pairing without changing its existing wire shape.
+    pub async fn pairing_begin_person(
+        &self,
+        request: &PersonPairingBegin,
+    ) -> Result<Envelope<PairingChallenge>, ClientError> {
+        self.post("/v1/client/pairings", request).await
+    }
     pub async fn pairing_complete(
         &self,
         pairing_id: &str,
@@ -2753,6 +2760,49 @@ impl Client {
                 pairing_id.trim_start_matches("pairing/")
             ),
             request,
+        )
+        .await
+    }
+    /// Person profiles must never accept an external-assistant session.
+    pub async fn pairing_complete_person(
+        &self,
+        pairing_id: &str,
+        request: &PairingComplete,
+    ) -> Result<Envelope<PersonPairedSession>, ClientError> {
+        self.post(
+            &format!(
+                "/v1/client/pairings/{}/complete",
+                percent_encode(pairing_id.trim_start_matches("pairing/"))
+            ),
+            request,
+        )
+        .await
+    }
+    pub async fn assistant_grant(&self, id: &str) -> Result<Envelope<AssistantGrant>, ClientError> {
+        self.get(&format!(
+            "/v1/client/assistant/grants/{}",
+            percent_encode(id)
+        ))
+        .await
+    }
+    pub async fn assistant_grant_revoke(
+        &self,
+        id: &str,
+    ) -> Result<Envelope<AssistantGrant>, ClientError> {
+        self.post(
+            &format!("/v1/client/assistant/grants/{}/revoke", percent_encode(id)),
+            &serde_json::json!({}),
+        )
+        .await
+    }
+    pub async fn assistant_grant_policy(
+        &self,
+        id: &str,
+        policy: &AssistantGrantPolicy,
+    ) -> Result<Envelope<AssistantGrant>, ClientError> {
+        self.post(
+            &format!("/v1/client/assistant/grants/{}/policy", percent_encode(id)),
+            policy,
         )
         .await
     }
@@ -4675,7 +4725,7 @@ mod device_stream_policy_tests {
             allow_public_http: false,
             person_root_fingerprint: None,
             signing_key: None,
-            session: PairedSession {
+            session: PersonPairedSession {
                 kind: "paired-session".into(),
                 device_id: "device/policy".into(),
                 person_id: "person/avery".into(),

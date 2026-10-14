@@ -675,6 +675,7 @@ async fn onboarding_api(
         st3::store::Store::open(&state_dir.join("claims.sqlite3"), "studio").unwrap(),
     );
     let state = st3::api::AppState {
+        owning_person: None,
         store: store.clone(),
         notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         event_notify: tokio::sync::watch::channel(0_u64).0,

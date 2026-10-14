@@ -50,6 +50,7 @@ async fn a_live_backup_download_restores_and_leaves_the_daemon_serving_reads() {
     }
     let socket = root.path().join("api.sock");
     let state = AppState {
+        owning_person: None,
         store: store.clone(),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0).0,

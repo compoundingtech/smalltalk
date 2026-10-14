@@ -79,6 +79,9 @@
     { "id": "action.submit", "method": "POST", "path": "/v1/client/actions", "request": "ActionRequest", "response": "ActionResult" },
     { "id": "pairing.begin", "method": "POST", "path": "/v1/client/pairings", "request": "PairingBegin", "response": "PairingChallenge", "local_only": true },
     { "id": "pairing.complete", "method": "POST", "path": "/v1/client/pairings/{id}/complete", "request": "PairingComplete", "response": "PairedSession" },
+    { "id": "assistant.grant.get", "method": "GET", "path": "/v1/client/assistant/grants/{id}", "response": "AssistantGrant", "local_only": true, "actor": "daemon-configured-owner", "capability": "assistant.grants.v1" },
+    { "id": "assistant.grant.revoke", "method": "POST", "path": "/v1/client/assistant/grants/{id}/revoke", "response": "AssistantGrant", "local_only": true, "actor": "daemon-configured-owner", "capability": "assistant.grants.v1" },
+    { "id": "assistant.grant.policy", "method": "POST", "path": "/v1/client/assistant/grants/{id}/policy", "request": "AssistantGrantPolicy", "response": "AssistantGrant", "local_only": true, "actor": "daemon-configured-owner", "capability": "assistant.grants.v1" },
     { "id": "terminal.stream", "method": "GET", "path": "/v1/client/terminals/{id}/stream", "response": "TerminalScreen", "websocket_protocol": "st3.client.terminal.v0" },
     { "id": "conversation.stream", "method": "GET", "path": "/v1/client/conversations/{id}/stream", "response": "ConversationChanges", "websocket_protocol": "st3.client.conversation.v0" },
     {"id": "glasses.put", "method": "PUT", "path": "/v1/client/glasses/{id}", "request": "GlassPut", "response": "Glass", "scope": "control.glasses", "idempotency_header": "Idempotency-Key"},
@@ -157,7 +160,10 @@
     "max_arrangement_operations": 1024,
     "max_arrangement_folders": 1024,
     "max_arrangement_placements": 4096,
-    "pairing_ttl_seconds": 300  },
+    "pairing_ttl_seconds": 300,
+    "assistant_grant_default_ttl_seconds": 3600,
+    "assistant_grant_max_ttl_seconds": 86400
+  },
   "idempotency_contract": {
     "storage": "local-sqlite-completed-response-rows",
     "minimum_retention_seconds": 604800,

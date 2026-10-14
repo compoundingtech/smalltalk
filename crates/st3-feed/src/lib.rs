@@ -1457,6 +1457,7 @@ mod tests {
 
     pub(super) fn test_state(root: &Path) -> st3::api::AppState {
         st3::api::AppState {
+            owning_person: None,
             // Socket reads overlap graph writes, as on a real WAL-backed member.
             store: Arc::new(st3::store::Store::open(&root.join("graph.db"), "stui-feed").unwrap()),
             notify: Arc::new(Notify::new()),

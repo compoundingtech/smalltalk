@@ -54,6 +54,7 @@ impl Daemon {
 
     fn state(&self) -> AppState {
         AppState {
+            owning_person: None,
             store: self.store.clone(),
             notify: Arc::new(Notify::new()),
             event_notify: self.event_notify.clone(),

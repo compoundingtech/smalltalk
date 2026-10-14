@@ -124,7 +124,7 @@ impl Grant {
     }
 }
 
-pub(super) fn validate(session: &PairedSession, expected_key: &str) -> Result<()> {
+pub(super) fn validate(session: &PersonPairedSession, expected_key: &str) -> Result<()> {
     verify(
         &session.person_id,
         &session.device_key_chain,

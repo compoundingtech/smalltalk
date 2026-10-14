@@ -1113,7 +1113,7 @@ The coverage query reads interval bounds only; it does not materialize older tra
 
 ## Pairing and remote access
 
-Pairing is device-to-person. Its begin request names the concrete initiating `person/*` identity and
+Person pairing is device-to-person. Its begin request names the concrete initiating `person/*` identity and
 is accepted only on the trusted local Unix API; the daemon persists that person as the delegator.
 The response shows a short-lived single-use code and pairing ID. A remote device reaches the
 loopback gateway through Fabric, proves the code, supplies its public key, and receives a scoped
@@ -1134,6 +1134,51 @@ must use `st devices --as person/alex pair --full-control "Alex iPhone"` on the 
 socket. The selected concrete scopes are sealed into that pairing; existing limited devices are
 not silently upgraded and must be re-paired, then revoked when no longer needed. Revocation takes
 effect for every subsequent request, including a new bounded terminal WebSocket exchange.
+
+### External assistant grants
+
+External assistants use a separate, closed principal namespace, never person delegation.
+See [External assistants](../external-assistants.md) for the staged A/B contract and dormant
+future send/kill requirements. No live issuance is authorized by merging this implementation.
+
+`PairingBegin` and `PairedSession` are disjoint untagged unions of person and assistant variants. Person
+wire fields and historical claims are unchanged; typed person clients use `PersonPairingBegin`
+and `PersonPairedSession`. Assistant begin names only `assistant/chatgpt`, seals explicit
+assistant read scopes, requires disclosure consent and its evidence, and uses the same
+five-minute single-use challenge. Grant duration defaults to one hour and cannot exceed
+24 hours; it is independent of challenge expiry. Completion returns `assistant-paired-session`,
+not a person session, and never creates a person signing chain. Assistant credentials and keys
+are retained in a separate owner-only client profile.
+
+Only the daemon's configured owning person through the trusted-local CLI over the Unix API
+may issue, inspect, renew, revoke, or change assistant grants. Missing owner configuration
+fails closed. Deployment owner identity is external configuration, never a hardcoded public
+identity; public examples and tests use `person/operator`. Management routes are
+`GET /v1/client/assistant/grants/{id}`, `POST .../{id}/revoke`, and `POST .../{id}/policy`.
+Responses use the normal snapshot envelope with an `AssistantGrant` value. Policy updates
+increment the policy revision. Only `minimal_read_mode=approval-once` is supported;
+caller-bound allow is not silently enabled. Grant projections include exact scope, consent,
+issuer as a concrete `PersonId` and revoked status, never the bearer or credential digest.
+`key_id` is the public-key SHA-256 digest. The recipient allowlist remains empty; A does not
+authorize any mutation.
+
+The issuer is sealed from the configured owner at trusted-local begin and preserved through
+gateway completion; remote callers cannot select or replace it. Assistant clients validate
+the issuer's concrete person shape from that gateway response without person grant proofs
+or a fixed named-owner check. The baseline fixture scopes are exactly
+`read.assistant.summary`, `read.assistant.attention`, `read.assistant.missions`, and
+`read.assistant.agents`; disclosure consent and `consent_evidence: "axe:igubz7"` remain required.
+
+Pairing completion, authenticated assistant requests, renewal/policy change and revocation
+must reach the authoritative grant-issuer member. A replicated claim on another member
+cannot establish current revocation/policy authority or permit cross-member proof replay.
+Only the configured owner's trusted-local inventory includes assistant device rows; these
+carry principal, sender class and grant metadata, without a synthetic `person_id`.
+Capability discovery advertises `assistant.grants.v1` to the trusted-local configured owner
+and does not substitute ordinary person grants on older servers.
+
+
+### Person declaration access
 
 Agent declarations are a separate, sensitive read: `GET /v1/client/agent-declarations/{id}`
 returns the currently applied desired tree, its canonical KDL v2 text, exact revision ID, and

@@ -8,7 +8,7 @@ use alacritty_terminal::{
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use st3::{api::AppState, model::PersonAskRequest, store::Store};
-use st3_client::{Client, PairingBegin};
+use st3_client::{Client, PersonPairingBegin};
 use std::{
     io::{Read, Write},
     path::Path,
@@ -137,6 +137,7 @@ fn state(root: &Path, node: &str) -> AppState {
         ))
         .unwrap();
     AppState {
+        owning_person: None,
         store: Arc::new(store),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0).0,
@@ -228,14 +229,11 @@ fn carrier_with_loss(
 }
 
 async fn pair(root: &Path, local: &Client, url: &str) {
-    let challenge = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Demo laptop".into(),
-            person_id: "person/avery".into(),
-            full_control: Some(true),
-            scopes: None,
-        })
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Demo laptop".into(),
+    person_id: "person/avery".into(),
+    full_control: Some(true),
+    scopes: None, })
         .await
         .unwrap()
         .value;
@@ -372,14 +370,11 @@ async fn stui_pair_persists_a_real_signing_key_and_leaves_read_only_devices_with
         state.store.claim_verdict(&claim.id).unwrap(),
         smallclaims::principal::Verdict::Verified
     );
-    let challenge = local
-        .pairing_begin(&PairingBegin {
-            api_version: st3_client::API_VERSION.into(),
-            device_name: "Display".into(),
-            person_id: "person/avery".into(),
-            full_control: None,
-            scopes: Some(vec!["read.projections".into()]),
-        })
+    let challenge = local.pairing_begin_person(&PersonPairingBegin { api_version: st3_client::API_VERSION.into(),
+    device_name: "Display".into(),
+    person_id: "person/avery".into(),
+    full_control: None,
+    scopes: Some(vec!["read.projections".into()]), })
         .await
         .unwrap()
         .value;

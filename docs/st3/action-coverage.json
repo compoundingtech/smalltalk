@@ -843,12 +843,45 @@
     },
     {
       "command": "st devices complete",
-      "description": "Complete a single-use pairing and privately persist its credential and signing key",
+      "description": "Complete a single-use person or assistant pairing and privately persist its credential and signing key",
       "tests": [
         "crates/st3/tests/client_v0_cli.rs::devices_complete_needs_no_daemon_config_and_never_prints_or_loses_secrets",
-        "crates/st3-client/tests/device_signing.rs::shared_completion_persists_both_key_types_and_preserves_a_working_device_on_failure"
+        "crates/st3-client/tests/device_signing.rs::shared_completion_persists_both_key_types_and_preserves_a_working_device_on_failure",
+        "crates/st3/src/main.rs::assistant_pairing_seals_explicit_scopes_expiry_and_consent"
       ],
       "verification": "real CLI against an isolated paired gateway; generated/imported Ed25519/P-256 keys; credential/key profile reloaded; signed messages verify"
+    },
+    {
+      "command": "st devices grant inspect",
+      "description": "Show one assistant grant's scopes, expiry, policy revision and consent without its credential",
+      "tests": [
+        "crates/st3/src/main.rs::assistant_pairing_seals_explicit_scopes_expiry_and_consent"
+      ],
+      "verification": "CLI parse and local term validation; trusted local Unix person only"
+    },
+    {
+      "command": "st devices grant policy",
+      "description": "Replace one assistant grant's explicit scopes, expiry and consent; increments its policy revision",
+      "tests": [
+        "crates/st3/src/main.rs::assistant_pairing_seals_explicit_scopes_expiry_and_consent"
+      ],
+      "verification": "CLI parse and local term validation; trusted local Unix person only"
+    },
+    {
+      "command": "st devices grant renew",
+      "description": "Extend one assistant grant with its current scopes after renewed consent; increments its policy revision",
+      "tests": [
+        "crates/st3/src/main.rs::assistant_pairing_seals_explicit_scopes_expiry_and_consent"
+      ],
+      "verification": "CLI parse and local term validation; trusted local Unix person only"
+    },
+    {
+      "command": "st devices grant revoke",
+      "description": "Revoke exactly one assistant grant",
+      "tests": [
+        "crates/st3/src/main.rs::assistant_pairing_seals_explicit_scopes_expiry_and_consent"
+      ],
+      "verification": "CLI parse; trusted local Unix person only"
     },
     {
       "command": "st devices ls",
@@ -860,7 +893,7 @@
     },
     {
       "command": "st devices pair",
-      "description": "Begin local pairing for one named person and device",
+      "description": "Begin local pairing for one named person and device, or one sealed assistant grant",
       "tests": [
         "crates/st3/tests/action_coverage.rs::cli_devices_and_native_import_survive_restart"
       ],

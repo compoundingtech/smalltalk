@@ -183,8 +183,12 @@ public actor St3Client {
     /// Diagnostic local acceptance: no graph receipt or snapshot fence.
     public func observationsReport(_ report: ObservationReport) async throws -> ObservationResponse { try await post("v1/client/observations", report) }
 
-    public func beginPairing(deviceName: String, personID: String) async throws -> Envelope<PairingChallenge> { try await post("v1/client/pairings", PairingBegin(apiVersion: st3ClientAPIVersion, deviceName: deviceName, personID: personID)) }
+    public func beginPairing(deviceName: String, personID: String) async throws -> Envelope<PairingChallenge> { try await post("v1/client/pairings", PersonPairingBegin(apiVersion: st3ClientAPIVersion, deviceName: deviceName, personID: personID)) }
+    public func beginPairing(_ request: PairingBegin) async throws -> Envelope<PairingChallenge> { try await post("v1/client/pairings", request) }
     public func completePairing(pairingID: String, code: String, devicePublicKey: String) async throws -> Envelope<PairedSession> { try await post("v1/client/pairings/\(pairingID.replacingOccurrences(of: "pairing/", with: ""))/complete", PairingComplete(apiVersion: st3ClientAPIVersion, code: code, devicePublicKey: devicePublicKey)) }
+    public func assistantGrant(_ id: String) async throws -> Envelope<AssistantGrant> { try await get("v1/client/assistant/grants/\(id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? id)") }
+    public func assistantGrantRevoke(_ id: String) async throws -> Envelope<AssistantGrant> { try await post("v1/client/assistant/grants/\(id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? id)/revoke", [String: String]()) }
+    public func assistantGrantPolicy(_ id: String, _ policy: AssistantGrantPolicy) async throws -> Envelope<AssistantGrant> { try await post("v1/client/assistant/grants/\(id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))) ?? id)/policy", policy) }
     public func terminalScreen(_ id: String) async throws -> Envelope<TerminalScreen> { try await get("v1/client/terminals/\(id.replacingOccurrences(of: "terminal/", with: ""))/screen") }
     public func agentQueue(_ id: String) async throws -> Envelope<AgentQueue> { try await get("v1/client/agent-queues/\(id)") }
     /// Open the terminal stream one `terminal.attach` capability allows. Each element is a whole

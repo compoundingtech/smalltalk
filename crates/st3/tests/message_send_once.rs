@@ -23,6 +23,7 @@ const LEAD: &str = "agent/example/lead";
 async fn daemon(root: &Path) -> (PathBuf, Arc<Store>, tokio::task::JoinHandle<()>) {
     let socket = root.join("st3.sock");
     let state = AppState {
+        owning_person: None,
         store: Arc::new(Store::open_memory("message-send-once").unwrap()),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,

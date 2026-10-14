@@ -209,8 +209,61 @@ fn generated_models_decode_every_stream_fixture() {
     assert_ne!(changed.value.revision, screen.value.revision);
     let ended: ErrorEnvelope = decode("terminal-stale-fence-error.json");
     assert_eq!(ended.code, ErrorCode::StaleFence);
-    let pairing: Envelope<PairedSession> = decode("pairing.json");
+    let pairing: Envelope<PersonPairedSession> = decode("pairing.json");
     assert!(pairing.value.credential.len() >= 32);
+}
+
+#[test]
+fn assistant_pairing_is_disjoint_from_person_delegation() {
+    let begin: PairingBegin = decode("assistant-pairing-begin.json");
+    let PairingBegin::Assistant(request) = begin else { panic!("assistant request decoded as person"); };
+    assert_eq!(request.assistant_id, AssistantPrincipal::Chatgpt);
+    let scopes = vec![
+        AssistantScope::Summary,
+        AssistantScope::Attention,
+        AssistantScope::Missions,
+        AssistantScope::Agents,
+    ];
+    assert_eq!(request.scopes, scopes);
+    assert!(request.disclosure_consent);
+    assert_eq!(request.consent_evidence, "axe:igubz7");
+    assert_eq!(request.expires_in_seconds, Some(3600));
+    let policy: AssistantGrantPolicy = decode("assistant-grant-policy.json");
+    assert_eq!(policy.minimal_read_mode, AssistantMinimalReadMode::ApprovalOnce);
+    assert_eq!(policy.scopes, scopes);
+    assert!(policy.disclosure_consent);
+    assert_eq!(policy.consent_evidence, "axe:igubz7");
+
+    let challenge: Envelope<PairingChallenge> = decode("assistant-pairing-challenge.json");
+    assert_eq!(challenge.value.grant_kind.as_deref(), Some("assistant"));
+    assert_ne!(challenge.value.grant_expires_at.as_deref(), Some(challenge.value.expires_at.as_str()));
+    assert!(challenge.value.person_root_fingerprint.is_none());
+
+    let paired: Envelope<PairedSession> = decode("assistant-pairing.json");
+    let PairedSession::Assistant(session) = paired.value else { panic!("assistant session decoded as person"); };
+    assert_eq!(session.sender_class, AssistantSenderClass::ExternalAssistant);
+    assert_eq!(session.grant.policy_revision, 1);
+    assert_eq!(session.grant.issuer, "person/operator");
+    assert_eq!(session.scopes, scopes);
+    assert_eq!(session.grant.scopes, scopes);
+    assert!(session.grant.disclosure_consent);
+    assert_eq!(session.grant.consent_evidence, "axe:igubz7");
+    assert!(session.grant.recipient_allowlist.is_empty());
+    let public = serde_json::to_value(&session.grant).unwrap();
+    assert!(public.get("credential").is_none());
+    assert!(public.get("credential_digest").is_none());
+    assert!(public.get("person_id").is_none());
+    assert!(serde_json::from_slice::<Envelope<PersonPairedSession>>(&fixture("assistant-pairing.json")).is_err());
+    assert!(serde_json::from_slice::<Envelope<AssistantPairedSession>>(&fixture("pairing.json")).is_err());
+    let person: Envelope<PairedSession> = decode("pairing.json");
+    assert!(matches!(person.value, PairedSession::Person(_)));
+
+    let mut mixed: serde_json::Value = decode("assistant-pairing-begin.json");
+    mixed["person_id"] = serde_json::json!("person/operator");
+    assert!(serde_json::from_value::<PairingBegin>(mixed).is_err());
+    let mut broad: serde_json::Value = decode("assistant-pairing-begin.json");
+    broad["scopes"] = serde_json::json!(["control.messages"]);
+    assert!(serde_json::from_value::<PairingBegin>(broad).is_err());
 }
 
 #[test]
@@ -298,7 +351,7 @@ fn generated_resource_union_decodes_all_kinds() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(device.person_id, "person/alex");
+    assert_eq!(device.person_id.as_deref(), Some("person/alex"));
     assert_eq!(device.state, "active");
 }
 

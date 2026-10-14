@@ -18,6 +18,10 @@
     { "file": "terminal-end.json", "definition": "ActionRequest" },
 
     { "file": "pairing.json", "definition": "Envelope" },
+    { "file": "assistant-pairing-begin.json", "definition": "PairingBegin" },
+    { "file": "assistant-pairing-challenge.json", "definition": "Envelope" },
+    { "file": "assistant-pairing.json", "definition": "Envelope" },
+    { "file": "assistant-grant-policy.json", "definition": "AssistantGrantPolicy" },
     { "file": "terminal-screen.json", "definition": "Envelope" },
     { "file": "terminal-screen-changed.json", "definition": "Envelope" },
     { "file": "terminal-stale-fence-error.json", "definition": "ErrorEnvelope" },

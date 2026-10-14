@@ -1089,6 +1089,7 @@ fn event_feeds_are_contiguous_and_terminal_streams_replace_whole_screens() {
 
 fn test_state(root: &Path) -> AppState {
     AppState {
+        owning_person: None,
         // Server reads and writes overlap; use the daemon's file-backed WAL semantics.
         store: Arc::new(
             Store::open(&root.join("claims.sqlite3"), "client-v0-baseline").unwrap(),
@@ -2927,6 +2928,10 @@ mission "example/other/one" state="ready" { concurrent-runs; goal "Wait outside 
             client_json_person(app.clone(), "/v1/client/capabilities", agent).await;
         for capability in capabilities["value"]["capabilities"].as_array().unwrap() {
             let id = capability["id"].as_str().unwrap();
+            if id == "assistant.grants.v1" {
+                assert_eq!(capability["state"], "ungranted", "{agent}: {capability}");
+                continue;
+            }
             if capability["state"] == "unavailable" || id.contains("glass") {
                 continue;
             }

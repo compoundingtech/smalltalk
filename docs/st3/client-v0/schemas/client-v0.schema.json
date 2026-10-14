@@ -59,6 +59,7 @@
     "RunGenerationId": {"type": "string", "pattern": "^(?:run-generation)/[^\\s]+$", "x-st-ref": "run-generation"},
     "StepRunId": {"type": "string", "pattern": "^(?:step-run)/[^\\s]+$", "x-st-ref": "step-run"},
     "AgentId": {"type": "string", "pattern": "^(?:agent)/[^\\s]+$", "x-st-ref": "agent"},
+    "PersonId": {"type": "string", "pattern": "^person/[^/\\s]+$", "description": "Concrete person identity, never a session actor or a deployment-specific fixed person."},
     "HostId": {"type": "string", "pattern": "^(?:host)/[^\\s]+$", "x-st-ref": "host"},
     "RuntimeId": {"type": "string", "pattern": "^(?:runtime)/[^\\s]+$", "x-st-ref": "runtime"},
     "TerminalId": {"type": "string", "pattern": "^(?:terminal)/[^\\s]+$", "x-st-ref": "terminal"},
@@ -184,6 +185,7 @@
             { "$ref": "#/$defs/ActionResult" },
             { "$ref": "#/$defs/PairingChallenge" },
             { "$ref": "#/$defs/PairedSession" },
+            { "$ref": "#/$defs/AssistantGrant" },
             { "$ref": "#/$defs/TerminalScreen" },
             { "$ref": "#/$defs/StatusHistory" },
             { "$ref": "#/$defs/AgentQueue" },
@@ -239,7 +241,14 @@
         },
         "event_cursor": { "$ref": "#/$defs/Cursor" },
         "oldest_event_cursor": { "$ref": "#/$defs/Cursor" },
-        "schemas": { "type": "array", "items": { "type": "string", "format": "uri-reference" }, "minItems": 1 }
+        "schemas": { "type": "array", "items": { "type": "string", "format": "uri-reference" }, "minItems": 1 },
+        "principal": { "$ref": "#/$defs/AssistantPrincipal" },
+        "sender_class": { "$ref": "#/$defs/AssistantSenderClass" },
+        "grant_kind": { "enum": ["person", "assistant"] },
+        "grant_id": { "$ref": "#/$defs/Id" },
+        "grant_expires_at": { "$ref": "#/$defs/Timestamp" },
+        "policy_revision": { "type": "integer", "minimum": 1 },
+        "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }
       }
     },
     "Operational": {
@@ -1534,11 +1543,15 @@
       ]
     },
     "Device": {
+      "oneOf": [
+        { "required": ["person_id"], "properties": { "person_id": { "$ref": "#/$defs/Id" }, "grant_kind": { "const": "person" }, "principal": false, "sender_class": false, "grant_id": false } },
+        { "required": ["principal", "sender_class", "grant_kind", "grant_id", "policy_revision", "minimal_read_mode"], "properties": { "grant_kind": { "const": "assistant" }, "person_id": false } }
+      ],
       "allOf": [
         { "$ref": "#/$defs/ResourceHeader" },
         {
           "type": "object",
-          "required": ["kind", "person_id", "session_actor", "state", "scopes", "expires_at"],
+          "required": ["kind", "session_actor", "state", "scopes", "expires_at"],
           "properties": {
             "kind": { "const": "device" },
             "person_id": { "$ref": "#/$defs/Id" },
@@ -1546,7 +1559,14 @@
             "session_actor": { "$ref": "#/$defs/Id" },
             "state": { "enum": ["active", "expired", "revoked"] },
             "scopes": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
-            "expires_at": { "$ref": "#/$defs/Timestamp" }
+            "expires_at": { "$ref": "#/$defs/Timestamp" },
+            "principal": { "$ref": "#/$defs/AssistantPrincipal" },
+            "sender_class": { "$ref": "#/$defs/AssistantSenderClass" },
+            "grant_kind": { "enum": ["person", "assistant"] },
+            "grant_id": { "$ref": "#/$defs/Id" },
+            "grant_expires_at": { "$ref": "#/$defs/Timestamp" },
+            "policy_revision": { "type": "integer", "minimum": 1 },
+            "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }
           }
         }
       ]
@@ -2299,7 +2319,64 @@
         "arrangement_revision": { "$ref": "#/$defs/Revision" }
       }
     },
+    "AssistantPrincipal": { "enum": ["assistant/chatgpt"] },
+    "AssistantSenderClass": { "enum": ["external-assistant"] },
+    "AssistantScope": { "enum": ["read.assistant.summary", "read.assistant.attention", "read.assistant.missions", "read.assistant.agents", "read.assistant.conversation", "read.assistant.terminal"] },
+    "AssistantMinimalReadMode": { "enum": ["approval-once"] },
+    "AssistantGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "principal", "sender_class", "session_actor", "device_id", "key_id", "issuer", "scopes", "expires_at", "policy_revision", "minimal_read_mode", "recipient_allowlist", "disclosure_consent", "consent_evidence", "revoked"],
+      "properties": {
+        "kind": { "const": "assistant-grant" },
+        "id": { "$ref": "#/$defs/Id" },
+        "principal": { "$ref": "#/$defs/AssistantPrincipal" },
+        "sender_class": { "$ref": "#/$defs/AssistantSenderClass" },
+        "session_actor": { "type": "string", "pattern": "^assistant/chatgpt/session/.+$" },
+        "device_id": { "$ref": "#/$defs/Id" },
+        "key_id": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 of the canonical device public-key string; never a credential digest." },
+        "issuer": { "$ref": "#/$defs/PersonId", "description": "Daemon-configured owning person, sealed by the authoritative grant-issuer member at trusted-local begin." },
+        "scopes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/AssistantScope" } },
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "policy_revision": { "type": "integer", "minimum": 1 },
+        "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" },
+        "recipient_allowlist": { "type": "array", "maxItems": 0, "items": { "type": "string", "pattern": "^agent/.+$" } },
+        "disclosure_consent": { "type": "boolean" },
+        "consent_evidence": { "const": "axe:igubz7" },
+        "revoked": { "type": "boolean" }
+      }
+    },
+    "AssistantGrantPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "scopes", "disclosure_consent", "consent_evidence", "minimal_read_mode"],
+      "properties": {
+        "api_version": { "const": "st3.client.v0" },
+        "scopes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/AssistantScope" } },
+        "expires_in_seconds": { "type": "integer", "minimum": 1, "maximum": 86400, "default": 3600 },
+        "disclosure_consent": { "const": true },
+        "consent_evidence": { "const": "axe:igubz7" },
+        "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }
+      }
+    },
+    "AssistantPairingBegin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["api_version", "device_name", "assistant_id", "scopes", "disclosure_consent", "consent_evidence"],
+      "properties": {
+        "api_version": { "const": "st3.client.v0" },
+        "device_name": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "assistant_id": { "$ref": "#/$defs/AssistantPrincipal" },
+        "scopes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/AssistantScope" } },
+        "expires_in_seconds": { "type": "integer", "minimum": 1, "maximum": 86400, "default": 3600 },
+        "disclosure_consent": { "const": true },
+        "consent_evidence": { "const": "axe:igubz7" }
+      }
+    },
     "PairingBegin": {
+      "oneOf": [{ "$ref": "#/$defs/PersonPairingBegin" }, { "$ref": "#/$defs/AssistantPairingBegin" }]
+    },
+    "PersonPairingBegin": {
       "type": "object",
       "additionalProperties": false,
       "required": ["api_version", "device_name", "person_id"],
@@ -2318,6 +2395,10 @@
       }
     },
     "PairingChallenge": {
+      "oneOf": [
+        { "properties": { "grant_kind": { "const": "person" }, "principal": false, "grant_id": false, "grant_expires_at": false, "policy_revision": false, "minimal_read_mode": false } },
+        { "required": ["principal", "grant_kind", "grant_id", "grant_expires_at", "policy_revision", "minimal_read_mode"], "properties": { "principal": { "$ref": "#/$defs/AssistantPrincipal" }, "grant_kind": { "const": "assistant" }, "grant_id": { "$ref": "#/$defs/Id" }, "grant_expires_at": { "$ref": "#/$defs/Timestamp" }, "policy_revision": { "type": "integer", "minimum": 1 }, "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }, "person_root_fingerprint": false } }
+      ],
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "pairing_id", "code", "expires_at"],
@@ -2326,7 +2407,13 @@
         "pairing_id": { "$ref": "#/$defs/Id" },
         "code": { "type": "string", "pattern": "^[A-Z2-9]{8}$" },
         "expires_at": { "$ref": "#/$defs/Timestamp" },
-        "person_root_fingerprint": { "type": "string", "pattern": "^sha256:[A-Za-z0-9_-]{43}$" }
+        "person_root_fingerprint": { "type": "string", "pattern": "^sha256:[A-Za-z0-9_-]{43}$" },
+        "principal": { "$ref": "#/$defs/AssistantPrincipal" },
+        "grant_kind": { "enum": ["person", "assistant"] },
+        "grant_id": { "$ref": "#/$defs/Id" },
+        "grant_expires_at": { "$ref": "#/$defs/Timestamp" },
+        "policy_revision": { "type": "integer", "minimum": 1 },
+        "minimal_read_mode": { "$ref": "#/$defs/AssistantMinimalReadMode" }
       }
     },
     "PairingComplete": {
@@ -2340,7 +2427,27 @@
         "key_storage": { "enum": ["secure-enclave", "software"] }
       }
     },
+    "AssistantPairedSession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "api_version", "principal", "sender_class", "device_id", "session_actor", "credential", "scopes", "expires_at", "grant"],
+      "properties": {
+        "kind": { "const": "assistant-paired-session" },
+        "api_version": { "const": "st3.client.v0" },
+        "principal": { "$ref": "#/$defs/AssistantPrincipal" },
+        "sender_class": { "$ref": "#/$defs/AssistantSenderClass" },
+        "device_id": { "$ref": "#/$defs/Id" },
+        "session_actor": { "type": "string", "pattern": "^assistant/chatgpt/session/.+$" },
+        "credential": { "x-st-codec": "redacted", "type": "string", "minLength": 32 },
+        "scopes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/AssistantScope" } },
+        "expires_at": { "$ref": "#/$defs/Timestamp" },
+        "grant": { "$ref": "#/$defs/AssistantGrant" }
+      }
+    },
     "PairedSession": {
+      "oneOf": [{ "$ref": "#/$defs/PersonPairedSession" }, { "$ref": "#/$defs/AssistantPairedSession" }]
+    },
+    "PersonPairedSession": {
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "device_id", "person_id", "session_actor", "credential", "scopes", "expires_at"],

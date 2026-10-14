@@ -6,7 +6,7 @@ import type {
     Arrangement, ArrangementId, ArrangementPage,
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationContentChunk, ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
-    PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelinePage,
+    PairingComplete, PairedSession, AssistantGrant, AssistantGrantPolicy, Resource, Snapshot, TerminalScreen, TimelinePage,
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };
@@ -285,6 +285,16 @@ export class St3Client {
 
     async completePairing(id: string, request: PairingComplete): Promise<EnvelopeOf<PairedSession>> {
         return this.request<PairedSession>('POST', `/v1/client/pairings/${encodeURIComponent(routedId(id))}/complete`, request);
+    }
+
+    async assistantGrant(id: string): Promise<EnvelopeOf<AssistantGrant>> {
+        return this.request<AssistantGrant>('GET', `/v1/client/assistant/grants/${encodeURIComponent(id)}`);
+    }
+    async assistantGrantRevoke(id: string): Promise<EnvelopeOf<AssistantGrant>> {
+        return this.request<AssistantGrant>('POST', `/v1/client/assistant/grants/${encodeURIComponent(id)}/revoke`, {});
+    }
+    async assistantGrantPolicy(id: string, policy: AssistantGrantPolicy): Promise<EnvelopeOf<AssistantGrant>> {
+        return this.request<AssistantGrant>('POST', `/v1/client/assistant/grants/${encodeURIComponent(id)}/policy`, policy);
     }
 
     async followOperation(id: string, options: { signal?: AbortSignal; intervalMs?: number } = {}): Promise<EnvelopeOf<Resource>> {

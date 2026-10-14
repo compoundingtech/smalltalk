@@ -1024,6 +1024,88 @@ export const ArrangementPage = /*#__PURE__*/ (() => Schema.Struct({
 export type ArrangementPage = typeof ArrangementPage.Type
 export type ArrangementPageEncoded = typeof ArrangementPage.Encoded
 
+export const AssistantMinimalReadMode = /*#__PURE__*/ (() => Schema.Literals(["approval-once"]).annotate({ identifier: "AssistantMinimalReadMode" }))()
+export type AssistantMinimalReadMode = typeof AssistantMinimalReadMode.Type
+export type AssistantMinimalReadModeEncoded = typeof AssistantMinimalReadMode.Encoded
+
+export const AssistantPrincipal = /*#__PURE__*/ (() => Schema.Literals(["assistant/chatgpt"]).annotate({ identifier: "AssistantPrincipal" }))()
+export type AssistantPrincipal = typeof AssistantPrincipal.Type
+export type AssistantPrincipalEncoded = typeof AssistantPrincipal.Encoded
+
+export const AssistantScope = /*#__PURE__*/ (() => Schema.Literals(["read.assistant.summary","read.assistant.attention","read.assistant.missions","read.assistant.agents","read.assistant.conversation","read.assistant.terminal"]).annotate({ identifier: "AssistantScope" }))()
+export type AssistantScope = typeof AssistantScope.Type
+export type AssistantScopeEncoded = typeof AssistantScope.Encoded
+
+export const AssistantSenderClass = /*#__PURE__*/ (() => Schema.Literals(["external-assistant"]).annotate({ identifier: "AssistantSenderClass" }))()
+export type AssistantSenderClass = typeof AssistantSenderClass.Type
+export type AssistantSenderClassEncoded = typeof AssistantSenderClass.Encoded
+
+/** Concrete person identity, never a session actor or a deployment-specific fixed person. */
+export const PersonId = /*#__PURE__*/ (() => Schema.String.check(Schema.isPattern(new RegExp("^person/[^/\\s]+$", "u"))).annotate({ identifier: "PersonId", description: "Concrete person identity, never a session actor or a deployment-specific fixed person." }))()
+export type PersonId = typeof PersonId.Type
+export type PersonIdEncoded = typeof PersonId.Encoded
+
+export const AssistantGrant = /*#__PURE__*/ (() => Schema.Struct({
+  "consent_evidence": Schema.Literal("axe:igubz7"),
+  "device_id": Id,
+  "disclosure_consent": Schema.Boolean,
+  "expires_at": Timestamp,
+  "id": Id,
+  /** Daemon-configured owning person, sealed by the authoritative grant-issuer member at trusted-local begin. */
+  "issuer": PersonId,
+  /** SHA-256 of the canonical device public-key string; never a credential digest. */
+  "key_id": Schema.String.check(Schema.isPattern(new RegExp("^[0-9a-f]{64}$", "u"))).annotate({ description: "SHA-256 of the canonical device public-key string; never a credential digest." }),
+  "kind": Schema.Literal("assistant-grant"),
+  "minimal_read_mode": AssistantMinimalReadMode,
+  "policy_revision": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)),
+  "principal": AssistantPrincipal,
+  "recipient_allowlist": Schema.Array(Schema.String.check(Schema.isPattern(new RegExp("^agent/.+$", "u")))).check(Schema.isMaxLength(0)),
+  "revoked": Schema.Boolean,
+  "scopes": Schema.Array(AssistantScope).check(Schema.isMinLength(1)).check(Schema.isUnique()),
+  "sender_class": AssistantSenderClass,
+  "session_actor": Schema.String.check(Schema.isPattern(new RegExp("^assistant/chatgpt/session/.+$", "u")))
+}).annotate({ identifier: "AssistantGrant" }))()
+export type AssistantGrant = typeof AssistantGrant.Type
+export type AssistantGrantEncoded = typeof AssistantGrant.Encoded
+
+export const AssistantGrantPolicy = /*#__PURE__*/ (() => Schema.Struct({
+  "api_version": Schema.Literal("st3.client.v0"),
+  "consent_evidence": Schema.Literal("axe:igubz7"),
+  "disclosure_consent": Schema.Literal(true),
+  "expires_in_seconds": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(86400))),
+  "minimal_read_mode": AssistantMinimalReadMode,
+  "scopes": Schema.Array(AssistantScope).check(Schema.isMinLength(1)).check(Schema.isUnique())
+}).annotate({ identifier: "AssistantGrantPolicy" }))()
+export type AssistantGrantPolicy = typeof AssistantGrantPolicy.Type
+export type AssistantGrantPolicyEncoded = typeof AssistantGrantPolicy.Encoded
+
+export const AssistantPairedSession = /*#__PURE__*/ (() => Schema.Struct({
+  "api_version": Schema.Literal("st3.client.v0"),
+  "credential": Schema.RedactedFromValue(Schema.String.check(Schema.isMinLength(32))),
+  "device_id": Id,
+  "expires_at": Timestamp,
+  "grant": AssistantGrant,
+  "kind": Schema.Literal("assistant-paired-session"),
+  "principal": AssistantPrincipal,
+  "scopes": Schema.Array(AssistantScope).check(Schema.isMinLength(1)).check(Schema.isUnique()),
+  "sender_class": AssistantSenderClass,
+  "session_actor": Schema.String.check(Schema.isPattern(new RegExp("^assistant/chatgpt/session/.+$", "u")))
+}).annotate({ identifier: "AssistantPairedSession" }))()
+export type AssistantPairedSession = typeof AssistantPairedSession.Type
+export type AssistantPairedSessionEncoded = typeof AssistantPairedSession.Encoded
+
+export const AssistantPairingBegin = /*#__PURE__*/ (() => Schema.Struct({
+  "api_version": Schema.Literal("st3.client.v0"),
+  "assistant_id": AssistantPrincipal,
+  "consent_evidence": Schema.Literal("axe:igubz7"),
+  "device_name": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(120)),
+  "disclosure_consent": Schema.Literal(true),
+  "expires_in_seconds": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)).check(Schema.isLessThanOrEqualTo(86400))),
+  "scopes": Schema.Array(AssistantScope).check(Schema.isMinLength(1)).check(Schema.isUnique())
+}).annotate({ identifier: "AssistantPairingBegin" }))()
+export type AssistantPairingBegin = typeof AssistantPairingBegin.Type
+export type AssistantPairingBeginEncoded = typeof AssistantPairingBegin.Encoded
+
 export const Attachment = /*#__PURE__*/ (() => Schema.Struct({
   "blob": Schema.String.check(Schema.isPattern(new RegExp("^blob/[0-9a-f]{64}$", "u"))),
   "media_type": Schema.Literals(["image/png","image/jpeg","image/gif","image/webp"]),
@@ -1168,13 +1250,20 @@ export type CursorEncoded = typeof Cursor.Encoded
 export const Capabilities = /*#__PURE__*/ (() => Schema.Struct({
   "capabilities": Schema.Array(Capability),
   "event_cursor": Cursor,
+  "grant_expires_at": optionalKey(Timestamp),
+  "grant_id": optionalKey(Id),
+  "grant_kind": optionalKey(Schema.Literals(["person","assistant"])),
   "kind": Schema.Literal("capabilities"),
   "limits": Schema.Struct({ "max_arrangement_body_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_folders": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_key_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_name_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_operations": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_placements": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangement_resource_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_arrangements": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_event_items": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)), "max_glass_body_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_glass_depth": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_glass_nodes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "max_glasses": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), /** The longest message body in UTF-8 bytes this daemon takes; absent on older daemons, which take 4096. */
 "max_message_bytes": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))).annotate({ description: "The longest message body in UTF-8 bytes this daemon takes; absent on older daemons, which take 4096." }), "max_page_items": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)), "max_response_bytes": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1024)), "max_wait_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)) }),
   /** Compile-time build identity of the responding daemon; absent on older servers. */
   "machine_version": optionalKey(Schema.String).annotate({ description: "Compile-time build identity of the responding daemon; absent on older servers." }),
+  "minimal_read_mode": optionalKey(AssistantMinimalReadMode),
   "oldest_event_cursor": Cursor,
+  "policy_revision": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))),
+  "principal": optionalKey(AssistantPrincipal),
   "schemas": Schema.Array(Schema.String).check(Schema.isMinLength(1)),
+  "sender_class": optionalKey(AssistantSenderClass),
   "session_actor": Id,
   "transport": Schema.Literals(["unix","fabric-loopback"])
 }).annotate({ identifier: "Capabilities" }))()
@@ -1277,19 +1366,10 @@ export const ConnectedClient = /*#__PURE__*/ (() => Schema.Struct({
 export type ConnectedClient = typeof ConnectedClient.Type
 export type ConnectedClientEncoded = typeof ConnectedClient.Encoded
 
-export const Device = /*#__PURE__*/ (() => Schema.Struct({
-  "expires_at": Timestamp,
-  "id": Id,
-  "kind": Schema.Literal("device"),
-  "name": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
-  "operational": optionalKey(Operational),
-  "person_id": Id,
-  "revision": Revision,
-  "scopes": Schema.Array(Schema.String).check(Schema.isUnique()),
-  "session_actor": Id,
-  "state": Schema.Literals(["active","expired","revoked"]),
-  "updated_at": Timestamp
-}).annotate({ identifier: "Device" }))()
+export const Device = /*#__PURE__*/ (() => Schema.Union([
+  Schema.Struct({ "expires_at": Timestamp, "grant_expires_at": optionalKey(Timestamp), "grant_id": optionalKey(Schema.Never), "grant_kind": optionalKey(Schema.Literal("person")), "id": Id, "kind": Schema.Literal("device"), "minimal_read_mode": optionalKey(AssistantMinimalReadMode), "name": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "operational": optionalKey(Operational), "person_id": Id, "policy_revision": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(1))), "principal": optionalKey(Schema.Never), "revision": Revision, "scopes": Schema.Array(Schema.String).check(Schema.isUnique()), "sender_class": optionalKey(Schema.Never), "session_actor": Id, "state": Schema.Literals(["active","expired","revoked"]), "updated_at": Timestamp }),
+  Schema.Struct({ "expires_at": Timestamp, "grant_expires_at": optionalKey(Timestamp), "grant_id": Id, "grant_kind": Schema.Literal("assistant"), "id": Id, "kind": Schema.Literal("device"), "minimal_read_mode": AssistantMinimalReadMode, "name": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE), "operational": optionalKey(Operational), "person_id": optionalKey(Schema.Never), "policy_revision": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)), "principal": AssistantPrincipal, "revision": Revision, "scopes": Schema.Array(Schema.String).check(Schema.isUnique()), "sender_class": AssistantSenderClass, "session_actor": Id, "state": Schema.Literals(["active","expired","revoked"]), "updated_at": Timestamp })
+], { mode: "oneOf" }).annotate({ identifier: "Device" }))()
 export type Device = typeof Device.Type
 export type DeviceEncoded = typeof Device.Encoded
 
@@ -2899,7 +2979,7 @@ export const Page = /*#__PURE__*/ (() => Schema.Struct({
 export type Page = typeof Page.Type
 export type PageEncoded = typeof Page.Encoded
 
-export const PairedSession = /*#__PURE__*/ (() => Schema.Struct({
+export const PersonPairedSession = /*#__PURE__*/ (() => Schema.Struct({
   "credential": Schema.RedactedFromValue(Schema.String.check(Schema.isMinLength(32))),
   "device_id": Id,
   "device_key_chain": optionalKey(Schema.Array(Schema.String)),
@@ -2910,17 +2990,21 @@ export const PairedSession = /*#__PURE__*/ (() => Schema.Struct({
   "person_root_key_proof": optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
   "scopes": Schema.Array(Schema.String).check(Schema.isUnique()),
   "session_actor": Id
-}).annotate({ identifier: "PairedSession" }))()
+}).annotate({ identifier: "PersonPairedSession" }))()
+export type PersonPairedSession = typeof PersonPairedSession.Type
+export type PersonPairedSessionEncoded = typeof PersonPairedSession.Encoded
+
+export const PairedSession = /*#__PURE__*/ (() => Schema.Union([
+  PersonPairedSession,
+  AssistantPairedSession
+], { mode: "oneOf" }).pipe(Schema.toTaggedUnion("kind")).annotate({ identifier: "PairedSession" }))()
 export type PairedSession = typeof PairedSession.Type
 export type PairedSessionEncoded = typeof PairedSession.Encoded
 
-export const PairingChallenge = /*#__PURE__*/ (() => Schema.Struct({
-  "code": Schema.String.check(Schema.isPattern(new RegExp("^[A-Z2-9]{8}$", "u"))),
-  "expires_at": Timestamp,
-  "kind": Schema.Literal("pairing-challenge"),
-  "pairing_id": Id,
-  "person_root_fingerprint": optionalKey(Schema.String.check(Schema.isPattern(new RegExp("^sha256:[A-Za-z0-9_-]{43}$", "u"))))
-}).annotate({ identifier: "PairingChallenge" }))()
+export const PairingChallenge = /*#__PURE__*/ (() => Schema.Union([
+  Schema.Struct({ "grant_expires_at": optionalKey(Schema.Never), "grant_id": optionalKey(Schema.Never), "grant_kind": optionalKey(Schema.Literal("person")), "minimal_read_mode": optionalKey(Schema.Never), "policy_revision": optionalKey(Schema.Never), "principal": optionalKey(Schema.Never) }),
+  Schema.Struct({ "grant_expires_at": Timestamp, "grant_id": Id, "grant_kind": Schema.Literal("assistant"), "minimal_read_mode": AssistantMinimalReadMode, "person_root_fingerprint": optionalKey(Schema.Never), "policy_revision": Schema.Int.check(Schema.isGreaterThanOrEqualTo(1)), "principal": AssistantPrincipal })
+], { mode: "oneOf" }).annotate({ identifier: "PairingChallenge" }))()
 export type PairingChallenge = typeof PairingChallenge.Type
 export type PairingChallengeEncoded = typeof PairingChallenge.Encoded
 
@@ -3009,7 +3093,7 @@ export const Envelope = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "request_id": RequestId,
   "snapshot": Snapshot,
-  "value": Schema.Union([DirectiveNotes, Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
+  "value": Schema.Union([DirectiveNotes, Capabilities, DocumentContent, SubjectDefinition, PublicationDefinition, AgentWorkspace, Page, ResourcesPage, Resource, TimelinePage, ConversationChanges, ConversationSearch, EventPage, ActionResult, PairingChallenge, PairedSession, AssistantGrant, TerminalScreen, StatusHistory, AgentQueue, UsagePeriod, MailBacklog], { mode: "oneOf" })
 }).annotate({ identifier: "Envelope" }))()
 export type Envelope = typeof Envelope.Type
 export type EnvelopeEncoded = typeof Envelope.Encoded
@@ -3130,14 +3214,21 @@ export const PairingAdvertisement = /*#__PURE__*/ (() => Schema.Struct({
 export type PairingAdvertisement = typeof PairingAdvertisement.Type
 export type PairingAdvertisementEncoded = typeof PairingAdvertisement.Encoded
 
-export const PairingBegin = /*#__PURE__*/ (() => Schema.Struct({
+export const PersonPairingBegin = /*#__PURE__*/ (() => Schema.Struct({
   "api_version": Schema.Literal("st3.client.v0"),
   "device_name": Schema.String.check(Schema.isMinLength(1)).check(Schema.isMaxLength(120)),
   "full_control": optionalKey(Schema.Boolean),
   "person_id": Schema.String.check(Schema.isPattern(new RegExp("^person/[^/]+$", "u"))),
   /** Narrows the default limited grant. Must not be combined with full_control. */
   "scopes": optionalKey(Schema.Array(Schema.Literals(["read.projections","read.glasses","control.glasses","terminal.read","control.attention","control.launches"])).check(Schema.isMinLength(1)).check(Schema.isUnique())).annotate({ description: "Narrows the default limited grant. Must not be combined with full_control." })
-}).annotate({ identifier: "PairingBegin" }))()
+}).annotate({ identifier: "PersonPairingBegin" }))()
+export type PersonPairingBegin = typeof PersonPairingBegin.Type
+export type PersonPairingBeginEncoded = typeof PersonPairingBegin.Encoded
+
+export const PairingBegin = /*#__PURE__*/ (() => Schema.Union([
+  PersonPairingBegin,
+  AssistantPairingBegin
+], { mode: "oneOf" }).annotate({ identifier: "PairingBegin" }))()
 export type PairingBegin = typeof PairingBegin.Type
 export type PairingBeginEncoded = typeof PairingBegin.Encoded
 

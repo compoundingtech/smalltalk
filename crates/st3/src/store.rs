@@ -673,6 +673,9 @@ WHERE kind='runtime.observed';
 CREATE INDEX IF NOT EXISTS claims_client_pairing_actor_index
 ON claims(json_extract(body, '$.fields.session_actor'))
 WHERE kind='custom.client.pairing-completed';
+CREATE INDEX IF NOT EXISTS claims_assistant_v1_credential_index
+ON claims(json_extract(body, '$.fields.credential_hash'), store_index)
+WHERE kind='custom.client.assistant.v1.granted';
 -- A runtime incarnation's claims about a subject by acceptance time, so when a session began
 -- and last changed are two seeks instead of a read of every claim the subject has. The
 -- expression is INCARNATION_OF_CLAIM, which queries repeat so the planner uses this index.

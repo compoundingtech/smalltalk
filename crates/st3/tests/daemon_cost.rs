@@ -1390,6 +1390,7 @@ mission "cost/history" state="ready" {
         }).unwrap();
     }
     let app = st3::api::router(AppState {
+        owning_person: None,
         store: store.clone(),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,
@@ -1933,6 +1934,7 @@ async fn measure(scale: f64, source: &Path, peer_source: &Path) -> Measured {
     })
     .unwrap();
     let state = AppState {
+        owning_person: None,
         store: store.clone(),
         notify: Arc::new(Notify::new()),
         event_notify: watch::channel(0_u64).0,

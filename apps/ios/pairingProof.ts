@@ -1,6 +1,6 @@
 // Match st3-client/device/grant_proof.rs. Crypto is supplied by Expo/CryptoKit in the app and
 // node:crypto in tests; no gateway value can supply the independently trusted fingerprint.
-import type { PairedSession } from '../../clients/typescript/st3-client';
+import type { PersonPairedSession } from '../../clients/typescript/st3-client';
 
 export type ProofCrypto = {
   hash(bytes: Uint8Array): Promise<Uint8Array>;
@@ -120,7 +120,7 @@ async function rootProof(root: Grant, fingerprint: string | undefined, crypto: P
 }
 
 /** Check enrollment before saving any credential. A fingerprint must be validated before POST. */
-export async function verifyPairing(session: PairedSession, key: string, fingerprint: string | undefined, crypto: ProofCrypto): Promise<void> {
+export async function verifyPairing(session: PersonPairedSession, key: string, fingerprint: string | undefined, crypto: ProofCrypto): Promise<void> {
   require(typeof session.person_id === 'string' && /^person\/[^/]+$/.test(session.person_id)
     && typeof session.credential === 'string' && session.credential.length >= 32 && strings(session.scopes), 'Invalid paired session');
   const chain = session.device_key_chain ?? [], proofs = session.device_key_proofs ?? [];

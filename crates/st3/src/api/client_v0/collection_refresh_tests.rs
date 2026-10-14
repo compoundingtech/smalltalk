@@ -1121,6 +1121,7 @@ fn paired_session() -> ClientSession {
         pairing_grant: None,
         grant_expires_at: None,
         transport: "paired",
+        local_peer: false,
         custom_forms: false,
         conversation_blocks: false,
         scopes: ["read.projections".into()].into_iter().collect(),

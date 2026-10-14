@@ -542,6 +542,28 @@ fn validate_model(
     if model.is_null() {
         bail!("client schema has no `{definition}` definition");
     }
+    // Reference-only oneOf branches are untagged unions: their members own the
+    // existing wire shape, rather than acquiring a synthetic discriminator.
+    if let Some(branches) = model["oneOf"]
+        .as_array()
+        .filter(|branches| branches.iter().all(|branch| branch["$ref"].is_string()))
+    {
+        let rust_block = struct_block(rust, &format!("pub enum {rust_name} {{"))?;
+        let swift_block = struct_block(swift, &format!("public enum {swift_name}:"))?;
+        for branch in branches {
+            let member = branch["$ref"]
+                .as_str()
+                .and_then(|reference| reference.rsplit('/').next())
+                .with_context(|| format!("union `{definition}` requires named reference branches"))?;
+            if !rust_block.contains(&format!("({member})"))
+                || !swift_block.contains(&format!("({member})"))
+            {
+                bail!("union `{definition}` omits member `{member}`");
+            }
+            validate_model(schema, member, member, member, rust, swift)?;
+        }
+        return Ok(());
+    }
     let properties = schema_properties(model)
         .with_context(|| format!("client schema `{definition}` has no properties"))?;
     let rust_block = struct_block(rust, &format!("pub struct {rust_name} {{"))?;
@@ -690,6 +712,8 @@ fn validate_surfaces(
         "PairingChallenge",
         "PairingComplete",
         "PairedSession",
+        "AssistantGrant",
+        "AssistantGrantPolicy",
         "TerminalAttachment",
         "TerminalScreen",
         "TerminalLine",
@@ -968,6 +992,9 @@ fn lower_camel(value: &str) -> String {
 }
 
 fn ts_type(value: &Value) -> Result<String> {
+    if let Some(allowed) = value.as_bool() {
+        return Ok(if allowed { "unknown" } else { "never" }.into());
+    }
     if let Some(reference) = value.get("$ref").and_then(Value::as_str) {
         return Ok(reference
             .rsplit('/')
@@ -987,14 +1014,16 @@ fn ts_type(value: &Value) -> Result<String> {
     }
     for union in ["oneOf", "anyOf"] {
         if let Some(items) = value.get(union).and_then(Value::as_array) {
-            return Ok(format!(
-                "({})",
-                items
-                    .iter()
-                    .map(ts_type)
-                    .collect::<Result<Vec<_>>>()?
-                    .join(" | ")
-            ));
+            let members = format!("({})", items.iter().map(ts_type).collect::<Result<Vec<_>>>()?.join(" | "));
+            if value.get("properties").is_some() || value.get("allOf").is_some() {
+                let mut base = value.clone();
+                base.as_object_mut().context("union schema")?.remove(union);
+                let base = ts_type(&base)?;
+                if base != "unknown" && !base.is_empty() {
+                    return Ok(format!("{base} & {members}"));
+                }
+            }
+            return Ok(members);
         }
     }
     if let Some(types) = value.get("type").and_then(Value::as_array) {
@@ -1330,6 +1359,35 @@ fn typescript_operation_methods(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn untagged_union_validation_checks_every_named_member() {
+        let schema = serde_json::json!({ "$defs": {
+            "Pair": { "oneOf": [{ "$ref": "#/$defs/Person" }, { "$ref": "#/$defs/Assistant" }] },
+            "Person": { "type": "object", "properties": { "person_id": { "type": "string" } } },
+            "Assistant": { "type": "object", "properties": { "principal": { "type": "string" } } }
+        } });
+        let rust = "pub enum Pair { Person(Person), Assistant(Assistant) }\npub struct Person { pub person_id: String }\npub struct Assistant { pub principal: String }";
+        let swift = "public enum Pair: Codable { case person(Person), assistant(Assistant) }\npublic struct Person: Codable { let personID: String }\npublic struct Assistant: Codable { let principal: String }";
+        validate_model(&schema, "Pair", "Pair", "Pair", rust, swift).unwrap();
+        assert!(validate_model(&schema, "Pair", "Pair", "Pair", &rust.replace("pub principal:", "pub wrong:"), swift).is_err());
+    }
+
+    #[test]
+    fn typescript_inline_unions_retain_common_fields_and_forbidden_keys() {
+        let schema = serde_json::json!({
+            "type": "object", "required": ["kind"],
+            "properties": { "kind": { "type": "string" } },
+            "oneOf": [
+                { "properties": { "person_id": { "type": "string" } } },
+                { "properties": { "person_id": false } }
+            ]
+        });
+        let rendered = ts_type(&schema).unwrap();
+        assert!(rendered.contains("kind: string"));
+        assert!(rendered.contains("person_id?: never"));
+        assert!(rendered.contains(" & "));
+    }
 
     fn temporary_output(name: &str) -> PathBuf {
         let nonce = SystemTime::now()

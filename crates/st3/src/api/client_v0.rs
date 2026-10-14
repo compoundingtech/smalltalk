@@ -99,6 +99,7 @@ mod collection_ivm;
 #[cfg(test)]
 mod collection_refresh_tests;
 pub(in crate::api) mod summary;
+pub(super) mod assistant;
 
 #[cfg(test)]
 mod stream_start_tests;
@@ -2641,6 +2642,8 @@ pub(super) struct ClientSession {
     pub(super) pairing_grant: Option<String>,
     grant_expires_at: Option<u128>,
     pub(super) transport: &'static str,
+    /// Server-established harness or local peer provenance, never a client header.
+    pub(super) local_peer: bool,
     pub(super) custom_forms: bool,
     pub(super) conversation_blocks: bool,
     scopes: std::collections::BTreeSet<String>,
@@ -2655,6 +2658,7 @@ impl ClientSession {
             pairing_grant: None,
             grant_expires_at: None,
             transport,
+            local_peer: false,
             custom_forms: true,
             conversation_blocks: false,
             scopes: std::collections::BTreeSet::new(),
@@ -2690,6 +2694,7 @@ impl ClientSession {
                 pairing_grant: None,
             grant_expires_at: None,
                 transport: "unix",
+                local_peer: false,
                 custom_forms,
                 conversation_blocks: false,
                 scopes: ["read.projections", "terminal.read"]
@@ -2706,6 +2711,7 @@ impl ClientSession {
             pairing_grant: None,
             grant_expires_at: None,
             transport: "unix",
+            local_peer: false,
             custom_forms,
             conversation_blocks: false,
             scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
@@ -2719,6 +2725,7 @@ impl ClientSession {
             pairing_grant: None,
             grant_expires_at: None,
             transport: "fabric-loopback",
+            local_peer: false,
             custom_forms: false,
             conversation_blocks: false,
             scopes: std::collections::BTreeSet::new(),
@@ -2748,7 +2755,7 @@ fn session_claim_actor(session: &ClientSession) -> String {
     }
 }
 
-pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
+pub(super) fn capabilities(state: &AppState, session: &ClientSession) -> Vec<Value> {
     let mut capabilities = ALL_SCOPES
         .iter()
         .map(|scope| {
@@ -2787,6 +2794,8 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
     }));
     capabilities.push(json!({"id":"device-key-proofs", "version":1, "state":"granted"}));
     capabilities.push(json!({"id":"conversation-blocks", "version":1, "state":if session.allows("read.projections") {"granted"} else {"ungranted"}}));
+    capabilities.push(json!({"id":"assistant.grants.v1", "version":1,
+        "state":if assistant::trusted_issuer(state, session).is_ok() {"granted"} else {"ungranted"}}));
     capabilities
 }
 
@@ -2825,6 +2834,13 @@ fn credential_digest(credential: &str) -> String {
     hex::encode(Sha256::digest(credential.as_bytes()))
 }
 
+/// Administrative reads must not inherit the general agent projection-read exemption.
+pub(super) fn administrative_get(request: &Request<Body>) -> bool {
+    request.method() == axum::http::Method::GET
+        && (request.uri().path().starts_with("/v1/client/assistant/grants/")
+            || request.uri().path() == "/v1/client/devices")
+}
+
 pub(super) fn authenticate(
     state: &AppState,
     request: &Request<Body>,
@@ -2853,6 +2869,14 @@ pub(super) fn authenticate(
                 .get(LOCAL_PERSON_HEADER)
                 .and_then(|value| value.to_str().ok());
             let mut session = ClientSession::local(person)?;
+            session.local_peer = request.extensions().get::<super::BoundAgent>().is_some()
+                || request.extensions().get::<super::LocalPeer>()
+                    .is_some_and(|peer| peer.ancestor.is_some())
+                || request.extensions().get::<super::NativeDeliveryPeer>().is_some();
+            if session.local_peer && administrative_get(request)
+                && session.authority_actor.starts_with("person/") {
+                return Err(forbidden("local harnesses and peers cannot inspect owner administration"));
+            }
             session.custom_forms = custom_forms;
             session.conversation_blocks = conversation_blocks;
             return Ok(session);
@@ -2872,6 +2896,10 @@ pub(super) fn authenticate(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| forbidden("the client authorization scheme must be Bearer"))?;
     let digest = credential_digest(credential);
+    if let Some(session) = assistant::authenticate(state, &digest, transport)? {
+        assistant::authorize_route(&session, request)?;
+        return Ok(session);
+    }
     let pairings = state
         .store
         .claims_for_kind_at("custom.client.pairing-completed", None, true, 10_000)
@@ -2940,6 +2968,7 @@ fn paired_client_session(
         pairing_grant: Some(paired.subject.clone()),
         grant_expires_at: Some(expires_at),
         transport,
+        local_peer: false,
         custom_forms,
         conversation_blocks: false,
         scopes,
@@ -5262,6 +5291,9 @@ pub(super) async fn devices(
         return client_page(&state, &snapshot, "devices", Vec::new(), &effective_query).map(Json);
     }
     let mut items = device_resources(&state, &snapshot, &person)?;
+    if assistant::trusted_issuer(&state, &session).is_ok() {
+        items.extend(assistant::device_resources(&state, &snapshot)?);
+    }
     if !query.history {
         items.retain(|item| item["state"] == "active");
     }
@@ -8093,11 +8125,22 @@ pub(super) struct PairingBegin {
     scopes: Option<Vec<String>>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(super) enum PairingBeginRequest {
+    Person(PairingBegin),
+    Assistant(assistant::AssistantPairingBegin),
+}
+
 pub(super) async fn pairing_begin(
     State(state): State<AppState>,
     Extension(session): Extension<ClientSession>,
-    Json(request): Json<PairingBegin>,
+    Json(request): Json<PairingBeginRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    let request = match request {
+        PairingBeginRequest::Person(request) => request,
+        PairingBeginRequest::Assistant(request) => return assistant::begin(state, session, request).await,
+    };
     if session.transport != "unix" {
         return Err(forbidden("pairing can only begin on the local Unix API"));
     }
@@ -8290,7 +8333,7 @@ static PAIRING_COMPLETIONS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_n
 
 pub(super) async fn pairing_complete(
     State(state): State<AppState>,
-    Extension(_session): Extension<ClientSession>,
+    Extension(session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
     Json(request): Json<PairingComplete>,
 ) -> Result<Json<Value>, ApiError> {
@@ -8298,6 +8341,9 @@ pub(super) async fn pairing_complete(
         return Err(validation(
             "the pairing completion has an invalid version or public key",
         ));
+    }
+    if let Some(completed) = assistant::complete(&state, &id, &request, session.transport).await? {
+        return Ok(completed);
     }
     let _completion = PAIRING_COMPLETIONS.lock().await;
     let pairing_id = client_detail_id("pairing", &id);
@@ -12212,8 +12258,10 @@ mission "queue-parity" state="ready" {
     #[tokio::test]
     async fn collections_socket_keeps_sixteen_windows_and_refuses_the_seventeenth() {
         use futures_util::{SinkExt as _, StreamExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
         assert!(
-            capabilities(&ClientSession::local(None).unwrap())
+            capabilities(&state, &ClientSession::local(None).unwrap())
                 .iter()
                 .any(|capability| {
                     capability["id"] == "collections"
@@ -12221,8 +12269,6 @@ mission "queue-parity" state="ready" {
                         && capability["state"] == "granted"
                 })
         );
-        let root = tempfile::tempdir().unwrap();
-        let state = test_state(root.path());
         let app = axum::Router::new().route(
             "/stream",
             axum::routing::get(move |upgrade: WebSocketUpgrade| {
@@ -14763,6 +14809,7 @@ mission "queue-parity" state="ready" {
 
     pub(super) fn test_state_named(root: &Path, node: &str) -> AppState {
         AppState {
+            owning_person: Some("person/operator".into()),
             store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
             notify: Arc::new(Notify::new()),
             event_notify: watch::channel(0_u64).0,
@@ -21837,6 +21884,7 @@ mission "example/zero-run" state="ready" {
             pairing_grant: None,
             grant_expires_at: None,
             transport: "paired",
+            local_peer: false,
             custom_forms: false,
             conversation_blocks: false,
             scopes: ["terminal.read".into()].into_iter().collect(),

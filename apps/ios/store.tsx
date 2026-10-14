@@ -560,6 +560,7 @@ function useAppStore(proof?: FabricProfile) {
       const gatewayClient = new St3Client({ baseUrl: requestUrl, fetchImpl: requestFetch, client: clientName('smalltalk-ios', app.expo.version, process.env.EXPO_PUBLIC_ST3_BUILD) });
       const result = await gatewayClient.completePairing(id, { api_version: API_VERSION, code, device_public_key: made.key, key_storage: made.storage });
       consumed = true; deviceId = result.value.device_id;
+      if (result.value.kind !== 'paired-session') throw new Error('A phone profile cannot enroll an external assistant.');
       await verifyPairing(result.value, made.key, pin, {
         hash: async bytes => new Uint8Array(await Crypto.digest(Crypto.CryptoDigestAlgorithm.SHA256, new Uint8Array(bytes))),
         verify: verifyGrantSignature,

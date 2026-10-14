@@ -165,6 +165,20 @@ pub struct Capabilities {
     pub event_cursor: String,
     pub oldest_event_cursor: String,
     pub schemas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<AssistantPrincipal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_class: Option<AssistantSenderClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimal_read_mode: Option<AssistantMinimalReadMode>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1581,7 +1595,8 @@ pub struct Device {
     pub header: ResourceHeader,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
-    pub person_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person_id: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     pub session_actor: String,
@@ -1589,6 +1604,20 @@ pub struct Device {
     #[serde(default)]
     pub scopes: Vec<String>,
     pub expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<AssistantPrincipal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_class: Option<AssistantSenderClass>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimal_read_mode: Option<AssistantMinimalReadMode>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Operation {
@@ -3673,7 +3702,14 @@ pub enum ActionStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct PairingBegin {
+#[serde(untagged)]
+pub enum PairingBegin {
+    Person(PersonPairingBegin),
+    Assistant(AssistantPairingBegin),
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PersonPairingBegin {
     pub api_version: String,
     pub device_name: String,
     pub person_id: String,
@@ -3691,6 +3727,18 @@ pub struct PairingChallenge {
     pub expires_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_root_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<AssistantPrincipal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_expires_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimal_read_mode: Option<AssistantMinimalReadMode>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct PairingComplete {
@@ -3702,7 +3750,14 @@ pub struct PairingComplete {
     pub key_storage: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct PairedSession {
+#[serde(untagged)]
+pub enum PairedSession {
+    Person(PersonPairedSession),
+    Assistant(AssistantPairedSession),
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PersonPairedSession {
     pub kind: String,
     pub device_id: String,
     pub person_id: String,
@@ -3719,6 +3774,95 @@ pub struct PairedSession {
     pub device_key_proofs: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub person_root_key_proof: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum AssistantPrincipal {
+    #[serde(rename = "assistant/chatgpt")]
+    Chatgpt,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum AssistantSenderClass {
+    #[serde(rename = "external-assistant")]
+    ExternalAssistant,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum AssistantMinimalReadMode {
+    #[serde(rename = "approval-once")]
+    ApprovalOnce,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum AssistantScope {
+    #[serde(rename = "read.assistant.summary")]
+    Summary,
+    #[serde(rename = "read.assistant.attention")]
+    Attention,
+    #[serde(rename = "read.assistant.missions")]
+    Missions,
+    #[serde(rename = "read.assistant.agents")]
+    Agents,
+    #[serde(rename = "read.assistant.conversation")]
+    Conversation,
+    #[serde(rename = "read.assistant.terminal")]
+    Terminal,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantPairingBegin {
+    pub api_version: String,
+    pub device_name: String,
+    pub assistant_id: AssistantPrincipal,
+    pub scopes: Vec<AssistantScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_seconds: Option<u64>,
+    pub disclosure_consent: bool,
+    pub consent_evidence: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantPairedSession {
+    pub kind: String,
+    pub api_version: String,
+    pub principal: AssistantPrincipal,
+    pub sender_class: AssistantSenderClass,
+    pub device_id: String,
+    pub session_actor: String,
+    pub credential: String,
+    pub scopes: Vec<AssistantScope>,
+    pub expires_at: String,
+    pub grant: AssistantGrant,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantGrant {
+    pub kind: String,
+    pub id: String,
+    pub principal: AssistantPrincipal,
+    pub sender_class: AssistantSenderClass,
+    pub session_actor: String,
+    pub device_id: String,
+    pub key_id: String,
+    /// Concrete daemon-configured owning person, sealed by the authoritative member.
+    pub issuer: String,
+    pub scopes: Vec<AssistantScope>,
+    pub expires_at: String,
+    pub policy_revision: u64,
+    pub minimal_read_mode: AssistantMinimalReadMode,
+    pub recipient_allowlist: Vec<String>,
+    pub disclosure_consent: bool,
+    pub consent_evidence: String,
+    pub revoked: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantGrantPolicy {
+    pub api_version: String,
+    pub scopes: Vec<AssistantScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_seconds: Option<u64>,
+    pub disclosure_consent: bool,
+    pub consent_evidence: String,
+    pub minimal_read_mode: AssistantMinimalReadMode,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

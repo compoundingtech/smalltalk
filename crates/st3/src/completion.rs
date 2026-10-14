@@ -471,7 +471,9 @@ pub fn select(
                             push(&attention.person_id, vec!["has attention items".into()])
                         }
                         Resource::Device(device) => {
-                            push(&device.person_id, vec!["has paired devices".into()])
+                            if let Some(person) = &device.person_id {
+                                push(person, vec!["has paired devices".into()]);
+                            }
                         }
                         _ => {}
                     }
