@@ -24,7 +24,7 @@
     "terminal_cancel_result": "reaped-or-explicit-no-op"
   },
   "root_cause": {
-    "file": "crates/st3/src/store.rs",
+    "file": "crates/st3-daemon/src/store.rs",
     "defect": "generic terminal run transitions retire only the run's own generation steps; nested child runs are reaped on selected timeout and revision paths but not on every terminal transition, and cancellation returns early for an already-terminal root"
   }
 }
