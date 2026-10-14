@@ -533,7 +533,18 @@ impl Ui {
         FormState {
             mark: self.prompt_marks.get(id).copied(),
             keys: self.prompt_keys.as_deref() == Some(id),
-            chosen: self.question_choices.get(id),
+            chosen: self
+                .question_call_key(id)
+                .and_then(|key| self.question_choices.get(&key)),
+        }
+    }
+
+    /// Where alert `id`'s picks are kept: by the alert and its one question call.
+    fn question_call_key(&self, id: &str) -> Option<String> {
+        let item = self.world.attention.items().iter().find(|item| item.id == id)?;
+        match prompt_model(&self.world, item)?.calls.as_slice() {
+            [only] => Some(question_key(id, &only.id)),
+            _ => None,
         }
     }
 
@@ -544,16 +555,26 @@ impl Ui {
             self.flash(GONE);
             return;
         };
-        let Some(asked) = prompt_model(&self.world, item).and_then(|model| model.questions) else {
+        let Some((asked, key)) = prompt_model(&self.world, item).and_then(|model| {
+            let key = match model.calls.as_slice() {
+                [only] => question_key(id, &only.id),
+                _ => return None,
+            };
+            Some((model.questions?, key))
+        }) else {
             self.flash("The question is gone");
             return;
         };
         let Some(multi) = asked.get(question).map(|question| question.multi) else {
             return;
         };
+        // Picks belong to this exact question call: a replaced question starts with none.
+        let prefix = question_key(id, "");
+        self.question_choices
+            .retain(|other, _| *other == key || !other.starts_with(&prefix));
         let picked = self
             .question_choices
-            .entry(id.to_owned())
+            .entry(key)
             .or_default()
             .entry(question)
             .or_default();
@@ -573,7 +594,7 @@ impl Ui {
     fn question_answer(&self, id: &str) -> Option<String> {
         let item = self.world.attention.items().iter().find(|item| item.id == id)?;
         let asked = prompt_model(&self.world, item)?.questions?;
-        let chosen = self.question_choices.get(id)?;
+        let chosen = self.question_choices.get(&self.question_call_key(id)?)?;
         let mut answers = serde_json::Map::new();
         for (index, question) in asked.iter().enumerate() {
             let options = chosen
@@ -1118,7 +1139,8 @@ impl Ui {
         match effect {
             Some((effect, notice)) if self.live => {
                 self.effects.push(effect);
-                self.question_choices.remove(id);
+                let prefix = question_key(id, "");
+                self.question_choices.retain(|key, _| !key.starts_with(&prefix));
                 self.prompt_marks.remove(id);
                 if self.prompt_keys.as_deref() == Some(id) {
                     self.prompt_keys = None;
@@ -1155,6 +1177,13 @@ fn first_line(text: &str) -> &str {
         .map(|line| line.trim().trim_start_matches('#').trim())
         .find(|line| !line.is_empty())
         .unwrap_or("")
+}
+
+
+/// Where the picks for a question alert's question call are kept: by the alert and the exact call,
+/// so picks made for one question never answer another that replaced it.
+fn question_key(alert: &str, call: &str) -> String {
+    format!("{alert}\u{0}{call}")
 }
 
 #[cfg(test)]
@@ -1559,6 +1588,12 @@ mod tests {
         assert!(ui.effects.is_empty());
         let shown = render(&ui, 100, 60);
         assert!(shown.contains("[✓] Tulips") && shown.contains("[✓] Asters"), "{shown}");
+        // Another question call replaces it: the picks made for the first never answer it.
+        let asked = ui.world.pending_calls[SEAT][0].clone();
+        ui.world.pending_calls.insert(SEAT.into(), vec![PendingCall { id: "call-replaced".into(), ..asked.clone() }]);
+        let shown = render(&ui, 100, 60);
+        assert!(shown.contains("[ ] Tulips") && !shown.contains("[✓]"), "{shown}");
+        ui.world.pending_calls.insert(SEAT.into(), vec![asked]);
         press(&mut ui, KeyCode::Char('3'), KeyModifiers::NONE);
         let [Effect::Attention { answer: Some(answer), .. }] = ui.effects.as_slice() else {
             panic!("{:?}", ui.effects);
