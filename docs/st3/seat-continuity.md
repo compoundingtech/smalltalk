@@ -86,7 +86,7 @@ session already knows what it describes.
 
 ## Tests
 
-- `crates/st3/src/handoff.rs`: naming, write authority, and what the message renders.
+- `crates/st3-daemon/src/handoff.rs`: naming, write authority, and what the message renders.
 - `tests/agents_restart.rs`: a requested restart waits for the handoff, goes ahead at the deadline,
   and a declaration change prepares first.
 - `reconcile::tests::a_new_incarnation_is_first_sent_the_handoff_its_seat_left`: the first

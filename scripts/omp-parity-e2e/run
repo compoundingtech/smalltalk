@@ -54,8 +54,8 @@ ST3=$(realpath "$ST3")
 [[ -z "$CORPUS" ]] || CORPUS=$(realpath "$CORPUS")
 require 'st3 executable' test -x "$ST3"
 ROOT=$(realpath "$(dirname "${BASH_SOURCE[0]}")/../..")
-FIXTURE="$ROOT/crates/st3/fixtures/native-records/omp-parity.jsonl"
-CHILD_FIXTURE="$ROOT/crates/st3/fixtures/native-records/omp-parity-child.jsonl"
+FIXTURE="$ROOT/crates/st3-daemon/fixtures/native-records/omp-parity.jsonl"
+CHILD_FIXTURE="$ROOT/crates/st3-daemon/fixtures/native-records/omp-parity-child.jsonl"
 require 'parent fixture readable' test -r "$FIXTURE"
 require 'child fixture readable' test -r "$CHILD_FIXTURE"
 ISO=$(mktemp -d "${TMPDIR:-/tmp}/omp-parity-e2e.XXXXXX")

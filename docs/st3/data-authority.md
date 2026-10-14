@@ -1,7 +1,7 @@
 # st data authority
 
 This document classifies the claim store's SQLite tables. `every_persistent_table_has_a_projection_scope`
-(`crates/st3/src/store/canonical_audit.rs`) fails when a table has no class; shared projection tables
+(`crates/st3-daemon/src/store/canonical_audit.rs`) fails when a table has no class; shared projection tables
 are listed in `SHARED_TABLES` there and in the production projection digests. Replicated storage tables
 have their own logical authority digests; local physical fields and caches are outside those identities.
 

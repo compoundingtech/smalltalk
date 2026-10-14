@@ -42,7 +42,7 @@ hex = "0.4"
 ring = "0.17"
 sha2 = "0.10"
 smallclaims = { path = "../smallclaims" }
-st3 = { path = "../st3", features = ["test-support"] }
+st3 = { package = "st3-daemon", path = "../st3-daemon", features = ["test-support"] }
 tempfile = "3"
 opentelemetry_sdk = "0.30"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }

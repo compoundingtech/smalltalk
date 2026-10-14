@@ -30,7 +30,7 @@
     "reason": "the execution timeout has not started"
   },
   "root_cause": {
-    "file": "crates/st3/src/reconcile.rs",
+    "file": "crates/st3-daemon/src/reconcile.rs",
     "function": "step_timed_out",
     "clock": "latest step-run.state accepted_at_unix_ms",
     "defect": "ready and blocked time consumes the active execution timeout before any worker claim"
