@@ -87,6 +87,16 @@ describe('kit transcript turn mapping', () => {
     expect(turns[0]!.items.map(item => item.id)).toEqual(['read', 'reasoning', 'answer', 'status'])
     expect(turns[1]!.items.map(item => item.id)).toEqual(['run'])
   })
+  it('preserves native event identity without adding text send state', () => {
+    const event: ConversationItem = {
+      _tag: 'Event', id: 'harness', kind: 'harness-message', title: 'Harness',
+      text: 'Ready', data: { native: true }, sender: { kind: 'system', label: 'Harness' },
+    }
+    const prepared = prepareTranscriptTurns([event], { firstTurnComplete: true })
+    expect(prepared[0]!.items[0]).toBe(event)
+    expect(prepared[0]!.items[0]).not.toHaveProperty('sendState')
+    expect(prepared[0]!.items[0]).toHaveProperty('data', event.data)
+  })
 
   it.each(['credential_pin', 'title_change', 'model_change', 'thinking_level_change'])('omits known internal kind %s', eventType => {
     const turns = transcriptTurnsForItems([

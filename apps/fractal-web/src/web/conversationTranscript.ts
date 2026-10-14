@@ -162,7 +162,7 @@ export const prepareTranscriptTurns = (
     const item: KitConversationItem = sourceItem._tag === 'UnknownEvent'
       ? { _tag: 'Notice', id: sourceItem.id, kind: 'event', text: 'An event this view cannot show yet.',
         ...(sourceItem.at === undefined ? {} : { at: sourceItem.at }) }
-      : hasKitSendState(sourceItem) ? sourceItem
+      : sourceItem._tag !== 'Text' || hasKitSendState(sourceItem) ? sourceItem
         : { ...sourceItem, sendState: sourceItem.sendState === undefined ? undefined : kitSendState(sourceItem.sendState) }
     if (isPrompt(item)) {
       flush()
