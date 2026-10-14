@@ -96,11 +96,11 @@ fn open(dir: &Path) -> Result<Connection, ApiError> {
             Err(_) => return Err(unavailable()),
         }
         use std::os::unix::fs::PermissionsExt;
-        if path
+        if !path
             .symlink_metadata()
             .map_err(|_| unavailable())?
             .file_type()
-            .is_symlink()
+            .is_file()
         {
             return Err(unavailable());
         }
@@ -133,6 +133,7 @@ pub(super) fn paired(
     session: &ClientSession,
 ) -> Result<(String, String, String, i64), ApiError> {
     let session = revalidate_session(state, session)?;
+    client_v0::require_scope(&session, "read.projections")?;
     let grant = session
         .pairing_grant
         .ok_or_else(|| client_v0::validation("a paired session is required"))?;
@@ -151,6 +152,16 @@ pub(super) fn paired(
             message: "push registration belongs on the pairing issuer".into(),
             details: Box::default(),
         });
+    }
+    if claim
+        .body
+        .pointer("/fields/person_id")
+        .and_then(Value::as_str)
+        != Some(session.authority_actor.as_str())
+    {
+        return Err(ApiError::internal(
+            "the pairing authority does not match its claim",
+        ));
     }
     let device = claim
         .body
@@ -376,6 +387,15 @@ mod tests {
     }
 
     fn pairing(state: &AppState, grant: &str, expires: u64) -> ClientSession {
+        pairing_with_scopes(state, grant, expires, &["read.projections"])
+    }
+
+    fn pairing_with_scopes(
+        state: &AppState,
+        grant: &str,
+        expires: u64,
+        scopes: &[&str],
+    ) -> ClientSession {
         let claim = state
             .store
             .append_claim(&ClaimInput {
@@ -387,7 +407,7 @@ mod tests {
                     ("person_id".into(), json!("person/fixture")),
                     ("session_actor".into(), json!("client/fixture")),
                     ("expires_at_unix_ms".into(), json!(expires)),
-                    ("scopes".into(), json!([])),
+                    ("scopes".into(), json!(scopes)),
                 ]),
                 evidence: vec![],
                 expected_subject: None,
@@ -578,5 +598,68 @@ mod tests {
             .is_err()
         );
         assert_eq!(token(&state), None);
+    }
+
+    #[tokio::test]
+    async fn pairing_without_read_scope_cannot_register() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let session = pairing_with_scopes(
+            &state,
+            "custom/client/push-unscoped",
+            client_now_ms() as u64 + 60_000,
+            &[],
+        );
+        let error = register(
+            State(state.clone()),
+            Extension(session),
+            Ok(Json(registration('a'))),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(token(&state), None);
+    }
+
+    #[tokio::test]
+    async fn broken_optional_capability_probe_keeps_capabilities_available() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let claim = state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "custom/client/push-missing-device".into(),
+                kind: "custom.client.pairing-completed".into(),
+                actor: Some("person/fixture".into()),
+                fields: BTreeMap::from([
+                    ("person_id".into(), json!("person/fixture")),
+                    ("session_actor".into(), json!("client/fixture")),
+                    (
+                        "expires_at_unix_ms".into(),
+                        json!(client_now_ms() as u64 + 60_000),
+                    ),
+                    ("scopes".into(), json!(["read.projections"])),
+                ]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let session =
+            client_v0::paired_client_session(&state, &claim, "fabric-loopback", false).unwrap();
+        let Json(value) = client_capabilities(
+            State(state.clone()),
+            Extension(new_client_snapshot(&state)),
+            Extension(session),
+        )
+        .await
+        .unwrap();
+        let push = value["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "push-registration")
+            .unwrap();
+        assert_eq!(push["state"], "ungranted");
     }
 }

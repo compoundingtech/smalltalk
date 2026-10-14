@@ -11643,14 +11643,6 @@ async fn dispatch_action(
                     idempotency_key: Some(request.idempotency_key.clone()),
                 })
                 .map_err(ApiError::bad)?;
-            #[cfg(feature = "push-registration")]
-            {
-                let local = state.clone();
-                let grant = paired.subject.clone();
-                tokio::task::spawn_blocking(move ||
-                    super::client_push_registration::revoked_pairing(&local, &grant)
-                ).await.map_err(ApiError::internal)??;
-            }
             // A revoked device's key signs nothing more, on every member.
             let field = |name: &str| paired.body.pointer(&format!("/fields/{name}")).and_then(Value::as_str);
             if let (Some(key), Some(person)) = (field("device_public_key").and_then(device_signing_key), field("person_id")) {
@@ -11660,6 +11652,16 @@ async fn dispatch_action(
                     .map_err(ApiError::bad)?;
             }
             signal_changed(state);
+            #[cfg(feature = "push-registration")]
+            {
+                let local = state.clone();
+                let grant = paired.subject.clone();
+                if !matches!(tokio::task::spawn_blocking(move ||
+                    super::client_push_registration::revoked_pairing(&local, &grant)
+                ).await, Ok(Ok(()))) {
+                    tracing::error!("local push target cleanup failed after pairing revocation");
+                }
+            }
             Ok(vec![device])
         }
         _ => Err(ApiError {
@@ -14716,6 +14718,47 @@ mission "queue-parity" state="ready" {
 
     fn test_state(root: &Path) -> AppState {
         test_state_named(root, "terminal-test")
+    }
+
+    #[cfg(feature = "push-registration")]
+    #[tokio::test]
+    async fn pairing_revoke_keeps_key_revocation_when_push_storage_fails() {
+        use base64::Engine as _;
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        state.store.append_claim(&ClaimInput {
+            subject: "custom/client/revoke-fixture".into(),
+            kind: "custom.client.pairing-completed".into(),
+            actor: Some("person/fixture".into()),
+            fields: BTreeMap::from([
+                ("device_id".into(), json!("device/revoke-fixture")),
+                ("person_id".into(), json!("person/fixture")),
+                ("session_actor".into(), json!("person/fixture/session/revoke-fixture")),
+                ("device_public_key".into(), json!(key)),
+                ("expires_at_unix_ms".into(), json!(client_now_ms() as u64 + 60_000)),
+                ("scopes".into(), json!(["read.projections", "control.pairing"])),
+            ]),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        std::fs::create_dir(root.path().join("push-registrations.sqlite3")).unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let request = ActionRequest {
+            api_version: CLIENT_API_VERSION.into(), id: "action/revoke-fixture".into(),
+            action_type: "pairing.revoke".into(), idempotency_key: "revoke-fixture".into(),
+            fence: Fence { snapshot_id: snapshot.id.clone(), ..Default::default() },
+            parameters: json!({"target_id":"device/revoke-fixture"}),
+        };
+        let session = ClientSession::local(Some("person/fixture")).unwrap();
+        assert_eq!(dispatch_action(&state, &snapshot, &session, &request).await.unwrap(),
+            vec!["device/revoke-fixture"]);
+        let revoked = state.store.claims_for_subject_kind_at(
+            "person/fixture", smallclaims::principal::KEY_REVOKED, None, true, 1,
+        ).unwrap().claims;
+        assert_eq!(revoked[0].body.pointer("/fields/key").and_then(Value::as_str), Some(key.as_str()));
+        assert_eq!(state.store.claims_for_subject_kind_at(
+            "custom/client/revoke-fixture", "custom.client.pairing-revoked", None, true, 1,
+        ).unwrap().claims.len(), 1);
     }
 
     #[test]
