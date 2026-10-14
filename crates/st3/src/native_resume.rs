@@ -868,7 +868,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn authored_transcript_first_artifact_write_through_inventory_and_repair_succeed() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::canonical_tempdir();
         let id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
         let transcript = root.path().join(format!("time_{id}.jsonl"));
         fs::write(&transcript, format!("{{\"type\":\"session\",\"id\":\"{id}\"}}\n")).unwrap();
