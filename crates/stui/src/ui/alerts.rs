@@ -1594,6 +1594,8 @@ mod tests {
         let shown = render(&ui, 100, 60);
         assert!(shown.contains("[ ] Tulips") && !shown.contains("[✓]"), "{shown}");
         ui.world.pending_calls.insert(SEAT.into(), vec![asked]);
+        let shown = render(&ui, 100, 60);
+        assert!(shown.contains("[✓] Tulips") && shown.contains("[✓] Asters"), "its own picks are kept: {shown}");
         press(&mut ui, KeyCode::Char('3'), KeyModifiers::NONE);
         let [Effect::Attention { answer: Some(answer), .. }] = ui.effects.as_slice() else {
             panic!("{:?}", ui.effects);
