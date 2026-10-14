@@ -1547,7 +1547,16 @@ fn native_pty_launcher_rejection_is_distinct_from_a_returned_producer_error() {
     ] {
         let root = tempfile::tempdir().unwrap();
         let pty = root.path().join("pty");
-        std::fs::write(&pty, binary).unwrap();
+        // Linux refuses a file with no shebang (ENOEXEC). macOS's spawn instead hands such a file
+        // to /bin/sh, which runs the text and so creates a launcher; there the file the kernel
+        // itself refuses is a fat Mach-O header with nothing behind it.
+        let contents: &[u8] = if cfg!(target_os = "macos") && binary == "invalid executable format"
+        {
+            b"\xca\xfe\xba\xbe invalid executable format"
+        } else {
+            binary.as_bytes()
+        };
+        std::fs::write(&pty, contents).unwrap();
         std::fs::set_permissions(&pty, std::fs::Permissions::from_mode(0o700)).unwrap();
         let intent = parse_intent(&format!("version 2\nagent \"example/rejected-pty\" {{ workspace {:?}; argv {:?} \"1000\"; }}", root.path().display().to_string(), sleep_program()), "node").unwrap();
         let mut member = intent

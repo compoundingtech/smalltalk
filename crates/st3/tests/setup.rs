@@ -15,7 +15,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let root = st3::test_support::canonical_tempdir();
         for dir in ["home/.config/st3", "run", "archive", "bin"] {
             fs::create_dir_all(root.path().join(dir)).unwrap();
         }
@@ -71,9 +71,7 @@ impl Fixture {
     }
 
     fn capture_pid(&mut self) -> u32 {
-        let pid = st3::startup::read(&self.path("run/st3.sock"))
-            .expect("setup started a live daemon")
-            .pid;
+        let pid = daemon_pid(&self.path("run/st3.sock")).expect("setup started a live daemon");
         self.daemon_pid = Some(pid);
         pid
     }
@@ -101,6 +99,34 @@ impl Drop for Fixture {
             }
         }
     }
+}
+
+/// The pid of the daemon serving `socket`. Linux daemons publish a startup receipt; the receipt
+/// does not exist on other platforms, where the socket's own peer is the daemon.
+fn daemon_pid(socket: &Path) -> Option<u32> {
+    if cfg!(target_os = "linux") {
+        return st3::startup::read(socket).map(|readiness| readiness.pid);
+    }
+    use std::os::fd::AsRawFd as _;
+    let stream = std::os::unix::net::UnixStream::connect(socket).ok()?;
+    let mut pid: libc::pid_t = 0;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    #[cfg(target_os = "macos")]
+    let status = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let status = {
+        let _ = (&stream, &mut pid, &mut length);
+        -1
+    };
+    (status == 0 && pid > 0).then_some(pid as u32)
 }
 
 fn success(output: &Output) -> String {
@@ -711,8 +737,8 @@ fn plain_st_first_run_shows_the_setup_screen_starts_daemon_and_opens_home() {
             if let Ok(bytes) = receiver.recv_timeout(Duration::from_millis(100)) {
                 output.extend(bytes);
             }
-            if let Some(readiness) = st3::startup::read(&fixture.path("run/st3.sock")) {
-                fixture.daemon_pid = Some(readiness.pid);
+            if let Some(pid) = daemon_pid(&fixture.path("run/st3.sock")) {
+                fixture.daemon_pid = Some(pid);
             }
         }
         writer.write_all(answer.as_bytes()).unwrap();
