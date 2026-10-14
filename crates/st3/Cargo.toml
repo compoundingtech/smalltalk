@@ -13,6 +13,7 @@ test-support = []
 # Opt in only in Performance; ordinary workspace checks need not build a second test binary.
 perf-load = []
 convergence-audit = []
+push-registration = []
 
 [dependencies]
 anyhow = "1"

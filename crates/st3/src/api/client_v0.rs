@@ -2970,7 +2970,7 @@ pub(super) fn authenticate(
     Ok(session)
 }
 
-fn paired_client_session(
+pub(super) fn paired_client_session(
     state: &AppState,
     paired: &ClaimRecord,
     transport: &'static str,
@@ -3013,7 +3013,7 @@ fn paired_client_session(
 
 /// Held collection sockets carry no bearer secret. Re-resolve their session grant at each
 /// arrangement read, using the same expiration/revocation checks as HTTP authentication.
-fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<ClientSession, ApiError> {
+pub(super) fn revalidate_session(state: &AppState, session: &ClientSession) -> Result<ClientSession, ApiError> {
     if session.transport == "unix" && acting_party(session) {
         return Ok(session.clone());
     }
@@ -11643,6 +11643,14 @@ async fn dispatch_action(
                     idempotency_key: Some(request.idempotency_key.clone()),
                 })
                 .map_err(ApiError::bad)?;
+            #[cfg(feature = "push-registration")]
+            {
+                let local = state.clone();
+                let grant = paired.subject.clone();
+                tokio::task::spawn_blocking(move ||
+                    super::client_push_registration::revoked_pairing(&local, &grant)
+                ).await.map_err(ApiError::internal)??;
+            }
             // A revoked device's key signs nothing more, on every member.
             let field = |name: &str| paired.body.pointer(&format!("/fields/{name}")).and_then(Value::as_str);
             if let (Some(key), Some(person)) = (field("device_public_key").and_then(device_signing_key), field("person_id")) {

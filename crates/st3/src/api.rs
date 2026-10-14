@@ -89,6 +89,8 @@ pub(crate) use published_attention::{published_attention_rows, refresh_attention
 mod directive_notes;
 mod request_latency;
 mod client_observations;
+#[cfg(feature = "push-registration")]
+mod client_push_registration;
 mod terminal_view;
 mod work_response;
 mod published_lists;
@@ -510,6 +512,8 @@ pub fn fabric_router(state: AppState) -> Router {
 
 fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> Router {
     crate::slo::install();
+    #[cfg(feature = "push-registration")]
+    client_push_registration::start_cleanup(state.clone());
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/harnesses", get(available_harnesses))
@@ -938,6 +942,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/hosts/{host}/agent-workspace",
             get(host_agent_workspace),
         );
+    #[cfg(feature = "push-registration")]
+    let app = app.route("/v1/client/push-registration", axum::routing::put(client_push_registration::register)
+        .delete(client_push_registration::revoke)
+        .layer(DefaultBodyLimit::max(client_push_registration::MAX_BODY_BYTES)));
     app.layer(from_fn_with_state(state.clone(), refuse_while_leaving))
         .layer(from_fn_with_state(
             (state.clone(), transport),
@@ -2114,6 +2122,22 @@ async fn client_capabilities(
     let oldest = oldest.saturating_sub(1);
     let cursor = format!("event-cursor/{}/{newest}", state.node);
     let capabilities = client_v0::capabilities(&session);
+    #[cfg(feature = "push-registration")]
+    let capabilities = {
+        let mut capabilities = capabilities;
+        let state_for_push = state.clone();
+        let session_for_push = session.clone();
+        let available = tokio::task::spawn_blocking(move || match
+            client_push_registration::paired(&state_for_push, &session_for_push) {
+                Ok(_) => Ok(true),
+                Err(error) if matches!(error.status, StatusCode::FORBIDDEN | StatusCode::CONFLICT | StatusCode::UNPROCESSABLE_ENTITY) => Ok(false),
+                Err(error) => Err(error),
+            }
+        ).await.map_err(ApiError::internal)??;
+        capabilities.push(json!({"id":"push-registration", "version":1,
+            "state":if available {"granted"} else {"ungranted"}}));
+        capabilities
+    };
     // The longest message body this daemon takes, so a composer shows a limit only when told.
     let max_message_bytes = message_body::MAX_BYTES;
     Ok(Json(json!({
