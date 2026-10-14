@@ -129,7 +129,9 @@ fn the_profile_writes_the_workspace_and_temp_and_refuses_everything_else() {
     let outside = elsewhere.join("outside.txt");
     let refused = sandboxed(&workspace, &fixture.socket, "echo no > \"$1\" && echo wrote", &[outside.to_str().unwrap()]);
     assert!(!says(&refused, "wrote") && !outside.exists(), "outside write: {}", report(&refused));
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("Read-only file system"), "{}", report(&refused));
+    // bubblewrap mounts the rest read-only; macOS's Seatbelt denies the write outright.
+    let refusal = if cfg!(target_os = "macos") { "Operation not permitted" } else { "Read-only file system" };
+    assert!(String::from_utf8_lossy(&refused.stderr).contains(refusal), "{}", report(&refused));
     // The home directory is the other place a seat must not write.
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from).filter(|home| home.starts_with("/home") || home.starts_with("/Users")) {
         let marker = home.join(format!(".st-sandbox-control-{}", std::process::id()));
