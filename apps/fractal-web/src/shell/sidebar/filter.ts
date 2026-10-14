@@ -28,63 +28,90 @@ const priority: Record<AgentStatus, number> = {
   retired: 9,
 }
 /** Workspace and agent state used to filter and order sidebar members. */
-export interface SidebarRow {
-  readonly workspace: Workspace
+export interface SidebarMatchRow {
+  readonly workspace: Pick<Workspace, 'title' | 'host'>
   readonly agent: Agent | undefined
   readonly status: AgentStatus
   readonly needsMe: boolean
 }
+/** Legacy sidebar additionally owns unread working state; matching does not require it. */
+export interface SidebarRow extends SidebarMatchRow {
+  readonly workspace: Workspace
+}
 
-/** Parsed sidebar search; machine groups AND together while prefixes within a group OR together. */
+/** Reported-fact facets; a missing or unreported fact never matches. */
+export type SidebarFacetField = 'repo' | 'state' | 'tool'
+/**
+ * Parsed sidebar search. Free text and its lowercase tokens drive matching and highlights; facets
+ * never reach highlights. Machine groups AND together while prefixes within a group OR together.
+ */
 export interface SidebarQuery {
-  readonly query: string
+  readonly text: string
+  readonly tokens: readonly string[]
+  readonly facets: readonly { readonly field: SidebarFacetField; readonly value: string }[]
   readonly machines: readonly (readonly string[])[]
 }
-/** Bare fuzzy text and AND-ed machine facets, each containing OR-ed lowercase prefixes. */
+/** Bare fuzzy text, repo:/state:/tool: facets and AND-ed machine:/host: facets of OR-ed lowercase prefixes. */
 export const parseSidebarQuery = (query: string): SidebarQuery => {
   const terms: string[] = []
+  const facets: { field: SidebarFacetField; value: string }[] = []
   const machines: string[][] = []
   for (const token of query.trim().split(/\s+/)) {
-    const facet = /^(?:machine|host):(.*)$/i.exec(token)
-    if (facet === null) {
-      if (token !== '') terms.push(token)
-    } else {
-      const values = facet[1]!.toLowerCase().split(',').filter((value) => value !== '')
+    const machine = /^(?:machine|host):(.*)$/i.exec(token)
+    const facet = /^(repo|state|tool):(.*)$/i.exec(token)
+    if (machine !== null) {
+      const values = machine[1]!.toLowerCase().split(',').filter((value) => value !== '')
       if (values.length > 0) machines.push(values)
-    }
+    } else if (facet !== null) {
+      facets.push({ field: facet[1]!.toLowerCase() as SidebarFacetField, value: facet[2]!.toLowerCase() })
+    } else if (token !== '') terms.push(token)
   }
-  return { query: terms.join(' '), machines }
+  const text = terms.join(' ')
+  return { text, tokens: tokenize(text), facets, machines }
 }
 /** Row host IDs omit their host/ namespace; query values remain literal shared-contract prefixes. */
 export const matchesSidebarHost = (hostId: string, machines: SidebarQuery['machines']): boolean => {
   const host = hostId.toLowerCase().replace(/^host\//, '')
   return machines.every((values) => values.some((value) => host.startsWith(value)))
 }
-/** Matches a sidebar row against visibility, status, host and contextual search filters. */
+/** Any active view filter: membership may shrink, so empty folders are hidden and matches revealed. */
+export const isSidebarFiltering = (filters: SidebarFilters, query: SidebarQuery): boolean =>
+  query.text !== '' ||
+  query.facets.length > 0 ||
+  query.machines.length > 0 ||
+  filters.needsMe ||
+  filters.hideEnded ||
+  filters.hideRetired ||
+  filters.host !== '' ||
+  filters.statuses.length > 0
+const facetFact = (row: SidebarMatchRow, field: SidebarFacetField): string =>
+  field === 'repo' ? row.agent?.checkout._tag === 'Known' ? row.agent.checkout.value.repository : ''
+    : field === 'tool' ? row.agent?.harness ?? ''
+      : [row.status, row.agent?.state, row.agent?.status, row.agent?.activity].filter(Boolean).join(' ')
+/** Free text matches displayed agent names and IDs; other facts require explicit facets. */
 export const matchesRow = ({
   row,
   filters,
-  context,
-  parsedQuery = parseSidebarQuery(filters.query),
+  query = parseSidebarQuery(filters.query),
 }: {
-  readonly row: SidebarRow
+  readonly row: SidebarMatchRow
   readonly filters: SidebarFilters
-  readonly context: string
-  readonly parsedQuery?: SidebarQuery
+  readonly query?: SidebarQuery
 }): boolean => {
   if (
     (filters.needsMe && !row.needsMe) ||
-    (filters.hideEnded && row.status === 'ended') ||
+    (filters.hideEnded && (row.status === 'ended' || row.agent?.state === 'done')) ||
     (filters.hideRetired && row.status === 'retired') ||
     (filters.host !== '' && row.workspace.host !== filters.host) ||
     (filters.statuses.length > 0 && !filters.statuses.includes(row.status))
   ) return false
-  if (!matchesSidebarHost(row.workspace.host, parsedQuery.machines)) return false
-  return parsedQuery.query === '' ||
+  if (!matchesSidebarHost(row.workspace.host, query.machines)) return false
+  if (!query.facets.every(({ field, value }) => value !== '' && facetFact(row, field).toLocaleLowerCase().includes(value))) return false
+  return query.tokens.length === 0 ||
     scoreTokens({
-      tokens: tokenize(parsedQuery.query),
+      tokens: query.tokens,
       primary: prepare(row.workspace.title),
-      secondary: prepare(`${row.agent?.description ?? ''} ${row.workspace.host} ${context}`),
+      secondary: prepare(row.agent?.ref ?? ''),
     }) > 0
 }
 
@@ -95,7 +122,7 @@ export const sortMembers = ({
   sort,
 }: {
   readonly members: readonly string[]
-  readonly rows: ReadonlyMap<string, SidebarRow>
+  readonly rows: ReadonlyMap<string, SidebarMatchRow>
   readonly sort: SortMode
 }): readonly string[] => {
   if (sort === 'manual') return members
@@ -121,42 +148,30 @@ export const filterFolders = ({
   rows,
   filters,
   sort,
-  ancestor = '',
-  parsedQuery = parseSidebarQuery(filters.query),
+  query = parseSidebarQuery(filters.query),
 }: {
   readonly folders: readonly ProjectedFolder[]
   readonly rows: ReadonlyMap<string, SidebarRow>
   readonly filters: SidebarFilters
   readonly sort: SortMode
-  readonly ancestor?: string
-  readonly parsedQuery?: SidebarQuery
+  readonly query?: SidebarQuery
 }): readonly ProjectedFolder[] =>
   folders.flatMap((folder) => {
-    const context = `${ancestor} ${folder.name}`
     const children = filterFolders({
       folders: folder.folders,
       rows: rows,
       filters: filters,
       sort: sort,
-      ancestor: context,
-      parsedQuery,
+      query,
     })
     const members = sortMembers({
       members: folder.members.filter((id) =>
-        matchesRow({ row: rows.get(id)!, filters: filters, context: context, parsedQuery }),
+        matchesRow({ row: rows.get(id)!, filters: filters, query }),
       ),
       rows: rows,
       sort: sort,
     })
-    const filtering =
-      parsedQuery.query !== '' ||
-      parsedQuery.machines.length > 0 ||
-      filters.needsMe ||
-      filters.hideEnded ||
-      filters.hideRetired ||
-      filters.host !== '' ||
-      filters.statuses.length > 0
-    return filtering && children.length === 0 && members.length === 0
+    return isSidebarFiltering(filters, query) && children.length === 0 && members.length === 0
       ? []
       : [{ ...folder, folders: children, members }]
   })

@@ -1,0 +1,4 @@
+import type { Agent } from '../data/source.ts'
+
+/** Fictional observed facts, including one genuinely unreported checkout. */
+export const searchAgents: readonly Agent[] = ['builder', 'reviewer', 'finished'].map((name, index) => ({ ref: `agent/${name}`, terminal: '', name: `${name} session`, description: 'Builder playbook for the sample product.', lifecycle: { _tag: 'Unknown' }, host: 'local', connected: true, activity: index === 0 ? 'working' : 'idle', status: index === 0 ? 'working' : 'idle', state: index === 2 ? 'stopped' : 'running', harness: index === 1 ? 'codex' : 'omp', usage: { _tag: 'Unknown' }, checkout: index === 1 ? { _tag: 'Unknown' } : { _tag: 'Known', value: { repository: 'example/product', base: 'main', branch: 'review' } }, workspace: { _tag: 'Unknown' }, startedAt: { _tag: 'Unknown' }, endedAt: { _tag: 'Unknown' }, blockedOn: { _tag: 'Unknown' }, ask: { _tag: 'Unknown' }, lastActivityAt: { _tag: 'Unknown' } }))

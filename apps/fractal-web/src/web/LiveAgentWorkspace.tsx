@@ -13,7 +13,7 @@ import * as stylex from '@stylexjs/stylex'
 import { useAtom, useAtomValue } from '@effect/atom-react'
 import { Schema } from 'effect'
 import * as Atom from 'effect/reactivity/Atom'
-import { SidebarAgentRow, ThreadHeader, ResizableSplit, assistantDarkTheme, liveComposerDarkTheme, liveAccentTheme, compositionLightTheme } from '@smalltalk/fractal-ui/assistant-ui/shell'
+import { SidebarAgentRow, SidebarQueryContext, sidebarRowAccessibleName, ThreadHeader, ResizableSplit, assistantDarkTheme, liveComposerDarkTheme, liveAccentTheme, compositionLightTheme } from '@smalltalk/fractal-ui/assistant-ui/shell'
 import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import { ViewportStore, ViewportStoreContext } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceScrollViewport.tsx'
 import { terminalSubjectForAgent } from '../data/projections.ts'
@@ -24,7 +24,51 @@ import type { ResourcePanelState } from '../shell/state.ts'
 import { afterNextPaint, type UxTelemetry } from '../telemetry/ux.ts'
 import { syncLine } from '../../../../packages/fractal-ui/src/assistant-ui/st3-views/sync-line.ts'
 import { useGatewaySync } from '../data/react.tsx'
-import { matchesSidebarHost, parseSidebarQuery } from '../shell/sidebar/filter.ts'
+import { AgentFolders } from '../shell/AgentFolders.tsx'
+import { useSidebarFolders, type SidebarFoldersBinding } from '../folders/useSidebarFolders.ts'
+import { fixtureFolders } from '../folders/fixture.ts'
+import { defaultFilters, fixtureSidebarState, sidebarState } from '../shell/sidebar/state.ts'
+import { parseSidebarQuery } from '../shell/sidebar/filter.ts'
+import { SidebarToolbar, type SidebarToolbarProps } from '../shell/sidebar/Toolbar.tsx'
+import type { Agent } from '../data/source.ts'
+import { sidebarAttention } from './sidebarAttention.ts'
+import { FolderAttentionSignal } from './AttentionControls.tsx'
+import { liveSidebarTree } from './liveSidebarTree.ts'
+import { SidebarEmptyState } from './SidebarEmptyState.tsx'
+
+const emptyAgents: readonly Agent[] = []
+const sidebarExtraSignals = [] as const
+
+/** Clock subscribers live below the collection: a tick updates rows, never tree layout. */
+const LiveSidebarAgentRow = React.memo((props: {
+  readonly agent: Agent
+  readonly stale: boolean
+  readonly active: boolean
+  readonly select: (ref: string) => void
+}) => {
+  const now = useNow()
+  const item = React.useMemo(() => sidebarRow({ agent: props.agent, stale: props.stale, now }), [props.agent, props.stale, now])
+  const onOpen = React.useCallback(() => props.select(props.agent.ref), [props.select, props.agent.ref])
+  return <SidebarAgentRow inTree item={item} now={now} variant="SR-2" layout="SR2-A" glyph="SG-1" extraSignals={sidebarExtraSignals} active={props.active} onOpen={onOpen} />
+})
+LiveSidebarAgentRow.displayName = 'LiveSidebarAgentRow'
+
+const LiveSidebarTreeView = React.memo((props: {
+  readonly binding: SidebarFoldersBinding
+  readonly tree: SidebarFoldersBinding['tree']
+  readonly agentsByRef: ReadonlyMap<string, Agent>
+  readonly accessibleNames: ReadonlyMap<string, string>
+  readonly needsYou: ReadonlySet<string>
+  readonly stale: boolean
+  readonly current: string
+  readonly query: string
+  readonly revealKey: string
+  readonly select: (ref: string) => void
+}) => <SidebarQueryContext.Provider value={props.query}><AgentFolders {...props.binding} tree={props.tree} accessibleNames={props.accessibleNames} selectedId={props.current} revealKey={props.revealKey} onSelect={props.select} renderFolderSignal={folder => <FolderAttentionSignal folder={folder} refs={props.needsYou} />} renderAgent={node => {
+  const agent = props.agentsByRef.get(node.id)
+  return agent === undefined ? null : <LiveSidebarAgentRow agent={agent} stale={props.stale} active={props.current === agent.ref} select={props.select} />
+}} /></SidebarQueryContext.Provider>)
+LiveSidebarTreeView.displayName = 'LiveSidebarTreeView'
 
 // A static import would evaluate the kit Transcript/Markdown/refractor before the shell paints.
 // Demand and speculative prefetch share one in-flight request; rejection releases it for retry.
@@ -135,7 +179,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
     hoverOwner.current?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     hoverOwner.current = null
   }, [location])
-  const agents = fleet._tag === 'Observed' ? fleet.value.agents : []
+  const agents = fleet._tag === 'Observed' ? fleet.value.agents : emptyAgents
   const rosterObserved = fleet._tag === 'Observed'
   const shellCommit = React.useCallback((node: HTMLDivElement | null) => {
     if (node === null) return
@@ -145,7 +189,11 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
     const cancelPrefetch = afterNextPaint(prefetchConversationPane)
     return () => { cancelCapture?.(); cancelPrefetch() }
   }, [ux])
-  const rosterCommit = React.useCallback((node: HTMLElement | null) => node === null || !rosterObserved ? undefined : ux?.rosterCommitted(), [ux, rosterObserved])
+  const rosterRef = React.useRef<HTMLElement | null>(null)
+  const rosterCommit = React.useCallback((node: HTMLElement | null) => {
+    rosterRef.current = node
+    return node === null || !rosterObserved ? undefined : ux?.rosterCommitted()
+  }, [ux, rosterObserved])
   const current = initialAgentFromUrl() ?? (storedAgent || agents[0]?.ref || '')
   const agent = agents.find((row) => row.ref === current)
   // A canonical subject address is not proof of a terminal. Keep the control disabled
@@ -158,7 +206,6 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   const terminalRef = terminalDisabledReason === undefined ? agent?.terminal : undefined
   const [headerSlot, setHeaderSlot] = React.useState<HTMLDivElement | null>(null)
   const [paneHost, setPaneHost] = React.useState<HTMLDivElement | null>(null)
-  const [search, setSearch] = React.useState('')
   const [panes, setPanes] = useAtom(workspacePanes(current))
   const query = new URLSearchParams(location.split('?')[1])
   const selectedPane = query.get('open') ?? 'thread'
@@ -194,11 +241,27 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
   const openDocument = React.useCallback((ref: string) => openLatest.current({ ref, presentation: 'detail' }), [])
   const stale = fleet._tag === 'Observed' && (fleet.freshness === 'stale' || connection._tag !== 'Live')
   const headerRow = agent === undefined ? undefined : sidebarRow({ agent, stale, now })
-  const parsedSearch = parseSidebarQuery(search)
-  const textSearch = parsedSearch.query.toLowerCase()
-  const filtered = agents.filter((row) =>
-    matchesSidebarHost(row.host, parsedSearch.machines) &&
-    `${row.name} ${row.ref} ${row.host}`.toLowerCase().includes(textSearch))
+  const folderSource = useDataSource()
+  const sidebarSettings = (folderSource.mode === 'fixtures' ? fixtureSidebarState : sidebarState)(folderSource.gateway ?? folderSource.mode)
+  const [filters, setFilters] = useAtom(sidebarSettings.filters)
+  // Typing stays urgent; filtering and the tree collection follow at transition priority.
+  const deferredFilters = React.useDeferredValue(filters)
+  const sidebarQuery = React.useMemo(() => parseSidebarQuery(deferredFilters.query), [deferredFilters.query])
+  const roster = React.useMemo(() => agents.map(row => ({ id: row.ref, subject: row.ref, label: row.name, host: row.host })), [agents])
+  const sidebarFolders = useSidebarFolders({
+    roster,
+    query: deferredFilters.query,
+    ...(folderSource.mode === 'fixtures' ? { source: fixtureFolders } : {}),
+    collapsedSource: sidebarSettings.collapsed,
+  })
+  const needsYou = React.useMemo(() => sidebarAttention({ agents, subjects }), [agents, subjects])
+  // Filtering uses observed status, not wall time; ticking cannot change membership.
+  const visibleSidebarTree = React.useMemo(() => liveSidebarTree({ tree: sidebarFolders.orderingTree, agents, needsYou, filters: deferredFilters, stale, now: 0 }), [sidebarFolders.orderingTree, agents, needsYou, deferredFilters, stale])
+  const agentsByRef = React.useMemo(() => new Map(agents.map(row => [row.ref, row])), [agents])
+  const accessibleNames = React.useMemo(() => new Map(agents.map(agent => [agent.ref, sidebarRowAccessibleName(sidebarRow({ agent, stale, now: 0 }))] as const)), [agents, stale])
+  const selectLatest = React.useRef(select)
+  selectLatest.current = select
+  const selectAgent = React.useCallback((ref: string) => selectLatest.current(ref), [])
   const byRef = React.useMemo(() => new Map(subjects.map((subject) => [subject.ref, subject])), [subjects])
   const separator = selectedPane.lastIndexOf(':')
   const urlPresentation = selectedPane.slice(separator + 1)
@@ -232,7 +295,8 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                 </header>
                 {collapsed ? null : (
                   <>
-                    <LiveSidebarSearch value={search} onChange={setSearch} />
+                    <LiveSidebarToolbar filters={filters} update={setFilters} hosts={[...new Set(agents.map(row => row.host))].toSorted()} needsMeCount={needsYou.size} onEnterResults={() => rosterRef.current?.querySelector<HTMLElement>('[role="row"]')?.focus()} />
+                    {fleet._tag === 'Observed' && visibleSidebarTree.length === 0 ? <SidebarEmptyState query={deferredFilters.query} needsMe={deferredFilters.needsMe} onClear={() => setFilters({ ...defaultFilters, sort: filters.sort })} /> : null}
                     <nav ref={rosterCommit} aria-label="Agent roster" onMouseOverCapture={rememberHoverOwner} onFocusCapture={rememberHoverOwner} {...stylex.props(styles.roster)}>
                       {fleet._tag === 'Waiting' ? <div aria-hidden="true" data-wf-roster-skeleton="waiting" {...stylex.props(styles.rosterSkeleton)}>
                         {Array.from({ length: 8 }, (_, index) => <div key={index} data-wf-skeleton-row="" {...stylex.props(styles.skeletonRow)}>
@@ -241,9 +305,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                           <span data-wf-skeleton-line="host" {...stylex.props(styles.skeletonLine, styles.skeletonHost)} />
                         </div>)}
                       </div> : null}
-                      {filtered.map((row) => (
-                        <SidebarAgentRow key={row.ref} item={sidebarRow({ agent: row, stale, now })} now={now} variant="SR-2" layout="SR2-A" glyph="SG-1" extraSignals={[]} query={parsedSearch.query} active={current === row.ref} onOpen={() => select(row.ref)} />
-                      ))}
+                      <LiveSidebarTreeView binding={sidebarFolders} tree={visibleSidebarTree} agentsByRef={agentsByRef} accessibleNames={accessibleNames} needsYou={needsYou} stale={stale} current={current} query={sidebarQuery.text} revealKey={deferredFilters.query} select={selectAgent} />
                     </nav>
                     {fleet._tag !== 'Observed' ? (
                       <p role="status" data-wf-roster-reason={fleet._tag === 'Unavailable' ? fleet.reason : undefined} {...stylex.props(styles.notice)}>
@@ -403,11 +465,9 @@ export function WorkspaceBody({ current, rosterRefs, view, agentName, onOpenTool
   </ViewportStoreContext.Provider>
 }
 
-/** Roster filter in the live sidebar. */
-export function LiveSidebarSearch({ value, onChange }: { readonly value: string; readonly onChange: (value: string) => void }) {
-  return <Aria.SearchField aria-label="Search agents" value={value} onChange={onChange} {...stylex.props(styles.search)}>
-    <Aria.Input aria-description="Use machine:dev3 or host:dev3,dev5 to filter host prefixes, ignoring case. Comma-separated values match any host; separate tokens must all match. Combine with search text." placeholder="Search agents" {...stylex.props(styles.searchInput)} />
-  </Aria.SearchField>
+/** The shared toolbar with the live sidebar's search surface, which must stand apart from the sidebar in both schemes. */
+export function LiveSidebarToolbar(props: Omit<SidebarToolbarProps, 'searchStyle'>) {
+  return <SidebarToolbar {...props} searchStyle={styles.searchField} />
 }
 
 const styles = stylex.create({
@@ -418,9 +478,9 @@ const styles = stylex.create({
   iconButton: { width: 28, height: 28, display: 'inline-flex', justifyContent: 'center', alignItems: 'center', backgroundColor: 'transparent', color: c.fgMuted, borderWidth: 0, borderRadius: 6, cursor: 'pointer' },
   textButton: { padding: '4px 8px', backgroundColor: 'transparent', color: c.fgMuted, borderWidth: 0, borderRadius: 6, cursor: 'pointer', fontSize: t.metaSize },
   // Message fill plus a hairline: raised equals the sidebar surface in light mode.
-  search: { marginInline: s.md, padding: `calc(${s.md} - ${g.hairline})`, borderRadius: 8, borderWidth: g.hairline, borderStyle: 'solid', borderColor: c.border, backgroundColor: c.message, flexShrink: 0 },
-  searchInput: { width: '100%', minWidth: 0, borderWidth: 0, outline: 'none', backgroundColor: 'transparent', color: c.fg, fontSize: t.metaSize },
-  roster: { display: 'flex', flexDirection: 'column', overflowY: 'auto', padding: s.md, minHeight: 0, flexGrow: 1, gap: 2 },
+  searchField: { backgroundColor: c.message, borderWidth: g.hairline, borderStyle: 'solid', borderColor: c.border },
+  // AgentFolders' Tree owns scrolling; the roster only assigns the remaining flex space.
+  roster: { display: 'flex', flexDirection: 'column', overflow: 'hidden', padding: s.md, minHeight: 0, flex: '1 1 0', gap: 2 },
   // Match SR-2's shared row/control/icon geometry and the roster's 2px inter-row gap.
   rosterSkeleton: { display: 'flex', flexDirection: 'column', gap: 2 },
   skeletonRow: { height: g.sidebarRow, flexShrink: 0, display: 'grid', gridTemplateColumns: `${g.icon} minmax(0, 1fr)`, gridTemplateRows: `${g.controlSm} ${g.controlSm}`, alignContent: 'center', alignItems: 'center', columnGap: s.xs2, paddingInline: s.sm, boxSizing: 'border-box' },

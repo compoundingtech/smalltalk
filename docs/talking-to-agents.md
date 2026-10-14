@@ -38,6 +38,15 @@ inside an opened tool bundle; loading the last call does not replace the other c
 
 ## In the web conversation
 
+The web agent sidebar shows your folder hierarchy, with unfiled agents in **Unfiled**.
+Each nested level is indented. Use **Right** to expand a folder or enter its first
+child, and **Left** to collapse it or return to its parent. Folder collapse state is
+saved for the gateway; searching temporarily expands matching folders.
+
+Press **/** to search the sidebar and **ArrowDown** to move into the results. Free text
+matches agent names and IDs; `repo:`, `state:` and `tool:` match reported facts, and
+`machine:dev3` or `host:dev3,dev5` filter by host prefix.
+
 Tool rows show a short description rather than raw commands or infrastructure paths.
 Protocol events are hidden by default; the conversation menu can show payload-free
 event notices for inspection. Process and agent senders use readable captions.

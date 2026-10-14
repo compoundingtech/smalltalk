@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The live web sidebar renders the roster as the accessible folder tree with the shared sidebar toolbar. Press / to search and ArrowDown to enter matching results; free text matches agent names and IDs, repo:, state: and tool: match reported facts, and machine: or host: still filter host prefixes. Needs me, finished agents and sort apply only to this browser's view, matching names are highlighted, clearing search reveals the selected agent, and empty results offer a clear-filters action",
+  "replay": { "status": "none", "detail": "No replay or rebuild." },
+  "schema": { "status": "none", "detail": "No tables, columns, indexes or triggers." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "Web client only; no protocol, harness or CLI change. Free text in the live sidebar no longer matches host names: use machine:dev3 or host:dev3 to filter by host. The live sidebar query and filters are now kept per gateway in the browser's existing sidebar settings. fractal-ui additively exports SidebarTree and its props, item and handle types from assistant-ui/shell." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "No manual step." },
+  "recovery": { "status": "none", "detail": "Nothing to recover." }
+}

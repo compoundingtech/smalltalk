@@ -131,8 +131,8 @@ describe.each([1280, 1440, 2980])('sidebar footer at %ipx', width => {
   })
 })
 
-describe('shipped live sidebar machine query', () => {
-  it('applies typed hosts to the real roster and preserves substring text and stripped highlights', async () => {
+describe('shipped live sidebar search', () => {
+  it('applies typed hosts to the real roster, matches free text on names and IDs only, and strips facets from highlights', async () => {
     const candidates: readonly Agent[] = [
       { ...agent, id: 'agent/compiler', name: 'Compiler Alpha', host_id: Option.some('host/dev3') },
       { ...agent, id: 'agent/sidebar', name: 'Sidebar Beta', host_id: Option.some('host/DEV5') },
@@ -141,8 +141,8 @@ describe('shipped live sidebar machine query', () => {
     ]
     registry.set(agents, observed({ value: candidates }))
     await mount(1440)
-    const input = sidebar().querySelector<HTMLInputElement>('input')!
-    expect(input.getAttribute('aria-description')).toMatch(/machine:.*host:/)
+    const input = sidebar().querySelector<HTMLInputElement>('input[aria-label="Search agents"]')!
+    expect(input.getAttribute('aria-description')).toMatch(/names and IDs.*machine:.*host:/)
     const search = async (value: string) => {
       await act(async () => {
         Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!.call(input, value)
@@ -160,8 +160,10 @@ describe('shipped live sidebar machine query', () => {
       ['machine:dev9', []],
       ['machine: host:,,', ['Compiler Alpha', 'Sidebar Beta', 'Compiler dev3 decoy']],
       ['Alpha machine:DEV', ['Compiler Alpha']],
-      ['cmp machine:dev', []],
-      ['dev3', ['Compiler Alpha', 'Compiler dev3 decoy']],
+      ['cmp machine:dev', ['Compiler Alpha']],
+      // Free text no longer reaches the host: dev3 matches only the decoy's displayed name.
+      ['dev3', ['Compiler dev3 decoy']],
+      ['agent/sidebar', ['Sidebar Beta']],
       ['machine:host/dev3', []],
     ] as const) {
       await search(query)
@@ -173,5 +175,13 @@ describe('shipped live sidebar machine query', () => {
     await search('Alpha machine:dev3')
     expect([...roster().querySelectorAll('mark')].map(mark => mark.textContent).join('')).toContain('Alpha')
     expect([...roster().querySelectorAll('mark')].some(mark => mark.textContent?.includes('machine:'))).toBe(false)
+  })
+  it('names each native tree row with the displayed freshness-qualified status', async () => {
+    registry.set(agents, observed({ value: [agent] }))
+    await mount(1440)
+    const rowName = () => roster().querySelector('[role="row"][data-sidebar-tree-key="agent/example"]')?.getAttribute('aria-label')
+    expect(rowName()).toBe('Example Agent, idle')
+    await act(async () => registry.set(agents, { _tag: 'Observed', value: [agent], freshness: 'stale' }))
+    expect(rowName()).toBe('Example Agent, Last verified · idle')
   })
 })

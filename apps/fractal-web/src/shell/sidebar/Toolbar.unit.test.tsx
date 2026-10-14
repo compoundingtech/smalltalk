@@ -24,6 +24,8 @@ it('ANDs the host menu with typed facets, counts them, and resets facets while p
   const row: SidebarRow = { workspace: { id: 'agent/compiler', title: 'Compiler', host: 'dev3', layout: dailyDriver, unread: [], notifications: [] }, agent: undefined, status: 'idle', needsMe: false }
   try {
     await act(async () => render())
+    const search = host.querySelector<HTMLInputElement>('input[aria-label="Search agents"]')!
+    expect(search.getAttribute('aria-description')).toMatch(/names and IDs.*repo:.*machine:dev3.*host:dev3,dev5/)
     const filterButton = host.querySelector<HTMLButtonElement>('button[aria-label="Filter agents · 2 active"]')!
     expect(filterButton).not.toBeNull()
     await act(async () => filterButton.click())
@@ -31,10 +33,10 @@ it('ANDs the host menu with typed facets, counts them, and resets facets while p
     expect(menu).not.toBeNull()
     await act(async () => { menu.value = 'dev5'; menu.dispatchEvent(new Event('change', { bubbles: true })) })
     expect(filters.host).toBe('dev5')
-    expect(matchesRow({ row, filters, context: '' })).toBe(false)
+    expect(matchesRow({ row, filters })).toBe(false)
     expect(host.querySelector('button[aria-label="Filter agents · 3 active"]')).not.toBeNull()
     await act(async () => { menu.value = 'dev3'; menu.dispatchEvent(new Event('change', { bubbles: true })) })
-    expect(matchesRow({ row, filters, context: '' })).toBe(true)
+    expect(matchesRow({ row, filters })).toBe(true)
     const reset = [...document.body.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Reset filters')!
     await act(async () => reset.click())
     expect(filters).toEqual({ ...defaultFilters, query: 'compiler', sort: 'name' })

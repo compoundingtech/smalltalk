@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Registers the in-app changelog entry for live sidebar search in the fractal-web changelog, so the status bar's recent changes list describes the new folder search.",
+  "replay": { "status": "none", "detail": "No replay or rebuild." },
+  "schema": { "status": "none", "detail": "No tables, columns, indexes or triggers." },
+  "rules": { "status": "none", "detail": "Checkpoint rules and digests are unchanged." },
+  "compatibility": { "status": "none", "detail": "Web client changelog content only; no protocol, harness, CLI or API change." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "No manual step." },
+  "recovery": { "status": "none", "detail": "Nothing to recover." }
+}

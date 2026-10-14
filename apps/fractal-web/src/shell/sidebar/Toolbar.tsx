@@ -18,16 +18,25 @@ import { parseSidebarQuery, sortModes, type SortMode } from './filter.ts'
 import { defaultFilters, type SidebarFilters } from './state.ts'
 import { statuses, type AgentStatus } from './StatusIcon.tsx'
 
+/** Inputs of the shared sidebar toolbar. */
+export interface SidebarToolbarProps {
+  readonly filters: SidebarFilters
+  readonly update: (value: SidebarFilters) => void
+  readonly hosts: readonly string[]
+  readonly needsMeCount?: number
+  readonly onEnterResults?: () => void
+  /** Host surface override for the search field, e.g. a fill that stands apart from its sidebar. */
+  readonly searchStyle?: stylex.StyleXStyles
+}
 /** Sidebar search, visibility, host, status and view-only ordering controls. */
 export const SidebarToolbar = ({
   filters,
   update,
   hosts,
-}: {
-  readonly filters: SidebarFilters
-  readonly update: (value: SidebarFilters) => void
-  readonly hosts: readonly string[]
-}) => {
+  needsMeCount,
+  onEnterResults,
+  searchStyle,
+}: SidebarToolbarProps) => {
   const search = React.useRef<HTMLDivElement>(null)
   const shortcut = React.useCallback((node: HTMLDivElement | null) => {
     if (node === null) return
@@ -48,11 +57,13 @@ export const SidebarToolbar = ({
     document.addEventListener('keydown', listener)
     return () => document.removeEventListener('keydown', listener)
   }, [])
+  const parsedQuery = parseSidebarQuery(filters.query)
   const activeCount =
     Number(filters.hideEnded) +
     Number(filters.hideRetired) +
     Number(filters.host !== '') +
-    parseSidebarQuery(filters.query).machines.length +
+    parsedQuery.machines.length +
+    parsedQuery.facets.length +
     filters.statuses.length
   return (
     <div ref={shortcut} {...stylex.props(styles.toolbar)}>
@@ -63,7 +74,15 @@ export const SidebarToolbar = ({
           onChange={(needsMe) => update({ ...filters, needsMe })}
           {...stylex.props(styles.toggle)}
         >
-          Needs me
+          Needs me{needsMeCount === undefined ? '' : ` · ${needsMeCount}`}
+        </ToggleButton>
+        <ToggleButton
+          aria-label="Show finished agents"
+          isSelected={!filters.hideEnded && !filters.hideRetired}
+          onChange={(show) => update({ ...filters, hideEnded: !show, hideRetired: !show })}
+          {...stylex.props(styles.toggle)}
+        >
+          Finished
         </ToggleButton>
         <div {...stylex.props(styles.menus)}>
           <DialogTrigger>
@@ -124,7 +143,7 @@ export const SidebarToolbar = ({
                   size="sm"
                   variant="secondary"
                   onPress={() =>
-                    update({ ...defaultFilters, query: parseSidebarQuery(filters.query).query, sort: filters.sort })
+                    update({ ...defaultFilters, query: parsedQuery.text, sort: filters.sort })
                   }
                 >
                   Reset filters
@@ -163,15 +182,17 @@ export const SidebarToolbar = ({
       </div>
       <div ref={search}>
         <Input
-          aria-label="Search agents and folders"
-          aria-description="Use machine:dev3 or host:dev3,dev5 to filter by host; combine with search text."
-          placeholder="Search agents…  /"
+          aria-label="Search agents"
+          aria-description="Free text matches agent names and IDs. Use repo:, state:, or tool: to search other facts, and machine:dev3 or host:dev3,dev5 to filter host prefixes."
+          placeholder="Search… repo: state: tool:  /"
           size="sm"
           value={filters.query}
           onChange={(query) => update({ ...filters, query })}
           onKeyDown={(event) => {
             if (event.key === 'Escape') update({ ...filters, query: '' })
+            if (event.key === 'ArrowDown' && onEnterResults !== undefined) { event.preventDefault(); onEnterResults() }
           }}
+          stylexStyle={searchStyle}
         />
       </div>
     </div>

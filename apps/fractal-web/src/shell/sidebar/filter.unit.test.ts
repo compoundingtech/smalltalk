@@ -106,8 +106,22 @@ describe('sidebar machine query', () => {
     ['machine: host:,, compiler', 'compiler', []],
     ['compiler machine:dev3 sidebar host:DEV', 'compiler sidebar', [['dev3'], ['dev']]],
     ['other:dev3 compiler-machine:dev3', 'other:dev3 compiler-machine:dev3', []],
-  ] as const)('parses %j without highlighting facets', (input, query, machines) => {
-    expect(parseSidebarQuery(input)).toEqual({ query, machines })
+  ] as const)('parses %j without highlighting facets', (input, text, machines) => {
+    expect(parseSidebarQuery(input)).toEqual({ text, tokens: text === '' ? [] : text.split(' '), facets: [], machines })
+  })
+
+  it('separates repo:, state: and tool: facets from free text', () => {
+    expect(parseSidebarQuery('Repo:Example/Product compiler TOOL:omp state:')).toEqual({
+      text: 'compiler', tokens: ['compiler'], facets: [{ field: 'repo', value: 'example/product' }, { field: 'tool', value: 'omp' }, { field: 'state', value: '' }], machines: [],
+    })
+  })
+
+  it('matches free text against names and IDs, never the host', () => {
+    const candidate = row('agent/compiler', 'Compiler', 'idle', 'host/dev3', 0)
+    expect(matchesRow({ row: candidate, filters: { ...defaultFilters, query: 'compiler' } })).toBe(true)
+    expect(matchesRow({ row: candidate, filters: { ...defaultFilters, query: 'agent/comp' } })).toBe(true)
+    expect(matchesRow({ row: candidate, filters: { ...defaultFilters, query: 'dev3' } })).toBe(false)
+    expect(matchesRow({ row: candidate, filters: { ...defaultFilters, query: 'machine:dev3' } })).toBe(true)
   })
 
   it('shares row host namespace stripping without rewriting query values', () => {
@@ -138,7 +152,7 @@ describe('sidebar machine query', () => {
     ['machine:dev', 'dev3', []],
   ] as const)('matches %j AND the exact menu host %j', (query, host, expected) => {
     expect(machineRows.filter((candidate) =>
-      matchesRow({ row: candidate, filters: { ...defaultFilters, query, host }, context: '' }),
+      matchesRow({ row: candidate, filters: { ...defaultFilters, query, host } }),
     ).map((candidate) => candidate.workspace.id)).toEqual(expected)
   })
 
@@ -152,8 +166,8 @@ describe('sidebar machine query', () => {
         const candidate = row('generated', 'Compiler', 'idle', `host/${host}`, 0)
         for (const key of ['machine', 'HOST']) {
           const query = `${key}:${prefix.toUpperCase()},,`
-          expect(parseSidebarQuery(query)).toEqual({ query: '', machines: [[prefix]] })
-          expect(matchesRow({ row: candidate, filters: { ...defaultFilters, query }, context: '' })).toBe(true)
+          expect(parseSidebarQuery(query)).toEqual({ text: '', tokens: [], facets: [], machines: [[prefix]] })
+          expect(matchesRow({ row: candidate, filters: { ...defaultFilters, query } })).toBe(true)
         }
       },
     ))

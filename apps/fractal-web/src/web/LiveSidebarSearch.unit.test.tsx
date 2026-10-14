@@ -26,35 +26,45 @@ vi.mock('@stylexjs/stylex', () => {
       sx.themes.set(theme, new Map(Object.entries(values).map(([key, value]) => [vars[key]!, value])))
       return theme
     },
-    props: (...styles: unknown[]) => ({ 'data-sx': JSON.stringify(Object.assign({}, ...flat(styles))) }),
+    // ui-compat adapters merge atomic classes, so the resolved style travels in the class name.
+    props: (...styles: unknown[]) => ({ className: JSON.stringify(Object.assign({}, ...flat(styles))) }),
   }
 })
 
 import { compositionLightTheme } from '@smalltalk/fractal-ui/assistant-ui/shell'
 import { colorVars } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
-import { LiveSidebarSearch } from './LiveAgentWorkspace.tsx'
+import { defaultFilters } from '../shell/sidebar/state.ts'
+import { LiveSidebarToolbar } from './LiveAgentWorkspace.tsx'
 
 const light = new Map(compositionLightTheme.flatMap(theme => [...sx.themes.get(theme)!]))
-const resolve = (scheme: 'dark' | 'light', value: unknown) =>
-  typeof value === 'string' && value.startsWith('var(') ? (scheme === 'light' ? light.get(value) : undefined) ?? sx.defaults.get(value) : value
+// The live shell's legacyBridge maps ui-compat adapter variables onto composition tokens.
+const bridge: Record<string, string> = { 'var(--panel)': colorVars.raised, 'var(--line)': colorVars.borderStrong }
+const resolve = (scheme: 'dark' | 'light', value: unknown): unknown => {
+  const token = typeof value === 'string' ? bridge[value] ?? value : value
+  return typeof token === 'string' && token.startsWith('var(') ? (scheme === 'light' ? light.get(token) : undefined) ?? sx.defaults.get(token) : token
+}
 
 let host: HTMLDivElement | undefined
 afterEach(() => { host?.remove(); host = undefined; vi.unstubAllGlobals() })
 
-describe('live sidebar search', () => {
+describe('live sidebar search field', () => {
   it.each(['dark', 'light'] as const)('stands apart from the %s sidebar surface', async (scheme) => {
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true)
+    vi.stubGlobal('ResizeObserver', class { observe() {} unobserve() {} disconnect() {} })
     host = document.createElement('div')
     document.body.append(host)
     const root = createRoot(host)
-    await act(async () => root.render(<LiveSidebarSearch value="" onChange={() => {}} />))
-    expect(host.querySelector('input')?.getAttribute('aria-description')).toMatch(/machine:.*host:/)
-    const field = host.querySelector('[data-sx]')!
-    const style = JSON.parse(field.getAttribute('data-sx')!) as Record<string, unknown>
+    await act(async () => root.render(<LiveSidebarToolbar filters={defaultFilters} update={() => {}} hosts={[]} />))
+    const field = host.querySelector<HTMLInputElement>('input[aria-label="Search agents"]')!
+    expect(field.getAttribute('aria-description')).toMatch(/machine:.*host:/)
+    const style = JSON.parse(field.className) as Record<string, unknown>
     const sidebar = resolve(scheme, colorVars.sidebar)
     expect(sidebar).toMatch(/^#/)
+    // Both resolve to real colors: an unresolved variable cannot pass as distinct.
+    expect(resolve(scheme, style.backgroundColor)).toMatch(/^#/)
     expect(resolve(scheme, style.backgroundColor)).not.toBe(sidebar)
     expect(style.borderStyle).toBe('solid')
+    expect(resolve(scheme, style.borderColor)).toMatch(/^(#|rgba\()/)
     expect(resolve(scheme, style.borderColor)).not.toBe(sidebar)
     await act(async () => root.unmount())
   })
