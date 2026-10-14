@@ -15,7 +15,7 @@ use tokio::sync::{Notify, watch};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authored_omp_resume_publishes_binding_from_an_empty_managed_directory() {
-    let root = tempfile::tempdir().unwrap();
+    let root = st3::test_support::canonical_tempdir();
     let subject = "agent/garden/worker";
     let id = "5f9a6e16-5e30-4bce-b327-9a8241321bd6";
     let legacy = root.path().join("legacy");
