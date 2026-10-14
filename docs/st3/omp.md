@@ -335,7 +335,7 @@ Its existing state-frame `reason` names the reopened toolCall id
 what the seat is waiting on. Shared native continuation does not depend on the bridge.
 
 The contraction criterion is behavioral, not a version equality assertion. The standalone
-`crates/st3/fixtures/omp-resume/native-reopen-probe.py` copies its adjacent public canary fixture into
+`crates/st3-daemon/fixtures/omp-resume/native-reopen-probe.py` copies its adjacent public canary fixture into
 a disposable native session directory, renders native resume in a PTY under an empty HOME with no
 auth or extensions, and never sends F5 or a prompt. It requires `OMP_BIN` pointing at the raw pinned
 OMP executable (not a fleet launcher); `--omp` overrides that variable. Optional `--fixture`,

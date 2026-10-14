@@ -719,7 +719,7 @@ behavior is recorded in the row on first adoption (`exact`) and changes only wit
 
 Capability advertisement is discovery, not an independent server admission rule. The client-v0
 server constructs registered capabilities with granted/ungranted/unavailable states
-(`crates/st3/src/api/client_v0.rs`, `capabilities`), checks action scopes in `action`, and opens
+(`crates/st3-daemon/src/api/client_v0.rs`, `capabilities`), checks action scopes in `action`, and opens
 terminal subscriptions through `open_terminal_subscription` and the attachment lease checks.
 It has no unsupported failure triggered solely by omission from that advertisement.
 Replay therefore imposes no new attach or subscribe restriction when an entry is omitted.

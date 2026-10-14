@@ -29548,7 +29548,7 @@ mod tests {
             );
         }
 
-        let server_source = include_str!("api.rs");
+        let server_source = include_str!("../../st3-daemon/src/api.rs");
         for handler in [
             "watch_resource",
             "unwatch_resource",

@@ -135,7 +135,7 @@ with tempfile.TemporaryDirectory() as scratch:
     git(repo, "config", "user.email", "ci@example.invalid")
     git(repo, "config", "user.name", "ci")
     base = commit(repo, "base", write=["src/main.rs", "clients/typescript/st3-client/index.ts", "docs/guide.md"])
-    rust = commit(repo, "rust", write=["src/main.rs", "crates/st3/src/lib.rs"])
+    rust = commit(repo, "rust", write=["src/main.rs", "crates/st3-daemon/src/lib.rs"])
     git(repo, "checkout", "--quiet", "-b", "web", base)
     client = commit(repo, "client", write=["clients/typescript/st3-client/index.ts"])
     git(repo, "checkout", "--quiet", "-b", "schema", base)
