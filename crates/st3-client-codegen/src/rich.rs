@@ -400,16 +400,21 @@ fn subject_ref(object: &Map<String, Value>, families: &Value) -> Result<String> 
 
 fn emit_string(object: &Map<String, Value>) -> Result<String> {
     let mut excluded = None;
+    let mut excluded_pattern = None;
     if let Some(not) = object.get("not") {
         let only = not.as_object().filter(|n| n.len() == 1);
         if let Some(known) = only.and_then(|n| n.get("enum")).and_then(Value::as_array) {
             return Ok(format!("unknownCase({})", js(&Value::Array(known.clone()))));
         }
-        // `not: { const }` excludes one value from an otherwise plain string.
-        excluded = Some(
-            only.and_then(|n| n.get("const"))
-                .context("only `not: { enum }` and `not: { const }` are translated")?,
-        );
+        // `not: { pattern }` excludes a family of values (sibling collections) from a plain string.
+        if let Some(pattern) = only.and_then(|n| n.get("pattern")) {
+            excluded_pattern = Some(pattern.as_str().context("`not.pattern` must be a string")?);
+        } else {
+            // `not: { const }` excludes one value from an otherwise plain string.
+            excluded = Some(only.and_then(|n| n.get("const")).context(
+                "only `not: { enum }`, `not: { const }` and `not: { pattern }` are translated",
+            )?);
+        }
     }
     let mut schema = match object.get("x-st-ref") {
         Some(families) => subject_ref(object, families)?,
@@ -442,6 +447,13 @@ fn emit_string(object: &Map<String, Value>) -> Result<String> {
             "{schema}.check(Schema.makeFilter((value: string) => value !== {}, {{ expected: {} }}))",
             js(value),
             js(&json!(format!("a string other than {value}")))
+        );
+    }
+    if let Some(pattern) = excluded_pattern {
+        schema = format!(
+            "{schema}.check(Schema.makeFilter((value: string) => !new RegExp({}, \"u\").test(value), {{ expected: {} }}))",
+            js(&json!(pattern)),
+            js(&json!(format!("a string not matching {pattern}")))
         );
     }
     if let Some(brand) = object.get("x-st-brand") {
@@ -959,7 +971,14 @@ fn recursive_type(value: &Value, encoded: bool) -> Result<String> {
         Some("string") if !encoded && codec == Some("redacted") => {
             "Redacted.Redacted<string>".into()
         }
-        Some("string") if !encoded && object.contains_key("not") => "UnknownCase".into(),
+        Some("string")
+            if !encoded
+                && object
+                    .get("not")
+                    .is_some_and(|not| not.get("pattern").is_none()) =>
+        {
+            "UnknownCase".into()
+        }
         Some("string") => {
             let mut ty = "string".to_owned();
             if !encoded {

@@ -1,6 +1,9 @@
 //! External assistants have their own versioned claims, never a delegated person chain.
 use super::*;
 use rusqlite::OptionalExtension as _;
+mod authorization;
+mod reads;
+pub(in crate::api) use authorization::{ReadReceipt, finish as finish_read, pin as pin_read_trust, read as read_projection};
 
 pub(super) const PRINCIPAL: &str = "assistant/chatgpt";
 const BEGUN: &str = "custom.client.assistant.v1.begun";
@@ -246,6 +249,9 @@ fn projection(state: &AppState, granted: &ClaimRecord) -> Result<Value, ApiError
                  "minimal_read_mode","recipient_allowlist","disclosure_consent","consent_evidence"] {
         value[name] = source[name].clone();
     }
+    if let Some(trust) = source.get("read_trust") {
+        value["read_trust"] = trust.clone();
+    }
     Ok(value)
 }
 
@@ -284,10 +290,9 @@ fn session(state: &AppState, granted: &ClaimRecord, transport: &'static str)
         conversation_blocks:false, local_peer:false, scopes })
 }
 
-// A grants no data surface until B's separately approved, proof-bearing endpoints exist.
-pub(super) fn authorize_route(_session: &ClientSession, _request: &Request<Body>)
+pub(super) fn authorize_route(session: &ClientSession, request: &Request<Body>)
     -> Result<(), ApiError> {
-    Err(forbidden("assistant grants authorize no generic read, stream, or mutation route"))
+    authorization::route(session, request)
 }
 pub(in crate::api) async fn inspect(State(state): State<AppState>, Extension(session): Extension<ClientSession>,
                            AxumPath(id): AxumPath<String>) -> Result<Json<Value>, ApiError> {

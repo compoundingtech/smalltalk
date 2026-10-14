@@ -106,6 +106,8 @@ pub enum ErrorCode {
     MessageTooLarge,
     MessageStoreFull,
     LongMessageSignatureUnsupported,
+    ResponseBudgetExceeded,
+    ContentNotText,
     Internal,
     #[serde(other)]
     Unknown,
@@ -139,6 +141,8 @@ pub struct Limits {
     /// which take 4096.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_message_bytes: Option<usize>,
+    pub max_assistant_response_bytes: Option<usize>,
+    pub default_assistant_response_bytes: Option<usize>,
     pub max_glass_body_bytes: Option<usize>,
     pub max_glasses: Option<usize>,
     pub max_glass_depth: Option<usize>,
@@ -3852,6 +3856,8 @@ pub struct AssistantGrant {
     pub disclosure_consent: bool,
     pub consent_evidence: String,
     pub revoked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_trust: Option<AssistantReadTrust>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -3863,6 +3869,245 @@ pub struct AssistantGrantPolicy {
     pub disclosure_consent: bool,
     pub consent_evidence: String,
     pub minimal_read_mode: AssistantMinimalReadMode,
+}
+
+/// Public pins only: the attestor and shim Ed25519 keys (base64url, 32 bytes) MUST differ.
+/// Budgets are configurable only downward: default 1..=4096, maximum 1..=16384, default <= maximum.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantReadTrust {
+    pub issuer: String,
+    pub key_id: String,
+    pub attestor_public_key: String,
+    pub shim_public_key: String,
+    pub default_response_bytes: usize,
+    pub max_response_bytes: usize,
+}
+/// Omitted budgets pin 4096 and 16384.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantReadTrustRequest {
+    pub api_version: String,
+    pub issuer: String,
+    pub key_id: String,
+    pub attestor_public_key: String,
+    pub shim_public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_response_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<usize>,
+}
+/// Summary query: only the response budget; the person is always the grant issuer.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantSummaryRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<usize>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantPageRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<usize>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantConversationContentRequest {
+    pub agent_id: String,
+    pub session_id: String,
+    pub reference: String,
+    pub revision: String,
+    pub start: usize,
+    pub end: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<usize>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantTerminalContentRequest {
+    pub agent_id: String,
+    pub terminal_id: String,
+    pub incarnation_id: String,
+    pub screen_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<usize>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum AssistantContentRequest {
+    Conversation(AssistantConversationContentRequest),
+    Terminal(AssistantTerminalContentRequest),
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AssistantProjection {
+    Summary,
+    Attention,
+    Missions,
+    Agents,
+    ConversationContent,
+    TerminalContent,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub enum ScgReadIdentity {
+    #[serde(rename = "chatgpt")]
+    Chatgpt,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScgReadAuthorizationPayload {
+    pub issuer: String,
+    pub identity: ScgReadIdentity,
+    pub assistant_id: AssistantPrincipal,
+    pub grant_id: String,
+    pub policy_revision: u64,
+    pub key_id: String,
+    pub approval_id: String,
+    pub execution_id: String,
+    pub projection: AssistantProjection,
+    pub parameters: std::collections::BTreeMap<String, String>,
+    pub max_response_bytes: usize,
+    pub request_digest: String,
+    pub expires_at_unix_ms: u64,
+    pub nonce: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScgReadAuthorization {
+    pub payload: ScgReadAuthorizationPayload,
+    pub signature: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantSummaryCounts {
+    pub attention: u64,
+    pub agent_states: BTreeMap<String, u64>,
+    pub mission_states: BTreeMap<String, u64>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantSummary {
+    pub kind: String,
+    pub as_of: String,
+    pub counts: AssistantSummaryCounts,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantAttentionItem {
+    pub id: String,
+    pub attention_kind: String,
+    pub person_id: String,
+    pub agent_id: Option<String>,
+    pub mission_id: Option<String>,
+    pub mission_run_id: Option<String>,
+    pub revision: String,
+    pub episode: String,
+    pub waiting_since: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantStepCounts {
+    pub total: u64,
+    pub completed: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantMissionItem {
+    pub id: String,
+    pub run_id: Option<String>,
+    pub agent_ids: Vec<String>,
+    pub phase: String,
+    pub step_counts: AssistantStepCounts,
+    pub blocked_count: u64,
+    pub revision: Option<String>,
+    pub updated_at: String,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantAgentItem {
+    pub id: String,
+    pub lifecycle: Option<String>,
+    pub runtime_state: String,
+    pub current_mission_id: Option<String>,
+    pub current_run_id: Option<String>,
+    pub updated_at: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantAttentionPage {
+    pub kind: String,
+    pub collection: String,
+    pub filters: BTreeMap<String, String>,
+    pub items: Vec<AssistantAttentionItem>,
+    pub page: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncNotice>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantMissionPage {
+    pub kind: String,
+    pub collection: String,
+    pub filters: BTreeMap<String, String>,
+    pub items: Vec<AssistantMissionItem>,
+    pub page: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncNotice>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantAgentPage {
+    pub kind: String,
+    pub collection: String,
+    pub filters: BTreeMap<String, String>,
+    pub items: Vec<AssistantAgentItem>,
+    pub page: PageInfo,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncNotice>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantContentRange {
+    pub start: u64,
+    pub end: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantConversationContent {
+    pub agent_id: String,
+    pub session_id: String,
+    pub reference: String,
+    pub revision: String,
+    pub start: u64,
+    pub end: u64,
+    pub text: String,
+    pub returned_bytes: u64,
+    pub truncated: bool,
+    pub next_range: Option<AssistantContentRange>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AssistantTerminalContent {
+    pub agent_id: String,
+    pub terminal_id: String,
+    pub incarnation_id: String,
+    pub screen_revision: String,
+    pub text: String,
+    pub returned_bytes: u64,
+    pub truncated: bool,
+}
+/// Disjoint by `kind`; a conversation answer never carries terminal fields or the reverse.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum AssistantContentPage {
+    #[serde(rename = "assistant-conversation-content")]
+    Conversation(AssistantConversationContent),
+    #[serde(rename = "assistant-terminal-content")]
+    Terminal(AssistantTerminalContent),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

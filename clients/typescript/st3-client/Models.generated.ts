@@ -385,6 +385,82 @@ export type ArrangementTombstoneRegister = {
   value: true;
 };
 
+export type AssistantAgentItem = {
+  current_mission_id: string | null;
+  current_run_id: string | null;
+  id: Id;
+  lifecycle: ("standing" | "owner" | "bounded" | "unknown" | null);
+  runtime_state: "desired" | "starting" | "running" | "waiting" | "stopped" | "failed" | "suspended" | "unknown";
+  updated_at: (Timestamp | null);
+};
+
+export type AssistantAgentPage = {
+  collection: "assistant.agents";
+  filters: {
+
+};
+  items: Array<AssistantAgentItem>;
+  kind: "page";
+  page: PageInfo;
+  sync?: SyncNotice;
+};
+
+export type AssistantAttentionItem = {
+  agent_id: string | null;
+  attention_kind: "human-gate" | "launch-approval" | "revision-approval" | "unread-message" | "person-step" | "agent-request" | "fault" | "harness-login" | "harness-prompt" | "custom" | "unknown";
+  episode: string;
+  id: Id;
+  mission_id: string | null;
+  mission_run_id: string | null;
+  person_id: PersonId;
+  revision: Revision;
+  waiting_since: Timestamp;
+};
+
+export type AssistantAttentionPage = {
+  collection: "assistant.attention";
+  filters: {
+
+};
+  items: Array<AssistantAttentionItem>;
+  kind: "page";
+  page: PageInfo;
+  sync?: SyncNotice;
+};
+
+export type AssistantContentPage = (AssistantConversationContent | AssistantTerminalContent);
+
+export type AssistantContentRange = {
+  end: number;
+  start: number;
+};
+
+export type AssistantContentRequest = (AssistantConversationContentRequest | AssistantTerminalContentRequest);
+
+export type AssistantConversationContent = {
+  agent_id: AgentId;
+  end: number;
+  kind: "assistant-conversation-content";
+  next_range: (AssistantContentRange | null);
+  reference: string;
+  returned_bytes: number;
+  revision: Revision;
+  session_id: Id;
+  start: number;
+  text: string;
+  truncated: boolean;
+};
+
+export type AssistantConversationContentRequest = {
+  agent_id: AgentId;
+  end: number;
+  max_response_bytes?: AssistantResponseBytes;
+  reference: string;
+  revision: Revision;
+  session_id: Id;
+  start: number;
+};
+
 export type AssistantGrant = {
   consent_evidence: "axe:igubz7";
   device_id: Id;
@@ -397,6 +473,7 @@ export type AssistantGrant = {
   minimal_read_mode: AssistantMinimalReadMode;
   policy_revision: number;
   principal: AssistantPrincipal;
+  read_trust?: AssistantReadTrust;
   recipient_allowlist: Array<string>;
   revoked: boolean;
   scopes: Array<AssistantScope>;
@@ -414,6 +491,37 @@ export type AssistantGrantPolicy = {
 };
 
 export type AssistantMinimalReadMode = "approval-once";
+
+export type AssistantMissionItem = {
+  agent_ids: Array<string>;
+  blocked_count: number;
+  id: Id;
+  phase: "draft" | "ready" | "running" | "standing" | "blocked" | "completed" | "failed" | "cancelled" | "retired" | "unknown";
+  revision: string | null;
+  run_id: string | null;
+  step_counts: {
+  completed: number;
+  total: number;
+};
+  updated_at: Timestamp;
+};
+
+export type AssistantMissionPage = {
+  collection: "assistant.missions";
+  filters: {
+
+};
+  items: Array<AssistantMissionItem>;
+  kind: "page";
+  page: PageInfo;
+  sync?: SyncNotice;
+};
+
+export type AssistantPageRequest = {
+  cursor?: Cursor;
+  limit?: number;
+  max_response_bytes?: AssistantResponseBytes;
+};
 
 export type AssistantPairedSession = {
   api_version: "st3.client.v0";
@@ -440,9 +548,69 @@ export type AssistantPairingBegin = {
 
 export type AssistantPrincipal = "assistant/chatgpt";
 
+export type AssistantProjection = "summary" | "attention" | "missions" | "agents" | "conversation-content" | "terminal-content";
+
+export type AssistantReadTrust = {
+  attestor_public_key: Ed25519PublicKey;
+  default_response_bytes: number;
+  issuer: PersonId;
+  key_id: string;
+  max_response_bytes: number;
+  shim_public_key: Ed25519PublicKey;
+};
+
+export type AssistantReadTrustRequest = {
+  api_version: "st3.client.v0";
+  attestor_public_key: Ed25519PublicKey;
+  default_response_bytes?: number;
+  issuer: PersonId;
+  key_id: string;
+  max_response_bytes?: number;
+  shim_public_key: Ed25519PublicKey;
+};
+
+export type AssistantResponseBytes = number;
+
 export type AssistantScope = "read.assistant.summary" | "read.assistant.attention" | "read.assistant.missions" | "read.assistant.agents" | "read.assistant.conversation" | "read.assistant.terminal";
 
 export type AssistantSenderClass = "external-assistant";
+
+export type AssistantSummary = {
+  as_of: Timestamp;
+  counts: {
+  agent_states: {
+  [key: string]: number;
+};
+  attention: number;
+  mission_states: {
+  [key: string]: number;
+};
+};
+  kind: "assistant-summary";
+};
+
+export type AssistantSummaryRequest = {
+  max_response_bytes?: AssistantResponseBytes;
+};
+
+export type AssistantTerminalContent = {
+  agent_id: AgentId;
+  incarnation_id: string;
+  kind: "assistant-terminal-content";
+  returned_bytes: number;
+  screen_revision: Revision;
+  terminal_id: TerminalId;
+  text: string;
+  truncated: boolean;
+};
+
+export type AssistantTerminalContentRequest = {
+  agent_id: AgentId;
+  incarnation_id: string;
+  max_response_bytes?: AssistantResponseBytes;
+  screen_revision: Revision;
+  terminal_id: TerminalId;
+};
 
 export type Attachment = {
   blob: string;
@@ -547,6 +715,7 @@ export type Capabilities = {
   grant_kind?: "person" | "assistant";
   kind: "capabilities";
   limits: {
+  default_assistant_response_bytes?: number;
   max_arrangement_body_bytes?: number;
   max_arrangement_folders?: number;
   max_arrangement_key_bytes?: number;
@@ -555,6 +724,7 @@ export type Capabilities = {
   max_arrangement_placements?: number;
   max_arrangement_resource_bytes?: number;
   max_arrangements?: number;
+  max_assistant_response_bytes?: number;
   max_event_items: number;
   max_glass_body_bytes?: number;
   max_glass_depth?: number;
@@ -866,14 +1036,16 @@ export type DocumentContent = {
   reference: string;
 };
 
+export type Ed25519PublicKey = string;
+
 export type Envelope = {
   api_version: "st3.client.v0";
   request_id: RequestId;
   snapshot: Snapshot;
-  value: (DirectiveNotes | Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | AssistantGrant | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
+  value: (DirectiveNotes | Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | AssistantGrant | AssistantSummary | AssistantAttentionPage | AssistantMissionPage | AssistantAgentPage | AssistantContentPage | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
-export type ErrorCode = ("attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "issuer-required" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "projection-detail-too-large" | "projection-detail-invalid-source" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "message-too-large" | "message-store-full" | "long-message-signature-unsupported" | "internal" | string);
+export type ErrorCode = ("attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "issuer-required" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "projection-detail-too-large" | "projection-detail-invalid-source" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "message-too-large" | "message-store-full" | "long-message-signature-unsupported" | "response-budget-exceeded" | "content-not-text" | "internal" | string);
 
 export type ErrorEnvelope = {
   api_version: "st3.client.v0";
@@ -1665,6 +1837,30 @@ export type Runtime = ResourceHeader & {
 };
 
 export type RuntimeId = string;
+
+export type ScgReadAuthorization = {
+  payload: ScgReadAuthorizationPayload;
+  signature: string;
+};
+
+export type ScgReadAuthorizationPayload = {
+  approval_id: string;
+  assistant_id: AssistantPrincipal;
+  execution_id: string;
+  expires_at_unix_ms: number;
+  grant_id: Id;
+  identity: "chatgpt";
+  issuer: PersonId;
+  key_id: string;
+  max_response_bytes: AssistantResponseBytes;
+  nonce: string;
+  parameters: {
+  [key: string]: string;
+};
+  policy_revision: number;
+  projection: AssistantProjection;
+  request_digest: string;
+};
 
 export type Session = ResourceHeader & {
   ended_at?: (Timestamp | null);

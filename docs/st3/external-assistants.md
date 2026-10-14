@@ -55,6 +55,7 @@ Reject missing owner configuration, remote, agent, non-owner, absent-consent, un
 ## B. Explicit proof-gated reads
 
 Use native snapshot/page envelope semantics and typed generated clients, never CLI output, KDL, arbitrary claim parsing, or prose scraping. The six scopes are closed and unrelated person scopes are not accepted:
+The attention, missions, and agents pages retain the optional native `sync` notice during replication catch-up or divergence. Its closed `SyncNotice` contract is shared with ordinary pages and decoded by the generated SDKs.
 
 | GET route under `/v1/client/assistant/` | Scope | Allowed fields, in addition to snapshot/page metadata |
 | --- | --- | --- |
@@ -74,6 +75,33 @@ Content responses default to 4 KiB and have a hard maximum of 16 KiB UTF-8 inclu
 Assistant principals are denied every other route and stream, including generic messages, timelines, search, declarations, documents, history, events, and terminal WebSockets. Every mutation is denied in A/B, including `observations.report`, `prompt.respond`, and ordinary message lifecycle operations. Native/legacy alternate routes cannot bypass scope or proof enforcement.
 
 B adds typed projection/content/proof schemas, the six operations with exact scope/budget metadata, and advertised assistant response ceilings. Acceptance must cover unrelated-route/mutation denial, field-only projection despite secrets/injected text in source bodies, absent/wrong/expired/reused authorization, stale revisions, changed ranges or grants, Unicode/envelope ceilings, and no private bytes in unapproved, denied, expired, foreign-handle, cached, or replayed status results.
+
+### Read wire contract
+
+Query parameters are scalar strings; duplicates, unknown names, and any `person` selector are rejected with `validation-failed`. The person is always the grant issuer, the daemon-configured owner.
+
+| Route | Query | Response value |
+| --- | --- | --- |
+| `summary` | `max_response_bytes` | `AssistantSummary`: `kind`, `as_of`, `counts` only |
+| `attention`, `missions`, `agents` | `cursor`, `limit`, `max_response_bytes` | `AssistantAttentionPage`, `AssistantMissionPage`, `AssistantAgentPage`: the native page shape with collection `assistant.<route>` and empty `filters` |
+| `conversation-content` | `agent_id`, `session_id`, `reference`, `revision`, `start`, `end`, `max_response_bytes` | `AssistantContentPage` with `kind: "assistant-conversation-content"` |
+| `terminal-content` | `agent_id`, `terminal_id`, `incarnation_id`, `screen_revision`, `max_response_bytes` | `AssistantContentPage` with `kind: "assistant-terminal-content"` |
+
+Every read carries `x-st3-scg-read-authorization`: unpadded base64url JSON `ScgReadAuthorization { payload, signature }`. The closed payload contains `issuer`, `identity: "chatgpt"`, `assistant_id: "assistant/chatgpt"`, `grant_id`, `policy_revision`, `key_id`, `approval_id`, `execution_id`, `projection` (the route suffix), `parameters` (every decoded query parameter, cursor and range included), `max_response_bytes`, `request_digest`, `expires_at_unix_ms`, and `nonce`. `signature` is unpadded base64url Ed25519 over the UTF-8 bytes `st3.scg-read.v1\n` followed by the canonical JSON payload: recursively sorted object keys, compact, integers only. `request_digest` is lowercase hexadecimal SHA-256 of canonical `{"method":"GET","path":<exact path>,"parameters":<decoded map>}`. st consumes the nonce atomically before returning private bytes; a replayed, expired, mismatched, or attestor-unverifiable proof is denied and discloses nothing. Generated clients never sign, retry, or widen the budget: they send exactly one request and reject a proof whose projection, parameters, or budget differ from the call.
+
+The response budget covers the entire JSON envelope. Without a query budget, the proof must name the pinned default (4096 unless lowered); an explicit `max_response_bytes` must equal the proof value. Neither may exceed the pinned maximum (16384 unless lowered). A response or native source record over budget fails with 413 `response-budget-exceeded`; non-UTF-8 content fails with 422 `content-not-text`. A forged, expired, or changed conversation reference returns 410 `conversation-content-invalidated`; a conversation revision mismatch, a session that is not the agent's current session, or a terminal incarnation/screen mismatch returns 409 `stale-fence`.
+
+### Read trust
+
+Every read is denied until the configured owning person pins trust for the exact grant at its authoritative origin:
+
+```sh
+st devices --as person/operator grant read-trust GRANT --issuer person/operator \
+  --key-id <key-id> --attestor-public-key <base64url-ed25519> --shim-public-key <base64url-ed25519> \
+  [--default-response-bytes N] [--max-response-bytes N]
+```
+
+This calls `POST /v1/client/assistant/grants/{id}/read-trust` with `AssistantReadTrustRequest` (`api_version`, `issuer`, `key_id`, `attestor_public_key`, `shim_public_key`, optional `default_response_bytes` ≤ 4096 and `max_response_bytes` ≤ 16384). Keys are 32-byte Ed25519 public keys in unpadded base64url. The attestor key must differ from the shim key, so a shim-signed request cannot authorize a read. Pinning increments the policy revision and returns `AssistantGrant` with `read_trust`; outstanding proofs for the old revision stop verifying. Public fixtures use placeholder pins and an intentionally invalid signature, never real keys.
 
 ## C. Future dormant approved message send
 

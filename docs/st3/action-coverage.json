@@ -868,6 +868,15 @@
       "verification": "CLI parse and local term validation; trusted local Unix person only"
     },
     {
+      "command": "st devices grant read-trust",
+      "description": "Pin the separate SCG read attestor and downward response budgets for one assistant grant",
+      "tests": [
+        "crates/st3/src/main.rs::assistant_read_trust_cli_pins_explicit_keys_and_downward_budgets",
+        "crates/st3/src/api/client_v0/assistant/authorization_tests.rs::assistant_response_budget_includes_envelope_and_supports_downward_policy"
+      ],
+      "verification": "CLI parse and real read-proof authorization; trusted-local configured owner only"
+    },
+    {
       "command": "st devices grant renew",
       "description": "Extend one assistant grant with its current scopes after renewed consent; increments its policy revision",
       "tests": [

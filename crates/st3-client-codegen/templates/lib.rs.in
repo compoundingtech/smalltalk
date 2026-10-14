@@ -33,6 +33,9 @@ use tokio_tungstenite::{
 };
 
 const HARD_MAX_RESPONSE_BYTES: usize = 8 * 1_048_576;
+/// Assistant read budgets bound the entire JSON envelope, inclusive (`operations.json` limits).
+pub const DEFAULT_ASSISTANT_RESPONSE_BYTES: usize = 4096;
+pub const MAX_ASSISTANT_RESPONSE_BYTES: usize = 16384;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(35);
 const STREAM_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 const RAW_TERMINAL_SUBPROTOCOL: &str = "st3.client.pty.v0";
@@ -860,6 +863,10 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::BlobExpired => {
             "this image was removed after its retention window; the message text remains".into()
         }
+        ErrorCode::ResponseBudgetExceeded => {
+            "the answer is larger than the requested response budget".into()
+        }
+        ErrorCode::ContentNotText => "this content is not plain text, so it was not returned".into(),
         ErrorCode::ValidationFailed
         | ErrorCode::ProjectionDetailTooLarge
         | ErrorCode::ProjectionDetailInvalidSource
@@ -1292,7 +1299,7 @@ impl Client {
         let mut pause = Duration::from_millis(100);
         let mut announced = false;
         loop {
-            let attempt = self.request_once::<Envelope<Page>>(Method::GET, &path, None, None, "application/json");
+            let attempt = self.request_once::<Envelope<Page>>(Method::GET, &path, None, None, "application/json", None);
             let outcome = if self.outage_wait.is_zero() {
                 attempt.await
             } else {
@@ -1568,6 +1575,50 @@ impl Client {
     }
     pub async fn assistant_grant_policy(&self, id: &str, policy: &AssistantGrantPolicy) -> Result<Envelope<AssistantGrant>, ClientError> {
         self.post(&format!("/v1/client/assistant/grants/{}/policy", percent_encode(id)), policy).await
+    }
+    pub async fn assistant_grant_read_trust(&self, id: &str, trust: &AssistantReadTrustRequest) -> Result<Envelope<AssistantGrant>, ClientError> {
+        self.post(&format!("/v1/client/assistant/grants/{}/read-trust", percent_encode(id)), trust).await
+    }
+    /// One approval-once read. The proof must already name this projection, these exact decoded
+    /// query parameters, and this response budget; the SDK never signs and never retries.
+    async fn assistant_read<T: DeserializeOwned>(&self, projection: &str, params: &impl Serialize, proof: &ScgReadAuthorization) -> Result<T, ClientError> {
+        use base64::Engine as _;
+        let protocol = |message: &str| ClientError::Protocol(message.to_owned());
+        let value = serde_json::to_value(params).map_err(|error| ClientError::Protocol(error.to_string()))?;
+        let object = value.as_object().ok_or_else(|| protocol("assistant parameters must be an object"))?;
+        let mut parameters = std::collections::BTreeMap::new();
+        for (key, value) in object {
+            let value = match value {
+                serde_json::Value::String(value) => value.clone(),
+                serde_json::Value::Number(value) if value.is_u64() => value.to_string(),
+                _ => return Err(protocol("assistant parameters must be scalar strings or unsigned integers")),
+            };
+            parameters.insert(key.clone(), value);
+        }
+        if serde_json::to_value(&proof.payload.projection).ok().and_then(|value| value.as_str().map(str::to_owned)).as_deref() != Some(projection) {
+            return Err(protocol("assistant proof names a different projection"));
+        }
+        if proof.payload.parameters != parameters {
+            return Err(protocol("assistant proof parameters differ from the request query"));
+        }
+        // An omitted budget means the grant pin's default, which the signed proof already names.
+        let budget = proof.payload.max_response_bytes;
+        if !(1..=MAX_ASSISTANT_RESPONSE_BYTES).contains(&budget)
+            || parameters.get("max_response_bytes").is_some_and(|value| *value != budget.to_string())
+        {
+            return Err(protocol("assistant response budget must match the proof and stay within 1..=16384"));
+        }
+        let mut path = format!("/v1/client/assistant/{projection}");
+        for (index, (key, value)) in parameters.iter().enumerate() {
+            path.push(if index == 0 { '?' } else { '&' });
+            path.push_str(&percent_encode(key));
+            path.push('=');
+            path.push_str(&percent_encode(value));
+        }
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(proof).map_err(|error| ClientError::Protocol(error.to_string()))?);
+        // Approval-once: no cursor-expiry retry and no outage retry loop may replay the proof.
+        self.request_once(Method::GET, &path, None, None, "application/json", Some((&encoded, budget))).await
     }
     async fn agent_queue_internal(
         &self,
@@ -2125,7 +2176,7 @@ impl Client {
         let mut pause = Duration::from_millis(100);
         let mut announced = false;
         loop {
-            match self.request_once(method.clone(), path, body.clone(), key, content_type).await {
+            match self.request_once(method.clone(), path, body.clone(), key, content_type, None).await {
                 Err(ClientError::Unreachable(mut outage)) if !self.outage_wait.is_zero() => {
                     let waited = started.elapsed();
                     if waited >= self.outage_wait {
@@ -2154,8 +2205,9 @@ impl Client {
         body: Option<Vec<u8>>,
         key: Option<&str>,
         content_type: &str,
+        read_authorization: Option<(&str, usize)>,
     ) -> Result<T, ClientError> {
-        let limit = self.response_limit();
+        let limit = read_authorization.map_or_else(|| self.response_limit(), |(_, limit)| limit);
         // Measured only when someone asked: no timer and no copy otherwise.
         let guard = RequestGuard::begin(&method, path);
         let request = async {
@@ -2171,6 +2223,7 @@ impl Client {
                         limit,
                         key,
                         content_type,
+                        read_authorization.map(|(proof, _)| proof),
                     )
                     .await
                 }
@@ -2179,6 +2232,7 @@ impl Client {
                         .header("x-st3-features", "custom-subjects.v1, conversation-blocks.v1");
                     request = propagation::inject_http(request);
                     if let Some(key) = key { request = request.header("idempotency-key", key); }
+                    if let Some((proof, _)) = read_authorization { request = request.header("x-st3-scg-read-authorization", proof); }
                     if let Some(name) = client_name() { request = request.header("x-st3-client", name); }
                     if let Some(credential) = &self.credential {
                         request = request.bearer_auth(credential);
@@ -2316,6 +2370,7 @@ async fn unix_request(
     limit: usize,
     key: Option<&str>,
     content_type: &str,
+    read_authorization: Option<&str>,
 ) -> Result<(u16, Vec<u8>), ClientError> {
     let stream = tokio::net::UnixStream::connect(socket)
         .await
@@ -2335,6 +2390,7 @@ async fn unix_request(
         builder = builder.header("authorization", format!("Bearer {credential}"));
     }
     if let Some(key) = key { builder = builder.header("idempotency-key", key); }
+    if let Some(proof) = read_authorization { builder = builder.header("x-st3-scg-read-authorization", proof); }
     if let Some(person) = local_person {
         builder = builder.header("x-st3-person", person);
     }

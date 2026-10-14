@@ -655,6 +655,13 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/pairings", post(client_v0::pairing_begin))
         .route("/v1/client/assistant/grants/{id}", get(client_v0::assistant::inspect))
         .route("/v1/client/assistant/grants/{id}/revoke", post(client_v0::assistant::revoke))
+        .route("/v1/client/assistant/grants/{id}/read-trust", post(client_v0::assistant::pin_read_trust))
+        .route("/v1/client/assistant/summary", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/attention", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/missions", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/agents", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/conversation-content", get(client_v0::assistant::read_projection))
+        .route("/v1/client/assistant/terminal-content", get(client_v0::assistant::read_projection))
         .route("/v1/client/assistant/grants/{id}/policy", post(client_v0::assistant::update_policy))
         .route(
             "/v1/client/pairings/{id}/complete",
@@ -1265,7 +1272,7 @@ async fn response_envelope_unbounded(
     }
     let enveloping = Instant::now();
     let mut diagnostic_envelope = crate::relay_trace::span(crate::relay_trace::Phase::Envelope);
-    let status = response.status();
+    let mut status = response.status();
     let (mut parts, body) = response.into_parts();
     // A page read inside one SQLite snapshot names that snapshot, which can be newer than the
     // one this request was admitted at.
@@ -1273,6 +1280,7 @@ async fn response_envelope_unbounded(
         .extensions
         .remove::<ClientSnapshot>()
         .or(client_snapshot);
+    let assistant_read = parts.extensions.remove::<client_v0::assistant::ReadReceipt>();
     let bytes = to_bytes(body, usize::MAX).await;
     let serialize = || {
         let raw = match bytes {
@@ -1333,13 +1341,28 @@ async fn response_envelope_unbounded(
     };
     // The agents roster's response parse, envelope and encoding are its serialization phase,
     // attributed to the request's existing server span.
-    let (envelope, body) = match otel.as_ref().filter(|_| request_route == "/v1/client/agents") {
+    let (mut envelope, mut body) = match otel.as_ref().filter(|_| request_route == "/v1/client/agents") {
         Some(server) => {
             let _server = server.enter();
             crate::otel::roster_scope(|| crate::otel::roster_phase("serialization", serialize))
         }
         None => serialize(),
     };
+    if status.is_success() && let Some(receipt) = assistant_read {
+        let within_budget = body.len() <= receipt.max_response_bytes;
+        let authorization = client_v0::assistant::finish_read(&state, &receipt, &body, within_budget).await;
+        if !within_budget || authorization.is_err() {
+            let error = authorization.err().unwrap_or_else(|| ApiError {
+                status: StatusCode::PAYLOAD_TOO_LARGE, code: "response-budget-exceeded".into(),
+                message: "the entire assistant response envelope exceeds its approved byte budget".into(),
+                details: Box::default(),
+            });
+            status = error.status;
+            envelope = client_error_envelope(status, &json!({"code":error.code,"message":error.message}), &request_id);
+            body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
+            parts.status = status;
+        }
+    }
     if let Some(trace) = crate::relay_trace::current() {
         trace.response(&request_id);
     }
@@ -1770,6 +1793,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "blob-expired"
         | "database-busy"
         | "database-locked"
+        | "response-budget-exceeded"
+        | "content-not-text"
         | "internal" => code.unwrap_or("internal").to_owned(),
         "too-many-attachments" | "invalid-blob-reference" => "validation-failed".into(),
         "launch-review-not-authorized"
@@ -2198,6 +2223,8 @@ async fn client_capabilities(
         "limits": {
             "max_page_items": CLIENT_MAX_PAGE_ITEMS,
             "max_event_items": 500,
+            "max_assistant_response_bytes": 16384,
+            "default_assistant_response_bytes": 4096,
             "max_response_bytes": CLIENT_MAX_RESPONSE_BYTES,
             "max_wait_ms": 30_000,
             "max_message_bytes": max_message_bytes,

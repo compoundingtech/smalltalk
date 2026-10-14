@@ -650,3 +650,93 @@ fn relay_omission_fixture_round_trips_without_inventing_nonnullable_fields() {
     let typed: ConversationChanges = serde_json::from_value(changes.clone()).unwrap();
     assert_eq!(serde_json::to_value(typed).unwrap(), changes);
 }
+
+/// Contract shape only: these fixtures carry placeholder pins and an intentionally invalid
+/// signature. Ed25519 verification, nonce replay and pin checks are exercised by the daemon tests.
+#[test]
+fn assistant_read_contract_decodes_fixtures_and_rejects_malformed_shapes() {
+    use sha2::Digest as _;
+
+    let trust: AssistantReadTrustRequest = decode("assistant-read-trust.json");
+    assert_eq!(trust.issuer, "person/operator");
+    assert_ne!(trust.attestor_public_key, trust.shim_public_key);
+    assert!(trust.default_response_bytes.unwrap() <= trust.max_response_bytes.unwrap());
+    let mut extra: serde_json::Value = decode("assistant-read-trust.json");
+    extra["shim_private_key"] = serde_json::json!("never");
+    assert!(serde_json::from_value::<AssistantReadTrustRequest>(extra).is_err());
+
+    let proof: ScgReadAuthorization = decode("assistant-read-authorization.json");
+    assert_eq!(proof.payload.identity, ScgReadIdentity::Chatgpt);
+    assert_eq!(proof.payload.assistant_id, AssistantPrincipal::Chatgpt);
+    assert_eq!(proof.payload.projection, AssistantProjection::ConversationContent);
+    assert_eq!(
+        proof.payload.parameters.get("max_response_bytes").map(String::as_str),
+        Some(proof.payload.max_response_bytes.to_string().as_str())
+    );
+    // The request digest is SHA-256 of canonical {method, parameters, path} over the decoded query.
+    let request = serde_json::json!({
+        "method": "GET",
+        "path": "/v1/client/assistant/conversation-content",
+        "parameters": proof.payload.parameters,
+    });
+    let canonical = smallclaims::hash::canonical_json_text(&request).unwrap();
+    assert_eq!(proof.payload.request_digest, hex::encode(sha2::Sha256::digest(canonical.as_bytes())));
+    // The query model a proof binds is the same disjoint request the SDK sends.
+    let query: AssistantConversationContentRequest = serde_json::from_value(serde_json::json!({
+        "agent_id": "agent/example", "session_id": "session/example", "reference": "content/example-0",
+        "revision": "r1", "start": 0, "end": 2048, "max_response_bytes": 8192,
+    }))
+    .unwrap();
+    assert_eq!(query.max_response_bytes, Some(proof.payload.max_response_bytes));
+
+    for (field, value) in [
+        ("identity", serde_json::json!("claude")),
+        ("assistant_id", serde_json::json!("assistant/other")),
+        ("projection", serde_json::json!("status")),
+        ("person_id", serde_json::json!("person/operator")),
+        ("parameters", serde_json::json!({"start": 0})),
+    ] {
+        let mut malformed: serde_json::Value = decode("assistant-read-authorization.json");
+        malformed["payload"][field] = value;
+        assert!(
+            serde_json::from_value::<ScgReadAuthorization>(malformed).is_err(),
+            "payload `{field}` must not decode"
+        );
+    }
+    let mut unsigned: serde_json::Value = decode("assistant-read-authorization.json");
+    unsigned.as_object_mut().unwrap().remove("signature");
+    assert!(serde_json::from_value::<ScgReadAuthorization>(unsigned).is_err());
+
+    let summary: Envelope<AssistantSummary> = decode("assistant-summary.json");
+    assert_eq!(summary.value.kind, "assistant-summary");
+    let mut owner_leak: serde_json::Value = decode("assistant-summary.json");
+    owner_leak["value"]["person_id"] = serde_json::json!("person/operator");
+    assert!(serde_json::from_value::<Envelope<AssistantSummary>>(owner_leak).is_err());
+    let attention: Envelope<AssistantAttentionPage> = decode("assistant-attention-page.json");
+    assert_eq!(attention.value.collection, "assistant.attention");
+    let missions: Envelope<AssistantMissionPage> = decode("assistant-mission-page.json");
+    assert_eq!(missions.value.items[0].step_counts.total, 3);
+    let agents: Envelope<AssistantAgentPage> = decode("assistant-agent-page.json");
+    assert!(agents.value.items[1].updated_at.is_none());
+    let conversation: Envelope<AssistantContentPage> = decode("assistant-conversation-content.json");
+    let AssistantContentPage::Conversation(text) = conversation.value else { panic!("conversation content decoded as terminal") };
+    assert_eq!(text.returned_bytes, text.text.len() as u64);
+    let terminal: Envelope<AssistantContentPage> = decode("assistant-terminal-content.json");
+    assert!(matches!(terminal.value, AssistantContentPage::Terminal(_)));
+
+    let mut mixed: serde_json::Value = decode("assistant-conversation-content.json");
+    mixed["value"]["terminal_id"] = serde_json::json!("terminal/example");
+    assert!(serde_json::from_value::<Envelope<AssistantContentPage>>(mixed).is_err());
+    let mut widened: serde_json::Value = decode("assistant-agent-page.json");
+    widened["value"]["items"][0]["runtime_ids"] = serde_json::json!([]);
+    assert!(serde_json::from_value::<Envelope<AssistantAgentPage>>(widened).is_err());
+    assert!(
+        serde_json::from_value::<AssistantContentRequest>(serde_json::json!({
+            "agent_id": "agent/example", "session_id": "session/example", "reference": "content/example-0",
+            "revision": "r1", "start": 0, "end": 1, "terminal_id": "terminal/example",
+        }))
+        .is_err()
+    );
+    assert!(serde_json::from_value::<AssistantPageRequest>(serde_json::json!({"person": "person/operator"})).is_err());
+    assert!(serde_json::from_value::<AssistantSummaryRequest>(serde_json::json!({"cursor": "c"})).is_err());
+}

@@ -6,7 +6,9 @@ import type {
     Arrangement, ArrangementId, ArrangementPage,
     PublicationDefinition, SubjectDefinition, AgentWorkspace, UsagePeriod, MailBacklog, ClientConnections, CollectionName, CollectionFrame, HostRepositories,
     ConversationContentChunk, ConversationChanges, ConversationSearch, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
-    PairingComplete, PairedSession, AssistantGrant, AssistantGrantPolicy, Resource, Snapshot, TerminalScreen, TimelinePage,
+    PairingComplete, PairedSession, AssistantGrant, AssistantGrantPolicy, AssistantReadTrustRequest, Resource, Snapshot, TerminalScreen, TimelinePage,
+    ScgReadAuthorization, AssistantSummaryRequest, AssistantPageRequest, AssistantConversationContentRequest, AssistantTerminalContentRequest,
+    AssistantSummary, AssistantAttentionPage, AssistantMissionPage, AssistantAgentPage, AssistantContentPage,
 } from './Models.generated.ts';
 
 export type PageOptions = { cursor?: string; limit?: number };
@@ -114,6 +116,24 @@ export class ClientError extends Error {
     }
 }
 
+/** Assistant read budgets bound the entire JSON envelope, inclusive (`operations.json` limits). */
+export const DEFAULT_ASSISTANT_RESPONSE_BYTES = 4096;
+export const MAX_ASSISTANT_RESPONSE_BYTES = 16384;
+
+/** A local refusal before or after an assistant read; it is never retried. */
+export class AssistantReadRejected extends Error {
+    constructor(reason: string) {
+        super(reason);
+        this.name = 'AssistantReadRejected';
+    }
+}
+
+function base64UrlJson(value: unknown): string {
+    let binary = '';
+    for (const byte of new TextEncoder().encode(JSON.stringify(value))) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 function routedId(id: string): string {
     if (id.startsWith('glass/')) return id.split('/').pop()!;
     return id.replace(/^(launch|session|pairing)\//, '');
@@ -201,10 +221,11 @@ export class St3Client {
         if (context.tracestate !== undefined) headers.tracestate = context.tracestate;
     }
 
-    private async request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, idempotencyKey?: string, raw?: { contentType: string }): Promise<EnvelopeOf<T>> {
+    private async request<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown, idempotencyKey?: string, raw?: { contentType: string }, readAuthorization?: { header: string; budget: number }): Promise<EnvelopeOf<T>> {
         const credential = await this.credential?.();
         const headers: Record<string, string> = { Accept: 'application/json', 'x-st3-features': 'custom-subjects.v1, conversation-blocks.v1' };
         if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+        if (readAuthorization) headers['x-st3-scg-read-authorization'] = readAuthorization.header;
         if (credential) headers.Authorization = `Bearer ${credential}`;
         if (this.client) headers['x-st3-client'] = this.client;
         if (body !== undefined) headers['Content-Type'] = raw?.contentType ?? 'application/json';
@@ -212,7 +233,14 @@ export class St3Client {
         const response = await this.fetchImpl(this.baseUrl + path, {
             method, headers, ...(body === undefined ? {} : { body: raw ? (body as BodyInit) : JSON.stringify(body) }),
         });
-        const payload: unknown = await response.json();
+        let payload: unknown;
+        if (readAuthorization) {
+            const bytes = new Uint8Array(await response.arrayBuffer());
+            if (bytes.byteLength > readAuthorization.budget) throw new AssistantReadRejected('assistant response exceeded max_response_bytes');
+            payload = JSON.parse(new TextDecoder().decode(bytes));
+        } else {
+            payload = await response.json();
+        }
         if (!payload || typeof payload !== 'object' || (payload as { api_version?: unknown }).api_version !== API_VERSION) {
             throw new Error('Unexpected st client API response');
         }
@@ -223,6 +251,27 @@ export class St3Client {
             throw new Error('Incomplete st client API response');
         }
         return payload as EnvelopeOf<T>;
+    }
+
+    /** One approval-once assistant read. The proof must already name this projection, these exact
+     * decoded query parameters and this response budget; the client never signs or retries. */
+    private async assistantRead<T>(projection: string, params: Record<string, string | number | undefined>, proof: ScgReadAuthorization): Promise<EnvelopeOf<T>> {
+        const parameters: Record<string, string> = {};
+        for (const [name, value] of Object.entries(params)) {
+            if (value === undefined) continue;
+            if (typeof value === 'number' && !(Number.isSafeInteger(value) && value >= 0)) throw new AssistantReadRejected('assistant parameters must be scalar strings or unsigned integers');
+            parameters[name] = String(value);
+        }
+        if (proof.payload.projection !== projection) throw new AssistantReadRejected('assistant proof names a different projection');
+        const signed = Object.entries(proof.payload.parameters).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+        const sent = Object.entries(parameters).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+        if (JSON.stringify(signed) !== JSON.stringify(sent)) throw new AssistantReadRejected('assistant proof parameters differ from the request query');
+        // An omitted budget means the grant pin's default, which the signed proof already names.
+        const budget = proof.payload.max_response_bytes;
+        if (!(budget >= 1 && budget <= MAX_ASSISTANT_RESPONSE_BYTES) || (parameters.max_response_bytes !== undefined && parameters.max_response_bytes !== String(budget))) {
+            throw new AssistantReadRejected('assistant response budget must match the proof and stay within 1..16384');
+        }
+        return this.request<T>('GET', `/v1/client/assistant/${projection}` + query(Object.fromEntries(sent)), undefined, undefined, undefined, { header: base64UrlJson(proof), budget });
     }
 
     private async get<T>(path: string, kind?: 'events'): Promise<EnvelopeOf<T>> {
@@ -295,6 +344,9 @@ export class St3Client {
     }
     async assistantGrantPolicy(id: string, policy: AssistantGrantPolicy): Promise<EnvelopeOf<AssistantGrant>> {
         return this.request<AssistantGrant>('POST', `/v1/client/assistant/grants/${encodeURIComponent(id)}/policy`, policy);
+    }
+    async assistantGrantReadTrust(id: string, trust: AssistantReadTrustRequest): Promise<EnvelopeOf<AssistantGrant>> {
+        return this.request<AssistantGrant>('POST', `/v1/client/assistant/grants/${encodeURIComponent(id)}/read-trust`, trust);
     }
 
     async followOperation(id: string, options: { signal?: AbortSignal; intervalMs?: number } = {}): Promise<EnvelopeOf<Resource>> {
@@ -501,6 +553,12 @@ export class St3Client {
     async arrangementsGet(personName: string, uuid: string): Promise<EnvelopeOf<Arrangement>> { return this.get(`/v1/client/arrangements/${encodeURIComponent(personName)}/${encodeURIComponent(uuid)}`); }
     async glassesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/glasses' + query(options)); }
     async glassesGet(id: string): Promise<EnvelopeOf<Glass>> { return this.get(`/v1/client/glasses/${encodeURIComponent(routedId(id))}`); }
+    async assistantSummary(params: AssistantSummaryRequest, proof: ScgReadAuthorization): Promise<EnvelopeOf<AssistantSummary>> { return this.assistantRead<AssistantSummary>('summary', params, proof); }
+    async assistantAttention(params: AssistantPageRequest, proof: ScgReadAuthorization): Promise<EnvelopeOf<AssistantAttentionPage>> { return this.assistantRead<AssistantAttentionPage>('attention', params, proof); }
+    async assistantMissions(params: AssistantPageRequest, proof: ScgReadAuthorization): Promise<EnvelopeOf<AssistantMissionPage>> { return this.assistantRead<AssistantMissionPage>('missions', params, proof); }
+    async assistantAgents(params: AssistantPageRequest, proof: ScgReadAuthorization): Promise<EnvelopeOf<AssistantAgentPage>> { return this.assistantRead<AssistantAgentPage>('agents', params, proof); }
+    async assistantConversationContent(params: AssistantConversationContentRequest, proof: ScgReadAuthorization): Promise<EnvelopeOf<AssistantContentPage>> { return this.assistantRead<AssistantContentPage>('conversation-content', params, proof); }
+    async assistantTerminalContent(params: AssistantTerminalContentRequest, proof: ScgReadAuthorization): Promise<EnvelopeOf<AssistantContentPage>> { return this.assistantRead<AssistantContentPage>('terminal-content', params, proof); }
     async agentCreate(input: Omit<ActionOf<'agent.create'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.create' } as ActionOf<'agent.create'>); }
     async agentQueueMove(input: Omit<ActionOf<'agent.queue-move'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.queue-move' } as ActionOf<'agent.queue-move'>); }
     async agentResume(input: Omit<ActionOf<'agent.resume'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.resume' } as ActionOf<'agent.resume'>); }

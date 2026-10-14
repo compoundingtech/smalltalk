@@ -1177,6 +1177,18 @@ carry principal, sender class and grant metadata, without a synthetic `person_id
 Capability discovery advertises `assistant.grants.v1` to the trusted-local configured owner
 and does not substitute ordinary person grants on older servers.
 
+Slice B adds six proof-gated reads under `/v1/client/assistant/`: `summary`, `attention`,
+`missions`, `agents`, `conversation-content`, and `terminal-content`, each requiring its exact
+`read.assistant.*` scope and an approval-once `x-st3-scg-read-authorization` proof. Every read is
+denied until the configured owner pins an attestor key and a different shim key with
+`POST /v1/client/assistant/grants/{id}/read-trust`, which increments the policy revision.
+Responses default to 4096 and never exceed 16384 bytes for the entire envelope; pins may only
+lower these. The person is always the grant issuer and no `person` query is accepted.
+Assistant principals are denied every other route, stream, and mutation. Generated clients
+expose `assistant_*` methods that send the caller-supplied proof exactly once and never sign or
+retry. See [External assistants](../external-assistants.md#read-wire-contract) for the query,
+proof, digest, budget, and error contract.
+
 
 ### Person declaration access
 
@@ -1455,7 +1467,7 @@ Errors have `error_version: st3.client.error.v0`, a stable kebab-case code, safe
 `cursor-gap`, `page-cursor-expired`, `projection-detail-too-large`,
 `projection-detail-invalid-source`, `rate-limited`, `runtime-not-local`,
 `runtime-authority-indeterminate`, `remote-unavailable`, `terminal-unavailable`, `terminal-ended`,
-and `internal`.
+`response-budget-exceeded` (HTTP 413), `content-not-text` (HTTP 422), and `internal`.
 
 Revoking a pairing from a non-issuer returns HTTP 409 with `code: issuer-required`,
 `retryable: false`, and `details.issuer_host_id` naming the authoritative issuer.
@@ -1486,7 +1498,8 @@ branch. Consumers accept future strings without changing their wire value. `Reso
 `UnknownResource`, which preserves a future kind's valid header and arbitrary payload. Its kind
 exclusion prevents malformed known resources from falling through that branch. The generated raw
 Rust, Swift, and TypeScript `Resource` types model known kinds only, so TypeScript keeps
-discriminant narrowing on `kind`.
+discriminant narrowing on `kind`. A plain-string `not: { pattern }` excludes a family of values,
+such as the native collections that `Page.collection` leaves to their dedicated page types.
 
 Daemon conformance uses a strict test-only view of the same schema: it closes composed resource
 fields, tightens open enums to known values, and removes `UnknownResource`. Consumer tolerance

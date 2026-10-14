@@ -64,6 +64,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
     case runtimeNotLocal, runtimeAuthorityIndeterminate, remoteUnavailable, `internal`
     case terminalUnavailable, terminalEnded, timelineHistoryIncomplete, conversationContentInvalidated, transcriptUnavailable
     case blobTooLarge, unsupportedMediaType, blobContentMismatch, blobQuotaExceeded, blobNotFound, blobExpired, messageTooLarge, messageStoreFull, longMessageSignatureUnsupported
+    case responseBudgetExceeded, contentNotText
     case unknown(String)
 
     public init(from decoder: Decoder) throws {
@@ -91,6 +92,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case "blob-too-large": .blobTooLarge; case "unsupported-media-type": .unsupportedMediaType; case "blob-content-mismatch": .blobContentMismatch
         case "blob-quota-exceeded": .blobQuotaExceeded; case "blob-not-found": .blobNotFound; case "blob-expired": .blobExpired
         case "message-too-large": .messageTooLarge; case "message-store-full": .messageStoreFull; case "long-message-signature-unsupported": .longMessageSignatureUnsupported
+        case "response-budget-exceeded": .responseBudgetExceeded; case "content-not-text": .contentNotText
         case "runtime-authority-indeterminate": .runtimeAuthorityIndeterminate; case "remote-unavailable": .remoteUnavailable; case "internal": .internal
         default: .unknown(raw)
         }
@@ -119,6 +121,7 @@ public enum ErrorCode: Codable, Sendable, Equatable {
         case .blobTooLarge: "blob-too-large"; case .unsupportedMediaType: "unsupported-media-type"; case .blobContentMismatch: "blob-content-mismatch"
         case .blobQuotaExceeded: "blob-quota-exceeded"; case .blobNotFound: "blob-not-found"; case .blobExpired: "blob-expired"
         case .messageTooLarge: "message-too-large"; case .messageStoreFull: "message-store-full"; case .longMessageSignatureUnsupported: "long-message-signature-unsupported"
+        case .responseBudgetExceeded: "response-budget-exceeded"; case .contentNotText: "content-not-text"
         case .runtimeAuthorityIndeterminate: "runtime-authority-indeterminate"; case .remoteUnavailable: "remote-unavailable"; case .internal: "internal"
         case .unknown(let value): value
         }
@@ -146,12 +149,13 @@ public enum JSONValue: Codable, Sendable, Equatable {
 public struct Capability: Codable, Sendable { public let id: String; public let version: UInt; public let state: String }
 public struct Limits: Codable, Sendable {
     public let maxPageItems: Int; public let maxEventItems: Int; public let maxResponseBytes: Int; public let maxWaitMS: UInt64
+    public let maxAssistantResponseBytes, defaultAssistantResponseBytes: Int?
     public let maxGlassBodyBytes, maxGlasses, maxGlassDepth, maxGlassNodes: Int?
     /// The longest message body in UTF-8 bytes the daemon takes now; nil on older daemons, which take 4096.
     public let maxMessageBytes: Int?
     public let maxArrangementBodyBytes, maxArrangements, maxArrangementNameBytes, maxArrangementKeyBytes, maxArrangementOperations, maxArrangementFolders, maxArrangementPlacements: Int?
     public let maxArrangementResourceBytes: Int?
-    enum CodingKeys: String, CodingKey { case maxArrangementResourceBytes = "max_arrangement_resource_bytes", maxArrangementBodyBytes = "max_arrangement_body_bytes", maxArrangements = "max_arrangements", maxArrangementNameBytes = "max_arrangement_name_bytes", maxArrangementKeyBytes = "max_arrangement_key_bytes", maxArrangementOperations = "max_arrangement_operations", maxArrangementFolders = "max_arrangement_folders", maxArrangementPlacements = "max_arrangement_placements", maxMessageBytes = "max_message_bytes", maxGlassBodyBytes = "max_glass_body_bytes", maxGlasses = "max_glasses", maxGlassDepth = "max_glass_depth", maxGlassNodes = "max_glass_nodes", maxPageItems = "max_page_items", maxEventItems = "max_event_items", maxResponseBytes = "max_response_bytes", maxWaitMS = "max_wait_ms" }
+    enum CodingKeys: String, CodingKey { case maxAssistantResponseBytes = "max_assistant_response_bytes", defaultAssistantResponseBytes = "default_assistant_response_bytes", maxArrangementResourceBytes = "max_arrangement_resource_bytes", maxArrangementBodyBytes = "max_arrangement_body_bytes", maxArrangements = "max_arrangements", maxArrangementNameBytes = "max_arrangement_name_bytes", maxArrangementKeyBytes = "max_arrangement_key_bytes", maxArrangementOperations = "max_arrangement_operations", maxArrangementFolders = "max_arrangement_folders", maxArrangementPlacements = "max_arrangement_placements", maxMessageBytes = "max_message_bytes", maxGlassBodyBytes = "max_glass_body_bytes", maxGlasses = "max_glasses", maxGlassDepth = "max_glass_depth", maxGlassNodes = "max_glass_nodes", maxPageItems = "max_page_items", maxEventItems = "max_event_items", maxResponseBytes = "max_response_bytes", maxWaitMS = "max_wait_ms" }
 }
 public struct Capabilities: Codable, Sendable {
     public let machineVersion: String?
@@ -697,12 +701,119 @@ public struct AssistantPairedSession: Codable, Sendable {
 public struct AssistantGrant: Codable, Sendable {
     /// Issuer is the concrete daemon-configured owning person sealed by the authoritative member.
     public let kind, id, sessionActor, deviceID, keyID, issuer, expiresAt, consentEvidence: String; public let principal: AssistantPrincipal; public let senderClass: AssistantSenderClass; public let scopes: [AssistantScope]; public let policyRevision: UInt64; public let minimalReadMode: AssistantMinimalReadMode; public let recipientAllowlist: [String]; public let disclosureConsent, revoked: Bool
-    enum CodingKeys: String, CodingKey { case kind, id, sessionActor = "session_actor", deviceID = "device_id", keyID = "key_id", issuer, expiresAt = "expires_at", consentEvidence = "consent_evidence", principal, senderClass = "sender_class", scopes, policyRevision = "policy_revision", minimalReadMode = "minimal_read_mode", recipientAllowlist = "recipient_allowlist", disclosureConsent = "disclosure_consent", revoked }
+    /// Owner-provisioned SCG read pins; absent means every assistant read is denied.
+    public let readTrust: AssistantReadTrust?
+    enum CodingKeys: String, CodingKey { case kind, id, sessionActor = "session_actor", deviceID = "device_id", keyID = "key_id", issuer, expiresAt = "expires_at", consentEvidence = "consent_evidence", principal, senderClass = "sender_class", scopes, policyRevision = "policy_revision", minimalReadMode = "minimal_read_mode", recipientAllowlist = "recipient_allowlist", disclosureConsent = "disclosure_consent", revoked, readTrust = "read_trust" }
 }
 public struct AssistantGrantPolicy: Codable, Sendable {
     public let apiVersion, consentEvidence: String; public let scopes: [AssistantScope]; public let expiresInSeconds: UInt64?; public let disclosureConsent: Bool; public let minimalReadMode: AssistantMinimalReadMode
     public init(apiVersion: String, scopes: [AssistantScope], expiresInSeconds: UInt64? = nil, disclosureConsent: Bool, consentEvidence: String, minimalReadMode: AssistantMinimalReadMode = .approvalOnce) { self.apiVersion = apiVersion; self.scopes = scopes; self.expiresInSeconds = expiresInSeconds; self.disclosureConsent = disclosureConsent; self.consentEvidence = consentEvidence; self.minimalReadMode = minimalReadMode }
     enum CodingKeys: String, CodingKey { case apiVersion = "api_version", consentEvidence = "consent_evidence", scopes, expiresInSeconds = "expires_in_seconds", disclosureConsent = "disclosure_consent", minimalReadMode = "minimal_read_mode" }
+}
+/// Public pins only; attestor and shim keys differ. Budgets only lower 4096/16384, default <= maximum.
+public struct AssistantReadTrust: Codable, Sendable, Equatable {
+    public let issuer, keyID, attestorPublicKey, shimPublicKey: String; public let defaultResponseBytes, maxResponseBytes: Int
+    enum CodingKeys: String, CodingKey { case issuer, keyID = "key_id", attestorPublicKey = "attestor_public_key", shimPublicKey = "shim_public_key", defaultResponseBytes = "default_response_bytes", maxResponseBytes = "max_response_bytes" }
+}
+public struct AssistantReadTrustRequest: Codable, Sendable, Equatable {
+    public let apiVersion, issuer, keyID, attestorPublicKey, shimPublicKey: String; public let defaultResponseBytes, maxResponseBytes: Int?
+    public init(apiVersion: String, issuer: String, keyID: String, attestorPublicKey: String, shimPublicKey: String, defaultResponseBytes: Int? = nil, maxResponseBytes: Int? = nil) { self.apiVersion = apiVersion; self.issuer = issuer; self.keyID = keyID; self.attestorPublicKey = attestorPublicKey; self.shimPublicKey = shimPublicKey; self.defaultResponseBytes = defaultResponseBytes; self.maxResponseBytes = maxResponseBytes }
+    enum CodingKeys: String, CodingKey { case apiVersion = "api_version", issuer, keyID = "key_id", attestorPublicKey = "attestor_public_key", shimPublicKey = "shim_public_key", defaultResponseBytes = "default_response_bytes", maxResponseBytes = "max_response_bytes" }
+}
+public struct AssistantSummaryRequest: Codable, Sendable, Equatable {
+    public let maxResponseBytes: Int?
+    public init(maxResponseBytes: Int? = nil) { self.maxResponseBytes = maxResponseBytes }
+    enum CodingKeys: String, CodingKey { case maxResponseBytes = "max_response_bytes" }
+}
+public struct AssistantPageRequest: Codable, Sendable, Equatable {
+    public let cursor: String?; public let limit, maxResponseBytes: Int?
+    public init(cursor: String? = nil, limit: Int? = nil, maxResponseBytes: Int? = nil) { self.cursor = cursor; self.limit = limit; self.maxResponseBytes = maxResponseBytes }
+    enum CodingKeys: String, CodingKey { case cursor, limit, maxResponseBytes = "max_response_bytes" }
+}
+public struct AssistantConversationContentRequest: Codable, Sendable, Equatable {
+    public let agentID, sessionID, reference, revision: String; public let start, end: UInt64; public let maxResponseBytes: Int?
+    public init(agentID: String, sessionID: String, reference: String, revision: String, start: UInt64, end: UInt64, maxResponseBytes: Int? = nil) { self.agentID = agentID; self.sessionID = sessionID; self.reference = reference; self.revision = revision; self.start = start; self.end = end; self.maxResponseBytes = maxResponseBytes }
+    enum CodingKeys: String, CodingKey { case agentID = "agent_id", sessionID = "session_id", reference, revision, start, end, maxResponseBytes = "max_response_bytes" }
+}
+public struct AssistantTerminalContentRequest: Codable, Sendable, Equatable {
+    public let agentID, terminalID, incarnationID, screenRevision: String; public let maxResponseBytes: Int?
+    public init(agentID: String, terminalID: String, incarnationID: String, screenRevision: String, maxResponseBytes: Int? = nil) { self.agentID = agentID; self.terminalID = terminalID; self.incarnationID = incarnationID; self.screenRevision = screenRevision; self.maxResponseBytes = maxResponseBytes }
+    enum CodingKeys: String, CodingKey { case agentID = "agent_id", terminalID = "terminal_id", incarnationID = "incarnation_id", screenRevision = "screen_revision", maxResponseBytes = "max_response_bytes" }
+}
+/// Disjoint content queries; mixing conversation and terminal fields is denied.
+public enum AssistantContentRequest: Codable, Sendable, Equatable {
+    case conversation(AssistantConversationContentRequest), terminal(AssistantTerminalContentRequest)
+    public init(from decoder: Decoder) throws {
+        let conversation = try? AssistantConversationContentRequest(from: decoder), terminal = try? AssistantTerminalContentRequest(from: decoder)
+        switch (conversation, terminal) {
+        case (let value?, nil): self = .conversation(value)
+        case (nil, let value?): self = .terminal(value)
+        default: throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "assistant content query must be exactly one of conversation or terminal"))
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        switch self { case .conversation(let value): try value.encode(to: encoder); case .terminal(let value): try value.encode(to: encoder) }
+    }
+}
+public enum AssistantProjection: String, Codable, Sendable { case summary, attention, missions, agents, conversationContent = "conversation-content", terminalContent = "terminal-content" }
+public enum ScgReadIdentity: String, Codable, Sendable { case chatgpt }
+/// Signed by the pinned attestor (Ed25519) over UTF-8 `st3.scg-read.v1\n` + canonical JSON of this payload.
+public struct ScgReadAuthorizationPayload: Codable, Sendable, Equatable {
+    public let issuer, grantID, keyID, approvalID, executionID, requestDigest, nonce: String
+    public let identity: ScgReadIdentity; public let assistantID: AssistantPrincipal; public let projection: AssistantProjection
+    public let policyRevision, expiresAtUnixMS: UInt64; public let parameters: [String: String]; public let maxResponseBytes: Int
+    enum CodingKeys: String, CodingKey { case issuer, grantID = "grant_id", keyID = "key_id", approvalID = "approval_id", executionID = "execution_id", requestDigest = "request_digest", nonce, identity, assistantID = "assistant_id", projection, policyRevision = "policy_revision", expiresAtUnixMS = "expires_at_unix_ms", parameters, maxResponseBytes = "max_response_bytes" }
+}
+/// Sent as unpadded base64url JSON in `x-st3-scg-read-authorization`.
+public struct ScgReadAuthorization: Codable, Sendable, Equatable { public let payload: ScgReadAuthorizationPayload; public let signature: String }
+public struct AssistantSummaryCounts: Codable, Sendable, Equatable {
+    public let attention: UInt64; public let agentStates, missionStates: [String: UInt64]
+    enum CodingKeys: String, CodingKey { case attention, agentStates = "agent_states", missionStates = "mission_states" }
+}
+public struct AssistantSummary: Codable, Sendable, Equatable {
+    public let kind, asOf: String; public let counts: AssistantSummaryCounts
+    enum CodingKeys: String, CodingKey { case kind, asOf = "as_of", counts }
+}
+public struct AssistantAttentionItem: Codable, Sendable, Equatable {
+    public let id, attentionKind, personID, revision, episode, waitingSince: String; public let agentID, missionID, missionRunID: String?
+    enum CodingKeys: String, CodingKey { case id, attentionKind = "attention_kind", personID = "person_id", revision, episode, waitingSince = "waiting_since", agentID = "agent_id", missionID = "mission_id", missionRunID = "mission_run_id" }
+}
+public struct AssistantStepCounts: Codable, Sendable, Equatable { public let total, completed: UInt64 }
+public struct AssistantMissionItem: Codable, Sendable, Equatable {
+    public let id, phase, updatedAt: String; public let runID, revision: String?; public let agentIDs: [String]; public let stepCounts: AssistantStepCounts; public let blockedCount: UInt64
+    enum CodingKeys: String, CodingKey { case id, phase, updatedAt = "updated_at", runID = "run_id", revision, agentIDs = "agent_ids", stepCounts = "step_counts", blockedCount = "blocked_count" }
+}
+public struct AssistantAgentItem: Codable, Sendable, Equatable {
+    public let id, runtimeState: String; public let lifecycle, currentMissionID, currentRunID, updatedAt: String?
+    enum CodingKeys: String, CodingKey { case id, runtimeState = "runtime_state", lifecycle, currentMissionID = "current_mission_id", currentRunID = "current_run_id", updatedAt = "updated_at" }
+}
+public struct AssistantAttentionPage: Codable, Sendable { public let kind, collection: String; public let filters: [String: String]; public let items: [AssistantAttentionItem]; public let page: PageInfo; public let sync: SyncNotice? }
+public struct AssistantMissionPage: Codable, Sendable { public let kind, collection: String; public let filters: [String: String]; public let items: [AssistantMissionItem]; public let page: PageInfo; public let sync: SyncNotice? }
+public struct AssistantAgentPage: Codable, Sendable { public let kind, collection: String; public let filters: [String: String]; public let items: [AssistantAgentItem]; public let page: PageInfo; public let sync: SyncNotice? }
+public struct AssistantContentRange: Codable, Sendable, Equatable { public let start, end: UInt64 }
+public struct AssistantConversationContent: Codable, Sendable, Equatable {
+    public let kind, agentID, sessionID, reference, revision, text: String; public let start, end, returnedBytes: UInt64; public let truncated: Bool; public let nextRange: AssistantContentRange?
+    enum CodingKeys: String, CodingKey { case kind, agentID = "agent_id", sessionID = "session_id", reference, revision, text, start, end, returnedBytes = "returned_bytes", truncated, nextRange = "next_range" }
+}
+public struct AssistantTerminalContent: Codable, Sendable, Equatable {
+    public let kind, agentID, terminalID, incarnationID, screenRevision, text: String; public let returnedBytes: UInt64; public let truncated: Bool
+    enum CodingKeys: String, CodingKey { case kind, agentID = "agent_id", terminalID = "terminal_id", incarnationID = "incarnation_id", screenRevision = "screen_revision", text, returnedBytes = "returned_bytes", truncated }
+}
+/// Disjoint by `kind`.
+public enum AssistantContentPage: Codable, Sendable, Equatable {
+    case conversation(AssistantConversationContent), terminal(AssistantTerminalContent)
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: KindKeys.self)
+        switch try container.decode(String.self, forKey: .kind) {
+        case "assistant-conversation-content": self = .conversation(try AssistantConversationContent(from: decoder))
+        case "assistant-terminal-content": self = .terminal(try AssistantTerminalContent(from: decoder))
+        default: throw DecodingError.dataCorruptedError(forKey: .kind, in: container, debugDescription: "Unknown assistant content kind")
+        }
+    }
+    public func encode(to encoder: Encoder) throws {
+        switch self { case .conversation(let value): try value.encode(to: encoder); case .terminal(let value): try value.encode(to: encoder) }
+    }
+    private enum KindKeys: String, CodingKey { case kind }
 }
 
 public struct TerminalLine: Codable, Sendable { public let row: Int; public let text: String; public let runs: [TerminalRun]; public let wrapped: Bool?; public let redacted: Bool; public let truncated: Bool }

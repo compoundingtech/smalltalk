@@ -159,6 +159,22 @@ fn action_method(action: &str) -> String {
     action.replace(['.', '-'], "_")
 }
 
+/// Assistant read operations: `(projection route suffix, query model, response model)`.
+/// Each one is a single proof-carrying GET; no generic page/list renderer may claim it.
+fn assistant_read(read: &Value) -> Result<Option<(&str, &str, &str)>> {
+    let path = read["path"].as_str().context("read path")?;
+    let Some(projection) = path.strip_prefix("/v1/client/assistant/") else {
+        return Ok(None);
+    };
+    let id = read["id"].as_str().context("read id")?;
+    if id != format!("assistant.{projection}") || read["proof_header"] != "x-st3-scg-read-authorization" {
+        bail!("assistant read `{id}` must be `assistant.<projection>` and carry the SCG read proof header");
+    }
+    let request = read["query_model"].as_str().with_context(|| format!("assistant read `{id}` has no query_model"))?;
+    let response = read["response"].as_str().context("read response")?;
+    Ok(Some((projection, request, response)))
+}
+
 fn rust_action_constructors(actions: &serde_json::Map<String, Value>) -> Result<String> {
     let mut out = String::new();
     for (action, definition) in actions {
@@ -204,7 +220,9 @@ fn rust_operation_methods(
             writeln!(out, "    pub async fn arrangements_get(&self, person_name: &str, uuid: &str) -> Result<Envelope<Arrangement>, ClientError> {{ self.get(&format!(\"/v1/client/arrangements/{{}}/{{}}\", percent_encode(person_name), percent_encode(uuid))).await }}")?;
             continue;
         }
-        if id == "capabilities.get" {
+        if let Some((projection, request, response)) = assistant_read(read)? {
+            writeln!(out, "    pub async fn {method}(&self, params: &{request}, proof: &ScgReadAuthorization) -> Result<Envelope<{response}>, ClientError> {{ self.assistant_read(\"{projection}\", params, proof).await }}")?;
+        } else if id == "capabilities.get" {
             writeln!(
                 out,
                 "    pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {{ self.capabilities_internal().await }}"
@@ -364,7 +382,9 @@ fn swift_operation_methods(
             writeln!(out, "    public func arrangementsGet(personName: String, uuid: String) async throws -> Envelope<Arrangement> {{ try await get(\"v1/client/arrangements/\\(Self.routedSessionID(personName))/\\(Self.routedSessionID(uuid))\") }}")?;
             continue;
         }
-        if matches!(
+        if let Some((projection, request, response)) = assistant_read(read)? {
+            writeln!(out, "    public func {method}(_ params: {request}, proof: ScgReadAuthorization) async throws -> Envelope<{response}> {{ try await assistantRead(\"{projection}\", params, proof: proof) }}")?;
+        } else if matches!(
             id,
             "capabilities.get"
                 | "timeline.list"
@@ -714,6 +734,22 @@ fn validate_surfaces(
         "PairedSession",
         "AssistantGrant",
         "AssistantGrantPolicy",
+        "AssistantReadTrust",
+        "AssistantReadTrustRequest",
+        "AssistantSummaryRequest",
+        "AssistantPageRequest",
+        "AssistantContentRequest",
+        "ScgReadAuthorization",
+        "ScgReadAuthorizationPayload",
+        "AssistantSummary",
+        "AssistantAttentionItem",
+        "AssistantMissionItem",
+        "AssistantAgentItem",
+        "AssistantAttentionPage",
+        "AssistantMissionPage",
+        "AssistantAgentPage",
+        "AssistantContentRange",
+        "AssistantContentPage",
         "TerminalAttachment",
         "TerminalScreen",
         "TerminalLine",
@@ -1237,6 +1273,10 @@ fn typescript_operation_methods(
         let response = read["response"].as_str().context("read response")?;
         let method = lower_camel(&pascal(id));
         if id == "capabilities.get" {
+            continue;
+        }
+        if let Some((projection, request, response)) = assistant_read(read)? {
+            writeln!(out, "    async {method}(params: {request}, proof: ScgReadAuthorization): Promise<EnvelopeOf<{response}>> {{ return this.assistantRead<{response}>('{projection}', params, proof); }}")?;
             continue;
         }
         let route = if path.contains("{id}") {
