@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Exact system-role OMP task-result, IRC, background-job completion and compaction envelopes become typed transcript events with compact neutral cards. Payloads are disclosed deliberately; Context compacted opens the shared Markdown summary renderer. Human text and near-miss envelopes remain literal.",
+  "replay": { "status": "none", "detail": "No replay or rebuild. Existing loaded timeline content is projected in the client." },
+  "schema": { "status": "none", "detail": "No persisted schema change. Event carries optional typed harness facts in the client view model." },
+  "rules": { "status": "none", "detail": "Checkpoint rules are unchanged." },
+  "compatibility": { "status": "none", "detail": "q101 app stopgap only: final system-role text/plain, bounded whole-body producer grammar, no human/user reinterpretation. Retirement gate: st adapters preserve OMP customType/details as typed TimelineBlocks including Unsupported, and the four envelope projection proofs pass against those blocks. Delete q101OmpEnvelopeStopgap and its timeline hook at that cutover. The kit is presentation-only." },
+  "downtime": { "status": "none", "detail": "None." },
+  "manual": { "status": "none", "detail": "No manual step." },
+  "recovery": { "status": "none", "detail": "Original payload and envelope remain in event metadata; unrecognized envelopes stay literal." }
+}
