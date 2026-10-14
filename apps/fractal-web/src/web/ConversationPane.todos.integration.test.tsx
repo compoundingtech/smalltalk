@@ -15,6 +15,7 @@ vi.mock('@stylexjs/stylex', () => ({
 vi.mock('@effect/atom-react', () => ({ useAtomValue: () => false }))
 vi.mock('../data/react.tsx', () => ({
   useDataSource: () => ({}), useConversation: () => state.tag === 'Waiting' ? { _tag: 'Waiting' } : { _tag: 'Unavailable', reason: 'failed', detail: 'example' },
+  useAgent: () => ({ _tag: 'Waiting' }),
   useConversationSync: () => undefined, useFeedInterest: () => {}, useGrants: () => ({ messageSend: 'ungranted' }), useNow: () => 0,
 }))
 vi.mock('./composerSend.ts', () => ({ composerSendBinding: () => ({ runtime: {}, disabledReason: 'Waiting for access' }) }))

@@ -138,6 +138,8 @@ export const geometryNumbers = {
   tooltipOffset: 6, contextOffset: 8, scrollEndTolerance: 1,
   estimatedMessageHeight: 160,
   threadViewportMin: 96,
+  /** QuestionForm stacks its question tabs and option previews below this measured form width. */
+  questionStack: 600,
 } as const
 
 export const motionVars = stylex.defineVars({

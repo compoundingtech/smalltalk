@@ -1,10 +1,12 @@
 import * as React from 'react'
 import * as stylex from '@stylexjs/stylex'
-import { Button } from 'react-aria-components'
+import { Button, Focusable } from 'react-aria-components'
 import { colorVars as c, typeVars as t, radiusVars as r, geometryVars as g } from '../composition-tokens.stylex'
-import { SidebarStatus as StatusGlyph } from '../sidebar/SidebarStatus'
+import { SidebarStatus as StatusGlyph, statusDescription } from '../sidebar/SidebarStatus'
+import { Tooltip } from './Controls'
 import { Icon } from './Icons'
-import type { AgentStatus } from '../sidebar/model'
+import { statuses, type AgentStatus } from '../sidebar/model'
+import { statusVars as tone } from '../composition-tokens.stylex'
 
 /**
  * Keyboard/pointer resizable separator. Arrow ±8, Shift+Arrow ±32,
@@ -115,6 +117,7 @@ export function ThreadHeader({
   onCommit,
   statusSince,
   freshness,
+  needsMe = false,
   panelOpen,
   drawerOpen,
   onTogglePanel,
@@ -131,6 +134,8 @@ export function ThreadHeader({
   statusLabel?: string
   statusSince?: number
   freshness?: 'live' | 'stale' | 'unobserved'
+  /** Native question attention, distinct from generic waiting activity. */
+  needsMe?: boolean
   /** Elapsed label; a ReactNode so an isolated ticker can be passed in. */
   elapsed?: React.ReactNode
   now?: number
@@ -165,7 +170,8 @@ export function ThreadHeader({
         <span {...stylex.props(styles.crumbTitle)}>{title}</span>
       </nav>
       <div {...stylex.props(styles.actions)}>
-        {status !== undefined ? <StatusGlyph status={status} statusLabel={statusLabel} statusSince={statusSince} freshness={freshness} now={now} /> : null}
+        {status !== undefined ? <Tooltip label={statusDescription({ statusLabel: statusLabel ?? statuses[status].label, statusSince, freshness })}><Focusable><span tabIndex={0} role="group" aria-label="Agent status" data-header-signal="status" {...stylex.props(styles.signal)}><StatusGlyph status={status} statusLabel={statusLabel} statusSince={statusSince} freshness={freshness} now={now} /></span></Focusable></Tooltip> : null}
+        {needsMe && <Tooltip label="Needs your attention"><Focusable><span tabIndex={0} role="img" aria-label="Needs your attention" data-header-signal="needs-me" {...stylex.props(styles.signal, styles.needsYou)}><Icon name="alert" /></span></Focusable></Tooltip>}
         {elapsed !== undefined ? <span role="timer" aria-label="Current conversation turn elapsed">{elapsed}</span> : null}
         <div data-testid="native-action-slot" ref={actionPortalRef}>{nativeActions}</div>
         {onOpen !== undefined && <button type="button" onClick={onOpen} {...stylex.props(styles.outlineXs)}>Open <Icon name="chevron-down" size={12} /></button>}
@@ -210,6 +216,8 @@ const styles = stylex.create({
   crumbTitle: { color: c.fg, fontWeight: t.weightMedium, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
   actionSlot: { display: 'flex', alignItems: 'center', gap: 8 },
   actions: { marginInlineStart: 'auto', display: 'flex', alignItems: 'center', gap: 6 },
+  signal: { display: 'inline-flex', alignItems: 'center', flexShrink: 0, borderRadius: r.control, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 2 } },
+  needsYou: { color: tone.attention },
   outlineXs: { height: g.controlSm, display: 'inline-flex', alignItems: 'center', paddingInline: 6, borderWidth: 1, borderStyle: 'solid', borderColor: c.borderStrong, backgroundColor: 'rgba(255, 255, 255, 0.025)', color: c.fg, borderRadius: r.control, fontSize: t.metaSize, lineHeight: t.metaLeading, fontWeight: t.weightMedium, cursor: 'pointer', ':hover': { backgroundColor: c.rowHover }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
   ghostMd: { width: 28, height: 28, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', borderWidth: 0, backgroundColor: 'transparent', color: c.fgMuted, borderRadius: r.control, cursor: 'pointer', fontSize: t.uiSize, transition: 'background-color 150ms ease, color 150ms ease', ':hover': { backgroundColor: c.rowHover, color: c.fg }, ':focus-visible': { outline: `2px solid ${c.primary}`, outlineOffset: 1 } },
   ghostOn: { color: c.fg, backgroundColor: c.rowHover },
@@ -218,9 +226,9 @@ const styles = stylex.create({
   drawer: { display: 'flex', flexDirection: 'column', borderTopWidth: 1, borderTopStyle: 'solid', borderTopColor: c.borderStrong, backgroundColor: c.canvas, flexShrink: 0, minHeight: 0 },
   drawerHead: { height: 32, display: 'flex', alignItems: 'center', gap: 12, paddingInline: 12 },
   drawerLabel: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: c.fgMuted, fontWeight: t.weightMedium },
-  drawerHint: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: c.fgFaint, marginInlineStart: 'auto' },
+  drawerHint: { fontSize: t.metaSize, lineHeight: t.metaLeading, color: c.fgMuted, marginInlineStart: 'auto' },
   drawerBody: { paddingInline: 12, paddingBottom: 4, overflowY: 'auto', fontFamily: t.fontMono, fontSize: t.codeSize, lineHeight: '20px', whiteSpace: 'pre-wrap' },
   drawerLine: { color: c.fgMuted },
-  drawerRangeLabel: { display: 'flex', alignItems: 'center', gap: 8, marginInline: 12, marginBottom: 8, fontSize: t.metaSize, lineHeight: t.metaLeading, color: c.fgFaint },
+  drawerRangeLabel: { display: 'flex', alignItems: 'center', gap: 8, marginInline: 12, marginBottom: 8, fontSize: t.metaSize, lineHeight: t.metaLeading, color: c.fgMuted },
   drawerRange: { accentColor: c.primary, flexGrow: 1 },
 })

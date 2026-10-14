@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "The fractal-ui kit adds an interactive QuestionForm for harness asks: radio and checkbox options, an automatic Other row, per-question notes, Recommended badges, markdown option previews, a tab strip with answered markers that stacks below 600 px, and keyboard answering (arrows, 1-9, Tab, Enter). A form waiting on the viewer carries the attention hairline and glyph, the header shows who asked and how long ago, and read-only requests are labelled as such. It ships with an Explore story. Separately, a kit Markdown block that opens with a heading now sits flush with its container: the first heading has no top margin.",
+  "replay": { "status": "none", "detail": "Kit presentation only." },
+  "schema": { "status": "none", "detail": "No schema changes." },
+  "rules": { "status": "none", "detail": "No rule changes." },
+  "compatibility": { "status": "none", "detail": "Additive kit export, plus one visual change on every kit Markdown surface: a leading heading loses its top margin. The props mirror the question model on the pending question-forms app branch, plus a required host clock (now); the application has no question renderer yet and nothing on main uses the form." },
+  "downtime": { "status": "none", "detail": "No downtime required." },
+  "manual": { "status": "none", "detail": "No manual steps required." },
+  "recovery": { "status": "none", "detail": "No persisted state changes." }
+}

@@ -4,6 +4,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { Agent, decodeUnknownSync } from '@smalltalk/st3-client/schema'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
+import { Option } from 'effect'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DataSourceProvider } from '../data/react.tsx'
 import { fixtureSource } from '../data/fixtureSource.ts'
@@ -12,6 +13,7 @@ import { terminalSubjectForAgent } from '../data/projections.ts'
 import { makeScreen } from '../terminal/fixtures.ts'
 import { LiveAgentWorkspace } from './LiveAgentWorkspace.tsx'
 
+import type { ConversationItem } from '../conversation/model.ts'
 vi.mock('@stylexjs/stylex', () => ({ create: (styles: unknown) => styles, defineVars: (variables: unknown) => variables, createTheme: () => ({}), keyframes: () => 'animation', props: () => ({}) }))
 const agent = decodeUnknownSync(Agent)({ kind: 'agent', id: 'agent/example', name: 'Example Agent', host_id: 'host/example', runtime_ids: ['runtime/example'], reachability: 'reachable', state: 'running', harness_state: 'idle', blocked_on: null, fault: null, revision: '1', updated_at: '2026-10-04T12:00:00.000Z' })
 const screen = { ...makeScreen({ scene: 'F3', columns: 40, rows: 4, frame: 0 }), terminal_id: 'terminal/example' as const }
@@ -33,8 +35,8 @@ beforeEach(() => {
   root = createRoot(host)
 })
 afterEach(async () => { await act(async () => root.unmount()); registry.dispose(); host.remove(); vi.unstubAllGlobals() })
-const mount = async (agents: Feed<readonly Agent[]>, terminal: Feed<typeof screen> = observed({ value: screen }), retryTerminal?: (ref: string) => void) => {
-  const source = fixtureSource({ world: { now: 0, agents: [agent], missions: [], attention: [], events: [], conversations: { [agent.id]: { items: [], hasOlder: false } }, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' } }, overrides: { agents, terminal: { 'terminal/example': terminal } } })
+const mount = async (agents: Feed<readonly Agent[]>, terminal: Feed<typeof screen> = observed({ value: screen }), retryTerminal?: (ref: string) => void, items: readonly ConversationItem[] = []) => {
+  const source = fixtureSource({ world: { now: 0, agents: [agent], missions: [], attention: [], events: [], conversations: { [agent.id]: { items, hasOlder: false } }, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' } }, overrides: { agents, terminal: { 'terminal/example': terminal } } })
   await act(async () => root.render(<DataSourceProvider source={{ ...source, ...(retryTerminal === undefined ? {} : { retryTerminal }) }} registry={registry}><LiveAgentWorkspace /></DataSourceProvider>))
 }
 const toggle = () => host.querySelector<HTMLButtonElement>('[data-testid="thread-header"] button[aria-label="Toggle terminal drawer"]')
@@ -58,6 +60,21 @@ describe('agent roster notice', () => {
 })
 
 describe('terminal navigation toggle', () => {
+  it('opens the selected terminal from the read-only question and does not toggle an already open drawer closed', async () => {
+    const pending = { ...agent, harness_state: Option.some('waiting'), blocked_on: Option.some('human'), ask: Option.some('question') }
+    await mount(observed({ value: [pending] }), observed({ value: screen }), undefined, [{
+      _tag: 'ToolCall', id: 'ask', callId: 'ask-call', name: 'ask', status: 'running', callSeen: true, at: '2026-10-04T12:00:00.000Z',
+      input: { questions: [{ question: 'Which check?', options: [{ label: 'Typecheck' }] }] },
+    }])
+    const opener = () => host.querySelector<HTMLButtonElement>(`[data-testid="question-dock"] [aria-label="Open the agent's terminal"]`)
+    await vi.waitFor(() => expect(opener()).not.toBeNull(), { timeout: 15_000 })
+    await act(async () => opener()!.click())
+    expect(new URLSearchParams(window.location.search).get('open')).toBe('terminal/example:detail')
+    await vi.waitFor(() => expect(grid()).not.toBeNull(), { timeout: 10_000 })
+    await act(async () => opener()!.click())
+    expect(new URLSearchParams(window.location.search).get('open')).toBe('terminal/example:detail')
+    expect(host.querySelector('[data-testid="terminal-pane"]')).not.toBeNull()
+  })
   it.each([
     ['agent/example-seat', 'terminal/example-seat'],
     ['agent/team/seat', 'terminal/team/seat'],

@@ -29,6 +29,7 @@ vi.mock('../data/react.tsx', async () => {
   const agents = Atom.make({ _tag: 'Observed' as const, freshness: 'live' as const, value: [] })
   return ({
   useConversation: (ref: string) => { source.conversation(ref); return source.feed },
+  useAgent: () => ({ _tag: 'Waiting' }),
   useConversationSync: (ref: string) => { source.conversationSync(ref); return source.sync },
   useDataSource: () => ({ agents, conversationInterest: undefined, retryConversation: source.retryConversation }),
   useFeedInterest: source.feedInterest,
@@ -209,9 +210,9 @@ describe('ConversationPane kit composition', () => {
     expect(intrinsicElements).toEqual(['div', 'div', 'div'])
     expect(pane).toContain("style={{ display: 'contents' }}")
     const workspace = readFileSync(new URL('./LiveAgentWorkspace.tsx', import.meta.url), 'utf8')
-    expect(workspace).toContain('createPortal(<WorkspaceBody current={current} rosterRefs={agents.map(agent => agent.ref)} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} ux={ux} />, paneHost)')
+    expect(workspace).toContain('createPortal(<WorkspaceBody current={current} rosterRefs={agents.map(agent => agent.ref)} view={workspaceView(chosen)} agentName={agentName} onOpenTool={setOpenedTool} onOpenTerminal={terminalRef === undefined ? undefined : () => open({ ref: terminalRef })} ux={ux} />, paneHost)')
     expect(workspace).toContain("hiddenPane: { contentVisibility: 'hidden'")
-    expect(workspace).toContain('<ConversationPaneLoadBoundary agentRef={pane.ref} agentName={pane.name} onOpenTool={onOpenTool} ux={ux} visible={shown} />')
+    expect(workspace).toContain('<ConversationPaneLoadBoundary agentRef={pane.ref} agentName={pane.name} onOpenTool={onOpenTool} onOpenTerminal={shown ? onOpenTerminal : undefined} ux={ux} visible={shown} />')
     expect(workspace).not.toContain('This subject has no available native view.')
   })
 })

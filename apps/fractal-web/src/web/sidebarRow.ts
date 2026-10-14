@@ -1,5 +1,6 @@
 import type { SidebarAgentRowData, SidebarAgentStatus } from '@smalltalk/fractal-ui/assistant-ui'
 import type { Agent } from '../data/source.ts'
+import { hasPendingQuestion } from './questions/projection.ts'
 
 /** Presentation of one actual roster observation. No per-row reads or inferred usage. */
 export const sidebarRow = ({ agent, stale, now }: {
@@ -15,13 +16,14 @@ export const sidebarRow = ({ agent, stale, now }: {
   const lastActivityAt = validTimestamp(agent.lastActivityAt._tag === 'Known' ? agent.lastActivityAt.value : undefined)
   const statusSince = validTimestamp(agent.statusSince)
   const knownStatuses = ['idle', 'working', 'waiting', 'errored', 'retired', 'suspended', 'stopped', 'ended', 'desired', 'starting', 'offline']
-  const statusLabel = knownStatuses.includes(agent.status) ? agent.status : 'Not observed'
+  const statusLabel = hasPendingQuestion(agent) ? 'Question pending' : knownStatuses.includes(agent.status) ? agent.status : 'Not observed'
   return {
     ref: agent.ref, id: agent.ref, title: agent.name, host: agent.host, status,
     statusLabel: stale ? 'Last verified · ' + statusLabel : !agent.connected ? 'Offline · ' + statusLabel : statusLabel,
     freshness: stale ? 'stale' : 'live', description: agent.description, harness: agent.harness,
     terminal: agent.terminal || undefined, mission: agent.mission, lastActivityAt, statusSince,
-    // Roster has no authoritative unread count or attention request. No signal is fabricated.
+    // Only the native human/question axes establish question attention; generic waiting does not.
+    ...(hasPendingQuestion(agent) ? { needsMe: true } : {}),
     childrenKnown: false, children: [], usage: { _tag: 'Unknown' }, duration: { _tag: 'Unknown' },
     lastTurn: lastActivityAt === undefined ? { _tag: 'Unknown' } : { _tag: 'Known', kind: 'activity', at: lastActivityAt },
   }

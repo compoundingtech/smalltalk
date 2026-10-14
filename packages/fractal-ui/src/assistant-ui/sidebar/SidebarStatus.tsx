@@ -29,13 +29,15 @@ const paths: Record<AgentStatus, React.ReactNode> = {
   retired: <><rect x="3" y="4" width="14" height="3" rx="1" /><path d="M4 7v9h12V7M8 10h4" /></>,
   unobserved: <><circle cx="10" cy="10" r="7" strokeDasharray="2 3" /><path d="M10 7v4M10 14h.01" /></>,
 }
+/** Sentence hosts expose on hover and focus (tooltip or hover card); the glyph itself carries no native title. */
+export const statusDescription = ({ statusLabel, statusSince, freshness = 'unobserved' }: Pick<SidebarStatusProps, 'statusSince' | 'freshness'> & { readonly statusLabel: string }) => `${statusLabel}. ${statusSince === undefined ? 'Status boundary unavailable' : `Observed status since ${new Date(statusSince).toISOString()}`}. Observation ${freshness}.`
 /** Shapes never collapse distinct states into an attention or completion fixture state. */
 export function SidebarStatus({ status, statusLabel = statuses[status].label, variant = 'SG-1', discRefinement = 'G1', statusSince, now, freshness = 'unobserved', iconOnly = false }: SidebarStatusProps) {
   const boundary = statusSince === undefined ? 'Status boundary unavailable' : `Observed status since ${new Date(statusSince).toISOString()}`
   const elapsed = statusSince !== undefined && now !== undefined ? compactTime({ at: statusSince, now }) : undefined
   const runningRing = variant === 'SG-1' && discRefinement === 'G2' && status === 'working'
   const shapeCue = variant === 'SG-1' && discRefinement === 'G3' && status !== 'working' && status !== 'idle'
-  return <span title={`${statusLabel}. ${boundary}. Observation ${freshness}.`} {...stylex.props(styles.root, status === 'working' && styles.working, status === 'waiting' && styles.waiting, status === 'stale' && styles.stale)}>
+  return <span {...stylex.props(styles.root, status === 'working' && styles.working, status === 'waiting' && styles.waiting, status === 'stale' && styles.stale)}>
     <svg data-disc-refinement={variant === 'SG-1' ? discRefinement : undefined} role="img" aria-label={`${statusLabel}; ${boundary}; ${freshness} observation`} viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" {...stylex.props(styles.icon, runningRing && styles.iconRing, (runningRing || (status === 'working' && variant === 'SG-3')) && styles.spin)}>{variant === 'SG-2' ? <circle cx="10" cy="10" r="4" fill="currentColor" stroke="none" /> : variant === 'SG-3' ? paths[status] : <><circle cx="10" cy="10" r="5" fill="currentColor" stroke="none" opacity={shapeCue ? '.25' : undefined} />{runningRing && <><circle cx="10" cy="10" r="7.5" opacity=".3" /><path d="M10 2.5a7.5 7.5 0 0 1 7.5 7.5" /></>}{shapeCue && paths[status]}</>}</svg>
     {variant === 'SG-2' && !iconOnly && <span>{statusLabel}</span>}
     {/* Icon-only glyphs sit in a fixed icon column; visible text there would overrun the next column. */}

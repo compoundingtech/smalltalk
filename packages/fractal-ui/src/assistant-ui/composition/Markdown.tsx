@@ -303,7 +303,8 @@ const styles = stylex.create({
   imagePlaceholder: { display: 'inline-flex', alignItems: 'center', gap: s.sm, padding: s.sm, borderWidth: g.hairline, borderStyle: 'solid', borderColor: border.border, borderRadius: r.sm, color: textColor.fgSoft, backgroundColor: surface.controlFill, fontSize: t.metaSize },
   imageAction: { borderWidth: 0, padding: s.xs, backgroundColor: surface.transparent, color: status.runningFg, fontFamily: t.fontSans, fontSize: t.metaSize, cursor: 'pointer', ':focus-visible': { outlineWidth: g.focusRing, outlineStyle: 'solid', outlineColor: accent.primary } },
   prose: { maxWidth: g.proseMax, fontSize: t.bodySize, lineHeight: t.bodyLeading },
-  heading: { margin: 0, marginBlockStart: s.xxl, marginBlockEnd: s.md, fontSize: t.headingSize, lineHeight: t.headingLeading, fontWeight: t.weightSemibold, color: textColor.fg },
+  /** Spec §2.2: the first Markdown child has no outer margin; only headings carry a top margin. */
+  heading: { margin: 0, marginBlockStart: { default: s.xxl, ':first-child': 0 }, marginBlockEnd: s.md, fontSize: t.headingSize, lineHeight: t.headingLeading, fontWeight: t.weightSemibold, color: textColor.fg },
   list: { margin: 0, marginBlockEnd: s.proseGap, paddingInlineStart: s.xxl, listStylePosition: 'outside' },
   unorderedList: { listStyleType: 'disc' }, orderedList: { listStyleType: 'decimal' },
   listItem: { display: 'list-item', fontSize: t.bodySize, lineHeight: t.bodyLeading, color: textColor.fgSoft },

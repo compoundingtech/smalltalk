@@ -5,7 +5,7 @@ import { EmbraceComposer } from '../../../../packages/fractal-ui/src/assistant-u
 import { EmbraceRuntimeProvider } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceRuntime.tsx'
 import { Transcript } from '../../../../packages/fractal-ui/src/assistant-ui/composition/Transcript.tsx'
 import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
-import { useConversation, useConversationSync, useDataSource, useFeedInterest, useGrants, useNow } from '../data/react.tsx'
+import { useAgent, useConversation, useConversationSync, useDataSource, useFeedInterest, useGrants, useNow } from '../data/react.tsx'
 import { createConversationTranscript, openableImageUrl, transcriptObservedAt, transcriptSyncStatus, type ConversationTranscriptState } from './conversationTranscript.ts'
 import { composerSendBinding, type SendRefusal } from './composerSend.ts'
 import { spaceVars } from '../../../../packages/fractal-ui/src/assistant-ui/composition-tokens.stylex.ts'
@@ -13,6 +13,8 @@ import { LiveAgentTodos } from '../conversation/todos/AgentTodos.tsx'
 import type { UxTelemetry } from '../telemetry/ux.ts'
 import type { ConversationPage, Feed } from '../data/source.ts'
 import type * as Atom from 'effect/reactivity/Atom'
+import { QuestionDock, QuestionDockGroup } from './questions/QuestionDock.tsx'
+import { hasPendingQuestion, pendingQuestionRequests } from './questions/projection.ts'
 
 /** The follow owns content and the kit owns its presentation. The display-contents host
  * boundary observes asynchronous runtime adoption without inventing a kit commit hook.
@@ -23,6 +25,7 @@ export const ConversationPane = ({
   agentName,
   onOpenTool,
   ux,
+  onOpenTerminal,
   visible = true,
   interest: shellInterest,
 }: {
@@ -31,6 +34,8 @@ export const ConversationPane = ({
   readonly agentName: string
   /** Host-owned detail surface for a tool call opened from the transcript. */
   readonly onOpenTool: (call: WorkLogCall) => void
+  /** Opens this agent's verified terminal drawer; absent when the roster reports no terminal. */
+  readonly onOpenTerminal?: () => void
   readonly ux?: UxTelemetry
   /** A retained hidden pane keeps its DOM but releases visible follow demand (setVisible false). */
   readonly visible?: boolean
@@ -84,14 +89,15 @@ export const ConversationPane = ({
     onFocusCapture={event => { if (!visible) event.target.blur() }}
     onKeyDownCapture={event => { if (!visible) { event.preventDefault(); event.stopPropagation() } }}
     onClickCapture={event => { if (!visible) { event.preventDefault(); event.stopPropagation() } }}>
-    <ConversationContent agentRef={agentRef} agentName={agentName} onOpenTool={onOpenTool} feed={feed} state={state} />
+    <ConversationContent agentRef={agentRef} agentName={agentName} onOpenTool={onOpenTool} onOpenTerminal={onOpenTerminal} feed={feed} state={state} />
   </div>
 }
 
-const ConversationContent = React.memo(function ConversationContent({ agentRef, agentName, onOpenTool, feed, state }: {
+const ConversationContent = React.memo(function ConversationContent({ agentRef, agentName, onOpenTool, onOpenTerminal, feed, state }: {
   readonly agentRef: string
   readonly agentName: string
   readonly onOpenTool: (call: WorkLogCall) => void
+  readonly onOpenTerminal?: () => void
   readonly feed: Feed<ConversationPage>
   readonly state: ConversationTranscriptState
 }) {
@@ -99,6 +105,7 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
   const now = useNow()
   const observation = useConversationSync(agentRef)
   const grants = useGrants()
+  const agent = useAgent(agentRef)
   const [refusal, setRefusal] = React.useState<SendRefusal>()
   const binding = composerSendBinding({
     source, agentRef, grants,
@@ -107,6 +114,9 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
     refusal, onRefused: setRefusal,
   })
   const retryConversation = source.retryConversation
+  // Timeline text alone cannot keep an orphaned running ask docked after native attention clears.
+  const questions = feed._tag === 'Observed' && agent._tag === 'Observed' && agent.value !== undefined && hasPendingQuestion(agent.value)
+    ? pendingQuestionRequests(feed.value.items, agentName) : []
   return <EmbraceRuntimeProvider key={agentRef} options={{ ...binding.runtime, isRunning: state._tag === 'Observed' && state.isRunning }}>
     {/* Bound the 100%-height kit frame to the space left above the composer. */}
     <div data-testid="conversation-history-host" style={{ flex: '1 1 0', minHeight: 0, minWidth: 0, overflow: 'hidden' }}>
@@ -135,6 +145,7 @@ const ConversationContent = React.memo(function ConversationContent({ agentRef, 
       {...(state._tag === 'Observed' && state.emptyState !== undefined ? { emptyState: state.emptyState } : {})}
     />
     </div>
+    {questions.length > 0 && <QuestionDockGroup>{questions.map(request => <QuestionDock key={request.id} request={request} now={now} onOpenTerminal={onOpenTerminal} />)}</QuestionDockGroup>}
     <LiveAgentTodos agentRef={agentRef} />
     {/* An unreadable conversation keeps its composer and draft; the binding names why sending waits. */}
     <div data-testid="conversation-composer-dock" style={{ flexShrink: 0, paddingBottom: spaceVars.lg }}>

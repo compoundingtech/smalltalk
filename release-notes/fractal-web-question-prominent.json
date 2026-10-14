@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Pending agent questions open above the composer without taking focus from your draft. The sidebar and thread header show when a question needs attention; hovering or keyboard-focusing the header status or attention icon, or a sidebar row, shows the status details. Read-only questions offer the agent terminal when available; docked prompts too long for two lines can be expanded without hiding the first choice by default. Native question status clears stale docked asks. Terminal drawer hints remain readable in both themes.",
+  "replay": { "status": "none", "detail": "Presentation only; existing conversation and roster observations are unchanged." },
+  "schema": { "status": "none", "detail": "No schema changes." },
+  "rules": { "status": "none", "detail": "No rule changes." },
+  "compatibility": { "status": "none", "detail": "The kit adds an optional needsMe header prop and a statusDescription helper. Existing callers remain valid. Web answering is still unavailable; the existing terminal drawer is the answer path." },
+  "downtime": { "status": "none", "detail": "No downtime required." },
+  "manual": { "status": "none", "detail": "No manual steps required." },
+  "recovery": { "status": "none", "detail": "No persisted state changes." }
+}

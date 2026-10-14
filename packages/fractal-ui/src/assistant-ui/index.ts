@@ -61,3 +61,7 @@ export { ComposerSession } from './composer-session/ComposerSession.tsx'
 export type { ComposerSessionProps, ComposerLayout, RunningBehavior, MentionMode, TargetMode } from './composer-session/ComposerSession.tsx'
 export { EffortPicker, unknownEffort, messageEffort } from './embrace-composer/EffortPicker.tsx'
 export type { EffortControl } from './embrace-composer/EffortPicker.tsx'
+
+/** Interactive harness question form; the host owns the request state, transport and drafts. */
+export { QuestionForm, type QuestionFormKitProps } from './questions/QuestionForm.tsx'
+export type { QuestionFormProps, QuestionRequestView, QuestionView, QuestionKind, QuestionState, QuestionVariant, OptionView, AnswerDraft, Answers, Preview as QuestionPreview } from './questions/model.ts'

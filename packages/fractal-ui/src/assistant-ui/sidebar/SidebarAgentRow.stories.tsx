@@ -2,7 +2,7 @@
 import * as React from 'react'
 import type { Meta, StoryObj } from '@storybook/react-vite'
 import * as stylex from '@stylexjs/stylex'
-import { expect, userEvent, within } from 'storybook/test'
+import { expect, userEvent, waitFor, within } from 'storybook/test'
 import { AgentHoverCard, SidebarAgentRow } from './SidebarAgentRow'
 import type { SidebarAgentRow as Row } from './model'
 import { spaceVars as s, surfaceVars as surface, textVars as ink, typeVars as t, geometryVars as g, borderVars as border, radiusVars as r, elevationVars as elevation } from '../composition-tokens.stylex'
@@ -41,6 +41,8 @@ function CardPair({ row }: { readonly row: Row }) {
   </div>
 }
 
+/** Reported facts only; the status sentence (the glyph's former native title) is checked separately. */
+const cardFacts = (card: HTMLElement) => [...card.children].filter(child => !(child instanceof HTMLElement && child.dataset['statusDescription'] !== undefined)).map(child => child.textContent).join(' ')
 async function assertCompactCard(canvasElement: HTMLElement) {
   const cards = within(canvasElement).getAllByTestId('agent-hover-card')
   await expect(cards).toHaveLength(1)
@@ -50,7 +52,7 @@ async function assertCompactCard(canvasElement: HTMLElement) {
   await expect(new Set(labels).size).toBe(labels.length)
   for (const label of ['Name', 'ID', 'Description', 'Last activity', 'Worktree', 'Lease expires']) await expect(labels).not.toContain(label)
   await expect(card.querySelectorAll('li').length).toBeLessThanOrEqual(3)
-  await expect(card.textContent).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:/)
+  await expect(cardFacts(card)).not.toMatch(/\d{4}-\d{2}-\d{2}T\d{2}:/)
 }
 function CohortList() {
   return <div data-frame-rows {...stylex.props(styles.list)}>{cohortRows.map((row, index) => <SidebarAgentRow key={row.ref} item={row} now={storyNow} active={index === 0} />)}</div>
@@ -74,7 +76,7 @@ export const HoverCardKnown: Story = { name: 'Hover card · fully reported', ren
 export const HoverCardUnknown: Story = { name: 'Hover card · unreported fields omitted', render: () => <main {...stylex.props(styles.root)}><CardPair row={unreportedRow} /></main>, play: async ({ canvasElement }) => {
   const card = within(canvasElement).getByTestId('hover-facts')
   await assertCompactCard(canvasElement)
-  await expect(card.textContent).not.toMatch(/unknown|unavailable|—/i)
+  await expect(cardFacts(within(card).getByTestId('agent-hover-card'))).not.toMatch(/unknown|unavailable|—/i)
   for (const label of ['Spend', 'Duration', 'Last turn', 'Model', 'PR', 'Branch']) await expect(within(card).queryByText(label)).toBeNull()
 } }
 export const TimeCohort: Story = { name: 'Time cohort · known vs none', render: () => <main {...stylex.props(styles.root)}><CohortList /></main>, play: async ({ canvasElement }) => {
@@ -94,6 +96,28 @@ export const QuickOpenAction: Story = { name: 'Row hover · quick Open', render:
   await userEvent.hover(target)
   await userEvent.click(within(target).getByRole('button', { name: /^Open / }))
   await expect(target.querySelector('[aria-current="page"]')).not.toBeNull()
+} }
+/** The status glyph and X-needs marker carry no native title: hovering or keyboard-focusing the row opens the hover card with the status sentence and the attention fact. */
+export const StatusDescription: Story = { name: 'Row hover and focus · status description', render: () => <main {...stylex.props(styles.root)}><div data-frame-rows {...stylex.props(styles.list)}><SidebarAgentRow item={knownRow} now={storyNow} actions={{ select: () => {} }} /></div></main>, play: async ({ canvasElement }) => {
+  const page = within(canvasElement.ownerDocument.body)
+  const row = within(canvasElement).getByTestId('taste-agent-row')
+  const wrapper = row.parentElement!
+  const sentence = 'Working. Observed status since 2026-10-08T11:58:30.000Z. Observation live.'
+  const marker = within(row).getByRole('img', { name: 'Needs your attention' })
+  await expect(marker.tagName.toLowerCase()).toBe('svg')
+  await expect(row.querySelector('[data-row-signal="X-needs"]')?.textContent).toBe('')
+  await expect(row.querySelectorAll('[data-row-column="status"] [title], [data-row-signal="X-needs"][title], [data-row-signal="X-needs"] [title]')).toHaveLength(0)
+  await userEvent.hover(row)
+  const hovered = await page.findByRole('tooltip')
+  await expect(within(hovered).getByText(sentence)).toBeVisible()
+  await expect(within(hovered).getByText('Needs your attention')).toBeVisible()
+  await userEvent.unhover(row)
+  await waitFor(() => expect(page.queryByRole('tooltip')).toBeNull())
+  for (let step = 0; step < 12 && !wrapper.contains(canvasElement.ownerDocument.activeElement); step++) await userEvent.tab()
+  await expect(wrapper.contains(canvasElement.ownerDocument.activeElement)).toBe(true)
+  const focused = await page.findByRole('tooltip')
+  await expect(within(focused).getByText(sentence)).toBeVisible()
+  await expect(within(focused).getByText('Needs your attention')).toBeVisible()
 } }
 export const AllStates: Story = { render: () => <main {...stylex.props(styles.root)}><CardPair row={knownRow} /><CardPair row={unreportedRow} /><CohortList /></main> }
 
