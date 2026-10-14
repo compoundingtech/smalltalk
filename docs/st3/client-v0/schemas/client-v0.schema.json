@@ -2647,7 +2647,8 @@
             "replace": { "type": "boolean" },
             "items": { "type": "array", "items": { "$ref": "#/$defs/TimelineEntry" } },
             "has_more": { "type": "boolean" },
-            "header": { "$ref": "#/$defs/ConversationHeader", "description": "Present when conversation-blocks.v1 is negotiated and at least one header field is available" }
+            "header": { "$ref": "#/$defs/ConversationHeader", "description": "Present when conversation-blocks.v1 is negotiated and at least one header field is available" },
+            "older_cursor": { "type": "string", "description": "Replacement frames only, present whenever has_more is true: the timeline cursor (GET /v1/client/sessions/{id}/timeline?cursor=...) for the entries just before this frame's oldest entry." }
           }
         },
         {

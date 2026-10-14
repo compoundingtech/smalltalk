@@ -222,6 +222,15 @@ const CONVERSATION_MAX_ADMISSIONS: usize = 8;
 const CONVERSATION_MAX_DAEMON_ADMISSIONS: usize = 32;
 const CONVERSATION_INITIAL_RETRY_WINDOW: Duration = Duration::from_secs(3);
 const CONVERSATION_INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+/// A conversation subscriber's first-frame size: its requested window capped to the page
+/// ceiling, or the full page when it names none. A client that pages older history through
+/// the frame's `older_cursor` can ask for a small first frame.
+fn conversation_first_frame_limit(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(CLIENT_MAX_PAGE_ITEMS)
+        .clamp(1, CLIENT_MAX_PAGE_ITEMS)
+}
+
 
 /// Both slots follow the physical lookup, not its cancelable subscription awaiter.
 struct ConversationAdmissionPermits {
@@ -1220,14 +1229,15 @@ async fn open_conversation_subscription(
     .map_err(ApiError::internal)?
 }
 
-/// A conversation's newest page, read here or relayed from its owner.
+/// A conversation's newest page, read here or relayed from its owner. The limit is the
+/// caller's frame size, so a relayed open asks its owner for exactly what it will show.
 async fn conversation_page(
     state: &AppState,
     session: &ClientSession,
     session_id: &str,
     remote: Option<&str>,
+    limit: usize,
 ) -> Result<Value, ApiError> {
-    const PAGE: usize = 200;
     if let Some(owner) = remote {
         let relay = state
             .client_relay
@@ -1241,7 +1251,7 @@ async fn conversation_page(
                     relay: None,
                     request: crate::peer::ClientReadOperation::Timeline {
                         session_id: session_id.to_owned(),
-                        limit: PAGE,
+                        limit,
                         cursor: None,
                     },
                 },
@@ -1262,7 +1272,7 @@ async fn conversation_page(
             &session,
             &session_id,
             &ClientListQuery {
-                limit: Some(PAGE),
+                limit: Some(limit),
                 ..Default::default()
             },
         )
@@ -1317,18 +1327,20 @@ async fn conversation_changes_value(
 
 /// Capture the first page and its replay boundary with one timeline read. The graph and local
 /// frontiers precede the read, so a concurrent append remains replayable after this page.
+/// `limit` is the first frame's entry count; older history stays on the timeline cursors.
 async fn conversation_open_value(
     state: &AppState,
     session: &ClientSession,
     session_id: &str,
     remote: Option<&str>,
+    limit: usize,
 ) -> Result<(Value, Value, Option<ConversationMark>), ApiError> {
     if remote.is_some() {
         let profile = crate::profile::current();
         let _relay = profile.as_ref().map(|op| op.wall_span("conversation/owner-relay"));
         // Existing owners relay the two public reads. Keep mixed-build relay compatibility.
         let start = conversation_changes_value(state, session, session_id, remote, None, 0, &mut None).await?;
-        let page = conversation_page(state, session, session_id, remote).await?;
+        let page = conversation_page(state, session, session_id, remote, limit).await?;
         return Ok((start, page, None));
     }
     let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
@@ -1339,7 +1351,7 @@ async fn conversation_open_value(
         drop(queued);
         let _entered = crate::profile::enter(profile.as_ref());
         let _open = crate::profile::span("conversation/local-open");
-        conversation_open_local_marked(&state, &session, &session_id)
+        conversation_open_local_marked(&state, &session, &session_id, limit)
             .map(|(start, page, mark)| (start, page, Some(mark)))
     }).await.map_err(ApiError::internal)?
 }
@@ -1352,14 +1364,14 @@ thread_local! {
 
 #[cfg(test)]
 fn conversation_open_local(
-    state: &AppState, session: &ClientSession, session_id: &str,
+    state: &AppState, session: &ClientSession, session_id: &str, limit: usize,
 ) -> Result<(Value, Value), ApiError> {
-    conversation_open_local_marked(state, session, session_id).map(|(start, page, _)| (start, page))
+    conversation_open_local_marked(state, session, session_id, limit).map(|(start, page, _)| (start, page))
 }
 
 /// The first page and its replay cursor, with the mark a follower keeps for its later waits.
 fn conversation_open_local_marked(
-    state: &AppState, session: &ClientSession, session_id: &str,
+    state: &AppState, session: &ClientSession, session_id: &str, limit: usize,
 ) -> Result<(Value, Value, ConversationMark), ApiError> {
     // Local rows follow a graph position. Capture their high-water first: a row newer than
     // the graph cut must never be excluded from both this page and its replay cursor.
@@ -1375,7 +1387,7 @@ fn conversation_open_local_marked(
         if let Some(pause) = pause.borrow_mut().take() { pause(); }
     });
     let (page, source_generation) =
-        match conversation_first_page_at_generation(state, &snapshot, session, session_id) {
+        match conversation_first_page_at_generation(state, &snapshot, session, session_id, limit) {
             Ok((page, generation, _)) => (page, generation),
             Err(error) if error.status == StatusCode::TOO_MANY_REQUESTS => return Err(error),
             // OPEN keeps the established managed-transcript availability notice and stored
@@ -1385,7 +1397,7 @@ fn conversation_open_local_marked(
                 require_scope(session, "read.projections")?;
                 (timeline_first_page(
                     state, &snapshot, session, session_id.to_owned(),
-                    &ClientListQuery { limit: Some(200), ..Default::default() },
+                    &ClientListQuery { limit: Some(limit), ..Default::default() },
                     Some(error),
                 )?.0, 0)
             }
@@ -1465,7 +1477,28 @@ async fn follow_conversation(
     ),
 ) {
     follow_conversation_since(
-        state, session, id, generation, session_id, remote, outbox, None, queue, first_frame, None,
+        state, session, id, generation, session_id, remote,
+        conversation_first_frame_limit(None), outbox, None, queue, first_frame, None,
+    )
+    .await;
+}
+
+/// [`follow_conversation`] with the subscriber's own first-frame window.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn follow_conversation_limited(
+    state: AppState,
+    session: ClientSession,
+    id: String,
+    generation: u64,
+    session_id: String,
+    remote: Option<String>,
+    first_frame_limit: usize,
+    outbox: tokio::sync::mpsc::UnboundedSender<(String, u64, Value)>,
+) {
+    follow_conversation_since(
+        state, session, id, generation, session_id, remote, first_frame_limit, outbox, None,
+        Queue::new(Kind::Conversation), (None, None), None,
     )
     .await;
 }
@@ -1480,6 +1513,7 @@ async fn follow_conversation_since(
     generation: u64,
     session_id: String,
     remote: Option<String>,
+    first_frame_limit: usize,
     outbox: tokio::sync::mpsc::UnboundedSender<(String, u64, Value)>,
     mut subscribed: Option<std::time::Instant>,
     queue: Arc<Queue>,
@@ -1490,11 +1524,14 @@ async fn follow_conversation_since(
 ) {
     let remote = remote.as_deref();
     let failed = |error: &ApiError| conversation_stream_error(&id, error);
+    // A page of long tool output can outgrow one frame. The frame then keeps its newest
+    // entries, read again as a smaller page so `older_cursor` starts right before them.
+    let mut frame_limit = first_frame_limit;
     let mut first_open = true;
     loop {
         let mut opened = conversation_profile_work(profile.as_ref(), "conversation/first-page", first_frame_work(
             first_read.take(),
-            conversation_open_value(&state, &session, &session_id, remote),
+            conversation_open_value(&state, &session, &session_id, remote, frame_limit),
         )).await;
         if std::mem::take(&mut first_open) && remote.is_some()
             && matches!(&opened, Err(error) if error.code == "remote-unavailable")
@@ -1509,7 +1546,7 @@ async fn follow_conversation_since(
                 // Once admitted, preserve the owner's normal read deadline: a slow
                 // but successful page must not be canceled by the retry-start window.
                 opened = conversation_profile_work(profile.as_ref(), "conversation/first-page",
-                    conversation_open_value(&state, &session, &session_id, remote)).await;
+                    conversation_open_value(&state, &session, &session_id, remote, frame_limit)).await;
             }
         }
         let (start, page, mut mark) = match opened {
@@ -1525,26 +1562,33 @@ async fn follow_conversation_since(
                 return;
             }
         };
-        let entered = crate::profile::enter(profile.as_ref());
-        let preparation = crate::profile::span("conversation/frame-preparation");
-        let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":true, "items":page["items"], "has_more":page["page"]["has_more"]});
-        if let Some(header) = page.get("header") {
-            frame["header"] = header.clone();
+        let (frame, entries) = {
+            let _entered = crate::profile::enter(profile.as_ref());
+            let _preparation = crate::profile::span("conversation/frame-preparation");
+            let frame = conversation_replace_frame(&id, &session_id, &page);
+            let entries = page["items"].as_array().map_or(0, Vec::len);
+            (frame, entries)
+        };
+        if frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES && entries > 1 {
+            frame_limit = entries - entries.div_ceil(4);
+            continue;
         }
-        // A page of long tool output can outgrow one frame: keep its newest entries.
-        while frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
-            let Some(items) = frame["items"]
-                .as_array_mut()
-                .filter(|items| items.len() > 1)
-            else {
-                break;
-            };
-            let drop = items.len().div_ceil(4);
-            items.drain(..drop);
-            frame["has_more"] = Value::Bool(true);
-        }
-        drop(preparation);
-        drop(entered);
+        frame_limit = first_frame_limit;
+        // With older history the client holds nothing before this frame's oldest entry. A
+        // change there must refresh the frame and its history cursor, not insert a delta above
+        // a gap or leave the client paging an obsolete history snapshot. "Before" is decided
+        // in the order the page itself was built in.
+        let oldest = frame["items"].get(0).filter(|_| frame["has_more"] == true).cloned();
+        let oldest_sent = match oldest {
+            None => None,
+            Some(oldest) => match conversation_window_order(&state, &session_id, &page).await {
+                Ok(order) => Some((order, oldest)),
+                Err(error) => {
+                    let _ = queue.send(|| outbox.send((id.clone(), generation, failed(&error))));
+                    return;
+                }
+            },
+        };
         if queue.send(|| outbox.send((id.clone(), generation, frame))).is_err() {
             return;
         }
@@ -1567,12 +1611,20 @@ async fn follow_conversation_since(
             )
             .await
             {
-                Ok(changes) => {
-                    if changes["items"]
-                        .as_array()
-                        .is_some_and(|items| !items.is_empty())
+                Ok(mut changes) => {
+                    let items = match changes["items"].take() {
+                        Value::Array(items) => items,
+                        _ => Vec::new(),
+                    };
+                    if let Some((order, oldest)) = &oldest_sent
+                        && items.iter().any(|item| !delta_follows_window(*order, item, oldest))
                     {
-                        let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":false, "items":changes["items"]});
+                        // Both cached stored pages and native cursors pin a history snapshot.
+                        // Re-open at the same limit to pair fresh items with a fresh older_cursor.
+                        break;
+                    }
+                    if !items.is_empty() {
+                        let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":false, "items":items});
                         if let Some(header) = changes.get("header") {
                             frame["header"] = header.clone();
                         }
@@ -1613,6 +1665,84 @@ async fn follow_conversation_since(
 
 fn frame_bytes(frame: &Value) -> usize {
     serde_json::to_vec(frame).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// The order a conversation page was built in: native pages by their timeline key, stored
+/// pages by sequence alone. A follower places later changes with the same comparison.
+#[derive(Clone, Copy)]
+enum WindowOrder {
+    Native(crate::external_sessions::TimelineOrder),
+    Stored,
+}
+
+/// Which order `page` was built in. Native pages are recognised by their native cursor or
+/// transcript entries; their order is the one `native_slice_page` and `native_timeline_page`
+/// sort by.
+async fn conversation_window_order(
+    state: &AppState,
+    session_id: &str,
+    page: &Value,
+) -> Result<WindowOrder, ApiError> {
+    let native_cursor = page["page"]["next_cursor"]
+        .as_str()
+        .is_some_and(|cursor| cursor.starts_with(NATIVE_PAGE_CURSOR_PREFIX));
+    let native_entries = page["items"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(is_native_record));
+    if !native_cursor && !native_entries {
+        return Ok(WindowOrder::Stored);
+    }
+    let (state, session_id) = (state.clone(), session_id.to_owned());
+    crate::api::read_deadline::spawn_blocking(move || {
+        native_timeline_order(&state, &new_client_snapshot(&state), &session_id)
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map(WindowOrder::Native)
+}
+
+fn is_native_record(item: &Value) -> bool {
+    item["id"].as_str().is_some_and(|id| id.starts_with("timeline-entry/native-"))
+}
+
+/// A native page's key for one entry: transcript records rank 0, Small Talk messages 1, as
+/// the native page builders assign by source.
+fn native_entry_key(item: &Value) -> crate::external_sessions::TimelineKey {
+    crate::external_sessions::timeline_key(item, u8::from(!is_native_record(item)))
+}
+
+/// A stored page's position for one entry; the stored projection sorts by it alone.
+fn stored_timeline_position(item: &Value) -> u64 {
+    item["sequence"].as_u64().unwrap_or(u64::MAX)
+}
+
+/// Whether a changed entry belongs after a replacement frame whose oldest entry is `oldest`:
+/// a new entry, or a revision of one the client holds. Entries keep their position across
+/// revisions, so a revision of anything older than the frame sorts before it.
+fn delta_follows_window(order: WindowOrder, item: &Value, oldest: &Value) -> bool {
+    item["id"] == oldest["id"]
+        || match order {
+            WindowOrder::Native(order) => native_entry_key(item)
+                .cmp_in(&native_entry_key(oldest), order)
+                .is_ge(),
+            WindowOrder::Stored => stored_timeline_position(item) >= stored_timeline_position(oldest),
+        }
+}
+
+/// A conversation's replacement frame from one timeline page. With older history it carries
+/// `older_cursor`, the page's own timeline cursor: the entries just before its oldest entry.
+fn conversation_replace_frame(id: &str, session_id: &str, page: &Value) -> Value {
+    let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id,
+        "replace":true, "items":page["items"], "has_more":page["page"]["has_more"]});
+    if let Some(header) = page.get("header") {
+        frame["header"] = header.clone();
+    }
+    if page["page"]["has_more"] == true
+        && let Some(cursor) = page["page"]["next_cursor"].as_str()
+    {
+        frame["older_cursor"] = Value::String(cursor.to_owned());
+    }
+    frame
 }
 
 /// The conversation followers a socket holds; they stop when it closes.
@@ -1879,6 +2009,9 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                             let subscription_id = request.id.clone();
                             let id = subscription_id.clone();
                             let admission_slots = admission_slots.clone();
+                            // The subscriber's own first-frame window, read before `admit`
+                            // takes the request: absent means the full page.
+                            let first_frame_limit = conversation_first_frame_limit(request.limit);
                             let opened = std::time::Instant::now();
                             let first_read = first_frames.get(&request.id).map(|first| first.span.clone());
                             let upgrade = upgrade.clone();
@@ -1895,7 +2028,7 @@ async fn collection_stream_socket_with_admission<F, Fut, A, Admission>(
                                 match conversation_profile_work(profile.as_ref(), "conversation/owner-resolution",
                                     admit(state.clone(), session.clone(), request, permits)).await {
                                     Ok((session_id, remote)) => {
-                                        follow_conversation_since(state, session, id, generation, session_id, remote, outbox, Some(opened), queue, (upgrade, first_read), profile).await;
+                                        follow_conversation_since(state, session, id, generation, session_id, remote, first_frame_limit, outbox, Some(opened), queue, (upgrade, first_read), profile).await;
                                     }
                                     Err(error) => {
                                         let frame = json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message});
@@ -6934,7 +7067,7 @@ fn timeline_first_page(
         });
         items.extend([query_notice, prefix_notice].into_iter().flatten());
     }
-    items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
+    items.sort_by_key(stored_timeline_position);
     let header = conversation_page_header(state, session, &session_id, &items, false);
     // A conversation opens at its newest bounded window. The cursor walks toward older
     // windows, while each individual page remains chronological for straightforward rendering.
@@ -7069,8 +7202,9 @@ fn conversation_first_page_at_generation(
     snapshot: &ClientSnapshot,
     session: &ClientSession,
     session_id: &str,
+    limit: usize,
 ) -> Result<(Value, u64, bool), ApiError> {
-    let query = ClientListQuery { limit: Some(200), ..Default::default() };
+    let query = ClientListQuery { limit: Some(limit), ..Default::default() };
     match conversation_blocks::source(state, session_id) {
         // Replay selects only its newest bounded projection, including for OpenCode.
         Ok(source) => {
@@ -7103,7 +7237,7 @@ fn conversation_read_now_unbounded(
 ) -> Result<Value, ApiError> {
     let snapshot = new_client_snapshot(state);
     let (page, source_generation, native_replay) =
-        conversation_first_page_at_generation(state, &snapshot, session, session_id)?;
+        conversation_first_page_at_generation(state, &snapshot, session, session_id, CLIENT_MAX_PAGE_ITEMS)?;
     let all = page["items"]
         .as_array()
         .ok_or_else(|| ApiError::internal("the timeline has no items"))?;
@@ -18584,6 +18718,800 @@ mission "example/zero-run" state="ready" {
         }
     }
 
+    /// A managed OMP transcript fixture: `records` message records of two entries each,
+    /// with identical timestamps so the canonical tie order carries the paging.
+    fn conversation_first_frame_fixture(
+        root: &Path,
+        node: &str,
+        records: usize,
+    ) -> (AppState, String, std::path::PathBuf) {
+        let state = test_state_named(root, node);
+        let owner = format!("agent/{node}");
+        let incarnation = "123:2026-10-08T12:00:00.000Z";
+        let native = format!("{node}-native");
+        let path = root.join("session.jsonl");
+        let message = |index: usize| {
+            json!({"type":"message", "id":format!("entry-{index}"),
+                "timestamp":"2026-10-08T12:00:00Z", "message":{"role":"assistant",
+                    "content":[{"type":"text", "text":format!("entry {index} {}", "x".repeat(512))}]}})
+        };
+        let mut transcript = format!(
+            "{}\n",
+            json!({"type":"session", "id":native, "timestamp":"2026-10-08T11:59:59Z", "cwd":root})
+        );
+        for index in 0..records {
+            transcript.push_str(&format!("{}\n", message(index)));
+        }
+        std::fs::write(&path, transcript).unwrap();
+        for (kind, fields) in [
+            ("runtime.observed", json!({"status":"running", "runtime_id":"first-frame-runtime",
+                "incarnation_id":incarnation})),
+            ("harness.observed", json!({"state":"idle", "driver":"omp", "incarnation_id":incarnation})),
+            ("harness.session-file", json!({"harness":"omp", "agent":owner,
+                "incarnation_id":incarnation, "session_id":native, "path":path})),
+        ] {
+            state.store.append_claim(&ClaimInput {
+                subject: owner.clone(),
+                kind: kind.into(),
+                actor: Some(owner.clone()),
+                fields: serde_json::from_value(fields).unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            }).unwrap();
+        }
+        (state, managed_session_id(&owner, incarnation), path)
+    }
+
+    #[test]
+    fn conversation_first_frame_limit_defaults_to_the_full_page_and_caps_requests() {
+        assert_eq!(conversation_first_frame_limit(None), 200);
+        assert_eq!(conversation_first_frame_limit(Some(1)), 1);
+        assert_eq!(conversation_first_frame_limit(Some(200)), 200);
+        assert_eq!(conversation_first_frame_limit(Some(500)), 200);
+        assert_eq!(conversation_first_frame_limit(Some(0)), 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_first_frame_carries_the_head_of_the_full_page() {
+        let _guard = conversation_blocks::prepared_counter_guard();
+        let root = tempfile::tempdir().unwrap();
+        let (state, session_id, _path) =
+            conversation_first_frame_fixture(root.path(), "first-frame-head", 130);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let full = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &session,
+            &session_id,
+            &ClientListQuery { limit: Some(200), ..Default::default() },
+        )
+        .unwrap()
+        .0;
+        let full_items = full["items"].as_array().unwrap();
+        assert_eq!(full_items.len(), 200);
+        assert_eq!(full["page"]["has_more"], true);
+        for window in full_items.windows(2) {
+            assert!(
+                window[0]["sequence"].as_u64() <= window[1]["sequence"].as_u64(),
+                "the full page stays chronological"
+            );
+        }
+        let (start, small) = conversation_open_local(&state, &session, &session_id, 20).unwrap();
+        assert!(start["next_cursor"]
+            .as_str()
+            .is_some_and(|cursor| cursor.starts_with("conversation-cursor/")));
+        assert_eq!(small["items"].as_array().unwrap(), &full_items[180..]);
+        assert_eq!(small["page"]["has_more"], true);
+        assert_eq!(small["page"]["limit"], 20);
+        let (_, one) = conversation_open_local(&state, &session, &session_id, 1).unwrap();
+        assert_eq!(one["items"].as_array().unwrap(), &full_items[199..]);
+        assert_eq!(one["page"]["has_more"], true);
+        // A subscriber asking for 20 gets the same head, with the cursor to what precedes it.
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let follower = tokio::spawn(follow_conversation_limited(
+            state.clone(),
+            session,
+            "chat".into(),
+            1,
+            session_id.clone(),
+            None,
+            conversation_first_frame_limit(Some(20)),
+            sender,
+        ));
+        let (_, _, frame) = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        follower.abort();
+        let _ = follower.await;
+        for (key, value) in [
+            ("kind", json!("conversation")),
+            ("id", json!("chat")),
+            ("collection", json!("conversation")),
+            ("session_id", json!(session_id)),
+            ("replace", json!(true)),
+            ("has_more", json!(true)),
+        ] {
+            assert_eq!(frame[key], value, "the first frame keeps its contract: {frame}");
+        }
+        assert_eq!(frame["items"].as_array().unwrap(), &full_items[180..]);
+        assert!(frame["older_cursor"].is_string(), "{frame}");
+        assert_collection_frame_conforms(&frame);
+    }
+
+    /// Every entry reachable from a first timeline page of `first_limit`, oldest first.
+    fn timeline_walk(state: &AppState, session_id: &str, first_limit: usize) -> Vec<Value> {
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let mut query = ClientListQuery { limit: Some(first_limit), ..Default::default() };
+        let mut items = Vec::new();
+        loop {
+            let page = timeline_value(state, &new_client_snapshot(state), &session, session_id, &query)
+                .unwrap()
+                .0;
+            // Each later page is older history; it goes before what is already shown.
+            items.splice(0..0, page["items"].as_array().unwrap().iter().cloned());
+            query.cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+            // A cursor continues at its own page size, as a client paging history would.
+            query.limit = None;
+            if query.cursor.is_none() {
+                return items;
+            }
+        }
+    }
+
+    /// A follower's first frame at `limit` (absent: the default), and then everything a client
+    /// reaches by paging the public timeline route from the frame's `older_cursor`, oldest first.
+    async fn first_frame_and_older_history(
+        state: &AppState,
+        session_id: &str,
+        remote: Option<&str>,
+        limit: Option<usize>,
+    ) -> (Value, Vec<Value>) {
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let follower = tokio::spawn(follow_conversation_limited(
+            state.clone(),
+            session.clone(),
+            "chat".into(),
+            1,
+            session_id.to_owned(),
+            remote.map(str::to_owned),
+            conversation_first_frame_limit(limit),
+            sender,
+        ));
+        let (_, _, frame) = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        follower.abort();
+        let _ = follower.await;
+        assert_eq!(frame["replace"], true, "{frame}");
+        // Relayed bodies arrive through the owner's typed client with explicit nulls, which the
+        // schema rejects; that predates this frame and is checked for local frames only.
+        if remote.is_none() {
+            assert_collection_frame_conforms(&frame);
+        }
+        assert_eq!(
+            frame["has_more"] == true,
+            frame["older_cursor"].is_string(),
+            "older_cursor accompanies has_more: {frame}"
+        );
+        let items = history_from_frame(state, session_id, &frame).await;
+        (frame, items)
+    }
+
+    /// Page back from this exact frame, never from a freshly opened substitute.
+    async fn history_from_frame(state: &AppState, session_id: &str, frame: &Value) -> Vec<Value> {
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let mut items = frame["items"].as_array().unwrap().clone();
+        let mut cursor = frame["older_cursor"].as_str().map(str::to_owned);
+        while let Some(active) = cursor {
+            let page = super::super::client_sessions_detail(
+                axum::extract::State(state.clone()),
+                axum::Extension(new_client_snapshot(state)),
+                axum::Extension(session.clone()),
+                axum::extract::Path(format!("{session_id}/timeline")),
+                axum::extract::Query(ClientListQuery { cursor: Some(active), ..Default::default() }),
+            )
+            .await
+            .unwrap()
+            .0;
+            items.splice(0..0, page["items"].as_array().unwrap().iter().cloned());
+            cursor = page["page"]["next_cursor"].as_str().map(str::to_owned);
+        }
+        items
+    }
+
+    async fn next_replacement(
+        frames: &mut tokio::sync::mpsc::UnboundedReceiver<(String, u64, Value)>,
+    ) -> Value {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (_, _, frame) = frames.recv().await.expect("follower remains open");
+                if frame["replace"] == true {
+                    return frame;
+                }
+                assert_eq!(frame["replace"], false, "{frame}");
+            }
+        })
+        .await
+        .expect("an older revision must refresh the replacement frame and its history cursor")
+    }
+
+    #[tokio::test]
+    async fn conversation_first_frame_older_pages_continue_the_full_window() {
+        let _guard = conversation_blocks::prepared_counter_guard();
+        let root = tempfile::tempdir().unwrap();
+        let (state, session_id, _path) =
+            conversation_first_frame_fixture(root.path(), "first-frame-walk", 130);
+        let full = timeline_walk(&state, &session_id, 200);
+        assert_eq!(full.len(), 260, "every fixture entry is reachable");
+        assert_eq!(timeline_walk(&state, &session_id, 20), full);
+        assert_eq!(timeline_walk(&state, &session_id, 1), full);
+        // A small first frame plus its older_cursor pages reproduce the 200 page and beyond.
+        for limit in [Some(20), Some(1), None] {
+            let (frame, walked) =
+                first_frame_and_older_history(&state, &session_id, None, limit).await;
+            let shown = limit.unwrap_or(200);
+            assert_eq!(frame["items"].as_array().unwrap(), &full[full.len() - shown..]);
+            assert_eq!(walked, full, "limit {limit:?}: the frame and its older pages cover the window");
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_first_frame_prepares_only_its_own_page() {
+        let _guard = conversation_blocks::prepared_counter_guard();
+        let root = tempfile::tempdir().unwrap();
+        let (state, session_id, _path) =
+            conversation_first_frame_fixture(root.path(), "first-frame-prepared", 130);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        conversation_blocks::reset_prepared_bodies(&session_id);
+        let (_, small) = conversation_open_local(&state, &session, &session_id, 20).unwrap();
+        assert_eq!(small["items"].as_array().unwrap().len(), 20);
+        assert!(
+            conversation_blocks::prepared_bodies() <= 21,
+            "a 20-entry first frame must prepare at most its page and the has-more probe; prepared {}",
+            conversation_blocks::prepared_bodies()
+        );
+        // The explicit 200-entry frame still prepares its own whole page: the control
+        // discriminates, and the discarded 180-entry work is exactly what this change removes.
+        conversation_blocks::reset_prepared_bodies(&session_id);
+        let (_, full) = conversation_open_local(&state, &session, &session_id, 200).unwrap();
+        assert_eq!(full["items"].as_array().unwrap().len(), 200);
+        assert!(
+            conversation_blocks::prepared_bodies() > 21,
+            "the control must discriminate; a 200-entry open prepared {}",
+            conversation_blocks::prepared_bodies()
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_conversation_first_frame_matches_and_continues_revisions() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "first-frame-stored");
+        let owner = "agent/first-frame-stored";
+        let incarnation = "stored-runtime:i1";
+        let timeline_entry = |index: usize, revision: u64, text: &str| {
+            json!({"operation": if revision == 1 { "append" } else { "replace" },
+                "entry_id":format!("timeline-entry/stored-{index}"), "sequence": index + 1,
+                "revision":revision, "role":"assistant", "entry_type":"content", "final":revision > 1,
+                "body":{"media_type":"text/plain", "text":text},
+                "driver":"codex", "incarnation_id":incarnation})
+        };
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: owner.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(owner.into()),
+                fields: serde_json::from_value(json!({"status":"running",
+                    "runtime_id":"stored-runtime", "incarnation_id":incarnation}))
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        for index in 0..60 {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: owner.into(),
+                    kind: "harness.timeline".into(),
+                    actor: Some(owner.into()),
+                    fields: serde_json::from_value(timeline_entry(
+                        index,
+                        1,
+                        &format!("stored {index}"),
+                    ))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let session_id = managed_session_id(owner, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let full = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &session,
+            &session_id,
+            &ClientListQuery { limit: Some(200), ..Default::default() },
+        )
+        .unwrap()
+        .0;
+        let full_items = full["items"].as_array().unwrap();
+        // The stored window holds all 60 appends (and whatever else the session derives).
+        for index in 0..60 {
+            let id = format!("timeline-entry/stored-{index}");
+            assert!(full_items.iter().any(|item| item["id"] == id.as_str()), "{id} is in the window");
+        }
+        assert!(full_items.len() > 20);
+        let tail = full_items.len() - 20;
+        let (_, small) = conversation_open_local(&state, &session, &session_id, 20).unwrap();
+        assert_eq!(small["items"].as_array().unwrap(), &full_items[tail..]);
+        assert_eq!(small["page"]["has_more"], true);
+        assert_eq!(timeline_walk(&state, &session_id, 20), full_items.to_vec());
+        let (frame, walked) =
+            first_frame_and_older_history(&state, &session_id, None, Some(20)).await;
+        assert_eq!(frame["items"].as_array().unwrap(), &full_items[tail..]);
+        assert_eq!(walked, full_items.to_vec(), "older pages from the small frame cover the stored window");
+        // Continuity after the frame, through live followers: a small one (20, older history
+        // behind it) and, as the control, one holding the whole stored window.
+        let follow = |limit: Option<usize>| {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let follower = tokio::spawn(follow_conversation_limited(
+                state.clone(), session.clone(), "chat".into(), 1, session_id.clone(), None,
+                conversation_first_frame_limit(limit), sender,
+            ));
+            (follower, receiver)
+        };
+        let (small_follower, mut small_frames) = follow(Some(20));
+        let (full_follower, mut full_frames) = follow(None);
+        for frames in [&mut small_frames, &mut full_frames] {
+            let (_, _, first) = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+                .await.unwrap().unwrap();
+            assert_eq!(first["replace"], true, "{first}");
+        }
+        // A new entry, a revision inside the small frame, and one older than it.
+        for fields in [
+            timeline_entry(60, 1, "stored 60"),
+            timeline_entry(55, 2, "stored 55 revised"),
+            timeline_entry(30, 2, "stored 30 revised"),
+        ] {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: owner.into(),
+                    kind: "harness.timeline".into(),
+                    actor: Some(owner.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        // Delta entries a follower sends until it has sent every `wanted` id.
+        async fn deltas_until(
+            frames: &mut tokio::sync::mpsc::UnboundedReceiver<(String, u64, Value)>,
+            wanted: &[&str],
+        ) -> Vec<Value> {
+            let mut items = Vec::new();
+            while !wanted.iter().all(|id| items.iter().any(|item: &Value| item["id"] == *id)) {
+                let (_, _, frame) = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("waiting for {wanted:?}; got {items:?}"))
+                    .unwrap();
+                assert_eq!(frame["replace"], false, "{frame}");
+                assert_collection_frame_conforms(&frame);
+                items.extend(frame["items"].as_array().unwrap().iter().cloned());
+            }
+            items
+        }
+        let full_delta = deltas_until(
+            &mut full_frames,
+            &["timeline-entry/stored-60", "timeline-entry/stored-55", "timeline-entry/stored-30"],
+        )
+        .await;
+        assert!(full_delta.iter().any(|item| item["id"] == "timeline-entry/stored-30"
+            && item["revision"] == 2), "control: the change feed carries the old revision");
+        let replacement = next_replacement(&mut small_frames).await;
+        assert_eq!(replacement["items"].as_array().unwrap().len(), 20);
+        assert_collection_frame_conforms(&replacement);
+        assert!(replacement["items"].as_array().unwrap().iter().any(|item|
+            item["id"] == "timeline-entry/stored-60"));
+        assert!(replacement["items"].as_array().unwrap().iter().any(|item|
+            item["id"] == "timeline-entry/stored-55" && item["revision"] == 2));
+        assert_ne!(replacement["older_cursor"], frame["older_cursor"],
+            "the replacement must provide a fresh history snapshot");
+        let refreshed_history = history_from_frame(&state, &session_id, &replacement).await;
+        assert!(refreshed_history.iter().any(|item| item["id"] == "timeline-entry/stored-30"
+            && item["revision"] == 2 && item["body"]["text"] == "stored 30 revised"),
+            "page back from the emitted replacement, not a fresh independent open");
+        small_follower.abort();
+        full_follower.abort();
+    }
+
+    /// Stored pages sort by sequence alone. When observed timestamps run against the sequence,
+    /// a follower must still place changes by sequence, as its frame was built.
+    #[tokio::test]
+    async fn stored_deltas_follow_sequence_order_when_timestamps_run_against_it() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "first-frame-skewed");
+        let owner = "agent/first-frame-skewed";
+        let incarnation = "skewed-runtime:i1";
+        let claim = |kind: &str, fields: Value| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: owner.into(),
+                    kind: kind.into(),
+                    actor: Some(owner.into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        claim("runtime.observed", json!({"status":"running", "runtime_id":"skewed-runtime",
+            "incarnation_id":incarnation}));
+        let base: u64 = 1_790_000_000_000;
+        // Entry 5 was observed long after the others, entry 25 long before them.
+        let observed = |index: usize| match index {
+            5 => base + 10_000_000,
+            25 => base - 10_000_000,
+            _ => base + index as u64 * 1_000,
+        };
+        let entry = |index: usize, revision: u64, text: &str| {
+            json!({"operation": if revision == 1 { "append" } else { "replace" },
+                "entry_id":format!("timeline-entry/skewed-{index}"), "sequence": index + 1,
+                "revision":revision, "role":"assistant", "entry_type":"content", "final":revision > 1,
+                "body":{"media_type":"text/plain", "text":text}, "driver":"codex",
+                "incarnation_id":incarnation, "observed_at_unix_ms":observed(index)})
+        };
+        for index in 0..30 {
+            claim("harness.timeline", entry(index, 1, &format!("skewed {index}")));
+        }
+        let session_id = managed_session_id(owner, incarnation);
+        // The page itself is in sequence order whatever the timestamps say.
+        let full = timeline_walk(&state, &session_id, 200);
+        let position = |id: &str| full.iter().position(|item| item["id"] == id).unwrap();
+        assert!(position("timeline-entry/skewed-5") < position("timeline-entry/skewed-25"));
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let follow = |limit: Option<usize>| {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let follower = tokio::spawn(follow_conversation_limited(
+                state.clone(), session.clone(), "chat".into(), 1, session_id.clone(), None,
+                conversation_first_frame_limit(limit), sender,
+            ));
+            (follower, receiver)
+        };
+        let (small_follower, mut small_frames) = follow(Some(10));
+        let (full_follower, mut full_frames) = follow(None);
+        let ids = |items: &[Value]| -> Vec<String> {
+            items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned)).collect()
+        };
+        let (_, _, small_first) = tokio::time::timeout(Duration::from_secs(10), small_frames.recv())
+            .await.unwrap().unwrap();
+        let held = ids(small_first["items"].as_array().unwrap());
+        assert_eq!(small_first["has_more"], true, "{small_first}");
+        assert!(held.contains(&"timeline-entry/skewed-25".to_owned()), "{held:?}");
+        assert!(!held.contains(&"timeline-entry/skewed-5".to_owned()), "{held:?}");
+        tokio::time::timeout(Duration::from_secs(10), full_frames.recv()).await.unwrap().unwrap();
+        // A new entry, a revision of a held entry with an early timestamp, and a revision of
+        // an older entry with a late one.
+        claim("harness.timeline", entry(30, 1, "skewed 30"));
+        claim("harness.timeline", entry(25, 2, "skewed 25 revised"));
+        // First check that a held revision stays a delta even with its early timestamp.
+        async fn sent_until(
+            frames: &mut tokio::sync::mpsc::UnboundedReceiver<(String, u64, Value)>,
+            wanted: &[&str],
+        ) -> Vec<Value> {
+            let mut items = Vec::new();
+            while !wanted.iter().all(|id| items.iter().any(|item: &Value| item["id"] == *id)) {
+                let (_, _, frame) = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("waiting for {wanted:?}; got {items:?}"))
+                    .unwrap();
+                assert_eq!(frame["replace"], false, "{frame}");
+                items.extend(frame["items"].as_array().unwrap().iter().cloned());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            while let Ok((_, _, frame)) = frames.try_recv() {
+                items.extend(frame["items"].as_array().unwrap().iter().cloned());
+            }
+            items
+        }
+        // Control: the whole-window follower receives the append and held revision as deltas.
+        sent_until(
+            &mut full_frames,
+            &["timeline-entry/skewed-30", "timeline-entry/skewed-25"],
+        )
+        .await;
+        let small = sent_until(
+            &mut small_frames,
+            &["timeline-entry/skewed-30", "timeline-entry/skewed-25"],
+        )
+        .await;
+        assert!(
+            small.iter().any(|item| item["id"] == "timeline-entry/skewed-25" && item["revision"] == 2),
+            "a held entry's revision arrives despite its early timestamp: {small:?}"
+        );
+        // Now revise the older entry with a late timestamp: it refreshes the frame's cursor,
+        // not an out-of-window delta. The projection's sequence order decides "older".
+        claim("harness.timeline", entry(5, 2, "skewed 5 revised"));
+        let replacement = next_replacement(&mut small_frames).await;
+        assert_eq!(replacement["items"].as_array().unwrap().len(), 10);
+        let history = history_from_frame(&state, &session_id, &replacement).await;
+        assert!(history.iter().any(|item|
+            item["id"] == "timeline-entry/skewed-5" && item["revision"] == 2));
+        small_follower.abort();
+        full_follower.abort();
+    }
+
+    #[tokio::test]
+    async fn native_first_frame_refreshes_history_after_a_same_sequence_rewrite() {
+        let _guard = conversation_blocks::prepared_counter_guard();
+        let root = tempfile::tempdir().unwrap();
+        let (state, session_id, path) =
+            conversation_first_frame_fixture(root.path(), "first-frame-native-rewrite", 60);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let (sender, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        let follower = tokio::spawn(follow_conversation_limited(
+            state.clone(), session, "chat".into(), 1, session_id.clone(), None, 20, sender,
+        ));
+        let (_, _, first) = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+            .await.unwrap().unwrap();
+        let original = history_from_frame(&state, &session_id, &first).await;
+        let highest = original.iter().filter_map(|item| item["sequence"].as_u64()).max();
+        let old = original.iter().find(|item|
+            item["body"]["text"].as_str().is_some_and(|text| text.starts_with("entry 5 ")))
+            .unwrap();
+        let old_id = old["id"].clone();
+        assert!(!first["items"].as_array().unwrap().iter().any(|item| item["id"] == old_id));
+        // Rewrite native content in place, including older records, without appending a record.
+        // Same byte count, inode and highest sequence: only the content generation changes.
+        let transcript = std::fs::read_to_string(&path).unwrap();
+        let revised = transcript.replace("\"text\":\"entry ", "\"text\":\"EDIT! ");
+        assert_ne!(revised, transcript);
+        assert_eq!(revised.len(), transcript.len());
+        std::fs::write(&path, revised).unwrap();
+        let replacement = next_replacement(&mut frames).await;
+        assert_eq!(replacement["items"].as_array().unwrap().len(), 20);
+        assert_ne!(replacement["older_cursor"], first["older_cursor"]);
+        let history = history_from_frame(&state, &session_id, &replacement).await;
+        assert_eq!(history.iter().filter_map(|item| item["sequence"].as_u64()).max(), highest);
+        assert!(history.iter().any(|item| item["id"] == old_id
+            && item["body"]["text"].as_str().is_some_and(|text| text.starts_with("EDIT! 5 "))));
+        follower.abort();
+    }
+
+    #[tokio::test]
+    async fn native_first_frame_refreshes_history_after_an_older_message_arrives() {
+        let _guard = conversation_blocks::prepared_counter_guard();
+        let root = tempfile::tempdir().unwrap();
+        let (state, session_id, path) =
+            conversation_first_frame_fixture(root.path(), "first-frame-native-history", 60);
+        // Put native records after the later graph message in timestamp order, so the message
+        // lands before the frame. Native cursors pin the graph cut, as well as the transcript.
+        let transcript = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, transcript.replace("2026-10-08T12:00:00Z", "2099-10-08T12:00:00Z")).unwrap();
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        let (sender, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        let follower = tokio::spawn(follow_conversation_limited(
+            state.clone(), session, "chat".into(), 1, session_id.clone(), None, 20, sender,
+        ));
+        let (_, _, first) = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+            .await.unwrap().unwrap();
+        assert_eq!(first["replace"], true, "{first}");
+        assert_eq!(first["items"].as_array().unwrap().len(), 20);
+        state.store.append_claim(&ClaimInput {
+            subject: "message/native-older-history".into(),
+            kind: "message.sent".into(),
+            actor: Some("person/example".into()),
+            fields: serde_json::from_value(json!({
+                "from":"person/example", "to":"agent/first-frame-native-history",
+                "session_id":session_id, "status":"sent", "content":"older native history message",
+            })).unwrap(),
+            evidence: vec![], expected_subject: None, idempotency_key: None,
+        }).unwrap();
+        let replacement = next_replacement(&mut frames).await;
+        assert_eq!(replacement["items"].as_array().unwrap().len(), 20);
+        assert_collection_frame_conforms(&replacement);
+        assert_ne!(replacement["older_cursor"], first["older_cursor"]);
+        let history = history_from_frame(&state, &session_id, &replacement).await;
+        assert!(history.iter().any(|item|
+            item["body"]["text"] == "older native history message"));
+        follower.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_conversation_open_relays_the_small_frame() {
+        let _guard = conversation_blocks::prepared_counter_guard();
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let (owner, session_id, _path) =
+            conversation_first_frame_fixture(owner_root.path(), "conversation-owner", 130);
+        let mut gateway = test_state_named(gateway_root.path(), "conversation-gateway");
+        gateway
+            .store
+            .import_replication(
+                "conversation-owner",
+                &owner.store.export_replication(0).unwrap(),
+            )
+            .unwrap();
+        crate::peer::serve_conversation_relay_pair(
+            owner.clone(),
+            &mut gateway,
+            gateway_root.path(),
+        )
+        .await
+        .unwrap();
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        // The relayed page read asks the owner for exactly the frame it will show.
+        conversation_blocks::reset_prepared_bodies(&session_id);
+        let page = conversation_page(
+            &gateway,
+            &session,
+            &session_id,
+            Some("host/conversation-owner"),
+            20,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 20);
+        assert_eq!(page["page"]["has_more"], true);
+        // A relayed owner read negotiates conversation blocks, so it also reads the newest 200
+        // entries its header summarizes; the frame itself is still the 20 asked for.
+        assert_eq!(
+            conversation_blocks::prepared_bodies(),
+            CLIENT_MAX_PAGE_ITEMS,
+            "the owner prepared {} bodies for a 20-entry relayed frame",
+            conversation_blocks::prepared_bodies()
+        );
+        // A remote open pairs that small page with the owner's replay cursor.
+        let (start, small, _) = conversation_open_value(
+            &gateway,
+            &session,
+            &session_id,
+            Some("host/conversation-owner"),
+            20,
+        )
+        .await
+        .unwrap();
+        assert_eq!(small["items"].as_array().unwrap().len(), 20);
+        assert!(start["next_cursor"].as_str().is_some_and(|cursor|
+            cursor.starts_with("conversation-cursor/conversation-owner/")));
+        // Through the gateway, a small frame plus its older_cursor pages (relayed to the owner)
+        // reproduce the owner's whole window; the default frame stays the 200 page.
+        // Relayed bodies spell absent fields as nulls, so entries compare by identity and order.
+        let keys = |items: &[Value]| -> Vec<(Value, Value)> {
+            items.iter().map(|item| (item["id"].clone(), item["revision"].clone())).collect()
+        };
+        let full = keys(&timeline_walk(&owner, &session_id, 200));
+        assert_eq!(full.len(), 260);
+        let owner_host = Some("host/conversation-owner");
+        let (frame, walked) =
+            first_frame_and_older_history(&gateway, &session_id, owner_host, Some(20)).await;
+        assert_eq!(keys(frame["items"].as_array().unwrap()), &full[240..]);
+        assert!(frame["older_cursor"].is_string(), "{frame}");
+        assert_eq!(keys(&walked), full, "relayed older pages continue the small frame");
+        let (frame, walked) =
+            first_frame_and_older_history(&gateway, &session_id, owner_host, None).await;
+        assert_eq!(keys(frame["items"].as_array().unwrap()), &full[60..]);
+        assert_eq!(keys(&walked), full);
+    }
+
+
+    /// Micro-benchmark: first-frame wall time at a small frame versus the former fixed 200,
+    /// warm fold (steady-state opens) and cold (first fold of a transcript). Print-only.
+    #[tokio::test]
+    #[ignore = "a micro-benchmark: run with --release --ignored --nocapture"]
+    async fn bench_conversation_first_frame_native() {
+        let _guard = conversation_blocks::prepared_counter_guard();
+        let warm = tempfile::tempdir().unwrap();
+        let (state, session_id, _path) =
+            conversation_first_frame_fixture(warm.path(), "first-frame-bench", 2_500);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        // One full page first, so the measured opens reuse the folded window.
+        conversation_open_local(&state, &session, &session_id, 200).unwrap();
+        for limit in [20, 200] {
+            let mut elapsed = Vec::new();
+            for _ in 0..30 {
+                let before = std::time::Instant::now();
+                conversation_open_local(&state, &session, &session_id, limit).unwrap();
+                elapsed.push(before.elapsed());
+            }
+            let (total, max) = (elapsed.iter().sum::<Duration>(), elapsed.iter().max().unwrap());
+            println!(
+                "bench-first-frame native entries=5000 warm n={limit} mean_ms={:.3} max_ms={:.3}",
+                total.as_secs_f64() * 1000.0 / elapsed.len() as f64,
+                max.as_secs_f64() * 1000.0
+            );
+        }
+        for limit in [20, 200] {
+            let cold = tempfile::tempdir().unwrap();
+            let (state, session_id, _path) = conversation_first_frame_fixture(
+                cold.path(),
+                &format!("first-frame-cold-{limit}"),
+                2_500,
+            );
+            let before = std::time::Instant::now();
+            conversation_open_local(&state, &session, &session_id, limit).unwrap();
+            println!(
+                "bench-first-frame native entries=5000 cold n={limit} ms={:.3}",
+                before.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    /// Micro-benchmark: the same comparison on a stored-claims conversation, where the
+    /// bounded operation window is folded on every open and only the returned page differs.
+    #[tokio::test]
+    #[ignore = "a micro-benchmark: run with --release --ignored --nocapture"]
+    async fn bench_conversation_first_frame_stored() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "first-frame-bench-stored");
+        let owner = "agent/first-frame-bench-stored";
+        let incarnation = "bench-stored-runtime:i1";
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: owner.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(owner.into()),
+                fields: serde_json::from_value(json!({"status":"running",
+                    "runtime_id":"bench-stored-runtime", "incarnation_id":incarnation}))
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        for index in 0..4_000 {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: owner.into(),
+                    kind: "harness.timeline".into(),
+                    actor: Some(owner.into()),
+                    fields: serde_json::from_value(json!({"operation":"append",
+                        "entry_id":format!("timeline-entry/bench-{index}"), "sequence": index + 1,
+                        "revision":1, "role":"assistant", "entry_type":"content", "final":true,
+                        "body":{"media_type":"text/plain", "text":format!("stored {index} {}", "x".repeat(256))},
+                        "driver":"codex", "incarnation_id":incarnation}))
+                    .unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let session_id = managed_session_id(owner, incarnation);
+        let session = ClientSession::local(Some("person/example")).unwrap();
+        conversation_open_local(&state, &session, &session_id, 200).unwrap();
+        for limit in [20, 200] {
+            let mut elapsed = Vec::new();
+            for _ in 0..20 {
+                let before = std::time::Instant::now();
+                conversation_open_local(&state, &session, &session_id, limit).unwrap();
+                elapsed.push(before.elapsed());
+            }
+            let (total, max) = (elapsed.iter().sum::<Duration>(), elapsed.iter().max().unwrap());
+            println!(
+                "bench-first-frame stored entries=4000 n={limit} mean_ms={:.3} max_ms={:.3}",
+                total.as_secs_f64() * 1000.0 / elapsed.len() as f64,
+                max.as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+
     #[tokio::test]
     async fn conversation_open_cursor_replays_a_message_committed_during_the_initial_read() {
         let root = tempfile::tempdir().unwrap();
@@ -18609,7 +19537,7 @@ mission "example/zero-run" state="ready" {
                 }).unwrap();
             }));
         });
-        let (start, page) = conversation_open_local(&state, &session, &session_id).unwrap();
+        let (start, page) = conversation_open_local(&state, &session, &session_id, 200).unwrap();
         assert!(!page["items"].as_array().unwrap().iter().any(|item| item["body"]["text"] == "committed during OPEN"));
         let delta = conversation_changes_local(&state, &session, &session_id, start["next_cursor"].as_str(), 0).await.unwrap();
         assert!(delta["items"].as_array().unwrap().iter().any(|item| item["body"]["text"] == "committed during OPEN"), "{delta}");
@@ -18651,7 +19579,7 @@ mission "example/zero-run" state="ready" {
                 }]);
             }));
         });
-        let (start, page) = conversation_open_local(&state, &session, &session_id).unwrap();
+        let (start, page) = conversation_open_local(&state, &session, &session_id, 200).unwrap();
         let contains_local = |value: &Value| value["items"].as_array().unwrap().iter()
             .any(|item| item["id"] == "timeline-entry/open-local-frontier");
         assert!(!contains_local(&page));
@@ -19620,7 +20548,7 @@ mission "example/zero-run" state="ready" {
             &ClientListQuery { limit: Some(200), ..Default::default() },
         ).unwrap().0;
         // Local OPEN captures the initial page and its generation-fenced cursor together.
-        let (opened, page) = conversation_open_local(&state, &session, &session_id).unwrap();
+        let (opened, page) = conversation_open_local(&state, &session, &session_id, 200).unwrap();
         let (failed_sequence, view) = error_view(&page).expect("the failed turn renders an error");
         assert_eq!(view["status"], "failed");
         assert_eq!(view["presentation"], "full");
@@ -19668,7 +20596,7 @@ mission "example/zero-run" state="ready" {
             assert_eq!(view["status"], status);
             assert_eq!(view["presentation"], presentation);
             assert_eq!(view["message"], "synthetic socket closed");
-            let (reopened, _) = conversation_open_local(&state, &session, &session_id).unwrap();
+            let (reopened, _) = conversation_open_local(&state, &session, &session_id, 200).unwrap();
             cursor = reopened["next_cursor"].as_str().unwrap().to_owned();
         }
         // With nothing rewritten since the reload, the follower resumes incrementally.
@@ -19943,7 +20871,7 @@ mission "example/zero-run" state="ready" {
                     "{notice:#}"
                 );
                 let (start, opened) =
-                    conversation_open_local(&state, &session, &session_id).unwrap();
+                    conversation_open_local(&state, &session, &session_id, 200).unwrap();
                 let items = opened["items"].as_array().unwrap();
                 assert!(items.iter().any(|item|
                     item["type"] == "message"

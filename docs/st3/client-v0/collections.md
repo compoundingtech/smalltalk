@@ -130,6 +130,23 @@ A conversation is one more subscription too. Name an agent or a session:
 {"kind":"subscribe","id":"talk","collection":"conversation","conversation":"agent/ID"}
 ```
 
+The first frame carries the conversation's newest 200 entries, or fewer when the subscribe
+names an optional `limit` (1 through 200). A replacement frame with `has_more: true` also
+carries `older_cursor`: pass it to `GET /v1/client/sessions/{id}/timeline?cursor=…` for the
+entries just before the frame's oldest entry, then follow that response's `page.next_cursor`.
+A client that pages this way can ask for a small first frame, such as `"limit":20`. When a
+replacement frame has older history, later deltas carry only new entries and revisions of
+entries from that frame onward. A change to an older entry sends a replacement frame instead,
+with the same requested limit and a fresh `older_cursor`. Every replacement frame is an
+authoritative new history snapshot: discard pages read back before it and their cursors, even
+when its window overlaps them, and ignore older-page responses requested before it. Page back
+from the new `older_cursor` to see the revision.
+Native conversation cursors also pin the source's content generation. A generation change
+triggers `replace: true` even when the newest sequence is unchanged and replay would return
+no delta entries. For append-only JSONL harness transcripts, the existing index detects
+file replacement, shrinkage and changes to the last complete record; an interior edit that
+preserves both the file length and the final record does not advance that generation.
+
 An agent's conversation is its current session's timeline with the Smalltalk to or from the agent
 joined in. The first `conversation` frame carries `id`, `collection` (`conversation`),
 `session_id`, `replace: true`, the newest page of timeline `items`, and `has_more`. Later frames
