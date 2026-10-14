@@ -838,6 +838,7 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::Forbidden => format!("not allowed: {message}"),
         ErrorCode::Internal => format!("st hit a problem: {message}"),
         ErrorCode::TimelineHistoryIncomplete
+        | ErrorCode::InventoryUnavailable
         | ErrorCode::ConversationContentInvalidated
         | ErrorCode::TranscriptUnavailable => message.to_owned(),
         ErrorCode::TerminalEnded => "the terminal ended: its process exited".into(),

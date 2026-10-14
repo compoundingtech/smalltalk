@@ -180,6 +180,7 @@ fn forwarded_deadline(operation: &crate::peer::ClientReadOperation) -> Option<Du
         | ClientReadOperation::SeatSnapshot { .. }
         | ClientReadOperation::AgentWorkspace { .. }
         | ClientReadOperation::Blob { .. }
+        | ClientReadOperation::HarnessInventory { .. }
         | ClientReadOperation::Messages { .. } => Some(ORDINARY),
     }
 }

@@ -56,6 +56,7 @@
 "harness.context-clear.requested" = { class = "transition", window = "7d", pending = "no reader audit yet" }
 "harness.context-clear.result" = { class = "transition", window = "7d", pending = "no reader audit yet" }
 "harness.diagnostic" = { class = "transition", window = "7d", pending = "only the seat status history rule retains its sources" }
+"harness.inventory.observed" = { class = "current", log = "on-change", pending = "no reader audit yet" }
 "harness.limits" = { class = "current" }
 # Other nodes read the current harness state: step readiness is judged on the mission's node and
 # fleet views run anywhere. Nothing reads a heartbeat, so only changes replicate.

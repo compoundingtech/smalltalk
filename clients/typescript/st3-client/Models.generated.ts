@@ -799,7 +799,7 @@ export type Envelope = {
   value: (DirectiveNotes | Capabilities | DocumentContent | SubjectDefinition | PublicationDefinition | AgentWorkspace | Page | ResourcesPage | Resource | TimelinePage | ConversationChanges | ConversationSearch | EventPage | ActionResult | PairingChallenge | PairedSession | TerminalScreen | StatusHistory | AgentQueue | UsagePeriod | MailBacklog);
 };
 
-export type ErrorCode = ("recipient-retired" | "lifecycle-unavailable" | "retirement-upgrade-required" | "attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "issuer-required" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "projection-detail-too-large" | "projection-detail-invalid-source" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "message-too-large" | "message-store-full" | "long-message-signature-unsupported" | "internal" | string);
+export type ErrorCode = ("recipient-retired" | "lifecycle-unavailable" | "retirement-upgrade-required" | "attention-migrated" | "arrangement-exists" | "arrangement-folder-exists" | "arrangement-retired" | "arrangement-limit" | "arrangement-folder-deleted" | "arrangement-cycle" | "arrangement-body-too-large" | "arrangement-owner-forbidden" | "invalid-arrangement-subject" | "invalid-arrangement-action" | "invalid-arrangement-operations" | "invalid-arrangement-folder" | "invalid-arrangement-name" | "invalid-arrangement-key" | "invalid-subject-reference" | "not-found" | "forbidden" | "unsupported-capability" | "validation-failed" | "idempotency-conflict" | "issuer-required" | "stale-fence" | "cursor-gap" | "page-cursor-expired" | "rate-limited" | "runtime-not-local" | "runtime-authority-indeterminate" | "remote-unavailable" | "terminal-unavailable" | "inventory-unavailable" | "terminal-ended" | "timeline-history-incomplete" | "projection-detail-too-large" | "projection-detail-invalid-source" | "conversation-content-invalidated" | "transcript-unavailable" | "blob-too-large" | "unsupported-media-type" | "blob-content-mismatch" | "blob-quota-exceeded" | "blob-not-found" | "blob-expired" | "message-too-large" | "message-store-full" | "long-message-signature-unsupported" | "internal" | string);
 
 export type ErrorEnvelope = {
   api_version: "st3.client.v0";
@@ -876,6 +876,41 @@ export type GlassTab = {
 };
 
 export type GoldenResourceSet = Array<Resource>;
+
+export type HarnessInventory = {
+  agent_id: string;
+  collection: "files" | "skills" | "skill-commands" | "slash-commands";
+  coverage: "none" | "native-workspace" | "enabled-skill-commands" | "dynamic-commands";
+  full_inventory: boolean;
+  items: Array<HarnessInventoryItem>;
+  kind: "harness-inventory";
+  native_session_id: string | null;
+  observed_at: string | null;
+  owner_host_id: string;
+  page: PageInfo;
+  reason: string | null;
+  runtime_incarnation: string;
+  session_id: string;
+  status: "supported" | "unsupported" | "unavailable";
+};
+
+export type HarnessInventoryItem = {
+  kind: "file" | "directory" | "skill-command" | "slash-command";
+  name: string;
+  source: "extension" | "prompt" | "skill" | null;
+};
+
+export type HarnessInventoryQuery = {
+  collection: "files" | "skills" | "skill-commands" | "slash-commands";
+  cursor?: string | null;
+  directory?: string;
+  limit?: number | null;
+  native_session_id: string;
+  owner_host_id: string;
+  prefix?: string;
+  runtime_incarnation: string;
+  session_id: string;
+};
 
 export type HarnessPhase = {
   name: string;

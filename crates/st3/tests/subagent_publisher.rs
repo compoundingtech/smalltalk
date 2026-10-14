@@ -355,9 +355,12 @@ fn omp_channel(store: &Store, agent_dir: &Path) -> st_drivers::pi_channel::Event
     let seq =
         st_drivers::harness_state::claim(agent_dir, OMP_SEAT, "omp", "provider-1").unwrap();
     let mut channel = st_drivers::pi_channel::EventObserver::new(
-        agent_dir, OMP_SEAT, "omp", "provider-1", seq, "runtime-1",
+        agent_dir, &agent_dir.join("sessions/omp"), OMP_SEAT, "omp", "provider-1", seq, "runtime-1",
     )
     .unwrap();
+    channel
+        .observe(&json!({"type": "session", "sessionId": "native-1"}))
+        .unwrap();
     channel
         .observe(&json!({"type": "ready", "sessionId": "native-1"}))
         .unwrap();

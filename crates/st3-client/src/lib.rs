@@ -878,6 +878,7 @@ pub fn plain_message(code: Option<&ErrorCode>, message: &str) -> String {
         ErrorCode::Forbidden => format!("not allowed: {message}"),
         ErrorCode::Internal => format!("st hit a problem: {message}"),
         ErrorCode::TimelineHistoryIncomplete
+        | ErrorCode::InventoryUnavailable
         | ErrorCode::ConversationContentInvalidated
         | ErrorCode::TranscriptUnavailable => message.to_owned(),
         ErrorCode::TerminalEnded => "the terminal ended: its process exited".into(),
@@ -1919,6 +1920,39 @@ impl Client {
     }
     pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {
         self.agent_queue_internal(agent_id).await
+    }
+    pub async fn harness_inventory_get(
+        &self,
+        agent_id: &str,
+        query: &HarnessInventoryQuery,
+    ) -> Result<Envelope<HarnessInventory>, ClientError> {
+        let mut fields = vec![
+            format!("owner_host_id={}", percent_encode(&query.owner_host_id)),
+            format!("session_id={}", percent_encode(&query.session_id)),
+            format!(
+                "native_session_id={}",
+                percent_encode(&query.native_session_id)
+            ),
+            format!(
+                "runtime_incarnation={}",
+                percent_encode(&query.runtime_incarnation)
+            ),
+            format!("collection={}", percent_encode(&query.collection)),
+            format!("directory={}", percent_encode(&query.directory)),
+            format!("prefix={}", percent_encode(&query.prefix)),
+        ];
+        if let Some(limit) = query.limit {
+            fields.push(format!("limit={limit}"));
+        }
+        if let Some(cursor) = &query.cursor {
+            fields.push(format!("cursor={}", percent_encode(cursor)));
+        }
+        self.get(&format!(
+            "/v1/client/harness-inventory/{}?{}",
+            percent_encode(agent_id),
+            fields.join("&")
+        ))
+        .await
     }
     pub async fn runtimes_list(
         &self,

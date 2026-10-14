@@ -11198,7 +11198,7 @@ impl Store {
             || !matches!(
                 input.kind.as_str(),
                 "harness.observed" | "harness.usage" | "harness.limits" | "harness.timeline"
-                    | "harness.todo.observed"
+                    | "harness.todo.observed" | "harness.inventory.observed"
             )
             || input.actor.as_deref() != Some(input.subject.as_str())
             || input.idempotency_key.is_none()
@@ -59362,7 +59362,7 @@ fn append_latest_observation_publication(
                 "harness.usage" => {
                     publish_due_usage_tx(transaction, &graph.origin, input, &local, now)?
                 }
-                "harness.todo.observed" | "workspace.observed" => Some(publish_latest_claim_tx(
+                "harness.todo.observed" | "harness.inventory.observed" | "workspace.observed" => Some(publish_latest_claim_tx(
                     transaction,
                     &graph.origin,
                     &input.subject,

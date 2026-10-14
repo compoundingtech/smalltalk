@@ -116,6 +116,7 @@ use smallclaims::fifo::{Kind, Queue};
 
 pub(super) mod raw_terminal;
 pub(super) mod resources;
+pub(super) mod harness_inventory;
 pub(super) mod search;
 pub(super) mod arrangements;
 pub(super) mod conversation_blocks;

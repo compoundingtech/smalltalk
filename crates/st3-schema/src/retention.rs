@@ -246,7 +246,7 @@ mod tests {
                 "runtime.action.requested" | "runtime.action.succeeded" | "runtime.action.failed"
                 | "runtime.action.deadline-reached" => Retention::SystemLocal,
                 "harness.observed" | "harness.usage" | "harness.todo.observed"
-                | "workspace.observed" => Retention::Latest,
+                | "harness.inventory.observed" | "workspace.observed" => Retention::Latest,
                 _ => Retention::Durable,
             };
             assert_eq!(spec.retention, before, "{kind}");
