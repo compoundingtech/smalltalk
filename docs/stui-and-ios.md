@@ -12,7 +12,18 @@ st
 
 The terminal UI opens a space with tabs and splits. **Ctrl+S** shows or hides the sidebar; choose **Agents** or **Missions** there. **Ctrl+K** finds an agent, mission, machine, space, or text in conversations; type a name and press **Enter** to open it.
 
-- **Home** (Now) lists your alerts, then updates that ask nothing. An alert is anything waiting on your answer: an ask, a review gate, a launch or revision approval, a harness prompt or login. Open it with **Ctrl+H** when you are not typing, or click the alert count in the top bar; the bar prints nothing when there are none. Each alert also shows in its agent's conversation, above the message box, with one-tap answers (a permission's allow and deny beside the call it would make, shown in full; a plan's approve; a Claude question's options, chosen and sent together; a screen prompt's own answers such as use, skip or trust; a request's named answers) and **open in Now** for the whole card. Follow each card's displayed actions; opening a card does not approve it.
+- **Home** (Now) lists your alerts, then updates that ask nothing. An alert is anything waiting on your answer: an ask, a review gate, a launch or revision approval, a harness prompt or login. Open it with **Ctrl+H** when you are not typing, or click the alert count in the top bar; the bar prints nothing when there are none. Each alert also shows in its agent's conversation, above the message box, as one line; click it or press **Ctrl+N** to expand it in place to the same card Now shows; a click on its top line, or **Esc** while the card has the keys, folds it back.
+
+A harness prompt's card reads like the harness's own dialog: what it asks about (the command, edit or plan in full), its question line ("Allow this read outside the working directories?"), and its options numbered in the harness's order and words ("1. Yes, but ask again next time"), with one marked **❯**. The card offers only the answers st can send, so the harness's other choices (keep allowing, auto-accept edits) stay in its terminal, and the card says so. A Claude question shows each question with its options to choose (several for a multi-select) before **Submit answers**; a screen prompt (a new MCP server, workspace trust) and a call Claude's auto mode denied show their own answers. The words come from one shared model for web, tui and ios, checked against the same cases in both languages: `crates/st3-ui-model/src/prompts.rs` (tui uses it) and `clients/typescript/st3-views/promptForm.ts` (for web and ios).
+
+Answering a prompt's card:
+
+- **Click** an option to answer it. A refusal (No, exit, quit) is a plain option and asks nothing more.
+- **Ctrl+N** in a conversation, or **a** on the card in Now, gives the card the keys. **↑/↓** and **Tab** move the mark and answer nothing. **1–9** answers that option, or chooses it for a question. **Enter** answers the marked option only when it is a safe one about what is shown in full (allow a call shown whole, approve a plan shown whole, submit your own choices, continue without an MCP server), never a refusal. **Esc** gives the keys back.
+- Typing never waits on a card: a letter goes straight to the message box with the keys.
+- A call too long for the band is cut there and its allow withheld; the card in Now (Ctrl+H) shows it whole and offers it.
+
+Follow each card's displayed actions; opening a card does not approve it.
 - **Agents** opens a seat's conversation, with messages, the harness transcript, and tool output. Scroll to read earlier entries; type in the message box and press **Enter** to reply.
 - **Missions** shows each run's steps, progress, waiting reason, and who is working on it.
 - **Usage** shows observed tokens, estimated cost, and account limits. Click **$ usage** in the top bar (widen the terminal if needed); **b** changes grouping and **p** changes the period.

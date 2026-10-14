@@ -17,6 +17,7 @@ package_view(
         "index.ts": "index.ts",
         "inventoryView.ts": "inventoryView.ts",
         "package.json": "package.json",
+        "promptForm.ts": "promptForm.ts",
         "requestView.ts": "requestView.ts",
         "sessionView.ts": "sessionView.ts",
         "slo.ts": "slo.ts",
