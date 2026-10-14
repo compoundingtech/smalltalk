@@ -4457,19 +4457,19 @@ mod tests {
         // Expanded on a click: the cards fill the room the conversation gives up.
         ui.click(Hit::Alert("agent/example/atlas/builder".into(), AlertTap::Toggle));
         let shown = screen(&ui);
-        assert!(shown.contains("1 alert") && shown.contains("deny") && shown.contains("open in Now"), "{shown}");
+        assert!(shown.contains("1 alert") && shown.contains("1. No") && !shown.contains("open in Now"), "{shown}");
         let lines: Vec<&str> = shown.lines().collect();
         let line = |needle: &str| lines.iter().position(|line| line.contains(needle)).unwrap();
-        assert!(line("open in Now") < line("Message Atlas Builder"), "{shown}");
+        assert!(line("1. No") < line("Message Atlas Builder"), "{shown}");
         assert!(line("Message Atlas Builder") + 3 >= lines.len(), "{shown}");
         // Another agent's conversation shows none of it.
         ui.open_in_glass(Pane::Agent(Some("agent/example/docs/writer".into())), Open::Tab);
         let other = screen(&ui);
-        assert!(!other.contains("open in Now"), "{other}");
+        assert!(!other.contains("1. No"), "{other}");
         // It clears itself when st stops listing it.
         ui.open_in_glass(Pane::Agent(Some("agent/example/atlas/builder".into())), Open::Tab);
         ui.world.attention = Load::Ready(vec![]);
-        assert!(!screen(&ui).contains("open in Now"));
+        assert!(!screen(&ui).contains("1. No"));
     }
 
     #[test]
@@ -6684,7 +6684,7 @@ mod tests {
     }
 
     #[test]
-    fn opened_alerts_read_as_a_pane_with_a_title_bar_a_bar_per_alert_and_a_rule_between() {
+    fn opened_alerts_read_as_a_pane_with_a_title_bar_and_each_alert_as_its_card() {
         let agent = "agent/example/atlas/builder";
         let mut ui = glass();
         ui.world.attention = Load::Ready(vec![
@@ -6695,15 +6695,16 @@ mod tests {
         ui.click(Hit::Alert(agent.into(), AlertTap::Toggle));
         let shown = screen(&ui);
         let lines: Vec<&str> = shown.lines().collect();
-        let title = lines.iter().position(|line| line.contains("◆ 2 alerts") && line.contains("▾ hide")).expect(&shown);
-        let rule = lines.iter().position(|line| line.contains("┄┄┄┄")).expect(&shown);
+        let title = lines.iter().position(|line| line.contains("◆ 2 alerts") && line.contains("▾ fold")).expect(&shown);
+        let card = lines.iter().position(|line| line.contains("┏━ PROMPT")).expect(&shown);
         let input = lines.iter().position(|line| line.contains("Message Atlas Builder")).expect(&shown);
-        assert!(title < rule && rule < input, "{shown}");
-        // Every row of an alert carries its bar, and what it says is wrapped, never cut at the edge.
-        let barred = lines[title + 1..input].iter().filter(|line| line.contains('▌')).count();
-        assert!(barred >= 6, "{shown}");
-        assert!(shown.matches("terminal (Ctrl+]) or open it in Now").count() == 2, "{shown}");
-        assert!(shown.matches("deny").count() >= 2, "the buttons stay in view: {shown}");
+        assert!(title < card && card < input, "{shown}");
+        // The card is the one Now shows: the form's refusal, numbered, and its keys in view.
+        assert!(shown.contains("1. No"), "the answers stay in view: {shown}");
+        assert!(shown.contains("Ctrl+N to answer with the keys"), "{shown}");
+        // A second card shows when it fits, else the band says how many more wait.
+        assert!(shown.matches("┏━ PROMPT").count() == 2 || shown.contains("+1 more in Now"), "{shown}");
+        assert!(!shown.contains("open in Now"), "{shown}");
     }
 
     #[test]

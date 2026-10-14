@@ -1,0 +1,164 @@
+[
+  {
+    "name": "a Claude read outside the working directories",
+    "harness": "claude",
+    "answers": ["allow", "deny"],
+    "prompt": "Claude asks to use Read",
+    "calls": [{ "tool": "Read", "input": { "file_path": "/srv/example/shared/notes.txt" } }],
+    "form": {
+      "question": "Allow this read outside the working directories?",
+      "options": [
+        { "answer": "allow", "label": "Yes, but ask again next time", "enter": true },
+        { "answer": "deny", "label": "No, and ask again next time", "enter": false }
+      ],
+      "mark": 0,
+      "elsewhere": "Claude's other choices are in its terminal (Ctrl+])."
+    }
+  },
+  {
+    "name": "a Claude command of several lines",
+    "harness": "claude",
+    "answers": ["allow", "deny"],
+    "prompt": "Claude asks to use Bash",
+    "calls": [{ "tool": "Bash", "input": { "command": "cd build\nmake clean\nmake all", "description": "Rebuild" } }],
+    "form": {
+      "question": "Do you want to proceed?",
+      "options": [
+        { "answer": "allow", "label": "Yes", "enter": true },
+        { "answer": "deny", "label": "No", "enter": false }
+      ],
+      "mark": 0,
+      "elsewhere": "Claude's other choices are in its terminal (Ctrl+])."
+    }
+  },
+  {
+    "name": "a Claude permission whose call is not in the conversation yet",
+    "harness": "claude",
+    "answers": ["allow", "deny"],
+    "prompt": "Claude asks to use Bash",
+    "calls": [],
+    "form": {
+      "question": "Do you want to proceed?",
+      "options": [{ "answer": "deny", "label": "No", "enter": false }],
+      "mark": null,
+      "elsewhere": "Claude's other choices are in its terminal (Ctrl+])."
+    }
+  },
+  {
+    "name": "a Claude edit",
+    "harness": "claude",
+    "answers": ["deny", "allow"],
+    "prompt": "Claude asks to use Edit",
+    "calls": [{ "tool": "Edit", "input": { "file_path": "src/garden.rs", "old_string": "a", "new_string": "b" } }],
+    "form": {
+      "question": "Do you want to make this edit to garden.rs?",
+      "options": [
+        { "answer": "allow", "label": "Yes", "enter": true },
+        { "answer": "deny", "label": "No", "enter": false }
+      ],
+      "mark": 0,
+      "elsewhere": "Claude's other choices are in its terminal (Ctrl+])."
+    }
+  },
+  {
+    "name": "a Claude plan",
+    "harness": "claude",
+    "answers": ["approve", "deny"],
+    "prompt": "Claude asks you to approve its plan",
+    "calls": [{ "tool": "ExitPlanMode", "input": { "plan": "1. Add a greeting\n2. Test it" } }],
+    "form": {
+      "question": "Would you like to proceed?",
+      "options": [
+        { "answer": "approve", "label": "Yes", "enter": true },
+        { "answer": "deny", "label": "No, keep planning", "enter": false }
+      ],
+      "mark": 0,
+      "elsewhere": "Claude's other choices are in its terminal (Ctrl+])."
+    }
+  },
+  {
+    "name": "a Claude question with a multi-select",
+    "harness": "claude",
+    "answers": ["answer", "deny"],
+    "prompt": "Claude asks a question",
+    "calls": [{ "tool": "AskUserQuestion", "input": { "questions": [
+      { "question": "Which color?", "header": "Color", "multiSelect": false, "options": [{ "label": "Red", "description": "" }, { "label": "Blue", "description": "" }] },
+      { "question": "Which pets?", "header": "Pets", "multiSelect": true, "options": [{ "label": "Cat", "description": "" }, { "label": "Dog", "description": "" }] }
+    ] } }],
+    "form": {
+      "question": "Ready to submit your answers?",
+      "options": [
+        { "answer": "answer", "label": "Submit answers", "enter": true },
+        { "answer": "deny", "label": "No, decline to answer", "enter": false }
+      ],
+      "mark": 0,
+      "elsewhere": null
+    }
+  },
+  {
+    "name": "Claude's new MCP server dialog",
+    "harness": "claude",
+    "answers": ["use", "use-all", "skip"],
+    "prompt": "New MCP server found in this project: example-echo.\nUse it, use it and all future ones, or continue without it.",
+    "calls": [],
+    "form": {
+      "question": "New MCP server found in this project: example-echo.",
+      "options": [
+        { "answer": "use", "label": "Use this MCP server", "enter": false },
+        { "answer": "use-all", "label": "Use this and all future MCP servers in this project", "enter": false },
+        { "answer": "skip", "label": "Continue without using this MCP server", "enter": true }
+      ],
+      "mark": 2,
+      "elsewhere": null
+    }
+  },
+  {
+    "name": "a Codex command approval",
+    "harness": "codex",
+    "answers": ["allow", "deny"],
+    "prompt": "Codex asks for approval",
+    "calls": [{ "tool": "shell", "input": { "command": "npm test -- --watch=false" } }],
+    "form": {
+      "question": "Would you like to run the following command?",
+      "options": [
+        { "answer": "allow", "label": "Yes, proceed", "enter": true },
+        { "answer": "deny", "label": "No", "enter": false }
+      ],
+      "mark": 0,
+      "elsewhere": "Codex's other choices are in its terminal (Ctrl+])."
+    }
+  },
+  {
+    "name": "a Codex trust dialog",
+    "harness": "codex",
+    "answers": ["trust", "quit"],
+    "prompt": "Do you trust the contents of this directory?",
+    "calls": [],
+    "form": {
+      "question": "Do you trust the contents of this directory?",
+      "options": [
+        { "answer": "trust", "label": "Yes, continue", "enter": false },
+        { "answer": "quit", "label": "No, quit", "enter": false }
+      ],
+      "mark": 0,
+      "elsewhere": null
+    }
+  },
+  {
+    "name": "a call Claude's auto mode denied",
+    "harness": "claude",
+    "answers": ["approve-once", "approve-kind", "dismiss"],
+    "prompt": "Claude's auto mode denied a Bash call (it reaches the network), and only you can allow it.",
+    "calls": [],
+    "form": {
+      "question": "Claude's auto mode denied this call. Allow it?",
+      "options": [
+        { "answer": "approve-once", "label": "Yes, allow it once", "enter": false },
+        { "answer": "approve-kind", "label": "Yes, and allow calls of its kind for this seat", "enter": false },
+        { "answer": "dismiss", "label": "No, leave it denied", "enter": false }
+      ],
+      "mark": 0,
+      "elsewhere": null
+    }
+  }
+]

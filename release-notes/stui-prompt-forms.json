@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "stui: a harness prompt reads like its harness's own form, in Now and expanded in place in its conversation",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "Client only. Uses the answers the daemon already lists under prompt.respond; nothing an answer means or how it reaches the harness changes. Adds a shared prompt form (st3-views promptForm, st3-ui-model prompts) for web, tui and ios."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No additional startup work or expected interruption."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator actions, client re-pairing or configuration changes required."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No persistent state changes or new swap-back restrictions."
+  }
+}

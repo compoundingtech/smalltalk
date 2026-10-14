@@ -274,6 +274,8 @@ pub struct Drafts<'a> {
     pub needs_words: Option<String>,
     /// "Chat about this": who it goes to, the draft, and the thread so far.
     pub chat: Option<Chat<'a>>,
+    /// A prompt's form: its mark, whether it has the keys, and a question's choices.
+    pub form: super::alerts::FormState<'a>,
 }
 
 pub struct Chat<'a> {
@@ -1203,10 +1205,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             );
         }
         AttentionKind::Prompt {
-            seat,
-            text: prompt,
-            answers,
-            ..
+            seat, text: prompt, ..
         } => {
             card.line(Line::from(vec![
                 span("waits  ", theme::dim()),
@@ -1215,23 +1214,16 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             card.blank();
             card.lines(text::markdown(&spaced(prompt), inner, theme::text()));
             card.blank();
-            if answers.is_empty() {
-                card.wrap(
-                    &text::inline(
-                        "Answer it in the seat's terminal (Ctrl+]). This clears when the prompt is gone, however it was answered.",
-                        theme::dim(),
-                    ),
-                    inner,
-                );
-            } else {
-                card.wrap(
-                    &text::inline(
-                        "The call it would make is the pending one in the seat's conversation: open the conversation to read it in full, then allow or deny it there. This clears when the prompt is gone, however it was answered.",
-                        theme::dim(),
-                    ),
-                    inner,
-                );
-            }
+            // The same form the band in its conversation expands to, with the call in full.
+            super::alerts::prompt_form(
+                &mut card,
+                world,
+                item,
+                drafts.form,
+                inner,
+                None,
+                super::alerts::Place::Now,
+            );
         }
         AttentionKind::Login { text: login, seats } => {
             card.lines(text::markdown(&spaced(login), inner, theme::text()));
@@ -1380,6 +1372,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             needs_words: None,
             confirm: None,
             chat: None,
+            form: Default::default(),
         };
         text_box(
             &mut card,

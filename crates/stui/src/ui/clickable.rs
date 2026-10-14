@@ -41,7 +41,6 @@ impl Ui {
             Hit::Answer(_) => "choose answer; Enter sends".into(),
             Hit::Alert(_, AlertTap::Answer(_)) => "answer this alert".into(),
             Hit::Alert(_, AlertTap::Choose(..)) => "choose this answer".into(),
-            Hit::Alert(_, AlertTap::Open) => "open this alert in Now".into(),
             Hit::Alert(_, AlertTap::Toggle) => "show or hide the alerts".into(),
             Hit::Voice => "start voice input".into(),
             Hit::NewTerminal => "new terminal".into(),

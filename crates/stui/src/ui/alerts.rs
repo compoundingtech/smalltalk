@@ -1,102 +1,424 @@
 //! Alerts in the conversation of the agent they belong to: what waits on the person, above the
-//! message box, with the answers that one tap can send and a way into the whole card in Now.
+//! message box, folded to one line until the person expands it in place to the whole card.
 //!
 //! An alert is anything that blocks or waits on an answer: an ask, a human gate, a launch or
 //! revision approval, a native harness prompt or a harness login. It clears itself when it is
 //! answered anywhere, so the band shows exactly what st lists and nothing it remembers.
+//!
+//! A native prompt is a form that reads like the harness's own dialog: its question line, its
+//! options numbered in its order with one marked, and the keys in a footer. The same form is the
+//! prompt's card in Now and its card in the band, built by [`prompt_form`] from the shared model
+//! in `st3_ui_model::prompts` (web, tui and ios offer the same answers in the same words).
+//! Focus only focuses: arrows and Tab move the mark and answer nothing. An answer takes its own
+//! number or a click on its own row, and Enter takes the marked one only when Enter may (the
+//! call or plan shown in full, the person's own choices, or a safe way past); never a refusal.
 
-use super::doc::AlertTap;
+use super::doc::{AlertTap, Target};
 use super::*;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier};
+use std::collections::{BTreeMap, BTreeSet};
+use st3_ui_model::prompts::{self, Call, Form, Kind, Question};
 
-/// The most alerts the band lists before it says how many more wait in Now.
+/// The most alerts the band shows expanded before it says how many more wait in Now.
 const SHOWN: usize = 2;
 /// The lines of a pending call the band shows. A call that is longer is cut with an ellipsis, and
-/// then `allow` is withheld: a person allows only what they can read in full.
+/// then `allow` is withheld: a person allows only what they can read in full. Now shows it all.
 const CALL_LINES: usize = 4;
 /// The lines of a plan the band shows before it is cut and `approve` is withheld likewise.
 const PLAN_LINES: usize = 24;
 
-/// A pending call's input as lines a person reads: each field on its own line, with a value's
-/// further lines indented under it, so a multi-line command or an edit's text is there in full.
-fn call_lines(call: &PendingCall) -> Vec<String> {
-    let mut lines = Vec::new();
-    match &call.input {
-        serde_json::Value::Object(fields) => {
-            for (key, value) in fields {
-                let text = match value {
-                    serde_json::Value::String(text) => text.clone(),
-                    other => serde_json::to_string_pretty(other).unwrap_or_default(),
-                };
-                let mut rest = text.lines();
-                lines.push(format!("{key}: {}", rest.next().unwrap_or_default()));
-                lines.extend(rest.map(|line| format!("  {line}")));
-            }
+/// Where a prompt's form is drawn: its words for the keys differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Place {
+    /// The band above a conversation's message box: Ctrl+N gives it the keys, Esc folds it.
+    Band,
+    /// The prompt's card in Now: `a` gives it the keys.
+    Now,
+}
+
+/// One numbered row of a prompt's form, in the order it is drawn and numbered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum FormRow {
+    /// An option of a harness question: its question's and its own place in the pending call.
+    Choose(usize, usize),
+    /// An answer st sends.
+    Answer(String),
+}
+
+/// What the person has done on a form so far: the mark, whether it has the keys, and a question's
+/// choices.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct FormState<'a> {
+    pub mark: Option<usize>,
+    pub keys: bool,
+    pub chosen: Option<&'a BTreeMap<usize, BTreeSet<usize>>>,
+}
+
+/// A native prompt read as a form: the calls it may be about, the shared model's form, and its
+/// rows.
+pub(super) struct PromptModel<'w> {
+    harness: Harness,
+    calls: Vec<&'w PendingCall>,
+    form: Form,
+    questions: Option<Vec<Question>>,
+    pub rows: Vec<FormRow>,
+}
+
+impl PromptModel<'_> {
+    /// The row marked when the person has not moved the mark: a question's first option, else
+    /// the form's own mark.
+    pub fn default_mark(&self) -> Option<usize> {
+        match &self.questions {
+            Some(_) => Some(0),
+            None => self.form.mark,
         }
-        serde_json::Value::Null => {}
-        serde_json::Value::String(text) => lines.extend(text.lines().map(str::to_owned)),
-        other => lines.extend(
-            serde_json::to_string_pretty(other)
-                .unwrap_or_default()
-                .lines()
-                .map(str::to_owned),
-        ),
     }
-    lines
-}
 
-/// One question of a harness's pending `AskUserQuestion` call.
-#[derive(Debug, Clone, PartialEq)]
-struct Question {
-    text: String,
-    header: String,
-    options: Vec<String>,
-    multi: bool,
-}
-
-/// The questions an `AskUserQuestion` call asks, when it is one and they can be read.
-fn questions(call: &PendingCall) -> Option<Vec<Question>> {
-    if call.tool != "AskUserQuestion" {
-        return None;
-    }
-    let asked = call.input.get("questions")?.as_array()?;
-    let questions = asked
-        .iter()
-        .map(|question| {
-            Some(Question {
-                text: question.get("question")?.as_str()?.to_owned(),
-                header: question
-                    .get("header")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                options: question
-                    .get("options")?
-                    .as_array()?
-                    .iter()
-                    .map(|option| option.get("label")?.as_str().map(str::to_owned))
-                    .collect::<Option<Vec<_>>>()?,
-                multi: question
-                    .get("multiSelect")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false),
+    /// Every question has a choice, so the answers can be sent.
+    fn complete(&self, chosen: Option<&BTreeMap<usize, BTreeSet<usize>>>) -> bool {
+        self.questions.as_ref().is_some_and(|asked| {
+            (0..asked.len()).all(|index| {
+                chosen
+                    .and_then(|chosen| chosen.get(&index))
+                    .is_some_and(|picked| !picked.is_empty())
             })
         })
-        .collect::<Option<Vec<_>>>()?;
-    (!questions.is_empty() && questions.iter().all(|question| !question.options.is_empty()))
-        .then_some(questions)
+    }
 }
 
-/// How an answer a prompt offers reads on its button.
-fn answer_label(answer: &str) -> String {
-    match answer {
-        "use-all" => "use all".into(),
-        "approve" => "approve plan".into(),
-        "answer" => "send".into(),
-        "approve-once" => "allow once".into(),
-        "approve-kind" => "allow this kind".into(),
-        other => other.to_owned(),
+/// The calls to show beside a prompt's answers: the exact call it asks about, when st names it
+/// (none when its harness named none); from an older daemon, every unanswered call, of which only
+/// a lone one is certain.
+fn prompt_calls<'w>(world: &'w World, seat: &str, call: &Option<Option<String>>) -> Vec<&'w PendingCall> {
+    let waiting = world.pending_calls.get(seat).map(Vec::as_slice).unwrap_or_default();
+    match call {
+        None => waiting.iter().collect(),
+        Some(named) => waiting
+            .iter()
+            .filter(|pending| named.as_deref() == Some(pending.id.as_str()))
+            .collect(),
     }
+}
+
+/// A native prompt as a form, when st lists answers for it.
+pub(super) fn prompt_model<'w>(world: &'w World, item: &Attention) -> Option<PromptModel<'w>> {
+    let AttentionKind::Prompt {
+        seat_id,
+        answers,
+        text,
+        call,
+        ..
+    } = &item.kind
+    else {
+        return None;
+    };
+    if answers.is_empty() {
+        return None;
+    }
+    let harness = world
+        .agents
+        .items()
+        .iter()
+        .find(|agent| &agent.id == seat_id)
+        .map_or(Harness::Unknown, |agent| agent.harness);
+    let calls = prompt_calls(world, seat_id, call);
+    let shared: Vec<Call<'_>> = calls
+        .iter()
+        .map(|call| Call {
+            tool: &call.tool,
+            input: &call.input,
+        })
+        .collect();
+    let form = prompts::prompt_form(
+        match harness {
+            Harness::Claude => prompts::Harness::Claude,
+            Harness::Codex => prompts::Harness::Codex,
+            _ => prompts::Harness::Other,
+        },
+        answers,
+        text,
+        &shared,
+    );
+    let questions = match (form.kind, shared.as_slice()) {
+        (Kind::Question, [only]) => prompts::questions(*only),
+        _ => None,
+    };
+    let mut rows = Vec::new();
+    for (index, question) in questions.iter().flatten().enumerate() {
+        rows.extend((0..question.options.len()).map(|option| FormRow::Choose(index, option)));
+    }
+    rows.extend(
+        form.options
+            .iter()
+            .map(|option| FormRow::Answer(option.answer.clone())),
+    );
+    Some(PromptModel {
+        harness,
+        calls,
+        form,
+        questions,
+        rows,
+    })
+}
+
+/// One option row: the mark, its number and its words, wrapped under themselves.
+fn option_lines(marked: bool, keys: bool, number: usize, label: &str, style: Style, width: usize) -> Vec<Line<'static>> {
+    let lead = if marked { "❯ " } else { "  " };
+    let style = if marked {
+        style.add_modifier(Modifier::BOLD).fg(theme::ACCENT)
+    } else {
+        style
+    };
+    let lead_style = if marked && keys {
+        theme::strong(theme::ACCENT)
+    } else if marked {
+        theme::fg(theme::ACCENT)
+    } else {
+        theme::dim()
+    };
+    let number = format!("{number}. ");
+    let indent = " ".repeat(text::width(lead) + text::width(&number));
+    text::wrap(
+        &[text::run(label.to_owned(), style)],
+        width,
+        &[text::run(lead, lead_style), text::run(number, if marked { lead_style } else { theme::dim() })],
+        &[text::run(indent, theme::dim())],
+        None,
+    )
+}
+
+/// A prompt's form into `doc` at `width`: what it is about (the call or plan in full, or the
+/// questions to choose from), the harness's question line, its numbered options with one marked,
+/// and the keys. `limit` cuts a call (the band's few lines); a call that is cut withholds the
+/// answers that would let it through. Returns whether the call or plan it is about is in view
+/// in full, and how many of its lines are shown.
+pub(super) fn prompt_form(
+    doc: &mut Doc,
+    world: &World,
+    item: &Attention,
+    state: FormState<'_>,
+    width: usize,
+    limit: Option<usize>,
+    place: Place,
+) -> (bool, usize) {
+    let Some(model) = prompt_model(world, item) else {
+        doc.wrap(
+            &text::inline(
+                "Answer it in the seat's terminal (Ctrl+]). This clears when the prompt is gone, however it was answered.",
+                theme::dim(),
+            ),
+            width,
+        );
+        return (false, 0);
+    };
+    let id = &item.id;
+    let harness = model.harness.name();
+    let note = |doc: &mut Doc, words: &str| doc.wrap(&text::inline(words, theme::dim()), width);
+    // What it is about.
+    let mut full = true;
+    let mut call_shown = 0;
+    match model.calls.as_slice() {
+        [_, _, ..] => {
+            note(
+                doc,
+                &format!(
+                    "{} calls are unanswered and st cannot tell which one {harness} asks about, so it offers no allow here:",
+                    model.calls.len()
+                ),
+            );
+            for call in model.calls.iter().take(CALL_LINES) {
+                let line = prompts::call_lines(&call.input).into_iter().next().unwrap_or_default();
+                doc.line(Line::from(vec![
+                    Span::styled(" · ", theme::dim()),
+                    Span::styled(
+                        text::truncate(&format!("{} {line}", call.tool), width.saturating_sub(4)),
+                        theme::text(),
+                    ),
+                ]));
+            }
+            if model.calls.len() > CALL_LINES {
+                note(doc, &format!(" … and {} more", model.calls.len() - CALL_LINES));
+            }
+            doc.blank();
+        }
+        [only] if model.questions.is_none() => {
+            let limit = limit.map(|limit| {
+                limit.min(if model.form.kind == Kind::Plan { PLAN_LINES } else { CALL_LINES })
+            });
+            // What would run sits behind a bar, apart from the options: a plan as markdown, as the
+            // harness shows it; any other call field by field.
+            let lines = match only.input.get("plan").and_then(serde_json::Value::as_str) {
+                Some(plan) if model.form.kind == Kind::Plan => text::markdown(plan, width.saturating_sub(2), theme::text())
+                    .into_iter()
+                    .map(|mut line| {
+                        line.spans.insert(0, Span::styled("▏ ", theme::fg(theme::SURFACE2)));
+                        line
+                    })
+                    .collect(),
+                _ => text::wrap(
+                    &[text::run(prompts::call_lines(&only.input).join("\n"), theme::text())],
+                    width.saturating_sub(2),
+                    &[text::run("▏ ", theme::fg(theme::SURFACE2))],
+                    &[text::run("▏ ", theme::fg(theme::SURFACE2))],
+                    None,
+                ),
+            };
+            doc.line(Line::from(Span::styled(only.tool.clone(), theme::bold())));
+            let shown = limit.map_or(lines.len(), |limit| limit.min(lines.len()));
+            full = shown == lines.len();
+            call_shown = shown;
+            for (index, mut line) in lines.into_iter().take(shown).enumerate() {
+                if !full && index + 1 == shown {
+                    line.spans.push(Span::styled(" …", theme::dim()));
+                }
+                doc.line(line);
+            }
+            doc.blank();
+        }
+        [_] => {}
+        [] if matches!(model.form.kind, Kind::Permission | Kind::Plan | Kind::Question) => {
+            note(
+                doc,
+                "What it asks about is not in the conversation yet, so st offers only what needs no reading. Or answer it in the terminal (Ctrl+]).",
+            );
+            doc.blank();
+        }
+        [] => {}
+    }
+    let mark = state.mark.or(model.default_mark());
+    let mut number = 0;
+    // A question's options are chosen here, any number of them for a multi-select.
+    for (index, question) in model.questions.iter().flatten().enumerate() {
+        let header = if question.header.is_empty() {
+            question.text.clone()
+        } else {
+            format!("{} · {}", question.header, question.text)
+        };
+        doc.lines(text::wrap(
+            &[
+                text::run(header, theme::bold()),
+                text::run(if question.multi { "  (choose any)" } else { "" }, theme::dim()),
+            ],
+            width,
+            &[],
+            &[],
+            None,
+        ));
+        let picked = state.chosen.and_then(|chosen| chosen.get(&index));
+        for (option, choice) in question.options.iter().enumerate() {
+            let on = picked.is_some_and(|picked| picked.contains(&option));
+            let box_ = match (question.multi, on) {
+                (true, true) => "[✓] ",
+                (true, false) => "[ ] ",
+                (false, true) => "✓ ",
+                (false, false) => "",
+            };
+            let mut label = format!("{box_}{}", choice.label);
+            if !choice.description.is_empty() {
+                label.push_str(&format!(" · {}", choice.description));
+            }
+            let line = doc.lines.len();
+            let style = if on { theme::fg(theme::GREEN) } else { theme::text() };
+            doc.lines(option_lines(mark == Some(number), state.keys, number + 1, &label, style, width));
+            doc.targets.push(Target {
+                line,
+                column: 0,
+                width: width as u16,
+                hit: Hit::Alert(id.clone(), AlertTap::Choose(index, option)),
+            });
+            number += 1;
+        }
+        doc.blank();
+    }
+    // The harness's question line, then its answers.
+    doc.lines(text::wrap(&[text::run(model.form.question.clone(), theme::bold())], width, &[], &[], None));
+    let complete = model.complete(state.chosen);
+    for option in &model.form.options {
+        let marked = mark == Some(number);
+        // An answer is a row that answers only when it can: a call cut short is not let through,
+        // and a question's answers go once every question has a choice.
+        let withheld = match option.answer.as_str() {
+            "allow" | "approve" if !full => Some("too long to show here in full"),
+            "answer" if !complete => Some("choose an answer to each question first"),
+            _ => None,
+        };
+        let line = doc.lines.len();
+        match withheld {
+            Some(why) => doc.lines(option_lines(
+                marked,
+                state.keys,
+                number + 1,
+                &format!("{} · {why}", option.label),
+                theme::dim(),
+                width,
+            )),
+            None => {
+                doc.lines(option_lines(marked, state.keys, number + 1, &option.label, theme::text(), width));
+                doc.targets.push(Target {
+                    line,
+                    column: 0,
+                    width: width as u16,
+                    hit: Hit::Alert(id.clone(), AlertTap::Answer(option.answer.clone())),
+                });
+            }
+        }
+        number += 1;
+    }
+    if !full {
+        note(
+            doc,
+            match place {
+                Place::Band => "The call is too long to show here in full: read it in Now (Ctrl+H), or answer it in the terminal (Ctrl+]).",
+                Place::Now => "The call is too long to show here in full: answer it in the terminal (Ctrl+]).",
+            },
+        );
+    }
+    if let Some(elsewhere) = &model.form.elsewhere {
+        note(doc, elsewhere);
+    }
+    doc.blank();
+    // The keys, as the harness's dialog lists its own.
+    let marked = mark.and_then(|mark| model.rows.get(mark));
+    let enter = match marked {
+        Some(FormRow::Choose(question, _)) => Some(
+            if model.questions.as_ref().is_some_and(|asked| asked[*question].multi) {
+                "Enter to toggle"
+            } else {
+                "Enter to choose"
+            },
+        ),
+        Some(FormRow::Answer(answer))
+            if prompts::enter_answers(answer)
+                && !(matches!(answer.as_str(), "allow" | "approve") && !full)
+                && !(answer == "answer" && !complete) =>
+        {
+            Some("Enter to select")
+        }
+        _ => None,
+    };
+    let count = model.rows.len();
+    let numbers = if count > 1 {
+        format!("1–{} to choose", count.min(9))
+    } else {
+        "1 to choose".into()
+    };
+    let hints = if state.keys {
+        let mut hints: Vec<String> = enter.map(str::to_owned).into_iter().collect();
+        hints.push("↑/↓ to move".into());
+        hints.push(numbers);
+        hints.push(match place {
+            Place::Band => "Esc to fold".into(),
+            Place::Now => "Esc to stop".into(),
+        });
+        hints.join(" · ")
+    } else {
+        match place {
+            Place::Band => "Ctrl+N to answer with the keys · or click an option".into(),
+            Place::Now => "a to answer with the keys · or click an option".into(),
+        }
+    };
+    doc.wrap(&[text::run(hints, theme::dim())], width);
+    (full, call_shown)
 }
 
 /// One row of the band: its line, and the buttons on it by column.
@@ -106,13 +428,6 @@ pub(super) struct BandRow {
 }
 
 impl BandRow {
-    fn text(spans: Vec<Span<'static>>) -> Self {
-        Self {
-            line: Line::from(spans),
-            hits: Vec::new(),
-        }
-    }
-
     /// The buttons in as few rows as fit `width`.
     fn button_rows(buttons: Vec<(String, Color, Hit)>, width: usize) -> Vec<Self> {
         let mut rows = Vec::new();
@@ -153,23 +468,24 @@ impl BandRow {
             hits,
         }
     }
-}
 
-/// A dim note under an alert's title, wrapped to the pane instead of cut at its edge.
-fn note_rows(note: &str, width: usize) -> Vec<BandRow> {
-    text::wrap(
-        &[text::run(note.to_owned(), theme::dim())],
-        width,
-        &[text::run("   ", theme::dim())],
-        &[text::run("   ", theme::dim())],
-        None,
-    )
-    .into_iter()
-    .map(|line| BandRow {
-        line,
-        hits: Vec::new(),
-    })
-    .collect()
+    /// A document's lines as rows, each with the targets on it.
+    fn from_doc(doc: Doc) -> Vec<Self> {
+        let mut rows: Vec<Self> = doc
+            .lines
+            .into_iter()
+            .map(|line| Self {
+                line,
+                hits: Vec::new(),
+            })
+            .collect();
+        for target in doc.targets {
+            if let Some(row) = rows.get_mut(target.line) {
+                row.hits.push((target.column, target.width, target.hit));
+            }
+        }
+        rows
+    }
 }
 
 impl Ui {
@@ -188,233 +504,32 @@ impl Ui {
             .collect()
     }
 
-    /// The tool calls the conversation records with no result yet, oldest first, in full.
-    fn calls_waiting(&self, agent: &str) -> &[PendingCall] {
-        self.world
-            .pending_calls
-            .get(agent)
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-    }
-
-    /// The calls to show beside a prompt's answers: the exact call it asks about, when st names
-    /// it (none when its harness named none); from an older daemon, every unanswered call, of
-    /// which only a lone one is certain.
-    fn prompt_calls(&self, seat: &str, call: &Option<Option<String>>) -> Vec<&PendingCall> {
-        let waiting = self.calls_waiting(seat);
-        match call {
-            None => waiting.iter().collect(),
-            Some(named) => waiting
-                .iter()
-                .filter(|pending| named.as_deref() == Some(pending.id.as_str()))
-                .collect(),
+    /// What the person has done on alert `id`'s form.
+    pub(super) fn form_state(&self, id: &str) -> FormState<'_> {
+        FormState {
+            mark: self.prompt_marks.get(id).copied(),
+            keys: self.prompt_keys.as_deref() == Some(id),
+            chosen: self.question_choices.get(id),
         }
-    }
-
-    /// What the band shows under a native prompt, and its buttons. `allow` and `approve` are
-    /// offered only beside the one waiting call shown in full; a question's options are chosen
-    /// here and sent together; a screen prompt's own answers (use, skip, trust, ...) and `deny`
-    /// are always one tap.
-    fn prompt_answer_rows(
-        &self,
-        id: &str,
-        seat: &str,
-        answers: &[String],
-        prompt: &str,
-        call: &Option<Option<String>>,
-        width: usize,
-    ) -> (Vec<BandRow>, Vec<(String, Color, Hit)>) {
-        let mut rows = Vec::new();
-        let mut buttons = Vec::new();
-        let button = |answer: &str, color: Color| {
-            (
-                answer_label(answer),
-                color,
-                Hit::Alert(id.to_owned(), AlertTap::Answer(answer.to_owned())),
-            )
-        };
-        if answers.is_empty() {
-            // Answered where it is shown.
-            rows.extend(
-                text::wrap(
-                    &[text::run(
-                        format!("{} · answer it in the terminal (Ctrl+])", first_line(prompt)),
-                        theme::dim(),
-                    )],
-                    width,
-                    &[text::run("   ", theme::dim())],
-                    &[text::run("   ", theme::dim())],
-                    None,
-                )
-                .into_iter()
-                .take(2)
-                .map(|line| BandRow { line, hits: Vec::new() }),
-            );
-            return (rows, buttons);
-        }
-        let calls = self.prompt_calls(seat, call);
-        let gated = answers
-            .iter()
-            .find(|answer| matches!(answer.as_str(), "allow" | "approve" | "answer"));
-        match (gated.map(String::as_str), calls.as_slice()) {
-            (Some("answer"), [only]) if let Some(asked) = questions(only) => {
-                let chosen = self.question_choices.get(&question_key(id, &only.id));
-                for (index, question) in asked.iter().enumerate() {
-                    let header = if question.header.is_empty() {
-                        question.text.clone()
-                    } else {
-                        format!("{} · {}", question.header, question.text)
-                    };
-                    rows.extend(note_rows(
-                        &format!(
-                            "{header}{}",
-                            if question.multi { " (choose any)" } else { "" }
-                        ),
-                        width,
-                    ));
-                    let picked = chosen.and_then(|chosen| chosen.get(&index));
-                    rows.extend(BandRow::button_rows(
-                        question
-                            .options
-                            .iter()
-                            .enumerate()
-                            .map(|(option, label)| {
-                                let on = picked.is_some_and(|picked| picked.contains(&option));
-                                (
-                                    format!("{}{}", if on { "✓ " } else { "" }, text::truncate(label, 32)),
-                                    if on { theme::GREEN } else { theme::SURFACE2 },
-                                    Hit::Alert(id.to_owned(), AlertTap::Choose(index, option)),
-                                )
-                            })
-                            .collect(),
-                        width,
-                    ));
-                }
-                let complete = (0..asked.len()).all(|index| {
-                    chosen
-                        .and_then(|chosen| chosen.get(&index))
-                        .is_some_and(|picked| !picked.is_empty())
-                });
-                if complete {
-                    buttons.push(button("answer", theme::GREEN));
-                }
-            }
-            (Some("answer"), _) => rows.extend(note_rows(
-                "the question is not in the conversation yet: answer it in the terminal (Ctrl+]) or open it in Now",
-                width,
-            )),
-            // Several calls wait and the prompt names none: show them all and offer no allow.
-            (Some(_), [_, _, ..]) => {
-                rows.extend(note_rows(
-                    &format!(
-                        "{} calls are unanswered and st cannot tell which one the harness asks about; answer it in the terminal (Ctrl+]):",
-                        calls.len()
-                    ),
-                    width,
-                ));
-                for call in calls.iter().take(CALL_LINES) {
-                    let line = call_lines(call).into_iter().next().unwrap_or_default();
-                    rows.push(BandRow::text(vec![
-                        Span::styled("   · ", theme::dim()),
-                        Span::styled(
-                            text::truncate(&format!("{} {line}", call.tool), width.saturating_sub(8)),
-                            theme::text(),
-                        ),
-                    ]));
-                }
-                if calls.len() > CALL_LINES {
-                    rows.push(BandRow::text(vec![Span::styled(
-                        format!("   … and {} more", calls.len() - CALL_LINES),
-                        theme::dim(),
-                    )]));
-                }
-            }
-            (Some(gated), [only]) => {
-                let limit = if gated == "approve" { PLAN_LINES } else { CALL_LINES };
-                let mut runs = vec![text::run(format!("{}\n", only.tool), theme::bold())];
-                runs.push(text::run(call_lines(only).join("\n"), theme::text()));
-                let lines = text::wrap(
-                    &runs,
-                    width.saturating_sub(4),
-                    &[text::run("   ", theme::dim())],
-                    &[text::run("   ", theme::dim())],
-                    None,
-                );
-                let cut = lines.len() > limit;
-                let last = lines.len().min(limit);
-                for (index, line) in lines.into_iter().take(limit).enumerate() {
-                    let mut line = line;
-                    if cut && index + 1 == last {
-                        line.spans.push(Span::styled(" …", theme::dim()));
-                    }
-                    rows.push(BandRow { line, hits: Vec::new() });
-                }
-                // The whole call must be in view to allow it, and the whole plan to approve it.
-                if !cut {
-                    buttons.push(button(gated, theme::GREEN));
-                } else {
-                    rows.extend(note_rows(
-                        "it is too long to show here in full: open it in Now, or answer it in the terminal (Ctrl+])",
-                        width,
-                    ));
-                }
-            }
-            (Some(_), []) => rows.extend(note_rows(
-                "the call it would make is not in the conversation yet: answer it in the terminal (Ctrl+]) or open it in Now",
-                width,
-            )),
-            (None, _) => rows.extend(note_rows(first_line(prompt), width)),
-        }
-        // A screen prompt's own answers, then deny, are one tap each.
-        for answer in answers {
-            match answer.as_str() {
-                "allow" | "approve" | "answer" | "deny" => {}
-                other => buttons.push(button(other, theme::ACCENT)),
-            }
-        }
-        if answers.iter().any(|answer| answer == "deny") {
-            buttons.push((
-                if gated.is_some_and(|gated| gated == "answer") {
-                    "decline".into()
-                } else {
-                    "deny".into()
-                },
-                theme::RED,
-                Hit::Alert(id.to_owned(), AlertTap::Answer("deny".into())),
-            ));
-        }
-        (rows, buttons)
     }
 
     /// Choose an option of a harness question alert's question, or for a multi-select toggle
     /// it. Nothing is sent until the person sends every question's choice.
     pub(super) fn choose_answer(&mut self, id: &str, question: usize, option: usize) {
-        let Some((seat, call)) = self.world.attention.items().iter().find_map(|item| match &item.kind {
-            AttentionKind::Prompt { seat_id, call, .. } if item.id == id => {
-                Some((seat_id.clone(), call.clone()))
-            }
-            _ => None,
-        }) else {
-            self.flash("That alert is gone");
+        let Some(item) = self.world.attention.items().iter().find(|item| item.id == id) else {
+            self.flash(GONE);
             return;
         };
-        let Some((asked, key)) = (match self.prompt_calls(&seat, &call).as_slice() {
-            [only] => questions(only).map(|asked| (asked, question_key(id, &only.id))),
-            _ => None,
-        }) else {
+        let Some(asked) = prompt_model(&self.world, item).and_then(|model| model.questions) else {
             self.flash("The question is gone");
             return;
         };
         let Some(multi) = asked.get(question).map(|question| question.multi) else {
             return;
         };
-        // Picks belong to this exact question call: a replaced question starts with none.
-        let prefix = question_key(id, "");
-        self.question_choices
-            .retain(|other, _| *other == key || !other.starts_with(&prefix));
         let picked = self
             .question_choices
-            .entry(key)
+            .entry(id.to_owned())
             .or_default()
             .entry(question)
             .or_default();
@@ -431,13 +546,10 @@ impl Ui {
     /// The JSON a question alert sends: positions only, each question's position to the positions
     /// of the options chosen. The questions and labels stay in the conversation; the seat's hook
     /// turns positions into labels.
-    fn question_answer(&self, id: &str, seat: &str, call: &Option<Option<String>>) -> Option<String> {
-        let calls = self.prompt_calls(seat, call);
-        let [only] = calls.as_slice() else {
-            return None;
-        };
-        let asked = questions(only)?;
-        let chosen = self.question_choices.get(&question_key(id, &only.id))?;
+    fn question_answer(&self, id: &str) -> Option<String> {
+        let item = self.world.attention.items().iter().find(|item| item.id == id)?;
+        let asked = prompt_model(&self.world, item)?.questions?;
+        let chosen = self.question_choices.get(id)?;
         let mut answers = serde_json::Map::new();
         for (index, question) in asked.iter().enumerate() {
             let options = chosen
@@ -454,21 +566,22 @@ impl Ui {
         Some(serde_json::Value::Object(answers).to_string())
     }
 
-    /// The band for `agent` at `width` columns: empty when nothing waits on the person there,
-    /// one line that says what waits until the person expands it, then the cards. It is only a
-    /// click away from either: no key reaches it, so typing is never taken by an alert.
-    pub(super) fn alert_band(&self, agent: &str, width: usize) -> Vec<BandRow> {
+    /// The band for `agent` at `width` columns and at most `room` rows: empty when nothing waits
+    /// on the person there, one line that says what waits until the person expands it, then the
+    /// cards in place. The line is a click or Ctrl+N away from them; no other key reaches it, so
+    /// typing is never taken by an alert.
+    pub(super) fn alert_band(&self, agent: &str, width: usize, room: usize) -> Vec<BandRow> {
         let alerts = self.alerts_in(agent);
         let Some(first) = alerts.first() else {
             return Vec::new();
         };
         if self.alerts_open.contains(agent) {
-            return self.alert_card(agent, width);
+            return self.alert_card(agent, width, room);
         }
         let count = alerts.len();
         let (glyph, color) = screens::attention_style(&first.kind);
         let lead = format!(" ◆ {count} alert{} · ", if count == 1 { "" } else { "s" });
-        let tail = " ▸ show ";
+        let tail = " ▸ show · Ctrl+N ";
         let room = width
             .saturating_sub(text::width(&lead) + text::width(tail) + 4)
             .max(8);
@@ -491,27 +604,142 @@ impl Ui {
         }]
     }
 
-    /// Show or hide the cards of `agent`'s alerts.
+    /// Show or hide the cards of `agent`'s alerts. Folding them takes the keys back from them.
     pub(super) fn toggle_alerts(&mut self, agent: &str) {
         if !self.alerts_open.remove(agent) {
             self.alerts_open.insert(agent.to_owned());
+        } else if self
+            .prompt_keys
+            .as_ref()
+            .is_some_and(|id| self.alerts_in(agent).iter().any(|item| &item.id == id))
+        {
+            self.prompt_keys = None;
         }
     }
 
-    /// The cards of `agent`'s alerts at `width` columns, under a line that hides them again.
-    fn alert_card(&self, agent: &str, width: usize) -> Vec<BandRow> {
+    /// One alert's card for the band, as its card in Now draws it: its kind and age in the frame,
+    /// its title, and for a prompt the same form, the call cut to `limit` lines. Also returns how
+    /// many lines of the call it shows.
+    fn band_card(&self, item: &Attention, width: usize, limit: usize) -> (Doc, usize) {
+        let (_, color) = screens::attention_style(&item.kind);
+        let heavy = color == theme::PERSON;
+        let inner = width.saturating_sub(4).max(10);
+        let mut card = Doc::new();
+        card.lines(text::wrap(
+            &[text::run(item.title.clone(), theme::bold())],
+            inner,
+            &[],
+            &[],
+            None,
+        ));
+        let mut buttons: Vec<(String, Color, Hit)> = Vec::new();
+        let mut call_shown = 0;
+        match &item.kind {
+            AttentionKind::Prompt { .. } => {
+                card.blank();
+                (_, call_shown) = prompt_form(
+                    &mut card,
+                    &self.world,
+                    item,
+                    self.form_state(&item.id),
+                    inner,
+                    Some(limit),
+                    Place::Band,
+                );
+            }
+            AttentionKind::Request {
+                structured: Some(request),
+                ..
+            } => {
+                // A named answer is one tap, unless it needs the person's words: that one is
+                // written in Now.
+                for answer in request
+                    .answers
+                    .iter()
+                    .filter(|answer| answer.outcome.as_deref() != Some("request_changes"))
+                    .take(3)
+                {
+                    buttons.push((
+                        text::truncate(&answer.label, 28),
+                        theme::ACCENT,
+                        Hit::Alert(item.id.clone(), AlertTap::Answer(answer.id.clone())),
+                    ));
+                }
+            }
+            AttentionKind::Request { question, .. } => {
+                card.line(Line::from(Span::styled(
+                    text::truncate(first_line(question), inner),
+                    theme::soft(),
+                )));
+                if item.title.trim_end().ends_with('?')
+                    && !item.actions.iter().any(|action| action == "custom.reply")
+                {
+                    buttons.push((
+                        "yes".into(),
+                        theme::GREEN,
+                        Hit::Alert(item.id.clone(), AlertTap::Answer("Yes".into())),
+                    ));
+                    buttons.push((
+                        "no".into(),
+                        theme::RED,
+                        Hit::Alert(item.id.clone(), AlertTap::Answer("No".into())),
+                    ));
+                }
+            }
+            AttentionKind::Login { text: login, seats } => {
+                card.wrap(
+                    &[text::run(
+                        format!(
+                            "{} · {} seat{} share this sign-in. Sign in in the seat's terminal (Ctrl+]).",
+                            first_line(login),
+                            seats.len().max(1),
+                            if seats.len() > 1 { "s" } else { "" }
+                        ),
+                        theme::dim(),
+                    )],
+                    inner,
+                );
+            }
+            _ => {}
+        }
+        for row in BandRow::button_rows(buttons, inner) {
+            let line = card.lines.len();
+            for (column, width, hit) in row.hits {
+                card.targets.push(Target {
+                    line,
+                    column: column.saturating_sub(1),
+                    width,
+                    hit,
+                });
+            }
+            let mut row_line = row.line;
+            row_line.spans.remove(0);
+            card.line(row_line);
+        }
+        let mut doc = Doc::new();
+        doc.card(
+            &format!("{} · waiting {}", item.kind.word(), item.age),
+            if heavy { theme::PERSON } else { color },
+            heavy,
+            card,
+            width,
+        );
+        (doc, call_shown)
+    }
+
+    /// The cards of `agent`'s alerts at `width` columns in at most `room` rows, under a line that
+    /// folds them again. A prompt's call is cut to what fits, never its answers.
+    fn alert_card(&self, agent: &str, width: usize, room: usize) -> Vec<BandRow> {
         let alerts = self.alerts_in(agent);
         if alerts.is_empty() {
             return Vec::new();
         }
-        let full = width;
-        let width = width.saturating_sub(2).max(10);
         let count = alerts.len();
         // The pane's title bar, filled across the width so the cards below read as one block
-        // that belongs to the box under it; the whole bar hides it again.
+        // that belongs to the box under it; the whole bar folds it again.
         let left = format!(" ◆ {count} alert{} ", if count == 1 { "" } else { "s" });
-        let right = " ▾ hide ";
-        let gap = full.saturating_sub(text::width(&left) + text::width(right));
+        let right = " ▾ fold · Esc ";
+        let gap = width.saturating_sub(text::width(&left) + text::width(right));
         let bar = |style: Style| style.bg(theme::SURFACE0);
         let mut rows = vec![BandRow {
             line: Line::from(vec![
@@ -521,123 +749,37 @@ impl Ui {
             ]),
             hits: vec![(
                 0,
-                full as u16,
+                width as u16,
                 Hit::Alert(agent.to_owned(), AlertTap::Toggle),
             )],
         }];
-        for (index, item) in alerts.iter().take(SHOWN).enumerate() {
-            // A thin rule between alerts, so where one ends and the next begins is plain.
-            if index > 0 {
-                rows.push(BandRow::text(vec![Span::styled(
-                    format!(" {}", "┄".repeat(full.saturating_sub(2))),
-                    theme::fg(theme::SURFACE1),
-                )]));
-            }
-            let first_row = rows.len();
-            let (glyph, color) = screens::attention_style(&item.kind);
-            let mut head = vec![
-                text::run(format!(" {glyph} "), theme::fg(color)),
-                text::run(item.title.clone(), theme::bold()),
-            ];
-            head.push(text::run(format!("  {} ago", item.age), theme::dim()));
-            rows.extend(
-                text::wrap(&head, width, &[], &[text::run("   ", theme::dim())], None)
-                    .into_iter()
-                    .take(2)
-                    .map(|line| BandRow {
-                        line,
-                        hits: Vec::new(),
-                    }),
-            );
-            let mut buttons: Vec<(String, Color, Hit)> = Vec::new();
-            match &item.kind {
-                AttentionKind::Prompt {
-                    seat_id,
-                    answers,
-                    text: prompt,
-                    call,
-                    ..
-                } => {
-                    let (prompt_rows, prompt_buttons) =
-                        self.prompt_answer_rows(&item.id, seat_id, answers, prompt, call, width);
-                    rows.extend(prompt_rows);
-                    buttons.extend(prompt_buttons);
-                }
-                AttentionKind::Request {
-                    structured: Some(request),
-                    ..
-                } => {
-                    // A named answer is one tap, unless it needs the person's words: that one
-                    // is written in Now.
-                    for answer in request
-                        .answers
-                        .iter()
-                        .filter(|answer| answer.outcome.as_deref() != Some("request_changes"))
-                        .take(3)
-                    {
-                        buttons.push((
-                            text::truncate(&answer.label, 28),
-                            theme::ACCENT,
-                            Hit::Alert(item.id.clone(), AlertTap::Answer(answer.id.clone())),
-                        ));
-                    }
-                }
-                AttentionKind::Request { question, .. } => {
-                    rows.push(BandRow::text(vec![
-                        Span::styled("   ", theme::dim()),
-                        Span::styled(
-                            text::truncate(first_line(question), width.saturating_sub(4)),
-                            theme::soft(),
-                        ),
-                    ]));
-                    if item.title.trim_end().ends_with('?')
-                        && !item.actions.iter().any(|action| action == "custom.reply")
-                    {
-                        buttons.push((
-                            "yes".into(),
-                            theme::GREEN,
-                            Hit::Alert(item.id.clone(), AlertTap::Answer("Yes".into())),
-                        ));
-                        buttons.push((
-                            "no".into(),
-                            theme::RED,
-                            Hit::Alert(item.id.clone(), AlertTap::Answer("No".into())),
-                        ));
-                    }
-                }
-                AttentionKind::Login { text: login, seats } => {
-                    rows.push(BandRow::text(vec![Span::styled(
-                        format!(
-                            "   {} · {} seat{} share this sign-in",
-                            text::truncate(first_line(login), width.saturating_sub(30)),
-                            seats.len().max(1),
-                            if seats.len() > 1 { "s" } else { "" }
-                        ),
-                        theme::dim(),
-                    )]));
-                }
-                _ => {}
-            }
-            buttons.push((
-                "open in Now".into(),
-                theme::SURFACE2,
-                Hit::Alert(item.id.clone(), AlertTap::Open),
-            ));
-            rows.extend(BandRow::button_rows(buttons, width));
-            // Each alert carries a bar down its left side in its own colour.
-            for row in &mut rows[first_row..] {
-                row.line
-                    .spans
-                    .insert(0, Span::styled("▌", theme::fg(color)));
-                for hit in &mut row.hits {
-                    hit.0 += 1;
-                }
-            }
+        // The alert with the keys comes first, so its form is the one in view.
+        let mut ordered = alerts.clone();
+        if let Some(keys) = &self.prompt_keys
+            && let Some(at) = ordered.iter().position(|item| &item.id == keys)
+        {
+            let item = ordered.remove(at);
+            ordered.insert(0, item);
         }
-        if count > SHOWN {
+        let mut shown = 0;
+        for item in ordered.iter().take(SHOWN) {
+            let left = room.saturating_sub(rows.len() + 1);
+            let (mut card, call_shown) = self.band_card(item, width, PLAN_LINES);
+            if card.lines.len() > left && call_shown > 0 {
+                // Cut the call to what fits, keeping the form's answers and keys in view.
+                let over = card.lines.len() - left;
+                card = self.band_card(item, width, call_shown.saturating_sub(over)).0;
+            }
+            if shown > 0 && card.lines.len() > left {
+                break;
+            }
+            rows.extend(BandRow::from_doc(card));
+            shown += 1;
+        }
+        if count > shown {
             rows.push(BandRow {
                 line: Line::from(Span::styled(
-                    format!("   +{} more in Now", count - SHOWN),
+                    format!("   +{} more in Now (Ctrl+H)", count - shown),
                     theme::dim(),
                 )),
                 hits: Vec::new(),
@@ -646,25 +788,175 @@ impl Ui {
         rows
     }
 
-    /// Open an alert's whole card in Now, selected.
-    pub(super) fn open_alert(&mut self, id: &str) {
-        if self.glasses.is_some() {
-            self.open_home();
-        } else {
-            self.switch_tab(0);
+    /// Now is what the person sees: its tab, or Home over the glass.
+    pub(super) fn home_in_view(&self) -> bool {
+        self.home_open() || (self.glasses.is_none() && self.tab == 0)
+    }
+
+    /// The agent whose conversation the person is in, with its band above the message box.
+    pub(super) fn conversation_here(&self) -> Option<String> {
+        if self.home_in_view() {
+            return None;
         }
-        if let Some(index) = self
-            .listing_for(0, 40)
-            .ids
-            .iter()
-            .position(|item| item == id)
-        {
-            self.select(index);
+        if self.glasses.is_some() {
+            self.composing_agent()
+        } else if self.tab == 1 {
+            self.selected_id()
+        } else {
+            None
         }
     }
 
-    /// Send a typed answer to an alert from its band: a prompt's `allow` or `deny`, a structured
-    /// request's named answer, or the yes or no of a question.
+    /// The prompt alert whose form takes the keys from here: in a conversation, the first of its
+    /// prompts with answers; in Now, the one selected.
+    fn form_here(&self) -> Option<String> {
+        let answerable = |item: &&Attention| prompt_model(&self.world, item).is_some();
+        if self.home_in_view() {
+            let id = self.selected_id()?;
+            self.world
+                .attention
+                .items()
+                .iter()
+                .filter(answerable)
+                .find(|item| item.id == id)
+                .map(|item| item.id.clone())
+        } else {
+            let agent = self.conversation_here()?;
+            self.alerts_in(&agent)
+                .into_iter()
+                .find(answerable)
+                .map(|item| item.id.clone())
+        }
+    }
+
+    /// Ctrl+N, or `a` on a prompt in Now: give its form the keys (expanding the band in place
+    /// in a conversation), or take them back and fold it.
+    pub(super) fn toggle_form_keys(&mut self) {
+        if self.prompt_keys.take().is_some() {
+            if !self.home_in_view()
+                && let Some(agent) = self.conversation_here()
+            {
+                self.alerts_open.remove(&agent);
+            }
+            return;
+        }
+        if !self.home_in_view()
+            && let Some(agent) = self.conversation_here()
+        {
+            if self.alerts_in(&agent).is_empty() {
+                self.flash("Nothing here waits on you");
+                return;
+            }
+            self.alerts_open.insert(agent);
+        }
+        match self.form_here() {
+            Some(id) => {
+                self.editing = false;
+                self.prompt_keys = Some(id);
+            }
+            None if self.home_in_view() => self.flash("This alert has no answers to choose from here"),
+            None => {}
+        }
+    }
+
+    /// A key while a prompt's form has the keys. Arrows and Tab move the mark; a number answers
+    /// (or chooses) its row; Enter takes the marked row only when Enter may; Esc folds. Any other
+    /// printable key goes back to typing, the key included. Returns whether the form took it.
+    pub(super) fn form_key(&mut self, key: KeyEvent) -> bool {
+        let Some(id) = self.prompt_keys.clone() else {
+            return false;
+        };
+        let Some(item) = self.world.attention.items().iter().find(|item| item.id == id) else {
+            self.prompt_keys = None;
+            return false;
+        };
+        let Some(model) = prompt_model(&self.world, item) else {
+            self.prompt_keys = None;
+            return false;
+        };
+        let rows = model.rows.clone();
+        let mark = self
+            .prompt_marks
+            .get(&id)
+            .copied()
+            .or(model.default_mark())
+            .filter(|mark| *mark < rows.len());
+        let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+        let count = rows.len().max(1);
+        match key.code {
+            KeyCode::Down | KeyCode::Tab | KeyCode::Right if plain => {
+                self.prompt_marks
+                    .insert(id, mark.map_or(0, |mark| (mark + 1) % count));
+            }
+            KeyCode::Up | KeyCode::BackTab | KeyCode::Left if plain => {
+                self.prompt_marks
+                    .insert(id, mark.map_or(0, |mark| (mark + count - 1) % count));
+            }
+            KeyCode::Esc => self.toggle_form_keys(),
+            KeyCode::Enter if plain => match mark.and_then(|mark| rows.get(mark)) {
+                Some(FormRow::Choose(question, option)) => self.choose_answer(&id, *question, *option),
+                Some(FormRow::Answer(answer)) if prompts::enter_answers(answer) => {
+                    self.answer_shown(&id, answer)
+                }
+                Some(FormRow::Answer(_)) | None => self.flash(format!(
+                    "Enter takes only an answer about what is shown in full: press its number{}",
+                    if rows.len() > 1 { format!(" (1–{})", rows.len().min(9)) } else { String::new() }
+                )),
+            },
+            KeyCode::Char(' ') if plain => {
+                if let Some(FormRow::Choose(question, option)) = mark.and_then(|mark| rows.get(mark)) {
+                    self.choose_answer(&id, *question, *option);
+                }
+            }
+            KeyCode::Char(digit @ '1'..='9') if plain => {
+                let index = digit as usize - '1' as usize;
+                match rows.get(index) {
+                    Some(FormRow::Choose(question, option)) => {
+                        self.prompt_marks.insert(id.clone(), index);
+                        self.choose_answer(&id, *question, *option);
+                    }
+                    Some(FormRow::Answer(answer)) => {
+                        self.prompt_marks.insert(id.clone(), index);
+                        self.answer_shown(&id, answer);
+                    }
+                    None => self.flash(format!("There is no {digit} here")),
+                }
+            }
+            // Typing is never blocked: the key goes to the message box (or Now's own keys).
+            KeyCode::Char(_) if plain => {
+                self.prompt_keys = None;
+                if !self.home_in_view() && self.conversation_here().is_some() {
+                    self.editing = true;
+                }
+                return false;
+            }
+            _ if key.code == KeyCode::Char('n') && key.modifiers == KeyModifiers::CONTROL => {
+                self.toggle_form_keys()
+            }
+            _ => {
+                self.prompt_keys = None;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Answer `answer` on alert `id` from the keys, only when its row is on screen and answers:
+    /// the same row a click would take. A call cut short or a question not yet chosen has none.
+    fn answer_shown(&mut self, id: &str, answer: &str) {
+        let wanted = Hit::Alert(id.to_owned(), AlertTap::Answer(answer.to_owned()));
+        let shown = self.frame.borrow().hits.iter().any(|(_, hit)| *hit == wanted);
+        if shown {
+            self.answer_alert(id, answer);
+        } else if answer == "answer" {
+            self.flash("Choose an answer to each question first");
+        } else {
+            self.flash("That answer is not in view in full here: scroll to it, or answer it in the terminal (Ctrl+])");
+        }
+    }
+
+    /// Send a typed answer to an alert: a prompt's answer, a structured request's named answer,
+    /// or the yes or no of a question.
     pub(super) fn answer_alert(&mut self, id: &str, answer: &str) {
         let Some(item) = self
             .world
@@ -673,16 +965,17 @@ impl Ui {
             .iter()
             .find(|item| item.id == id)
         else {
-            self.flash("That alert is gone");
+            self.flash(GONE);
             return;
         };
         let effect = match &item.kind {
-            AttentionKind::Prompt { seat_id, call, .. }
-                if item.actions.iter().any(|a| a == "prompt.respond") =>
+            AttentionKind::Prompt { answers, .. }
+                if item.actions.iter().any(|a| a == "prompt.respond")
+                    && answers.iter().any(|offered| offered == answer) =>
             {
                 // A question's answer is the choices made here.
                 let sent = if answer == "answer" {
-                    self.question_answer(id, seat_id, call)
+                    self.question_answer(id)
                 } else {
                     Some(answer.to_owned())
                 };
@@ -694,7 +987,7 @@ impl Ui {
                             reason: None,
                             answer: Some(sent),
                         },
-                        format!("Answering {}…", answer_label(answer)),
+                        format!("Answering “{}”…", self.answer_words(item, answer)),
                     )
                 })
             }
@@ -736,21 +1029,36 @@ impl Ui {
         match effect {
             Some((effect, notice)) if self.live => {
                 self.effects.push(effect);
-                let prefix = question_key(id, "");
-                self.question_choices.retain(|key, _| !key.starts_with(&prefix));
+                self.question_choices.remove(id);
+                self.prompt_marks.remove(id);
+                if self.prompt_keys.as_deref() == Some(id) {
+                    self.prompt_keys = None;
+                }
                 self.flash(notice);
             }
             Some((_, notice)) => self.flash(format!("{notice} demo: nothing was sent")),
-            None => self.flash("st does not offer that answer here: open it in Now"),
+            None => self.flash("st does not offer that answer here: answer it in the terminal (Ctrl+])"),
         }
+    }
+
+    /// The words a prompt's answer reads as on its form.
+    fn answer_words(&self, item: &Attention, answer: &str) -> String {
+        prompt_model(&self.world, item)
+            .and_then(|model| {
+                model
+                    .form
+                    .options
+                    .into_iter()
+                    .find(|option| option.answer == answer)
+                    .map(|option| option.label)
+            })
+            .unwrap_or_else(|| answer.to_owned())
     }
 }
 
-/// Where the picks for a question alert's question call are kept: by the alert and the exact call,
-/// so picks made for one question never answer another that replaced it.
-fn question_key(alert: &str, call: &str) -> String {
-    format!("{alert}\u{0}{call}")
-}
+/// What a client says when the alert it answers is no longer listed, in st's own words for a
+/// prompt that is gone.
+const GONE: &str = "That prompt is no longer waiting: it was answered or replaced";
 
 /// The first non-empty line, without markdown's heading marks.
 fn first_line(text: &str) -> &str {
@@ -763,20 +1071,24 @@ fn first_line(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::glass::{Glasses, Open};
+    use ratatui::{Terminal, backend::TestBackend};
 
-    fn prompt(id: &str, answers: &[&str]) -> Attention {
+    const SEAT: &str = "agent/example/atlas/builder";
+
+    fn prompt(id: &str, answers: &[&str], text: &str) -> Attention {
         Attention {
             id: id.into(),
             tier: Tier::Stopped,
-            title: "agent/example/atlas is waiting for a permission".into(),
+            title: "builder is waiting for permission".into(),
             waiting: None,
             age: "1m".into(),
             mission: None,
-            agent: Some("agent/example/atlas".into()),
+            agent: Some(SEAT.into()),
             kind: AttentionKind::Prompt {
-                seat: "atlas".into(),
-                seat_id: "agent/example/atlas".into(),
-                text: "Claude asks to use Bash".into(),
+                seat: "builder".into(),
+                seat_id: SEAT.into(),
+                text: text.into(),
                 answers: answers.iter().map(|answer| (*answer).to_owned()).collect(),
                 episode: "episode-1".into(),
                 call: None,
@@ -789,14 +1101,8 @@ mod tests {
             related: vec![],
             raised_by: None,
             blocked: None,
-            conversations: vec!["agent/example/atlas".into()],
+            conversations: vec![SEAT.into()],
         }
-    }
-
-    fn with_alerts(items: Vec<Attention>) -> Ui {
-        let mut world = demo::world();
-        world.attention = Load::Ready(items);
-        Ui::new(world)
     }
 
     fn call(tool: &str, input: serde_json::Value) -> PendingCall {
@@ -807,357 +1113,423 @@ mod tests {
         }
     }
 
-    fn bash(command: &str) -> PendingCall {
-        call("Bash", serde_json::json!({"command": command}))
+    /// One prompt kind with invented content: the answers st lists, the call it is about, and
+    /// what its form must show.
+    struct Case {
+        name: &'static str,
+        harness: Harness,
+        answers: &'static [&'static str],
+        text: &'static str,
+        calls: Vec<PendingCall>,
+        /// The options in order, as numbered rows.
+        options: &'static [&'static str],
+        /// The option marked at first.
+        marked: Option<&'static str>,
+        question: &'static str,
     }
 
-    fn waiting(ui: &mut Ui, calls: Vec<PendingCall>) {
-        ui.world
-            .pending_calls
-            .insert("agent/example/atlas".into(), calls);
+    fn cases() -> Vec<Case> {
+        vec![
+            Case {
+                name: "claude read outside the working directories",
+                harness: Harness::Claude,
+                answers: &["allow", "deny"],
+                text: "Claude asks to use Read",
+                calls: vec![call("Read", serde_json::json!({"file_path": "/srv/example/shared/notes.txt"}))],
+                options: &["Yes, but ask again next time", "No, and ask again next time"],
+                marked: Some("Yes, but ask again next time"),
+                question: "Allow this read outside the working directories?",
+            },
+            Case {
+                name: "claude command of several lines",
+                harness: Harness::Claude,
+                answers: &["allow", "deny"],
+                text: "Claude asks to use Bash",
+                calls: vec![call(
+                    "Bash",
+                    serde_json::json!({"command": "cd garden\nmake clean\nmake all", "description": "Rebuild"}),
+                )],
+                options: &["Yes", "No"],
+                marked: Some("Yes"),
+                question: "Do you want to proceed?",
+            },
+            Case {
+                name: "claude plan",
+                harness: Harness::Claude,
+                answers: &["approve", "deny"],
+                text: "Claude asks you to approve its plan",
+                calls: vec![call(
+                    "ExitPlanMode",
+                    serde_json::json!({"plan": "1. Add a greeting to the garden page\n2. Test it"}),
+                )],
+                options: &["Yes", "No, keep planning"],
+                marked: Some("Yes"),
+                question: "Would you like to proceed?",
+            },
+            Case {
+                name: "claude question with a multi-select",
+                harness: Harness::Claude,
+                answers: &["answer", "deny"],
+                text: "Claude asks a question",
+                calls: vec![call(
+                    "AskUserQuestion",
+                    serde_json::json!({"questions": [
+                        {"question": "Which flowers?", "header": "Flowers", "multiSelect": true,
+                         "options": [{"label": "Tulips", "description": "spring"},
+                                     {"label": "Asters", "description": "autumn"}]}
+                    ]}),
+                )],
+                options: &[
+                    "[ ] Tulips · spring",
+                    "[ ] Asters · autumn",
+                    "Submit answers · choose an answer to each question first",
+                    "No, decline to answer",
+                ],
+                marked: Some("[ ] Tulips · spring"),
+                question: "Ready to submit your answers?",
+            },
+            Case {
+                name: "claude new MCP server",
+                harness: Harness::Claude,
+                answers: &["use", "use-all", "skip"],
+                text: "New MCP server found in this project: example-echo.",
+                calls: vec![],
+                options: &[
+                    "Use this MCP server",
+                    "Use this and all future MCP servers in this project",
+                    "Continue without using this MCP server",
+                ],
+                marked: Some("Continue without using this MCP server"),
+                question: "New MCP server found in this project: example-echo.",
+            },
+            Case {
+                name: "codex approval",
+                harness: Harness::Codex,
+                answers: &["allow", "deny"],
+                text: "Codex asks for approval",
+                calls: vec![call("shell", serde_json::json!({"command": "npm test -- --watch=false"}))],
+                options: &["Yes, proceed", "No"],
+                marked: Some("Yes, proceed"),
+                question: "Would you like to run the following command?",
+            },
+        ]
     }
 
-    /// The cards, as a person sees them after expanding the band.
-    impl Ui {
-        fn expanded_band(&self, agent: &str, width: usize) -> Vec<BandRow> {
-            self.alert_card(agent, width)
+    fn world_with(case: &Case) -> World {
+        let mut world = demo::world();
+        if let Load::Ready(agents) = &mut world.agents
+            && let Some(agent) = agents.iter_mut().find(|agent| agent.id == SEAT)
+        {
+            agent.harness = case.harness;
         }
+        world.attention = Load::Ready(vec![prompt("attention/one", case.answers, case.text)]);
+        world.pending_calls.insert(SEAT.into(), case.calls.clone());
+        world
     }
 
-    fn texts(rows: &[BandRow]) -> String {
-        rows.iter()
-            .map(|row| {
-                row.line
-                    .spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
+    /// The conversation, as a person in a glass sees it.
+    fn in_conversation(world: World) -> Ui {
+        let mut ui = Ui::new(world);
+        ui.glasses = Some(Glasses::open(None, None));
+        ui.glasses.as_mut().unwrap().sidebar.shown = false;
+        ui.open_in_glass(Pane::Agent(Some(SEAT.into())), Open::Tab);
+        ui
+    }
+
+    /// Now, with the alert's card selected.
+    fn in_now(world: World) -> Ui {
+        let mut ui = Ui::new(world);
+        ui.switch_tab(0);
+        let index = ui.ids().iter().position(|id| id == "attention/one").unwrap();
+        ui.select(index);
+        ui
+    }
+
+    fn render(ui: &Ui, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| ui.render(frame)).unwrap();
+        terminal.draw(|frame| ui.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect::<Vec<_>>()
             .join("\n")
     }
 
-    fn taps(rows: &[BandRow]) -> Vec<Hit> {
-        rows.iter()
-            .flat_map(|row| row.hits.iter().map(|(_, _, hit)| hit.clone()))
+    fn press(ui: &mut Ui, code: KeyCode, modifiers: KeyModifiers) {
+        ui.key(KeyEvent::new(code, modifiers));
+    }
+
+    /// The numbered option rows on screen, in order, with whether each is marked.
+    fn options(shown: &str) -> Vec<(bool, usize, String)> {
+        shown
+            .lines()
+            .filter_map(|line| {
+                // Inside a card's frame, an option row starts with its mark or two spaces.
+                let line = match line.split_once('┃') {
+                    Some((_, inside)) => inside,
+                    None => line.split_once('│').map_or(line, |(_, inside)| inside),
+                };
+                let line = line.strip_prefix(' ').unwrap_or(line);
+                let marked = line.starts_with("❯ ");
+                let rest = line.strip_prefix("❯ ").or_else(|| line.strip_prefix("  "))?;
+                if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+                    return None;
+                }
+                let (number, label) = rest.split_once(". ")?;
+                let number = number.parse::<usize>().ok()?;
+                let label = label.trim_end_matches(['│', '┃', ' ']).trim_end();
+                Some((marked, number, label.to_owned()))
+            })
             .collect()
     }
 
-    #[test]
-    fn nothing_waiting_shows_no_band() {
-        let ui = with_alerts(vec![]);
-        assert!(ui.expanded_band("agent/example/atlas", 80).is_empty());
+    /// The screen's words in one line, without card frames, so wrapped words read on.
+    fn words_of(shown: &str) -> String {
+        shown
+            .replace(['┃', '│'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
-    #[test]
-    fn an_alert_shows_only_in_the_conversation_it_belongs_to() {
-        let ui = with_alerts(vec![prompt("attention/one", &["allow", "deny"])]);
-        assert!(!ui.expanded_band("agent/example/atlas", 80).is_empty());
-        assert!(ui.expanded_band("agent/example/other", 80).is_empty());
+    fn check_form(case: &Case, shown: &str, width: u16, place: &str) {
+        let rows = options(shown);
+        let labels: Vec<&str> = rows.iter().map(|(_, _, label)| label.as_str()).collect();
+        // A label too long for a narrow card wraps: its first line starts the same.
+        assert_eq!(rows.len(), case.options.len(), "{} {place} at {width}: {labels:?}\n{shown}", case.name);
+        for ((_, number, label), wanted) in rows.iter().zip(case.options) {
+            assert!(wanted.starts_with(label.as_str()), "{} {place} at {width}: {label} for {wanted}\n{shown}", case.name);
+            assert!(*number >= 1);
+        }
+        let numbers: Vec<usize> = rows.iter().map(|(_, number, _)| *number).collect();
+        assert_eq!(numbers, (1..=rows.len()).collect::<Vec<_>>(), "{}", case.name);
+        let marked: Vec<&str> = rows.iter().filter(|(marked, _, _)| *marked).map(|(_, _, label)| label.as_str()).collect();
+        match case.marked {
+            Some(wanted) => assert!(marked.len() == 1 && wanted.starts_with(marked[0]), "{} {place} at {width}: {marked:?}\n{shown}", case.name),
+            None => assert!(marked.is_empty(), "{}", case.name),
+        }
+        let flat = words_of(shown);
+        let question = case.question.split_whitespace().collect::<Vec<_>>().join(" ");
+        let squeezed: String = flat.chars().filter(|c| c.is_alphanumeric()).collect();
+        let wanted: String = question.chars().filter(|c| c.is_alphanumeric()).collect();
+        assert!(squeezed.contains(&wanted), "{} {place} at {width}: question\n{shown}", case.name);
+        assert!(!shown.contains("open in Now"), "{}\n{shown}", case.name);
     }
 
+    /// Every prompt kind in Now and in its conversation, folded and expanded, at three widths:
+    /// the same form, worded and numbered like the harness's, with its marked option and keys.
     #[test]
-    fn a_pending_claude_call_is_shown_in_full_beside_allow_and_deny() {
-        let mut ui = with_alerts(vec![prompt("attention/one", &["allow", "deny"])]);
-        waiting(&mut ui, vec![bash("rm -rf build/cache")]);
-        let rows = ui.expanded_band("agent/example/atlas", 80);
-        let shown = texts(&rows);
-        assert!(shown.contains("1 alert"), "{shown}");
-        assert!(shown.contains("rm -rf build/cache"), "{shown}");
-        let taps = taps(&rows);
-        assert!(taps.contains(&Hit::Alert(
-            "attention/one".into(),
-            AlertTap::Answer("allow".into())
-        )));
-        assert!(taps.contains(&Hit::Alert(
-            "attention/one".into(),
-            AlertTap::Answer("deny".into())
-        )));
+    fn every_prompt_kind_reads_like_its_harness_in_now_and_in_place() {
+        for case in cases() {
+            for width in [60u16, 80, 120] {
+                // Now: the card carries the prompt's answers.
+                let ui = in_now(world_with(&case));
+                let shown = render(&ui, width, 60);
+                check_form(&case, &shown, width, "Now");
+                let flat = words_of(&shown);
+                assert!(flat.contains("a to answer with the keys"), "{}\n{shown}", case.name);
+
+                // The conversation, folded: one line, nothing to answer, a way in.
+                let mut ui = in_conversation(world_with(&case));
+                let shown = render(&ui, width, 60);
+                assert!(shown.contains("◆ 1 alert") && shown.contains("Ctrl+N"), "{}\n{shown}", case.name);
+                assert!(options(&shown).is_empty(), "{} folded\n{shown}", case.name);
+                assert!(!shown.contains("open in Now"));
+
+                // Expanded in place: the same card.
+                ui.click(Hit::Alert(SEAT.into(), AlertTap::Toggle));
+                let shown = render(&ui, width, 60);
+                check_form(&case, &shown, width, "band");
+                assert!(shown.contains("PROMPT · WAITING 1M"), "{}\n{shown}", case.name);
+                let flat = words_of(&shown);
+                assert!(flat.contains("Ctrl+N to answer with the keys"), "{}\n{shown}", case.name);
+
+                // With the keys, the footer lists them as the harness does.
+                ui.toggle_form_keys();
+                let shown = render(&ui, width, 60);
+                let flat = words_of(&shown);
+                assert!(flat.contains("↑/↓ to move") && flat.contains("Esc to fold"), "{}\n{shown}", case.name);
+                assert_eq!(
+                    flat.contains("Enter to select") || flat.contains("Enter to toggle") || flat.contains("Enter to choose"),
+                    case.marked.is_some(),
+                    "{}\n{shown}",
+                    case.name
+                );
+                // Esc folds it back to its line.
+                press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+                let shown = render(&ui, width, 60);
+                assert!(options(&shown).is_empty(), "{} folded again\n{shown}", case.name);
+            }
+        }
     }
 
+    fn bash_world() -> World {
+        let case = &cases()[1];
+        world_with(case)
+    }
+
+    /// Focus only focuses: arrows and Tab move the mark and send nothing. Enter takes the marked
+    /// allow, shown in full; a refusal takes its own number, never Enter.
     #[test]
-    fn with_several_calls_unanswered_every_one_is_listed_and_only_deny_is_offered() {
-        let mut ui = with_alerts(vec![prompt("attention/one", &["allow", "deny"])]);
-        waiting(
-            &mut ui,
-            vec![
-                bash("rm -rf build/cache"),
-                call("Write", serde_json::json!({"file_path": "notes.md", "content": "hi"})),
-            ],
+    fn the_mark_moves_without_answering_and_enter_never_refuses() {
+        let mut ui = in_conversation(bash_world());
+        ui.live = true;
+        render(&ui, 80, 40);
+        press(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        render(&ui, 80, 40);
+        for code in [KeyCode::Down, KeyCode::Tab, KeyCode::Up, KeyCode::BackTab, KeyCode::Down] {
+            press(&mut ui, code, KeyModifiers::NONE);
+        }
+        assert!(ui.effects.is_empty(), "moving the mark answers nothing");
+        let shown = render(&ui, 80, 40);
+        assert!(options(&shown).iter().any(|(marked, _, label)| *marked && label == "No"), "{shown}");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(ui.effects.is_empty(), "Enter never takes a refusal");
+        press(&mut ui, KeyCode::Up, KeyModifiers::NONE);
+        render(&ui, 80, 40);
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        let [Effect::Attention { action, answer: Some(answer), .. }] = ui.effects.as_slice() else {
+            panic!("{:?}", ui.effects);
+        };
+        assert_eq!((action.as_str(), answer.as_str()), ("prompt.respond", "allow"));
+
+        // A refusal is its own number.
+        let mut ui = in_conversation(bash_world());
+        ui.live = true;
+        render(&ui, 80, 40);
+        press(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        render(&ui, 80, 40);
+        press(&mut ui, KeyCode::Char('2'), KeyModifiers::NONE);
+        assert!(matches!(ui.effects.as_slice(), [Effect::Attention { answer: Some(answer), .. }] if answer == "deny"));
+    }
+
+    /// Typing is never blocked: a letter while the form has the keys goes to the message box.
+    #[test]
+    fn a_letter_while_the_form_has_the_keys_types_into_the_message_box() {
+        let mut ui = in_conversation(bash_world());
+        ui.live = true;
+        render(&ui, 80, 40);
+        press(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert!(ui.prompt_keys.is_some());
+        for letter in "hi".chars() {
+            press(&mut ui, KeyCode::Char(letter), KeyModifiers::NONE);
+        }
+        assert!(ui.effects.is_empty());
+        assert!(ui.prompt_keys.is_none());
+        assert_eq!(ui.conversation_state.drafts.get(SEAT).map(String::as_str), Some("hi"));
+        // And digits typed into the box stay text.
+        press(&mut ui, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert!(ui.effects.is_empty());
+        assert_eq!(ui.conversation_state.drafts.get(SEAT).map(String::as_str), Some("hi1"));
+    }
+
+    /// A call too long for the band is cut there and its allow withheld, by click and by key;
+    /// Now shows it whole and offers allow.
+    #[test]
+    fn a_call_too_long_for_the_band_is_allowed_only_where_it_is_shown_whole() {
+        let mut world = bash_world();
+        world.pending_calls.insert(
+            SEAT.into(),
+            vec![call("Bash", serde_json::json!({"command": (1..=12).map(|n| format!("echo step {n}")).collect::<Vec<_>>().join("\n")}))],
         );
-        let rows = ui.expanded_band("agent/example/atlas", 80);
-        let shown = texts(&rows);
+        let allow = Hit::Alert("attention/one".into(), AlertTap::Answer("allow".into()));
+        let mut ui = in_conversation(world.clone());
+        ui.live = true;
+        ui.click(Hit::Alert(SEAT.into(), AlertTap::Toggle));
+        let shown = render(&ui, 80, 40);
+        assert!(shown.contains("too long to show here in full"), "{shown}");
+        assert!(!shown.contains("echo step 12"), "{shown}");
+        assert!(!ui.frame.borrow().hits.iter().any(|(_, hit)| *hit == allow));
+        press(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        press(&mut ui, KeyCode::Char('1'), KeyModifiers::NONE);
+        assert!(ui.effects.is_empty(), "the key cannot allow what is not shown");
+
+        let ui = in_now(world);
+        let shown = render(&ui, 120, 60);
+        assert!(shown.contains("echo step 12"), "{shown}");
+        assert!(ui.frame.borrow().hits.iter().any(|(_, hit)| *hit == allow));
+    }
+
+    /// A question is answered with choices made here, by number or Enter, and sent together.
+    #[test]
+    fn a_question_is_chosen_by_number_and_sent_once_complete() {
+        let case = &cases()[3];
+        let mut ui = in_now(world_with(case));
+        ui.live = true;
+        render(&ui, 100, 60);
+        press(&mut ui, KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(ui.prompt_keys.as_deref(), Some("attention/one"));
+        // Enter on the marked option chooses it; nothing is sent.
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        press(&mut ui, KeyCode::Char('2'), KeyModifiers::NONE);
+        assert!(ui.effects.is_empty());
+        let shown = render(&ui, 100, 60);
+        assert!(shown.contains("[✓] Tulips") && shown.contains("[✓] Asters"), "{shown}");
+        press(&mut ui, KeyCode::Char('3'), KeyModifiers::NONE);
+        let [Effect::Attention { answer: Some(answer), .. }] = ui.effects.as_slice() else {
+            panic!("{:?}", ui.effects);
+        };
+        assert_eq!(serde_json::from_str::<serde_json::Value>(answer).unwrap(), serde_json::json!({"0": [0, 1]}));
+    }
+
+    #[test]
+    fn a_click_on_an_option_answers_it_and_a_gone_prompt_says_so() {
+        let mut ui = in_conversation(bash_world());
+        ui.live = true;
+        ui.click(Hit::Alert("attention/one".into(), AlertTap::Answer("deny".into())));
+        assert!(matches!(ui.effects.as_slice(), [Effect::Attention { answer: Some(answer), .. }] if answer == "deny"));
+        let mut ui = in_conversation(bash_world());
+        ui.live = true;
+        ui.world.attention = Load::Ready(vec![]);
+        ui.click(Hit::Alert("attention/one".into(), AlertTap::Answer("allow".into())));
+        assert!(ui.effects.is_empty());
+        assert_eq!(ui.flash.as_ref().map(|(text, _)| text.as_str()), Some(GONE));
+    }
+
+    #[test]
+    fn several_unanswered_calls_offer_no_allow_and_another_harness_answers_in_its_terminal() {
+        let mut world = bash_world();
+        world.pending_calls.insert(
+            SEAT.into(),
+            vec![call("Bash", serde_json::json!({"command": "make"})), call("Write", serde_json::json!({"file_path": "notes.md"}))],
+        );
+        let ui = in_now(world.clone());
+        let shown = render(&ui, 120, 60);
         assert!(shown.contains("2 calls are unanswered"), "{shown}");
-        assert!(
-            shown.contains("rm -rf build/cache") && shown.contains("notes.md"),
-            "{shown}"
-        );
-        let taps = taps(&rows);
-        assert!(!taps.contains(&Hit::Alert(
-            "attention/one".into(),
-            AlertTap::Answer("allow".into())
-        )));
-        assert!(taps.contains(&Hit::Alert(
-            "attention/one".into(),
-            AlertTap::Answer("deny".into())
-        )));
-    }
-
-    #[test]
-    fn allow_is_withheld_when_the_call_cannot_be_shown() {
-        let mut ui = with_alerts(vec![prompt("attention/one", &["allow", "deny"])]);
-        // No call in the conversation yet.
-        let taps_without = taps(&ui.expanded_band("agent/example/atlas", 80));
-        assert!(!taps_without.contains(&Hit::Alert(
-            "attention/one".into(),
-            AlertTap::Answer("allow".into())
-        )));
-        assert!(taps_without.contains(&Hit::Alert(
-            "attention/one".into(),
-            AlertTap::Answer("deny".into())
-        )));
-        // A call too long to read in full is not allowed from here either.
-        waiting(&mut ui, vec![bash(&"word ".repeat(200))]);
-        let rows = ui.expanded_band("agent/example/atlas", 60);
-        assert!(!taps(&rows).contains(&Hit::Alert(
-            "attention/one".into(),
-            AlertTap::Answer("allow".into())
-        )));
-        assert!(texts(&rows).contains('…'));
-    }
-
-    #[test]
-    fn another_harnesss_prompt_is_answered_in_the_terminal() {
-        let ui = with_alerts(vec![prompt("attention/one", &[])]);
-        let rows = ui.expanded_band("agent/example/atlas", 80);
-        let shown = texts(&rows);
-        assert!(shown.contains("answer it in the terminal"), "{shown}");
-        assert_eq!(
-            taps(&rows),
-            vec![
-                Hit::Alert("agent/example/atlas".into(), AlertTap::Toggle),
-                Hit::Alert("attention/one".into(), AlertTap::Open)
-            ]
-        );
+        let labels: Vec<String> = options(&shown).into_iter().map(|(_, _, label)| label).collect();
+        assert_eq!(labels, ["No"]);
+        world.attention = Load::Ready(vec![prompt("attention/one", &[], "Pi asks for approval")]);
+        let ui = in_now(world);
+        let shown = render(&ui, 120, 60);
+        assert!(shown.contains("Answer it in the seat's terminal"), "{shown}");
+        assert!(options(&shown).is_empty());
     }
 
     #[test]
     fn updates_and_messages_are_not_alerts() {
-        let mut update = prompt("attention/update", &[]);
+        let mut update = prompt("attention/update", &[], "");
         update.kind = AttentionKind::Update {
             from: "atlas".into(),
             body: "done".into(),
             about: String::new(),
             subjects: vec![],
         };
-        let mut message = prompt("attention/message", &[]);
-        message.kind = AttentionKind::Message {
-            from: "atlas".into(),
-            body: "hi".into(),
-        };
-        let ui = with_alerts(vec![update, message]);
-        assert!(ui.expanded_band("agent/example/atlas", 80).is_empty());
-    }
-
-    #[test]
-    fn more_than_two_alerts_say_how_many_wait_in_now() {
-        let ui = with_alerts(vec![
-            prompt("attention/a", &[]),
-            prompt("attention/b", &[]),
-            prompt("attention/c", &[]),
-        ]);
-        let shown = texts(&ui.expanded_band("agent/example/atlas", 80));
-        assert!(shown.contains("3 alerts"), "{shown}");
-        assert!(shown.contains("+1 more in Now"), "{shown}");
-    }
-
-    #[test]
-    fn tapping_allow_sends_prompt_respond_for_that_alert() {
-        let mut ui = with_alerts(vec![prompt("attention/one", &["allow", "deny"])]);
-        ui.live = true;
-        ui.click(Hit::Alert(
-            "attention/one".into(),
-            AlertTap::Answer("deny".into()),
-        ));
-        assert!(matches!(
-            ui.effects.as_slice(),
-            [Effect::Attention { id, action, answer: Some(answer), .. }]
-                if id == "attention/one" && action == "prompt.respond" && answer == "deny"
-        ));
-    }
-
-    /// A harness question is answered here: each question with its options, chosen with a tap
-    /// (any number for a multi-select), and sent together once every question has a choice.
-    #[test]
-    fn a_question_is_answered_with_the_options_chosen_here() {
-        let mut ui = with_alerts(vec![prompt("attention/one", &["answer", "deny"])]);
-        ui.live = true;
-        waiting(
-            &mut ui,
-            vec![call(
-                "AskUserQuestion",
-                serde_json::json!({"questions": [
-                    {"question": "Which color?", "header": "Color", "multiSelect": false,
-                     "options": [{"label": "Red", "description": ""}, {"label": "Blue", "description": ""}]},
-                    {"question": "Which pets?", "header": "Pets", "multiSelect": true,
-                     "options": [{"label": "Cat", "description": ""}, {"label": "Dog", "description": ""},
-                                 {"label": "Fish", "description": ""}]},
-                ]}),
-            )],
-        );
-        let send = Hit::Alert("attention/one".into(), AlertTap::Answer("answer".into()));
-        let rows = ui.expanded_band("agent/example/atlas", 80);
-        let shown = texts(&rows);
-        assert!(shown.contains("Color · Which color?"), "{shown}");
-        assert!(shown.contains("Pets · Which pets? (choose any)"), "{shown}");
-        assert!(shown.contains("Fish"), "{shown}");
-        assert!(!taps(&rows).contains(&send), "nothing is chosen yet");
-        assert!(taps(&rows).contains(&Hit::Alert(
-            "attention/one".into(),
-            AlertTap::Answer("deny".into())
-        )));
-        for (question, option) in [(0, 0), (0, 1), (1, 0), (1, 2), (1, 1), (1, 1)] {
-            ui.click(Hit::Alert("attention/one".into(), AlertTap::Choose(question, option)));
-        }
-        let rows = ui.expanded_band("agent/example/atlas", 80);
-        assert!(texts(&rows).contains("✓ Blue"), "{}", texts(&rows));
-        assert!(taps(&rows).contains(&send));
-        // Another question call replaces it: the picks made for the first never answer it.
-        let asked = ui.world.pending_calls["agent/example/atlas"][0].clone();
-        waiting(&mut ui, vec![PendingCall { id: "call-replaced".into(), ..asked.clone() }]);
-        let rows = ui.expanded_band("agent/example/atlas", 80);
-        assert!(!texts(&rows).contains("✓ Blue"), "{}", texts(&rows));
-        assert!(!taps(&rows).contains(&send), "nothing is chosen for the new question");
-        waiting(&mut ui, vec![asked]);
-        ui.click(send);
-        let [Effect::Attention { action, answer: Some(answer), .. }] = ui.effects.as_slice() else {
-            panic!("{:?}", ui.effects);
-        };
-        assert_eq!(action, "prompt.respond");
-        // Positions only: the questions' and options' words stay in the conversation.
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(answer).unwrap(),
-            serde_json::json!({"0": [1], "1": [0, 2]})
-        );
-    }
-
-    /// A prompt that names its exact call is answered only beside that call: a parent's open
-    /// Task call is never the call an allow lets through, and a prompt that named none has no
-    /// allow at all.
-    #[test]
-    fn allow_is_offered_only_beside_the_exact_call_the_prompt_names() {
-        let named = |call: Option<&str>| {
-            let mut item = prompt("attention/one", &["allow", "deny"]);
-            if let AttentionKind::Prompt { call: named, .. } = &mut item.kind {
-                *named = Some(call.map(str::to_owned));
-            }
-            item
-        };
-        let allow = Hit::Alert("attention/one".into(), AlertTap::Answer("allow".into()));
-        let task = call("Task", serde_json::json!({"prompt": "run the build"}));
-        // The subagent's call is not in this conversation: only the parent's Task call is.
-        let mut ui = with_alerts(vec![named(Some("call-Bash"))]);
-        waiting(&mut ui, vec![task.clone()]);
-        let rows = ui.expanded_band("agent/example/atlas", 80);
-        assert!(!taps(&rows).contains(&allow));
-        assert!(!texts(&rows).contains("run the build"), "{}", texts(&rows));
-        // Beside the named call, among others, allow is offered and only it is shown.
-        waiting(&mut ui, vec![task.clone(), bash("make")]);
-        let rows = ui.expanded_band("agent/example/atlas", 80);
-        assert!(taps(&rows).contains(&allow));
-        assert!(texts(&rows).contains("command: make"));
-        assert!(!texts(&rows).contains("run the build"));
-        // Named none: no allow, whatever is pending.
-        let mut ui = with_alerts(vec![named(None)]);
-        waiting(&mut ui, vec![bash("make")]);
-        assert!(!taps(&ui.expanded_band("agent/example/atlas", 80)).contains(&allow));
-    }
-
-    /// A plan is shown in full beside `approve`; a screen prompt's own answers are one tap each.
-    #[test]
-    fn a_plan_and_a_screen_prompt_offer_their_own_answers() {
-        let mut ui = with_alerts(vec![prompt("attention/one", &["approve", "deny"])]);
-        waiting(
-            &mut ui,
-            vec![call(
-                "ExitPlanMode",
-                serde_json::json!({"plan": "1. Create hello.txt\n2. Write hello in it"}),
-            )],
-        );
-        let rows = ui.expanded_band("agent/example/atlas", 80);
-        assert!(texts(&rows).contains("2. Write hello in it"), "{}", texts(&rows));
-        assert!(taps(&rows).contains(&Hit::Alert(
-            "attention/one".into(),
-            AlertTap::Answer("approve".into())
-        )));
-
-        let ui = with_alerts(vec![prompt("attention/two", &["use", "use-all", "skip"])]);
-        let rows = ui.expanded_band("agent/example/atlas", 80);
-        let taps = taps(&rows);
-        for answer in ["use", "use-all", "skip"] {
-            assert!(
-                taps.contains(&Hit::Alert(
-                    "attention/two".into(),
-                    AlertTap::Answer(answer.into())
-                )),
-                "{answer}"
-            );
-        }
-        assert!(texts(&rows).contains(" use all "), "{}", texts(&rows));
-    }
-
-    #[test]
-    fn a_tap_on_a_gone_alert_sends_nothing() {
-        let mut ui = with_alerts(vec![]);
-        ui.live = true;
-        ui.click(Hit::Alert(
-            "attention/gone".into(),
-            AlertTap::Answer("allow".into()),
-        ));
-        assert!(ui.effects.is_empty());
-    }
-
-    #[test]
-    fn open_selects_the_alert_in_now() {
-        let mut ui = with_alerts(vec![prompt("attention/a", &[]), prompt("attention/b", &[])]);
-        ui.click(Hit::Alert("attention/b".into(), AlertTap::Open));
-        assert_eq!(ui.tab, 0);
-        assert_eq!(ui.attention_focus().as_deref(), Some("attention/b"));
-    }
-
-    #[test]
-    fn the_band_is_one_line_until_it_is_expanded() {
-        let mut ui = with_alerts(vec![
-            prompt("attention/a", &["allow", "deny"]),
-            prompt("attention/b", &[]),
-        ]);
-        let rows = ui.alert_band("agent/example/atlas", 80);
-        assert_eq!(rows.len(), 1, "{}", texts(&rows));
-        let shown = texts(&rows);
-        assert!(shown.contains("2 alerts"), "{shown}");
-        assert!(shown.contains("is waiting for a permission"), "{shown}");
-        // Nothing on the line answers an alert by accident.
-        assert_eq!(
-            taps(&rows),
-            vec![Hit::Alert("agent/example/atlas".into(), AlertTap::Toggle)]
-        );
-        ui.click(Hit::Alert("agent/example/atlas".into(), AlertTap::Toggle));
-        let open = ui.alert_band("agent/example/atlas", 80);
-        assert!(open.len() > 1);
-        assert!(taps(&open).contains(&Hit::Alert(
-            "attention/a".into(),
-            AlertTap::Answer("deny".into())
-        )));
-        ui.click(Hit::Alert("agent/example/atlas".into(), AlertTap::Toggle));
-        assert_eq!(ui.alert_band("agent/example/atlas", 80).len(), 1);
+        let mut world = demo::world();
+        world.attention = Load::Ready(vec![update]);
+        let ui = Ui::new(world);
+        assert!(ui.alert_band(SEAT, 80, 20).is_empty());
     }
 
     #[test]
     fn the_collapsed_line_fits_a_narrow_pane() {
-        let ui = with_alerts(vec![prompt("attention/a", &[])]);
+        let ui = in_conversation(bash_world());
         for width in [12usize, 24, 40] {
-            let rows = ui.alert_band("agent/example/atlas", width);
-            assert_eq!(rows.len(), 1);
+            assert_eq!(ui.alert_band(SEAT, width, 10).len(), 1);
         }
     }
 }

@@ -12,13 +12,12 @@ use ratatui::text::{Line, Span};
 /// What a button on an alert does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AlertTap {
-    /// Send one of its typed answers: `allow`, `deny`, or a structured answer's id.
+    /// Send one of its typed answers: a prompt's (`allow`, `deny`, `skip`, ...), or a structured
+    /// answer's id.
     Answer(String),
     /// Choose, or for a multi-select also unchoose, an option of a harness's question: the
     /// question's and the option's places in the pending call.
     Choose(usize, usize),
-    /// Open the alert's whole card in Now, where every kind is answered.
-    Open,
     /// Expand or collapse the band: the `Hit` names the agent's conversation, not an alert.
     Toggle,
 }

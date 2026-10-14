@@ -5,3 +5,4 @@
 #![forbid(unsafe_code)]
 
 pub mod missions;
+pub mod prompts;
