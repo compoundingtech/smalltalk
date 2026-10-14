@@ -459,7 +459,7 @@ pub struct Ui {
     /// The prompt alert whose form has the keys (Ctrl+N in a conversation, `a` in Now).
     prompt_keys: Option<String>,
     /// Each alert's band card from the last frame, with a hash of what it was drawn from.
-    band_cards: RefCell<HashMap<(String, usize), (u64, Doc, usize)>>,
+    band_cards: RefCell<HashMap<(String, usize), alerts::KeptCard>>,
     /// `stui --glasses`: named glasses of tabs and split panes, and a palette, in place of the
     /// sidebar layout.
     pub(crate) glasses: Option<glass::Glasses>,
@@ -830,6 +830,10 @@ impl Ui {
                     None => "closed, x clears it".into(),
                 });
                 kept.actions.clear();
+                // A closed prompt waits for nothing: its form offers no answer.
+                if let AttentionKind::Prompt { answers, .. } = &mut kept.kind {
+                    answers.clear();
+                }
             }
             items.push(kept);
         }

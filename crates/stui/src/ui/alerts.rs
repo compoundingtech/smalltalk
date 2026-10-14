@@ -421,6 +421,10 @@ pub(super) fn prompt_form(
     (full, call_shown)
 }
 
+/// A band card kept between frames: a hash of what it was drawn from, the card, and how many
+/// lines of its call it shows.
+pub(super) type KeptCard = (u64, Doc, usize);
+
 /// One row of the band: its line, and the buttons on it by column.
 pub(super) struct BandRow {
     pub(super) line: Line<'static>,
@@ -811,7 +815,12 @@ impl Ui {
         // The pane's title bar, filled across the width so the cards below read as one block
         // that belongs to the box under it; the whole bar folds it again.
         let left = format!(" ◆ {count} alert{} ", if count == 1 { "" } else { "s" });
-        let right = " ▾ fold · Esc ";
+        // Esc folds only while a form here has the keys; a click on the bar always does.
+        let keys_here = self
+            .prompt_keys
+            .as_ref()
+            .is_some_and(|keys| alerts.iter().any(|item| &item.id == keys));
+        let right = if keys_here { " ▾ fold · Esc " } else { " ▾ fold " };
         let gap = width.saturating_sub(text::width(&left) + text::width(right));
         let bar = |style: Style| style.bg(theme::SURFACE0);
         let mut rows = vec![BandRow {
@@ -946,6 +955,11 @@ impl Ui {
             return false;
         };
         let Some(model) = prompt_model(&self.world, item) else {
+            // Its answers went while it had the keys: Esc still folds it, and nothing else is taken.
+            if key.code == KeyCode::Esc {
+                self.toggle_form_keys();
+                return true;
+            }
             self.prompt_keys = None;
             return false;
         };
@@ -1607,6 +1621,54 @@ mod tests {
     fn now_follows_the_seat_of_the_prompt_it_shows() {
         let ui = in_now(bash_world());
         assert!(ui.live_conversations().contains(&SEAT.to_owned()));
+    }
+
+    /// A prompt st stops listing stays under Recently closed, offering no answer, in Now or in place.
+    #[test]
+    fn a_closed_prompt_offers_no_answer() {
+        let world = bash_world();
+        let mut ui = in_now(world.clone());
+        ui.live = true;
+        assert!(options(&render(&ui, 80, 40)).len() == 2);
+        let mut next = world;
+        next.attention = Load::Ready(vec![]);
+        ui.set_world(next);
+        let index = ui.ids().iter().position(|id| id == "attention/one").unwrap();
+        ui.select(index);
+        let shown = render(&ui, 80, 40);
+        assert!(shown.contains("closed, x clears it"), "{shown}");
+        assert!(options(&shown).is_empty(), "{shown}");
+        assert!(!shown.contains("to answer with the keys"), "{shown}");
+        assert!(ui.alert_band(SEAT, 80, 20).is_empty());
+    }
+
+    /// The bar names Esc only while a form here has the keys, and Esc still folds a form whose
+    /// answers went while it had them (st stops offering them once the prompt waits too long).
+    #[test]
+    fn esc_folds_the_band_it_names_even_after_the_answers_go() {
+        let world = bash_world();
+        let mut ui = in_conversation(world.clone());
+        ui.live = true;
+        ui.toggle_alerts(SEAT);
+        let bar = |ui: &Ui| ui.alert_band(SEAT, 80, 30)[0].line.to_string();
+        assert!(bar(&ui).contains("▾ fold") && !bar(&ui).contains("Esc"), "{}", bar(&ui));
+        ui.toggle_alerts(SEAT);
+        press(&mut ui, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert!(bar(&ui).contains("▾ fold · Esc"), "{}", bar(&ui));
+        let mut next = world;
+        if let Load::Ready(items) = &mut next.attention {
+            for item in items.iter_mut() {
+                if let AttentionKind::Prompt { answers, .. } = &mut item.kind {
+                    answers.clear();
+                }
+            }
+        }
+        ui.set_world(next);
+        assert!(options(&render(&ui, 80, 40)).is_empty());
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(ui.prompt_keys.is_none());
+        assert_eq!(ui.alert_band(SEAT, 80, 30).len(), 1, "folded to its line");
+        assert!(ui.effects.is_empty());
     }
 
     #[test]
