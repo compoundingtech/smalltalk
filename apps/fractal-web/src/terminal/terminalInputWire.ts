@@ -13,11 +13,6 @@ export type TerminalInputWire =
   | { readonly mode: 'key'; readonly value: string }
   | { readonly mode: 'raw'; readonly value: string }
 
-/** Above this many UTF-8 bytes a paste asks for confirmation before it is sent. */
-export const pasteConfirmBytes = 4 * 1024
-/** A paste larger than this is refused locally; it would not be one honest terminal write. */
-export const pasteMaxBytes = 64 * 1024
-
 const named: ReadonlyArray<readonly [string, string]> = [
   ['enter', '\r'],
   ['tab', '\t'],
@@ -71,32 +66,3 @@ export const terminalInputWire = (bytes: Uint8Array): TerminalInputWire | undefi
   const name = keyNames.get(latin1(bytes))
   return name === undefined ? rawInput(bytes) : { mode: 'key', value: name }
 }
-
-const bracketMarkers = ['\x1b[200~', '\x1b[201~']
-
-/**
- * Clipboard line endings become the carriage return a terminal Enter sends, and embedded
- * bracketed-paste markers are removed so pasted text cannot end the bracket early and run as keys.
- * Removal repeats until stable: deleting one marker must not splice a new one together.
- */
-export const normalizePaste = (text: string) => {
-  let normalized = text.replaceAll('\r\n', '\r')
-  for (let previous = ''; previous !== normalized; ) {
-    previous = normalized
-    for (const marker of bracketMarkers) normalized = normalized.replaceAll(marker, '')
-  }
-  return normalized
-}
-
-/** Inserted or composed text up to this many UTF-8 bytes on one line goes straight to the terminal. */
-export const directTextMaxBytes = 128
-
-/**
- * Whether inserted text (an IME commit, dictation or autocomplete) must take the paste path:
- * any line break or other control character, or more than `directTextMaxBytes`.
- */
-export const isBulkText = (text: string) =>
-  [...text].some((char) => {
-    const code = char.codePointAt(0) ?? 0
-    return code < 0x20 || code === 0x7f
-  }) || new TextEncoder().encode(text).length > directTextMaxBytes

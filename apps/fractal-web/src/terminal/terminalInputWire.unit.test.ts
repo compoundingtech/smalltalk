@@ -2,8 +2,8 @@ import { readFile } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
 
 import { makeGhosttyKeyboard, type BrowserTerminalKey } from './ghosttyKeyboard.ts'
-import { keyboardTestModes } from './terminalInputFixture.ts'
-import { directTextMaxBytes, isBulkText, normalizePaste, terminalInputWire } from './terminalInputWire.ts'
+import { keyboardTestModes } from './fixtures.ts'
+import { terminalInputWire } from './terminalInputWire.ts'
 
 const bytes = (value: string) => Uint8Array.from(value, (char) => char.charCodeAt(0))
 const utf8 = new TextEncoder()
@@ -40,31 +40,5 @@ describe('terminal input wire', () => {
     } finally {
       encoder.dispose()
     }
-  })
-
-  it('brackets a paste per the screen mode and turns CRLF into CR', async () => {
-    const encoder = await makeGhosttyKeyboard(await readFile(new URL('./assets/ghostty-key-encoder.generated.wasm', import.meta.url)))
-    const decode = new TextDecoder()
-    try {
-      expect(normalizePaste('one\r\ntwo\r\n')).toBe('one\rtwo\r')
-      expect(decode.decode(encoder.paste({ text: normalizePaste('one\r\ntwo'), modes: keyboardTestModes }))).toBe('\x1b[200~one\rtwo\x1b[201~')
-      expect(decode.decode(encoder.paste({ text: normalizePaste('one\r\ntwo'), modes: { ...keyboardTestModes, bracketed_paste: false } }))).toBe('one\rtwo')
-    } finally {
-      encoder.dispose()
-    }
-  })
-
-  it('removes bracketed-paste markers, including ones spliced together by a removal', () => {
-    expect(normalizePaste('a\x1b[201~b\x1b[200~c')).toBe('abc')
-    expect(normalizePaste('a\x1b[20\x1b[201~1~b')).toBe('ab')
-  })
-
-  it('admits only a short single line of inserted text directly', () => {
-    expect(isBulkText('日本語')).toBe(false)
-    expect(isBulkText('x'.repeat(directTextMaxBytes))).toBe(false)
-    expect(isBulkText('x'.repeat(directTextMaxBytes + 1))).toBe(true)
-    expect(isBulkText('one\ntwo')).toBe(true)
-    expect(isBulkText('a\x1bb')).toBe(true)
-    expect(isBulkText('a\x7f')).toBe(true)
   })
 })

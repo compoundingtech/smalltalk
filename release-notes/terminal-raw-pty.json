@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Web terminals type and render through the raw PTY stream with an in-browser Ghostty emulator; the projected screen stays as a read-only fallback",
+  "replay": {
+    "status": "none",
+    "detail": "No claim, replay or projection change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, index or trigger changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Server auth is unchanged. The web client requests a raw attachment per connection (`POST /v1/client/terminals/{id}/raw-attachments`) and the daemon admits it only for credentials holding `terminal.control`; limited pairings do not hold it today, so those devices get the read-only view."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Fractal web opens `st3.client.pty.v0` WebSockets through its gateway for visible terminal panes and sends keys, pastes and element-driven resizes as frames on that socket. The \"Terminal keyboard / Enable input\" strip, the per-key `terminal.input` posts and the explicit Resize dialog are removed from the web client; the `terminal.input` and `terminal.resize` actions remain available to other clients. Each attached browser pane is a writable client, so the shared PTY size is the smallest attached pane. When the attach is refused, the socket fails three times in a row, or the emulator asset cannot load, the pane shows the projected screen read-only with a Read-only chip."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "A daemon restart or deploy drops the socket; the pane reconnects with a fresh capability, replays the current screen, and never replays keys typed while disconnected."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action. Devices paired with limited scopes stay read-only until their pairing admits `terminal.control`."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new persistent state. Reverting the web client restores the projected view and the input strip."
+  }
+}

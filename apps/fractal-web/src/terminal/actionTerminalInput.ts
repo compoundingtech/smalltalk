@@ -2,7 +2,8 @@ import * as Atom from 'effect/reactivity/Atom'
 import type * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 
 import type { TerminalInputPort, TerminalInputState } from './orderedTerminalInput.ts'
-import { pasteMaxBytes, rawInput, terminalInputWire, type TerminalInputWire } from './terminalInputWire.ts'
+import { pasteMaxBytes } from './rawTerminalInput.ts'
+import { rawInput, terminalInputWire, type TerminalInputWire } from './terminalInputWire.ts'
 
 /** What one `terminal.input` action did. Every reason is fixed, user-readable copy. */
 export type TerminalInputOutcome =

@@ -50,7 +50,7 @@ vi.mock('../data/react.tsx', async () => {
   useDataSource: () => ({ agents, conversationInterest: undefined }),
   useFeedInterest: () => {},
   useNow: () => source.now,
-  useGrants: () => ({ actions: 'ungranted', messageSend: 'ungranted', terminalInput: 'ungranted' }),
+  useGrants: () => ({ actions: 'ungranted', messageSend: 'ungranted', terminalInput: 'ungranted', terminalControl: 'ungranted' }),
   })
 })
 

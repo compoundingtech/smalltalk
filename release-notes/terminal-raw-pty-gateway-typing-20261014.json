@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Merge current main into the raw web terminal and keep gateway typing: devices without `terminal.control` watch the raw stream as a PEEK and still type through `terminal.input` on the same surface",
+  "replay": {
+    "status": "none",
+    "detail": "No claim, replay or projection change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, index or trigger changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Server auth is unchanged. The web client decides the input path once from the credential's grants: `terminal.control` gets a raw ATTACH that types and votes the size; `terminal.input` without `terminal.control` gets a raw PEEK (`mode: peek`, admitted with `terminal.read`) for output and the gateway `terminal.input` action for typing; neither grant gets a read-only PEEK."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Supersedes the read-only fallback described in terminal-raw-pty: the web client again uses the `terminal.input` action and the explicit `terminal.resize` dialog whenever it is not holding a live ATTACH, so every device that can type today still types. A refused or failed ATTACH reopens the stream as a PEEK and moves typing to the gateway; a refused PEEK shows the projected screen. A PEEK never sends DATA, RESIZE or RESET, and only an ATTACH votes the shared PTY size. Main's agent controls (interrupt through `terminal.input`) are kept. The \"Terminal keyboard / Enable input\" strip stays removed."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No downtime. A daemon restart drops the raw socket as before; gateway typing never replays keys typed while disconnected."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action. Limited pairings keep typing without being granted `terminal.control`."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new persistent state. Reverting this merge returns limited pairings to the read-only raw view."
+  }
+}

@@ -102,6 +102,30 @@ export {
   FOLLOW_SUBSCRIBE_SPAN,
   type FirstFrameOutcome,
 } from './firstFrame.ts'
+export {
+  PTY_SUBPROTOCOL,
+  PtyFrame,
+  PtyProtocolError,
+  encodePtyFrame,
+  makePtyFrameReader,
+  type PtyTarget,
+  type PtyMode,
+  type PtySize,
+  PtyAttachFailure,
+  type PtyAttachment,
+  requestPtyAttachment,
+  ptyStreamUrl,
+  type PtyState,
+  type PtyEvent,
+  ptyBackoffMillis,
+  ptyTransition,
+  ptyFallback,
+  type PtySocket,
+  type PtySocketFactory,
+  type PtyOutput,
+  type PtySession,
+  openPtySession,
+} from './pty.ts'
 
 // Arrangement windows use the generated owner-scoped subscribeArrangements API.
 

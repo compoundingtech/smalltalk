@@ -10,7 +10,7 @@ import type {
   TerminalScreen,
 } from '@smalltalk/st3-client'
 import type { AttachmentSendRequest, MessageSendAction } from './source.ts'
-import { Effect, Layer } from 'effect'
+import { Effect, Layer, SubscriptionRef } from 'effect'
 import * as Option from 'effect/Option'
 import * as Atom from 'effect/reactivity/Atom'
 import { afterEach, beforeEach, describe, expect, vi } from 'vitest'
@@ -58,6 +58,7 @@ class Gateway {
   terminalReplacement = ''
   replaceOnAttach = false
   terminalAttachRefusal: string | undefined
+  readonly rawAttachments: Array<{ readonly path: string; readonly body: unknown }> = []
   readonly terminalInputs: unknown[] = []
   terminalAttachRetryable = false
   terminalAttachStatus = 409
@@ -65,6 +66,7 @@ class Gateway {
   runtimesWithoutTerminal = new Set<string>()
   messageGrant: 'granted' | 'ungranted' = 'granted'
   terminalInputGrant: 'granted' | 'ungranted' = 'granted'
+  terminalControlGrant: 'granted' | 'ungranted' = 'ungranted'
   transportFailure = false
   capabilityGate: Promise<void> | undefined
   capabilityFailure = false
@@ -119,6 +121,7 @@ class Gateway {
           { id: 'work.done', state: 'granted', version: 0 },
           { id: 'message.send', state: this.messageGrant, version: 0 },
           { id: 'terminal.input', state: this.terminalInputGrant, version: 0 },
+          { id: 'terminal.control', state: this.terminalControlGrant, version: 0 },
         ],
         event_cursor: 'cursor/current',
         oldest_event_cursor: 'cursor/oldest',
@@ -261,6 +264,19 @@ class Gateway {
       } else {
         throw new Error(`Unexpected action ${action.type}`)
       }
+    } else if (path.endsWith('/raw-attachments') && typeof init?.body === 'string') {
+      const body = JSON.parse(init.body) as { readonly runtime_incarnation: string; readonly mode: 'attach' | 'peek' }
+      this.rawAttachments.push({ path, body })
+      // A PEEK needs only `terminal.read`; limited pairings on main lack `terminal.control` for ATTACH.
+      if (body.mode === 'peek') return Response.json({
+        api_version: 'st3.client.v0', snapshot,
+        value: { terminal_id: 'terminal/example', runtime_incarnation: body.runtime_incarnation, owner_host_id: 'host/example', mode: 'peek', stream_capability: 'peek-capability' },
+      })
+      return Response.json({
+        api_version: 'st3.client.v0', error_version: 'st3.client.error.v0',
+        code: 'forbidden', message: 'This device may not control terminals', retryable: false,
+        request_id: 'request/raw-attachment', details: {},
+      }, { status: 403 })
     } else if (path === '/v1/client/usage') {
       value = { since_ms: 0, until_ms: 1000, rows: [] }
     } else {
@@ -1231,6 +1247,85 @@ describe('terminal dependent-read authority', () => {
         warn.mockRestore()
         expect(logged).not.toMatch(/private-screen-text|private-title|wide|Error/)
         expect(live.registry.get(live.source.terminal('terminal/example'))._tag).not.toBe('Observed')
+      }),
+    ),
+  )
+})
+
+describe('raw terminal stream', () => {
+  it.live('requests a fresh raw attachment through the gateway and reports a refusal for the read-only fallback', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        const session = yield* live.source.terminalRaw!.open({
+          target: { terminalId: 'terminal/example', incarnation: 'incarnation-example' },
+          mode: 'attach',
+          size: { cols: 80, rows: 24 },
+          onOutput: () => {},
+        })
+        yield* settle
+        expect(gateway.rawAttachments).toEqual([{
+          path: '/v1/client/terminals/example/raw-attachments',
+          body: { runtime_incarnation: 'incarnation-example', mode: 'attach' },
+        }])
+        const state = yield* SubscriptionRef.get(session.state)
+        expect(state).toMatchObject({ _tag: 'Refused', status: 403, code: 'forbidden' })
+        expect(session.send(new Uint8Array([3]))).toBe(false)
+      }).pipe(Effect.scoped),
+    ),
+  )
+
+  it.live('requests a view-only PEEK capability through the same gateway', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        const sockets: string[] = []
+        vi.stubGlobal('WebSocket', class {
+          binaryType = ''
+          onopen = null
+          onmessage = null
+          onclose = null
+          onerror = null
+          constructor(url: string) {
+            sockets.push(url)
+          }
+          send() {}
+          close() {}
+        })
+        const session = yield* live.source.terminalRaw!.open({
+          target: { terminalId: 'terminal/example', incarnation: 'incarnation-example' },
+          mode: 'peek',
+          size: { cols: 80, rows: 24 },
+          onOutput: () => {},
+        })
+        yield* settle
+        expect(session.mode).toBe('peek')
+        expect(gateway.rawAttachments).toEqual([{
+          path: '/v1/client/terminals/example/raw-attachments',
+          body: { runtime_incarnation: 'incarnation-example', mode: 'peek' },
+        }])
+        expect(sockets).toHaveLength(1)
+        expect(sockets[0]).toMatch(/\/v1\/client\/terminals\/example\/raw-stream\?incarnation=incarnation-example&mode=peek$/)
+      }).pipe(Effect.scoped),
+    ),
+  )
+
+  it.live('publishes terminal.input and terminal.control as separate grants for the input decision', () =>
+    withGateway((live) =>
+      Effect.gen(function* () {
+        live.registry.mount(live.source.grants)
+        yield* settle
+        expect(live.registry.get(live.source.grants)).toMatchObject({ terminalInput: 'granted', terminalControl: 'ungranted' })
+      }),
+    ),
+  )
+
+  it.live('publishes terminal.control when the device holds it', () =>
+    withGateway((live, gateway) =>
+      Effect.gen(function* () {
+        gateway.terminalControlGrant = 'granted'
+        gateway.terminalInputGrant = 'ungranted'
+        live.registry.mount(live.source.grants)
+        yield* settle
+        expect(live.registry.get(live.source.grants)).toMatchObject({ terminalInput: 'ungranted', terminalControl: 'granted' })
       }),
     ),
   )

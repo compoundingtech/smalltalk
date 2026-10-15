@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Correct the raw web terminal's grant claims (limited pairings stay read-only PEEK until they hold `terminal.control`) and stop gateway typing when the page is hidden or unloaded",
+  "replay": {
+    "status": "none",
+    "detail": "No claim, replay or projection change."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No schema, index or trigger changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "Server auth is unchanged. Correction to terminal-raw-pty-gateway-typing-20261014: the server maps the `terminal.input` action to the `terminal.control` scope and advertises it as granted only when that scope is held, and limited pairing scopes include neither. A device therefore never holds `terminal.input` without `terminal.control`, so limited pairings do not type through the gateway: they watch a read-only PEEK (admitted with `terminal.read`) until the server admits `terminal.control` for them (compoundingtech/smalltalk#2873). The gateway `terminal.input` path keeps devices that hold `terminal.control` typing after their raw ATTACH is refused, fails or cannot start its emulator."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Gateway typing again stops when the page is hidden (`visibilitychange` to hidden) or unloaded (`pagehide`), as main's keyboard strip did: the input session closes at once and keys still queued behind an in-flight post are dropped, never sent later. Typing resumes only after focusing or clicking the terminal; a key alone is refused with a notice and the chip reads Click to type. Raw ATTACH typing, paste, IME and resize behaviour are unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No downtime."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No operator action. Correction to terminal-raw-pty-gateway-typing-20261014: limited pairings stay read-only until compoundingtech/smalltalk#2873 grants them `terminal.control`; they did not gain typing."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No new persistent state. Reverting this change reopens the hidden-page gap (queued gateway keys could post after the tab was hidden) and leaves the earlier, incorrect grant wording as the only release note."
+  }
+}

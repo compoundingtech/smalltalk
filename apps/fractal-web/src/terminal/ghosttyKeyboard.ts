@@ -1,6 +1,7 @@
 import type { TerminalModes } from '@smalltalk/st3-client/schema'
 
 import { ghosttyKeyCodes } from './ghosttyKeyCodes.generated.ts'
+import { instantiateGhosttyNative, type GhosttyNative } from './ghosttyVt.ts'
 
 /** The encoder executes Smalltalk's pinned native Ghostty WASM, not a JS approximation. */
 export interface TerminalKeyEncoder {
@@ -43,44 +44,13 @@ const punctuation: Readonly<Record<string, string>> = {
 }
 const utf8 = new TextEncoder()
 
-/** Load the pinned native Ghostty encoder asset for browser use. */
-export const loadGhosttyKeyboard = async (): Promise<TerminalKeyEncoder> => {
-  const response = await fetch(
-    new URL('./assets/ghostty-key-encoder.generated.wasm', import.meta.url),
-  )
-  if (!response.ok) throw new Error(`Native terminal encoder unavailable: HTTP ${response.status}`)
-  return makeGhosttyKeyboard(await response.arrayBuffer())
-}
+/** Instantiate a private native module for existing byte-based encoder callers. */
+export const makeGhosttyKeyboard = async (bytes: BufferSource): Promise<TerminalKeyEncoder> =>
+  makeGhosttyKeyboardOn(await instantiateGhosttyNative(bytes))
 
-/** Separate loader allows browser and Node proofs to execute the identical committed native asset. */
-export const makeGhosttyKeyboard = async (bytes: BufferSource): Promise<TerminalKeyEncoder> => {
-  let memory: WebAssembly.Memory | undefined
-  const instance = await WebAssembly.instantiate(bytes, {
-    env: {
-      // oxlint-disable-next-line overeng/named-args -- WebAssembly fixes the positional (pointer, length) import ABI.
-      log: (pointer: number, length: number) => {
-        if (memory !== undefined)
-          console.warn(new TextDecoder().decode(new Uint8Array(memory.buffer, pointer, length)))
-      },
-    },
-  })
-  const exports = instance.instance.exports
-  if (!(exports.memory instanceof WebAssembly.Memory))
-    throw new Error('Native encoder has no memory export')
-  memory = exports.memory
-  const heap = exports.memory
-  const call = (name: string, ...args: number[]): number => {
-    const fn = exports[name]
-    if (typeof fn !== 'function') throw new Error(`Missing native encoder export: ${name}`)
-    const result: unknown = fn(...args)
-    if (result === undefined) return 0
-    if (typeof result !== 'number') throw new Error(`Invalid native encoder return: ${name}`)
-    return result
-  }
-  const checked = (name: string, ...args: number[]) => {
-    const result = call(name, ...args)
-    if (result !== 0) throw new Error(`Native terminal encoding failed (${name}: ${result})`)
-  }
+/** Create an encoder sharing the terminal's native module and memory. */
+export const makeGhosttyKeyboardOn = (native: GhosttyNative): TerminalKeyEncoder => {
+  const { memory: heap, call, checked } = native
   const slot = call('ghostty_wasm_alloc_usize')
   const option = call('ghostty_wasm_alloc_u8')
   let encoder = 0

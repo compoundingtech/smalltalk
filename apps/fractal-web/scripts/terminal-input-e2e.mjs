@@ -4,9 +4,10 @@
  * Seat is required, with no default, and must contain the delimited word "scratch".
  * PLAYWRIGHT_MODULE: path or specifier of the playwright module (default 'playwright').
  * CHROMIUM_PATH: optional browser executable.
- * Pass = input enables, `echo <nonce>` reaches the terminal (the nonce appears on a grid row, which
- * renders only gateway screen frames: a shell echo line or a TUI's input line both count), Ctrl-C is
- * accepted without closing the input session, and the page never leaves the scratch seat.
+ * Pass = the raw PTY stream goes live (chip leaves "Connecting…" for "Click to type", never
+ * "Read-only"), a click on the grid starts typing, `echo <nonce>` reaches the terminal (the nonce
+ * appears on a grid row, which renders only PTY output: a shell echo line or a TUI's input line both
+ * count), Ctrl-C is sent without dropping the stream, and the page never leaves the scratch seat.
  */
 import fs from 'node:fs'
 import { randomBytes } from 'node:crypto'
@@ -37,7 +38,8 @@ const step = (name, ok, extra = {}) => {
 const onSeat = () => decodeURIComponent(new URL(page.url()).pathname) === `/w/${SEAT}`
 const pane = page.locator('[data-testid="terminal-pane"]')
 const grid = pane.locator('[aria-roledescription="terminal"]')
-const inputState = () => pane.locator('[data-terminal-input-state]').getAttribute('data-terminal-input-state')
+const chip = () => pane.locator('[data-terminal-mode]').textContent()
+const inputState = () => pane.locator('[data-terminal-input]').getAttribute('data-terminal-input')
 // The grid paints gateway screens only, never local keystrokes; the fresh nonce cannot predate typing.
 const echoed = () => grid.locator('[data-terminal-row]').evaluateAll(
   (rows, token) => rows.some((row) => row.textContent.includes(token)),
@@ -55,19 +57,17 @@ try {
   if ((await toggle.getAttribute('aria-pressed')) !== 'true') await toggle.click()
   await grid.waitFor({ state: 'visible', timeout: 60_000 })
   step('grid-visible', true)
-  const enable = pane.getByRole('button', { name: 'Enable input', exact: true })
-  await enable.waitFor({ state: 'visible', timeout: 30_000 })
-  await enable.click()
-  step('input-ready', await poll(async () => (await inputState()) === 'Ready', 15_000))
+  step('raw-live', await poll(async () => ['Click to type', 'Typing'].includes(await chip()), 30_000), { chip: await chip() })
+  await grid.click()
+  step('typing', await poll(async () => (await chip()) === 'Typing', 5_000))
   step('still-on-scratch-seat', onSeat())
   await page.keyboard.type(`echo ${nonce}`)
   await page.keyboard.press('Enter')
   step('nonce-echoed', await poll(echoed, 30_000))
   await page.keyboard.press('Control+C')
   await page.waitForTimeout(1500)
-  step('ctrl-c-accepted', (await inputState()) === 'Ready' && (await pane.locator('[role="alert"]').count()) === 0)
+  step('ctrl-c-accepted', (await inputState()) === 'live' && (await pane.locator('[role="alert"]').count()) === 0)
   await page.screenshot({ path: `${out}/terminal-input.png` })
-  await pane.getByRole('button', { name: 'Disable input', exact: true }).click()
   report.pass = report.steps.every((entry) => entry.ok)
 } catch (error) {
   report.error = String(error).slice(0, 300)

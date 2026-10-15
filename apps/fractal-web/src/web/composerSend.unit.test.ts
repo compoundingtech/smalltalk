@@ -10,7 +10,7 @@ const message = {
   role: 'user', content: [{ type: 'text', text: 'hello' }], createdAt: new Date(0),
   metadata: { custom: {} }, parentId: null, sourceId: null, runConfig: undefined,
 } as const
-const grants = { actions: 'granted', messageSend: 'granted', terminalInput: 'ungranted' } as const
+const grants = { actions: 'granted', messageSend: 'granted', terminalInput: 'ungranted', terminalControl: 'ungranted' } as const
 const seat = 'agent/example/scratch'
 
 describe('composer send contract', () => {

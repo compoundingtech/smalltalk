@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { TerminalInputUnsendable } from './actionTerminalInput.ts'
 import { makeTerminalInputFixture } from './terminalInputFixture.ts'
-import { pasteMaxBytes } from './terminalInputWire.ts'
+import { pasteMaxBytes } from './rawTerminalInput.ts'
 
 const text = new TextEncoder()
 const raw = (value: string) => ({ mode: 'raw', value: btoa(value) })

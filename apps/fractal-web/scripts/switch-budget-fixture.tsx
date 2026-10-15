@@ -52,7 +52,7 @@ const attachments: AttachmentPort = {
   chunk: async () => refusal,
   send: async request => { performance.mark('synthetic-send:' + request.parameters.to); return refusal },
 }
-const source = { ...base, grants: Atom.make({ actions: 'granted', messageSend: 'granted', terminalInput: 'ungranted' } as const), attachments,
+const source = { ...base, grants: Atom.make({ actions: 'granted', messageSend: 'granted', terminalInput: 'ungranted', terminalControl: 'ungranted' } as const), attachments,
   conversation: (ref: string) => feeds[ref]!, conversationInterest: (ref: string) => interests[ref]! }
 window.history.replaceState(null, '', '/w/' + refs[0] + location.search)
 createRoot(document.getElementById('root')!).render(<DataSourceProvider source={source} registry={registry}><LiveAgentWorkspace /></DataSourceProvider>)

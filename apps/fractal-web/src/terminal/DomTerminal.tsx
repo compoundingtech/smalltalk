@@ -25,6 +25,10 @@ export const TERMINAL_LINE_HEIGHT = 17
 export type DomTerminalProps = {
   readonly screen: TerminalScreen
   readonly palette: TerminalPalette
+  /** Positioned on the cell grid above the rows, e.g. the input target at the cursor. */
+  readonly overlay?: ReactNode
+  /** Id of the element describing how to interact with this terminal. */
+  readonly describedBy?: string
 }
 
 /** Keep loading visible instead of font-display:block turning a connected terminal all black. */
@@ -190,7 +194,7 @@ const styles = stylex.create({
   },
 })
 
-const LoadedTerminal = ({ screen, palette }: DomTerminalProps) => {
+const LoadedTerminal = ({ screen, palette, overlay, describedBy }: DomTerminalProps) => {
   const fonts = use(terminalFontsReady())
   if (fonts._tag === 'Failed') {
     return (
@@ -205,7 +209,8 @@ const LoadedTerminal = ({ screen, palette }: DomTerminalProps) => {
       role="region"
       aria-roledescription="terminal"
       aria-label={`Terminal: ${screen.title}`}
-      // Focusable so keyboard users can reach (and later type into) the pane.
+      aria-describedby={describedBy}
+      // Focusable so keyboard users can reach the pane, select and copy its text.
       tabIndex={0}
       data-terminal-renderer="T1"
       {...stylex.props(styles.root)}
@@ -221,6 +226,7 @@ const LoadedTerminal = ({ screen, palette }: DomTerminalProps) => {
         <TerminalLineView key={line.row} line={line} palette={palette} />
       ))}
       <Cursor cursor={screen.cursor} palette={palette} />
+      {overlay}
     </div>
   )
 }

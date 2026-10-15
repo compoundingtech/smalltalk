@@ -32,6 +32,18 @@ type Style = Omit<TerminalRun, 'text'>
 type Seg = TerminalRun
 type Row = ReadonlyArray<Seg>
 
+/** Plain legacy-mode terminal with bracketed paste, shared by encoder and input proofs. */
+export const keyboardTestModes: TerminalModes = {
+  alternate_screen: false,
+  application_cursor: false,
+  application_keypad: false,
+  bracketed_paste: true,
+  kitty_keyboard: 0,
+  focus_events: false,
+  mouse_encoding: 'default',
+  mouse_tracking: 'none',
+}
+
 /** Synthetic renderer-fidelity scenes. */
 export type SceneId = 'F1' | 'F2' | 'F3' | 'F4'
 

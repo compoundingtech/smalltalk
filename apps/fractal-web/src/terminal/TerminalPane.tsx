@@ -94,12 +94,14 @@ export const TerminalPane = ({
   state,
   banner,
   controls,
+  onLatest,
   children,
 }: {
   readonly screen: TerminalScreen | null
   readonly state: PaneState
   readonly banner?: ReactNode
   readonly controls?: ReactNode
+  readonly onLatest?: () => void
   readonly children: ReactNode
 }) => {
   return (
@@ -138,7 +140,9 @@ export const TerminalPane = ({
         )}
       </header>
       {banner === undefined ? null : <div {...stylex.props(styles.banner)}>{banner}</div>}
-      <TerminalViewport ended={state === 'ended'}>{children}</TerminalViewport>
+      <TerminalViewport ended={state === 'ended'} {...(onLatest === undefined ? {} : { onLatest })}>
+        {children}
+      </TerminalViewport>
     </section>
   )
 }

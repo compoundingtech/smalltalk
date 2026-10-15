@@ -78,7 +78,7 @@ export const fixtureSource = ({
   ...(world.proposed === undefined ? {} : { proposed: world.proposed }),
   now: Atom.make(world.now),
   grants: Atom.make(
-    overrides.grants ?? { actions: 'granted', messageSend: 'ungranted', terminalInput: 'granted' },
+    overrides.grants ?? { actions: 'granted', messageSend: 'ungranted', terminalInput: 'granted', terminalControl: 'granted' },
   ),
   connection: Atom.make<ConnectionState>(overrides.connection ?? { _tag: 'Live' }),
   agents: Atom.make(overrides.agents ?? observed({ value: world.agents })),

@@ -22,9 +22,12 @@ const publishHighlights = () => {
 export const TerminalViewport = ({
   children,
   ended = false,
+  onLatest,
 }: {
   readonly children: React.ReactNode
   readonly ended?: boolean
+  /** Returns an emulator-owned viewport (raw mode) to the active area as well. */
+  readonly onLatest?: () => void
 }) => {
   const id = React.useId()
   const viewport = React.useRef<HTMLDivElement | null>(null)
@@ -181,6 +184,7 @@ export const TerminalViewport = ({
         <Button
           onPress={() => {
             following.current = true
+            onLatest?.()
             const element = viewport.current
             if (element !== null) element.scrollTop = element.scrollHeight
           }}
