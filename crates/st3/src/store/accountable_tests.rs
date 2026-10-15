@@ -255,7 +255,7 @@ fn accountable_absent_preserves_previous_cbor_bytes_and_desired_revisions() {
     assert_eq!(desired_revision(&minimal), "e9fcc02577cf489c512b41ff9998ade7db1e9c12a66d8269fe13e379757da944");
     assert_eq!(canonical_hash(&previous(&minimal)).unwrap(), desired_revision(&minimal));
 
-    let fixture: Value = serde_json::from_str(include_str!(
+    let fixture: Value = serde_json::from_str(/* sqlite-large-value: allow-for-now lv-h4617e7725991 owner=st3::store::accountable_tests TODO=trace-statement-and-value-representation */ include_str!(
         "../../tests/fixtures/harness-access-previous-build.json"
     )).unwrap();
     for body in fixture["desired_subjects"].as_array().unwrap() {

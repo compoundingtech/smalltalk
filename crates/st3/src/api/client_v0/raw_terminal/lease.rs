@@ -90,7 +90,7 @@ fn latest(
         "SELECT origin,body FROM claims WHERE subject=?1 AND kind=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
     );
     let row: Option<(String, String)> = connection
-        .query_row(&query, params![subject, kind], |row| {
+        .query_row(/* sqlite-large-value: allow-for-now lv-hc6a130d94514 owner=st3::api::client_v0::raw_terminal::lease TODO=trace-statement-and-value-representation */ &query, params![subject, kind], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })
         .optional()?;

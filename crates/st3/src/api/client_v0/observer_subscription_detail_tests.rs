@@ -195,7 +195,7 @@ async fn detail_router_preserves_ids_kinds_stops_and_actor_scope() {
     // Projection compatibility fixture for legacy raw IDs, not a new admission rule.
     let connection = Connection::open(root.path().join("graph.db")).unwrap();
     crate::store::configure_projection_writer(&connection).unwrap();
-    connection.execute("UPDATE desired SET owner_run='mission-run/owner', owner_generation='run-generation/owner', owner_step='step-run/owner/watch' WHERE subject=?1", [OBSERVER]).unwrap();
+    connection.execute(/* sqlite-large-value: allow-for-now lv-hb3ffc00de08e owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET owner_run='mission-run/owner', owner_generation='run-generation/owner', owner_step='step-run/owner/watch' WHERE subject=?1", [OBSERVER]).unwrap();
     let (_, owned) = get(&state, &format!("/v1/client/observers/{OBSERVER}")).await;
     assert_eq!(owned["value"]["owner_run_id"], "mission-run/owner");
     assert_eq!(
@@ -218,10 +218,10 @@ async fn detail_router_preserves_ids_kinds_stops_and_actor_scope() {
             Ok(())
         })
         .unwrap();
-    connection.execute("UPDATE desired SET owner_run=NULL,owner_generation=NULL,owner_step=NULL WHERE subject=?1", [OBSERVER]).unwrap();
+    connection.execute(/* sqlite-large-value: allow-for-now lv-h9d146536b86b owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET owner_run=NULL,owner_generation=NULL,owner_step=NULL WHERE subject=?1", [OBSERVER]).unwrap();
     connection
         .execute(
-            "INSERT INTO desired SELECT 'detail/watch/source',kind,revision,claim_id,
+            /* sqlite-large-value: allow-for-now lv-h87eea61ec47a owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO desired SELECT 'detail/watch/source',kind,revision,claim_id,
         body,member,owner_run,owner_generation,owner_step FROM desired WHERE subject=?1",
             [OBSERVER],
         )
@@ -231,7 +231,7 @@ async fn detail_router_preserves_ids_kinds_stops_and_actor_scope() {
     assert_eq!(value["value"]["state"], "pending");
     connection
         .execute(
-            "UPDATE desired SET kind='agent' WHERE subject='detail/watch/source'",
+            /* sqlite-large-value: allow-for-now lv-h30205afcdca6 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET kind='agent' WHERE subject='detail/watch/source'",
             [],
         )
         .unwrap();
@@ -239,7 +239,7 @@ async fn detail_router_preserves_ids_kinds_stops_and_actor_scope() {
     assert_eq!(value["value"]["id"], OBSERVER);
     connection
         .execute(
-            "DELETE FROM desired WHERE subject='detail/watch/source'",
+            /* sqlite-large-value: allow-for-now lv-h372054f8792e owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM desired WHERE subject='detail/watch/source'",
             [],
         )
         .unwrap();
@@ -499,7 +499,7 @@ async fn detail_router_admits_timestamp_and_host_before_any_snapshot_constructio
     assert!(!triggers.is_empty());
     for (name, _) in &triggers {
         connection
-            .execute_batch(&format!("DROP TRIGGER \"{}\"", name.replace('"', "\"\"")))
+            .execute_batch(&format!(/* sqlite-large-value: allow-for-now lv-hd9052e82099c owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "DROP TRIGGER \"{}\"", name.replace('"', "\"\"")))
             .unwrap();
     }
     let snapshots = SnapshotConstructions::track(&state);
@@ -514,7 +514,7 @@ async fn detail_router_admits_timestamp_and_host_before_any_snapshot_constructio
         let path = format!("/v1/client/{collection}/{subject}");
         connection
             .execute(
-                "UPDATE claims SET accepted_at_unix_ms=?2 WHERE store_index=?1",
+                /* sqlite-large-value: allow-for-now lv-ha35cf05fd0ad owner=st3::api::client_v0::observer_subscription_detail_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms=?2 WHERE store_index=?1",
                 params![position, "0".repeat(280_000)],
             )
             .unwrap();
@@ -532,7 +532,7 @@ async fn detail_router_admits_timestamp_and_host_before_any_snapshot_constructio
             connection
                 .execute(
                     &format!(
-                        "UPDATE claims SET accepted_at_unix_ms={invalid} WHERE store_index=?1"
+                        /* sqlite-large-value: allow-for-now lv-h9147945a009b owner=st3::api::client_v0::observer_subscription_detail_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms={invalid} WHERE store_index=?1"
                     ),
                     [position],
                 )
@@ -546,7 +546,7 @@ async fn detail_router_admits_timestamp_and_host_before_any_snapshot_constructio
         }
         connection
             .execute(
-                "UPDATE claims SET accepted_at_unix_ms=?2 WHERE store_index=?1",
+                /* sqlite-large-value: allow-for-now lv-hf1370bf074ea owner=st3::api::client_v0::observer_subscription_detail_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms=?2 WHERE store_index=?1",
                 params![position, accepted],
             )
             .unwrap();
@@ -564,7 +564,7 @@ async fn detail_router_admits_timestamp_and_host_before_any_snapshot_constructio
         );
     }
     for (_, sql) in triggers {
-        connection.execute_batch(&sql).unwrap();
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h935741dc4467 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=trace-statement-and-value-representation */ &sql).unwrap();
     }
     // A successful detail constructs exactly the guarded response snapshot, which
     // still appears in the wire envelope. Other routes keep admission snapshots.
@@ -615,14 +615,14 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
     ] {
         let original: Option<String> = connection
             .query_row(
-                &format!("SELECT {column} FROM desired WHERE subject=?1"),
+                /* sqlite-large-value: allow-for-now lv-hc67fdfe347f3 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=trace-statement-and-value-representation */ &format!("SELECT {column} FROM desired WHERE subject=?1"),
                 [OBSERVER],
                 |row| row.get(0),
             )
             .unwrap();
         connection
             .execute(
-                &format!("UPDATE desired SET {column}=?2 WHERE subject=?1"),
+                &format!(/* sqlite-large-value: allow-for-now lv-h53bd2764f785 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET {column}=?2 WHERE subject=?1"),
                 params![OBSERVER, huge],
             )
             .unwrap();
@@ -630,7 +630,7 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
         assert!(error["message"].as_str().unwrap().contains("source"));
         connection
             .execute(
-                &format!("UPDATE desired SET {column}=?2 WHERE subject=?1"),
+                &format!(/* sqlite-large-value: allow-for-now lv-h9eb9cb563a59 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET {column}=?2 WHERE subject=?1"),
                 params![OBSERVER, original],
             )
             .unwrap();
@@ -644,14 +644,14 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
     assert!(!triggers.is_empty());
     for (name, _) in &triggers {
         connection
-            .execute_batch(&format!("DROP TRIGGER \"{}\"", name.replace('"', "\"\"")))
+            .execute_batch(&format!(/* sqlite-large-value: allow-for-now lv-h3dc520c7e3e1 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "DROP TRIGGER \"{}\"", name.replace('"', "\"\"")))
             .unwrap();
     }
     // Kind eligibility must not materialize an oversized wrong-kind row before
     // returning absent/fallback. A raw candidate refusing admission never falls
     // through to the otherwise valid prefixed declaration.
     connection.execute(
-        "INSERT INTO desired SELECT 'detail/watch/source','agent',revision,claim_id,body,NULL,NULL,NULL,NULL FROM desired WHERE subject=?1",
+        /* sqlite-large-value: allow-for-now lv-h1aaa1debf90b owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO desired SELECT 'detail/watch/source','agent',revision,claim_id,body,NULL,NULL,NULL,NULL FROM desired WHERE subject=?1",
         [OBSERVER],
     ).unwrap();
     let raw_path = "/v1/client/observers/detail/watch/source";
@@ -662,7 +662,7 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
     );
     connection
         .execute(
-            "UPDATE desired SET kind=?2 WHERE subject=?1",
+            /* sqlite-large-value: allow-for-now lv-h085ac7947adb owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET kind=?2 WHERE subject=?1",
             params!["detail/watch/source", huge],
         )
         .unwrap();
@@ -670,7 +670,7 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
     for value in ["X'80'", "CAST(X'80' AS TEXT)"] {
         connection
             .execute(
-                &format!("UPDATE desired SET kind={value} WHERE subject=?1"),
+                &format!(/* sqlite-large-value: allow-for-now lv-hb5fd606ec793 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET kind={value} WHERE subject=?1"),
                 ["detail/watch/source"],
             )
             .unwrap();
@@ -680,13 +680,13 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
     // while this fixture's UPDATE digest trigger is still suspended.
     connection
         .execute(
-            "UPDATE desired SET kind='agent' WHERE subject='detail/watch/source'",
+            /* sqlite-large-value: allow-for-now lv-h6ead45b6202b owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET kind='agent' WHERE subject='detail/watch/source'",
             [],
         )
         .unwrap();
     connection
         .execute(
-            "DELETE FROM desired WHERE subject='detail/watch/source'",
+            /* sqlite-large-value: allow-for-now lv-hba4259e3bd10 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM desired WHERE subject='detail/watch/source'",
             [],
         )
         .unwrap();
@@ -700,20 +700,20 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
             .unwrap();
         connection
             .execute(
-                &format!("UPDATE desired SET body={value} WHERE subject=?1"),
+                &format!(/* sqlite-large-value: allow-for-now lv-he3ba5805a2e2 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET body={value} WHERE subject=?1"),
                 [OBSERVER],
             )
             .unwrap();
         refuses(&state, &path, "projection-detail-invalid-source").await;
         connection
             .execute(
-                "UPDATE desired SET body=?2 WHERE subject=?1",
+                /* sqlite-large-value: allow-for-now lv-hd41b1625cf5b owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET body=?2 WHERE subject=?1",
                 params![OBSERVER, original],
             )
             .unwrap();
     }
     for (_, sql) in triggers {
-        connection.execute_batch(&sql).unwrap();
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h163f178cf800 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=trace-statement-and-value-representation */ &sql).unwrap();
     }
     // A transaction on this fixture connection would hide modifications from router readers.
     // Persist each corrupt fixture update, then restore it before the next case.
@@ -726,7 +726,7 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
         .unwrap();
     connection
         .execute(
-            "UPDATE desired SET member=?2 WHERE subject=?1",
+            /* sqlite-large-value: allow-for-now lv-ha431152a05c4 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET member=?2 WHERE subject=?1",
             params![OBSERVER, huge],
         )
         .unwrap();
@@ -737,7 +737,7 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
     );
     connection
         .execute(
-            "UPDATE desired SET owner_run=?2 WHERE subject=?1",
+            /* sqlite-large-value: allow-for-now lv-h96adeeeeb9d2 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET owner_run=?2 WHERE subject=?1",
             params![OBSERVER, "\u{1}".repeat(90_000)],
         )
         .unwrap();
@@ -745,16 +745,16 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
     assert!(error["message"].as_str().unwrap().contains("output"));
     connection
         .execute(
-            "UPDATE desired SET owner_run=NULL WHERE subject=?1",
+            /* sqlite-large-value: allow-for-now lv-h4c3ba4f91998 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET owner_run=NULL WHERE subject=?1",
             [OBSERVER],
         )
         .unwrap();
-    connection.execute("INSERT INTO desired SELECT 'detail/watch/source',kind,revision,claim_id,?2,NULL,NULL,NULL,NULL FROM desired WHERE subject=?1", params![OBSERVER, json!({"padding":"x".repeat(140_000),"children":[]}).to_string()]).unwrap();
+    connection.execute(/* sqlite-large-value: allow-for-now lv-h10e7635214aa owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO desired SELECT 'detail/watch/source',kind,revision,claim_id,?2,NULL,NULL,NULL,NULL FROM desired WHERE subject=?1", params![OBSERVER, json!({"padding":"x".repeat(140_000),"children":[]}).to_string()]).unwrap();
     let mut padded: Value = serde_json::from_str(&original).unwrap();
     padded["padding"] = json!("x".repeat(140_000));
     connection
         .execute(
-            "UPDATE desired SET body=?2 WHERE subject=?1",
+            /* sqlite-large-value: allow-for-now lv-h3167afd34087 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET body=?2 WHERE subject=?1",
             params![OBSERVER, padded.to_string()],
         )
         .unwrap();
@@ -766,13 +766,13 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
     .await;
     connection
         .execute(
-            "DELETE FROM desired WHERE subject='detail/watch/source'",
+            /* sqlite-large-value: allow-for-now lv-h0e281a394b25 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM desired WHERE subject='detail/watch/source'",
             [],
         )
         .unwrap();
     connection
         .execute(
-            "UPDATE desired SET body=?2 WHERE subject=?1",
+            /* sqlite-large-value: allow-for-now lv-h5dbc8d05592c owner=st3::api::client_v0::observer_subscription_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET body=?2 WHERE subject=?1",
             params![OBSERVER, original],
         )
         .unwrap();
@@ -794,14 +794,14 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
     let large_state = json!({"fields":{"state":"healthy","reason":huge}}).to_string();
     connection
         .execute(
-            "UPDATE claims SET body=?2 WHERE store_index=?1",
+            /* sqlite-large-value: allow-for-now lv-hae53772e6ece owner=st3::api::client_v0::observer_subscription_detail_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET body=?2 WHERE store_index=?1",
             params![position, large_state],
         )
         .unwrap();
     refuses(&state, &path, "projection-detail-too-large").await;
     connection
         .execute(
-            "UPDATE claims SET body=?2, predecessors=?3 WHERE store_index=?1",
+            /* sqlite-large-value: allow-for-now lv-h7fe1fb287354 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET body=?2, predecessors=?3 WHERE store_index=?1",
             params![position, body, huge],
         )
         .unwrap();
@@ -819,14 +819,14 @@ async fn detail_width_type_encoding_and_cumulative_output_refusals_are_named() {
         .unwrap();
     connection
         .execute(
-            "UPDATE claims SET accepted_at_unix_ms='invalid' WHERE store_index=?1",
+            /* sqlite-large-value: allow-for-now lv-hdaf4b0eb2b9c owner=st3::api::client_v0::observer_subscription_detail_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms='invalid' WHERE store_index=?1",
             [position],
         )
         .unwrap();
     refuses(&state, &path, "projection-detail-invalid-source").await;
     connection
         .execute(
-            "UPDATE claims SET accepted_at_unix_ms=?2 WHERE store_index=?1",
+            /* sqlite-large-value: allow-for-now lv-h2e3a1bde947e owner=st3::api::client_v0::observer_subscription_detail_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET accepted_at_unix_ms=?2 WHERE store_index=?1",
             params![position, accepted],
         )
         .unwrap();
@@ -1084,7 +1084,7 @@ async fn detail_seek_plans_and_metadata_bytecodes_use_indexed_headers() {
         (SNAPSHOT_METADATA_SQL, "claims"),
     ] {
         let mut query = connection
-            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .prepare(/* sqlite-large-value: allow-for-now lv-h18101db1d1be owner=st3::api::client_v0::observer_subscription_detail_tests TODO=trace-statement-and-value-representation */ &format!("EXPLAIN QUERY PLAN {sql}"))
             .unwrap();
         let mut rows = query.raw_query();
         let mut plan = Vec::new();
@@ -1113,7 +1113,7 @@ async fn detail_seek_plans_and_metadata_bytecodes_use_indexed_headers() {
         // Audit every OP_Column, including kind, revision, owners and timestamps.
         // Only the composite index's integer store_index may use an ordinary
         // column read; every variable-width source field needs byte/type flags.
-        let mut query = connection.prepare(&format!("EXPLAIN {sql}")).unwrap();
+        let mut query = connection.prepare(/* sqlite-large-value: allow-for-now lv-h56aea7c55e88 owner=st3::api::client_v0::observer_subscription_detail_tests TODO=trace-statement-and-value-representation */ &format!("EXPLAIN {sql}")).unwrap();
         let mut rows = query.raw_query();
         let mut cursor_roots = BTreeMap::new();
         let mut flags = Vec::new();

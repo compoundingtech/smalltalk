@@ -52,7 +52,7 @@ impl Store {
     pub(crate) fn conversation_local_position(&self) -> Result<u64> {
         Ok(self.readers.get().prepare_cached(
             "SELECT COALESCE(MAX(id),0) FROM local_observations",
-        )?.query_row([], |row| row.get(0))?)
+        )?.query_row(/* sqlite-large-value: allow-for-now lv-h6545ecfa9e8e owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ [], |row| row.get(0))?)
     }
 
     /// Whether a fixed graph/local frontier contains a relevant change. No payload leaves SQL,
@@ -63,8 +63,8 @@ impl Store {
         if after == through && local_after == local_through {
             return Ok(false);
         }
-        Ok(self.readers.get().prepare_cached(CONVERSATION_CHANGED)?
-            .query_row(params![owner, after, through, local_after, local_through], |row| row.get(0))?)
+        Ok(self.readers.get().prepare_cached(/* sqlite-large-value: allow-for-now lv-hb9e5eb96d198 owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ CONVERSATION_CHANGED)?
+            .query_row(/* sqlite-large-value: allow-for-now lv-h2c79cac14e48 owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ params![owner, after, through, local_after, local_through], |row| row.get(0))?)
     }
 
     /// A volatile, rebuildable identity map at a logical claim frontier. Only changed agents
@@ -132,7 +132,7 @@ impl Store {
             _ => {
                 let connection = self.readers.get();
                 let names = connection
-                    .prepare_cached(RANGE_SUBJECTS)?
+                    .prepare_cached(/* sqlite-large-value: allow-for-now lv-h2d7f7a11dc31 owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ RANGE_SUBJECTS)?
                     .query_map(params![through, "agent/", "agent0"], |row| {
                         row.get::<_, String>(0)
                     })?
@@ -238,13 +238,13 @@ impl Store {
                     "SELECT store_index FROM claims WHERE kind='message.sent' AND store_index<?1
                  ORDER BY store_index DESC LIMIT 1 OFFSET 9999",
                 )?
-                .query_row([before], |row| row.get::<_, u64>(0))
+                .query_row(/* sqlite-large-value: allow-for-now lv-hb36bd776de49 owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ [before], |row| row.get::<_, u64>(0))
                 .optional()?
                 .unwrap_or(0)
                 .max(after.saturating_add(1));
             connection
                 .prepare_cached(
-                    "WITH selected AS (
+                    /* sqlite-large-value: allow-for-now lv-h4f39aaadccb5 owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ "WITH selected AS (
                     SELECT store_index FROM claims INDEXED BY claims_message_to_order_index
                     WHERE kind='message.sent' AND json_extract(body,'$.fields.to')=?1
                       AND store_index>=?2 AND store_index<?3
@@ -280,7 +280,7 @@ impl Store {
         let ids = {
             let connection = self.readers.get();
             connection
-                .prepare_cached(TIMELINE_OWNER_IDS)?
+                .prepare_cached(/* sqlite-large-value: allow-for-now lv-h819e378d82be owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ TIMELINE_OWNER_IDS)?
                 .query_map(params![owner, before.unwrap_or(i64::MAX as u64)], |row| {
                     row.get::<_, String>(0)
                 })?
@@ -301,7 +301,7 @@ impl Store {
             let batch = &ids[offset..end];
             let raw = {
                 let connection = self.readers.get();
-                let mut statement = connection.prepare_cached(&format!(
+                let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-habcf1987a4ea owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ &format!(
                     "SELECT {CLAIM_COLUMNS} FROM claims
                      WHERE id IN (SELECT value FROM json_each(?1)) ORDER BY store_index DESC",
                 ))?;
@@ -374,22 +374,22 @@ impl Store {
     ) -> Result<(Option<u128>, Option<u128>)> {
         let connection = self.readers.get();
         let started: Option<String> = connection
-            .prepare_cached(&format!(
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-hf360815db8fd owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ &format!(
             "SELECT accepted_at_unix_ms FROM claims INDEXED BY claims_incarnation_accepted_index
              WHERE subject=?1 AND {INCARNATION_OF_CLAIM}=?2 AND kind='runtime.observed'
                AND json_type(body,'$.fields.incarnation_id')='text'
              ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms LIMIT 1",
         ))?
-            .query_row(params![owner, incarnation], |row| row.get(0))
+            .query_row(/* sqlite-large-value: allow-for-now lv-h2ebf9ee335ec owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ params![owner, incarnation], |row| row.get(0))
             .optional()?;
         let ended = started.as_ref().map(|started| -> Result<Option<String>> {
-            Ok(connection.prepare_cached(&format!(
+            Ok(connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h185f8aaf93cb owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ &format!(
                 "SELECT accepted_at_unix_ms FROM claims INDEXED BY claims_subject_kind_accepted_index
                  WHERE subject=?1 AND kind='runtime.observed' AND json_type(body,'$.fields.incarnation_id')='text'
                    AND {INCARNATION_OF_CLAIM}!=?2
                    AND (length(accepted_at_unix_ms),accepted_at_unix_ms)>(length(?3),?3)
                  ORDER BY length(accepted_at_unix_ms),accepted_at_unix_ms LIMIT 1",
-            ))?.query_row(params![owner, incarnation, started], |row| row.get(0)).optional()?)
+            ))?.query_row(/* sqlite-large-value: allow-for-now lv-he345cfcf3e31 owner=st3::store::conversation_reads TODO=trace-statement-and-value-representation */ params![owner, incarnation, started], |row| row.get(0)).optional()?)
         }).transpose()?.flatten();
         Ok((
             started.and_then(|value| value.parse().ok()),

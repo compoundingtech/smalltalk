@@ -11,7 +11,7 @@ fn fixture() -> Connection {
     let connection = Connection::open_in_memory().unwrap();
     // Invented admitted facts; signature verification and admission have separate controls.
     connection.execute_batch(
-        "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        /* sqlite-large-value: allow-for-now lv-h9cd53cdb5da9 owner=smallclaims::store::membership_query_tests TODO=chunk-or-reference-variable-columns */ "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
          INSERT INTO meta VALUES('fleet_anchor_key','anchor-key');
          CREATE TABLE batches(id TEXT PRIMARY KEY, origin TEXT, replica_sequence INTEGER);
          CREATE TABLE claims(id TEXT PRIMARY KEY, kind TEXT, subject TEXT, body TEXT, batch_id TEXT);
@@ -45,13 +45,13 @@ fn admitted(id: &str, name: &str, key: &str, via: &str, writer: &str, sequence: 
 fn insert_claim(connection: &Connection, claim: &FleetClaim) {
     connection
         .execute(
-            "INSERT INTO batches VALUES(?1,?2,?3)",
+            /* sqlite-large-value: allow-for-now lv-hdf7bb43c650f owner=smallclaims::store::membership_query_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO batches VALUES(?1,?2,?3)",
             params![claim.id, claim.writer, claim.sequence],
         )
         .unwrap();
     connection
         .execute(
-            "INSERT INTO claims VALUES(?1,?2,?3,?4,?1)",
+            /* sqlite-large-value: allow-for-now lv-h771f68bc2561 owner=smallclaims::store::membership_query_tests TODO=prepare-body-and-predecessor-values */ "INSERT INTO claims VALUES(?1,?2,?3,?4,?1)",
             params![
                 claim.id,
                 claim.kind,
@@ -65,14 +65,14 @@ fn insert_claim(connection: &Connection, claim: &FleetClaim) {
 fn envelope(connection: &Connection, claim: &FleetClaim, hash: &str, keys: &[&str]) {
     connection
         .execute(
-            "INSERT INTO replica_envelopes VALUES(?1,?2,?3,?4)",
+            /* sqlite-large-value: allow-for-now lv-h78c914935ecd owner=smallclaims::store::membership_query_tests TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO replica_envelopes VALUES(?1,?2,?3,?4)",
             params![claim.writer, claim.sequence, hash, claim.id],
         )
         .unwrap();
     for key in keys {
         connection
             .execute(
-                "INSERT INTO replica_envelope_signatures VALUES(?1,?2,?3,?4)",
+                /* sqlite-large-value: allow-for-now lv-heecc52686f3d owner=smallclaims::store::membership_query_tests TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO replica_envelope_signatures VALUES(?1,?2,?3,?4)",
                 params![claim.writer, claim.sequence, hash, key],
             )
             .unwrap();
@@ -107,7 +107,7 @@ fn membership_join_preserves_forks_exact_signature_identity_and_local_fallback()
     ] {
         connection
             .execute(
-                "INSERT INTO replica_envelope_signatures VALUES(?1,?2,?3,'anchor-key')",
+                /* sqlite-large-value: allow-for-now lv-h340bdec4b8b2 owner=smallclaims::store::membership_query_tests TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO replica_envelope_signatures VALUES(?1,?2,?3,'anchor-key')",
                 params![writer, sequence, hash],
             )
             .unwrap();
@@ -133,11 +133,11 @@ fn membership_join_preserves_forks_exact_signature_identity_and_local_fallback()
 #[test]
 fn membership_without_anchor_does_not_inspect_or_admit_claims() {
     let connection = fixture();
-    connection.execute("DELETE FROM meta", []).unwrap();
+    connection.execute(/* sqlite-large-value: allow-for-now lv-haba18bfca731 owner=smallclaims::store::membership_query_tests TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM meta", []).unwrap();
     let anchor = admitted("anchor", "birch", "anchor-key", "anchor", "birch", 3);
     insert_claim(&connection, &anchor);
     connection
-        .execute("UPDATE claims SET body='malformed'", [])
+        .execute(/* sqlite-large-value: allow-for-now lv-h9be0a7a129f5 owner=smallclaims::store::membership_query_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET body='malformed'", [])
         .unwrap();
     envelope(&connection, &anchor, "anchor", &["anchor-key"]);
     assert_eq!(
@@ -198,14 +198,14 @@ fn membership_signers_do_not_multiply_claim_rows_or_scan_unrelated_signatures() 
     for index in 0..128 {
         connection
             .execute(
-                "INSERT INTO replica_envelope_signatures VALUES('birch',3,'anchor',?1)",
+                /* sqlite-large-value: allow-for-now lv-h9c78d72f8d0e owner=smallclaims::store::membership_query_tests TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO replica_envelope_signatures VALUES('birch',3,'anchor',?1)",
                 [format!("other-key-{index}")],
             )
             .unwrap();
     }
     let measure = || {
         let mut statement = connection
-            .prepare(&fleet_claims_with_signers_query())
+            .prepare(/* sqlite-large-value: allow-for-now lv-h99012a678132 owner=smallclaims::store::membership_query_tests TODO=trace-statement-and-value-representation */ &fleet_claims_with_signers_query())
             .unwrap();
         let mut rows = statement.query([]).unwrap();
         let mut count = 0;
@@ -223,7 +223,7 @@ fn membership_signers_do_not_multiply_claim_rows_or_scan_unrelated_signatures() 
     for index in 0..4096 {
         connection
             .execute(
-                "INSERT INTO replica_envelope_signatures VALUES('elm',?1,'unrelated','other-key')",
+                /* sqlite-large-value: allow-for-now lv-h40aaea1d01ec owner=smallclaims::store::membership_query_tests TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO replica_envelope_signatures VALUES('elm',?1,'unrelated','other-key')",
                 [index],
             )
             .unwrap();

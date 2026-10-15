@@ -42,7 +42,7 @@ impl SearchIndex {
     pub fn new() -> Result<Self> {
         let connection = Connection::open_in_memory()?;
         connection.execute_batch(
-            "CREATE VIRTUAL TABLE entries USING fts5(source UNINDEXED,
+            /* sqlite-large-value: allow-for-now lv-hcc96f3cfe647 owner=st3::conversation_search TODO=trace-statement-and-value-representation */ "CREATE VIRTUAL TABLE entries USING fts5(source UNINDEXED,
             conversation_id UNINDEXED, entry_id UNINDEXED, agent_id UNINDEXED,
             timestamp UNINDEXED, entry_type UNINDEXED, text, tokenize='unicode61');",
         )?;
@@ -51,11 +51,11 @@ impl SearchIndex {
 
     pub fn replace(&mut self, source: &str, entries: &[SearchEntry]) -> Result<()> {
         let tx = self.connection.transaction()?;
-        tx.execute("DELETE FROM entries WHERE source=?1", [source])?;
+        tx.execute(/* sqlite-large-value: allow-for-now lv-ha030f8a1c9a5 owner=st3::conversation_search TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM entries WHERE source=?1", [source])?;
         {
-            let mut insert = tx.prepare("INSERT INTO entries VALUES (?1,?2,?3,?4,?5,?6,?7)")?;
+            let mut insert = tx.prepare(/* sqlite-large-value: allow-for-now lv-hb61845ee55b6 owner=st3::conversation_search TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO entries VALUES (?1,?2,?3,?4,?5,?6,?7)")?;
             for entry in entries {
-                insert.execute(params![
+                insert.execute(/* sqlite-large-value: allow-for-now lv-h95214f2b25cc owner=st3::conversation_search TODO=trace-statement-and-value-representation */ params![
                     source,
                     entry.conversation_id,
                     entry.entry_id,
@@ -72,7 +72,7 @@ impl SearchIndex {
 
     pub fn remove(&mut self, source: &str) -> Result<()> {
         self.connection
-            .execute("DELETE FROM entries WHERE source=?1", [source])?;
+            .execute(/* sqlite-large-value: allow-for-now lv-h5f15a6033c96 owner=st3::conversation_search TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM entries WHERE source=?1", [source])?;
         Ok(())
     }
 

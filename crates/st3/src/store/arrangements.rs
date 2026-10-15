@@ -2,7 +2,7 @@
 use super::*;
 use st3_schema::arrangements::{self as schema, Operation};
 
-pub(super) const SCHEMA: &str = r#"
+pub(super) const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-h390895c07e8b owner=st3::store::arrangements TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS arrangements (
     subject TEXT PRIMARY KEY, owner TEXT NOT NULL, created INTEGER NOT NULL DEFAULT 0,
     retired INTEGER NOT NULL DEFAULT 0, revision TEXT NOT NULL, winner BLOB NOT NULL,
@@ -32,7 +32,7 @@ pub(super) fn project(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Res
     let operations = schema::operations(&claim.subject, &fields).map_err(anyhow::Error::new)?;
     let owner = schema::owner(&claim.subject).map_err(anyhow::Error::new)?;
     let key = canonical::sortable_key(&canonical::claim_key(transaction, &claim.id)?);
-    transaction.execute("INSERT INTO arrangements(subject,owner,revision,winner,updated_at,changed_index) VALUES(?1,?2,?3,?4,?5,?6)
+    transaction.execute(/* sqlite-large-value: allow-for-now lv-h71d1ca71dbc8 owner=st3::store::arrangements TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO arrangements(subject,owner,revision,winner,updated_at,changed_index) VALUES(?1,?2,?3,?4,?5,?6)
         ON CONFLICT(subject) DO UPDATE SET revision=CASE WHEN excluded.winner>arrangements.winner THEN excluded.revision ELSE arrangements.revision END,
         updated_at=CASE WHEN excluded.winner>arrangements.winner THEN excluded.updated_at ELSE arrangements.updated_at END,
         winner=MAX(arrangements.winner,excluded.winner),changed_index=MAX(arrangements.changed_index,excluded.changed_index)", params![claim.subject,owner,claim.id,key,claim.accepted_at_unix_ms.to_string(),claim.store_index])?;
@@ -40,7 +40,7 @@ pub(super) fn project(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Res
     for operation in operations {
         match operation {
             Operation::Create { name } => {
-                transaction.execute("UPDATE arrangements SET created=1 WHERE subject=?1", [&claim.subject])?;
+                transaction.execute(/* sqlite-large-value: allow-for-now lv-heff6a55d7667 owner=st3::store::arrangements TODO=bound-or-reference-values-and-reclamation */ "UPDATE arrangements SET created=1 WHERE subject=?1", [&claim.subject])?;
                 writes.push(("name".into(), json!(name)));
             }
             Operation::Rename { name } => writes.push(("name".into(), json!(name))),
@@ -52,11 +52,11 @@ pub(super) fn project(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Res
             Operation::FolderMove { id,parent,key } => writes.push((format!("folder/{id}/position"), json!({"parent":parent,"key":key}))),
             Operation::FolderDelete { id } => writes.push((format!("folder/{id}/tombstone"), json!(true))),
             Operation::SubjectPlace { subject,folder,key } => writes.push((format!("placement/{subject}"), json!({"folder":folder,"key":key}))),
-            Operation::Retire {} => { transaction.execute("UPDATE arrangements SET retired=1 WHERE subject=?1", [&claim.subject])?; }
+            Operation::Retire {} => { transaction.execute(/* sqlite-large-value: allow-for-now lv-hd0badd4aba21 owner=st3::store::arrangements TODO=bound-or-reference-values-and-reclamation */ "UPDATE arrangements SET retired=1 WHERE subject=?1", [&claim.subject])?; }
         }
     }
     for (register,value) in writes {
-        transaction.execute("INSERT INTO arrangement_registers(subject,register,value,revision,winner) VALUES(?1,?2,?3,?4,?5)
+        transaction.execute(/* sqlite-large-value: allow-for-now lv-haeea370fa510 owner=st3::store::arrangements TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO arrangement_registers(subject,register,value,revision,winner) VALUES(?1,?2,?3,?4,?5)
             ON CONFLICT(subject,register) DO UPDATE SET value=excluded.value,revision=excluded.revision,winner=excluded.winner
             WHERE excluded.winner>arrangement_registers.winner", params![claim.subject,register,canonical_json_text(&value)?,claim.id,key])?;
     }
@@ -207,12 +207,12 @@ pub(super) fn prepare(transaction: &Transaction<'_>, input: &ClaimInput) -> Resu
 
 pub(super) fn open(transaction: &Transaction<'_>) -> Result<()> {
     let ready: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key='arrangement_heads_v1')", [], |row| row.get(0))?;
-    if !ready { rebuild(transaction)?; transaction.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('arrangement_heads_v1','1')", [])?; }
+    if !ready { rebuild(transaction)?; transaction.execute(/* sqlite-large-value: allow-for-now lv-h8ddda3977e81 owner=st3::store::arrangements TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO meta(key,value) VALUES('arrangement_heads_v1','1')", [])?; }
     Ok(())
 }
 pub(super) fn rebuild(transaction: &Transaction<'_>) -> Result<()> {
-    transaction.execute("DELETE FROM arrangement_registers", [])?;
-    transaction.execute("DELETE FROM arrangements", [])?;
+    transaction.execute(/* sqlite-large-value: allow-for-now lv-he051f7737e87 owner=st3::store::arrangements TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM arrangement_registers", [])?;
+    transaction.execute(/* sqlite-large-value: allow-for-now lv-h1e0f8b9c22fd owner=st3::store::arrangements TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM arrangements", [])?;
     let mut statement = transaction.prepare("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM claims WHERE kind='arrangement.edited' AND NOT EXISTS(SELECT 1 FROM replica_records WHERE claim_id=claims.id AND state='repaired')")?;
     let claims = statement.query_map([],claim_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
     drop(statement);

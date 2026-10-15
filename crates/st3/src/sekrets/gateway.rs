@@ -786,7 +786,7 @@ impl Gateway {
             );
             return self.refuse(stream, caller, &run, Some(&owner), Some(&profile), reason);
         }
-        let mut prepared = match self.prepare(&usable.profile, &run, fds, caller.tile.as_deref()) {
+        let mut prepared = match self.prepare(/* sqlite-large-value: allow-for-now lv-haad0c341df6c owner=st3::sekrets::gateway TODO=trace-statement-and-value-representation */ &usable.profile, &run, fds, caller.tile.as_deref()) {
             Ok(prepared) => prepared,
             Err(error) => {
                 return self.refuse(
@@ -814,7 +814,7 @@ impl Gateway {
                 "tty": run.tty.is_some(),
             }),
         )?;
-        let outcome = self.execute(stream, &run, prepared, &profile, call);
+        let outcome = self.execute(/* sqlite-large-value: allow-for-now lv-h3b431d3910af owner=st3::sekrets::gateway TODO=trace-statement-and-value-representation */ stream, &run, prepared, &profile, call);
         let exit = match &outcome {
             Ok(status) => json!({ "call": call, "code": status.code(), "signal": status.signal() }),
             Err(error) => json!({ "call": call, "error": format!("{error:#}") }),

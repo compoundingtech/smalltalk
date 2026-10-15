@@ -47,7 +47,7 @@ mission "detail" state="ready" {
     crate::store::configure_projection_writer(&connection).unwrap();
     connection
         .execute(
-            "UPDATE planning_sessions SET request_ref=?1 WHERE id=?2",
+            /* sqlite-large-value: allow-for-now lv-h5a3c0d8f67db owner=st3::api::client_v0::launch_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE planning_sessions SET request_ref=?1 WHERE id=?2",
             rusqlite::params![request, id],
         )
         .unwrap();
@@ -138,7 +138,7 @@ async fn launch_detail_preserves_native_ids_history_fields_and_scope() {
     for status in ["cancelled", "approved", "failed"] {
         connection
             .execute(
-                "UPDATE planning_sessions SET status=?1 WHERE id=?1",
+                /* sqlite-large-value: allow-for-now lv-h9734606417c8 owner=st3::api::client_v0::launch_detail_tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE planning_sessions SET status=?1 WHERE id=?1",
                 [status],
             )
             .unwrap();

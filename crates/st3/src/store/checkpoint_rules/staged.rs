@@ -21,13 +21,13 @@ fn for_each_group(
         let value: Option<String> = if first {
             staging
                 .query_row(
-                    &format!("SELECT {column} FROM claims WHERE {column} IS NOT NULL ORDER BY {column} LIMIT 1"),
+                    /* sqlite-large-value: allow-for-now lv-hc76eaa2b0347 owner=st3::store::checkpoint_rules::staged TODO=trace-statement-and-value-representation */ &format!("SELECT {column} FROM claims WHERE {column} IS NOT NULL ORDER BY {column} LIMIT 1"),
                     [],
                     |row| row.get(0),
                 )
                 .optional()?
         } else {
-            staging.query_row(&next, [&after], |row| row.get(0)).optional()?
+            staging.query_row(/* sqlite-large-value: allow-for-now lv-h91b29d9f2f8e owner=st3::store::checkpoint_rules::staged TODO=trace-statement-and-value-representation */ &next, [&after], |row| row.get(0)).optional()?
         };
         first = false;
         let Some(value) = value else {
@@ -75,7 +75,7 @@ pub(crate) fn plan_staged(planner: &StagedPlanner<'_>) -> Result<()> {
     let cut = planner.cut_unix_ms();
 
     // The status-history rule, one seat at a time.
-    let mut keep_status = staging.prepare_cached("UPDATE claims SET status_keep=1 WHERE pos=?1")?;
+    let mut keep_status = staging.prepare_cached(/* sqlite-large-value: allow-for-now lv-ha290bafdf8dc owner=st3::store::checkpoint_rules::staged TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET status_keep=1 WHERE pos=?1")?;
     for_each_group(staging, "seat", |seat| {
         let members = staging
             .prepare_cached("SELECT pos, id FROM claims WHERE seat=?1 ORDER BY pos")?
@@ -85,7 +85,7 @@ pub(crate) fn plan_staged(planner: &StagedPlanner<'_>) -> Result<()> {
         let claims = planner.claims(&ids)?;
         let sources = claims.iter().collect::<Vec<_>>();
         for position in status_keep_positions(&sources, cut) {
-            keep_status.execute([members[position].0])?;
+            keep_status.execute(/* sqlite-large-value: allow-for-now lv-hdac18e56a1d6 owner=st3::store::checkpoint_rules::staged TODO=trace-statement-and-value-representation */ [members[position].0])?;
         }
         Ok(())
     })?;
@@ -107,7 +107,7 @@ pub(crate) fn plan_staged(planner: &StagedPlanner<'_>) -> Result<()> {
     }
 
     // The slot rules, one slot at a time.
-    let mut drop_claim = staging.prepare_cached("UPDATE claims SET dropped=1 WHERE pos=?1")?;
+    let mut drop_claim = staging.prepare_cached(/* sqlite-large-value: allow-for-now lv-ha15a45ac783a owner=st3::store::checkpoint_rules::staged TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET dropped=1 WHERE pos=?1")?;
     let mut closed = staging.prepare_cached(
         "SELECT EXISTS(SELECT 1 FROM closed WHERE subject=?1 AND request=?2)",
     )?;
@@ -123,7 +123,7 @@ pub(crate) fn plan_staged(planner: &StagedPlanner<'_>) -> Result<()> {
         let slot_claims = claims.iter().collect::<Vec<_>>();
         let is_closed = rule == Rule::Deferral && {
             let request = slot.last().cloned().unwrap_or_default();
-            closed.query_row(params![slot[0], request], |row| row.get::<_, bool>(0))?
+            closed.query_row(/* sqlite-large-value: allow-for-now lv-hcda3dd34b22c owner=st3::store::checkpoint_rules::staged TODO=trace-statement-and-value-representation */ params![slot[0], request], |row| row.get::<_, bool>(0))?
         };
         let mut keep = rule_keep(rule, members.len(), &slot_claims, is_closed, &limits_newest, cut);
         if rule != Rule::LoopState {
@@ -131,7 +131,7 @@ pub(crate) fn plan_staged(planner: &StagedPlanner<'_>) -> Result<()> {
         }
         for (position, member) in members.iter().enumerate() {
             if !keep.contains(&position) && !member.status_keep && rule.old_enough(member.accepted_at, cut) {
-                drop_claim.execute([member.pos])?;
+                drop_claim.execute(/* sqlite-large-value: allow-for-now lv-h912c32c784af owner=st3::store::checkpoint_rules::staged TODO=trace-statement-and-value-representation */ [member.pos])?;
             }
         }
         Ok(())
@@ -140,7 +140,7 @@ pub(crate) fn plan_staged(planner: &StagedPlanner<'_>) -> Result<()> {
 
     // D4: guards.
     staging.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS guarded_kinds(kind TEXT PRIMARY KEY);
+        /* sqlite-large-value: allow-for-now lv-h6fcd14eec7cb owner=st3::store::checkpoint_rules::staged TODO=chunk-or-reference-variable-columns */ "CREATE TEMP TABLE IF NOT EXISTS guarded_kinds(kind TEXT PRIMARY KEY);
          DELETE FROM temp.guarded_kinds;",
     )?;
     {
@@ -148,13 +148,13 @@ pub(crate) fn plan_staged(planner: &StagedPlanner<'_>) -> Result<()> {
             .prepare("SELECT DISTINCT kind FROM claims")?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut insert = staging.prepare("INSERT INTO temp.guarded_kinds(kind) VALUES (?1)")?;
+        let mut insert = staging.prepare(/* sqlite-large-value: allow-for-now lv-h0122510ad671 owner=st3::store::checkpoint_rules::staged TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO temp.guarded_kinds(kind) VALUES (?1)")?;
         for kind in kinds.iter().filter(|kind| guarded_kind(kind)) {
-            insert.execute([kind])?;
+            insert.execute(/* sqlite-large-value: allow-for-now lv-h51d35d15f113 owner=st3::store::checkpoint_rules::staged TODO=trace-statement-and-value-representation */ [kind])?;
         }
     }
     staging.execute_batch(
-        "UPDATE claims SET dropped=0 WHERE dropped=1 AND (
+        /* sqlite-large-value: allow-for-now lv-h77dcc015a478 owner=st3::store::checkpoint_rules::staged TODO=chunk-or-reference-exact-wire-values */ "UPDATE claims SET dropped=0 WHERE dropped=1 AND (
              substr(actor, 1, 7)='person/'
              OR kind IN (SELECT kind FROM temp.guarded_kinds)
              OR valid=0
@@ -172,7 +172,7 @@ pub(crate) fn plan_staged(planner: &StagedPlanner<'_>) -> Result<()> {
     loop {
         let mut changed = false;
         // Newest first, so a claim kept back here can witness the ones before it.
-        let mut keep = staging.prepare_cached("UPDATE claims SET dropped=0 WHERE pos=?1")?;
+        let mut keep = staging.prepare_cached(/* sqlite-large-value: allow-for-now lv-hc1d162fa261c owner=st3::store::checkpoint_rules::staged TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET dropped=0 WHERE pos=?1")?;
         for_each_group(staging, "slot", |slot_text| {
             let members = slot_members(staging, slot_text)?;
             let mut later = BTreeSet::new();
@@ -180,7 +180,7 @@ pub(crate) fn plan_staged(planner: &StagedPlanner<'_>) -> Result<()> {
             for member in members.iter().rev() {
                 let mut dropped = member.dropped;
                 if dropped && !witnessed_names(&member.kind, &member.fields, &later, later_claims) {
-                    keep.execute([member.pos])?;
+                    keep.execute(/* sqlite-large-value: allow-for-now lv-h4011aa1a60e5 owner=st3::store::checkpoint_rules::staged TODO=trace-statement-and-value-representation */ [member.pos])?;
                     dropped = false;
                     changed = true;
                 }
@@ -193,14 +193,14 @@ pub(crate) fn plan_staged(planner: &StagedPlanner<'_>) -> Result<()> {
         })?;
         drop(keep);
         let kept = staging.execute(
-            "UPDATE claims SET dropped=0 WHERE dropped=1 AND operation_id IS NOT NULL
+            /* sqlite-large-value: allow-for-now lv-hd9ce75725a5f owner=st3::store::checkpoint_rules::staged TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET dropped=0 WHERE dropped=1 AND operation_id IS NOT NULL
                AND EXISTS(SELECT 1 FROM claims other
                           WHERE other.operation_id=claims.operation_id AND other.dropped=0)",
             [],
         )?;
         let kept = kept
             + staging.execute(
-                "UPDATE claims SET dropped=0 WHERE dropped=1
+                /* sqlite-large-value: allow-for-now lv-h8a1494867aac owner=st3::store::checkpoint_rules::staged TODO=chunk-or-reference-exact-wire-values */ "UPDATE claims SET dropped=0 WHERE dropped=1
                    AND EXISTS(SELECT 1 FROM claims other
                               WHERE other.writer=claims.writer AND other.sequence=claims.sequence
                                 AND other.envelope_hash=claims.envelope_hash AND other.dropped=0)",
@@ -208,7 +208,7 @@ pub(crate) fn plan_staged(planner: &StagedPlanner<'_>) -> Result<()> {
             )?;
         let kept = kept
             + staging.execute(
-                "UPDATE claims SET dropped=0 WHERE dropped=1
+                /* sqlite-large-value: allow-for-now lv-ha55bdedefa1d owner=st3::store::checkpoint_rules::staged TODO=chunk-or-reference-exact-wire-values */ "UPDATE claims SET dropped=0 WHERE dropped=1
                    AND (SELECT records FROM envelopes
                         WHERE envelopes.writer=claims.writer AND envelopes.sequence=claims.sequence
                           AND envelopes.envelope_hash=claims.envelope_hash)

@@ -7,6 +7,17 @@ have their own logical authority digests; local physical fields and caches are o
 
 The claim log and immutable blobs are the durable graph authority.
 
+## Large inline values
+
+New storage work must avoid unbounded large inline SQLite objects, including variable
+metadata and index keys. Use a reviewed bounded physical representation or reference
+without reducing the logical input contract or rejecting valid historical data.
+[Large SQLite values](large-values.md) defines the transitional source inventory,
+allow-for-now owner/TODO markers, static guard coverage and cleanup plan. No numeric
+large-value threshold is accepted; the guard checks source-site exceptions, not sizes.
+
+## Retention and local observations
+
 A claim kind of `local` retention (`st schema show KIND`) is an observation that only the node
 that made it reads. The daemon records it in `local_observations` instead of the claim log. It gets
 no batch, no envelope and no digest, so it never replicates and trimming it never changes what a

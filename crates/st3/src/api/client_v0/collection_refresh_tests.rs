@@ -466,7 +466,7 @@ async fn assert_parity(fixture: &Fixture, session: &ClientSession, held: &BTreeM
 }
 
 fn custom_review_kind(store: &Store) {
-    let manifest = serde_json::from_str(include_str!(
+    let manifest = serde_json::from_str(/* sqlite-large-value: allow-for-now lv-hdf0799f8eafe owner=st3::api::client_v0::collection_refresh_tests TODO=trace-statement-and-value-representation */ include_str!(
         "../../../../../examples/st3/custom-review.json"
     )).unwrap();
     store.register_custom_kind(&crate::store::custom::RegistrationRequest {
@@ -679,7 +679,7 @@ async fn inventory_reconnect(
 }
 
 fn inventory_schema(frame: &Value) {
-    let schema: Value = serde_json::from_str(include_str!(
+    let schema: Value = serde_json::from_str(/* sqlite-large-value: allow-for-now lv-h18cf7c832c7d owner=st3::api::client_v0::collection_refresh_tests TODO=trace-statement-and-value-representation */ include_str!(
         "../../../../../docs/st3/client-v0/schemas/client-v0.schema.json"
     ))
     .unwrap();

@@ -7,13 +7,13 @@ fn returning_a_manual_read_transaction_unpins_wal_and_reuses_a_clean_reader() {
     let writer = Connection::open(&path).unwrap();
     writer
         .execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            /* sqlite-large-value: allow-for-now lv-h7de44fbc14e9 owner=smallclaims::sqlite::read_lifetime::tests TODO=chunk-or-reference-variable-columns */ "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
          CREATE TABLE payload(value BLOB); INSERT INTO payload VALUES (zeroblob(4096));",
         )
         .unwrap();
     let pool = ReadPool::new(&path, false).unwrap();
     let reader = pool.get();
-    reader.execute_batch("BEGIN").unwrap();
+    reader.execute_batch(/* sqlite-large-value: allow-for-now lv-hdf135fc5f525 owner=smallclaims::sqlite::read_lifetime::tests TODO=trace-statement-and-value-representation */ "BEGIN").unwrap();
     assert_eq!(
         reader
             .query_row("SELECT length(value) FROM payload", [], |row| row
@@ -22,7 +22,7 @@ fn returning_a_manual_read_transaction_unpins_wal_and_reuses_a_clean_reader() {
         4096
     );
     writer
-        .execute_batch("UPDATE payload SET value=zeroblob(8192)")
+        .execute_batch(/* sqlite-large-value: allow-for-now lv-h68ae5eb7509f owner=smallclaims::sqlite::read_lifetime::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE payload SET value=zeroblob(8192)")
         .unwrap();
     let blocked = checkpoint_wal_report(&writer).unwrap();
     assert!(
@@ -61,7 +61,7 @@ fn file_pool() -> (tempfile::TempDir, Connection, ReadPool) {
     let writer = Connection::open(&path).unwrap();
     writer
         .execute_batch(
-            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+            /* sqlite-large-value: allow-for-now lv-hc6971cefa82c owner=smallclaims::sqlite::read_lifetime::tests TODO=chunk-or-reference-variable-columns */ "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
         CREATE TABLE payload(value BLOB); INSERT INTO payload VALUES(zeroblob(4096));",
         )
         .unwrap();
@@ -75,10 +75,10 @@ fn failed_rollback_discards_the_physical_reader() {
     let (_directory, writer, pool) = file_pool();
     let reader = pool.get();
     reader
-        .execute_batch("BEGIN; SELECT * FROM payload")
+        .execute_batch(/* sqlite-large-value: allow-for-now lv-hc871bb91f4f5 owner=smallclaims::sqlite::read_lifetime::tests TODO=trace-statement-and-value-representation */ "BEGIN; SELECT * FROM payload")
         .unwrap();
     writer
-        .execute_batch("UPDATE payload SET value=zeroblob(8192)")
+        .execute_batch(/* sqlite-large-value: allow-for-now lv-hb7f8923255f2 owner=smallclaims::sqlite::read_lifetime::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE payload SET value=zeroblob(8192)")
         .unwrap();
     reader.authorizer(Some(|context: AuthContext<'_>| {
         if matches!(context.action, AuthAction::Transaction { .. }) {
@@ -104,10 +104,10 @@ fn error_and_panic_return_only_clean_ordinary_readers() {
     let failure: Result<()> = crate::read_budget::with(Some(budget.clone()), || {
         let reader = pool.get();
         reader
-            .execute_batch("BEGIN; SELECT * FROM payload")
+            .execute_batch(/* sqlite-large-value: allow-for-now lv-h5b6a3a9e38a4 owner=smallclaims::sqlite::read_lifetime::tests TODO=trace-statement-and-value-representation */ "BEGIN; SELECT * FROM payload")
             .unwrap();
         writer
-            .execute_batch("UPDATE payload SET value=zeroblob(8192)")
+            .execute_batch(/* sqlite-large-value: allow-for-now lv-h0b26c646a9ba owner=smallclaims::sqlite::read_lifetime::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE payload SET value=zeroblob(8192)")
             .unwrap();
         budget.cancel();
         crate::read_budget::check()?;
@@ -118,10 +118,10 @@ fn error_and_panic_return_only_clean_ordinary_readers() {
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let reader = pool.get();
         reader
-            .execute_batch("BEGIN; SELECT * FROM payload")
+            .execute_batch(/* sqlite-large-value: allow-for-now lv-h560fff892c9b owner=smallclaims::sqlite::read_lifetime::tests TODO=trace-statement-and-value-representation */ "BEGIN; SELECT * FROM payload")
             .unwrap();
         writer
-            .execute_batch("UPDATE payload SET value=zeroblob(16384)")
+            .execute_batch(/* sqlite-large-value: allow-for-now lv-h0f241e3a72c0 owner=smallclaims::sqlite::read_lifetime::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE payload SET value=zeroblob(16384)")
             .unwrap();
         panic!("worker unwind");
     }));
@@ -150,7 +150,7 @@ fn nested_snapshot_drop_preserves_outer_cut_and_error_panic_cleanup() {
     let writer = Connection::open(&path).unwrap();
     writer
         .execute_batch(
-            "PRAGMA wal_autocheckpoint=0; CREATE TABLE payload(value INTEGER);
+            /* sqlite-large-value: allow-for-now lv-h3f7d4d7d63f4 owner=smallclaims::sqlite::read_lifetime::tests TODO=chunk-or-reference-variable-columns */ "PRAGMA wal_autocheckpoint=0; CREATE TABLE payload(value INTEGER);
         INSERT INTO payload VALUES(1)",
         )
         .unwrap();
@@ -167,7 +167,7 @@ fn nested_snapshot_drop_preserves_outer_cut_and_error_panic_cleanup() {
             let first = store.readers.live_read_report().oldest_snapshot.unwrap();
             assert!(first.snapshot_confirmed_age_ms.is_some());
             assert!(first.connection_id.is_some());
-            writer.execute_batch("UPDATE payload SET value=2").unwrap();
+            writer.execute_batch(/* sqlite-large-value: allow-for-now lv-h002dc3085322 owner=smallclaims::sqlite::read_lifetime::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE payload SET value=2").unwrap();
             store.read_snapshot(|nested| {
                 assert_eq!(nested, index);
                 assert_eq!(value(), 1);
@@ -185,13 +185,13 @@ fn nested_snapshot_drop_preserves_outer_cut_and_error_panic_cleanup() {
         .unwrap();
     assert_eq!(value(), 2);
     let failed: Result<()> = store.read_snapshot(|_| {
-        writer.execute_batch("UPDATE payload SET value=3").unwrap();
+        writer.execute_batch(/* sqlite-large-value: allow-for-now lv-h3c5fc436ca8d owner=smallclaims::sqlite::read_lifetime::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE payload SET value=3").unwrap();
         anyhow::bail!("snapshot error")
     });
     assert!(failed.is_err());
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _: Result<()> = store.read_snapshot(|_| {
-            writer.execute_batch("UPDATE payload SET value=4").unwrap();
+            writer.execute_batch(/* sqlite-large-value: allow-for-now lv-h7da9b2bb8cf0 owner=smallclaims::sqlite::read_lifetime::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE payload SET value=4").unwrap();
             panic!("snapshot unwind");
         });
     }));
@@ -221,7 +221,7 @@ fn canceled_worker_is_reported_until_legitimate_return_then_unpins() {
                 .request_read(|| {
                     worker_pool
                         .get()
-                        .execute_batch("BEGIN; SELECT * FROM payload")
+                        .execute_batch(/* sqlite-large-value: allow-for-now lv-h4df2825a9017 owner=smallclaims::sqlite::read_lifetime::tests TODO=trace-statement-and-value-representation */ "BEGIN; SELECT * FROM payload")
                         .unwrap();
                     ready.send(()).unwrap();
                     finishing.recv_timeout(Duration::from_secs(30)).unwrap();
@@ -233,7 +233,7 @@ fn canceled_worker_is_reported_until_legitimate_return_then_unpins() {
     started.recv_timeout(Duration::from_secs(30)).unwrap();
     budget.cancel();
     writer
-        .execute_batch("UPDATE payload SET value=zeroblob(8192)")
+        .execute_batch(/* sqlite-large-value: allow-for-now lv-h3ea04f6abe45 owner=smallclaims::sqlite::read_lifetime::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE payload SET value=zeroblob(8192)")
         .unwrap();
     let candidate = pool.live_read_report();
     assert_eq!(
@@ -282,7 +282,7 @@ fn diagnostics_scope_pool_and_distinguish_checkout_from_known_snapshot() {
         assert_eq!(first.route.unwrap().len(), 256);
         assert_eq!(first.budget_expired, Some(false));
         reader
-            .execute_batch("BEGIN; SELECT * FROM payload")
+            .execute_batch(/* sqlite-large-value: allow-for-now lv-h87abbba89bca owner=smallclaims::sqlite::read_lifetime::tests TODO=trace-statement-and-value-representation */ "BEGIN; SELECT * FROM payload")
             .unwrap();
         pending.snapshot_started(reader.connection.as_ref().unwrap());
         let snapshot = pool.live_read_report().oldest_snapshot.unwrap();

@@ -10,11 +10,11 @@ pub fn initialize(connection: &Connection) -> Result<()> {
     )?;
     if !has_key {
         transaction.execute_batch(
-            "ALTER TABLE documents ADD COLUMN binding_key BLOB NOT NULL DEFAULT x'';",
+            /* sqlite-large-value: allow-for-now lv-hb57be21581e4 owner=smallclaims::store::document_index TODO=bound-or-reference-values-and-reclamation */ "ALTER TABLE documents ADD COLUMN binding_key BLOB NOT NULL DEFAULT x'';",
         )?;
     }
     transaction.execute_batch(
-        "CREATE INDEX IF NOT EXISTS document_canonical_latest ON documents(name,binding_key DESC);",
+        /* sqlite-large-value: allow-for-now lv-h13fe0291fdd7 owner=smallclaims::store::document_index TODO=chunk-or-reference-variable-columns */ "CREATE INDEX IF NOT EXISTS document_canonical_latest ON documents(name,binding_key DESC);",
     )?;
     let done: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM meta WHERE key='canonical_document_binding_keys')",
@@ -49,14 +49,14 @@ pub fn initialize(connection: &Connection) -> Result<()> {
         }
         drop(statement);
         let mut update = transaction.prepare(
-            "UPDATE documents SET binding_claim_id=?3,binding_key=?4 WHERE name=?1 AND hash=?2",
+            /* sqlite-large-value: allow-for-now lv-h27f9e0ede89a owner=smallclaims::store::document_index TODO=bound-or-reference-values-and-reclamation */ "UPDATE documents SET binding_claim_id=?3,binding_key=?4 WHERE name=?1 AND hash=?2",
         )?;
         for ((name, hash), (key, id)) in bindings {
-            update.execute(params![name, hash, id, key])?;
+            update.execute(/* sqlite-large-value: allow-for-now lv-hd6e104a05fb6 owner=smallclaims::store::document_index TODO=trace-statement-and-value-representation */ params![name, hash, id, key])?;
         }
         drop(update);
         transaction.execute(
-            "INSERT INTO meta(key,value) VALUES('canonical_document_binding_keys','1')",
+            /* sqlite-large-value: allow-for-now lv-he499682e1ffa owner=smallclaims::store::document_index TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO meta(key,value) VALUES('canonical_document_binding_keys','1')",
             [],
         )?;
     }

@@ -43,7 +43,7 @@ fn typed_rows(store: &Store) -> BTreeMap<String, Vec<Vec<rusqlite::types::Value>
     ["mission_runs", "run_generations"].into_iter().map(|table| {
         let columns = projection_digest::columns(&reader, table, &[]).unwrap();
         let sql = format!("SELECT {} FROM {table} ORDER BY id", columns.join(","));
-        let mut statement = reader.prepare(&sql).unwrap();
+        let mut statement = reader.prepare(/* sqlite-large-value: allow-for-now lv-h1e4897955eb5 owner=st3::store::declarative_revision_timestamp_tests TODO=trace-statement-and-value-representation */ &sql).unwrap();
         let rows = statement.query_map([], |row| {
             (0..columns.len()).map(|index| row.get(index)).collect::<rusqlite::Result<Vec<_>>>()
         }).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
@@ -149,7 +149,7 @@ fn declarative_revision_late_failure_rolls_back_the_proposal_and_run_date() {
     let digests = checked_digests(&store);
     // Refuse the final publication receipt, after the actual proposal and date writes.
     store.connection.write().execute_batch(&format!(
-        "CREATE TEMP TRIGGER refuse_timestamp_receipt BEFORE INSERT ON idempotency
+        /* sqlite-large-value: allow-for-now lv-h43168b8c0ccc owner=st3::store::declarative_revision_timestamp_tests TODO=bound-or-reference-values-and-reclamation */ "CREATE TEMP TRIGGER refuse_timestamp_receipt BEFORE INSERT ON idempotency
          WHEN NEW.operation_id='{}'
          BEGIN SELECT RAISE(ABORT,'injected late timestamp publication failure'); END;",
         opaque_cache_key("timestamp-revision"),

@@ -296,7 +296,7 @@ impl Store {
             .readers
             .get()
             .prepare_cached("SELECT COUNT(*) FROM operations WHERE state='conflict'")?
-            .query_row([], |row| row.get(0))?)
+            .query_row(/* sqlite-large-value: allow-for-now lv-h58da23dc1734 owner=st3::store::summary_list TODO=trace-statement-and-value-representation */ [], |row| row.get(0))?)
     }
 
     /// Whether the machines read at `after` may still hold at `through`, read in the snapshot at
@@ -326,7 +326,7 @@ impl Store {
                           AND runtime.store_index<=?2)"
             )
         };
-        let mut statement = connection.prepare_cached(&format!(
+        let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h8550417f01db owner=st3::store::summary_list TODO=trace-statement-and-value-representation */ &format!(
             "SELECT subject, actor, kind, {CURRENT_VIEW_CLAIM}, {}, {}
              FROM claims WHERE store_index>?1 AND store_index<=?2 ORDER BY store_index LIMIT ?3",
             runtime("subject"),

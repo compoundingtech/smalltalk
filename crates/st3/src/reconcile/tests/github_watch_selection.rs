@@ -111,7 +111,7 @@ async fn a_pass_selects_projection_only_seat_removal_without_a_feed_record() {
         .connection
         .write()
         .execute(
-            "DELETE FROM desired WHERE subject='agent/example.planner'",
+            /* sqlite-large-value: allow-for-now lv-h555550a316f3 owner=st3::reconcile::tests::github_watch_selection TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM desired WHERE subject='agent/example.planner'",
             [],
         )
         .unwrap();

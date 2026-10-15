@@ -112,7 +112,7 @@ pub fn claim_key(connection: &Connection, id: &str) -> Result<ClaimKey> {
             WHERE claims.id=?1")
     });
     let (time, writer, sequence, batch, position, id) =
-        connection.prepare_cached(&QUERY)?.query_row([id], |row| {
+        connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h548175136201 owner=smallclaims::store::canonical TODO=trace-statement-and-value-representation */ &QUERY)?.query_row(/* sqlite-large-value: allow-for-now lv-h6f4cb2726891 owner=smallclaims::store::canonical TODO=trace-statement-and-value-representation */ [id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,

@@ -8,7 +8,7 @@ fn synthetic_source() -> Connection {
     let connection = Connection::open_in_memory().unwrap();
     connection
         .execute_batch(
-            "CREATE TABLE batches(id TEXT PRIMARY KEY, origin TEXT, replica_sequence INTEGER);
+            /* sqlite-large-value: allow-for-now lv-hd810e77f1aef owner=st3::store::actual_state_sorter_tests TODO=chunk-or-reference-variable-columns */ "CREATE TABLE batches(id TEXT PRIMARY KEY, origin TEXT, replica_sequence INTEGER);
          CREATE TABLE claims(store_index INTEGER PRIMARY KEY AUTOINCREMENT,
              id TEXT UNIQUE, batch_id TEXT, subject TEXT, kind TEXT, body TEXT,
              accepted_at_unix_ms TEXT);
@@ -32,7 +32,7 @@ fn synthetic_row(
 ) -> u64 {
     connection
         .execute(
-            "INSERT INTO claims(id,batch_id,subject,kind,body,accepted_at_unix_ms)
+            /* sqlite-large-value: allow-for-now lv-h2cb420656a31 owner=st3::store::actual_state_sorter_tests TODO=prepare-body-and-predecessor-values */ "INSERT INTO claims(id,batch_id,subject,kind,body,accepted_at_unix_ms)
          VALUES (?1,?2,?3,?4,?5,?6)",
             params![id, batch, SUBJECT, kind, body.to_string(), time],
         )
@@ -40,7 +40,7 @@ fn synthetic_row(
     let index = connection.last_insert_rowid() as u64;
     connection
         .execute(
-            "INSERT INTO replica_records(claim_id,position) VALUES (?1,?2)",
+            /* sqlite-large-value: allow-for-now lv-hc58ae0f1778c owner=st3::store::actual_state_sorter_tests TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO replica_records(claim_id,position) VALUES (?1,?2)",
             params![id, position],
         )
         .unwrap();
@@ -94,7 +94,7 @@ fn actual_identity_stream_keeps_canonical_wire_order_and_field_carriers() {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         let canonical = connection
-            .prepare(&format!(
+            .prepare(/* sqlite-large-value: allow-for-now lv-h7c3401e41e3b owner=st3::store::actual_state_sorter_tests TODO=trace-statement-and-value-representation */ &format!(
                 "SELECT claims.id FROM claims ORDER BY {CANONICAL_ORDER}"
             ))
             .unwrap()
@@ -149,7 +149,7 @@ fn actual_identity_stream_keeps_historical_cut_and_repaired_exclusion() {
     );
     connection
         .execute(
-            "INSERT INTO projection_digest_repaired_claims VALUES ('repaired')",
+            /* sqlite-large-value: allow-for-now lv-hcca02d38ae2f owner=st3::store::actual_state_sorter_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO projection_digest_repaired_claims VALUES ('repaired')",
             [],
         )
         .unwrap();
@@ -181,7 +181,7 @@ fn actual_identity_stream_keeps_historical_cut_and_repaired_exclusion() {
         Some(json!({"carried":"kept","phase":"new"}))
     );
     connection
-        .execute("UPDATE claims SET body='invalid' WHERE id='new'", [])
+        .execute(/* sqlite-large-value: allow-for-now lv-h906a12172412 owner=st3::store::actual_state_sorter_tests TODO=prepare-body-and-predecessor-values */ "UPDATE claims SET body='invalid' WHERE id='new'", [])
         .unwrap();
     assert!(latest_actual_at(&connection, SUBJECT, None).is_err());
     assert_eq!(
@@ -215,7 +215,7 @@ fn actual_identity_stream_reads_the_pinned_native_reader_cut() {
     let store = Store::open(&directory.path().join("claims.sqlite3"), "alder").unwrap();
     let old = append_observation(&store, 9, json!({"phase":"old","carried":"kept"}));
     let reader = store.readers.get();
-    reader.execute_batch("BEGIN").unwrap();
+    reader.execute_batch(/* sqlite-large-value: allow-for-now lv-h4baa5b2b3311 owner=st3::store::actual_state_sorter_tests TODO=trace-statement-and-value-representation */ "BEGIN").unwrap();
     assert_eq!(
         latest_actual_at(&reader, SUBJECT, None).unwrap(),
         Some(json!({"phase":"old","carried":"kept"}))
@@ -225,7 +225,7 @@ fn actual_identity_stream_reads_the_pinned_native_reader_cut() {
         latest_actual_at(&reader, SUBJECT, None).unwrap(),
         Some(json!({"phase":"old","carried":"kept"}))
     );
-    reader.execute_batch("ROLLBACK").unwrap();
+    reader.execute_batch(/* sqlite-large-value: allow-for-now lv-he3c6d972b45d owner=st3::store::actual_state_sorter_tests TODO=trace-statement-and-value-representation */ "ROLLBACK").unwrap();
     assert_eq!(
         latest_actual_at(&reader, SUBJECT, Some(old.store_index)).unwrap(),
         Some(json!({"phase":"old","carried":"kept"}))
@@ -240,7 +240,7 @@ fn actual_identity_stream_reads_the_pinned_native_reader_cut() {
 #[cfg(target_os = "linux")]
 fn body_sort_reference(connection: &Connection) -> Option<Value> {
     let mut statement = connection
-        .prepare(&format!(
+        .prepare(/* sqlite-large-value: allow-for-now lv-h7ac11010d620 owner=st3::store::actual_state_sorter_tests TODO=trace-statement-and-value-representation */ &format!(
             "SELECT claims.kind, claims.body FROM claims INDEXED BY claims_subject_kind_index
          JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM}
@@ -319,11 +319,11 @@ fn actual_identity_stream_bounds_native_reader_and_writer_temp_bytes() {
                 let mut writer = store.connection.write();
                 let transaction = writer.transaction().unwrap();
                 transaction.execute(
-                    "INSERT INTO batches(id,origin,replica_sequence,previous_hash,hash,accepted_at_unix_ms)
+                    /* sqlite-large-value: allow-for-now lv-h1239f38bcb3b owner=st3::store::actual_state_sorter_tests TODO=chunk-or-reference-exact-wire-values */ "INSERT INTO batches(id,origin,replica_sequence,previous_hash,hash,accepted_at_unix_ms)
                      VALUES ('batch/alder/sorter','alder',1,NULL,'sorter','1')", [],
                 ).unwrap();
                 transaction.execute(
-                    "WITH RECURSIVE history(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM history WHERE n+1<?1)
+                    /* sqlite-large-value: allow-for-now lv-he6cd1d81ffbd owner=st3::store::actual_state_sorter_tests TODO=prepare-body-and-predecessor-values */ "WITH RECURSIVE history(n) AS (SELECT 0 UNION ALL SELECT n+1 FROM history WHERE n+1<?1)
                      INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
                      SELECT printf('%064x',n),'batch/alder/sorter',?2,'resource.observed','alder',
                             json_object('fields',json_object('rank',n,'cursor',?3)), '[]',CAST(?1-n AS TEXT)

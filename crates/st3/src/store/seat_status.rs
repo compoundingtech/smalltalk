@@ -147,7 +147,7 @@ pub(super) fn state_run_since(
     state: &str,
     index: u64,
 ) -> Result<Option<u128>> {
-    let mut statement = connection.prepare_cached(&harness_observations_of_incarnation_query())?;
+    let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hff6318c3b21d owner=st3::store::seat_status TODO=trace-statement-and-value-representation */ &harness_observations_of_incarnation_query())?;
     let mut rows = statement.query(params![subject, index, incarnation])?;
     let mut since = None;
     while let Some(row) = rows.next()? {
@@ -227,7 +227,7 @@ pub(super) fn enrich_harness(
             AND (claims.kind!='harness.observed' OR json_extract(claims.body,'$.fields.status_transition') IS NOT 0)
             ORDER BY {CANONICAL_ORDER}");
         let claims = connection
-            .prepare_cached(&query)?
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-he004015b5562 owner=st3::store::seat_status TODO=trace-statement-and-value-representation */ &query)?
             .query_map(params![subject, index, view.incarnation_id], claim_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let refs = claims.iter().collect::<Vec<_>>();
@@ -281,8 +281,8 @@ impl Store {
         let prompt_query = newest_claims_of_kind_query("claims.accepted_at_unix_ms", "harness.diagnostic")
             .replace(" ORDER BY", " AND json_extract(claims.body,'$.fields.incarnation_id')=?3 AND json_extract(claims.body,'$.fields.code') IN ('provider-auth-expired','provider-trust-prompt','provider-auth-restored','provider-update-prompt','provider-update-restored') ORDER BY") + " LIMIT 1";
         let prompt: Option<String> = connection
-            .prepare_cached(&prompt_query)?
-            .query_row(params![subject, index, harness.incarnation_id], |row| {
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-hf2fc9079eb55 owner=st3::store::seat_status TODO=trace-statement-and-value-representation */ &prompt_query)?
+            .query_row(/* sqlite-large-value: allow-for-now lv-hfdde367aa046 owner=st3::store::seat_status TODO=trace-statement-and-value-representation */ params![subject, index, harness.incarnation_id], |row| {
                 row.get(0)
             })
             .optional()?;
@@ -296,7 +296,7 @@ impl Store {
                AND json_extract(body, '$.fields.incarnation_id')=?3
              ORDER BY id DESC LIMIT 1",
             )?
-            .query_row(params![subject, index, harness.incarnation_id], |row| {
+            .query_row(/* sqlite-large-value: allow-for-now lv-hbd8bf3cfe3ed owner=st3::store::seat_status TODO=trace-statement-and-value-representation */ params![subject, index, harness.incarnation_id], |row| {
                 Ok((row.get(0)?, row.get::<_, i64>(1)? as u128))
             })
             .optional()?;
@@ -375,7 +375,7 @@ fn history_at_inner(connection: &Connection, subject: &str, now: u128, index: u6
         };
         let query = newest_claims_of_kind_query(&columns, kind)
             .replace(" ORDER BY", &format!("{filter} ORDER BY"));
-        let mut statement = connection.prepare_cached(&query)?;
+        let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hb2e053b295d7 owner=st3::store::seat_status TODO=trace-statement-and-value-representation */ &query)?;
         let mut rows = statement.query(params![subject, index])?;
         while let Some(row) = rows.next()? {
             smallclaims::read_budget::check()?;
@@ -408,8 +408,8 @@ fn history_at_inner(connection: &Connection, subject: &str, now: u128, index: u6
         AND json_extract(claims.body,'$.fields.status')='running' ORDER BY {CANONICAL_ORDER} LIMIT 1", canonical::position_sql("claims"));
     for incarnation in baseline_incarnations {
         let source = connection
-            .prepare_cached(&query)?
-            .query_row(params![subject, incarnation, index], |row| {
+            .prepare_cached(/* sqlite-large-value: allow-for-now lv-ha838eb114f31 owner=st3::store::seat_status TODO=trace-statement-and-value-representation */ &query)?
+            .query_row(/* sqlite-large-value: allow-for-now lv-haa49a8d1de1b owner=st3::store::seat_status TODO=trace-statement-and-value-representation */ params![subject, incarnation, index], |row| {
                 let claim = claim_from_row(row)?;
                 Ok((
                     canonical::key_from_record(&claim, row.get(10)?, row.get(11)?, row.get(12)?),

@@ -8,7 +8,7 @@ fn latest_handoff(
     view: &StepRunView,
     at: u128,
 ) -> Result<Option<ClaimRecord>, St3Error> {
-    connection.query_row(&canonical_sql("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='work.released' AND json_extract(body,'$.fields.handoff_message') IS NOT NULL AND json_extract(body,'$.fields.attempt')=?2 AND CAST(accepted_at_unix_ms AS INTEGER)<=?3 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+    connection.query_row(/* sqlite-large-value: allow-for-now lv-hf0a90e006c0b owner=st3::store::adhoc_work TODO=trace-statement-and-value-representation */ &canonical_sql("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='work.released' AND json_extract(body,'$.fields.handoff_message') IS NOT NULL AND json_extract(body,'$.fields.attempt')=?2 AND CAST(accepted_at_unix_ms AS INTEGER)<=?3 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
         params![view.subject, view.attempt, at as i64], claim_from_row).optional().map_err(internal)
 }
 
@@ -109,7 +109,7 @@ pub(super) fn transfer_tx(
     body["fields"]["handoff_to"] = json!(input.to);
     body["fields"]["handoff_message"] = json!(message);
     tx.execute(
-        "UPDATE step_runs SET assignee=?2, available_to='[]' WHERE subject=?1",
+        /* sqlite-large-value: allow-for-now lv-h74e5e2f887e9 owner=st3::store::adhoc_work TODO=bound-or-reference-values-and-reclamation */ "UPDATE step_runs SET assignee=?2, available_to='[]' WHERE subject=?1",
         params![current.subject, input.to],
     )
     .map_err(internal)?;
@@ -190,7 +190,7 @@ pub(super) fn project_start(tx: &Transaction<'_>, claim: &ClaimRecord) -> Result
             "a minimal work run needs its work step",
         )
     })?;
-    tx.execute("INSERT OR IGNORE INTO step_runs(subject,run_id,generation_id,step_path,definition_hash,status,attempt,assignee,available_to,agentless,title,goals,created_at_unix_ms,updated_at_unix_ms,constraints) VALUES(?1,?2,?3,'work',?4,'ready',1,?5,'[]',0,?6,?7,?8,?8,'[]')",
+    tx.execute(/* sqlite-large-value: allow-for-now lv-hadc3a6d82e2b owner=st3::store::adhoc_work TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO step_runs(subject,run_id,generation_id,step_path,definition_hash,status,attempt,assignee,available_to,agentless,title,goals,created_at_unix_ms,updated_at_unix_ms,constraints) VALUES(?1,?2,?3,'work',?4,'ready',1,?5,'[]',0,?6,?7,?8,?8,'[]')",
         params![subject, run, generation, step.definition_hash, claim.actor, fields["ad_hoc_title"].as_str(), serde_json::to_string(&vec![fields["ad_hoc_title"].as_str().unwrap_or_default()]).map_err(internal)?, claim.accepted_at_unix_ms.to_string()]).map_err(internal)?;
     Ok(())
 }
@@ -261,7 +261,7 @@ impl Store {
             .remove(&mission_id)
             .ok_or_else(|| St3Error::new("internal", "minimal work mission missing"))?;
         self.connection.batched(|tx| {
-            if let Some(existing) = tx.query_row(&canonical_sql("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='mission-run.created' ORDER BY CANONICAL_ASC(claims) LIMIT 1"), [&run], claim_from_row).optional().map_err(internal)? {
+            if let Some(existing) = tx.query_row(/* sqlite-large-value: allow-for-now lv-hec0ea37dfa27 owner=st3::store::adhoc_work TODO=trace-statement-and-value-representation */ &canonical_sql("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='mission-run.created' ORDER BY CANONICAL_ASC(claims) LIMIT 1"), [&run], claim_from_row).optional().map_err(internal)? {
                 if existing.body["fields"]["ad_hoc_title"] != input.title || existing.actor.as_deref() != Some(&input.actor) {
                     return Err(St3Error::new("idempotency-conflict", "this start key already names another task"));
                 }
@@ -301,7 +301,7 @@ impl Store {
             if view.status != "ready" || step_owner_is_terminal_tx(tx, &subject)? {
                 return Err(St3Error::new("stale-handoff", "this handoff is no longer waiting for acknowledgment"));
             }
-            let seen: Option<String> = tx.query_row(&canonical_sql("SELECT id FROM claims WHERE subject=?1 AND actor=?2 AND kind IN ('message.read','message.closed') ORDER BY CANONICAL_ASC(claims) LIMIT 1"), params![input.message, input.actor], |row| row.get(0)).optional().map_err(internal)?;
+            let seen: Option<String> = tx.query_row(/* sqlite-large-value: allow-for-now lv-h9eb5c85f6ead owner=st3::store::adhoc_work TODO=trace-statement-and-value-representation */ &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND actor=?2 AND kind IN ('message.read','message.closed') ORDER BY CANONICAL_ASC(claims) LIMIT 1"), params![input.message, input.actor], |row| row.get(0)).optional().map_err(internal)?;
             let receipt = match seen {
                 Some(receipt) => receipt,
                 None => append_claim_tx(tx, &self.origin, &input.message, "message.read", Some(&input.actor), &json!({"fields": {"status": "read"}}), &[], None).map_err(claim_append_error)?.id,

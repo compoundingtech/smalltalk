@@ -28,11 +28,11 @@ fn mailbox_fence_cost_is_bounded_with_sparse_observation_history() {
                     fields
                 };
                 tx.execute(
-                    "INSERT INTO batches VALUES (?1,'node',?2,NULL,?1,?3)",
+                    /* sqlite-large-value: allow-for-now lv-h371cfa5e1cff owner=st3::store::mailbox_fence_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO batches VALUES (?1,'node',?2,NULL,?1,?3)",
                     params![id, (seat * (history + 1) + n) as i64, (n + 1).to_string()],
                 )
                 .unwrap();
-                tx.execute("INSERT INTO claims (id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                tx.execute(/* sqlite-large-value: allow-for-now lv-h2aeffc717c82 owner=st3::store::mailbox_fence_tests TODO=prepare-body-and-predecessor-values */ "INSERT INTO claims (id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
                     VALUES (?1,?1,?5,?2,'node',?3,'[]',?4)",
                     params![id, kind, json!({"fields":fields}).to_string(), (n + 1).to_string(), subject]).unwrap();
             }
@@ -71,7 +71,7 @@ fn mailbox_fence_cost_is_bounded_with_sparse_observation_history() {
         .iter()
         .map(|query| {
             connection
-                .prepare_cached(query)
+                .prepare_cached(/* sqlite-large-value: allow-for-now lv-h293820680af9 owner=st3::store::mailbox_fence_tests TODO=trace-statement-and-value-representation */ query)
                 .unwrap()
                 .reset_status(rusqlite::StatementStatus::VmStep)
         })
@@ -110,7 +110,7 @@ fn insert_observation(
 ) {
     connection
         .execute(
-            "INSERT INTO batches VALUES (?1,?2,0,NULL,?1,?3)",
+            /* sqlite-large-value: allow-for-now lv-hd76ddd131b86 owner=st3::store::mailbox_fence_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO batches VALUES (?1,?2,0,NULL,?1,?3)",
             params![id, writer, time.to_string()],
         )
         .unwrap();
@@ -120,7 +120,7 @@ fn insert_observation(
         "agent/eval.worker"
     };
     connection.execute(
-        "INSERT INTO claims (id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
+        /* sqlite-large-value: allow-for-now lv-h40eb8b222f17 owner=st3::store::mailbox_fence_tests TODO=prepare-body-and-predecessor-values */ "INSERT INTO claims (id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
          VALUES (?1,?1,?2,?3,?4,'agent/eval.worker',?5,'[]',?6)",
         params![id, subject, kind, writer, body.to_string(), time.to_string()],
     ).unwrap();
@@ -337,7 +337,7 @@ fn mailbox_fence_state_index_backfills_existing_stores_and_seeks_both_epochs() {
         let store = Store::open(&path, "node").unwrap();
         let connection = store.connection.lock().unwrap();
         connection
-            .execute_batch("DROP INDEX claims_harness_state_incarnation_accepted_index")
+            .execute_batch(/* sqlite-large-value: allow-for-now lv-h57cdd0ae8c33 owner=st3::store::mailbox_fence_tests TODO=bound-or-reference-values-and-reclamation */ "DROP INDEX claims_harness_state_incarnation_accepted_index")
             .unwrap();
         insert_runtime(&connection);
         insert_observation(
@@ -362,7 +362,7 @@ fn mailbox_fence_state_index_backfills_existing_stores_and_seeks_both_epochs() {
     assert_ended(&connection, false);
     for incarnation in [Some("current"), None] {
         let plan = connection
-            .prepare(&format!(
+            .prepare(/* sqlite-large-value: allow-for-now lv-h0a675a8de974 owner=st3::store::mailbox_fence_tests TODO=trace-statement-and-value-representation */ &format!(
                 "EXPLAIN QUERY PLAN {}",
                 newest_mailbox_harness_state_query()
             ))

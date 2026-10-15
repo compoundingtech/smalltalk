@@ -23,7 +23,7 @@ const LAYOUT: &str =
     "smallclaims.ivm.retained-claims.v2;plain-admission;retain-repaired;canonical.v1";
 const COLUMNS: &str =
     "id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms";
-const SCHEMA: &str = "
+const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-h91b906c7de8e owner=smallclaims::ivm::claim_source TODO=chunk-or-reference-variable-columns */ "
 CREATE TABLE IF NOT EXISTS ivm_install_claim_kinds (
  source TEXT NOT NULL, kind TEXT NOT NULL, PRIMARY KEY(source,kind)
 );
@@ -130,7 +130,7 @@ impl ClaimSource {
 
     pub(crate) fn create_schema(&self, connection: &Connection) -> Result<()> {
         self.installer.create_schema(connection)?;
-        connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h336bbfc70aed owner=smallclaims::ivm::claim_source TODO=trace-statement-and-value-representation */ SCHEMA)?;
         // Indexed claim/kind discovery, bounded by registered sources, never by same-batch
         // children or output count. Unsupported canonical edits invalidate the entire source.
         let relevant = "SELECT DISTINCT k.source FROM ivm_install_claim_kinds k JOIN claims c ON c.kind=k.kind WHERE c.id=OLD.claim_id";
@@ -144,7 +144,7 @@ impl ClaimSource {
         let changed_sources = "SELECT k.source FROM ivm_install_claim_kinds k JOIN claims c ON c.kind=k.kind WHERE c.id=NEW.claim_id AND ((c.store_index<=(SELECT projected FROM ivm_source WHERE singleton=1) AND NOT EXISTS(SELECT 1 FROM ivm_install_claim_ranks r WHERE r.source=k.source AND r.claim_id=c.id)) OR (SELECT position FROM ivm_install_claim_ranks r WHERE r.source=k.source AND r.claim_id=c.id)<>(SELECT MIN(position) FROM replica_records WHERE claim_id=c.id))";
         // Replace the bounded trigger definition on upgrade; the v2 source fingerprint
         // keeps any prior registered source/namespace unavailable until explicit recovery.
-        connection.execute_batch("DROP TRIGGER IF EXISTS ivm_install_claim_record_insert")?;
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h34b0045efaf9 owner=smallclaims::ivm::claim_source TODO=bound-or-reference-values-and-reclamation */ "DROP TRIGGER IF EXISTS ivm_install_claim_record_insert")?;
         let triggers: [(&str, &str, String, String); 7] = [
             ("record_insert", "AFTER INSERT ON replica_records", "NEW.claim_id IS NOT NULL".into(), changed_sources.to_string()),
             ("record_delete", "AFTER DELETE ON replica_records", "OLD.claim_id IS NOT NULL".into(), relevant.to_string()),
@@ -156,7 +156,7 @@ impl ClaimSource {
             ("source_epoch", "AFTER UPDATE OF epoch ON ivm_source", "OLD.epoch<>NEW.epoch".into(), all.to_string()),
         ];
         for (name, event, condition, sources) in triggers {
-            connection.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS ivm_install_claim_{name} {event} WHEN {condition} BEGIN
+            connection.execute_batch(&format!(/* sqlite-large-value: allow-for-now lv-h0d17d2d43780 owner=smallclaims::ivm::claim_source TODO=bound-or-reference-values-and-reclamation */ "CREATE TRIGGER IF NOT EXISTS ivm_install_claim_{name} {event} WHEN {condition} BEGIN
                 UPDATE ivm_install_sources SET available=0 WHERE name IN ({sources});
                 UPDATE ivm_install_jobs SET phase='stopped',error='retained claim source changed outside bounded capture' WHERE source IN ({sources}) AND phase IN ('scan','catchup');
                 UPDATE ivm_install_roots SET ready=0,status_revision=status_revision+1,error='retained claim source changed outside bounded capture' WHERE source IN ({sources}) AND (ready<>0 OR error IS NOT 'retained claim source changed outside bounded capture');
@@ -189,7 +189,7 @@ impl ClaimSource {
             .register_source(tx, self.name, &self.fingerprint, cut.epoch)?;
         for kind in &self.kinds {
             tx.execute(
-                "INSERT INTO ivm_install_claim_kinds VALUES(?1,?2)",
+                /* sqlite-large-value: allow-for-now lv-h30499893b99d owner=smallclaims::ivm::claim_source TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_install_claim_kinds VALUES(?1,?2)",
                 params![self.name, kind],
             )?;
         }
@@ -207,12 +207,12 @@ impl ClaimSource {
         self.installer
             .restore_source(tx, expected, &self.fingerprint, cut.epoch)?;
         tx.execute(
-            "DELETE FROM ivm_install_claim_kinds WHERE source=?1",
+            /* sqlite-large-value: allow-for-now lv-hf05b625ae5f7 owner=smallclaims::ivm::claim_source TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM ivm_install_claim_kinds WHERE source=?1",
             [self.name],
         )?;
         for kind in &self.kinds {
             tx.execute(
-                "INSERT INTO ivm_install_claim_kinds VALUES(?1,?2)",
+                /* sqlite-large-value: allow-for-now lv-ha17e89d9282a owner=smallclaims::ivm::claim_source TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_install_claim_kinds VALUES(?1,?2)",
                 params![self.name, kind],
             )?;
         }
@@ -255,7 +255,7 @@ impl ClaimSource {
             return Ok(());
         }
         let fact = ClaimFact::read(tx, claim)?;
-        tx.execute("INSERT INTO ivm_install_claim_ranks VALUES(?1,?2,?3) ON CONFLICT(source,claim_id) DO UPDATE SET position=excluded.position",params![self.name,claim.id,fact.canonical_position])?;
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h74f3ad553af2 owner=smallclaims::ivm::claim_source TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO ivm_install_claim_ranks VALUES(?1,?2,?3) ON CONFLICT(source,claim_id) DO UPDATE SET position=excluded.position",params![self.name,claim.id,fact.canonical_position])?;
         self.installer.record(tx, self.name, &fact.mutation()?)?;
         Ok(())
     }
@@ -370,7 +370,7 @@ impl ClaimSource {
                 break;
             }
             let claim = connection.query_row(
-                &format!("SELECT {COLUMNS} FROM claims WHERE store_index=?1"),
+                /* sqlite-large-value: allow-for-now lv-h9d270bd60acf owner=smallclaims::ivm::claim_source TODO=trace-statement-and-value-representation */ &format!("SELECT {COLUMNS} FROM claims WHERE store_index=?1"),
                 [index],
                 claim_from_row,
             )?;

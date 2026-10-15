@@ -214,7 +214,7 @@ fn native_lean_mission_membership_matches_full_cards() {
     let expiry = client_now_ms() + 60_000;
     let c = rusqlite::Connection::open(root.path().join("graph.db")).unwrap();
     crate::store::configure_projection_writer(&c).unwrap();
-    c.execute("UPDATE step_runs SET status='working',lease_owner='agent/builder',lease_incarnation='fixture',lease_expires_at_unix_ms=?2 WHERE subject=?1",
+    c.execute(/* sqlite-large-value: allow-for-now lv-h7b9530af1004 owner=st3::api::client_v0::summary::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE step_runs SET status='working',lease_owner='agent/builder',lease_incarnation='fixture',lease_expires_at_unix_ms=?2 WHERE subject=?1",
         rusqlite::params![step,expiry.to_string()]).unwrap();
     store
         .read_snapshot(|_| {
@@ -418,7 +418,7 @@ fn summary_does_not_hydrate_thousands_of_unstarted_definitions() {
     crate::store::configure_projection_writer(&c).unwrap();
     let tx = c.transaction().unwrap();
     for i in 0..3000 {
-        tx.execute("INSERT INTO mission_definitions(mission_id,revision,state,claim_id) SELECT ?1,revision,state,claim_id FROM mission_definitions WHERE mission_id='summary-base'", [format!("summary-unused-{i}")]).unwrap();
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h4c4e829762e9 owner=st3::api::client_v0::summary::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO mission_definitions(mission_id,revision,state,claim_id) SELECT ?1,revision,state,claim_id FROM mission_definitions WHERE mission_id='summary-base'", [format!("summary-unused-{i}")]).unwrap();
     }
     tx.commit().unwrap();
     let before = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get);

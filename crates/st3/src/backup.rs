@@ -272,17 +272,17 @@ pub fn verify_file(path: &Path) -> Result<Header> {
 }
 
 /// Build privately at the current schema. Failed restores never publish a partial graph.
-pub fn restore(source: &Path, destination: &Path) -> Result<RestoreReport> {
+pub /* sqlite-large-value-flow: allow-for-now flow-h3f3097a87b9e owner=st3::backup TODO=chunk-or-reference-exact-wire-values */ fn restore(source: &Path, destination: &Path) -> Result<RestoreReport> {
     let header = verify_file(source)?;
     let existing = if destination.exists() {
         let connection = rusqlite::Connection::open(destination)?;
         connection.busy_timeout(std::time::Duration::ZERO)?;
-        connection.execute_batch("BEGIN EXCLUSIVE;")?;
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-hdbdcc11e6d90 owner=st3::backup TODO=trace-statement-and-value-representation */ "BEGIN EXCLUSIVE;")?;
         require_empty_database(&connection)?;
         // A WAL file may outlive the last connection. Changing journal mode takes the locks
         // that distinguish a closed database from a live WAL reader, unlike file existence.
         // Keep the exclusive connection lock through publication so no new writer can enter.
-        connection.execute_batch("COMMIT; PRAGMA locking_mode=EXCLUSIVE;")?;
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h7183073e55b7 owner=st3::backup TODO=trace-statement-and-value-representation */ "COMMIT; PRAGMA locking_mode=EXCLUSIVE;")?;
         connection
             .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
             .context("restore requires an offline database")?;
@@ -463,7 +463,7 @@ fn require_empty_database(connection: &rusqlite::Connection) -> Result<()> {
         )?;
         if exists {
             let has_envelopes: bool = connection.query_row(
-                &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+                /* sqlite-large-value: allow-for-now lv-hdb7bcb5d870d owner=st3::backup TODO=trace-statement-and-value-representation */ &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
                 [],
                 |r| r.get(0),
             )?;

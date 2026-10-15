@@ -316,7 +316,7 @@ fn retracted_and_restored_token_cannot_admit_a_different_prepared_declaration() 
         .connection
         .batched(|tx| {
             tx.execute(
-                "CREATE TEMP TABLE aba_a AS SELECT * FROM desired WHERE subject=?1",
+                /* sqlite-large-value: allow-for-now lv-h320c55468002 owner=st3::reconcile::tests::start_preemption TODO=chunk-or-reference-variable-columns */ "CREATE TEMP TABLE aba_a AS SELECT * FROM desired WHERE subject=?1",
                 [subject],
             )
         })
@@ -332,20 +332,20 @@ fn retracted_and_restored_token_cannot_admit_a_different_prepared_declaration() 
         .connection
         .batched(|tx| {
             tx.execute(
-                "CREATE TEMP TABLE aba_b AS SELECT * FROM desired WHERE subject=?1",
+                /* sqlite-large-value: allow-for-now lv-h539a06db378a owner=st3::reconcile::tests::start_preemption TODO=chunk-or-reference-variable-columns */ "CREATE TEMP TABLE aba_b AS SELECT * FROM desired WHERE subject=?1",
                 [subject],
             )
         })
         .unwrap()
         .unwrap();
-    store.connection.batched(|tx| tx.execute_batch("DELETE FROM desired WHERE subject='exec/example/worker'; INSERT INTO desired SELECT * FROM aba_a;")).unwrap().unwrap();
+    store.connection.batched(|tx| tx.execute_batch(/* sqlite-large-value: allow-for-now lv-hbd8054914562 owner=st3::reconcile::tests::start_preemption TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM desired WHERE subject='exec/example/worker'; INSERT INTO desired SELECT * FROM aba_a;")).unwrap().unwrap();
     let after_retraction = store
         .desired_subjects_named(&[subject.into()])
         .unwrap()
         .remove(0);
     assert_eq!(after_retraction.kind, stale.kind);
     assert_eq!(after_retraction.desired, stale.desired);
-    store.connection.batched(|tx| tx.execute_batch("DELETE FROM desired WHERE subject='exec/example/worker'; INSERT INTO desired SELECT * FROM aba_b;")).unwrap().unwrap();
+    store.connection.batched(|tx| tx.execute_batch(/* sqlite-large-value: allow-for-now lv-h6f0ba0665a4c owner=st3::reconcile::tests::start_preemption TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM desired WHERE subject='exec/example/worker'; INSERT INTO desired SELECT * FROM aba_b;")).unwrap().unwrap();
     assert_eq!(store.selected_desired_token(subject).unwrap(), token);
     let member = stale.member.as_ref().unwrap().clone();
     let prepared = start_jobs::PreparedStart {
@@ -1219,10 +1219,10 @@ async fn missing_or_repaired_original_request_prevents_real_native_start() {
         let local_id: i64 = request.id.rsplit('/').next().unwrap().parse().unwrap();
         if change == "deleted" {
             connection
-                .execute("DELETE FROM local_observations WHERE id=?1", [local_id])
+                .execute(/* sqlite-large-value: allow-for-now lv-h4ff6097a26bf owner=st3::reconcile::tests::start_preemption TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_observations WHERE id=?1", [local_id])
                 .unwrap();
         } else {
-            connection.execute("UPDATE local_observations SET body=json_set(body,'$.fields.runtime_id','foreign-runtime') WHERE id=?1", [local_id]).unwrap();
+            connection.execute(/* sqlite-large-value: allow-for-now lv-h5d8991153ea1 owner=st3::reconcile::tests::start_preemption TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_observations SET body=json_set(body,'$.fields.runtime_id','foreign-runtime') WHERE id=?1", [local_id]).unwrap();
         }
         assert!(!store.runtime_start_request_retained(&request).unwrap());
         reconciler.start_queued_job(&operation).unwrap();

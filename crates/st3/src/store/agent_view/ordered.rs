@@ -4,7 +4,7 @@ use super::*;
 
 const MAX_DEPTH: usize = 128;
 
-pub(super) const SCHEMA: &str = r#"
+pub(super) const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-hf67798c46cf3 owner=st3::store::agent_view::ordered TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS local_agent_ordered_nodes (
  id INTEGER PRIMARY KEY AUTOINCREMENT, claim TEXT NOT NULL UNIQUE,
  stream TEXT NOT NULL, rank BLOB NOT NULL, priority BLOB NOT NULL,
@@ -54,7 +54,7 @@ fn write(connection: &Connection, node: &mut Node) -> Result<()> {
     node.summary = summary(connection, node.left)?
         .join(&Summary::event(&node.event, node.id)?)
         .join(&summary(connection, node.right)?);
-    connection.execute("UPDATE local_agent_ordered_nodes SET left_id=?2,right_id=?3,summary=?4,machine=?5 WHERE id=?1",
+    connection.execute(/* sqlite-large-value: allow-for-now lv-hecbcb517cede owner=st3::store::agent_view::ordered TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_agent_ordered_nodes SET left_id=?2,right_id=?3,summary=?4,machine=?5 WHERE id=?1",
         params![node.id,node.left,node.right,serde_json::to_string(&node.summary)?,node.summary.machine.encode()])?;
     Ok(())
 }
@@ -193,11 +193,11 @@ fn root(connection: &Connection, stream: &str) -> Result<Option<u64>> {
 fn put_root(connection: &Connection, stream: &str, id: Option<u64>) -> Result<()> {
     match id {
         Some(id) => {
-            connection.execute("INSERT INTO local_agent_ordered_roots VALUES(?1,?2) ON CONFLICT(stream) DO UPDATE SET root=excluded.root",params![stream,id])?;
+            connection.execute(/* sqlite-large-value: allow-for-now lv-hfee16154b753 owner=st3::store::agent_view::ordered TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_agent_ordered_roots VALUES(?1,?2) ON CONFLICT(stream) DO UPDATE SET root=excluded.root",params![stream,id])?;
         }
         None => {
             connection.execute(
-                "DELETE FROM local_agent_ordered_roots WHERE stream=?1",
+                /* sqlite-large-value: allow-for-now lv-hbe5e64381b2e owner=st3::store::agent_view::ordered TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_agent_ordered_roots WHERE stream=?1",
                 [stream],
             )?;
         }
@@ -217,7 +217,7 @@ pub(super) fn retract(connection: &Connection, claim: &str) -> Result<()> {
         let next = remove(connection, root(connection, &stream)?, &rank, 0)?;
         put_root(connection, &stream, next)?;
         connection.execute(
-            "DELETE FROM local_agent_ordered_nodes WHERE claim=?1",
+            /* sqlite-large-value: allow-for-now lv-h9c6d4cb243dd owner=st3::store::agent_view::ordered TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_agent_ordered_nodes WHERE claim=?1",
             [claim],
         )?;
     }
@@ -231,12 +231,12 @@ pub(super) fn admit(connection: &Connection, event: &Event) -> Result<()> {
         event.fields.get("incarnation_id").and_then(Value::as_str),
     );
     let priority = Sha256::digest(event.claim.as_bytes()).to_vec();
-    connection.execute("INSERT INTO local_agent_ordered_nodes(claim,stream,rank,priority,event,summary,machine) VALUES(?1,?2,?3,?4,?5,'{}',X'')",
+    connection.execute(/* sqlite-large-value: allow-for-now lv-h3fc7da17e2bf owner=st3::store::agent_view::ordered TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_agent_ordered_nodes(claim,stream,rank,priority,event,summary,machine) VALUES(?1,?2,?3,?4,?5,'{}',X'')",
         params![event.claim,stream,event.rank,priority,serde_json::to_string(event)?])?;
     let id = connection.last_insert_rowid() as u64;
     let own = Summary::event(event, id)?;
     connection.execute(
-        "UPDATE local_agent_ordered_nodes SET summary=?2,machine=?3 WHERE id=?1",
+        /* sqlite-large-value: allow-for-now lv-h9e451e21e418 owner=st3::store::agent_view::ordered TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_agent_ordered_nodes SET summary=?2,machine=?3 WHERE id=?1",
         params![id, serde_json::to_string(&own)?, own.machine.encode()],
     )?;
     let next = insert(

@@ -12,7 +12,7 @@ use smallclaims::ivm::{Contribution, Definition, LocalChange, Readiness, View, V
 
 pub(crate) const VIEW: &str = "st3.work-summaries.v1";
 const CLOCK: &str = "st3.work-summaries.clock";
-const SCHEMA: &str = r#"
+const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-ha3a75b93ff7f owner=st3::store::work_summaries_ivm TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS local_work_summary_clock (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), through_ms BLOB NOT NULL CHECK(length(through_ms)=16)
 );
@@ -64,7 +64,7 @@ impl View for WorkSummaries {
         }
     }
     fn create_schema(&self, connection: &Connection) -> Result<()> {
-        connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-h1165ccca1600 owner=st3::store::work_summaries_ivm TODO=trace-statement-and-value-representation */ SCHEMA)?;
         Ok(())
     }
     fn contributions(
@@ -165,13 +165,13 @@ fn maintain(tx: &Transaction<'_>, key: &str, at: u128) -> Result<bool> {
     for register in ["progress", "completion"] {
         let winner: Option<String> = if let Some(upper) = &upper {
             tx.query_row(
-                WINNER,
+                /* sqlite-large-value: allow-for-now lv-h0f47beead5eb owner=st3::store::work_summaries_ivm TODO=trace-statement-and-value-representation */ WINNER,
                 params![VIEW, key, register, upper.as_slice()],
                 |row| row.get(0),
             )
             .optional()?
         } else {
-            tx.query_row(LAST, params![VIEW, key, register], |row| row.get(0))
+            tx.query_row(/* sqlite-large-value: allow-for-now lv-h6c3d259aac9b owner=st3::store::work_summaries_ivm TODO=trace-statement-and-value-representation */ LAST, params![VIEW, key, register], |row| row.get(0))
                 .optional()?
         };
         if let Some(winner) = winner {
@@ -180,7 +180,7 @@ fn maintain(tx: &Transaction<'_>, key: &str, at: u128) -> Result<bool> {
         if let Some(upper) = &upper {
             let rank: Option<Vec<u8>> = tx
                 .query_row(
-                    NEXT,
+                    /* sqlite-large-value: allow-for-now lv-hb3e82788c7e4 owner=st3::store::work_summaries_ivm TODO=trace-statement-and-value-representation */ NEXT,
                     params![VIEW, key, register, upper.as_slice()],
                     |row| row.get(0),
                 )
@@ -212,9 +212,9 @@ fn maintain(tx: &Transaction<'_>, key: &str, at: u128) -> Result<bool> {
         completion_summary: summary("completion"),
     };
     if new == Summaries::default() && next_at.is_none() {
-        tx.execute("DELETE FROM local_work_summaries WHERE key=?1", [key])?;
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h2a12130080e0 owner=st3::store::work_summaries_ivm TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_work_summaries WHERE key=?1", [key])?;
     } else {
-        tx.execute("INSERT INTO local_work_summaries VALUES(?1,?2,?3,?4,?5,?6,?7)
+        tx.execute(/* sqlite-large-value: allow-for-now lv-ha45ded7c38a3 owner=st3::store::work_summaries_ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_work_summaries VALUES(?1,?2,?3,?4,?5,?6,?7)
           ON CONFLICT(key) DO UPDATE SET progress=excluded.progress,progress_at=excluded.progress_at,
           completion=excluded.completion,next_at=excluded.next_at
           WHERE progress IS NOT excluded.progress OR progress_at IS NOT excluded.progress_at
@@ -248,7 +248,7 @@ fn ready_at(connection: &Connection, views: &Views, at: u128) -> Result<()> {
         "work summary historical clock unavailable"
     );
     let due = connection
-        .prepare_cached(DUE)?
+        .prepare_cached(/* sqlite-large-value: allow-for-now lv-h9756775f29b5 owner=st3::store::work_summaries_ivm TODO=trace-statement-and-value-representation */ DUE)?
         .exists(params![at.to_be_bytes().as_slice(), 1])?;
     anyhow::ensure!(!due, "work summary captured time pending");
     Ok(())
@@ -266,7 +266,7 @@ pub(crate) fn clock_page(
     let mut cut = ready(tx, views)?;
     anyhow::ensure!(at >= clock(tx)?, "work summary clock regressed");
     let keys = tx
-        .prepare_cached(DUE)?
+        .prepare_cached(/* sqlite-large-value: allow-for-now lv-h1198bc862b3f owner=st3::store::work_summaries_ivm TODO=trace-statement-and-value-representation */ DUE)?
         .query_map(params![at.to_be_bytes().as_slice(), limit], |row| {
             row.get::<_, String>(0)
         })?
@@ -292,7 +292,7 @@ pub(crate) fn clock_page(
         );
     }
     tx.execute(
-        "UPDATE local_work_summary_clock SET through_ms=?1 WHERE singleton=1 AND through_ms<?1",
+        /* sqlite-large-value: allow-for-now lv-he609964d542e owner=st3::store::work_summaries_ivm TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_work_summary_clock SET through_ms=?1 WHERE singleton=1 AND through_ms<?1",
         [at.to_be_bytes().as_slice()],
     )?;
     Ok(keys.len())

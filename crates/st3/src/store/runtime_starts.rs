@@ -15,12 +15,12 @@ pub(super) fn create_schema(connection: &Connection) -> Result<()> {
         // The installation transaction replaces earlier draft triggers once. No
         // ledger backfill is needed: existing results predate every new capture.
         transaction.execute_batch(
-            "DROP TRIGGER IF EXISTS local_runtime_starts_observation_insert;
+            /* sqlite-large-value: allow-for-now lv-h6ca965e20fa2 owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "DROP TRIGGER IF EXISTS local_runtime_starts_observation_insert;
              DROP TRIGGER IF EXISTS local_runtime_starts_observation_update;
              DROP TRIGGER IF EXISTS local_runtime_starts_observation_delete;",
         )?;
     }
-    transaction.execute_batch(r#"
+    transaction.execute_batch(/* sqlite-large-value: allow-for-now lv-h0f3b14e10aa0 owner=st3::store::runtime_starts TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE IF NOT EXISTS local_runtime_start_observation_generation (
     id INTEGER PRIMARY KEY CHECK(id=1),
     value INTEGER NOT NULL CHECK(typeof(value)='integer' AND value>=0)
@@ -107,7 +107,7 @@ CREATE INDEX IF NOT EXISTS local_runtime_start_evidence_observation ON local_run
             "runtime-start ledger has operations but lacks immutable publication format cuts; preserve this store and roll forward with its original format-boundary evidence"
         );
         transaction.execute_batch(
-            "INSERT OR IGNORE INTO meta(key,value)
+            /* sqlite-large-value: allow-for-now lv-haaa22927d7ba owner=st3::store::runtime_starts TODO=prepare-body-and-predecessor-values */ "INSERT OR IGNORE INTO meta(key,value)
              SELECT 'publication-operation-format-shared-cut', CAST(COALESCE(MAX(store_index),0) AS TEXT) FROM claims;
              INSERT OR IGNORE INTO meta(key,value)
              SELECT 'publication-operation-format-local-cut', CAST(COALESCE(MAX(id),0) AS TEXT) FROM local_observations;",
@@ -204,7 +204,7 @@ fn pin_evidence(tx: &Transaction<'_>, operation: &str, origin: &str, evidence: &
         evidence.strip_prefix(&format!("{LOCAL_OBSERVATION_ID_PREFIX}{origin}/"))
     {
         let position: i64 = position.parse()?;
-        tx.execute("INSERT OR IGNORE INTO local_runtime_start_evidence(operation_id,observation_id) VALUES (?1,?2)",
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h6ab425e3739e owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO local_runtime_start_evidence(operation_id,observation_id) VALUES (?1,?2)",
             params![operation, position])?;
     }
     Ok(())
@@ -212,7 +212,7 @@ fn pin_evidence(tx: &Transaction<'_>, operation: &str, origin: &str, evidence: &
 
 fn release_evidence(tx: &Transaction<'_>, operation: &str) -> rusqlite::Result<()> {
     tx.execute(
-        "DELETE FROM local_runtime_start_evidence WHERE operation_id=?1 AND EXISTS (
+        /* sqlite-large-value: allow-for-now lv-h72e5255fabef owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_runtime_start_evidence WHERE operation_id=?1 AND EXISTS (
         SELECT 1 FROM local_runtime_starts WHERE id=?1 AND finished=1 AND applied=1
           AND (revoked_by IS NULL OR cleanup_verified=1)
           AND (json_extract(result,'$.error') IS NULL OR cleanup_verified=1))",
@@ -239,8 +239,8 @@ fn retained_runtime_start_request(
             [position], |row| local_observation_from_row(origin, row),
         ).optional().map_err(Into::into)
     } else {
-        connection.prepare_cached(&format!("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM claims WHERE id=?1 AND {UNREPAIRED_CLAIM}"))?
-            .query_row([id], claim_from_row).optional().map_err(Into::into)
+        connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hea4f182aac9d owner=st3::store::runtime_starts TODO=trace-statement-and-value-representation */ &format!("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms FROM claims WHERE id=?1 AND {UNREPAIRED_CLAIM}"))?
+            .query_row(/* sqlite-large-value: allow-for-now lv-hdf719d141b14 owner=st3::store::runtime_starts TODO=trace-statement-and-value-representation */ [id], claim_from_row).optional().map_err(Into::into)
     }
 }
 
@@ -476,7 +476,7 @@ impl Store {
                         // Positive no-effect proof survives repair/retraction. Do not
                         // manufacture receipts citing evidence that no longer exists.
                         tx.execute(
-                            "UPDATE local_runtime_starts SET receipted=1 WHERE id=?1",
+                            /* sqlite-large-value: allow-for-now lv-hff4778b9ea35 owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET receipted=1 WHERE id=?1",
                             [id],
                         )?;
                         return Ok(true);
@@ -614,7 +614,7 @@ impl Store {
                             // not regress that exact runtime from running to starting.
                             let current: Option<String> = tx
                                 .query_row(
-                                    &format!(
+                                    /* sqlite-large-value: allow-for-now lv-h00efaf58440d owner=st3::store::runtime_starts TODO=trace-statement-and-value-representation */ &format!(
                                         "{} LIMIT 1",
                                         newest_claims_of_kind_query(
                                             "claims.id",
@@ -703,7 +703,7 @@ impl Store {
                     result["runtime_observation"] = observation;
                 }
                 tx.execute(
-                    "UPDATE local_runtime_starts SET receipted=1,result=?2 WHERE id=?1",
+                    /* sqlite-large-value: allow-for-now lv-heeb0d5b522fd owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET receipted=1,result=?2 WHERE id=?1",
                     params![id, serde_json::to_string(&result)?],
                 )?;
                 Ok(true)
@@ -740,14 +740,14 @@ impl Store {
     pub fn runtime_start_for(&self, subject: &str) -> Result<Option<RuntimeStartOperation>> {
         smallclaims::touched::note_read(|| format!("local-runtime-start:{subject}"));
         self.readers.get().query_row(
-            &format!("SELECT * FROM local_runtime_starts WHERE subject=?1 AND ({PENDING}) ORDER BY id DESC LIMIT 1"),
+            /* sqlite-large-value: allow-for-now lv-h72767f72b89d owner=st3::store::runtime_starts TODO=trace-statement-and-value-representation */ &format!("SELECT * FROM local_runtime_starts WHERE subject=?1 AND ({PENDING}) ORDER BY id DESC LIMIT 1"),
             [subject], read,
         ).optional().map_err(Into::into)
     }
 
     pub fn pending_runtime_starts(&self) -> Result<Vec<RuntimeStartOperation>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(&format!(
+        let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h62392feb7090 owner=st3::store::runtime_starts TODO=trace-statement-and-value-representation */ &format!(
             "SELECT * FROM local_runtime_starts WHERE {PENDING} ORDER BY id"
         ))?;
         statement
@@ -798,7 +798,7 @@ impl Store {
             }
             let selected = selected.map(|row| row.claim_id);
             let busy: bool = tx.query_row(
-                &format!("SELECT EXISTS(SELECT 1 FROM local_runtime_starts WHERE subject=?1 AND ({PENDING}))"),
+                /* sqlite-large-value: allow-for-now lv-hd9545758f491 owner=st3::store::runtime_starts TODO=trace-statement-and-value-representation */ &format!("SELECT EXISTS(SELECT 1 FROM local_runtime_starts WHERE subject=?1 AND ({PENDING}))"),
                 [&operation.subject], |row| row.get(0))?;
             if busy { return Ok(RuntimeStartAdmission::SeatBusy); }
             if !operation.body["request"].is_null() {
@@ -874,7 +874,7 @@ impl Store {
             operation.body["start_request_receipt"] = serde_json::to_value(&request)?;
             operation.body["start_request_position"] = json!(local_observation_position(&request).context("physical request needs its original local position")?);
             let body = serde_json::to_string(&operation.body)?;
-            tx.execute("INSERT INTO local_runtime_starts(id,subject,owner,body) VALUES (?1,?2,?3,?4)",
+            tx.execute(/* sqlite-large-value: allow-for-now lv-hc03971e3c1cc owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_runtime_starts(id,subject,owner,body) VALUES (?1,?2,?3,?4)",
                 params![operation.id, operation.subject, operation.owner, body])?;
             if let Some(request) = operation.body["start_request"].as_str() {
                 pin_evidence(tx, &operation.id, self.origin(), request)?;
@@ -889,7 +889,7 @@ impl Store {
         self.connection.batched(|tx| -> Result<bool> {
             let running: usize = tx.query_row("SELECT COUNT(*) FROM local_runtime_starts WHERE finished=0 AND dispatched=1", [], |row| row.get(0))?;
             if running >= limit { return Ok(false); }
-            Ok(tx.execute("UPDATE local_runtime_starts SET dispatched=1 WHERE id=?1 AND dispatched=0 AND finished=0 AND revoked_by IS NULL", [id])? == 1)
+            Ok(tx.execute(/* sqlite-large-value: allow-for-now lv-h254bdd4d414d owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET dispatched=1 WHERE id=?1 AND dispatched=0 AND finished=0 AND revoked_by IS NULL", [id])? == 1)
         }).map_err(|error| anyhow::anyhow!("{error}"))?
     }
 
@@ -927,7 +927,7 @@ impl Store {
 
     pub fn unresolved_runtime_start_counts(&self) -> Result<(u64, u64)> {
         self.readers.get().query_row(
-            &format!("SELECT COUNT(*), COALESCE(SUM(revoked_by IS NOT NULL),0) FROM local_runtime_starts WHERE {PENDING}"),
+            /* sqlite-large-value: allow-for-now lv-hce8c6f733d92 owner=st3::store::runtime_starts TODO=trace-statement-and-value-representation */ &format!("SELECT COUNT(*), COALESCE(SUM(revoked_by IS NOT NULL),0) FROM local_runtime_starts WHERE {PENDING}"),
             [], |row| Ok((row.get(0)?, row.get(1)?)),
         ).map_err(Into::into)
     }
@@ -945,7 +945,7 @@ impl Store {
 
     pub fn revoke_runtime_start(&self, id: &str, request: &str) -> Result<()> {
         self.connection.batched(|tx| -> Result<()> {
-            tx.execute("UPDATE local_runtime_starts SET revoked_by=COALESCE(revoked_by,?2) WHERE id=?1", params![id, request])?;
+            tx.execute(/* sqlite-large-value: allow-for-now lv-h0bdfa9a80b9d owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET revoked_by=COALESCE(revoked_by,?2) WHERE id=?1", params![id, request])?;
             pin_evidence(tx, id, self.origin(), request)?;
             Ok(())
         })
@@ -959,7 +959,7 @@ impl Store {
             if operation.finished { return Ok(()); }
             let mut result = result.clone();
             closed_runtime_start_result(&operation, self.origin(), &mut result)?;
-            tx.execute("UPDATE local_runtime_starts SET finished=1,result=?2,
+            tx.execute(/* sqlite-large-value: allow-for-now lv-hc851a2f92574 owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET finished=1,result=?2,
                 cleanup_verified=CASE WHEN json_extract(?2,'$.error') IS NOT NULL AND json_extract(?2,'$.producer_closed')=1 THEN 1 ELSE cleanup_verified END
                 WHERE id=?1 AND finished=0", params![id, serde_json::to_string(&result)?])?;
             Ok(())
@@ -975,7 +975,7 @@ impl Store {
             if operation.dispatched || operation.finished || operation.revoked_by.is_none() { return Ok(false); }
             let mut result = json!({"error":"start was revoked before dispatch","producer_closed":true,"closure_kind":"never-dispatched"});
             closed_runtime_start_result(&operation, self.origin(), &mut result)?;
-            tx.execute("UPDATE local_runtime_starts SET finished=1,cleanup_verified=1,result=?2 WHERE id=?1",
+            tx.execute(/* sqlite-large-value: allow-for-now lv-h09738fc36913 owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET finished=1,cleanup_verified=1,result=?2 WHERE id=?1",
                 params![id, serde_json::to_string(&result)?])?;
             Ok(true)
         }).map_err(|error| anyhow::anyhow!("{error}"))?
@@ -1002,7 +1002,7 @@ impl Store {
                 result["producer_closed"] = Value::from(true);
                 closed_runtime_start_result(&operation, self.origin(), &mut result)?;
                 tx.execute(
-                    "UPDATE local_runtime_starts SET cleanup_verified=1,result=?2 WHERE id=?1",
+                    /* sqlite-large-value: allow-for-now lv-h4db693e3ebc6 owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET cleanup_verified=1,result=?2 WHERE id=?1",
                     params![id, serde_json::to_string(&result)?],
                 )?;
                 release_evidence(tx, id)?;
@@ -1050,7 +1050,7 @@ impl Store {
                     json!({"kind":"exact-runtime-ended","status":status,"incarnation":incarnation}),
                 )?;
                 tx.execute(
-                    "UPDATE local_runtime_starts SET cleanup_verified=1,result=?2 WHERE id=?1",
+                    /* sqlite-large-value: allow-for-now lv-h1569b1c2c1e8 owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET cleanup_verified=1,result=?2 WHERE id=?1",
                     params![id, serde_json::to_string(&result)?],
                 )?;
                 release_evidence(tx, id)?;
@@ -1062,7 +1062,7 @@ impl Store {
     pub(crate) fn verify_runtime_start(&self, id: &str, incarnation: &str) -> Result<bool> {
         self.connection.batched(|tx| -> Result<bool> {
             Ok(tx.execute(
-                "UPDATE local_runtime_starts SET result=json_set(result,
+                /* sqlite-large-value: allow-for-now lv-h4b506f93921b owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET result=json_set(result,
                     '$.incarnation',?2,'$.verification','operation-incarnation','$.phase','completed')
                  WHERE id=?1 AND finished=1 AND applied=0 AND receipted=0
                     AND revoked_by IS NULL AND json_extract(result,'$.error') IS NULL",
@@ -1094,7 +1094,7 @@ impl Store {
                 result["producer_closed"] = Value::from(true);
                 closed_runtime_start_result(&operation, self.origin(), &mut result)?;
                 tx.execute(
-                    "UPDATE local_runtime_starts SET cleanup_verified=1,result=?2 WHERE id=?1",
+                    /* sqlite-large-value: allow-for-now lv-hdfab0238d16a owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET cleanup_verified=1,result=?2 WHERE id=?1",
                     params![id, serde_json::to_string(&result)?],
                 )?;
                 Ok(true)
@@ -1106,7 +1106,7 @@ impl Store {
         self.connection
             .batched(|tx| {
                 tx.execute(
-                    "UPDATE local_runtime_starts SET applied=1 WHERE id=?1 AND finished=1
+                    /* sqlite-large-value: allow-for-now lv-h45fa1142ded8 owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET applied=1 WHERE id=?1 AND finished=1
                         AND (revoked_by IS NOT NULL OR json_extract(result,'$.error') IS NOT NULL
                             OR json_extract(result,'$.verification')='operation-incarnation')",
                     [id],
@@ -1179,7 +1179,7 @@ impl Store {
                 "retirement_request":request,"retirement_request_receipt":requested,
                 "retirement_result":result["retirement_result"]});
             retain_runtime_start_closure(&operation, self.origin(), &mut result, witness)?;
-            tx.execute("UPDATE local_runtime_starts SET cleanup_verified=1,result=?2 WHERE id=?1",
+            tx.execute(/* sqlite-large-value: allow-for-now lv-h89540ce01f97 owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET cleanup_verified=1,result=?2 WHERE id=?1",
                 params![id, serde_json::to_string(&result)?])?;
             release_evidence(tx, id)?;
             Ok(true)
@@ -1190,7 +1190,7 @@ impl Store {
         self.connection
             .batched(|tx| {
                 tx.execute(
-                    "UPDATE local_runtime_starts SET cleanup_verified=1 WHERE id=?1",
+                    /* sqlite-large-value: allow-for-now lv-h7127520d07dd owner=st3::store::runtime_starts TODO=bound-or-reference-values-and-reclamation */ "UPDATE local_runtime_starts SET cleanup_verified=1 WHERE id=?1",
                     [id],
                 )?;
                 release_evidence(tx, id)

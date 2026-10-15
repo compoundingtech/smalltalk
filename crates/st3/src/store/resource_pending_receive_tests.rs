@@ -77,7 +77,7 @@ observer "github/acme/demo/pull/1" {
         .connection
         .write()
         .execute(
-            "INSERT INTO local_resource_projection_pending(subject) VALUES(?1)",
+            /* sqlite-large-value: allow-for-now lv-h60e7d65ec813 owner=st3::store::resource_pending_receive_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_resource_projection_pending(subject) VALUES(?1)",
             [resource],
         )
         .unwrap();
@@ -106,12 +106,12 @@ observer "github/acme/demo/pull/1" {
         let connection = target.connection.write();
         connection
             .execute(
-                "INSERT INTO local_resource_projection_pending(subject) VALUES(?1)",
+                /* sqlite-large-value: allow-for-now lv-hba0e63fdf14f owner=st3::store::resource_pending_receive_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_resource_projection_pending(subject) VALUES(?1)",
                 [resource],
             )
             .unwrap();
         connection
-            .execute("UPDATE replica_envelopes SET receipt_state='pending'", [])
+            .execute(/* sqlite-large-value: allow-for-now lv-h07596fa706d2 owner=st3::store::resource_pending_receive_tests TODO=chunk-or-reference-exact-wire-values */ "UPDATE replica_envelopes SET receipt_state='pending'", [])
             .unwrap();
     }
     drop(target);
@@ -121,7 +121,7 @@ observer "github/acme/demo/pull/1" {
         .connection
         .write()
         .execute(
-            "INSERT INTO local_resource_projection_pending(subject) VALUES(?1)",
+            /* sqlite-large-value: allow-for-now lv-h81c363d12b81 owner=st3::store::resource_pending_receive_tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_resource_projection_pending(subject) VALUES(?1)",
             [resource],
         )
         .unwrap();

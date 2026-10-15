@@ -22,7 +22,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
     // Capture once, before any new request. Existing rows have no recoverable caller
     // association and remain until the separately scheduled deployment+30d follow-up.
     connection.execute(
-        "INSERT OR IGNORE INTO meta(key,value)
+        /* sqlite-large-value: allow-for-now lv-h4d25c7671914 owner=smallclaims::store::idempotency TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO meta(key,value)
          SELECT 'idempotency_legacy_rowid',CAST(COALESCE(MAX(rowid),0) AS TEXT) FROM idempotency",
         [],
     )?;
@@ -34,7 +34,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
     )?;
     if !has_expiry {
         connection.execute_batch(
-            "ALTER TABLE idempotency ADD COLUMN expires_at_unix_ms INTEGER NOT NULL DEFAULT 0;",
+            /* sqlite-large-value: allow-for-now lv-h5480a780f2e4 owner=smallclaims::store::idempotency TODO=bound-or-reference-values-and-reclamation */ "ALTER TABLE idempotency ADD COLUMN expires_at_unix_ms INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
     let has_replay_safe: bool = connection.query_row(
@@ -44,11 +44,11 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
     )?;
     if !has_replay_safe {
         connection.execute_batch(
-            "ALTER TABLE idempotency ADD COLUMN replay_safe INTEGER NOT NULL DEFAULT 0;",
+            /* sqlite-large-value: allow-for-now lv-h7c28fba7c856 owner=smallclaims::store::idempotency TODO=bound-or-reference-values-and-reclamation */ "ALTER TABLE idempotency ADD COLUMN replay_safe INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
     connection.execute_batch(&format!(
-        "CREATE TRIGGER IF NOT EXISTS idempotency_completed_expiry AFTER INSERT ON idempotency
+        /* sqlite-large-value: allow-for-now lv-hdb2fa41c50c9 owner=smallclaims::store::idempotency TODO=bound-or-reference-values-and-reclamation */ "CREATE TRIGGER IF NOT EXISTS idempotency_completed_expiry AFTER INSERT ON idempotency
          BEGIN
              UPDATE idempotency SET expires_at_unix_ms=
                  CAST(unixepoch('subsec') * 1000 AS INTEGER) + {RETENTION_MS}
@@ -179,14 +179,14 @@ pub fn cleanup_tx(
             !durable && !super::checkpoint::checkpointed_operation(transaction, &key)?.is_empty();
         if (!replay_safe && !durable && !checkpointed) || in_use(transaction, &response)? {
             transaction.execute(
-                "UPDATE idempotency SET rowid=(SELECT MAX(rowid)+1 FROM idempotency),
+                /* sqlite-large-value: allow-for-now lv-h36ef58823b64 owner=smallclaims::store::idempotency TODO=bound-or-reference-values-and-reclamation */ "UPDATE idempotency SET rowid=(SELECT MAX(rowid)+1 FROM idempotency),
                  expires_at_unix_ms=?2 WHERE rowid=?1",
                 params![rowid, now_unix_ms.saturating_add(RETENTION_MS)],
             )?;
             result.extended += 1;
         } else {
             result.deleted +=
-                transaction.execute("DELETE FROM idempotency WHERE operation_id=?1", [key])?;
+                transaction.execute(/* sqlite-large-value: allow-for-now lv-he5174c795ab6 owner=smallclaims::store::idempotency TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM idempotency WHERE operation_id=?1", [key])?;
         }
     }
     Ok(result)

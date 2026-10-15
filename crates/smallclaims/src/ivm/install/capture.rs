@@ -246,7 +246,7 @@ fn payload(table: &str, key: &[&str], change: Change, revision: &str) -> String 
 fn fence(source: &str) -> String {
     let reason = "deferred trigger capture gap; explicit recovery required";
     format!(
-        "UPDATE ivm_install_sources SET available=0 WHERE name={source};\n\
+        /* sqlite-large-value: allow-for-now lv-ha160f037c55f owner=smallclaims::ivm::install::capture TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_sources SET available=0 WHERE name={source};\n\
         UPDATE ivm_install_roots SET ready=0,status_revision=status_revision+1,error='{reason}' \
         WHERE source={source} AND (ready<>0 OR error IS NOT '{reason}');\n\
         UPDATE ivm_install_jobs SET phase='stopped',error='{reason}' WHERE source={source} AND phase IN ('scan','catchup');\n"
@@ -268,7 +268,7 @@ fn append(
     );
     let reason = "deferred trigger capture gap; explicit recovery required";
     format!(
-        "UPDATE ivm_install_sources SET \
+        /* sqlite-large-value: allow-for-now lv-h1414e57ee27a owner=smallclaims::ivm::install::capture TODO=bound-or-reference-values-and-reclamation */ "UPDATE ivm_install_sources SET \
       available=CASE WHEN available=1 AND ({identity}) AND revision>=0 AND revision<9223372036854775807 \
         AND {config} AND journal_rows>=0 AND journal_rows<{} AND journal_bytes>=0 \
         AND ({next}) IS NOT NULL AND length(CAST(({next}) AS BLOB))<= {} \

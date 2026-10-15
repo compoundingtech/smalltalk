@@ -59,7 +59,7 @@ async fn guard_summary_accounting_preserves_responses_counts_errors_and_unreache
     assert_eq!(count(GUARD), 1);
     assert_eq!(count(SUMMARY), 1);
     // A genuine store refusal is still returned, and its reached guard call is counted.
-    state.store.connection.write().execute_batch("DROP TABLE replica_envelopes").unwrap();
+    state.store.connection.write().execute_batch(/* sqlite-large-value: allow-for-now lv-h407ed81d4800 owner=st3::api::replication_guard_tests TODO=chunk-or-reference-exact-wire-values */ "DROP TABLE replica_envelopes").unwrap();
     assert!(replication_export(State(state), Json(request(true, true))).await.is_err());
     assert_eq!(count(GUARD), 2);
     let report = crate::performance::snapshot();

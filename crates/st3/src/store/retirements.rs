@@ -2,7 +2,7 @@
 use super::*;
 use crate::model::{LifecycleUnavailableReason, MessageSendRefusal};
 
-pub(super) const SCHEMA: &str = "CREATE INDEX IF NOT EXISTS st3_replica_lifecycle_unavailable
+pub(super) const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-hbd2bd1ef5daa owner=st3::store::retirements TODO=chunk-or-reference-variable-columns */ "CREATE INDEX IF NOT EXISTS st3_replica_lifecycle_unavailable
     ON replica_records(subject_hint,kind_hint) WHERE state IN ('unknown','invalid');
     CREATE INDEX IF NOT EXISTS st3_lifecycle_operation_index
     ON claims(subject,json_extract(body,'$._operation.id'))
@@ -26,7 +26,7 @@ pub(super) fn create_selection_triggers(connection: &Connection) -> Result<()> {
         ("update", "UPDATE OF kind,member,body"),
     ] {
         connection.execute_batch(&format!(
-            "CREATE TRIGGER IF NOT EXISTS st3_retired_desired_{name} AFTER {event} ON desired
+            /* sqlite-large-value: allow-for-now lv-h46719ef04513 owner=st3::store::retirements TODO=chunk-or-reference-exact-wire-values */ "CREATE TRIGGER IF NOT EXISTS st3_retired_desired_{name} AFTER {event} ON desired
              WHEN (NEW.kind != 'stop' OR NEW.member IS NOT NULL OR json_extract(NEW.body,'$.retirement') IS NULL)
                AND EXISTS(SELECT 1 FROM claims WHERE subject=NEW.subject AND kind='agent.retired'
                  AND NOT EXISTS(SELECT 1 FROM replica_records WHERE claim_id=claims.id AND state='repaired'))
@@ -46,12 +46,12 @@ pub(super) fn record(
     subject: &str,
     at: Option<u64>,
 ) -> Result<Option<ClaimRecord>, St3Error> {
-    connection.prepare_cached(&format!(
+    connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hd7bf599318a9 owner=st3::store::retirements TODO=trace-statement-and-value-representation */ &format!(
         "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1 AND claims.kind='agent.retired' AND (?2 IS NULL OR claims.store_index<=?2)
          AND NOT EXISTS(SELECT 1 FROM replica_records WHERE replica_records.claim_id=claims.id AND state='repaired')
          ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
-    )).map_err(internal)?.query_row(params![subject,at], claim_from_row).optional().map_err(internal)
+    )).map_err(internal)?.query_row(/* sqlite-large-value: allow-for-now lv-h31b3d5ea2ef0 owner=st3::store::retirements TODO=trace-statement-and-value-representation */ params![subject,at], claim_from_row).optional().map_err(internal)
 }
 
 fn retired(recipient: &str, claim: &ClaimRecord) -> St3Error {
@@ -104,7 +104,7 @@ pub(super) fn admit_recipient(
     };
     let pending: bool = connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM replica_records INDEXED BY st3_replica_lifecycle_unavailable
         WHERE subject_hint=?1 AND state IN ('unknown','invalid') AND (kind_hint IN ('agent.retired','intent.desired') OR kind_hint IS NULL))")
-        .map_err(internal)?.query_row([recipient], |row| row.get(0)).map_err(internal)?;
+        .map_err(internal)?.query_row(/* sqlite-large-value: allow-for-now lv-h37195deda3e8 owner=st3::store::retirements TODO=trace-statement-and-value-representation */ [recipient], |row| row.get(0)).map_err(internal)?;
     if pending {
         return Err(unavailable(
             recipient,
@@ -116,7 +116,7 @@ pub(super) fn admit_recipient(
         WHERE claims.subject=?1 AND claims.kind IN ('agent.retired','intent.desired')
           AND json_extract(claims.body,'$._operation.id') IS NOT NULL AND operations.state='conflict'
           AND NOT EXISTS(SELECT 1 FROM replica_records WHERE claim_id=claims.id AND state='repaired'))")
-        .map_err(internal)?.query_row([recipient], |row| row.get(0)).map_err(internal)?;
+        .map_err(internal)?.query_row(/* sqlite-large-value: allow-for-now lv-h26ecd83ba99a owner=st3::store::retirements TODO=trace-statement-and-value-representation */ [recipient], |row| row.get(0)).map_err(internal)?;
     if conflict {
         return Err(unavailable(recipient, LifecycleUnavailableReason::Conflict));
     }
@@ -124,7 +124,7 @@ pub(super) fn admit_recipient(
         let another: bool = connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM claims
             WHERE subject=?1 AND kind='agent.retired' AND id<>?2
               AND NOT EXISTS(SELECT 1 FROM replica_records WHERE claim_id=claims.id AND state='repaired'))")
-            .map_err(internal)?.query_row(params![recipient,claim.id],|row|row.get(0)).map_err(internal)?;
+            .map_err(internal)?.query_row(/* sqlite-large-value: allow-for-now lv-ha6a2129ac4e6 owner=st3::store::retirements TODO=trace-statement-and-value-representation */ params![recipient,claim.id],|row|row.get(0)).map_err(internal)?;
         if another {
             return Err(unavailable(recipient, LifecycleUnavailableReason::Conflict));
         }
@@ -152,7 +152,7 @@ pub(super) fn project_subject(connection: &Connection, subject: &str) -> Result<
         let body = json!({"name":"stop", "arguments":[subject], "properties":{}, "children":[], "retirement":claim.id});
         connection
             .execute(
-                "UPDATE desired SET kind='stop',member=NULL,body=?2 WHERE subject=?1",
+                /* sqlite-large-value: allow-for-now lv-h7c94213d1ff9 owner=st3::store::retirements TODO=bound-or-reference-values-and-reclamation */ "UPDATE desired SET kind='stop',member=NULL,body=?2 WHERE subject=?1",
                 params![subject, canonical_json_text(&body).map_err(internal)?],
             )
             .map_err(internal)?;

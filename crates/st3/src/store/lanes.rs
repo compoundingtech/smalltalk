@@ -313,7 +313,7 @@ fn lane_entry(view: &LaneView, argument: &str) -> Result<String, St3Error> {
 }
 
 fn lane_declarations_tx(connection: &Connection, run: Option<&str>) -> Result<Vec<DesiredSubject>> {
-    let mut statement = connection.prepare_cached(if run.is_some() {
+    let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-hce852b967de4 owner=st3::store::lanes TODO=trace-statement-and-value-representation */ if run.is_some() {
         "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
          FROM desired WHERE owner_run=?1 AND kind='lane' ORDER BY subject"
     } else {
@@ -392,7 +392,7 @@ fn lane_view_tx(connection: &Connection, declaration: &DesiredSubject) -> Result
 
 /// A lane's claims in the store's replica-stable order.
 pub(super) fn lane_events_tx(connection: &Connection, subject: &str) -> Result<Vec<Event>> {
-    let mut statement = connection.prepare_cached(&canonical_sql(
+    let mut statement = connection.prepare_cached(/* sqlite-large-value: allow-for-now lv-h0e36000330f2 owner=st3::store::lanes TODO=trace-statement-and-value-representation */ &canonical_sql(
         "SELECT claims.id, claims.kind, claims.actor, claims.body, claims.accepted_at_unix_ms
          FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1 AND claims.kind IN

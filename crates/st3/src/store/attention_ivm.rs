@@ -11,7 +11,7 @@ const CUSTOM_CHANGE: &str = "st3.attention.custom.source";
 const PERSON_CLOCK: &str = "st3.attention.person.clock";
 const CUSTOM_CLOCK: &str = "st3.attention.custom.clock";
 
-const SCHEMA: &str = r#"
+const SCHEMA: &str = /* sqlite-large-value: allow-for-now lv-h838153d38737 owner=st3::store::attention_ivm TODO=chunk-or-reference-variable-columns */ r#"
 CREATE INDEX IF NOT EXISTS attention_open_person_sources_v3 ON step_runs(subject)
  WHERE assignee>='person/' AND assignee<'person0';
 CREATE TABLE IF NOT EXISTS local_attention_open (
@@ -83,7 +83,7 @@ impl View for Family {
         }
     }
     fn create_schema(&self, connection: &Connection) -> Result<()> {
-        connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-hf81622485559 owner=st3::store::attention_ivm TODO=trace-statement-and-value-representation */ SCHEMA)?;
         // Projection updates and raw source corrections use the same reverse index. The
         // OLD edge survives reassignment/removal until maintenance reads the new source.
         for (table, key) in [
@@ -106,12 +106,12 @@ impl View for Family {
                     "DELETE" => vec!["OLD"],
                     _ => vec!["OLD", "NEW"],
                 } {
-                    body.push_str(&format!("INSERT INTO local_attention_open_dirty SELECT family,source FROM local_attention_open_dependencies WHERE dependency={} ON CONFLICT DO NOTHING;", dependency(which)));
+                    body.push_str(&format!(/* sqlite-large-value: allow-for-now lv-h5b4c1823f528 owner=st3::store::attention_ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_attention_open_dirty SELECT family,source FROM local_attention_open_dependencies WHERE dependency={} ON CONFLICT DO NOTHING;", dependency(which)));
                     if table == "step_runs" {
-                        body.push_str(&format!("INSERT INTO local_attention_open_dirty SELECT 'person',{which}.subject WHERE {which}.assignee>='person/' AND {which}.assignee<'person0' ON CONFLICT DO NOTHING;"));
+                        body.push_str(&format!(/* sqlite-large-value: allow-for-now lv-h693b6ce1d608 owner=st3::store::attention_ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_attention_open_dirty SELECT 'person',{which}.subject WHERE {which}.assignee>='person/' AND {which}.assignee<'person0' ON CONFLICT DO NOTHING;"));
                     }
                 }
-                connection.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS attention_open_{table}_{action} AFTER {action} ON {table} BEGIN {body} END;"))?;
+                connection.execute_batch(&format!(/* sqlite-large-value: allow-for-now lv-ha68d301a0ae8 owner=st3::store::attention_ivm TODO=bound-or-reference-values-and-reclamation */ "CREATE TRIGGER IF NOT EXISTS attention_open_{table}_{action} AFTER {action} ON {table} BEGIN {body} END;"))?;
             }
         }
         // Canonical tie corrections can change a request/declaration without changing its
@@ -122,11 +122,11 @@ impl View for Family {
                 "DELETE" => "OLD.claim_id",
                 _ => "OLD.claim_id,NEW.claim_id",
             };
-            connection.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS attention_open_record_{action} AFTER {action} ON replica_records BEGIN
+            connection.execute_batch(&format!(/* sqlite-large-value: allow-for-now lv-hbed760b7dd6e owner=st3::store::attention_ivm TODO=chunk-or-reference-exact-wire-values */ "CREATE TRIGGER IF NOT EXISTS attention_open_record_{action} AFTER {action} ON replica_records BEGIN
               INSERT INTO local_attention_open_dirty SELECT family,source FROM local_attention_open_dependencies
               WHERE dependency IN (SELECT subject FROM claims WHERE id IN ({references})) ON CONFLICT DO NOTHING; END;"))?;
         }
-        connection.execute_batch("CREATE TRIGGER IF NOT EXISTS attention_open_batch_update AFTER UPDATE OF origin,replica_sequence ON batches BEGIN
+        connection.execute_batch(/* sqlite-large-value: allow-for-now lv-hd3ce73939c94 owner=st3::store::attention_ivm TODO=chunk-or-reference-exact-wire-values */ "CREATE TRIGGER IF NOT EXISTS attention_open_batch_update AFTER UPDATE OF origin,replica_sequence ON batches BEGIN
           INSERT INTO local_attention_open_dirty SELECT family,source FROM local_attention_open_dependencies
           WHERE dependency IN (SELECT subject FROM claims WHERE batch_id IN (OLD.id,NEW.id)) ON CONFLICT DO NOTHING; END;")?;
         Ok(())
@@ -149,7 +149,7 @@ impl View for Family {
             )
             .optional()?;
         tx.execute(
-            "DELETE FROM local_attention_open_dependencies WHERE family=?1 AND source=?2",
+            /* sqlite-large-value: allow-for-now lv-h0c396cab608c owner=st3::store::attention_ivm TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_attention_open_dependencies WHERE family=?1 AND source=?2",
             params![family, source],
         )?;
         let next = match self {
@@ -158,7 +158,7 @@ impl View for Family {
         };
         let Some((item, body, eligible)) = next else {
             tx.execute(
-                "DELETE FROM local_attention_open WHERE family=?1 AND source=?2",
+                /* sqlite-large-value: allow-for-now lv-he72e185d4ff5 owner=st3::store::attention_ivm TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_attention_open WHERE family=?1 AND source=?2",
                 params![family, source],
             )?;
             return Ok(before.is_some());
@@ -169,7 +169,7 @@ impl View for Family {
             before.as_ref() != Some(&(item_text.clone(), body_text.clone(), eligible.to_string()));
         if changed {
             tx.execute(
-                "INSERT INTO local_attention_open VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                /* sqlite-large-value: allow-for-now lv-h1ea38507776d owner=st3::store::attention_ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO local_attention_open VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
               ON CONFLICT(family,source) DO UPDATE SET id=excluded.id,person=excluded.person,
               priority=excluded.priority,requested=excluded.requested,eligible=excluded.eligible,
               episode=excluded.episode,item=excluded.item,body=excluded.body",
@@ -202,7 +202,7 @@ fn priority(item: &AttentionItemView) -> u8 {
 }
 fn dependency(tx: &Transaction<'_>, family: &str, source: &str, key: &str) -> Result<()> {
     tx.execute(
-        "INSERT OR IGNORE INTO local_attention_open_dependencies VALUES(?1,?2,?3)",
+        /* sqlite-large-value: allow-for-now lv-h6f65303fd36d owner=st3::store::attention_ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO local_attention_open_dependencies VALUES(?1,?2,?3)",
         params![family, source, key],
     )?;
     Ok(())
@@ -420,7 +420,7 @@ pub(crate) fn flush(
         )?;
         if changes.deferred.is_empty() {
             tx.execute(
-                "DELETE FROM local_attention_open_dirty WHERE family=?1 AND source=?2",
+                /* sqlite-large-value: allow-for-now lv-h85595acf770c owner=st3::store::attention_ivm TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_attention_open_dirty WHERE family=?1 AND source=?2",
                 params![family, source],
             )?;
         }
@@ -482,12 +482,12 @@ pub(crate) fn seed_page(
         }
     };
     let keys = tx
-        .prepare_cached(query)?
+        .prepare_cached(/* sqlite-large-value: allow-for-now lv-h5536ba1e6ffb owner=st3::store::attention_ivm TODO=trace-statement-and-value-representation */ query)?
         .query_map(params![after, limit], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for source in &keys {
         tx.execute(
-            "INSERT OR IGNORE INTO local_attention_open_dirty VALUES(?1,?2)",
+            /* sqlite-large-value: allow-for-now lv-h6d8ace751119 owner=st3::store::attention_ivm TODO=bound-or-reference-values-and-reclamation */ "INSERT OR IGNORE INTO local_attention_open_dirty VALUES(?1,?2)",
             params![family.name(), source],
         )?;
     }
@@ -529,7 +529,7 @@ pub(crate) fn backfill_page(
             },
         )?;
         tx.execute(
-            "DELETE FROM local_attention_open_dirty WHERE family=?1 AND source=?2",
+            /* sqlite-large-value: allow-for-now lv-h586c6157a771 owner=st3::store::attention_ivm TODO=bound-or-reference-values-and-reclamation */ "DELETE FROM local_attention_open_dirty WHERE family=?1 AND source=?2",
             params![name, source],
         )?;
     }

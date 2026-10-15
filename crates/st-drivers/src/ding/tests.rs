@@ -808,7 +808,7 @@ const CAPTURED_CODEX_TRUST_SELECTION: &str = "
 /// picker was open. It begins at the picker heading and preserves every emitted byte through
 /// the end of stdout.
 const CAPTURED_CODEX_MODEL_PICKER: &str =
-    include_str!("fixtures/codex-model-picker-default-to-end.bin");
+    /* sqlite-large-value: allow-for-now lv-h40cf0bd66913 owner=st_drivers::ding::tests TODO=trace-statement-and-value-representation */ include_str!("fixtures/codex-model-picker-default-to-end.bin");
 
 const CODEX_LATENCY_RETRY_NOTICE: &str =
     "Our systems are thinking a bit more\r\n\r\nRetry with a faster model";

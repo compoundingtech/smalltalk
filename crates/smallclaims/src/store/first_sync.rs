@@ -85,7 +85,7 @@ pub fn first_sync_tx(connection: &Connection) -> Result<Option<ReplicationFirstS
 
 pub fn save_first_sync(connection: &Connection, first: &ReplicationFirstSync) -> Result<()> {
     connection.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES ('first_sync', ?1)",
+        /* sqlite-large-value: allow-for-now lv-he36db82473fc owner=smallclaims::store::first_sync TODO=bound-or-reference-values-and-reclamation */ "INSERT OR REPLACE INTO meta(key, value) VALUES ('first_sync', ?1)",
         [serde_json::to_string(first)?],
     )?;
     Ok(())

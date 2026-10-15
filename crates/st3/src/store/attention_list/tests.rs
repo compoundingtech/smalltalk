@@ -24,7 +24,7 @@ fn input(subject: &str, kind: &str, actor: Option<&str>, fields: Value) -> Claim
 
 fn custom(store: &Store, subject: &str, person: &str) {
     let manifest =
-        serde_json::from_str(include_str!("../../../../../examples/st3/custom-review.json"))
+        serde_json::from_str(/* sqlite-large-value: allow-for-now lv-h20cd7be08a04 owner=st3::store::attention_list::tests TODO=trace-statement-and-value-representation */ include_str!("../../../../../examples/st3/custom-review.json"))
             .unwrap();
     store
         .register_custom_kind(&crate::store::custom::RegistrationRequest {
@@ -238,7 +238,7 @@ fn a_rolled_back_write_changes_nothing_published() {
     {
         let mut writer = store.connection.write();
         let tx = writer.transaction().unwrap();
-        tx.execute("UPDATE step_runs SET status='cancelled' WHERE subject=?1", [&ask.subject])
+        tx.execute(/* sqlite-large-value: allow-for-now lv-h2dfcdc4b8797 owner=st3::store::attention_list::tests TODO=bound-or-reference-values-and-reclamation */ "UPDATE step_runs SET status='cancelled' WHERE subject=?1", [&ask.subject])
             .unwrap();
         tx.rollback().unwrap();
     }
@@ -327,7 +327,7 @@ fn a_projection_catching_up_folds_only_when_the_claims_it_projected_matter() {
             .connection
             .write()
             .execute(
-                "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
+                /* sqlite-large-value: allow-for-now lv-hf2c3e59afd66 owner=st3::store::attention_list::tests TODO=bound-or-reference-values-and-reclamation */ "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
                  VALUES ('graph', 'healthy', ?1, '0')
                  ON CONFLICT(aggregate) DO UPDATE SET status='healthy', last_good_store_index=?1",
                 [through],

@@ -37,7 +37,7 @@ fn synthetic_same_batch_nonmessage_deletion_changes_legacy_rank_with_fixed_candi
     // supply the real canonical::claim_key expression's columns, not a complete Store schema.
     connection
         .execute_batch(
-            r#"
+            /* sqlite-large-value: allow-for-now lv-h7fd2d18a4fc3 owner=st3::store::message_thread_legacy_rank_dependency_tests TODO=chunk-or-reference-variable-columns */ r#"
 CREATE TABLE batches(id TEXT PRIMARY KEY, origin TEXT, replica_sequence INTEGER);
 CREATE TABLE claims(
     id TEXT PRIMARY KEY, batch_id TEXT, accepted_at_unix_ms TEXT,
@@ -83,7 +83,7 @@ INSERT INTO raw_parent_candidates VALUES
 
     assert_eq!(
         connection
-            .execute("DELETE FROM claims WHERE id='distinct-earlier'", [])
+            .execute(/* sqlite-large-value: allow-for-now lv-hed7878fb85c9 owner=st3::store::message_thread_legacy_rank_dependency_tests TODO=prepare-body-and-predecessor-values */ "DELETE FROM claims WHERE id='distinct-earlier'", [])
             .unwrap(),
         1
     );
@@ -100,7 +100,7 @@ INSERT INTO raw_parent_candidates VALUES
 
     assert_eq!(
         connection
-            .execute("DELETE FROM claims WHERE id='same-earlier'", [])
+            .execute(/* sqlite-large-value: allow-for-now lv-ha1a4dd0ce93d owner=st3::store::message_thread_legacy_rank_dependency_tests TODO=prepare-body-and-predecessor-values */ "DELETE FROM claims WHERE id='same-earlier'", [])
             .unwrap(),
         1
     );
