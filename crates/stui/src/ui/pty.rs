@@ -1053,7 +1053,19 @@ fn encode_key(actor: &TerminalActor, key: &pty_terminal::KeyEvent, keypad: bool)
             };
         }
     }
-    actor.encode_key(key)
+    let mut bytes = actor.encode_key(key);
+    // The key encoder follows Ghostty's macOS rule that Option composes characters, and
+    // pty-terminal does not tell it otherwise. The outer terminal has already decided what
+    // Alt meant by the time stui sees it, so an Alt press that came out as plain text still
+    // carries the Escape prefix a legacy child expects.
+    if cfg!(target_os = "macos")
+        && key.mods.contains(Mods::ALT)
+        && key.action != KeyAction::Release
+        && bytes.first().is_some_and(|byte| *byte != 0x1b)
+    {
+        bytes.insert(0, 0x1b);
+    }
+    bytes
 }
 
 fn protocol_mouse(mouse: MouseEvent, column: u16, row: u16) -> Option<pty_terminal::MouseEvent> {
@@ -1111,6 +1123,15 @@ mod tests {
             term.encode_key(&protocol_key(release).unwrap()),
             b"\x1b[97;1:3u"
         );
+    }
+
+    #[test]
+    fn alt_with_a_character_reaches_the_child_with_an_escape_prefix() {
+        let term = TerminalActor::new(24, 80, 0);
+        let alt_a = protocol_key(key(KeyCode::Char('a'), KeyModifiers::ALT)).unwrap();
+        assert_eq!(encode_key(&term, &alt_a, false), b"\x1ba");
+        let plain_a = protocol_key(key(KeyCode::Char('a'), KeyModifiers::NONE)).unwrap();
+        assert_eq!(encode_key(&term, &plain_a, false), b"a");
     }
 
     #[test]
