@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
+import { TimelineEntry } from '@smalltalk/st3-client/schema'
+import { Schema } from 'effect'
 import { convertConversationItem } from '../../../../packages/fractal-ui/src/assistant-ui/embrace-converter.ts'
 import type { SyncStatus } from '@smalltalk/fractal-ui/assistant-ui/sync'
 import type { ConversationItem, SendState } from '../conversation/model.ts'
+import { timelineItems } from '../conversation/fromTimeline.ts'
+import { toolExecutionStartCall, toolExecutionStartEntry } from '../conversation/ompInternalRecords.fixtures.ts'
 import { mapConversationFeed, openableImageUrl, prepareTranscriptTurns, transcriptSendFailureReason, transcriptSyncStatus, transcriptTurnsForItems } from './conversationTranscript.ts'
 
 const at = (seconds: number) => `2026-10-08T12:00:${String(seconds).padStart(2, '0').slice(-2)}.000Z`
@@ -69,6 +73,17 @@ describe('kit transcript turn mapping', () => {
     const inspected = transcriptTurnsForItems(items, { firstTurnComplete: true, showSystemEvents: true })
     expect(inspected[0]!.items.filter(item => item._tag === 'Notice')).toHaveLength(2)
     expect(JSON.stringify(inspected)).not.toContain('private-event')
+  })
+  it('renders an omp tool start as its tool row only, with the record behind system events', () => {
+    const entries = [toolExecutionStartCall, toolExecutionStartEntry].map(entry => Schema.decodeUnknownSync(TimelineEntry)(entry))
+    const items = timelineItems([{ replace: true, hasMore: false, entries }])
+    const [turn] = transcriptTurnsForItems(items, { firstTurnComplete: true })
+    expect(turn!.items.map(item => item._tag)).toEqual(['ToolCall'])
+    expect(turn!.work.calls).toHaveLength(1)
+    expect(JSON.stringify(turn)).not.toContain('tool_execution_start')
+    const [inspected] = transcriptTurnsForItems(items, { firstTurnComplete: true, showSystemEvents: true })
+    expect(inspected!.items.map(item => item._tag)).toEqual(['ToolCall', 'Notice'])
+    expect(JSON.stringify(inspected)).not.toContain('"raw"')
   })
   it('prepares the leading assistant tail as a prompt-less turn without losing its work', () => {
     const leading = [scenario[1]!, scenario[2]!, scenario[3]!]

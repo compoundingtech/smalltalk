@@ -129,6 +129,31 @@ const unrecognizedOmpItem = (
   }
 }
 
+const hiddenVisibilities: Readonly<Record<string, true | undefined>> = { internal: true, 'hidden-by-harness': true }
+
+/**
+ * st3 marks native records that only repeat what the transcript already shows with block
+ * visibility `internal` (a UI hint): omp's `tool_execution_start` (its call is a row of its own)
+ * and credential pins. Their fallback text is the record's JSON, so they become inspectable
+ * UnknownEvents with the blocks preserved, never prose.
+ */
+const internalNativeItem = (
+  entry: Extract<Entry, { type: 'content' }>,
+): ConversationItem | undefined => {
+  const blocks = entry.body.blocks ?? []
+  if (blocks.length === 0 || !blocks.every(block => block.visibility !== undefined && hiddenVisibilities[block.visibility] === true))
+    return undefined
+  const primary = blocks.find(block => block.kind !== 'source_record') ?? blocks[0]!
+  const viewType: unknown = primary.view === undefined ? undefined : Reflect.get(primary.view, 'type')
+  return {
+    _tag: 'UnknownEvent',
+    id: entry.id,
+    at: entryTimestamp(entry),
+    eventType: typeof viewType === 'string' ? viewType : primary.source_type,
+    data: { blocks },
+  }
+}
+
 /**
  * String convention emitted by st's external_sessions.rs `push_native_block`, matching the
  * reasoning-label semantics in st3-conversation-ui/src/adapt.rs. No duration is available.
@@ -158,6 +183,8 @@ const itemOf = ({
     case 'content': {
       const internal = unrecognizedOmpItem(entry)
       if (internal !== undefined) return internal
+      const hidden = internalNativeItem(entry)
+      if (hidden !== undefined) return hidden
       const reasoning = parseNativeReasoning(entry)
       if (reasoning !== undefined) return reasoning
       const event = contentEvent({

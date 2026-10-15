@@ -2,6 +2,10 @@ import { TimelineEntry } from '@smalltalk/st3-client/schema'
 import { Schema } from 'effect'
 import { describe, expect, it } from 'vitest'
 import { LiveTimeline } from './fromTimeline.ts'
+import {
+  toolExecutionStartCall, toolExecutionStartEntry, toolExecutionStartRecord, unknownCustomEntry, unknownCustomRecord,
+  visibleCustomEntry,
+} from './ompInternalRecords.fixtures.ts'
 
 describe('native conversation page boundaries', () => {
   it('retains the older edge across newer deltas and resets it on replace', () => {
@@ -670,5 +674,33 @@ but this line is the harness's own`,
       ],
     })
     expect(timeline.project().items.map((item) => item.id)).toEqual([mailContent])
+  })
+})
+
+describe('internal native records', () => {
+  const project = (...entries: ReadonlyArray<unknown>) => {
+    const timeline = new LiveTimeline()
+    timeline.apply({ replace: true, hasMore: false, entries: entries.map(entry => Schema.decodeUnknownSync(TimelineEntry)(entry)) })
+    return timeline.project().items
+  }
+
+  it('keeps an omp tool_execution_start out of prose and inspectable beside its call', () => {
+    const items = project(toolExecutionStartCall, toolExecutionStartEntry)
+    expect(items.map(item => item._tag)).toEqual(['ToolCall', 'UnknownEvent'])
+    expect(items[0]).toMatchObject({ callId: toolExecutionStartRecord.data.toolCallId, name: 'eval' })
+    expect(items[1]).toMatchObject({ id: toolExecutionStartEntry.id, eventType: 'tool_start' })
+    expect(items[1]).toHaveProperty('data.blocks.0.payload.raw', toolExecutionStartRecord)
+    expect(items.some(item => item._tag === 'Text')).toBe(false)
+  })
+
+  it('surfaces an unknown custom record as an inspectable event, never dropping it', () => {
+    const [item] = project(unknownCustomEntry)
+    expect(item).toMatchObject({ _tag: 'UnknownEvent', id: unknownCustomEntry.id, eventType: 'custom' })
+    expect(item).toHaveProperty('data.raw', unknownCustomRecord)
+  })
+
+  it('leaves records without an internal visibility hint as they were', () => {
+    const [item] = project(visibleCustomEntry)
+    expect(item).toMatchObject({ _tag: 'Text', id: visibleCustomEntry.id, text: visibleCustomEntry.body.text })
   })
 })
