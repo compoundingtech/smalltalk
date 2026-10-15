@@ -1173,6 +1173,8 @@ mod retry_tests {
                     attempt_started,
                     None,
                     &http,
+                    None,
+                    &mut BTreeSet::new(),
                 )
                 .await
             );
@@ -1193,6 +1195,8 @@ mod retry_tests {
                 tokio::time::Instant::now(),
                 None,
                 &http,
+                None,
+                &mut BTreeSet::new(),
             )
             .await
         );
@@ -1246,6 +1250,8 @@ mod retry_tests {
                     started,
                     Some(&previous),
                     &http,
+                    None,
+                    &mut BTreeSet::new(),
                 )
             )
             .await
@@ -1278,6 +1284,8 @@ mod retry_tests {
                 tokio::time::Instant::now(),
                 Some(&old),
                 &http,
+                None,
+                &mut BTreeSet::new(),
             )
             .await
         );
@@ -1699,6 +1707,7 @@ mod retry_tests {
         for away in [Duration::from_secs(120), Duration::from_secs(4 * 3600)] {
             tokio::time::advance(away).await;
             let backend = Local(Arc::new(plain_memory("retry-fixture").unwrap()));
+            let mut early_spent = BTreeSet::new();
             let wait = wait_peer_retry(
                 &backend,
                 crate::store::now_ms(),
@@ -1712,6 +1721,8 @@ mod retry_tests {
                 tokio::time::Instant::now(),
                 None,
                 &http,
+                None,
+                &mut early_spent,
             );
             tokio::pin!(wait);
             assert!(futures_util::poll!(&mut wait).is_pending());
@@ -1737,6 +1748,7 @@ mod retry_tests {
         }
         tokio::time::advance(Duration::from_millis(1)).await;
         let backend = Local(Arc::new(plain_memory("retry-fixture").unwrap()));
+        let mut early_spent = BTreeSet::new();
         let wait = wait_peer_retry(
             &backend,
             crate::store::now_ms(),
@@ -1750,6 +1762,8 @@ mod retry_tests {
             tokio::time::Instant::now(),
             None,
             &http,
+            None,
+            &mut early_spent,
         );
         tokio::pin!(wait);
         assert!(futures_util::poll!(&mut wait).is_pending());
@@ -2096,6 +2110,7 @@ mod retry_tests {
         let mut activity = fleet.activity_changed.subscribe();
         let mut connectivity = fleet.connectivity_changed.subscribe();
         let backend = Local(Arc::new(plain_memory("retry-fixture").unwrap()));
+        let mut early_spent = BTreeSet::new();
         let wait = wait_peer_retry(
             &backend,
             crate::store::now_ms(),
@@ -2109,6 +2124,8 @@ mod retry_tests {
             tokio::time::Instant::now(),
             None,
             &http,
+            None,
+            &mut early_spent,
         );
         tokio::pin!(wait);
         // Retain the routes sender while waiting.
@@ -2737,6 +2754,7 @@ async fn an_always_failing_http_peer_cannot_refresh_its_own_probe_window() {
     assert!(!error.is::<PeerOverloaded>());
     {
         let started = tokio::time::Instant::now();
+        let mut early_spent = BTreeSet::new();
         let wait = wait_peer_retry(
             &local,
             crate::store::now_ms(),
@@ -2750,6 +2768,8 @@ async fn an_always_failing_http_peer_cannot_refresh_its_own_probe_window() {
             started,
             Some(&previous),
             &http,
+            None,
+            &mut early_spent,
         );
         tokio::pin!(wait);
         let mut completed = false;
@@ -2779,6 +2799,7 @@ async fn an_always_failing_http_peer_cannot_refresh_its_own_probe_window() {
     let started = tokio::time::Instant::now();
     let delay = retry_delay(Duration::from_secs(3600), &fleet, "cedar");
     assert_eq!(delay, Duration::from_secs(3600));
+    let mut early_spent = BTreeSet::new();
     let wait = wait_peer_retry(
         &local,
         crate::store::now_ms(),
@@ -2792,6 +2813,8 @@ async fn an_always_failing_http_peer_cannot_refresh_its_own_probe_window() {
         started,
         Some(&previous),
         &http,
+        None,
+        &mut early_spent,
     );
     tokio::pin!(wait);
     for _ in 0..2 {
@@ -2898,5 +2921,379 @@ async fn concurrent_slow_exports_refuse_more_work_with_authenticated_overload() 
     );
     for request in requests {
         request.abort();
+    }
+}
+
+/// Early recovery after an outage (st2#3079). A link on one held listener that the test switches
+/// between the ways an outage and a recovery look to the worker.
+mod early_recovery {
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+
+    /// Down: accept each connection and close it without a byte, as the messaging-faults link
+    /// does while disabled.
+    const DOWN: u8 = 0;
+    /// Up, refusing: answer HEAD with 405 and refuse each exchange with 401 after reading it, as a
+    /// reachable older peer does.
+    const REFUSING: u8 = 1;
+    /// Up for HEAD only: answer HEAD with 405, but close each exchange without an answer.
+    const HEAD_ONLY: u8 = 2;
+
+    /// Read one request exactly, head and content-length body; `None` at the end of the stream.
+    /// Answering with request bytes unread would let the close become a reset.
+    async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<bool> {
+        let mut received = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        let head_end = loop {
+            let count = stream.read(&mut buffer).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            received.extend_from_slice(&buffer[..count]);
+            if let Some(at) = received.windows(4).position(|window| window == b"\r\n\r\n") {
+                break at + 4;
+            }
+        };
+        let head = String::from_utf8_lossy(&received[..head_end]).to_ascii_lowercase();
+        let length: usize = head
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .map_or(0, |value| value.trim().parse().unwrap());
+        let mut body = received.len() - head_end;
+        while body < length {
+            let count = stream.read(&mut buffer).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            body += count;
+        }
+        Some(head.starts_with("post "))
+    }
+
+    struct Link {
+        url: String,
+        mode: Arc<AtomicU8>,
+        /// Exchanges the peer behind the link read, in any mode but `DOWN`.
+        exchanges: Arc<AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Link {
+        async fn start(mode: u8) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let mode = Arc::new(AtomicU8::new(mode));
+            let exchanges = Arc::new(AtomicUsize::new(0));
+            let (serving, counted) = (mode.clone(), exchanges.clone());
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let (mode, exchanges) = (serving.clone(), counted.clone());
+                    tokio::spawn(async move {
+                        loop {
+                            if mode.load(Ordering::SeqCst) == DOWN {
+                                return;
+                            }
+                            let Some(post) = read_request(&mut stream).await else {
+                                return;
+                            };
+                            if post {
+                                exchanges.fetch_add(1, Ordering::SeqCst);
+                            }
+                            let answer: &[u8] = match (mode.load(Ordering::SeqCst), post) {
+                                (DOWN, _) | (HEAD_ONLY, true) => return,
+                                (_, true) => {
+                                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n"
+                                }
+                                (_, false) => {
+                                    b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\n\r\n"
+                                }
+                            };
+                            if stream.write_all(answer).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                url,
+                mode,
+                exchanges,
+                server,
+            }
+        }
+
+        fn set(&self, mode: u8) {
+            self.mode.store(mode, Ordering::SeqCst);
+        }
+    }
+
+    /// One worker's view of the peer behind a link: what `dial_peer` holds between attempts.
+    struct Worker {
+        fleet: FleetContext,
+        routes: watch::Receiver<Vec<Route>>,
+        _route_tx: watch::Sender<Vec<Route>>,
+        inbound: watch::Receiver<u64>,
+        activity: watch::Receiver<u64>,
+        connectivity: watch::Receiver<u64>,
+        http: reqwest::Client,
+        auth: FleetAuth,
+        local: Local<Store>,
+        query: ReplicationExchange,
+        peer: PeerConfig,
+        /// The route's last successful exchange, just before the outage.
+        previous: (String, tokio::time::Instant),
+        early_spent: BTreeSet<String>,
+        attempts: usize,
+    }
+
+    impl Worker {
+        fn new(link: &Link) -> Self {
+            let fleet = FleetContext::legacy(BTreeSet::from(["cedar".into()]));
+            let (route_tx, routes) = watch::channel(vec![Route::Http(link.url.clone())]);
+            let inbound = fleet.inbound_changed.subscribe();
+            let activity = fleet.activity_changed.subscribe();
+            let connectivity = fleet.connectivity_changed.subscribe();
+            let auth = FleetAuth::test("invented-fleet", &[7; 32]);
+            let store = Arc::new(plain_memory("birch").unwrap());
+            let query = store.export_replication_summary(auth.fleet_id()).unwrap();
+            Self {
+                fleet,
+                routes,
+                _route_tx: route_tx,
+                inbound,
+                activity,
+                connectivity,
+                http: replication_http_client(),
+                auth,
+                local: Local(store),
+                query,
+                peer: PeerConfig {
+                    name: "cedar".into(),
+                    url: link.url.clone(),
+                },
+                previous: (link.url.clone(), tokio::time::Instant::now()),
+                early_spent: BTreeSet::new(),
+                attempts: 0,
+            }
+        }
+
+        /// One failed signed exchange, and whether it went unanswered on its route.
+        async fn attempt(&mut self) -> Option<String> {
+            self.attempts += 1;
+            let error = post_signed(
+                &self.http,
+                &self.local,
+                &self.peer,
+                "birch",
+                &self.auth,
+                &self.fleet,
+                &self.query,
+                false,
+            )
+            .await
+            .unwrap_err();
+            exchange_unanswered(&error).then(|| self.peer.url.clone())
+        }
+
+        /// Wait out a failure, advancing paused time a second at a time while sockets run, and
+        /// return the seconds the wait took, or `None` when it outlasted `limit` seconds.
+        async fn wait(&mut self, unanswered: Option<&str>, limit: u64) -> Option<u64> {
+            let started = tokio::time::Instant::now();
+            let wait = wait_peer_retry(
+                &self.local,
+                crate::store::now_ms(),
+                Duration::from_secs(3600),
+                &mut self.routes,
+                &mut self.inbound,
+                &mut self.activity,
+                &mut self.connectivity,
+                &self.fleet,
+                "cedar",
+                started,
+                Some(&self.previous),
+                &self.http,
+                unanswered,
+                &mut self.early_spent,
+            );
+            tokio::pin!(wait);
+            for _ in 0..limit {
+                tokio::select! {
+                    woken = &mut wait => {
+                        assert!(!woken, "only a timer or a probe ends these waits");
+                        return Some(started.elapsed().as_secs());
+                    }
+                    _ = async { for _ in 0..100 { tokio::task::yield_now().await; } } => {}
+                }
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+            None
+        }
+    }
+
+    fn keep_awake() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_restored_right_after_an_unanswered_exchange_is_retried_at_its_first_probe() {
+        let awake = keep_awake();
+        let link = Link::start(DOWN).await;
+        let mut worker = Worker::new(&link);
+        let unanswered = worker.attempt().await;
+        assert_eq!(unanswered.as_deref(), Some(link.url.as_str()));
+        // The link returns at once, to a reachable peer that answers HEAD with 405.
+        link.set(REFUSING);
+        let waited = worker.wait(unanswered.as_deref(), 10).await;
+        let waited = waited.expect("the retry goes out within the 10-second recovery bound");
+        assert!(
+            waited <= PEER_PROBE_INTERVAL.as_secs() + 1,
+            "retried at the first probe after the link returned: {waited} s"
+        );
+        assert!(
+            worker.fleet.activity.read().unwrap().is_empty(),
+            "a probe is not activity"
+        );
+        // The early attempt reaches the peer, which refuses it: a reachable failure, which keeps
+        // the 30-second cap although the same route answers HEAD with 405.
+        let reached = worker.attempt().await;
+        assert_eq!(reached, None);
+        assert_eq!(link.exchanges.load(Ordering::SeqCst), 1);
+        assert_eq!(worker.wait(reached.as_deref(), 25).await, None);
+        awake.abort();
+        link.server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_early_attempt_is_spent_until_a_probe_sees_the_route_down_again() {
+        let awake = keep_awake();
+        // The link answers HEAD but drops every exchange: up for the probe, down for the POST.
+        let link = Link::start(HEAD_ONLY).await;
+        let mut worker = Worker::new(&link);
+        let first = worker.attempt().await;
+        assert!(first.is_some());
+        let early = worker.wait(first.as_deref(), 10).await;
+        assert!(early.is_some_and(|waited| waited <= PEER_PROBE_INTERVAL.as_secs() + 1));
+        // The early attempt fails the same way. Its route still answers HEAD, so no second early
+        // attempt: the 30-second cap holds.
+        let second = worker.attempt().await;
+        assert!(second.is_some());
+        assert_eq!(worker.wait(second.as_deref(), 25).await, None);
+        // A probe that finds the route down re-arms it, and the next answer releases one more.
+        let third = worker.attempt().await;
+        link.set(DOWN);
+        assert_eq!(worker.wait(third.as_deref(), 4).await, None);
+        link.set(HEAD_ONLY);
+        let rearmed = worker.wait(third.as_deref(), 10).await;
+        assert!(rearmed.is_some_and(|waited| waited <= PEER_PROBE_INTERVAL.as_secs() + 1));
+        // Three attempts, each an export and a signature, over a link that never carried an
+        // exchange; two were released early, one per observed outage and recovery.
+        assert_eq!(worker.attempts, 3);
+        assert_eq!(link.exchanges.load(Ordering::SeqCst), 3);
+        awake.abort();
+        link.server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_of_another_route_or_past_its_window_releases_nothing_early() {
+        let awake = keep_awake();
+        let link = Link::start(DOWN).await;
+        let mut worker = Worker::new(&link);
+        let unanswered = worker.attempt().await;
+        link.set(REFUSING);
+        // The failure was on another route: this route answering says nothing about it.
+        assert_eq!(worker.wait(Some("http://127.0.0.1:1"), 25).await, None);
+        // Past the probe window there are no probes, so nothing is released or re-armed.
+        tokio::time::advance(PEER_PROBE_WINDOW).await;
+        assert_eq!(worker.wait(unanswered.as_deref(), 45).await, None);
+        assert!(worker.early_spent.is_empty());
+        awake.abort();
+        link.server.abort();
+    }
+
+    /// The classification the early attempt rests on, for the pinned reqwest 0.12.28 and hyper
+    /// 1.11.0: if a version bump changes how a close before the response head surfaces, this
+    /// fails rather than the recovery silently reverting to the 30-second cap.
+    #[tokio::test]
+    async fn only_an_exchange_that_got_no_response_head_is_unanswered() {
+        let refused = tokio::net::TcpSocket::new_v4().unwrap();
+        refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let send = |url: String, timeout: Duration| async move {
+            replication_http_client()
+                .post(format!("{url}{EXCHANGE_PATH}"))
+                .body(vec![b'x'; 64 * 1024])
+                .timeout(timeout)
+                .send()
+                .await
+        };
+        let refused_error = send(
+            format!("http://{}", refused.local_addr().unwrap()),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert!(exchange_unanswered(&anyhow::Error::new(refused_error)));
+        let closing = Link::start(DOWN).await;
+        for _ in 0..4 {
+            let closed = send(closing.url.clone(), Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            assert!(
+                exchange_unanswered(&anyhow::Error::new(closed).context("before headers")),
+                "a close before any answer is unanswered"
+            );
+        }
+        closing.server.abort();
+        // A peer that reads the exchange and never answers was reached: it stalled.
+        let stalling = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", stalling.local_addr().unwrap());
+        let held = tokio::spawn(async move {
+            let (mut stream, _) = stalling.accept().await.unwrap();
+            read_request(&mut stream).await;
+            std::future::pending::<()>().await;
+        });
+        let stalled = send(url, Duration::from_millis(500)).await.unwrap_err();
+        assert!(stalled.is_timeout());
+        assert!(!exchange_unanswered(&anyhow::Error::new(stalled)));
+        held.abort();
+        // A peer that answers every exchange with a redirect to itself did answer: reqwest gives
+        // up after its redirect limit, and that is no outage.
+        let redirecting = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", redirecting.local_addr().unwrap());
+        let looping = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = redirecting.accept().await.unwrap();
+                tokio::spawn(async move {
+                    while read_request(&mut stream).await.is_some() {
+                        let answer = format!(
+                            "HTTP/1.1 302 Found\r\nlocation: {EXCHANGE_PATH}\r\ncontent-length: 0\r\n\r\n"
+                        );
+                        if stream.write_all(answer.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let redirected = send(url, Duration::from_secs(5)).await.unwrap_err();
+        assert!(redirected.is_redirect(), "{redirected:?}");
+        assert!(!exchange_unanswered(&anyhow::Error::new(redirected)));
+        looping.abort();
+        // A request this node could not build never left it.
+        let unbuilt = replication_http_client()
+            .post("not a url")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(unbuilt.is_builder(), "{unbuilt:?}");
+        assert!(!exchange_unanswered(&anyhow::Error::new(unbuilt)));
     }
 }

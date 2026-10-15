@@ -1085,6 +1085,9 @@ async fn dial_peer<B: Backend>(
     let mut moving = false;
     let mut route = 0_usize;
     let mut last_http_success = None;
+    // Routes whose one early attempt after an outage is spent, until a probe sees them down again
+    // or an exchange over them succeeds. See `wait_peer_retry`.
+    let mut early_spent = BTreeSet::new();
     let mut refused = Vec::<(Route, tokio::time::Instant)>::new();
     let mut last_attempt_unix_ms = crate::store::now_ms();
     loop {
@@ -1254,6 +1257,9 @@ async fn dial_peer<B: Backend>(
                 attempt_started,
                 last_http_success.as_ref(),
                 &http,
+                // No route was dialled, so no route was found unanswering.
+                None,
+                &mut early_spent,
             )
             .await
             {
@@ -1270,6 +1276,7 @@ async fn dial_peer<B: Backend>(
                 if is_http {
                     last_http_success = Some((peer.url.clone(), tokio::time::Instant::now()));
                 }
+                early_spent.remove(&peer.url);
                 backoff = PeerBackoff::default();
                 must_send = false;
                 record_worker(&backend, &name, "idle", attempt_unix_ms, None).await;
@@ -1358,6 +1365,8 @@ async fn dial_peer<B: Backend>(
                     },
                     last_http_success.as_ref(),
                     &http,
+                    (is_http && exchange_unanswered(&error)).then_some(peer.url.as_str()),
+                    &mut early_spent,
                 )
                 .await
                 {
@@ -1417,6 +1426,22 @@ fn fabric_refusal_delay_with_jitter(jitter: u16) -> Duration {
     Duration::from_millis(1800 * (800 + u64::from(jitter) % 401))
 }
 
+/// Whether an exchange failed before the peer sent any response head: its connection could not
+/// be made, or was closed, reset or aborted before an answer. reqwest 0.12.28 with hyper 1.11.0
+/// reports these as a connect error, or as a request error with no status that is not a
+/// timeout. A timeout after connecting is not this: that peer was reached and stalled. Neither
+/// is any answer, however it failed (an error status, a redirect loop, a body cut off after its
+/// head), nor a fault building the request here.
+fn exchange_unanswered(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(|error| {
+            error.is_connect()
+                || (error.is_request() && error.status().is_none() && !error.is_timeout())
+        })
+}
+
 /// Failed connections have no graph wake dependency: unrelated local writes must not
 /// turn an absent member into a hot loop. Jitter spreads fleet retries across an hour.
 #[derive(Default)]
@@ -1454,6 +1479,8 @@ async fn wait_peer_retry<B: Backend>(
     attempt_started: tokio::time::Instant,
     last_http_success: Option<&(String, tokio::time::Instant)>,
     http: &reqwest::Client,
+    unanswered: Option<&str>,
+    early_spent: &mut BTreeSet<String>,
 ) -> bool {
     let started = tokio::time::Instant::now();
     let mut deadline = started + delay;
@@ -1518,7 +1545,20 @@ async fn wait_peer_retry<B: Backend>(
                     .timeout(PEER_PROBE_TIMEOUT).send().await.is_ok()
             }, if probe_url.is_some() => {
                 next_probe = tokio::time::Instant::now() + PEER_PROBE_INTERVAL;
-                if alive {
+                let probed = probe_url.unwrap();
+                if !alive {
+                    // The route is down: its next recovery may be retried early once more.
+                    early_spent.remove(probed.as_str());
+                } else if unanswered == Some(probed.as_str()) && !early_spent.contains(probed.as_str()) {
+                    // The failed exchange got no answer on this route, and the route answers
+                    // now: the outage has ended, so retry now rather than up to 30 seconds after
+                    // the failure. Once per outage: a later failure keeps the cap below until a
+                    // probe sees the route down again. The backoff count is kept.
+                    early_spent.insert(probed.clone());
+                    record_worker(backend, name, "backoff", last_attempt_unix_ms,
+                        Some(Duration::ZERO)).await;
+                    return false;
+                } else {
                     // Transport is alive, but another expensive exchange has just failed.
                     // Retain backoff and allow at most one attempt every 30 seconds at the cap.
                     // A cheap probe is not authenticated activity. It must not refresh

@@ -415,7 +415,19 @@ without resetting its failure count. It neither exports an inventory nor records
 Probes do not extend their own eligibility window. Only authenticated activity, including an
 overload answer, keeps the 30-second cap active; a peer that answers probes but keeps failing
 signed exchanges returns to the long retry schedule after five minutes. A route that has never
-worked or a replaced route keeps the long retry schedule. Graph wakes
+worked or a replaced route keeps the long retry schedule.
+
+An outage is different from a refusal. When the failed exchange got no response head on its
+route, the peer never answered: the connection could not be made, or was closed, reset or
+aborted first. If a probe of that same route then answers, the link is back, and the exchange
+is retried at that probe instead of up to 30 seconds after the failure. That early attempt is
+spent until a probe finds the route down again or an exchange over it succeeds, so a link that
+answers `HEAD` but drops every exchange costs one early attempt (one export, signature and
+exchange) per outage and recovery, and otherwise keeps the 30-second cap. A peer that answered
+and failed (an error status, an overload, a body cut off after its head), or one that stalled
+until the exchange timed out after connecting, keeps the cap. The failure count is kept across
+an early attempt. The classification rests on how reqwest 0.12.28 and hyper 1.11.0 report a
+close before the response head; a control fails if that changes. Graph wakes
 still leave intentionally absent peers alone. Transport life only schedules an exchange;
 the exchange still authenticates every claim and peer.
 
