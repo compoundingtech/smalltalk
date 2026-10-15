@@ -1313,6 +1313,10 @@
               source ${./scripts/ci-cargo-tools-env} || exit $?
               export RUSTC_WRAPPER=${ciRustcWrapper}/bin/ci-rustc-wrapper
             fi
+            # Pushing a branch signs its checks first when they have no evidence yet (scripts/evidence-prepush).
+            if [ -z "''${GITHUB_ACTIONS:-}" ] && [ -z "''${CI:-}" ] && [ -x ./scripts/install-git-hooks ]; then
+              ./scripts/install-git-hooks || echo "scripts/install-git-hooks failed: pushes will not sign evidence" >&2
+            fi
           '';
         };
         # The in-process load test uses a stand-in PTY and needs no collector or harness tools.

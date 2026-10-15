@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Install the pre-push hook that signs evidence. Idempotent; never replaces a hook it did not write.
+#   scripts/install-git-hooks [--uninstall]
+#
+# The hook is a small stub. At push time it does NOT run anything from the tree being pushed: it takes
+# scripts/evidence-prepush and scripts/st-test from the base branch of the remote (<remote>/main) into a temporary
+# directory and runs those copies, so the hook and the runner are never the pushed branch's. (The checks the runner then
+# runs, nix develop, pnpm install and the tests, are the tree's code, on this machine as this user with the key within
+# reach: cooperative trust, known defect 22.) When the base has no such files the stub does nothing.
+# It does nothing in CI (GITHUB_ACTIONS or CI set).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+[ -z "${GITHUB_ACTIONS:-}" ] && [ -z "${CI:-}" ] || exit 0
+git rev-parse --git-dir >/dev/null 2>&1 || exit 0   # not a checkout (a source export): nothing to install into
+hooks=$(git rev-parse --git-path hooks)
+mark='# st-evidence-prepush: written by scripts/install-git-hooks'
+hook="$hooks/pre-push"
+if [ "${1:-}" = --uninstall ]; then
+  if [ -f "$hook" ] && grep -qF "$mark" "$hook"; then rm -f "$hook"; echo "removed $hook"; fi
+  exit 0
+fi
+if [ "$(git config --get core.hooksPath || true)" != "" ]; then
+  echo "install-git-hooks: core.hooksPath is set; add the stub from scripts/install-git-hooks to that directory yourself" >&2
+  exit 0
+fi
+if [ -e "$hook" ] && ! grep -qF "$mark" "$hook"; then
+  echo "install-git-hooks: $hook exists and is not ours; not replacing it" >&2
+  exit 0
+fi
+mkdir -p "$hooks"
+cat > "$hook.tmp" <<'STUB'
+#!/usr/bin/env bash
+# st-evidence-prepush: written by scripts/install-git-hooks
+# Never blocks a push. Runs the base branch's copy of scripts/evidence-prepush, never the pushed tree's.
+remote=${1:-origin}
+git rev-parse -q --verify "refs/remotes/$remote/main" >/dev/null 2>&1 || exit 0
+work=$(mktemp -d 2>/dev/null) || exit 0
+trap 'rm -rf "$work"' EXIT
+git archive "refs/remotes/$remote/main" scripts/evidence-prepush scripts/st-test 2>/dev/null | tar -x -C "$work" 2>/dev/null || exit 0
+[ -f "$work/scripts/evidence-prepush" ] || exit 0
+if command -v python3 >/dev/null 2>&1; then
+  python3 "$work/scripts/evidence-prepush" "$@"
+else
+  echo "evidence: python3 is not on PATH; not signing" >&2
+fi
+exit 0
+STUB
+chmod +x "$hook.tmp"
+changed=1
+[ -f "$hook" ] && cmp -s "$hook.tmp" "$hook" && changed=0
+mv -f "$hook.tmp" "$hook"
+[ "$changed" -eq 0 ] || echo "evidence pre-push hook installed (ST_SKIP_EVIDENCE=1 skips)"

@@ -593,6 +593,24 @@ recorded too. `evidence-wrap`, `evidence-sign` and `evidence-verify` come from t
 line per check: result, seconds, and whether the verifier, from the base, now counts the tree as covered
 (`untrusted_signer` until the host's key line is on main). `--push REMOTE` pushes the notes after they verify, with the identity git uses for REMOTE (or
 `EVIDENCE_PUSH_TOKEN`); whether that identity may create `refs/notes/evidence/*` is a repository rule not yet confirmed for agent seats.
+`scripts/st-test --status` runs nothing and says whether the tree is already covered (exit 0 if all, 3 if not).
+
+A pre-push hook does this without anyone remembering. `scripts/install-git-hooks` (run by the default `nix develop` shell outside CI; it prints
+one line the first time and does nothing when `GITHUB_ACTIONS` or `CI` is set) installs a stub in the repository's hooks directory, never replacing
+a hook it did not write and leaving a configured `core.hooksPath` alone. **The hook and the runner are not the pushed branch's:** the stub takes
+`scripts/evidence-prepush` and `scripts/st-test` from `<remote>/main` into a temporary directory and runs those copies (when the base has none it
+does nothing). The checks they run are the tree's code (`nix develop`, `pnpm install`, the tests), on this machine as you with the host's signing key
+within reach: that is cooperative trust (known defect 22), not something the base-pinned hook protects against. When you push the branch
+you have checked out, the hook asks `st-test --status`; if every check is covered the push goes, silently. Otherwise it runs `st-test --push REMOTE`
+(an interactive push waits for it up to `ST_EVIDENCE_TIME_LIMIT`, default 1200 seconds, then stops it with TERM and KILL of its whole process
+group) and the push goes. A push from an agent (`ST_AGENT` set, or no terminal on stderr) runs inside a tool call with a short timeout, so there the hook
+waits at most `ST_EVIDENCE_AGENT_LIMIT` seconds (default 120), prints that signing continues in the background with its log path, and lets the push go;
+the notes are pushed when the run finishes, and agents should run `scripts/st-test --push origin` before pushing so the first CI run already sees them.
+It never blocks a push: a failing check is recorded and printed, a timeout is printed, and so is every other failure (an exception, a missing `python3`,
+a slow fetch, a signer that `.st/evidence-keys` on main does not list, a missing signing key). `ST_SKIP_EVIDENCE=1` skips it and says so. Tags, deletes,
+other branches and the base branch are pushed untouched, and the notes push inside the run does not run the hook again. A new tree always takes the slow
+path (the checks run once); so does every fixup that changes the tree; a tree that already has notes is instant.
+
 It runs `nix develop` and `pnpm install` from the tree under test, on the signing host as its user: code in that tree runs
 there with the key within reach (cooperative trust, see Host keys). It changes no policy: a check skips only where `enforce` is true.
 
