@@ -172,46 +172,55 @@ pub fn run_controlled_paths(
     ];
     env.extend(paths.environment(&identity));
     // An st3 seat never carries an st2 residency fence, so an inherited one must not reach hooks.
-    run_provider_with_env_removals(
-        "Claude",
-        None,
-        &claude_argv,
-        &env,
-        &[
-            EXPECTED_NATIVE_SESSION_ENV,
-            RESUME_GENERATION_ENV,
-            "CATALOG",
-            "ST_ROOT",
-        ],
-        crate::provider_session::SESSION_REFRESH,
-        PROVIDER_POLL,
-        &STOP,
-        Some(&observer),
-    )
+    crate::claude_usage::supervise(paths, &identity, &runtime_id, observer.session(), || {
+        run_provider_with_env_removals(
+            "Claude",
+            None,
+            &claude_argv,
+            &env,
+            &[
+                EXPECTED_NATIVE_SESSION_ENV,
+                RESUME_GENERATION_ENV,
+                "CATALOG",
+                "ST_ROOT",
+            ],
+            crate::provider_session::SESSION_REFRESH,
+            PROVIDER_POLL,
+            &STOP,
+            Some(&observer),
+        )
+    })
     .with_context(|| format!("running interactive Claude driver '{runtime_id}'"))
 }
 
 /// Resume supervising an interactive Claude provider a predecessor driver image launched through
 /// [`run_controlled_paths`] and released with [`crate::provider_session::Detached`].
 pub fn adopt_controlled_paths(
-    agent_dir: &Path,
+    paths: &crate::driver_paths::Paths,
     identity: &str,
     runtime_id: &str,
     pid: u32,
     session: &str,
     seq: u64,
 ) -> Result<()> {
-    let observer = SessionObserver::adopt(agent_dir, identity, "claude", runtime_id, session, seq);
-    crate::provider_session::adopt_provider(
-        "Claude",
-        None,
-        pid,
-        crate::provider_session::SESSION_REFRESH,
-        PROVIDER_POLL,
-        &STOP,
-        Some(&observer),
-    )
+    let observer = SessionObserver::adopt(&paths.agent_dir, identity, "claude", runtime_id, session, seq);
+    crate::claude_usage::supervise(paths, identity, runtime_id, session, || {
+        crate::provider_session::adopt_provider(
+            "Claude",
+            None,
+            pid,
+            crate::provider_session::SESSION_REFRESH,
+            PROVIDER_POLL,
+            &STOP,
+            Some(&observer),
+        )
+    })
     .with_context(|| format!("supervising adopted interactive Claude driver '{runtime_id}'"))
+}
+
+/// A current native usage acquisition fault; Stop observations do not certify complete usage.
+pub fn usage_observation_warning(agent_dir: &Path, incarnation: &str) -> Option<String> {
+    crate::claude_usage::warning(agent_dir, incarnation)
 }
 
 fn requires_st2_channel(argv: &[String]) -> bool {

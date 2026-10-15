@@ -28,6 +28,7 @@ pub mod claude_denials;
 pub mod claude_mcp;
 pub mod claude_prompts;
 pub mod claude_session;
+mod claude_usage;
 pub mod codex_app_server;
 pub mod context;
 pub mod contracts;
