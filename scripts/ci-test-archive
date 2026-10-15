@@ -18,6 +18,7 @@ import tempfile
 import time
 import zipfile
 import subprocess
+import sys
 
 FILES = ('workspace.tar.zst', 'sekrets-st3', 'production-build.json')
 
@@ -41,6 +42,45 @@ def identity():
             'targets': digest(Path('scripts/ci-nextest-targets'))}
 
 
+def validate_byte_sizes(manifest, actual):
+    # Version-2 producers without this optional inventory remain valid. Sizes
+    # supplement the mandatory digests; they never replace source/hash checks.
+    if 'byte_sizes' not in manifest:
+        return
+    sizes = manifest['byte_sizes']
+    if (not isinstance(sizes, dict) or set(sizes) != set(FILES)
+            or any(type(sizes[n]) is not int or sizes[n] < 0 or sizes[n] != actual[n] for n in FILES)):
+        raise ValueError('producer byte-size inventory mismatch')
+
+
+def report_sizes(sizes, *, zip_entries=None):
+    """Use existing stat/ZIP metadata only: no extra payload read or archive walk."""
+    try:
+        rows = [{'name': name, 'payload_bytes': sizes[name]} for name in FILES]
+        if zip_entries is not None:
+            # These are the complete ZIP's authenticated metadata. CRC and file
+            # hashes were checked before reporting, including the manifest.
+            rows = [{'name': entry.filename, 'payload_bytes': entry.file_size,
+                     'stored_bytes': entry.compress_size} for entry in zip_entries]
+        print('Producer artifact component bytes: ' + json.dumps(rows, sort_keys=True), flush=True)
+        path = os.environ.get('GITHUB_STEP_SUMMARY')
+        if path:
+            with open(path, 'a') as stream:
+                stream.write('### Exact producer artifact component sizes\n\n')
+                stream.write('| Component | Payload bytes | ZIP stored bytes |\n| --- | ---: | ---: |\n')
+                for row in rows:
+                    stream.write('| ' + row['name'] + ' | ' + str(row['payload_bytes']) + ' | '
+                                 + str(row.get('stored_bytes', 'not yet uploaded')) + ' |\n')
+                stream.write('\nPayload sizes exclude ZIP framing. workspace.tar.zst is already compressed; '
+                             'this does not inventory its members or claim a shrink.\n')
+    except Exception:
+        # Optional reporting cannot change producer success or verified inputs.
+        try:
+            print('::warning::optional producer size report unavailable', file=sys.stderr)
+        except Exception:
+            pass
+
+
 def verify(manifest, current, directory, producer_attempt):
     expected = {**current, "attempt": producer_attempt}
     if not producer_attempt.isdecimal() or not 1 <= int(producer_attempt) <= int(current["attempt"]):
@@ -53,6 +93,7 @@ def verify(manifest, current, directory, producer_attempt):
         raise ValueError('the workspace archive and production gateway files are required')
     if not Path(manifest['workspace']).is_absolute():
         raise ValueError('build workspace must be absolute')
+    validate_byte_sizes(manifest, {name: (directory / name).stat().st_size for name in FILES})
     for name in FILES:
         if digest(directory / name) != manifest['files'][name]:
             raise ValueError(f'test archive digest mismatch: {name}')
@@ -99,6 +140,7 @@ def extract_verified_zip(archive, destination, expected_size, expected_hash, man
         manifest = json.loads(manifest_bytes)
         if set(manifest.get('files', {})) != set(FILES):
             raise ValueError('the workspace archive and production gateway files are required')
+        validate_byte_sizes(manifest, {name: zipped.getinfo(name).file_size for name in FILES})
         destination.mkdir(mode=0o700, exist_ok=False)
         for entry in entries:
             target = destination / entry.filename
@@ -108,6 +150,7 @@ def extract_verified_zip(archive, destination, expected_size, expected_hash, man
             expected = manifest_hash if entry.filename == 'manifest.json' else manifest['files'][entry.filename]
             if digest(target) != expected:
                 raise ValueError('downloaded producer file digest mismatch: ' + entry.filename)
+        report_sizes({name: zipped.getinfo(name).file_size for name in FILES}, zip_entries=entries)
 
 
 class TransferError(Exception):
@@ -315,8 +358,10 @@ def main():
         import shutil
         shutil.copy2(binaries[0]['executable'], directory / 'sekrets-st3')
         manifest = {'version': 2, 'standalone_model': True, 'identity': current, 'workspace': str(Path.cwd().resolve()),
-                    'files': {name: digest(directory / name) for name in FILES}}
+                    'files': {name: digest(directory / name) for name in FILES},
+                    'byte_sizes': {name: (directory / name).stat().st_size for name in FILES}}
         (directory / 'manifest.json').write_text(json.dumps(manifest, sort_keys=True, indent=2) + '\n')
+        report_sizes(manifest['byte_sizes'])
         with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
             stream.write('producer-attempt=' + current['attempt'] + '\n')
             stream.write('manifest-sha256=' + digest(directory / 'manifest.json') + '\n')

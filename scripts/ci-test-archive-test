@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Archive consumers fail closed on source, attempt, tool or artifact mismatches."""
 import copy
+import json
 import importlib.machinery
 import importlib.util
 from pathlib import Path
@@ -138,6 +139,8 @@ else:
     assert groups[0][groups[0].index('-E') + 1] == 'not package(=st2) or (kind(test) and (binary(=integration) or binary(=agent_resource) or binary(=driver_expansion)))'
     assert not any('-p' in command and 'st2' in command for command in commands)
     produced = dict(line.split('=', 1) for line in outputs.read_text().splitlines())
+    produced_manifest = json.loads((scratch / 'ci-test-archives/manifest.json').read_text())
+    assert produced_manifest['byte_sizes'] == {name: (scratch / 'ci-test-archives' / name).stat().st_size for name in module.FILES}
     environment['CI_TEST_ARCHIVE_MANIFEST_SHA256'] = produced['manifest-sha256']
     environment['CI_TEST_ARCHIVE_PRODUCER_ATTEMPT'] = produced['producer-attempt']
     (scratch / 'ci-test-archives/sekrets-st3').chmod(0o644)
@@ -159,7 +162,6 @@ print('Archive entry-point controls passed: original selected targets in one arc
 # cannot become successful test inputs. All fixtures here are tiny text files.
 import hashlib
 import io
-import json
 import stat
 import unittest
 from unittest.mock import patch
@@ -241,6 +243,32 @@ class DownloadControls(unittest.TestCase):
     def download(self, fake):
         with patch.dict(os.environ, self.environment, clear=True), patch.object(module.subprocess, 'run', fake), patch.object(module, 'transfer_zip', fake.transfer):
             module.download(self.destination)
+
+    def test_authenticated_size_mismatch_rejected_before_extract(self):
+        value = json.loads(self.manifest)
+        value['byte_sizes'] = {name: len(data) for name, data in self.files.items()}
+        value['byte_sizes'][module.FILES[0]] += 1
+        self.manifest = json.dumps(value).encode()
+        data = self.make_zip()
+        with self.assertRaisesRegex(ValueError, 'byte-size inventory mismatch'):
+            self.extract(data, manifest_hash=hashlib.sha256(self.manifest).hexdigest())
+        self.assertFalse(self.destination.exists())
+
+    def test_verified_zip_component_lengths_reported(self):
+        import contextlib
+        value = json.loads(self.manifest)
+        value['byte_sizes'] = {name: len(data) for name, data in self.files.items()}
+        self.manifest = json.dumps(value).encode()
+        data = self.make_zip()
+        out = io.StringIO()
+        with patch.dict(os.environ, {}, clear=True), contextlib.redirect_stdout(out):
+            self.extract(data, manifest_hash=hashlib.sha256(self.manifest).hexdigest())
+        rows = json.loads(out.getvalue().split(': ', 1)[1])
+        self.assertEqual({row['name'] for row in rows}, {*module.FILES, 'manifest.json'})
+        for row in rows:
+            self.assertEqual(row['payload_bytes'], row['stored_bytes'])
+            if row['name'] in self.files:
+                self.assertEqual(row['payload_bytes'], len(self.files[row['name']]))
 
     def test_complete_zip_and_producer_hashes(self):
         self.download(self.fake_gh([self.zip_bytes]))
@@ -549,9 +577,51 @@ class StreamingControls(unittest.TestCase):
             self.assertNotIn('signed-secret', str(raised.exception))
 
 
+class SizeInventoryControls(unittest.TestCase):
+    def test_legacy_manifest_without_sizes_stays_valid(self):
+        module.validate_byte_sizes({'version': 2}, {name: 1 for name in module.FILES})
+
+    def test_wrong_size_type_keys_or_value_refused(self):
+        actual = {name: 11 for name in module.FILES}
+        module.validate_byte_sizes({'byte_sizes': actual}, actual)
+        for sizes in [None, {}, {**actual, 'extra': 1}, {**actual, module.FILES[0]: True},
+                      {**actual, module.FILES[0]: -1}, {**actual, module.FILES[0]: 10}]:
+            with self.subTest(sizes=sizes), self.assertRaises(ValueError):
+                module.validate_byte_sizes({'byte_sizes': sizes}, actual)
+
+    def test_size_inventory_cannot_replace_mandatory_digests(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for name in module.FILES: (root / name).write_bytes(b'fixture')
+            current = {'attempt': '1'}
+            manifest = dict(version=2, standalone_model=True, identity=current, workspace='/producer',
+                            files={name: '0' * 64 for name in module.FILES},
+                            byte_sizes={name: 7 for name in module.FILES})
+            with self.assertRaisesRegex(ValueError, 'digest mismatch'):
+                module.verify(manifest, current, root, '1')
+
+    def test_report_uses_metadata_without_reading_payload(self):
+        import contextlib, io
+        from types import SimpleNamespace
+        entries = [SimpleNamespace(filename=name, file_size=100, compress_size=80) for name in (*module.FILES, 'manifest.json')]
+        out = io.StringIO()
+        with patch.dict(os.environ, {}, clear=True), patch.object(Path, 'open', side_effect=AssertionError('payload read')), contextlib.redirect_stdout(out):
+            module.report_sizes({name: 100 for name in module.FILES}, zip_entries=entries)
+        rows = json.loads(out.getvalue().split(': ', 1)[1])
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(sum(row['stored_bytes'] for row in rows), 320)
+
+    def test_report_summary_failure_is_optional(self):
+        import contextlib, io
+        with patch.dict(os.environ, {'GITHUB_STEP_SUMMARY': '/fixture/unwritable'}), patch('builtins.open', side_effect=OSError('fixture')):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                module.report_sizes({name: 1 for name in module.FILES})
+
+
 suite = unittest.TestSuite([
     unittest.defaultTestLoader.loadTestsFromTestCase(DownloadControls),
     unittest.defaultTestLoader.loadTestsFromTestCase(StreamingControls),
+    unittest.defaultTestLoader.loadTestsFromTestCase(SizeInventoryControls),
 ])
 result = unittest.TextTestRunner(verbosity=2).run(suite)
 if not result.wasSuccessful():

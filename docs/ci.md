@@ -1210,7 +1210,7 @@ retry follows quota exhaustion.
 
 Test archive transfer verifies the complete ZIP before exposing consumer inputs. The four
 archive consumers download only the successful producer artifact ID, verify its API size
-and SHA256, verify the producer-output manifest hash and all five ZIP members, then
+and SHA256, verify the producer-output manifest hash and all four ZIP members, then
 publish a fresh private directory atomically. A failed or incomplete transfer gets at most
 one repeat download of that same ID (each ZIP request has a 10-minute limit); interrupted
 requests retain their signal status. No compiler or test is retried. Source, run, successful
@@ -1248,3 +1248,14 @@ deadline. Signed storage URLs, credentials and raw HTTP errors are excluded.
 Final failure removes the private partial and starts no tests. These diagnostics
 distinguish a zero-byte stall from an interrupted transfer; transport recovery
 does not waive a failed gate or authorize a workflow rerun.
+
+The producer now adds the three component byte lengths to its hash-bound version-2
+manifest and prints them in the log and step summary. Consumers also print each
+verified ZIP member's payload and compressed byte lengths, using metadata already
+read for whole-ZIP/hash/CRC verification. This adds no network request, payload
+reread, tar inventory pass or extra artifact member. Older manifests without the
+optional byte lengths still verify; a present size inventory must exactly match
+the files. Reporting failures do not change a producer or verification result.
+These numbers distinguish workspace.tar.zst from the standalone gateway and build
+metadata; they do not yet identify members inside the compressed workspace archive
+or establish that any executable is safe to remove.

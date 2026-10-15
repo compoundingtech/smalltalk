@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Report exact CI test-artifact component sizes without another transfer or payload scan.",
+  "replay": {
+    "status": "none",
+    "detail": "CI artifact diagnostics only; mandatory source/run/attempt/digest/CRC checks and the three payload files remain unchanged."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "CI artifact diagnostics only; mandatory source/run/attempt/digest/CRC checks and the three payload files remain unchanged."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "CI artifact diagnostics only; mandatory source/run/attempt/digest/CRC checks and the three payload files remain unchanged."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "CI artifact diagnostics only; mandatory source/run/attempt/digest/CRC checks and the three payload files remain unchanged."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "CI artifact diagnostics only; mandatory source/run/attempt/digest/CRC checks and the three payload files remain unchanged."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Producer logs show component byte sizes; consumers show payload and ZIP-stored bytes after verification. Optional manifest byte_sizes is checked when present; old version-2 manifests remain valid. No operator action or new GitHub read."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No routing, timeout, retry or extraction-policy change. Diagnostic publication errors are optional; invalid present size metadata is refused."
+  }
+}
