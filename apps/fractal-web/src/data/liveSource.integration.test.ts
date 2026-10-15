@@ -846,6 +846,59 @@ describe('cold conversation admission', () => {
 
 
 describe('terminal dependent-read authority', () => {
+  it.live('prefetches only explicit terminal intent and shares that retained viewer with drawer demand', () =>
+    withGateway((live, gateway) => Effect.gen(function* () {
+      live.registry.mount(live.source.agents)
+      yield* settle
+      gateway.fleet([agent])
+      yield* settle
+      expect(gateway.runtimeReads).toEqual([])
+      expect(gateway.terminalActions).toEqual([])
+      const ref = 'terminal/example'
+      live.source.prefetchTerminal?.(ref)
+      yield* settle
+      expect(gateway.runtimeReads).toEqual(['runtime/old'])
+      expect(gateway.terminalActions).toHaveLength(1)
+      live.source.prefetchTerminal?.(ref)
+      live.registry.mount(live.source.terminalInterest!(ref))
+      yield* settle
+      expect(gateway.runtimeReads).toEqual(['runtime/old'])
+      expect(gateway.terminalActions).toHaveLength(1)
+    })),
+  )
+
+  it.live('renders the retained terminal immediately on warm remount without Waiting or another attach', () =>
+    withGateway((live, gateway) => Effect.gen(function* () {
+      live.registry.mount(live.source.agents)
+      yield* settle
+      gateway.fleet([agent])
+      yield* settle
+      const ref = 'terminal/example'
+      const leave = live.registry.mount(live.source.terminalInterest!(ref))
+      const stopReading = live.registry.mount(live.source.terminal(ref))
+      yield* settle
+      gateway.screen(gateway.subscription('terminal').id, 'old', 'Retained output')
+      yield* settle
+      expect(live.registry.get(live.source.terminal(ref))).toMatchObject({ _tag: 'Observed' })
+      stopReading()
+      leave()
+      yield* settle
+      const reads = gateway.runtimeReads.length
+      const attaches = gateway.terminalActions.length
+      /** React reads the retained snapshot before its passive visible-interest effect. */
+      expect(live.registry.get(live.source.terminal(ref))).toMatchObject({
+        _tag: 'Observed', value: { lines: [expect.objectContaining({ text: 'Retained output' })] },
+      })
+      const reopen = live.registry.mount(live.source.terminalInterest!(ref))
+      expect(live.registry.get(live.source.terminal(ref))).toMatchObject({
+        _tag: 'Observed', value: { lines: [expect.objectContaining({ text: 'Retained output' })] },
+      })
+      expect(gateway.runtimeReads).toHaveLength(reads)
+      expect(gateway.terminalActions).toHaveLength(attaches)
+      reopen()
+    })),
+  )
+
   it.live('terminal failure contract: reports a seat missing from an authoritative live roster without runtime reads', () =>
     withGateway((live, gateway) => Effect.gen(function* () {
       live.registry.mount(live.source.agents)

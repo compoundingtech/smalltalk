@@ -5,13 +5,16 @@ import { arrangementSidebarDoc, folders, type FolderState } from './client.ts'
 import { emptyDoc, type FolderDoc } from './core.mts'
 import { arrangementUuid, refusalText, type RestageVerdict } from './edit.ts'
 import { boundRows, canDrop, filterSidebarTree, restageBoundMove, restageCreate, restageDelete, restageRename, rowStatus, sidebarProjection, sidebarTree, type SidebarDocument, type SidebarSeat } from './sidebarAdapter.ts'
-import type { AgentFoldersProps } from './sidebarContract.ts'
+import type { AgentFoldersProps, SidebarAgent } from './sidebarContract.ts'
 
 export interface SidebarFoldersOptions {
   /** The host supplies actual seat row keys and their shared subject; never infer a subject from a label. */
   readonly roster: readonly SidebarSeat[]
   readonly source?: Atom.Atom<FolderState>
   readonly query?: string
+  /** Host search semantics for agent rows while `query` is non-empty; defaults to label matching. */
+  readonly matchesAgent?: (node: SidebarAgent) => boolean
+  readonly collapsedSource?: Atom.Writable<readonly string[], readonly string[]>
 }
 export type SidebarFoldersBinding = Pick<AgentFoldersProps, 'tree' | 'canDrop' | 'onMove' | 'onCreateFolder' | 'onRenameFolder' | 'onDeleteFolder' | 'onToggleCollapsed' | 'unavailable' | 'treeStatus'> & {
   readonly orderingTree: AgentFoldersProps['tree']
@@ -23,15 +26,17 @@ export type SidebarFoldersBinding = Pick<AgentFoldersProps, 'tree' | 'canDrop' |
  * Subscription owns the existing sidebarFolders atom's editor, inventory follow and abort finalizer.
  * No second reader/editor or persistence of st domain data. Source injection exercises this without the kit.
  */
-export const useSidebarFolders = ({ roster, source = folders, query = '' }: SidebarFoldersOptions): SidebarFoldersBinding => {
+export const useSidebarFolders = ({ roster, source = folders, query = '', matchesAgent, collapsedSource }: SidebarFoldersOptions): SidebarFoldersBinding => {
   const registry = React.useContext(RegistryContext)
   const snapshot = useAtomValue(source)
   const local = React.useMemo(() => ({
-    collapse: Atom.make<ReadonlyMap<string, boolean>>(new Map()),
+    collapse: Atom.make<readonly string[]>([]),
     /** Fixed-copy refusal of a write planned without a request, such as the filing stage of create-with-agent. */
     refused: Atom.make<string | undefined>(undefined),
   }), [source])
-  const [collapse, setCollapse] = useAtom(local.collapse)
+  const collapseAtom = collapsedSource ?? local.collapse
+  const [collapsedIds, setCollapsedIds] = useAtom(collapseAtom)
+  const collapse = new Map(collapsedIds.map(id => [id, true]))
   const refused = useAtomValue(local.refused)
   const currentRoster = React.useRef(roster)
   currentRoster.current = roster
@@ -80,7 +85,7 @@ export const useSidebarFolders = ({ roster, source = folders, query = '' }: Side
     : snapshot.readOnly ? 'Folder editing is unavailable for this connection.'
     : (snapshot.sidebarCandidates?.length ?? 0) > 1 ? 'Several sidebar layouts are available. Using the earliest layout; the others are unchanged.' : undefined
   return {
-    tree: filterSidebarTree(orderingTree, query), orderingTree, status, rowStatus: status, treeStatus, unavailable,
+    tree: filterSidebarTree(orderingTree, query, matchesAgent), orderingTree, status, rowStatus: status, treeStatus, unavailable,
     canDrop: (items, target) => ready() ? canDrop({ ...currentDoc(), roster: currentRoster.current }, { items, target }) : { refused: 'Folder editing is unavailable for this connection.' },
     onMove: (intent) => {
       // Agent rows are bound to the subject they showed now; a rebound row key refuses instead of moving another agent.
@@ -104,9 +109,10 @@ export const useSidebarFolders = ({ roster, source = folders, query = '' }: Side
     onRenameFolder: (intent) => { submit((fresh) => restageRename(fresh, intent)) },
     onDeleteFolder: (intent) => { submit((fresh) => restageDelete(fresh, intent)) },
     onToggleCollapsed: ({ id, collapsed }) => {
-      const folds = new Map(registry.get(local.collapse))
-      folds.set(id, collapsed)
-      setCollapse(folds)
+      // Search reveals descendants temporarily, without changing the saved working layout.
+      if (query.trim() !== '') return
+      const ids = registry.get(collapseAtom).filter(folder => folder !== id)
+      setCollapsedIds(collapsed ? [...ids, id] : ids)
     },
   }
 }

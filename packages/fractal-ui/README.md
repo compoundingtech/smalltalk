@@ -24,6 +24,19 @@ String projections must receive a ticking `now`; the host may intentionally paus
 observation clock while disconnected so retained facts do not imply that fresh
 observations are arriving.
 
+Sidebar rows accept a separate `context` Known/Unknown occupancy observation: used tokens,
+window tokens, percentage and observation time. A known reading renders `Context N%`;
+the row's accessible description preserves the full main-session numerator, window and as-of time.
+Unknown occupancy is omitted, never derived from cumulative tokens or descendant-inclusive
+spend. Hosts clear the current claim at an incarnation change and restore it only from a
+newer occupancy observation. Retained stale readings are labelled last observed.
+
+Rows also accept `spend.last24h` / `spend.last7d` windowed API-equivalent spend (root plus
+subagents, not billed spend). `metricLayout` selects Layout C: `compact` puts 24h spend and
+last activity in the time column of a one-line row; `expanded` replaces line two with 24h and
+7d spend, context and last activity. Both draw a decorative context ring behind the status
+glyph. Unreported windows and occupancy are omitted; the description carries every reported value.
+
 ## Run
 
 ```sh
@@ -63,6 +76,7 @@ node packages/fractal-ui/scripts/kit-play-gate.mjs packages/fractal-ui/storybook
 - **Fractal UI / Transcript**: the locked U2·F3·Y3 transcript in dark and light: settled/expanded work, streamed answers, failed/interrupted/unknown work, loading, retained-history synchronization, answer metadata, unavailable conversations, the older-history boundary with and without a load action, pending and failed sends (including Pending→Sent identity) and the read-only empty state.
 - **Fractal UI / Sidebar/Agent Row**: compact hover-card facts, omitted unreported fields, the known-vs-none time cohort and the quick Open hover action.
 - **Fractal UI / Human time**: all four kinds and unreported time, pinned to New York, at 440/1440 in light/dark plus a host-theme tooltip and a fake-timer live tick.
+- **Fractal UI / Sidebar/Roster**: a deterministic 100-row roster rendered on demand, for fitting cost.
 
 ## Families
 
@@ -168,6 +182,8 @@ Hosts must not invent `Progress` or `Quiet` observations to fill gaps in the wir
 Rows render reported facts only; unreported fields are omitted — never shown as placeholders — and remain in the accessible details. Line-one metric and trailing-signal tracks share the widest intrinsic content width in their row cohort, so rows without a reported since-time keep the same title start as their cohort; tree nesting supplies hierarchy without a second indentation. Hovering a row swaps the time slot for a quick Open action. The hover card stays compact — status, host, current work, spend, duration, Last turn/Last activity, model, PR, branch and subagents — and never shows raw timestamps.
 
 The status glyph column holds the glyph only; elapsed time in status stays in the accessible details. Each row is the containing block for its visually hidden details trigger, so a long roster overflows only its scroll pane, never the document. `ThreadHeader` omits the breadcrumb folder when the host reports none.
+Row fitting is batched: every mounted row registers with one shared animation-frame pass that restores line-one fields, reads every cohort, then writes every cohort, so each drop step and the subtitle signal fit force at most one synchronous layout regardless of roster size. **Fractal UI / Sidebar/Roster** `HundredAgentRender` mounts 100 rows and records the render's long tasks.
+After the drop steps shrink the cohort track, three batched restoration rounds reconsider scope, subagent count, then tokens. The restoration ceiling includes **every** row whose title meets the 60% floor at the pre-restoration track, including persistent-chevron parents; only rows already below the floor are excluded. Restoration must never move a qualifying title below the floor, and a restored field must also avoid subagent collisions. `pnpm check:sidebar-fitting` covers both qualifying and already-below-floor chevrons, both row orders, collisions and a second fit's fixed point. `HundredAgentRender` asserts the invariant across all 100 rows: at the default 256px width the shared track stays at 32px, preserving the 20 parent titles at 155px instead of widening to 46px and reducing them to 141px. Row 91's otherwise-restorable scope remains hidden to protect those titles.
 
 ### Markdown and the thinking disclosure
 

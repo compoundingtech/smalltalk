@@ -1,7 +1,7 @@
 import { generateKeyBetween, generateNKeysBetween } from 'fractional-indexing'
 import { drawnParents, insertAt, isLive, liveAncestor, positionKey, project, wouldCycle, type FolderDoc, type Insertion, type Projection, type ProjectedFolder } from './core.mts'
 import { refusalText, sidebarOperations, type ArrangementEditorState, type RestageVerdict, type SidebarOperation } from './edit.ts'
-import type { SidebarCreateFolder, SidebarDropVerdict, SidebarMove, SidebarNode, SidebarRowStatus } from './sidebarContract.ts'
+import type { SidebarAgent, SidebarCreateFolder, SidebarDropVerdict, SidebarMove, SidebarNode, SidebarRowStatus } from './sidebarContract.ts'
 
 /** A seat's row key is not its shared membership subject. Lifecycle does not filter this roster. */
 export interface SidebarSeat { readonly id: string; readonly subject: string; readonly host: string; readonly label: string }
@@ -26,26 +26,29 @@ export const sidebarTree = (projection: Projection, roster: readonly SidebarSeat
     children: [...item.folders.map(folder), ...item.members.flatMap((subject) => seats.get(subject) ?? [])],
   })
   const unfiled = new Set(projection.unfiled)
-  const hosts = new Map<string, SidebarSeat[]>()
-  for (const seat of roster) if (unfiled.has(seat.subject)) {
-    const rows = hosts.get(seat.host) ?? []
-    rows.push(seat)
-    hosts.set(seat.host, rows)
-  }
-  return [...projection.folders.map(folder), ...[...hosts].sort(([a], [b]) => compare(`host:${a}`, `host:${b}`)).map(([host, rows]): SidebarNode => ({
-    _tag: 'Group', id: `host:${host}`, label: host, collapsed: collapse.get(`host:${host}`) ?? false,
-    children: rows.sort((a, b) => compare(a.id, b.id)).map((seat) => ({ _tag: 'Agent', id: seat.id, subject: seat.subject, label: seat.label })),
-  }))]
+  const rows = roster.filter(seat => unfiled.has(seat.subject)).toSorted((a, b) => compare(a.host, b.host) || compare(a.id, b.id))
+  return [...projection.folders.map(folder), ...(rows.length === 0 ? [] : [{
+    _tag: 'Group' as const, id: 'wf/unfiled', label: 'Unfiled', collapsed: collapse.get('wf/unfiled') ?? false,
+    children: rows.map((seat): SidebarNode => ({ _tag: 'Agent', id: seat.id, subject: seat.subject, label: seat.label })),
+  }])]
 }
 
-/** Filtering is a view operation; all move plans continue to use the complete document. */
-export const filterSidebarTree = (tree: readonly SidebarNode[], query: string): SidebarNode[] => {
+/**
+ * Filtering is a view operation; all move plans continue to use the complete document.
+ * Hosts with richer search semantics supply `matchesAgent`; the default matches labels.
+ */
+export const filterSidebarTree = (
+  tree: readonly SidebarNode[],
+  query: string,
+  matchesAgent?: (node: SidebarAgent) => boolean,
+): SidebarNode[] => {
   const needle = query.trim().toLocaleLowerCase()
   if (needle === '') return [...tree]
+  const matches = matchesAgent ?? ((node: SidebarAgent) => node.label.toLocaleLowerCase().includes(needle))
   return tree.flatMap((node): SidebarNode[] => {
-    if (node._tag === 'Agent') return node.label.toLocaleLowerCase().includes(needle) ? [node] : []
-    const children = filterSidebarTree(node.children, query)
-    return children.length === 0 ? [] : [{ ...node, children }]
+    if (node._tag === 'Agent') return matches(node) ? [node] : []
+    const children = filterSidebarTree(node.children, query, matches)
+    return children.length === 0 ? [] : [{ ...node, collapsed: false, children }]
   })
 }
 

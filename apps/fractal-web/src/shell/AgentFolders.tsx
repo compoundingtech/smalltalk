@@ -3,6 +3,7 @@ import * as stylex from '@stylexjs/stylex'
 import { Schema } from 'effect'
 import type * as Atom from 'effect/reactivity/Atom'
 import * as React from 'react'
+import { SidebarTreeLevel } from '@smalltalk/fractal-ui/assistant-ui/shell'
 import { useLocale } from 'react-aria'
 import {
   Button as AriaButton,
@@ -11,7 +12,9 @@ import {
   TreeItem,
   TreeItemContent,
   Virtualizer,
+  useDragAndDrop,
   type Key,
+  type DragAndDropOptions,
   type TreeItemRenderProps,
   type TreeProps,
 } from 'react-aria-components'
@@ -42,6 +45,7 @@ import type { SidebarFilters } from './sidebar/state.ts'
 import { StatusIcon, agentStatus, compactTime, type AgentStatus } from './sidebar/StatusIcon.tsx'
 import { SidebarToolbar } from './sidebar/Toolbar.tsx'
 import type { Workspace, WindowAction } from './workspaces.ts'
+import type { AgentFoldersProps, SidebarNode, SidebarMoveTarget } from '../folders/sidebarContract.ts'
 
 const unfiled = 'wf/unfiled'
 const styles = stylex.create({
@@ -70,6 +74,7 @@ const styles = stylex.create({
     position: 'relative',
     gap: '3px',
     padding: '5px 6px',
+    paddingInlineStart: 'calc(6px + (var(--tree-item-level, 1) - 1) * var(--sidebar-tree-step, 16px))',
     marginBlock: '1px',
     borderRadius: scale.radiusSm,
     backgroundColor: {
@@ -141,8 +146,8 @@ const styles = stylex.create({
   affordance: {
     display: 'inline-flex',
     alignItems: 'center',
-    justifyContent: 'center',
-    width: '14px',
+    justifyContent: 'start',
+    width: '16px',
     height: '18px',
     flexShrink: 0,
     color: tokens['--ds-gray-900'],
@@ -158,6 +163,7 @@ const styles = stylex.create({
     position: 'relative',
     gap: '4px',
     padding: '4px 8px',
+    paddingInlineStart: 'calc(6px + (var(--tree-item-level, 1) - 1) * var(--sidebar-tree-step, 16px))',
     minHeight: '30px',
   },
   // React Aria Components 1.21.1 Tree hardcodes hasDragButton: true and requires
@@ -186,11 +192,12 @@ const styles = stylex.create({
     backgroundColor: tokens['--ds-gray-alpha-200'],
     fontWeight: 600,
   },
-  indent: (depth: number) => ({ marginInlineStart: `${depth * 16}px` }),
+  drag: { position: 'absolute', insetInlineEnd: 0, top: 0, opacity: { default: 0, ':focus-visible': 1 }, width: 16, height: 16 },
+  treeContent: { position: 'relative', width: '100%' },
 })
 
 /** Fractal folders own membership; view-only filters, order and collapse use shared persistence. */
-export const AgentFolders = React.memo(
+const LegacyAgentFolders = React.memo(
   ({
     workspaces,
     selection,
@@ -318,12 +325,11 @@ export const AgentFolders = React.memo(
       [selection, dispatch, filters.query, multipleHosts, source],
     )
     for (const id of agentElements.keys()) if (!rows.has(id)) agentElements.delete(id)
-    const renderAgent = ({ id, depth }: { readonly id: string; readonly depth: number }) => {
+    const renderAgent = ({ id }: { readonly id: string }) => {
       const { workspace } = rows.get(id)!
       const cached = agentElements.get(id)
       if (
         cached !== undefined &&
-        cached.depth === depth &&
         cached.workspace.title === workspace.title &&
         cached.workspace.host === workspace.host &&
         cached.workspace.unread.length === workspace.unread.length
@@ -362,7 +368,6 @@ export const AgentFolders = React.memo(
                 workspace={rowWorkspace}
                 selection={selection}
                 dispatch={dispatch}
-                depth={depth + 1}
                 query={parsedQuery.query}
                 multipleHosts={multipleHosts}
               />
@@ -370,26 +375,23 @@ export const AgentFolders = React.memo(
           </TreeItemContent>
         </TreeItem>
       )
-      agentElements.set(id, { workspace: rowWorkspace, depth, element })
+      agentElements.set(id, { workspace: rowWorkspace, element })
       return element
     }
     const renderFolder = ({
       folder,
-      depth,
     }: {
       readonly folder: ProjectedFolder
-      readonly depth: number
     }): React.ReactElement => {
       const children = [
-        ...folder.folders.map((child) => renderFolder({ folder: child, depth: depth + 1 })),
-        ...folder.members.map((id) => renderAgent({ id, depth: depth + 1 })),
+        ...folder.folders.map((child) => renderFolder({ folder: child })),
+        ...folder.members.map((id) => renderAgent({ id })),
       ]
       const count = descendantCount(folder)
       const cached = folderElements.get(folder.id)
       const sameContent =
         cached !== undefined &&
         cached.name === folder.name &&
-        cached.depth === depth &&
         cached.count === count
       if (sameContent && sameElements(cached.children, children)) return cached.element
       const content = sameContent ? (
@@ -397,7 +399,7 @@ export const AgentFolders = React.memo(
       ) : (
         <TreeItemContent>
           {({ isExpanded }) => (
-            <div {...stylex.props(styles.folder, styles.indent(depth))}>
+            <div {...stylex.props(styles.folder)}>
               <AriaButton slot="chevron" {...stylex.props(styles.affordance)}>
                 <WfIcon name={isExpanded ? 'chevronDown' : 'chevronRight'} />
               </AriaButton>
@@ -427,10 +429,10 @@ export const AgentFolders = React.memo(
           {children}
         </TreeItem>
       )
-      folderElements.set(folder.id, { name: folder.name, depth, count, content, children, element })
+      folderElements.set(folder.id, { name: folder.name, count, content, children, element })
       return element
     }
-    const unfiledChildren = visibleUnfiled.map((id) => renderAgent({ id, depth: 1 }))
+    const unfiledChildren = visibleUnfiled.map((id) => renderAgent({ id }))
     const cachedUnfiled = folderElements.get(unfiled)
     const unfiledContent =
       cachedUnfiled?.count === visibleUnfiled.length ? (
@@ -466,7 +468,6 @@ export const AgentFolders = React.memo(
       )
     folderElements.set(unfiled, {
       name: 'Unfiled',
-      depth: 0,
       count: visibleUnfiled.length,
       content: unfiledContent,
       children: unfiledChildren,
@@ -478,7 +479,7 @@ export const AgentFolders = React.memo(
       [folderElements],
     )
     const nextItems = [
-      ...visibleFolders.map((folder) => renderFolder({ folder, depth: 0 })),
+      ...visibleFolders.map((folder) => renderFolder({ folder })),
       ...(visibleUnfiled.length === 0 && (visibleFolders.length > 0 || searching)
         ? []
         : [unfiledElement]),
@@ -653,12 +654,10 @@ export const sameFolderFleet = (
 type AgentRowWorkspace = Pick<Workspace, 'id' | 'title' | 'host' | 'unread'>
 interface CachedAgentElement {
   readonly workspace: AgentRowWorkspace
-  readonly depth: number
   readonly element: React.ReactElement
 }
 interface CachedFolderElement {
   readonly name: string
-  readonly depth: number
   readonly count: number
   readonly content: React.ReactElement
   readonly children: readonly React.ReactElement[]
@@ -671,6 +670,103 @@ const sameElements = (
 ): boolean =>
   left.length === right.length && left.every((element, index) => element === right[index])
 const renderTreeElement = (element: React.ReactElement): React.ReactElement => element
+
+/** The live host owns roster presentation and arrangement edits; RAC owns hierarchy and focus. */
+const BoundAgentFolders = (props: AgentFoldersProps) => {
+  // The live roster already supplies its 8px inset; avoid a second inset on nested titles.
+  const layout = React.useMemo(() => new ListLayout({ estimatedRowSize: 48, padding: 0 }), [])
+  const treeRef = React.useRef<HTMLDivElement>(null)
+  const expanded = new Set<Key>()
+  const foldersById = new Map<string, SidebarNode>()
+  const index = (nodes: readonly SidebarNode[]): void => {
+    for (const node of nodes) {
+      foldersById.set(node.id, node)
+      if (node._tag !== 'Agent') {
+        if (!node.collapsed) expanded.add(node.id)
+        index(node.children)
+      }
+    }
+  }
+  index(props.tree)
+  const dropTarget = (target: { readonly type: string; readonly key?: Key; readonly dropPosition?: string }): SidebarMoveTarget | undefined => {
+    if (target.type === 'root') return { _tag: 'Root', index: (props.orderingTree ?? props.tree).filter(node => node._tag === 'Folder').length }
+    if (target.key === undefined) return undefined
+    const node = foldersById.get(String(target.key))
+    if (node === undefined) return undefined
+    if (target.dropPosition === 'on') return node._tag === 'Group' ? { _tag: 'Unfiled' } : node._tag === 'Folder' ? { _tag: 'Into', folder: node.id } : undefined
+    return { _tag: target.dropPosition === 'before' ? 'Before' : 'After', sibling: node.id }
+  }
+  const applyDrop = async (event: { readonly target: { readonly type: string; readonly key?: Key; readonly dropPosition?: string }; readonly items: Parameters<NonNullable<DragAndDropOptions['onItemDrop']>>[0]['items'] }): Promise<void> => {
+    const target = dropTarget(event.target)
+    const item = event.items[0]
+    if (target === undefined || item?.kind !== 'text' || event.items.length !== 1) return
+    const id = await item.getText('application/x-fractal-sidebar-row')
+    if ('ok' in props.canDrop([id], target)) props.onMove({ items: [id], target })
+  }
+  const { dragAndDropHooks } = useDragAndDrop<React.ReactElement>({
+    getItems: keys => [...keys].filter(key => foldersById.get(String(key))?._tag !== 'Group').map(key => ({ 'application/x-fractal-sidebar-row': String(key), 'text/plain': foldersById.get(String(key))?.label ?? String(key) })),
+    acceptedDragTypes: ['application/x-fractal-sidebar-row'],
+    getAllowedDropOperations: () => ['move'],
+    getDropOperation: (target, types) => {
+      const intent = dropTarget(target)
+      return intent !== undefined && types.has('application/x-fractal-sidebar-row') ? 'move' : 'cancel'
+    },
+    onItemDrop: applyDrop,
+    onInsert: applyDrop,
+    onRootDrop: event => applyDrop({ ...event, target: { type: 'root' } }),
+  })
+  const render = (node: SidebarNode): React.ReactElement => {
+    const status = props.rowStatus?.get(node.id)
+    return (
+    // The collection item owns the row name, so it survives memoized reposition and RAC prop refreshes.
+    <TreeItem key={node.id} id={node.id} textValue={node.label} aria-label={node._tag === 'Agent' ? props.agentAccessibleName?.(node) : undefined} hasChildItems={node._tag !== 'Agent'} onAction={node._tag === 'Agent' ? () => props.onSelect?.(node.id) : undefined} data-wf-agent-ref={node._tag === 'Agent' ? node.subject : undefined} className={treeItemClassName}>
+      <TreeItemContent>
+        {({ level, isExpanded }) => (
+          <div data-sidebar-content="" {...stylex.props(styles.treeContent)}>
+            <AriaButton slot="drag" aria-label={`Move ${node.label}`} {...stylex.props(styles.drag)} />
+            {node._tag === 'Agent' ? <SidebarTreeLevel value={level}>{props.renderAgent?.(node)}</SidebarTreeLevel> : (
+              <div {...stylex.props(styles.folder)}>
+                <AriaButton slot="chevron" {...stylex.props(styles.affordance)}><WfIcon name={isExpanded ? 'chevronDown' : 'chevronRight'} /></AriaButton>
+                <span {...stylex.props(styles.folderLabel)}>{node.label}</span>
+              </div>
+            )}
+            {status?._tag === 'Pending' ? <span role="status">Saving folder layout…</span> : null}
+            {status?._tag === 'Refused' ? <span role="status">{status.reason}{status.onRetry === undefined ? null : <AriaButton onPress={status.onRetry}>Try again</AriaButton>}</span> : null}
+          </div>
+        )}
+      </TreeItemContent>
+      {node._tag === 'Agent' ? null : node.children.map(render)}
+    </TreeItem>
+  )
+  }
+  const items = props.tree.map(render)
+  const expandAncestors = (selected: string) => {
+    const path: Exclude<SidebarNode, { readonly _tag: 'Agent' }>[] = []
+    const find = (nodes: readonly SidebarNode[]): boolean => {
+      for (const node of nodes) {
+        if (node._tag === 'Agent') { if (node.id === selected) return true }
+        else {
+          path.push(node)
+          if (find(node.children)) return true
+          path.pop()
+        }
+      }
+      return false
+    }
+    if (find(props.tree)) for (const node of path) if (node.collapsed) props.onToggleCollapsed({ id: node.id, collapsed: false })
+  }
+  return <>
+    <AgentFolderTree items={items} expanded={expanded} onExpandedChange={keys => {
+      for (const node of foldersById.values()) if (node._tag !== 'Agent' && node.collapsed === keys.has(node.id)) props.onToggleCollapsed({ id: node.id, collapsed: !keys.has(node.id) })
+    }} layout={layout} treeRef={treeRef} dragAndDropHooks={dragAndDropHooks} />
+    <RevealAgentRow selected={props.selectedId ?? ''} layout={layout} treeRef={treeRef} items={items} expandAncestors={expandAncestors} />
+    {props.treeStatus}
+    {props.unavailable === undefined ? null : <div role="status">{props.unavailable}</div>}
+  </>
+}
+
+export const AgentFolders = (props: AgentFoldersProps | React.ComponentProps<typeof LegacyAgentFolders>) =>
+  'tree' in props ? <BoundAgentFolders {...props} /> : <LegacyAgentFolders {...props} />
 const treeItemClassName = ({ isFocusVisible }: TreeItemRenderProps): string =>
   stylex.props(styles.item, isFocusVisible && styles.focused).className ?? ''
 
@@ -688,12 +784,14 @@ const AgentFolderTree = React.memo(
     onExpandedChange,
     layout,
     treeRef,
+    dragAndDropHooks,
   }: {
     readonly items: readonly React.ReactElement[]
     readonly expanded: ReadonlySet<Key>
     readonly onExpandedChange: NonNullable<TreeProps<React.ReactElement>['onExpandedChange']>
     readonly layout: ListLayout<unknown>
     readonly treeRef: React.RefObject<HTMLDivElement | null>
+    readonly dragAndDropHooks?: TreeProps<React.ReactElement>['dragAndDropHooks']
   }) => {
     const { direction } = useLocale()
     const navigation = React.useRef<TreeItemRenderProps['state'] | undefined>(undefined)
@@ -757,6 +855,7 @@ const AgentFolderTree = React.memo(
             ref={treeRef}
             items={items}
             selectionMode="none"
+            dragAndDropHooks={dragAndDropHooks}
             expandedKeys={expanded}
             onExpandedChange={onExpandedChange}
             className={({ state }) => {
@@ -773,24 +872,21 @@ const AgentFolderTree = React.memo(
 )
 
 /** Selection from another surface reveals its row without subscribing the collection to selection. */
-const RevealSelectedAgent = ({
-  selection,
-  layout,
-  treeRef,
-  items,
-  expandAncestors,
-}: {
-  readonly selection: Atom.Atom<string>
+type RevealAgentRowProps = {
+  readonly selected: string
   readonly layout: ListLayout<unknown>
   readonly treeRef: React.RefObject<HTMLDivElement | null>
   readonly items: readonly React.ReactElement[]
   readonly expandAncestors: (id: string) => void
-}) => {
-  const selected = useAtomValue(selection)
+}
+const RevealSelectedAgent = (props: Omit<RevealAgentRowProps, 'selected'> & { readonly selection: Atom.Atom<string> }) =>
+  <RevealAgentRow {...props} selected={useAtomValue(props.selection)} />
+
+const RevealAgentRow = ({ selected, layout, treeRef, items, expandAncestors }: RevealAgentRowProps) => {
   const revealed = React.useRef<string | undefined>(undefined)
   const expand = React.useEffectEvent(expandAncestors)
   React.useLayoutEffect(() => {
-    if (revealed.current === selected) return
+    if (selected === '' || revealed.current === selected) return
     revealed.current = undefined
     expand(selected)
     // The collection portal commits before Virtualizer finishes its layout. Use its keyed
@@ -822,14 +918,12 @@ const AgentFolderRow = React.memo(
     workspace,
     selection,
     dispatch,
-    depth,
     query,
     multipleHosts,
   }: {
     readonly workspace: AgentRowWorkspace
     readonly selection: Atom.Atom<string>
     readonly dispatch: (action: WindowAction) => void
-    readonly depth: number
     readonly query: string
     readonly multipleHosts: boolean
   }) => {
@@ -867,7 +961,7 @@ const AgentFolderRow = React.memo(
       })
     }
     return (
-      <CurrentAgent selection={selection} agentRef={workspace.id} status={status} depth={depth}>
+      <CurrentAgent selection={selection} agentRef={workspace.id} status={status}>
         {(current) => (
           <>
             <AgentUsageRow
@@ -962,13 +1056,11 @@ const CurrentAgent = ({
   selection,
   agentRef,
   status,
-  depth,
   children,
 }: {
   readonly selection: Atom.Atom<string>
   readonly agentRef: string
   readonly status: AgentStatus
-  readonly depth: number
   readonly children: (current: boolean) => React.ReactNode
 }) => {
   const current = useAtomValue(selection, (selected) => selected === agentRef)
@@ -980,7 +1072,6 @@ const CurrentAgent = ({
         status === 'working' && styles.workingRail,
         status === 'waiting' && styles.waitingRail,
         status === 'stale' && styles.staleRail,
-        styles.indent(depth),
         current && styles.selected,
       )}
     >

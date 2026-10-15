@@ -35,6 +35,8 @@ export type AgentFoldersProps = {
   readonly selectedId?: string
   readonly onSelect?: (id: string) => void
   readonly renderAgent?: (agent: SidebarAgent) => React.ReactNode
+  /** Accessible name of the owning tree row (RAC TreeItem aria-label); textValue stays the label for typeahead. */
+  readonly agentAccessibleName?: (agent: SidebarAgent) => string
   readonly ariaLabel?: string
   readonly style?: StyleXStyles
 }

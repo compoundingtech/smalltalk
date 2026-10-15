@@ -20,6 +20,10 @@ import { TerminalHistory } from './TerminalHistory.tsx'
 import { TerminalKeyboardBinding } from './TerminalKeyboardBinding.tsx'
 import { TerminalPane } from './TerminalPane.tsx'
 import { TerminalResize } from './TerminalResize.tsx'
+import { terminalFontsReady } from './terminalFonts.ts'
+
+/** Warm the terminal's owned faces without pulling fonts into the eager workspace graph. */
+export const prepareTerminal = terminalFontsReady
 
 /** A terminal source publishes a human reason; a blank or placeholder detail falls back to fixed copy. */
 export const terminalUnobservedCopy = (feed: UnobservedFeed): string => {
