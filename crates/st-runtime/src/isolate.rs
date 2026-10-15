@@ -5,6 +5,9 @@
 //! Linux uses a transient systemd user scope when the user manager is available. The scope is a
 //! sibling of the daemon service, so a daemon cgroup restart does not stop the task.
 //!
+//! Named instances keep their own runtime directory for tasks, but systemd clients use
+//! `ST_INSTANCE_HOST_XDG_RUNTIME_DIR` to reach the host's user manager.
+//!
 //! Other Unix hosts use a detached process session. Linux uses the same fallback when its user
 //! manager is unavailable, but reports that mode as degraded.
 //!
@@ -58,15 +61,30 @@ fn scope_expansion_flag(output: &[u8]) -> Option<bool> {
     (version >= 236).then_some(version >= 254)
 }
 
-fn systemd_scope_in(environment: &std::collections::BTreeMap<String, String>) -> Option<bool> {
-    if !environment.contains_key("XDG_RUNTIME_DIR") {
-        return None;
+// Only the systemd client uses the host runtime directory. The scoped task keeps the
+// instance directory, just as other children of the daemon do.
+fn host_runtime_dir(environment: &std::collections::BTreeMap<String, String>) -> Option<&str> {
+    if environment
+        .get("ST_INSTANCE")
+        .is_some_and(|name| !name.is_empty())
+    {
+        environment
+            .get("ST_INSTANCE_HOST_XDG_RUNTIME_DIR")
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    } else {
+        environment.get("XDG_RUNTIME_DIR").map(String::as_str)
     }
+}
+
+fn systemd_scope_in(environment: &std::collections::BTreeMap<String, String>) -> Option<bool> {
+    let runtime_dir = host_runtime_dir(environment)?;
     let systemd_run = crate::resolve_executable("systemd-run", environment).ok()?;
     let output = Command::new(systemd_run)
         .arg("--version")
         .env_clear()
         .envs(environment)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
         .stderr(Stdio::null())
         .output()
         .ok()?;
@@ -79,6 +97,7 @@ fn systemd_scope_in(environment: &std::collections::BTreeMap<String, String>) ->
         .args(["--user", "show-environment"])
         .env_clear()
         .envs(environment)
+        .env("XDG_RUNTIME_DIR", runtime_dir)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -139,12 +158,23 @@ pub(crate) fn sanitize(value: &str) -> String {
 }
 
 pub fn wrap(unit: &str, program: &OsStr, arguments: &[&OsStr]) -> Command {
+    wrap_in(unit, program, arguments, None)
+}
+
+/// Construct the launcher with its final environment before selecting the host systemd session.
+pub(crate) fn wrap_in(
+    unit: &str,
+    program: &OsStr,
+    arguments: &[&OsStr],
+    environment: Option<&std::collections::BTreeMap<String, String>>,
+) -> Command {
     wrap_for_mode(
         mode(),
         *SCOPE_EXPANSION_FLAG.get().unwrap_or(&true),
         unit,
         program,
         arguments,
+        environment,
     )
 }
 
@@ -154,6 +184,7 @@ fn wrap_for_mode(
     unit: &str,
     program: &OsStr,
     arguments: &[&OsStr],
+    environment: Option<&std::collections::BTreeMap<String, String>>,
 ) -> Command {
     match isolation {
         Isolation::Scope => {
@@ -171,15 +202,66 @@ fn wrap_for_mode(
             if expansion_flag {
                 command.arg("--expand-environment=no");
             }
+            if let Some(environment) = environment {
+                command.env_clear().envs(environment);
+            }
+            instance_scope_environment(&mut command, environment);
             command.arg("--").arg(program).args(arguments);
             command
         }
         Isolation::Detached | Isolation::DegradedDetached => {
             let mut command = Command::new(program);
+            if let Some(environment) = environment {
+                command.env_clear().envs(environment);
+            }
             command.args(arguments);
             command
         }
     }
+}
+
+fn instance_scope_environment(
+    command: &mut Command,
+    environment: Option<&std::collections::BTreeMap<String, String>>,
+) {
+    let value = |key: &str| match environment {
+        Some(environment) => environment.get(key).map(std::ffi::OsString::from),
+        None => std::env::var_os(key),
+    };
+    if !value("ST_INSTANCE").is_some_and(|name| !name.is_empty()) {
+        return;
+    }
+    // systemd-run applies --setenv only when it execs the task, after connecting
+    // to the manager. The task therefore retains the instance runtime directory.
+    if let Some(runtime_dir) = value("XDG_RUNTIME_DIR") {
+        let mut assignment = std::ffi::OsString::from("--setenv=XDG_RUNTIME_DIR=");
+        assignment.push(runtime_dir);
+        command.arg(assignment);
+    }
+    match value("ST_INSTANCE_HOST_XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        Some(host) => {
+            command.env("XDG_RUNTIME_DIR", host);
+        }
+        None => {
+            command.env_remove("XDG_RUNTIME_DIR");
+        }
+    }
+}
+
+fn systemctl() -> Command {
+    let mut command = Command::new("systemctl");
+    if std::env::var_os("ST_INSTANCE").is_some_and(|name| !name.is_empty()) {
+        match std::env::var_os("ST_INSTANCE_HOST_XDG_RUNTIME_DIR").filter(|value| !value.is_empty())
+        {
+            Some(host) => {
+                command.env("XDG_RUNTIME_DIR", host);
+            }
+            None => {
+                command.env_remove("XDG_RUNTIME_DIR");
+            }
+        }
+    }
+    command
 }
 
 /// How long the processes left in a work scope get to exit on SIGTERM before SIGKILL.
@@ -319,7 +401,7 @@ pub fn signal_scope(unit: &str, signal: i32) -> Result<bool> {
 
 /// The cgroup directory of `unit`, or none once the unit is not loaded.
 fn control_group(unit: &str) -> Result<Option<PathBuf>> {
-    let mut command = Command::new("systemctl");
+    let mut command = systemctl();
     command.args([
         "--user",
         "show",
@@ -380,7 +462,7 @@ fn kill_unit(unit: &str, signal: i32) -> Result<bool> {
         libc::SIGKILL => "SIGKILL".to_owned(),
         other => other.to_string(),
     };
-    let mut command = Command::new("systemctl");
+    let mut command = systemctl();
     command
         .args(["--user", "kill"])
         .arg(format!("--signal={name}"))
@@ -425,6 +507,7 @@ mod tests {
             "st-studio.scope",
             OsStr::new("provider"),
             &arguments,
+            None,
         );
         let actual = command.get_args().collect::<Vec<_>>();
         let separator = actual
@@ -447,6 +530,7 @@ mod tests {
             "st-studio.scope",
             program,
             &arguments,
+            None,
         );
         let actual = command.get_args().collect::<Vec<_>>();
         let separator = actual
@@ -459,6 +543,73 @@ mod tests {
         assert!(actual[..separator].contains(&OsStr::new("--description=st seat")));
         assert!(actual.contains(&OsStr::new("--no-ask-password")));
         assert_eq!(command.get_program(), OsStr::new("systemd-run"));
+    }
+
+    #[test]
+    fn instance_isolation_probe_uses_the_host_runtime_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let environment = std::collections::BTreeMap::from([
+            ("PATH".into(), root.path().display().to_string()),
+            ("ST_INSTANCE".into(), "try".into()),
+            ("XDG_RUNTIME_DIR".into(), "/tmp/st-instance/try/run".into()),
+            (
+                "ST_INSTANCE_HOST_XDG_RUNTIME_DIR".into(),
+                "/run/user/1000".into(),
+            ),
+        ]);
+        for program in ["systemd-run", "systemctl"] {
+            let path = root.path().join(program);
+            std::fs::write(
+                &path,
+                "#!/bin/sh\n[ \"$XDG_RUNTIME_DIR\" = /run/user/1000 ] || exit 1\nprintf 'systemd 260\\n'\n",
+            ).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        assert_eq!(systemd_scope_in(&environment), Some(true));
+        let mut without_instance = environment.clone();
+        without_instance.remove("ST_INSTANCE");
+        assert_eq!(systemd_scope_in(&without_instance), None);
+        let mut without_host = environment;
+        without_host.remove("ST_INSTANCE_HOST_XDG_RUNTIME_DIR");
+        assert_eq!(systemd_scope_in(&without_host), None);
+    }
+
+    #[test]
+    fn instance_scope_uses_the_host_session_but_preserves_the_task_runtime_directory() {
+        let environment = std::collections::BTreeMap::from([
+            ("ST_INSTANCE".into(), "try".into()),
+            ("XDG_RUNTIME_DIR".into(), "/tmp/st-instance/try/run".into()),
+            (
+                "ST_INSTANCE_HOST_XDG_RUNTIME_DIR".into(),
+                "/run/user/1000".into(),
+            ),
+        ]);
+        let command = wrap_for_mode(
+            Isolation::Scope,
+            true,
+            "st3-work.scope",
+            OsStr::new("provider"),
+            &[OsStr::new("%n:$HOME")],
+            Some(&environment),
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(key, _)| *key == "XDG_RUNTIME_DIR")
+                .unwrap()
+                .1,
+            Some(OsStr::new("/run/user/1000")),
+        );
+        let arguments = command.get_args().collect::<Vec<_>>();
+        let separator = arguments.iter().position(|arg| *arg == "--").unwrap();
+        assert!(arguments[..separator].contains(&OsStr::new(
+            "--setenv=XDG_RUNTIME_DIR=/tmp/st-instance/try/run"
+        )));
+        assert_eq!(
+            &arguments[separator + 1..],
+            &[OsStr::new("provider"), OsStr::new("%n:$HOME")]
+        );
     }
 
     #[test]
