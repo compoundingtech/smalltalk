@@ -134,6 +134,10 @@ about = "Live foreground time / reported foreground time; disconnected foregroun
 min_percent = 99
 path = "client/ios/live-share"
 
+[divergence]
+about = "Open P1 projection bugs: two members that hold the same envelopes and project a table differently. Each is a fault for the fleet's fault agent with what a reproduction needs; nothing repairs it from a peer"
+max_open = 0
+
 [database]
 about = "This member's store: the pages in use, and how much they grow a day once checkpoints and retention have run"
 max_live_gb = 8.0

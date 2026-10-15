@@ -20,6 +20,7 @@ pub struct Targets {
     pub statement: Statement,
     pub transaction: Transaction,
     pub cpu: Cpu,
+    pub divergence: Divergence,
     pub database: Database,
 }
 
@@ -63,6 +64,15 @@ pub struct Transaction {
 pub struct Cpu {
     pub about: String,
     pub max_cores: f64,
+}
+
+/// Projection divergences, counted fleet-wide from their open faults. A projection is a pure
+/// function of the claims, so each one is a bug.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Divergence {
+    pub about: String,
+    pub max_open: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -501,6 +511,20 @@ pub fn doctor_lines(report: &Value) -> Vec<(String, &'static str, String)> {
         ));
     }
     lines
+}
+
+/// `st doctor`'s line for open projection divergences: met while there are no more open than the
+/// target allows, which is none. A miss is `info` like every other target's: the fault itself goes
+/// to the fleet's fault agent, and while a peer still differs the replication check fails.
+pub fn divergence_line(open: u64) -> (String, &'static str, String) {
+    let max_open = targets().divergence.max_open;
+    (
+        "slo/projection-divergence".into(),
+        if open <= max_open { "pass" } else { "info" },
+        format!(
+            "open P1 projection bugs ≤ {max_open}: {open} open; `st subject daemon/NODE` for the member that found one shows it with what a reproduction needs"
+        ),
+    )
 }
 
 /// `st doctor`'s line for the store's size: met when the pages in use and their daily growth are

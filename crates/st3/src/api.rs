@@ -7544,6 +7544,15 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
             message,
         });
     }
+    // Only a daemon that runs the divergence check knows the count; the rest show no line.
+    if let Some(open) = reader_store.open_divergences_at_last_check() {
+        let (name, status, message) = crate::slo::divergence_line(open);
+        report.checks.push(DoctorCheck {
+            name,
+            status: status.into(),
+            message,
+        });
+    }
     report.checks.extend(github_usage_checks(
         &crate::resource::github_usage_report(),
         client_now_ms(),
@@ -12815,12 +12824,18 @@ pub fn slo_rows(store: &crate::store::Store) -> anyhow::Result<Vec<Value>> {
         .and_then(|reloaded| reloaded.ok())
         .and_then(|config| crate::store::LimitsPolicy::from_config(&config))
         .map_or(crate::store::ACCOUNT_READING_WINDOW_MS, |policy| policy.fresh_ms);
-    Ok(crate::objectives::rows(
+    let mut rows = crate::objectives::rows(
         &request_latency_target_windows(),
         &limits,
         client_now_ms() as u64,
         fresh_ms,
-    ))
+    );
+    if let Some(open) = store.open_divergences_at_last_check() {
+        // Objectives come before budgets.
+        let budgets = rows.iter().position(|row| row["kind"] == "budget").unwrap_or(rows.len());
+        rows.insert(budgets, crate::objectives::divergence(open));
+    }
+    Ok(rows)
 }
 
 async fn get_slo(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

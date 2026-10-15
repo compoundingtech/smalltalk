@@ -66,6 +66,10 @@ pub struct ReplicationExchange {
     /// Signatures answering the other side's `signature_requests`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub signatures: Vec<ReplicaEnvelopeSignature>,
+    /// The sender's build, so a member that finds the same claims projecting differently can
+    /// name both builds in the bug it records. Older peers leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -411,6 +415,28 @@ pub struct ReplicationPeerSync {
     /// exchanges cannot fix that, so this node's views can be wrong until it is repaired.
     #[serde(default)]
     pub diverged: bool,
+}
+
+/// Two members that hold the same envelopes and project one table differently. A projection is
+/// a pure function of the claims, so this is a bug to reproduce and fix, never something to
+/// repair from a peer. It carries what a reproduction needs.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ProjectionDivergence {
+    pub peer: String,
+    /// The shared projection (table) whose digests differ, or `graph` for a peer that sends only
+    /// the older whole-graph digest.
+    pub projection: String,
+    /// The claims both members projected: the inventory digest they share and each writer's
+    /// highest sequence in it.
+    pub inventory_digest: String,
+    pub writer_high_water: BTreeMap<String, u64>,
+    pub local_digest: String,
+    pub peer_digest: String,
+    pub local_build: String,
+    /// Absent for a peer whose build does not say.
+    pub peer_build: Option<String>,
+    pub since_unix_ms: u128,
+    pub compared_at_unix_ms: u128,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
