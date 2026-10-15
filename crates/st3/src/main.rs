@@ -19896,7 +19896,7 @@ fn spawn_st3_provider(
         ProviderStart::Adopt(session) => match (driver.as_str(), session) {
             ("claude", DetachedSession::Provider { pid, session, seq }) => {
                 st_drivers::claude_session::adopt_controlled_paths(
-                    &paths.agent_dir,
+                    &paths.resolved(),
                     &paths.identity,
                     &paths.runtime_id,
                     pid,

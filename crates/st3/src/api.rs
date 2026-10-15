@@ -7870,6 +7870,50 @@ fn claude_hooks_check(
     })
 }
 
+fn claude_usage_check(
+    state: &AppState,
+    desired: &[crate::model::DesiredSubject],
+) -> Result<DoctorCheck, ApiError> {
+    let mut faults = Vec::new();
+    let host = st_drivers::run::detect_host();
+    for seat in desired.iter().filter(|seat| {
+        seat.member.as_ref().is_some_and(|member| {
+            member.host == state.store.origin() && member.driver.as_deref() == Some("claude")
+        })
+    }) {
+        let Some(observed) = state
+            .store
+            .latest_claim(&seat.subject, Some("harness.observed"))
+            .map_err(ApiError::internal)?
+        else {
+            continue;
+        };
+        let fields = observed.body.get("fields").unwrap_or(&observed.body);
+        if fields["driver"] != "claude" || fields["state"] == "ended" {
+            continue;
+        }
+        let Some(incarnation) = fields["evidence_incarnation"].as_str() else {
+            continue;
+        };
+        let agent_dir =
+            crate::hooks::claude_agent_dir(&state.state_dir.join("drivers"), &seat.subject, &host);
+        if let Some(warning) =
+            st_drivers::claude_session::usage_observation_warning(&agent_dir, incarnation)
+        {
+            faults.push(format!("{}: {warning}", seat.subject));
+        }
+    }
+    Ok(DoctorCheck {
+        name: "claude-usage-observation".into(),
+        status: if faults.is_empty() { "pass" } else { "warn" }.into(),
+        message: if faults.is_empty() {
+            "no current Claude native usage observer reports a fault; acquisition completeness requires source reconciliation".into()
+        } else {
+            faults.join("; ")
+        },
+    })
+}
+
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path)
@@ -8333,6 +8377,7 @@ fn doctor_report_with_operation_drift(
         },
     });
     checks.push(claude_hooks_check(state, &desired)?);
+    checks.push(claude_usage_check(state, &desired)?);
     checks.push(graph_references_check(
         &state
             .store
