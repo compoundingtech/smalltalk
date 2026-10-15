@@ -177,6 +177,8 @@ agent "garden/cedar" {{
             starts = [json.loads(line) for line in path.read_text().splitlines()]
             sessions = [row for row in starts if row.get("event") == "session"]
             assert len(sessions) == 2 and all(row["sessionId"] == native for row in sessions), sessions
+            assert all(row["sessionFile"] == str(transcript) and row["resumed"] is True
+                       for row in sessions), sessions
             assert not any(row.get("event") == "turn" for row in starts), starts
         messages = [json.loads(line) for line in transcript.read_text().splitlines()
                     if json.loads(line).get("type") == "message"]

@@ -1172,6 +1172,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("session_id", string()),
                 ("agent", reference()),
                 ("incarnation_id", string()),
+                ("desired_token", string()),
                 (
                     "status",
                     enumeration(&["active", "inactive", "missing", "unknown"]),
@@ -3207,6 +3208,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("discovery_revision", string()),
             ("agent", reference_to(&["agent"])),
             ("incarnation_id", string()),
+            ("desired_token", string()),
             (
                 "status",
                 enumeration(&["active", "inactive", "missing", "unknown"]),
