@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "heavy": [
+    {
+      "package": "st3",
+      "binary": "integration",
+      "modules": ["boot_canaries", "convergence", "daemon_restart", "fleet", "messaging_faults"]
+    }
+  ]
+}

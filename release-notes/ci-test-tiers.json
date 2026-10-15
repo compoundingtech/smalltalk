@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Test tiers: a tier definition, a CI_TEST_TIER filter in ci-nextest (default all, nothing selects a tier yet) and the inventory proof extended to prove the tiers disjoint and complete",
+  "replay": {
+    "status": "none",
+    "detail": "No claim replay or recovery behavior changes; this changes CI test selection scripts and docs."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers, schema-version changes or data rewrites."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No checkpoint rules or digests change."
+  },
+  "compatibility": {
+    "status": "none",
+    "detail": "No client, wire or harness contract change. CI_TEST_TIER defaults to all, so every existing caller selects exactly the tests it selected before."
+  },
+  "downtime": {
+    "status": "none",
+    "detail": "No upgrade downtime."
+  },
+  "manual": {
+    "status": "none",
+    "detail": "No manual step."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "No recovery procedure; reverting restores the previous selection scripts."
+  }
+}

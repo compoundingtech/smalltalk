@@ -216,6 +216,14 @@ partitions, retries, eight test threads, real VM checks and required contexts ar
 Local and macOS runs use the same metadata-derived binary selection and CI profile;
 `CI_TEST_PARTITION` selects the shard.
 
+`CI_TEST_TIER` (`all`, the default, `fast` or `heavy`) narrows the run and the list to a tier of the selection. HEAVY is the
+end-to-end modules in `scripts/ci-test-tiers.json` (today the `st3` integration modules `boot_canaries`, `convergence`,
+`daemon_restart`, `fleet` and `messaging_faults`); FAST is defined as everything else, so a test cannot belong to neither. The
+partition applies after the tier filter, and the build and an archive are the same for every tier. `scripts/ci-test-partitions`
+proves that the two tiers are disjoint and together equal the whole selection, that neither is empty (a misspelled module would
+otherwise leave HEAVY empty and FAST everything), and that the shards of the fast tier cover it. Nothing selects a tier in a
+workflow yet: every job runs `all` until the workflow change that makes pull requests run FAST.
+
 New test files and paths are checked automatically by `genie-freshness` on each PR and
 merge group. A guard failure names each file and line and points its author to `test_env!`
 and these repair instructions; it does not allow the raw path through.

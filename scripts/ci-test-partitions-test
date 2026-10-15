@@ -51,6 +51,19 @@ for wrong in [shards[:3], shards+[set()], [set(),*shards[1:]],
     else:
         raise AssertionError("four-shard omission/overlap/extra/count must fail")
 
+# Tiers: disjoint and complete, neither empty.
+tier_full = {("b", str(i)) for i in range(6)}
+tier_heavy = {("b", "4"), ("b", "5")}
+module.verify_tiers(tier_full, tier_full - tier_heavy, tier_heavy)
+for broken in [(tier_full, tier_full), (tier_full, set()), (set(), tier_heavy), (tier_full - tier_heavy | {("b", "4")}, tier_heavy),
+               (tier_full - tier_heavy - {("b", "0")}, tier_heavy), (tier_full - tier_heavy | {("x", "extra")}, tier_heavy)]:
+    try:
+        module.verify_tiers(tier_full, *broken)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a broken tier split passed")
+
 with tempfile.TemporaryDirectory() as temp:
     scratch = Path(temp)
     cargo = scratch / "cargo"
@@ -69,6 +82,25 @@ with tempfile.TemporaryDirectory() as temp:
         env["CI_TEST_PARTITION"] = "hash:1/3"
         result = subprocess.run(["bash", "scripts/ci-nextest", action, *extra], cwd=root, env=env, capture_output=True)
         assert result.returncode == 2 and not calls.exists(), "incomplete shard count must fail before Cargo"
+
+    # The tier narrows the selection with an AND, only when asked; a bad tier fails before Cargo.
+    for tier, expected in [("all", None), ("fast", "not ("), ("heavy", "(package(=st3) and binary(=integration)")]:
+        calls.unlink(missing_ok=True)
+        env.pop("CI_TEST_EXTRACTED", None)
+        env.update(CI_TEST_PARTITION="hash:1/2", CI_TEST_TIER=tier)
+        subprocess.run(["bash", "scripts/ci-nextest", "run"], cwd=root, env=env, capture_output=True)
+        command = [json.loads(line) for line in calls.read_text().splitlines() if json.loads(line)[0] == "nextest"][0]
+        selection = command[command.index("-E") + 1]
+        if expected is None:
+            assert "boot_canaries" not in selection, "tier all adds no filter"
+        else:
+            assert selection.endswith(")") and f") and ({expected}" in selection or f"and ({expected}" in selection, selection
+            assert "boot_canaries" in selection and "daemon_restart" in selection
+    calls.unlink(missing_ok=True)
+    env["CI_TEST_TIER"] = "everything"
+    result = subprocess.run(["bash", "scripts/ci-nextest", "run"], cwd=root, env=env, capture_output=True)
+    assert result.returncode == 2 and not calls.exists(), "an unknown tier must fail before Cargo"
+    env.pop("CI_TEST_TIER")
 
     # Archive reuse runs the selected workspace once and propagates failure without compiling.
     calls.unlink(missing_ok=True)
