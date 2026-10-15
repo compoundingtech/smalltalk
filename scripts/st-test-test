@@ -280,6 +280,19 @@ class StTest(unittest.TestCase):
             for name in ('GIT_DIR', 'GIT_AUTHOR_NAME', 'GIT_WORK_TREE', 'GIT_PUSH_OPTION_COUNT'):
                 self.assertNotIn(name, os.environ)
 
+    def test_the_checks_do_not_see_the_agent_seats_variables_but_the_hosts_ranking_name_and_the_switches_stay(self):
+        self.commit('b.txt', 'two')
+        seat = {'ST_MISSION': 'm', 'ST3_ENDPOINT': 'e', 'CLAUDECODE': '1', 'CLAUDE_CONFIG_DIR': '/c', 'ANTHROPIC_API_KEY': 'k',
+                'ST_AGENT': 'agent/x', 'ST_AGENT_FOO': 'x', 'ST_SKIP_EVIDENCE': '0', 'ST_EVIDENCE_TIME_LIMIT': '9'}
+        out = Path(self.tmp.name) / 'seen'
+        code, _, err = self.run_st_test('--check', 'demo', extra_env=seat, command=['sh', '-c', f'env > {out}'])
+        self.assertEqual(code, 0, err)
+        seen = dict(line.split('=', 1) for line in out.read_text().splitlines() if '=' in line)
+        for name in ('ST_MISSION', 'ST3_ENDPOINT', 'CLAUDECODE', 'CLAUDE_CONFIG_DIR', 'ANTHROPIC_API_KEY', 'ST_AGENT_FOO'):
+            self.assertNotIn(name, seen)
+        for name in ('ST_AGENT', 'ST_SKIP_EVIDENCE', 'ST_EVIDENCE_TIME_LIMIT'):
+            self.assertIn(name, seen)
+
     def test_a_base_that_looks_like_a_git_option_is_refused(self):
         self.commit('b.txt', 'two')
         for bad in ('--upload-pack=x', '-x', 'a b', ''):

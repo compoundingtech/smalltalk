@@ -69,6 +69,20 @@ def selecting(name):
     return name in SELECTING or name.startswith('GIT_PUSH_OPTION')
 
 
+SEAT_PREFIXES = ('ST_', 'ST2_', 'ST3_', 'CLAUDE', 'ANTHROPIC_')
+KEPT_SEAT = ('ST_AGENT', 'ST_SKIP_EVIDENCE')  # exact names, plus every ST_EVIDENCE* switch; this list is the only exception mechanism
+
+
+def scrub_seat_environment():
+    """A CI runner has none of the variables an agent seat carries (identity, mission, session, daemon endpoint, hook and messaging
+    settings), and the checks must see what CI sees: tests that read them fail or behave differently under a seat (the ci-local-gate
+    drill's claude hook tests did). ST_AGENT stays because the host ranks `nix develop` starts by it (so a check can still read it: the nix wrapper that needs it
+    starts the check); the evidence switches stay. The kept list is the only exception mechanism for a future ST_* switch."""
+    for name in [name for name in os.environ
+                 if name.startswith(SEAT_PREFIXES) and name not in KEPT_SEAT and not name.startswith('ST_EVIDENCE')]:
+        del os.environ[name]
+
+
 def scrub_git_environment():
     """Drop the repository- and identity-selecting GIT_* variables (st2#3014); the notes push keeps its transport variables."""
     for name in [name for name in os.environ if selecting(name)]:
@@ -157,6 +171,7 @@ def repository_of(remote):
 
 def main(argv):
     scrub_git_environment()
+    scrub_seat_environment()
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('--check', action='append', default=[], metavar='NAME', help='only this check (repeatable)')
     parser.add_argument('--base', default='origin/main', help='the accepted base (default origin/main)')

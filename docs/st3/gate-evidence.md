@@ -759,7 +759,7 @@ a slow fetch, a signer that `.st/evidence-keys` on main does not list, a missing
 other branches and the base branch are pushed untouched, and the notes push inside the run does not run the hook again. A new tree always takes the slow
 path (the checks run once); so does every fixup that changes the tree; a tree that already has notes is instant.
 
-It runs `nix develop` and `pnpm install` from the tree under test, on the signing host as its user: code in that tree runs
+The checks run without the agent seat's identity and session variables (`ST_*`, `ST2_*`, `ST3_*`, `CLAUDE*`, `ANTHROPIC_*`; `ST_AGENT`, `ST_SKIP_EVIDENCE` and the `ST_EVIDENCE*` switches stay, by exact name: that list in `scripts/st-test` is the only exception mechanism, and `ST_AGENT` stays visible to the checks because the `nix` wrapper that needs it starts them), as on a CI runner: tests that read them fail or behave differently under a seat. Tests that bind a request to the seat by process ancestry still do, so a trustworthy full run of the Linux gate must be started detached from any seat. It runs `nix develop` and `pnpm install` from the tree under test, on the signing host as its user: code in that tree runs
 there with the key within reach (cooperative trust, see Host keys). It changes no policy: a check skips only where `enforce` is true.
 
 ### When the gate says skip
