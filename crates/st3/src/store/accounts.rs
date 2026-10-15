@@ -307,13 +307,11 @@ pub(super) fn declared_accounts_at(connection: &Connection) -> Result<Vec<Accoun
     Ok(accounts)
 }
 
-/// The declared account an unbound seat's launch environment puts it on, by login directory.
+/// The declared account an unbound seat's launch environment puts it on: its login directory, the
+/// harness's default one, or the key file its harness reads.
 fn unbound_login_account(connection: &Connection, seat: &str, body: &str) -> Result<Option<String>> {
     let desired: Value = serde_json::from_str(body)?;
     let Some(driver) = crate::accounts::harness_driver(&desired) else {
-        return Ok(None);
-    };
-    let Some(variable) = crate::accounts::login_environment_name(driver) else {
         return Ok(None);
     };
     let member: Option<String> = connection
@@ -324,19 +322,22 @@ fn unbound_login_account(connection: &Connection, seat: &str, body: &str) -> Res
         return Ok(None);
     };
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let Some(directory) = member
-        .environment
-        .get(variable)
-        .cloned()
-        .or_else(|| std::env::var(variable).ok())
-        .filter(|directory| !directory.is_empty())
-        .and_then(|directory| crate::accounts::expand_login(&directory, home.as_deref()))
-    else {
-        return Ok(None);
-    };
+    let configured = crate::accounts::login_environment_name(driver).and_then(|variable| {
+        member
+            .environment
+            .get(variable)
+            .cloned()
+            .or_else(|| std::env::var(variable).ok())
+    });
     let accounts = declared_accounts_at(connection)?;
-    Ok(crate::accounts::account_by_login(&accounts, driver, &member.host, &directory, home.as_deref())
-        .map(|account| account.name.clone()))
+    Ok(crate::accounts::unbound_login_account(
+        &accounts,
+        driver,
+        &member.host,
+        configured.as_deref(),
+        home.as_deref(),
+    )
+    .map(|account| account.name.clone()))
 }
 
 /// The newest durable or local observation, within the caller's snapshot or write transaction.

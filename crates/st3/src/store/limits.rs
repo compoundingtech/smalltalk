@@ -10,7 +10,7 @@
 //! Seatless identity-less history is hidden once that driver has identified evidence; it is
 //! never attributed to an identified account, and active seats keep their unknown evidence.
 
-use super::accounts::limit_binding_is_current;
+use super::accounts::{declared_accounts_at, limit_binding_is_current};
 use super::*;
 use crate::model::DoctorCheck;
 use serde::Deserialize;
@@ -92,6 +92,11 @@ pub struct AccountLimit {
     /// about the age or completeness of its quota evidence.
     #[serde(default)]
     pub identified: bool,
+    /// The provider label this reading carried before a declaration claimed it as the account's
+    /// identity. The limits policy still matches it, so naming an account never changes whether it
+    /// is exempt. Never serialized.
+    #[serde(skip)]
+    pub identity: Option<String>,
     pub driver: String,
     pub plan: Option<String>,
     pub five_hour_percent: Option<f64>,
@@ -145,6 +150,10 @@ impl LimitsPolicy {
                 .as_ref()
                 .is_some_and(|name| self.exempt_accounts.contains(name))
             || self.exempt_accounts.contains(&episode_account(limit))
+            || limit
+                .identity
+                .as_ref()
+                .is_some_and(|label| self.exempt_accounts.contains(label))
     }
 }
 
@@ -181,6 +190,7 @@ pub(crate) fn reading(origin: &str, body: &Value) -> Option<(AccountLimit, Strin
             account: account.clone(),
             account_ref,
             identified,
+            identity: None,
             driver,
             plan: fields["plan"].as_str().map(str::to_owned),
             five_hour_percent: percent("five_hour_percent"),
@@ -468,6 +478,17 @@ pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLi
                 .or_insert_with(|| declared.clone());
         }
     }
+    // A declaration may claim a provider label as the account's own: every reading under it, from
+    // any seat, is that account's.
+    for declared in declared_accounts_at(connection)? {
+        for identity in &declared.identities {
+            if let Some((driver, _)) = identity.split_once('/') {
+                alias
+                    .entry((driver.to_owned(), identity.clone()))
+                    .or_insert_with(|| declared.name.clone());
+            }
+        }
+    }
     let resolve = |driver: String, account: String, account_ref: String| -> Key {
         match alias.get(&(driver.clone(), account.clone())) {
             Some(declared) if account_ref.is_empty() => (
@@ -486,8 +507,10 @@ pub(super) fn account_limits_at(connection: &Connection) -> Result<Vec<AccountLi
             continue;
         };
         limit.measured_by = subject;
+        let aliased = account_ref.is_empty().then(|| account.clone());
         let key = resolve(driver, account, account_ref);
         if let Some(declared) = &key.2 {
+            limit.identity = aliased.filter(|raw| *raw != key.1);
             limit.account = key.1.clone();
             limit.account_ref = Some(declared.clone());
             limit.identified = true;

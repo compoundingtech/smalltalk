@@ -37,14 +37,18 @@ pub(super) fn validate(request: &CollectionSubscribe) -> Result<(), ApiError> {
 
 /// Shared serialization keeps the HTTP and followed usage reports identical.
 pub(super) fn usage_value(store: &Store, since_ms: u64, until_ms: u64) -> anyhow::Result<Value> {
-    let (mut rows, agent_messages) = store.usage_period_report(since_ms, until_ms)?;
+    let crate::store::AttributedUsage {
+        mut rows,
+        agent_messages,
+        limits,
+        accounts,
+    } = store.attributed_usage(since_ms, until_ms)?;
     for row in &mut rows {
         if let Some(fields) = row.as_object_mut() {
             fields.retain(|_, value| value.as_str() != Some(""));
         }
     }
-    let limits = store
-        .account_limits()?
+    let limits = limits
         .into_iter()
         .map(|limit| {
             let mut value = serde_json::to_value(limit).expect("account limit is serializable");
@@ -55,7 +59,7 @@ pub(super) fn usage_value(store: &Store, since_ms: u64, until_ms: u64) -> anyhow
         })
         .collect::<Vec<_>>();
     Ok(
-        json!({"since_ms":since_ms, "until_ms":until_ms, "rows":rows, "limits":limits, "agent_messages":agent_messages}),
+        json!({"since_ms":since_ms, "until_ms":until_ms, "rows":rows, "limits":limits, "accounts":accounts, "agent_messages":agent_messages}),
     )
 }
 

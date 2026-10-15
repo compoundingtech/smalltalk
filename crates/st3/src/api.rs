@@ -12922,16 +12922,13 @@ async fn get_usage(
         )));
     }
     let store = state.store.clone();
-    let (rows, agent_messages, limits) = blocking_store(move || {
-        let (rows, agent_messages) = store.usage_period_report(since_ms, until_ms)?;
-        Ok((
-            rows,
-            agent_messages,
-            store.account_limits()?,
-        ))
-    })
-    .await?;
-    let mut report = json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "agent_messages": agent_messages});
+    let crate::store::AttributedUsage {
+        rows,
+        agent_messages,
+        limits,
+        accounts,
+    } = blocking_store(move || store.attributed_usage(since_ms, until_ms)).await?;
+    let mut report = json!({"since_ms": since_ms, "until_ms": until_ms, "rows": rows, "limits": limits, "accounts": accounts, "agent_messages": agent_messages});
     // The policy as the config file says now, so `st usage` shows which accounts it never stops.
     let reloaded = tokio::task::spawn_blocking(crate::config::reload_daemon_limits)
         .await

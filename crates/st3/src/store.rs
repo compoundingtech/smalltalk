@@ -162,6 +162,8 @@ pub(crate) use mission_eligibility::MISSING_AGENT_CONDITION;
 mod revision_seats;
 pub(crate) mod delegation;
 mod limits;
+mod usage_accounts;
+pub use usage_accounts::AttributedUsage;
 mod database_size;
 pub use database_size::DatabaseSize;
 mod person_work;

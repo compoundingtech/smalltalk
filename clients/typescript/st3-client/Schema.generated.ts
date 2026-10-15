@@ -1935,6 +1935,30 @@ export const UnknownResource = /*#__PURE__*/ (() => Schema.Struct({
 export type UnknownResource = typeof UnknownResource.Type
 export type UnknownResourceEncoded = typeof UnknownResource.Encoded
 
+/** An api-key account's spend so far in the UTC calendar month of the period's end, against its monthly budget. Costs are API-equivalent; tokens with no price are counted apart, never as free. */
+export const UsageCredits = /*#__PURE__*/ (() => Schema.Struct({
+  "budget_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "period_start_ms": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "unpriced_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  "used_microusd": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))
+}).annotate({ identifier: "UsageCredits", description: "An api-key account's spend so far in the UTC calendar month of the period's end, against its monthly budget. Costs are API-equivalent; tokens with no price are counted apart, never as free." }))()
+export type UsageCredits = typeof UsageCredits.Type
+export type UsageCreditsEncoded = typeof UsageCredits.Encoded
+
+export const UsageAccount = /*#__PURE__*/ (() => Schema.Struct({
+  /** The label its usage rows and limits carry, joining them to this account. */
+  "account": optionalKey(Schema.String).annotate({ description: "The label its usage rows and limits carry, joining them to this account." }),
+  "credits": optionalKey(UsageCredits),
+  "driver": optionalKey(Schema.String),
+  "kind": Schema.Literals(["subscription","api-key"]),
+  /** The declared name, like nathan/claude-1. */
+  "name": Schema.String.annotate({ description: "The declared name, like nathan/claude-1." }),
+  "plan": optionalKey(Schema.String),
+  "provider": Schema.String
+}).annotate({ identifier: "UsageAccount" }))()
+export type UsageAccount = typeof UsageAccount.Type
+export type UsageAccountEncoded = typeof UsageAccount.Encoded
+
 export const UsageLimit = /*#__PURE__*/ (() => Schema.Struct({
   "account": Schema.String,
   "account_ref": optionalKey(Schema.String),
@@ -1985,6 +2009,8 @@ export type UsagePricingEncoded = typeof UsagePricing.Encoded
 
 export const UsageRow = /*#__PURE__*/ (() => Schema.Struct({
   "account": optionalKey(Schema.String),
+  /** The declared account this row's spend is read against, when one claims its label. Absent on older servers. */
+  "account_ref": optionalKey(Schema.String).annotate({ description: "The declared account this row's spend is read against, when one claims its label. Absent on older servers." }),
   "agent": Id,
   "cache_write_1h_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   "cache_write_tokens": Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
@@ -2007,6 +2033,8 @@ export type UsageRow = typeof UsageRow.Type
 export type UsageRowEncoded = typeof UsageRow.Encoded
 
 export const UsagePeriod = /*#__PURE__*/ (() => Schema.Struct({
+  /** Every declared account in name order, so each panel lists the same accounts. Absent on older servers. */
+  "accounts": optionalKey(Schema.Array(UsageAccount)).annotate({ description: "Every declared account in name order, so each panel lists the same accounts. Absent on older servers." }),
   "agent_messages": optionalKey(AgentMessageEstimate),
   "limits": optionalKey(Schema.Array(UsageLimit)),
   "rows": Schema.Array(UsageRow),

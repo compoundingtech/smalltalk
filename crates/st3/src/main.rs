@@ -10983,6 +10983,50 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or(&[]);
+    let declared_accounts = report["accounts"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if !declared_accounts.is_empty() && only.is_none() {
+        // Every declared account, whether or not it spent or reported a limit, so a missing
+        // account is visible as missing and never as absent from the list.
+        output.push('\n');
+        let _ = writeln!(
+            output,
+            "ACCOUNTS  {} · every declared account",
+            declared_accounts.len()
+        );
+        for account in declared_accounts {
+            let name = account["name"].as_str().unwrap_or("unknown");
+            let limit = limits
+                .iter()
+                .find(|limit| limit["account"] == account["account"] && !account["account"].is_null());
+            let dollars = |microusd: &Value| {
+                format!("${}", microusd.as_u64().unwrap_or(0) / 1_000_000)
+            };
+            let detail = if let Some(credits) = account.get("credits") {
+                format!(
+                    "credits {}{} of {} this month",
+                    dollars(&credits["used_microusd"]),
+                    if credits["unpriced_tokens"].as_u64().unwrap_or(0) > 0 { "+" } else { "" },
+                    dollars(&credits["budget_microusd"])
+                )
+            } else if let Some(limit) = limit {
+                let weekly = limit["weekly_percent"]
+                    .as_f64()
+                    .map_or_else(|| "?".to_owned(), |value| format!("{value:.0}%"));
+                let reset = limit["weekly_resets_at_unix_ms"]
+                    .as_u64()
+                    .and_then(|at| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at as i64))
+                    .map_or_else(String::new, |at| format!(" resets {}", at.format("%Y-%m-%d %H:%M UTC")));
+                let stale = if limit["stale"].as_bool() == Some(true) { "  stale" } else { "" };
+                format!("weekly {weekly}{reset}{stale}")
+            } else {
+                "no limits reported".to_owned()
+            };
+            let _ = writeln!(output, "{name}  {detail}");
+        }
+    }
     if !limits.is_empty() && only.is_none() {
         let percent = |value: &Value| {
             value
@@ -11050,6 +11094,11 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
     let declared = limits
         .iter()
         .filter_map(|limit| Some((limit["account"].as_str()?, limit["account_ref"].as_str()?)))
+        .chain(
+            declared_accounts
+                .iter()
+                .filter_map(|account| Some((account["account"].as_str()?, account["name"].as_str()?))),
+        )
         .collect::<BTreeMap<_, _>>();
     let groups = only
         .map(|by| vec![by])
@@ -27940,6 +27989,30 @@ mod tests {
         let output = render_usage_report(&report, 24, None);
         assert!(output.contains("  ada/claude-1 (claude/aaaa)  stale\n"), "{output}");
         assert!(output.contains("  claude/bbbb\n"), "{output}");
+    }
+
+    #[test]
+    fn usage_lists_every_declared_account_with_its_limit_or_credits() {
+        let report = json!({
+            "rows": [],
+            "limits": [
+                {"account": "claude/aaaa", "account_ref": "ada/claude-1", "weekly_percent": 24.0,
+                 "weekly_resets_at_unix_ms": 1_799_500_000_000_u64, "stale": false,
+                 "measured_at_unix_ms": 1_799_000_000_000_u64},
+            ],
+            "accounts": [
+                {"name": "ada/claude-1", "account": "claude/aaaa", "provider": "anthropic", "kind": "subscription"},
+                {"name": "ada/claude-2", "account": "claude/bbbb", "provider": "anthropic", "kind": "subscription"},
+                {"name": "ada/key", "account": "omp/cccc", "provider": "anthropic", "kind": "api-key",
+                 "credits": {"budget_microusd": 200_000_000_u64, "used_microusd": 154_300_000_u64,
+                             "unpriced_tokens": 7, "period_start_ms": 0}},
+            ],
+        });
+        let output = render_usage_report(&report, 24, None);
+        assert!(output.contains("ACCOUNTS  3 · every declared account\n"), "{output}");
+        assert!(output.contains("ada/claude-1  weekly 24% resets 2027-01-09 "), "{output}");
+        assert!(output.contains("ada/claude-2  no limits reported\n"), "{output}");
+        assert!(output.contains("ada/key  credits $154+ of $200 this month\n"), "{output}");
     }
 
     #[test]

@@ -221,6 +221,7 @@ fn usage() -> Vec<st3_client::UsageRow> {
         } else {
             "anthropic"
         })),
+        account_ref: None,
         host: Some(s(host)),
         pricing: Some(s("list-2026-10-02")),
         native_session_id: None,
