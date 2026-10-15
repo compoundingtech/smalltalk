@@ -49,6 +49,7 @@
     ["store", "api"],
     ["store", "reconcile"],
     ["suspension", "store"],
-    ["telemetry", "driver_hook"]
+    ["telemetry", "driver_hook"],
+    ["tiles", "sekrets"]
   ]
 }
