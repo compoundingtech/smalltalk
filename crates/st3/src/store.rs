@@ -46,6 +46,8 @@ mod card_fold_tests;
 #[cfg(test)]
 mod roster_controls;
 #[cfg(test)]
+mod roster_fresh_proof_tests;
+#[cfg(test)]
 mod agents_window_deadline_tests;
 pub(crate) mod step_labels;
 mod operation_audit;
@@ -3689,6 +3691,61 @@ impl Store {
         Ok(match self.changed_agent_resources(cut, index, &items)? {
             AgentResourcesChange::Delta(delta) => delta.subjects.is_empty() && !delta.queues && !delta.membership,
             AgentResourcesChange::Invalidated { .. } => false,
+        })
+    }
+
+    /// The unchanged-card proof for the exact complete publication a response selected,
+    /// rather than the newest one when the proof happens to run. No fold or write occurs.
+    /// Keep the original wait predicate above unchanged: this is an additional observation
+    /// for the served rows, not a new freshness/refresh admission policy.
+    pub(crate) fn served_agent_roster_unchanged_through(
+        &self,
+        through: u64,
+        history: bool,
+        cut: u64,
+        published_at: u128,
+        cards: &Arc<Vec<Value>>,
+    ) -> Result<bool> {
+        if self.smalltalk.agent_roster_refresh.get().is_none()
+            || self.agent_roster_faults_pending(history)
+        {
+            return Ok(false);
+        }
+        self.read_snapshot(|physical| {
+            if cut > through || through > physical {
+                return Ok(false);
+            }
+            let Some((local, valid_until)) = self
+                .smalltalk
+                .agent_resources_cache
+                .lock()
+                .expect("agent resources cache poisoned")
+                .iter()
+                .find(|entry| {
+                    entry.history == history
+                        && entry.covered.is_none()
+                        && entry.index == cut
+                        && entry.published_at_unix_ms == published_at
+                        && Arc::ptr_eq(&entry.items, cards)
+                })
+                .map(|entry| (entry.local, entry.valid_until_unix_ms))
+            else {
+                return Ok(false);
+            };
+            if valid_until.is_some_and(|expiry| now_ms() >= expiry)
+                || roster_local_frontier(&self.readers.get(), through)? != local
+            {
+                return Ok(false);
+            }
+            if cut == through {
+                return Ok(true);
+            }
+            Ok(match self.changed_agent_resources(cut, through, cards)? {
+                AgentResourcesChange::Delta(delta) => {
+                    delta.subjects.is_empty() && !delta.queues && !delta.membership
+                }
+                AgentResourcesChange::Invalidated { .. } => false,
+            })
         })
     }
 

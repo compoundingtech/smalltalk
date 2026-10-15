@@ -5486,8 +5486,8 @@ async fn client_agents(
 }
 
 /// An agents page from the refresher's publications. A first page answers at once from the
-/// newest one, or says not ready; one that asks for a fresh roster first waits briefly for a
-/// roster at or after its own cut. A
+/// newest one, or says not ready; a fresh read briefly waits for its cut or for proof that
+/// a complete publication's cards are unchanged through it. A
 /// continuation answers from the roster published at exactly its first page's cut, or says the
 /// page expired. Neither folds a card.
 async fn client_agents_published(
@@ -5505,15 +5505,20 @@ async fn client_agents_published(
         .await?;
     }
     let fresh = query.fresh;
-    if fresh {
+    let fresh_wait = if fresh {
         let waited = Instant::now();
-        wait_for_agent_roster(&state.store, query.history).await;
+        let outcome = wait_for_agent_roster(&state.store, query.history).await;
         record_roster_stage(request_latency::RosterStage::FreshWait, waited.elapsed());
-    }
+        Some(outcome)
+    } else {
+        None
+    };
     let reader = state.clone();
     let history = query.history;
     let built = Instant::now();
-    let page = blocking_roster(move || Ok(client_agents_published_page(&reader, &query, requested))).await;
+    let page = blocking_roster(move || {
+        Ok(client_agents_published_page(&reader, &query, requested, fresh_wait))
+    }).await;
     if fresh {
         record_roster_stage(request_latency::RosterStage::FreshPage, built.elapsed());
     }
@@ -5621,39 +5626,168 @@ fn client_agent_roster_head(store: &Store, index: u64) -> anyhow::Result<()> {
     client_agent_cards_selected(store, false, index, &head, false).map(drop)
 }
 
+/// The exit taken by the existing bounded fresh wait, including its unsuccessful exits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RosterFreshWaitOutcome {
+    Published,
+    Unchanged,
+    RefreshFailed,
+    Disconnected,
+    Timeout,
+    ReadFailed,
+}
+
+impl RosterFreshWaitOutcome {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::Unchanged => "unchanged",
+            Self::RefreshFailed => "refresh_failed",
+            Self::Disconnected => "disconnected",
+            Self::Timeout => "timeout",
+            Self::ReadFailed => "read_failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RosterFreshWait {
+    // This is obtained when the wait starts, and can be later than the request snapshot.
+    wanted: Option<u64>,
+    outcome: RosterFreshWaitOutcome,
+}
+
 /// For a read that asked to see what was written before it: wait, briefly, for the refresher
 /// to publish a roster at or after the current cut, unless no claim since the newest
 /// publication changes a card, so that a refresh would fold nothing. The read itself folds
-/// nothing.
-async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) {
-    let Ok(wanted) = store.index() else { return };
+/// nothing. The exit is reported separately from proof of the publication later served.
+async fn wait_for_agent_roster(store: &Arc<Store>, history: bool) -> RosterFreshWait {
+    let Ok(wanted) = store.index() else {
+        return RosterFreshWait {
+            wanted: None,
+            outcome: RosterFreshWaitOutcome::ReadFailed,
+        };
+    };
+    let publications = store.subscribe_agent_roster();
+    let outcome = wait_for_agent_roster_publications(store, history, wanted, publications).await;
+    RosterFreshWait {
+        wanted: Some(wanted),
+        outcome,
+    }
+}
+
+// A separate receiver lets a private control exercise the existing closed-channel exit.
+// Production always uses the Store receiver above; wait policy and deadline stay unchanged.
+async fn wait_for_agent_roster_publications(
+    store: &Arc<Store>,
+    history: bool,
+    wanted: u64,
+    mut publications: tokio::sync::watch::Receiver<u64>,
+) -> RosterFreshWaitOutcome {
     let published = |store: &Store| {
         let index = store.index().ok()?;
-        store.published_agent_roster(index, history).map(|(cut, _, _)| cut).or_else(|| {
-            (!history).then(|| store.published_agent_roster_head(index, 1)).flatten()
-                .map(|(cut, _, _, _)| cut)
-        })
+        store
+            .published_agent_roster(index, history)
+            .map(|(cut, _, _)| cut)
+            .or_else(|| {
+                (!history)
+                    .then(|| store.published_agent_roster_head(index, 1))
+                    .flatten()
+                    .map(|(cut, _, _, _)| cut)
+            })
     };
-    let mut publications = store.subscribe_agent_roster();
-    let _ = tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
+    tokio::time::timeout(AGENT_ROSTER_READ_WAIT, async {
         while published(store).is_none_or(|cut| cut < wanted) {
             store.request_fresh_agent_roster(history);
             if published(store).is_some() && store.agent_roster_refresh_failed() {
-                return;
+                return RosterFreshWaitOutcome::RefreshFailed;
             }
             // Claims on unrelated subjects move the cut all the time; the paced refresher
             // would publish the same cards. One bounded range read tells.
             let reader = Arc::clone(store);
             if let Ok(true) = blocking_store(move || {
                 reader.published_agent_roster_unchanged_through(wanted, history)
-            }).await {
-                return;
+            })
+            .await
+            {
+                return RosterFreshWaitOutcome::Unchanged;
             }
             if publications.changed().await.is_err() {
-                return;
+                return RosterFreshWaitOutcome::Disconnected;
             }
         }
-    }).await;
+        RosterFreshWaitOutcome::Published
+    })
+    .await
+    .unwrap_or(RosterFreshWaitOutcome::Timeout)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RosterUnchangedProof {
+    NotChecked,
+    Verified,
+    Refused,
+    ReadFailed,
+}
+
+impl RosterUnchangedProof {
+    fn name(self) -> &'static str {
+        match self {
+            Self::NotChecked => "not_checked",
+            Self::Verified => "verified",
+            Self::Refused => "refused",
+            Self::ReadFailed => "read_failed",
+        }
+    }
+}
+
+fn roster_fresh_served_proof(
+    store: &Store,
+    history: bool,
+    waited: RosterFreshWait,
+    served: Option<(u64, u128, &Arc<Vec<Value>>)>,
+) -> RosterUnchangedProof {
+    if waited.outcome != RosterFreshWaitOutcome::Unchanged {
+        return RosterUnchangedProof::NotChecked;
+    }
+    let Some(wanted) = waited.wanted else {
+        return RosterUnchangedProof::ReadFailed;
+    };
+    let Some((cut, published_at, cards)) = served else {
+        return RosterUnchangedProof::Refused;
+    };
+    match store.served_agent_roster_unchanged_through(wanted, history, cut, published_at, cards) {
+        Ok(true) => RosterUnchangedProof::Verified,
+        Ok(false) => RosterUnchangedProof::Refused,
+        Err(_) => RosterUnchangedProof::ReadFailed,
+    }
+}
+
+// The wait's exit alone is not a certificate for whichever publication the later worker
+// selects. Verify only the exact complete rows being served, within a read-only snapshot.
+// A failure/refusal is recorded honestly and does not change the existing response policy.
+fn record_roster_fresh_wait(
+    store: &Store,
+    history: bool,
+    waited: Option<RosterFreshWait>,
+    served: Option<(u64, u128, &Arc<Vec<Value>>)>,
+) {
+    let Some(waited) = waited else { return };
+    // Like the other detailed roster attributes, proof work is opt-in for a recording
+    // request. Untraced requests retain the existing read cost and response behavior.
+    if !crate::otel::roster_recording() {
+        return;
+    }
+    crate::otel::roster_attribute("st.roster.fresh_wait", waited.outcome.name());
+    if let Some(wanted) = waited.wanted {
+        crate::otel::roster_attribute("st.roster.fresh_wait_cut", wanted as i64);
+    }
+    let proof = roster_fresh_served_proof(store, history, waited, served);
+    crate::otel::roster_attribute("st.roster.fresh_proof", proof.name());
+    crate::otel::roster_attribute(
+        "st.roster.fresh_unchanged_verified",
+        proof == RosterUnchangedProof::Verified,
+    );
 }
 
 /// The snapshot of a roster published at `cut`: that cut, its time, and when it was folded.
@@ -5670,63 +5804,108 @@ fn client_agents_published_page(
     state: &AppState,
     query: &ClientListQuery,
     requested: u64,
+    fresh_wait: Option<RosterFreshWait>,
 ) -> Result<Option<ClientPageResponse>, ApiError> {
     let store = &state.store;
-    let current = store.index().map_err(ApiError::internal)?;
-    let index = current;
-    let Some((index, cards, published_at)) = store.published_agent_roster(index, query.history) else {
-        // Before the first complete roster, an unfiltered first page can come from its head.
-        if query.status.is_some() || query.history {
-            return Ok(None);
-        }
-        let Some((index, refs, head, published_at)) =
-            store.published_agent_roster_head(index, CLIENT_MAX_PAGE_ITEMS + 1)
+    // Keep one recording point after all ordinary returns, including errors. Retain an
+    // Arc only for traced requests; the proof still refers to the selected publication.
+    let recording = fresh_wait.is_some() && crate::otel::roster_recording();
+    let mut served = None;
+    let result = (|| {
+        let current = store.index().map_err(ApiError::internal)?;
+        let index = current;
+        let Some((index, cards, published_at)) = store.published_agent_roster(index, query.history)
         else {
-            return Ok(None);
-        };
-        store.request_agent_roster_refresh();
-        crate::otel::record_roster_read("published_head", requested, Some(index), query.fresh);
-        let snapshot = roster_snapshot(state, index, published_at);
-        let mut page = client_page_read(state, &snapshot, "agents", (*refs).clone(), query, true)?;
-        page.items = client_agent_cards_from_cached(
-            store, page_cards(&head, &page.items), &page.items, &snapshot.created_at,
-        )?;
-        return Ok(Some((Extension(snapshot), Json(page))));
-    };
-    // A roster older than the current cut, its local activity or its queue deadline needs a
-    // refresh; the newest one needs none.
-    if index < current || !store.agent_roster_current(current, query.history).map_err(ApiError::internal)? {
-        if query.history {
-            store.request_agent_roster_history();
-        } else {
+            // Before the first complete roster, an unfiltered first page can come from its head.
+            if query.status.is_some() || query.history {
+                return Ok(None);
+            }
+            let Some((index, refs, head, published_at)) =
+                store.published_agent_roster_head(index, CLIENT_MAX_PAGE_ITEMS + 1)
+            else {
+                return Ok(None);
+            };
             store.request_agent_roster_refresh();
+            crate::otel::record_roster_read("published_head", requested, Some(index), query.fresh);
+            // A partial head is not the complete publication used by unchanged-through.
+            let snapshot = roster_snapshot(state, index, published_at);
+            let mut page =
+                client_page_read(state, &snapshot, "agents", (*refs).clone(), query, true)?;
+            page.items = client_agent_cards_from_cached(
+                store,
+                page_cards(&head, &page.items),
+                &page.items,
+                &snapshot.created_at,
+            )?;
+            return Ok(Some((Extension(snapshot), Json(page))));
+        };
+        // A roster older than the current cut, its local activity or its queue deadline needs a
+        // refresh; the newest one needs none.
+        if index < current
+            || !store
+                .agent_roster_current(current, query.history)
+                .map_err(ApiError::internal)?
+        {
+            if query.history {
+                store.request_agent_roster_history();
+            } else {
+                store.request_agent_roster_refresh();
+            }
         }
-    }
-    let snapshot = roster_snapshot(state, index, published_at);
-    let path = if query.status.is_some() { "filtered_full" } else { "published_complete" };
-    crate::otel::record_roster_read(path, requested, Some(index), query.fresh);
-    if let Some(status) = query.status.as_deref() {
-        let mut cards = (*cards).clone();
-        overlay_agent_resources(store, &mut cards, &snapshot.created_at)
-            .map_err(ApiError::internal)?;
-        cards.retain(|card| card["state"].as_str() == Some(status));
-        let page = client_page_read(state, &snapshot, "agents", cards, query, true)?;
-        return Ok(Some((Extension(snapshot), Json(page))));
-    }
-    // Continuations keep the same membership, order and queue metadata as the exact path's
-    // refs, and read their cards from this same publication.
-    let refs = crate::otel::roster_phase("membership", || cards.iter().map(|card| {
-        let mut reference = serde_json::Map::new();
-        for field in ["id", "name", "host_id"].into_iter().chain(AGENT_QUEUE_FIELDS) {
-            reference.insert(field.to_owned(), card[field].clone());
+        let snapshot = roster_snapshot(state, index, published_at);
+        let path = if query.status.is_some() {
+            "filtered_full"
+        } else {
+            "published_complete"
+        };
+        crate::otel::record_roster_read(path, requested, Some(index), query.fresh);
+        if recording {
+            served = Some((index, published_at, Arc::clone(&cards)));
         }
-        Value::Object(reference)
-    }).collect::<Vec<_>>());
-    let mut page = client_page_read(state, &snapshot, "agents", refs, query, true)?;
-    page.items = client_agent_cards_from_cached(
-        store, page_cards(&cards, &page.items), &page.items, &snapshot.created_at,
-    )?;
-    Ok(Some((Extension(snapshot), Json(page))))
+        if let Some(status) = query.status.as_deref() {
+            let mut cards = (*cards).clone();
+            overlay_agent_resources(store, &mut cards, &snapshot.created_at)
+                .map_err(ApiError::internal)?;
+            cards.retain(|card| card["state"].as_str() == Some(status));
+            let page = client_page_read(state, &snapshot, "agents", cards, query, true)?;
+            return Ok(Some((Extension(snapshot), Json(page))));
+        }
+        // Continuations keep the same membership, order and queue metadata as the exact path's
+        // refs, and read their cards from this same publication.
+        let refs = crate::otel::roster_phase("membership", || {
+            cards
+                .iter()
+                .map(|card| {
+                    let mut reference = serde_json::Map::new();
+                    for field in ["id", "name", "host_id"]
+                        .into_iter()
+                        .chain(AGENT_QUEUE_FIELDS)
+                    {
+                        reference.insert(field.to_owned(), card[field].clone());
+                    }
+                    Value::Object(reference)
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut page = client_page_read(state, &snapshot, "agents", refs, query, true)?;
+        page.items = client_agent_cards_from_cached(
+            store,
+            page_cards(&cards, &page.items),
+            &page.items,
+            &snapshot.created_at,
+        )?;
+        Ok(Some((Extension(snapshot), Json(page))))
+    })();
+    record_roster_fresh_wait(
+        store,
+        query.history,
+        fresh_wait,
+        served
+            .as_ref()
+            .filter(|_| matches!(&result, Ok(Some(_))))
+            .map(|(cut, published_at, cards)| (*cut, *published_at, cards)),
+    );
+    result
 }
 
 /// A page continuing a first page served from a publication: its cards come from the roster
@@ -17150,6 +17329,8 @@ fn normalize_message_party(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod roster_fresh;
+
     use super::*;
     use axum::body::to_bytes;
     use axum::http::Request;
