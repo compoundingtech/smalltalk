@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Avoid transferring unused inventory buckets from the daemon to its replication worker for a recent-inbound authority comparison.",
+  "replay": { "status": "none", "detail": "No rebuild, replay or startup work is introduced." },
+  "schema": { "status": "none", "detail": "No storage schema, generation, index or migration changes." },
+  "rules": { "status": "none", "detail": "Admission, sealing, checkpoint, signature and retention rules are unchanged." },
+  "compatibility": { "status": "none", "detail": "The additive option is local-daemon only and omitted by default. Old local daemons return their existing full response to the same request. Ordinary summaries, the existing guard marker, signed peer messages, anti-entropy and retries retain their contracts." },
+  "downtime": { "status": "none", "detail": "No new operational step or restart requirement is introduced." },
+  "manual": { "status": "none", "detail": "No new setting or operator action is required." },
+  "recovery": { "status": "none", "detail": "No cached guard result is retained. Every call uses the existing fresh snapshot and error path; a missing digest does not authorize skipping an exchange." }
+}

@@ -49,6 +49,17 @@ pub trait Backend: Clone + Send + Sync + 'static {
         }
     }
 
+    /// Read the recent-inbound guard's scalar without requiring a process boundary to carry
+    /// every bucket. Backends without that local optimization keep the full summary path and
+    /// its errors, exactly once. The result is fresh at its read cut, not a promise about later
+    /// writes; callers must retain their existing change notifications and anti-entropy.
+    fn authority_digest(
+        &self,
+        fleet_id: &str,
+    ) -> impl Future<Output = Result<String>> + Send {
+        async move { Ok(self.guard_summary(fleet_id).await?.exchange.authority_digest) }
+    }
+
     /// Store a peer's exchange, then admit and project what it carried. `round_trip` is how
     /// long this worker's request that returned it took, when the exchange is a response.
     fn receive(
