@@ -297,6 +297,14 @@ pkgs.testers.runNixOSTest {
         )
     )
     machine.wait_for_file("/run/user/1000/st3.sock")
+    # The socket file appears while the daemon is still starting ("the API is not ready"), so the
+    # file is not readiness. Ready means a daemon API read answers: `st clients` is read-only and
+    # fails until then.
+    machine.wait_until_succeeds(
+        "ssh -o StrictHostKeyChecking=no -o BatchMode=yes -i /root/.ssh/id_ed25519 "
+        f"ada@localhost {shlex.quote(f'{st} clients')} >/dev/null 2>&1",
+        timeout=120,
+    )
     assert "can now use the profiles granted to them" in login("ada", f"{st} sekrets enable")
     login(
         "ada",
