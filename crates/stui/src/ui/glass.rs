@@ -599,7 +599,7 @@ enum Action {
     /// Every conversation simplified, or in full again (Ctrl+P).
     ToggleSimple,
     /// Agents open on their terminal, or on their conversation.
-    ToggleTerminalFirst,
+    ToggleConversationFirst,
     ToggleTerminalFallback,
     /// Ask for a name, for a glass to rename, make or copy.
     Name(Naming),
@@ -969,14 +969,14 @@ impl Ui {
             Action::ToggleSimple,
         ));
         choices.push(start(
-            if self.terminal_first() {
-                "Open agents on their conversation".into()
+            if self.conversation_first() {
+                "Conversation first: off (attach terminals)".into()
             } else {
-                "Open agents on their terminal".into()
+                "Conversation first: on".into()
             },
-            "this device; the conversation is the default",
-            "terminal conversation default view open agents attach tui".into(),
-            Action::ToggleTerminalFirst,
+            "this device; opening an agent attaches its terminal unless this is on",
+            "conversation first terminal default view open agents attach tui setting".into(),
+            Action::ToggleConversationFirst,
         ));
         choices.push(start(
             if self.terminal_fallback {
@@ -3018,7 +3018,7 @@ impl Ui {
             Action::NewTerminal => self.open_new_terminal(),
             Action::NewMission => self.open_new_mission(),
             Action::ToggleSimple => self.toggle_simple(),
-            Action::ToggleTerminalFirst => self.toggle_terminal_first(),
+            Action::ToggleConversationFirst => self.toggle_conversation_first(),
             Action::ToggleTerminalFallback => self.toggle_terminal_fallback(),
             Action::Said { agent, query } => {
                 self.open_in_glass(Pane::Agent(Some(agent.clone())), how);
@@ -3959,7 +3959,7 @@ impl Ui {
         // A message box belongs to the pane it was opened in: once another pane or tab has the
         // focus, typing must not go on into a draft nobody can see (Nathan, 2026-10-07).
         if before != (self.tab, self.selected_id()) {
-            if self.terminal_first
+            if !self.conversation_first()
                 && let Some(Pane::Agent(Some(id))) = self.focused_pane()
                 && id.starts_with("agent/")
             {
@@ -4648,14 +4648,12 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_first_device_attaches_an_agent_after_the_tab_stays_in_front() {
-        // Nathan, 2026-10-07: a setting for the terminal as the default view; the conversation
-        // stays the default, and flicking through tabs attaches nothing.
+    fn opening_an_agent_attaches_its_terminal_unless_this_device_chose_conversation_first() {
+        // 2026-10-15: attaching is the default and conversation first the setting; flicking
+        // through tabs attaches nothing.
         let mut ui = glass();
         ui.live = true;
-        assert!(!ui.terminal_first(), "the conversation is the default");
-        ui.toggle_terminal_first();
-        assert!(ui.terminal_first());
+        assert!(!ui.conversation_first(), "attaching is the default");
         ui.open_in_glass(
             Pane::Agent(Some("agent/example/atlas/builder".to_owned())),
             Open::Tab,
@@ -4670,18 +4668,58 @@ mod tests {
         ui.show_tab(1);
         ui.step_default_view();
         assert!(ui.effects.is_empty(), "{:?}", ui.effects);
-        // Staying on it does.
+        // Staying on it does, and the tab is the terminal now.
         ui.show_tab(0);
-        std::thread::sleep(std::time::Duration::from_millis(350));
+        std::thread::sleep(ATTACH_DWELL + std::time::Duration::from_millis(50));
         ui.step_default_view();
         assert!(
             ui.effects.iter().any(|effect| matches!(effect, Effect::OpenTerminal { agent } if agent == "agent/example/atlas/builder")),
             "{:?}",
             ui.effects
         );
-        // Switched back, the conversation is the default again.
-        ui.toggle_terminal_first();
-        assert!(!ui.terminal_first());
+        assert_eq!(
+            ui.focused_pane(),
+            Some(Pane::Terminal("agent/example/atlas/builder".into()))
+        );
+        // Conversation first: the same agent opens on its conversation.
+        let mut ui = glass();
+        ui.live = true;
+        ui.toggle_conversation_first();
+        assert!(ui.conversation_first());
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".to_owned())),
+            Open::Tab,
+        );
+        ui.effects.clear();
+        std::thread::sleep(ATTACH_DWELL + std::time::Duration::from_millis(50));
+        ui.step_default_view();
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+        assert_eq!(
+            ui.focused_pane(),
+            Some(Pane::Agent(Some("agent/example/atlas/builder".into())))
+        );
+    }
+
+    #[test]
+    fn an_agent_without_a_terminal_opens_its_conversation_and_says_nothing() {
+        let mut ui = glass();
+        ui.live = true;
+        let id = ui
+            .world
+            .agents
+            .items()
+            .iter()
+            .find(|agent| !agent.terminal || agent.unmanaged)
+            .map(|agent| agent.id.clone())
+            .expect("the demo has an agent without a terminal");
+        ui.open_in_glass(Pane::Agent(Some(id.clone())), Open::Tab);
+        ui.effects.clear();
+        ui.flash = None;
+        std::thread::sleep(ATTACH_DWELL + std::time::Duration::from_millis(50));
+        ui.step_default_view();
+        assert!(ui.effects.is_empty(), "{:?}", ui.effects);
+        assert!(ui.flash.is_none(), "{:?}", ui.flash);
+        assert_eq!(ui.focused_pane(), Some(Pane::Agent(Some(id))));
     }
 
     #[test]

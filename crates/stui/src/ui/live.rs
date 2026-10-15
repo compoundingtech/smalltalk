@@ -519,11 +519,8 @@ pub fn run(context: Context) -> Result<()> {
     let mut terminal_runtimes_by_agent: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // The fleet host that owns each opened terminal, so a dropped stream attaches again directly.
     let mut terminal_owners: BTreeMap<String, String> = BTreeMap::new();
-    // Attaching a dropped terminal again: whether a try is out, and how many failed.
-    let mut reattaching = false;
     // When a terminal was asked for, while it connects: the wait is shown, and a long one named.
     let mut attach_started: Option<Instant> = None;
-    let mut reattach_tries = 0_u32;
     // The cursor shape last set, so it changes only when the attached terminal asks.
     let mut cursor_style: Option<crossterm::cursor::SetCursorStyle> = None;
     // The tab shown on the last pass: opening a tab loads what only it needs.
@@ -1151,7 +1148,6 @@ pub fn run(context: Context) -> Result<()> {
                     ui.flash(format!("Attached · {route}"));
                 }
                 Fetched::Reattached { agent, outcome } => {
-                    reattaching = false;
                     if let Some(native) = ui
                         .terminal_view(&agent)
                         .and_then(|view| view.native.as_ref())
@@ -1160,7 +1156,7 @@ pub fn run(context: Context) -> Result<()> {
                             Ok(direct) => native.reconnect(direct.stream, &direct.name),
                             Err(reason) if reason.contains("restarted") => native.give_up(reason),
                             // Still unreachable: the next try waits longer.
-                            Err(_) => reattach_tries += 1,
+                            Err(reason) => native.retry_failed(reason),
                         }
                     }
                 }
@@ -1888,25 +1884,12 @@ pub fn run(context: Context) -> Result<()> {
             });
         }
         // A stream that dropped while the program ran attaches again, to the same incarnation,
-        // after a wait that grows with each try.
-        if !reattaching
-            && extras.live
-            && let Some((view, native)) = ui
-                .terminal
-                .iter()
-                .chain(ui.parked.iter())
-                .filter_map(|view| view.native.as_ref().map(|native| (view, native)))
-                .find(|(_, native)| {
-                    native.dropped().is_some_and(|at| {
-                        at.elapsed() >= Duration::from_secs(2_u64.pow(reattach_tries.min(5)))
-                    })
-                })
+        // after a wait that grows with each try (`pty::retry_delay`).
+        if extras.live
+            && let Some((agent, expected)) = ui.reattach_due()
         {
-            reattaching = true;
             let client = client.clone();
             let tx = fetched_tx.clone();
-            let agent = view.agent.clone();
-            let expected = native.incarnation.clone();
             let runtime_ids = terminal_runtimes_by_agent
                 .get(&agent)
                 .cloned()
@@ -1925,14 +1908,6 @@ pub fn run(context: Context) -> Result<()> {
                 .await;
                 let _ = tx.send(Fetched::Reattached { agent, outcome });
             });
-        }
-        if ui
-            .terminal
-            .iter()
-            .chain(ui.parked.iter())
-            .all(|view| view.native.is_none())
-        {
-            reattach_tries = 0;
         }
         ui.terminal_requests();
         // While an attached terminal's output flows, or voice listens, draw it as it comes.

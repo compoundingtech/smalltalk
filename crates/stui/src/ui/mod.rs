@@ -25,6 +25,9 @@ mod hyperlinks;
 #[cfg(test)]
 #[path = "../../tests/support/terminal_tab.rs"]
 mod terminal_tab;
+#[cfg(test)]
+#[path = "../../tests/support/attach_default.rs"]
+mod attach_default;
 pub use glass::set_glasses_version;
 pub use lastrun::log_panics as lastrun_log_panics;
 pub use lastrun::note_exit as lastrun_note_exit;
@@ -350,9 +353,22 @@ struct ChatState {
     editing: bool,
 }
 
-/// How long an agent's tab stays in front before its terminal attaches, on a device that opens
-/// agents on their terminal: flicking through tabs attaches nothing.
+/// How long an agent's tab stays in front before its terminal attaches (unless this device
+/// opens agents on their conversation): flicking through tabs attaches nothing.
 const ATTACH_DWELL: Duration = Duration::from_millis(300);
+
+/// What a terminal whose link dropped says while it gets back: the reason, the try it is on or
+/// the wait before the next, and the key to the conversation.
+fn reconnecting_status(reason: &str, tries: u32, next: Option<Instant>) -> String {
+    let doing = match next {
+        None => format!("attaching again (try {tries})"),
+        Some(at) => {
+            let wait = at.saturating_duration_since(Instant::now()).as_secs() + 1;
+            format!("try {} in {wait}s", tries + 1)
+        }
+    };
+    format!("reconnecting: {reason} · {doing} · Ctrl+\\ conversation")
+}
 
 /// How long a second Ctrl+T may follow the first and leave the terminal.
 /// How many closed items Home keeps listed under "Recently closed".
@@ -411,8 +427,9 @@ pub struct Ui {
     /// Conversations scrolled up to their oldest entry since the last frame: each asks st for
     /// the page before it.
     older_wanted: RefCell<BTreeSet<String>>,
-    /// This device opens an agent's tab on its terminal, not its conversation (a setting).
-    terminal_first: bool,
+    /// This device opens an agent's tab on its conversation rather than attaching its terminal:
+    /// its own choice, or `None` when it never chose and the terminal attaches.
+    conversation_first: Option<bool>,
     /// This device permits the daemon after a failed direct terminal route.
     pub(crate) terminal_fallback: bool,
     /// The agent whose tab just took the focus, and when: its terminal attaches once the tab has
@@ -745,7 +762,7 @@ impl Ui {
             acted: HashSet::new(),
             closed: HashSet::new(),
             older_wanted: RefCell::default(),
-            terminal_first: false,
+            conversation_first: None,
             terminal_fallback: true,
             attach_when: None,
             popover: None,
@@ -922,7 +939,7 @@ impl Ui {
             // chose the full view keeps it.
             let loaded = prefs::load(&path);
             self.simple = simplified(&loaded);
-            self.terminal_first = loaded.terminal_first == Some(true);
+            self.conversation_first = prefs::conversation_first(&loaded);
             self.terminal_fallback = loaded.terminal_fallback != Some(false);
         }
     }
@@ -1008,7 +1025,8 @@ impl Ui {
                 &path,
                 &prefs::Prefs {
                     simple: Some(self.simple),
-                    terminal_first: Some(self.terminal_first),
+                    terminal_first: self.conversation_first.map(|first| !first),
+                    conversation_first: self.conversation_first,
                     terminal_fallback: Some(self.terminal_fallback),
                 },
             );
@@ -1026,25 +1044,26 @@ impl Ui {
         });
     }
 
-    /// Open an agent's tab on its terminal, or on its conversation (the default): this device's
-    /// choice, remembered.
-    pub(crate) fn toggle_terminal_first(&mut self) {
-        self.terminal_first = !self.terminal_first;
+    /// Open an agent's tab on its conversation, or attach its terminal (the default): this
+    /// device's choice, remembered.
+    pub(crate) fn toggle_conversation_first(&mut self) {
+        self.conversation_first = Some(!self.conversation_first());
         self.save_prefs();
-        self.flash(if self.terminal_first {
-            "Agents open on their terminal · the conversation is a key away (Ctrl+\\ leaves the terminal)"
+        self.flash(if self.conversation_first() {
+            "Conversation first: agents open on their conversation · Ctrl+] attaches the terminal"
         } else {
-            "Agents open on their conversation · Ctrl+] attaches the terminal"
+            "Agents attach their terminal when opened · Ctrl+\\ shows the conversation"
         });
     }
 
-    /// Whether this device opens agents on their terminal.
-    pub(crate) fn terminal_first(&self) -> bool {
-        self.terminal_first
+    /// Whether this device opens agents on their conversation instead of attaching.
+    pub(crate) fn conversation_first(&self) -> bool {
+        self.conversation_first == Some(true)
     }
 
-    /// Attach the terminal of an agent whose tab has been in front for a moment, when this device
-    /// opens agents on their terminal.
+    /// Attach the terminal of an agent whose tab has been in front for a moment, unless this
+    /// device opens agents on their conversation. An agent without a terminal (a session st did
+    /// not start, a harness with none) stays on its conversation, and nothing is said.
     pub(crate) fn step_default_view(&mut self) {
         let Some((id, at)) = &self.attach_when else {
             return;
@@ -1057,8 +1076,15 @@ impl Ui {
         let still_here = matches!(self.focused_pane(), Some(Pane::Agent(Some(ref now))) if *now == id);
         let attached = self.terminal.as_ref().is_some_and(|view| view.agent == id)
             || self.parked.iter().any(|view| view.agent == id);
-        if still_here && !attached && !self.editing && self.terminal_first {
-            self.attach_terminal(&id);
+        let has_terminal = self
+            .world
+            .agents
+            .items()
+            .iter()
+            .any(|agent| agent.id == id && agent.terminal && !agent.unmanaged);
+        if still_here && !attached && !self.editing && !self.conversation_first() && has_terminal {
+            // The tab turns into the terminal, as Ctrl+] does; Ctrl+\ turns it back.
+            self.open_terminal();
         }
     }
 
@@ -3305,8 +3331,15 @@ impl Ui {
                     .terminal
                     .as_ref()
                     .is_some_and(|view| view.agent == agent);
+            // The link dropped while the agent ran: what happened and what comes next, never a
+            // bare spinner, and the conversation one key away.
+            let lost = native.lost().zip(native.reconnecting());
             let status = match (native.ended(), native.attached(), scrolled) {
                 (Some(reason), _, _) => format!("ended: {reason}"),
+                (None, _, _) if lost.is_some() => {
+                    let (reason, (tries, next)) = lost.unwrap_or_default();
+                    reconnecting_status(&reason, tries, next)
+                }
                 (None, false, _) => "attaching…".into(),
                 (None, true, 0) if selection_here => {
                     "selection on · drag copies · ctrl+alt+s resumes program mouse".into()
@@ -3339,9 +3372,11 @@ impl Ui {
             ]);
             buf.set_line(area.x, area.y, &header, area.width);
             self.hit(Rect { height: 1, ..area }, Hit::Detach);
+            // What waits on the person is on top of the terminal, never hidden by it.
+            let band = self.terminal_alert_band(buf, area, agent);
             let body = Rect {
-                y: area.y + 1,
-                height: area.height.saturating_sub(1),
+                y: area.y + 1 + band,
+                height: area.height.saturating_sub(1 + band),
                 ..area
             };
             // Where the mouse maps and where a new attach starts is the focused terminal's body;
@@ -3393,7 +3428,9 @@ impl Ui {
         let status = match (&view.ended, &view.stale) {
             (Some(reason), _) => format!("ended: {reason}"),
             (None, Some(reason)) if view.lines.is_empty() => format!("{reason}…"),
-            (None, Some(reason)) => format!("not current, reconnecting: {reason}"),
+            (None, Some(reason)) => {
+                format!("not current, reconnecting: {reason} · Ctrl+\\ conversation")
+            }
             (None, None) => "Ctrl-C and Ctrl-D need a second press to reach the agent".into(),
         };
         buf.set_stringn(
@@ -3403,6 +3440,20 @@ impl Ui {
             area.width as usize,
             theme::dim(),
         );
+        let band = self.terminal_alert_band(
+            buf,
+            Rect {
+                y: area.y + 1,
+                height: area.height.saturating_sub(1),
+                ..area
+            },
+            agent,
+        );
+        let area = Rect {
+            y: area.y + band,
+            height: area.height.saturating_sub(band),
+            ..area
+        };
         let rows = area.height.saturating_sub(2) as usize;
         let skip = terminal_rows_skipped(view.lines.len(), rows, view.cursor);
         for (offset, line) in view.lines.iter().skip(skip).take(rows).enumerate() {
@@ -3420,6 +3471,38 @@ impl Ui {
                 cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
             }
         }
+    }
+
+    /// Draw `agent`'s alerts under the first row of `area`, the attached terminal's pane, and
+    /// return the rows they take. Only the mouse reaches them, as in the conversation: every key
+    /// still goes to the terminal, so typing can never answer an alert by accident. A shell has
+    /// none; the band never takes more than half the pane.
+    fn terminal_alert_band(&self, buf: &mut Buffer, area: Rect, agent: &str) -> u16 {
+        if !agent.starts_with("agent/") || area.height < 6 {
+            return 0;
+        }
+        let mut band = self.alert_band(agent, area.width as usize);
+        band.truncate((area.height as usize / 2).max(1));
+        for (offset, row) in band.iter().enumerate() {
+            let y = area.y + 1 + offset as u16;
+            buf.set_style(
+                Rect { y, height: 1, ..area },
+                Style::default().bg(theme::SURFACE0),
+            );
+            buf.set_line(area.x, y, &row.line, area.width);
+            for (column, width, hit) in &row.hits {
+                self.hit(
+                    Rect {
+                        x: area.x + column,
+                        y,
+                        width: (*width).min(area.width.saturating_sub(*column)),
+                        height: 1,
+                    },
+                    hit.clone(),
+                );
+            }
+        }
+        band.len() as u16
     }
 
     /// Whether the attached terminal is a shell rather than an agent's.
@@ -3772,7 +3855,18 @@ impl Ui {
                     "this agent's details beside it (ctrl+i too, where the terminal tells it from tab)",
                 ),
                 ("drag", "select text in one pane; release copies it"),
-                ("ctrl+]  ctrl+\\  ctrl+t ctrl+t", "attach the agent's terminal; leave it (or Ctrl+T twice)"),
+                (
+                    "ctrl+]  ctrl+\\  ctrl+t ctrl+t",
+                    "attach the agent's terminal; leave it for the conversation (or Ctrl+T twice)",
+                ),
+                (
+                    "opening an agent",
+                    "attaches its terminal; \"Conversation first\" in the palette (ctrl+k) opens the conversation instead, on this device",
+                ),
+                (
+                    "click an alert",
+                    "over an attached terminal too: show it, answer it; every key still goes to the terminal",
+                ),
                 (
                     "ctrl+r  backspace",
                     "a message that was not sent: send it again; take it back to change",
@@ -5029,6 +5123,20 @@ impl Ui {
                     .set((body.height.max(1), body.width.max(1)));
             }
         }
+    }
+
+    /// A terminal whose lost stream is due to attach again, with the incarnation it must be; the
+    /// try is then under way (`pty::NativeTerminal::take_reattach`). One at a time.
+    pub(crate) fn reattach_due(&self) -> Option<(String, String)> {
+        self.terminal
+            .iter()
+            .chain(self.parked.iter())
+            .find_map(|view| {
+                let native = view.native.as_ref()?;
+                native
+                    .take_reattach()
+                    .then(|| (view.agent.clone(), native.incarnation.clone()))
+            })
     }
 
     /// Let go of `agent`'s terminal wherever it is attached; whether there was one.
