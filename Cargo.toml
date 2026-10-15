@@ -74,6 +74,57 @@ debug = 1
 [profile.test.package."*"]
 debug = 0
 
+# Optimize hot third-party code in dev/test while preserving assertions and the
+# existing no-debug-info dependency policy. Workspace crates retain opt-level 0.
+
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+debug = 0
+debug-assertions = true
+overflow-checks = true
+
+[profile.dev.package.sha2]
+opt-level = 3
+debug = 0
+debug-assertions = true
+overflow-checks = true
+
+[profile.dev.package.ring]
+opt-level = 3
+debug = 0
+debug-assertions = true
+overflow-checks = true
+
+[profile.dev.package.serde_json]
+opt-level = 3
+debug = 0
+debug-assertions = true
+overflow-checks = true
+
+[profile.test.package.libsqlite3-sys]
+opt-level = 3
+debug = 0
+debug-assertions = true
+overflow-checks = true
+
+[profile.test.package.sha2]
+opt-level = 3
+debug = 0
+debug-assertions = true
+overflow-checks = true
+
+[profile.test.package.ring]
+opt-level = 3
+debug = 0
+debug-assertions = true
+overflow-checks = true
+
+[profile.test.package.serde_json]
+opt-level = 3
+debug = 0
+debug-assertions = true
+overflow-checks = true
+
 [package]
 name = "st2"
 version.workspace = true
