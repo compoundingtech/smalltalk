@@ -165,13 +165,18 @@ export function alertsIn(items: readonly KeptAttention[], agentId: string, actor
   return openAlerts(items, actor).filter(item => alertConversations(item).includes(agentId));
 }
 
-/** A native prompt's answers, as its alert offers them; null when the alert offers none. */
-export type PromptAnswers = { target_id: string; episode: string; answers: Array<'allow' | 'deny'> };
+/**
+ * A native prompt's answers, as its alert offers them; null when the alert offers none. `allow`
+ * or `deny` a permission, `approve` or `deny` a plan, `answer` (the choices of a question, see
+ * `questionAnswer`) or `deny` a question, and a screen prompt's own answers (`use`, `use-all`,
+ * `skip`, `trust`, `exit`, `quit`).
+ */
+export type PromptAnswers = { target_id: string; episode: string; answers: string[] };
 export function promptAnswers(item: Pick<Attention, 'actions' | 'source_id'> & { episode?: string; action_parameters?: unknown }): PromptAnswers | null {
   if (!(item.actions as readonly string[]).includes('prompt.respond')) return null;
   const parameters = (item.action_parameters as Record<string, unknown> | undefined)?.['prompt.respond'] as { target_id?: unknown; episode?: unknown; answers?: unknown } | undefined;
   if (!parameters) return null;
-  const answers = (Array.isArray(parameters.answers) ? parameters.answers : []).filter((answer): answer is 'allow' | 'deny' => answer === 'allow' || answer === 'deny');
+  const answers = (Array.isArray(parameters.answers) ? parameters.answers : []).filter((answer): answer is string => typeof answer === 'string' && /^[a-z][a-z-]*$/.test(answer));
   if (!answers.length) return null;
   const target_id = typeof parameters.target_id === 'string' ? parameters.target_id : item.source_id;
   const episode = typeof parameters.episode === 'string' ? parameters.episode : item.episode ?? '';
@@ -179,7 +184,7 @@ export function promptAnswers(item: Pick<Attention, 'actions' | 'source_id'> & {
 }
 
 /** The call a harness recorded before it asked, in full: its tool and each input, lines intact. */
-export type PendingCall = { id: string; tool: string; lines: string[] };
+export type PendingCall = { id: string; tool: string; lines: string[]; input?: unknown };
 
 function inputLines(args: unknown): string[] {
   let value = args;
@@ -193,6 +198,11 @@ function inputLines(args: unknown): string[] {
     lines.push(`${key}: ${first}`, ...rest.map(line => `  ${line}`));
   }
   return lines;
+}
+
+function parsedInput(args: unknown): unknown {
+  if (typeof args !== 'string') return args;
+  try { return JSON.parse(args); } catch { return args; }
 }
 
 /**
@@ -210,16 +220,78 @@ export function pendingCalls(entries: ReadonlyArray<Pick<TimelineEntry, 'type' |
     const body = entry.body as { call_id?: unknown; name?: unknown; arguments?: unknown };
     const call = typeof body.call_id === 'string' ? body.call_id : entry.id;
     if (answered.has(call) || open.some(other => other.id === call)) continue;
-    open.push({ id: call, tool: typeof body.name === 'string' && body.name ? body.name : 'tool', lines: inputLines(body.arguments) });
+    open.push({ id: call, tool: typeof body.name === 'string' && body.name ? body.name : 'tool', lines: inputLines(body.arguments), input: parsedInput(body.arguments) });
   }
   return open;
 }
 
+/** One question of a harness's pending `AskUserQuestion` call. */
+export type PendingQuestion = { question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean };
+
+/** The questions of the one pending call, when it is an `AskUserQuestion` whose questions can be read. */
+export function pendingQuestions(calls: readonly PendingCall[]): PendingQuestion[] | null {
+  if (calls.length !== 1 || calls[0].tool !== 'AskUserQuestion') return null;
+  const asked = (calls[0].input as { questions?: unknown } | undefined)?.questions;
+  if (!Array.isArray(asked) || !asked.length) return null;
+  const questions: PendingQuestion[] = [];
+  for (const each of asked) {
+    const question = each as { question?: unknown; header?: unknown; options?: unknown; multiSelect?: unknown };
+    if (typeof question.question !== 'string' || !Array.isArray(question.options) || !question.options.length) return null;
+    const options = question.options.map(option => option as { label?: unknown; description?: unknown });
+    if (!options.every(option => typeof option.label === 'string' && option.label)) return null;
+    questions.push({
+      question: question.question,
+      header: typeof question.header === 'string' ? question.header : '',
+      options: options.map(option => ({ label: option.label as string, description: typeof option.description === 'string' ? option.description : '' })),
+      multiSelect: question.multiSelect === true,
+    });
+  }
+  return questions;
+}
+
 /**
- * The answers a client may offer: deny always; allow only when exactly one call is unanswered and
- * it is shown in full, since only then is it certain what an allow allows.
+ * The answer a question alert sends once every question has a choice: each question's text with
+ * its chosen labels, several joined with a comma, as Claude's `AskUserQuestion` takes them. Null
+ * while a question has none.
  */
-export function offeredAnswers(prompt: PromptAnswers, calls: readonly PendingCall[]): Array<'allow' | 'deny'> {
+export function questionAnswer(questions: readonly PendingQuestion[], chosen: ReadonlyArray<ReadonlyArray<number>>): string | null {
+  const answers: Record<string, string> = {};
+  for (const [index, question] of questions.entries()) {
+    const labels = (chosen[index] ?? []).map(option => question.options[option]?.label).filter((label): label is string => !!label);
+    if (!labels.length) return null;
+    answers[question.question] = labels.join(', ');
+  }
+  return JSON.stringify(answers);
+}
+
+/** How an answer a prompt offers reads on its button. */
+export function answerLabel(answer: string): string {
+  switch (answer) {
+    case 'allow': return 'Allow';
+    case 'deny': return 'Deny';
+    case 'approve': return 'Approve plan';
+    case 'answer': return 'Send';
+    case 'use': return 'Use it';
+    case 'use-all': return 'Use all';
+    case 'skip': return 'Skip';
+    case 'trust': return 'Trust';
+    case 'exit': return 'Exit';
+    case 'quit': return 'Quit';
+    default: return answer;
+  }
+}
+
+/**
+ * The answers a client may offer. `allow` and `approve` only when exactly one call is unanswered
+ * and it is shown in full, since only then is it certain what they let through; `answer` only
+ * when that call's questions can be shown and chosen from; every other answer (deny, and a
+ * screen prompt's own answers) always.
+ */
+export function offeredAnswers(prompt: PromptAnswers, calls: readonly PendingCall[]): string[] {
   const certain = calls.length === 1 && calls[0].lines.length > 0;
-  return prompt.answers.filter(answer => answer === 'deny' || certain);
+  return prompt.answers.filter(answer => {
+    if (answer === 'allow' || answer === 'approve') return certain;
+    if (answer === 'answer') return pendingQuestions(calls) !== null;
+    return true;
+  });
 }

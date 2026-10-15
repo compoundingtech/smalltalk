@@ -9,7 +9,9 @@ type Code = ClientError['response']['code'];
 export function plainMessage(code: Code | string | undefined, message: string): string {
   const host = message.split(/\s+/).find(word => word.startsWith('host/'))?.slice('host/'.length).replace(/[^A-Za-z0-9]+$/, '');
   switch (code) {
-    case 'stale-fence': return 'st changed while this was on its way, so it was not applied';
+    // A native prompt's answer is refused in words written for the person: the prompt was
+    // answered elsewhere or replaced, or only its terminal can answer it.
+    case 'stale-fence': return message.startsWith('that prompt ') ? message : 'st changed while this was on its way, so it was not applied';
     case 'page-cursor-expired':
     case 'cursor-gap': return 'the list changed while it was being read';
     case 'remote-unavailable': return host ? `${host} cannot be reached right now` : 'the host this lives on cannot be reached right now';
@@ -45,6 +47,14 @@ export function appliedAnswer(error: unknown): 'none' | 'unknown' | undefined {
 export function outcomeUnknown(error: unknown): boolean {
   if (error instanceof ClientError) return appliedAnswer(error) === 'unknown';
   return isTransient(error);
+}
+
+/**
+ * Whether st refused a native prompt's answer because the prompt itself is gone (answered
+ * elsewhere, replaced) or only its terminal answers it: sending the answer again never helps.
+ */
+export function promptGone(error: unknown): boolean {
+  return error instanceof ClientError && error.response.code === 'stale-fence' && error.response.message.startsWith('that prompt ');
 }
 
 /** Any error as a person reads it. */

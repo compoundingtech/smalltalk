@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
-import { ClientError, appliedAnswer, isTransient, isTransientCode, notApplied, outcomeUnknown, plainError, plainMessage, retryTransient } from '../../clients/typescript/st3-client/index.ts';
+import { ClientError, appliedAnswer, isTransient, isTransientCode, notApplied, outcomeUnknown, plainError, plainMessage, promptGone, retryTransient } from '../../clients/typescript/st3-client/index.ts';
 
 // st's errors read as sentences, as in the Rust client: no codes reach a person.
 assert.equal(plainMessage('stale-fence', 'the client snapshot changed before the action was submitted'), 'st changed while this was on its way, so it was not applied');
+// A native prompt's refusal keeps st's own words: why it cannot be answered from here.
+assert.equal(plainMessage('stale-fence', 'that prompt is no longer waiting: it was answered or replaced'), 'that prompt is no longer waiting: it was answered or replaced');
 assert.equal(plainMessage('remote-unavailable', 'owner host/Juniper is temporarily unavailable; cached data remains usable'), 'Juniper cannot be reached right now');
 assert.equal(plainMessage('not-found', 'agent `agent/x` does not exist'), 'it is gone: agent `agent/x` does not exist');
 assert.equal(plainMessage(undefined, 'invalid subscription'), 'invalid subscription');
@@ -16,6 +18,9 @@ assert.ok(isTransientCode(undefined) && isTransientCode('page-cursor-expired') &
 assert.ok(isTransientCode('terminal-unavailable') && !isTransientCode('terminal-ended'));
 assert.equal(plainMessage('terminal-ended', 'the terminal process exited'), 'the terminal ended: its process exited');
 assert.ok(notApplied(refused('stale-fence')) && !notApplied(new TypeError('Network request failed')), 'a lost answer may have applied');
+// A prompt st says is gone stays gone: its answer is never sent again; a race is.
+const gone = new ClientError({ api_version: 'st3.client.v0', error_version: 'st3.client.error.v0', request_id: 'request/x', code: 'stale-fence', message: 'that prompt is no longer waiting: it was answered or replaced', retryable: false, details: {} }, 422);
+assert.ok(promptGone(gone) && !promptGone(refused('stale-fence')));
 
 // A race is tried again with a fresh request; a refusal is not.
 let tries = 0;
