@@ -1,4 +1,5 @@
 import { Agent, decodeUnknownSync, type AgentEncoded } from '@smalltalk/st3-client/schema'
+import { openAgent } from '@st3/sdk/effect'
 
 /** Synthetic agent identity shared by the native todo projection tests. */
 export const todoAgentRef = 'agent/example/example'
@@ -44,8 +45,8 @@ export const todoFixture = {
   },
 } satisfies NonNullable<AgentEncoded['todo']>
 
-/** Decoded running agent carrying an accepted synthetic todo claim. */
-export const todoAgent = decodeUnknownSync(
+/** Running agent carrying an accepted synthetic todo claim, opened like the live roster decode. */
+export const todoAgent = openAgent(decodeUnknownSync(
   Agent,
   'strict',
 )({
@@ -60,5 +61,5 @@ export const todoAgent = decodeUnknownSync(
   updated_at: todoFixture.accepted_at,
   incarnation_id: 'fixture-incarnation',
   todo: todoFixture,
-})
+}))
 

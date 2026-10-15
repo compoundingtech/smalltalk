@@ -5,6 +5,7 @@ import {
   type ResourceObservationEncoded,
   type TerminalScreen,
 } from '@smalltalk/st3-client/schema'
+import type { DecodedAgent } from '@st3/sdk/effect'
 import * as Atom from 'effect/reactivity/Atom'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -196,7 +197,7 @@ describe('SDK sync observation hooks', () => {
   it('passes exact SDK observations through independently of already observed fixture content', () => {
     const registry = AtomRegistry.make()
     const base = fixtureSource({ world })
-    const agents = transitionFeedSync(initialFeedSync<typeof world.agents>(100), { _tag: 'Requested', since: 125 }, 125)
+    const agents = transitionFeedSync(initialFeedSync<readonly DecodedAgent[]>(100), { _tag: 'Requested', since: 125 }, 125)
     const gateway: FeedSyncObservation = { status: { _tag: 'Requested', since: 110 }, observedAt: 110 }
     const source: DataSource = {
       ...base,

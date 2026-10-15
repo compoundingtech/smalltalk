@@ -15,11 +15,11 @@ import * as stylex from '@stylexjs/stylex'
 import { useAtom, useAtomValue } from '@effect/atom-react'
 import { Schema } from 'effect'
 import * as Atom from 'effect/reactivity/Atom'
-import { SidebarAgentRow, ThreadHeader, ResizableSplit, assistantDarkTheme, liveComposerDarkTheme, liveAccentTheme, compositionLightTheme } from '@smalltalk/fractal-ui/assistant-ui/shell'
+import { ThreadHeader, ResizableSplit, assistantDarkTheme, liveComposerDarkTheme, liveAccentTheme, compositionLightTheme } from '@smalltalk/fractal-ui/assistant-ui/shell'
 import type { WorkLogCall } from '@smalltalk/fractal-ui/assistant-ui'
 import { ViewportStore, ViewportStoreContext } from '../../../../packages/fractal-ui/src/assistant-ui/EmbraceScrollViewport.tsx'
 import { terminalSubjectForAgent } from '../data/projections.ts'
-import { useFleet, useSubjectList, useConnection, useNow, useFeedInterest, useDataSource } from '../data/react.tsx'
+import { useFleet, useSubjectList, useConnection, useNow, useFeedInterest, useDataSource, useRosterDecode } from '../data/react.tsx'
 import { persistedAtom } from '../state/persistence.ts'
 import { WorkbenchContextProvider, ResourcePanelProvider, MonitorDetailProvider, type OpenRequest } from '../shell/context.tsx'
 import type { ResourcePanelState } from '../shell/state.ts'
@@ -27,6 +27,7 @@ import { afterNextPaint, type UxTelemetry } from '../telemetry/ux.ts'
 import { syncLine } from '../../../../packages/fractal-ui/src/assistant-ui/st3-views/sync-line.ts'
 import { useGatewaySync } from '../data/react.tsx'
 import { matchesSidebarHost, parseSidebarQuery } from '../shell/sidebar/filter.ts'
+import { LiveRoster } from './LiveRoster.tsx'
 
 // A static import would evaluate the kit Transcript/Markdown/refractor before the shell paints.
 // Demand and speculative prefetch share one in-flight request; rejection releases it for retry.
@@ -123,7 +124,7 @@ const initialAgentFromUrl = () => {
 
 /** One authoritative agent thread per workspace; local geometry never grants backend authority. */
 export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?: UxTelemetry; readonly onSelectConversation?: (ref: string) => void }) {
-  const fleet = useFleet(), subjects = useSubjectList(), connection = useConnection(), now = useNow()
+  const fleet = useFleet(), subjects = useSubjectList(), connection = useConnection(), now = useNow(), rosterDecode = useRosterDecode()
   const [storedAgent, setStoredAgent] = useAtom(selectedAgent)
   const [ratio, setRatio] = useAtom(sidebarRatio), [collapsed, setCollapsed] = useAtom(sidebarClosed), [scheme, setScheme] = useAtom(palette)
   const viewport = React.useSyncExternalStore(subscribeViewport, viewportWidth, viewportWidth)
@@ -236,27 +237,7 @@ export function LiveAgentWorkspace({ ux, onSelectConversation }: { readonly ux?:
                 {collapsed ? null : (
                   <>
                     <LiveSidebarSearch value={search} onChange={setSearch} />
-                    <nav ref={rosterCommit} aria-label="Agent roster" onMouseOverCapture={rememberHoverOwner} onFocusCapture={rememberHoverOwner} {...stylex.props(styles.roster)}>
-                      {fleet._tag === 'Waiting' ? <div aria-hidden="true" data-wf-roster-skeleton="waiting" {...stylex.props(styles.rosterSkeleton)}>
-                        {Array.from({ length: 8 }, (_, index) => <div key={index} data-wf-skeleton-row="" {...stylex.props(styles.skeletonRow)}>
-                          <span {...stylex.props(styles.skeletonGlyph)} />
-                          <span data-wf-skeleton-line="name" {...stylex.props(styles.skeletonLine, styles.skeletonName)} />
-                          <span data-wf-skeleton-line="host" {...stylex.props(styles.skeletonLine, styles.skeletonHost)} />
-                        </div>)}
-                      </div> : null}
-                      {filtered.map((row) => (
-                        <SidebarAgentRow key={row.ref} item={sidebarRow({ agent: row, stale, now })} now={now} variant="SR-2" layout="SR2-A" glyph="SG-1" extraSignals={[]} query={parsedSearch.query} active={current === row.ref} onOpen={() => select(row.ref)} />
-                      ))}
-                    </nav>
-                    {fleet._tag !== 'Observed' ? (
-                      <p role="status" data-wf-roster-reason={fleet._tag === 'Unavailable' ? fleet.reason : undefined} {...stylex.props(styles.notice)}>
-                        {fleet._tag === 'Waiting' ? 'Waiting for the agent roster.' : fleet.reason === 'ungranted' ? 'Read access to the agent roster has not been granted.' : fleet.reason === 'unsupported' ? 'This connection does not support the agent roster.' : 'The agent roster could not be loaded; reconnect and try again.'}
-                      </p>
-                    ) : stale ? (
-                      <p role="status" {...stylex.props(styles.notice)}>
-                        {fleet.coverage?._tag === 'Partial' ? 'Showing a partial roster · live updates pending' : 'Last observed roster · live updates pending'}
-                      </p>
-                    ) : null}
+                    <LiveRoster fleet={fleet} rows={filtered} stale={stale} now={now} query={parsedSearch.query} current={current} decode={rosterDecode} onSelect={select} navRef={rosterCommit} onHoverOwner={rememberHoverOwner} />
                     <footer {...stylex.props(styles.footer)}>
                       <Aria.Button onPress={() => setScheme(scheme === 'dark' ? 'light' : 'dark')} aria-label="Toggle color scheme" {...stylex.props(styles.iconButton)}>
                         {scheme === 'dark' ? '☀' : '☾'}
@@ -431,14 +412,6 @@ const styles = stylex.create({
   // Message fill plus a hairline: raised equals the sidebar surface in light mode.
   search: { marginInline: s.md, padding: `calc(${s.md} - ${g.hairline})`, borderRadius: 8, borderWidth: g.hairline, borderStyle: 'solid', borderColor: c.border, backgroundColor: c.message, flexShrink: 0 },
   searchInput: { width: '100%', minWidth: 0, borderWidth: 0, outline: 'none', backgroundColor: 'transparent', color: c.fg, fontSize: t.metaSize },
-  roster: { display: 'flex', flexDirection: 'column', overflowY: 'auto', padding: s.md, minHeight: 0, flexGrow: 1, gap: 2 },
-  // Match SR-2's shared row/control/icon geometry and the roster's 2px inter-row gap.
-  rosterSkeleton: { display: 'flex', flexDirection: 'column', gap: 2 },
-  skeletonRow: { height: g.sidebarRow, flexShrink: 0, display: 'grid', gridTemplateColumns: `${g.icon} minmax(0, 1fr)`, gridTemplateRows: `${g.controlSm} ${g.controlSm}`, alignContent: 'center', alignItems: 'center', columnGap: s.xs2, paddingInline: s.sm, boxSizing: 'border-box' },
-  skeletonGlyph: { gridColumn: '1', gridRow: '1', width: g.icon, height: g.icon, borderRadius: '50%', backgroundColor: c.border, opacity: 0.5 },
-  skeletonLine: { gridColumn: '2', height: 8, borderRadius: 4, backgroundColor: c.border, opacity: 0.5 },
-  skeletonName: { gridRow: '1', width: '68%' },
-  skeletonHost: { gridRow: '2', width: '44%' },
   footer: { height: 40, display: 'flex', alignItems: 'center', gap: s.md, paddingInline: s.lg, flexShrink: 0 },
   connection: { marginLeft: 'auto', fontSize: t.denseSize, color: c.fgMuted },
   workspace: { display: 'flex', flexDirection: 'column', flexGrow: 1, minWidth: 0, minHeight: 0 },

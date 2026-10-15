@@ -12,7 +12,9 @@
  * The tracer is teed into an in-memory `SpanRing` for the dev perf panel and, when an OTLP URL is
  * given, exported as OTLP/JSON via `fetch` directly to that explicitly configured endpoint.
  */
-import { Context, Deferred, Effect, Exit, FiberSet, Layer, Option, Scope, Tracer } from 'effect'
+import { CollectionName } from '@smalltalk/st3-client/schema'
+import { normalizeDecodePath } from '@st3/sdk/effect'
+import { Context, Deferred, Effect, Exit, FiberSet, Layer, Option, Schema, Scope, Tracer } from 'effect'
 import * as FetchHttpClient from 'effect/http/FetchHttpClient'
 import * as OtlpExporter from 'effect/observability/OtlpExporter'
 import * as OtlpSerialization from 'effect/observability/OtlpSerialization'
@@ -41,7 +43,7 @@ export interface TelemetryOptions {
   readonly otlpTracesUrl: string | undefined
   /** Low-cardinality resource attributes, e.g. `{ 'wf.lab.contender': 'atom' }`. */
   readonly resourceAttributes: Readonly<Record<string, string | number>>
-  /** Production omits script names and strips SDK events, failure details and unknown spans. */
+  /** Production exports allowlisted spans and sanitized decode diagnostics, never failure details. */
   readonly production?: boolean
 }
 
@@ -107,6 +109,7 @@ const exportedSpanNames: Readonly<Record<string, true>> = {
   'st3.capabilities': true,
   'st3.socket.probe': true,
   'st3.socket.create': true,
+  'st3.resource.decode': true,
   'wf.ui.interaction': true,
   'wf.main.long_frame': true,
   'wf.page.vitals': true,
@@ -128,6 +131,21 @@ const exportedAttributes: Readonly<Record<string, true>> = {
   'wf.vitals.long_frames': true,
   'wf.vitals.inp_ms': true,
   'wf.vitals.lcp_ms': true,
+}
+
+const isDecodeResource = Schema.is(CollectionName)
+/** Decode diagnostics carry schema coordinates and counters, never identities or failure text. */
+const isDecodeAttribute = (key: string, value: unknown): boolean => {
+  switch (key) {
+    case 'resource': return isDecodeResource(value)
+    case 'path': return typeof value === 'string' && normalizeDecodePath(value) === value
+    case 'tag': return value === 'Rejected' || value === 'Degraded'
+    case 'count':
+    case 'rejectedCount':
+    case 'degradedCount':
+      return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    default: return false
+  }
 }
 
 /** Long Animation Frames API (Chromium); not in TypeScript's DOM lib yet. */
@@ -206,9 +224,10 @@ export const makeTelemetry = (options: TelemetryOptions): Telemetry => {
         return Tracer.nativeTracer.span(spanOptions)
       if (exporter !== undefined) return exporter.span(spanOptions)
       const span = Tracer.nativeTracer.span(spanOptions)
-      // Tracer.Span exposes event(), not an events read model. Capture through that public API;
-      // production replaces it with a no-op in the tee, so it needs no event buffer at all.
-      const events: Array<Parameters<Tracer.Span['event']>> | undefined = options.production ? undefined : []
+      // Only decode diagnostics retain production events; the tee sanitizes them before capture.
+      // Tracer.Span exposes event(), not an events read model, so capture through its public API.
+      const events: Array<Parameters<Tracer.Span['event']>> | undefined =
+        !options.production || spanOptions.name === 'st3.resource.decode' ? [] : undefined
       if (events !== undefined) {
         span.event = (...event) => {
           if (events.length < 64) events.push(event)
@@ -243,15 +262,22 @@ export const makeTelemetry = (options: TelemetryOptions): Telemetry => {
               } : spanOptions)
         if (options.production) {
           const attribute = span.attribute.bind(span)
+          const event = span.event.bind(span)
           // SDK labels are fixed operation names, never a resource ref supplied by the caller.
           if (span.name.startsWith('st3.') && Object.hasOwn(exportedSpanNames, span.name))
             attribute('span.label', span.name.slice(4))
           Object.assign(span, {
             attribute: (key: string, value: unknown) => {
-              if (Object.hasOwn(exportedAttributes, key) && !span.name.startsWith('st3.'))
+              if (span.name === 'st3.resource.decode' ? isDecodeAttribute(key, value)
+                : Object.hasOwn(exportedAttributes, key) && !span.name.startsWith('st3.'))
                 attribute(key, value)
             },
-            event: () => {},
+            event: (name: string, at: bigint, attributes?: Record<string, unknown>) => {
+              if (span.name === 'st3.resource.decode' && name === 'st3.resource.decode_failure')
+                event(name, at, Object.fromEntries(
+                  Object.entries(attributes ?? {}).filter(([key, value]) => isDecodeAttribute(key, value)),
+                ))
+            },
             addLinks: () => {},
           })
         }

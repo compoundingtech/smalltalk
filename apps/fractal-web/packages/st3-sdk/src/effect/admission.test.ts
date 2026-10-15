@@ -379,7 +379,7 @@ describe('follow admission', () => {
         yield* settle
         expect(agents.events.at(-1)).toEqual({
           _tag: 'Observed',
-          value: { items: [], hasMore: false, rawItems: [], snapshot },
+          value: { items: [], hasMore: false, rawItems: [], snapshot, undecodable: [], decodeStale: false },
         })
         expect(agents.ended()).toBe(false)
       }),
@@ -417,7 +417,7 @@ describe('follow admission', () => {
         yield* settle
         expect(agents.events.at(-1)).toEqual({
           _tag: 'Observed',
-          value: { items: [], hasMore: false, rawItems: [], snapshot },
+          value: { items: [], hasMore: false, rawItems: [], snapshot, undecodable: [], decodeStale: false },
         })
         yield* Effect.promise(() => vi.advanceTimersByTimeAsync(5000))
         expect(gateway.subscribes('agents')).toBe(3)
@@ -528,8 +528,8 @@ describe('follow admission', () => {
         yield* settle
 
         expect(agents.events).toEqual([
-          { _tag: 'Observed', value: { items: [], hasMore: false, rawItems: [], snapshot } },
-          { _tag: 'Observed', value: { items: [], hasMore: true, rawItems: [], snapshot } },
+          { _tag: 'Observed', value: { items: [], hasMore: false, rawItems: [], snapshot, undecodable: [], decodeStale: false } },
+          { _tag: 'Observed', value: { items: [], hasMore: true, rawItems: [], snapshot, undecodable: [], decodeStale: false } },
         ])
 
         yield* st3.setVisible(windowSpec('agents'), true)

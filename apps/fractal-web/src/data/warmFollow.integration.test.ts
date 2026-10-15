@@ -360,6 +360,59 @@ describe('warm conversation switching at the data layer', () => {
     } finally { release(); await live.dispose() }
   })
 
+  it('keeps the published HTTP roster when the first socket snapshot is all bad', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8 })
+    gateway.publishedRoster = [agent]
+    const release = live.registry.mount(live.source.agents)
+    try {
+      await stallInitialRoster(gateway)
+      await until(() => live.registry.get(live.source.agents)._tag === 'Observed')
+      gateway.fleet([{ ...agent, id: 'broken-id' }])
+      await until(() => live.registry.get(live.source.rosterDecode!).decodeStale)
+      expect(live.registry.get(live.source.agents)).toMatchObject({
+        _tag: 'Observed', freshness: 'stale', value: [{ id: agent.id }],
+      })
+      expect(live.registry.get(live.source.rosterDecode!).undecodable).not.toHaveLength(0)
+      const subscription = gateway.commands.findLast(command =>
+        command.kind === 'subscribe' && command.collection === 'agents')
+      if (subscription === undefined) throw new Error('Expected roster subscription')
+      gateway.send({
+        kind: 'changes', id: subscription.id, collection: 'agents', has_more: false,
+        upserts: [], removes: [], order: [], snapshot,
+      })
+      await drain()
+      await drain()
+      expect(live.registry.get(live.source.agents)).toMatchObject({
+        _tag: 'Observed', freshness: 'stale', value: [{ id: agent.id }],
+      })
+      expect(live.registry.get(live.source.rosterDecode!)).toMatchObject({ decodeStale: true })
+      expect(live.registry.get(live.source.rosterDecode!).undecodable).not.toHaveLength(0)
+    } finally { release(); await live.dispose() }
+  })
+
+  it('ignores diagnostics from a late HTTP fallback after newer socket evidence', async () => {
+    const { live, gateway } = openLive({ maxFollows: 8 })
+    gateway.publishedRoster = [agent]
+    let releaseRead: () => void = () => {}
+    gateway.rosterGate = new Promise<void>(resolve => { releaseRead = resolve })
+    const release = live.registry.mount(live.source.agents)
+    try {
+      await stallInitialRoster(gateway)
+      gateway.fleet([agent])
+      await until(() => live.registry.get(live.source.agents)._tag === 'Observed')
+      gateway.fleet([{ ...agent, id: 'broken-id' }])
+      await until(() => live.registry.get(live.source.rosterDecode!).decodeStale)
+      const evidence = live.registry.get(live.source.rosterDecode!)
+      releaseRead()
+      await drain()
+      await drain()
+      expect(live.registry.get(live.source.rosterDecode!)).toEqual(evidence)
+      expect(live.registry.get(live.source.agents)).toMatchObject({
+        _tag: 'Observed', freshness: 'stale', value: [{ id: agent.id }],
+      })
+    } finally { releaseRead(); release(); await live.dispose() }
+  })
+
   it('keeps waiting for live data when no roster publication exists yet', async () => {
     const { live, gateway } = openLive({ maxFollows: 8 })
     gateway.rosterFailure = 503

@@ -150,14 +150,16 @@ export const AgentTodos = ({
                   {...stylex.props(styles.task)}
                 >
                   <span
-                    aria-label={statusLabels[task.status]}
+                    aria-label={
+                      typeof task.status === 'string' ? statusLabels[task.status] : 'Unrecognized status'
+                    }
                     {...stylex.props(
                       styles.status,
                       task.status === 'in_progress' && styles.active,
                       task.status === 'blocked' && styles.stale,
                     )}
                   >
-                    {statusMarks[task.status]}
+                    {typeof task.status === 'string' ? statusMarks[task.status] : '?'}
                   </span>
                   <span
                     {...stylex.props(styles.content, task.status === 'completed' && styles.done)}

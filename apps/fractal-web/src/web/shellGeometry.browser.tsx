@@ -1,4 +1,5 @@
 import { Agent, decodeUnknownSync, type AgentEncoded } from '@smalltalk/st3-client/schema'
+import { openAgent, type DecodedAgent } from '@st3/sdk/effect'
 import * as Atom from 'effect/reactivity/Atom'
 import * as AtomRegistry from 'effect/reactivity/AtomRegistry'
 import { createRoot } from 'react-dom/client'
@@ -30,7 +31,7 @@ const agents = Array.from({ length: 216 }, (_, index) => decodeUnknownSync(Agent
 } satisfies AgentEncoded))
 
 const registry = AtomRegistry.make()
-const roster = Atom.make<Feed<readonly Agent[]>>(waiting).pipe(Atom.keepAlive)
+const roster = Atom.make<Feed<readonly DecodedAgent[]>>(waiting).pipe(Atom.keepAlive)
 const source = {
   ...fixtureSource({ world: { now, events: [], agents, missions: [], attention: [], conversations: {}, terminals: {}, envelopes: {}, usage: { _tag: 'undeclared' } } }),
   agents: roster,
@@ -65,7 +66,7 @@ try {
   const waitingFacts = measure('waiting')
   // No agent is observed yet: the header names no folder rather than a placeholder.
   expect(waitingFacts.breadcrumb === 'Select an agent', `waiting: breadcrumb is ${JSON.stringify(waitingFacts.breadcrumb)}`)
-  registry.set(roster, observed({ value: agents }))
+  registry.set(roster, observed({ value: agents.map(openAgent) }))
   await afterPaint()
   const populated = measure('populated')
   expect(populated.rows === agents.length, `populated: ${populated.rows} rows rendered`)
