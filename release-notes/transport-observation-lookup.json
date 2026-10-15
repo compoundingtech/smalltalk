@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Bootstrap the transport-observation seek index online after APIs serve",
+  "replay": {"status": "none", "detail": "Claim contents and canonical ordering are unchanged. The side index is local acceleration, not replicated authority."},
+  "schema": {"status": "changed", "detail": "No index creation or backfill runs during store opening. After both APIs serve, one managed background writer loan creates the empty transport-only side table/index and capture triggers in the same transaction as its backfill high-water mark. Subsequent background loans visit at most 128 source rows per committed page. Inserts, identity/kind/time updates and deletes maintain capture atomically."},
+  "rules": {"status": "none", "detail": "Transport status and refresh windows retain their semantics. The original canonical query remains active until sqlite_master and the final committed readiness marker permit the side-index query. Canonical newest-timestamp ties still use the original tie breakers."},
+  "compatibility": {"status": "changed", "detail": "No wire or claim changes. WAL readers serve during background pages. Every install/copy transaction shares the managed writer queue, so no independent migration commit can invalidate an application's deferred read-then-write snapshot. Each page releases its background loan and yields for 100 ms; pending foreground writers retain priority. Metrics report readiness, elapsed build time and a begin-through-commit upper bound on page write hold including finalizers but excluding queue wait."},
+  "downtime": {"status": "none", "detail": "Target additional first-open delay is zero: bootstrap starts only after APIs serve. No synchronous historical index build remains."},
+  "manual": {"status": "none", "detail": "No manual migration is required; committed cursor state resumes after interruption."},
+  "recovery": {"status": "none", "detail": "Binary rollback does not require undoing the additive local tables or triggers."}
+}

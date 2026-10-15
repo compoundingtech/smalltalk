@@ -71,6 +71,7 @@ pub mod first_sync;
 pub mod principals;
 pub mod projection_digest;
 pub mod runtime;
+pub mod transport_observation_index;
 
 pub use runtime::{IncrementalProjection, ReplayProgress, Runtime};
 
@@ -7250,19 +7251,11 @@ impl Store {
         let subject = format!("host/{peer}");
         let now = now_ms();
         // Another member's observation of this peer cannot renew this node's evidence.
-        let latest: Option<(String, String)> = self
-            .readers
-            .get()
-            .query_row(
-                &canonical_sql(
-                    "SELECT body, accepted_at_unix_ms FROM claims
-                WHERE subject=?1 AND kind='transport.observed' AND origin=?2
-                ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ),
-                params![subject, self.origin],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
+        let latest = transport_observation_index::latest(
+            &self.readers.get(),
+            &subject,
+            &self.origin,
+        )?;
         let already_current = latest.is_some_and(|(body, accepted_at)| {
             let body: Value = serde_json::from_str(&body).unwrap_or_default();
             let observed_at = body
