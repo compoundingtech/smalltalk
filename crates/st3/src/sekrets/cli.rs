@@ -197,15 +197,16 @@ struct SetupArgs {
     checkout_roots: Vec<PathBuf>,
 }
 
-/// Exit code for the caller: the command's own, or 1 for st's errors.
-pub async fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
+/// Exit code for the caller: the command's own, or 1 for st's errors. `endpoint` is st's
+/// `--endpoint`, which, like `ST3_ENDPOINT`, names this user's daemon.
+pub async fn run(args: SekretsArgs, json_output: bool, endpoint: Option<String>) -> Result<i32> {
     let Some(command) = args.command else {
         if args.argv.is_empty() {
             bail!(
                 "name a command after `--`, such as `st sekrets -- gh pr list`, or see `st sekrets --help`"
             );
         }
-        let connection = identified_connection().await?;
+        let connection = identified_connection(endpoint.as_deref()).await?;
         return connection.run(RunRequest {
             profile: args.profile,
             argv: args.argv,
@@ -234,7 +235,7 @@ pub async fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
             } else {
                 argv.extend(login.args);
             }
-            let connection = identified_connection().await?;
+            let connection = identified_connection(endpoint.as_deref()).await?;
             connection.run(RunRequest {
                 profile: Some(login.profile),
                 argv,
@@ -243,7 +244,7 @@ pub async fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
             })
         }
         SekretsCommand::Whoami => {
-            let connection = identified_connection().await?;
+            let connection = identified_connection(endpoint.as_deref()).await?;
             if json_output {
                 println!(
                     "{}",
@@ -258,10 +259,8 @@ pub async fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
             Ok(0)
         }
         SekretsCommand::Enable => {
-            let connection = identified_connection().await?;
-            let config = crate::config::Config::load_client_unvalidated(None)?.0;
-            let client =
-                crate::client::Client::new(crate::client::Endpoint::Unix(config.client_socket()));
+            let connection = identified_connection(endpoint.as_deref()).await?;
+            let client = daemon_client(endpoint.as_deref())?;
             let node: Value = client.get("/v1/sekrets/node").await?;
             let (Some(node_name), Some(key)) = (node["node"].as_str(), node["key"].as_str()) else {
                 bail!("the daemon did not say its node key");
@@ -279,7 +278,7 @@ pub async fn run(args: SekretsArgs, json_output: bool) -> Result<i32> {
             })
         }
         other => {
-            let connection = identified_connection().await?;
+            let connection = identified_connection(endpoint.as_deref()).await?;
             let request = management_request(other)?;
             let value = connection.manage(&request)?;
             print_value(&value, json_output, |value| render(&request, value))
@@ -361,14 +360,12 @@ fn management_request(command: SekretsCommand) -> Result<Request> {
 }
 
 /// Connect, and when this process is a seat, bring its daemon's attestation.
-async fn identified_connection() -> Result<Connection> {
+async fn identified_connection(endpoint: Option<&str>) -> Result<Connection> {
     let mut connection = Connection::open(&socket_path())?;
     if let CallerView::Unidentified { .. } = connection.caller
         && std::env::var("ST_AGENT").is_ok_and(|agent| agent.starts_with("agent/"))
     {
-        let config = crate::config::Config::load_client_unvalidated(None)?.0;
-        let client =
-            crate::client::Client::new(crate::client::Endpoint::Unix(config.client_socket()));
+        let client = daemon_client(endpoint)?;
         let attestation: Attestation = client
             .post("/v1/sekrets/attest", &json!({ "nonce": connection.nonce }))
             .await
@@ -376,6 +373,35 @@ async fn identified_connection() -> Result<Connection> {
         connection.hello(Some(attestation))?;
     }
     Ok(connection)
+}
+
+/// This user's daemon, found as every other st command finds it: `--endpoint`, then
+/// `ST3_ENDPOINT`, then the configured socket. A seat's driver sets `ST3_ENDPOINT` to the daemon
+/// that runs it, which need not be at the configured socket.
+fn daemon_client(endpoint: Option<&str>) -> Result<crate::client::Client> {
+    let endpoint = daemon_endpoint(
+        endpoint.map(str::to_owned),
+        std::env::var("ST3_ENDPOINT").ok(),
+        || {
+            Ok(crate::config::Config::load_client_unvalidated(None)?
+                .0
+                .client_socket())
+        },
+    )?;
+    Ok(crate::client::Client::new(endpoint))
+}
+
+fn daemon_endpoint(
+    flag: Option<String>,
+    environment: Option<String>,
+    configured: impl FnOnce() -> Result<PathBuf>,
+) -> Result<crate::client::Endpoint> {
+    Ok(
+        match flag.or(environment).filter(|value| !value.is_empty()) {
+            Some(endpoint) => crate::client::Endpoint::parse(endpoint),
+            None => crate::client::Endpoint::Unix(configured()?),
+        },
+    )
 }
 
 fn describe(caller: &CallerView) -> String {
@@ -732,6 +758,47 @@ echo "sekrets gateway running; next, from a login session: st sekrets enable"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_seat_asks_the_daemon_its_driver_names_to_vouch() {
+        let configured = || Ok(PathBuf::from("/run/user/1000/st3.sock"));
+        let unix = |endpoint: crate::client::Endpoint| match endpoint {
+            crate::client::Endpoint::Unix(path) => path,
+            other => panic!("expected a socket, got {other:?}"),
+        };
+        assert_eq!(
+            unix(daemon_endpoint(None, Some("/state/st3.sock".into()), configured).unwrap()),
+            Path::new("/state/st3.sock")
+        );
+        assert_eq!(
+            unix(
+                daemon_endpoint(
+                    Some("/flag/st3.sock".into()),
+                    Some("/state/st3.sock".into()),
+                    configured
+                )
+                .unwrap()
+            ),
+            Path::new("/flag/st3.sock")
+        );
+        assert_eq!(
+            unix(daemon_endpoint(None, None, configured).unwrap()),
+            Path::new("/run/user/1000/st3.sock")
+        );
+        assert_eq!(
+            unix(daemon_endpoint(None, Some(String::new()), configured).unwrap()),
+            Path::new("/run/user/1000/st3.sock")
+        );
+        assert!(matches!(
+            daemon_endpoint(
+                None,
+                Some("http://127.0.0.1:7777".into()),
+                || unreachable!()
+            )
+            .unwrap(),
+            crate::client::Endpoint::Http(_)
+        ));
+    }
 
     #[test]
     fn until_reads_dates_and_times() {

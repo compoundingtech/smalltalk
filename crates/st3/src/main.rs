@@ -5797,7 +5797,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
     // The gateway runs as the sekrets user, which has no st configuration.
     if let Command::Sekrets(args) = cli.command {
-        let code = st3::sekrets::cli::run(args, cli.json).await?;
+        let code = st3::sekrets::cli::run(args, cli.json, cli.endpoint).await?;
         use std::io::Write as _;
         let _ = cli_output::stdout().flush();
         return Err(CommandExit(code as u8).into());
