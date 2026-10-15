@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Add test-only controls that pin how the replication HTTP client reports a refused connection, a closed link, a refusal, an overload, a stall and a cut-off response",
+  "replay": {"status": "none", "detail": "No replay or rebuild. Test-only controls; the daemon and its retry policy are unchanged."},
+  "schema": {"status": "none", "detail": "No tables, columns, indexes or triggers."},
+  "rules": {"status": "none", "detail": "Checkpoint rules and digests are unchanged."},
+  "compatibility": {"status": "none", "detail": "No client, wire or harness contract change."},
+  "downtime": {"status": "none", "detail": "None."},
+  "manual": {"status": "none", "detail": "No manual step."},
+  "recovery": {"status": "none", "detail": "Nothing to recover: the controls exist only in test builds."}
+}

@@ -2578,3 +2578,6 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
 #[cfg(test)]
 #[path = "worker_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "transport_error_tests.rs"]
+mod transport_error_tests;
