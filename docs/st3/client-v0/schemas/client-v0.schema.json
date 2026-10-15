@@ -1817,6 +1817,7 @@
       "required": ["id", "sequence", "revision", "timestamp", "role", "type", "final", "body"],
       "properties": {
         "id": { "$ref": "#/$defs/TimelineEntryId" },
+        "delivers": { "type": "string", "pattern": "^message/[^\\s]+$" },
         "sequence": { "type": "integer", "minimum": 0 },
         "revision": { "type": "integer", "minimum": 1 },
         "timestamp": { "$ref": "#/$defs/Timestamp" },

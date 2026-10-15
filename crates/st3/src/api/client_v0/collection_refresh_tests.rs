@@ -1123,6 +1123,7 @@ fn paired_session() -> ClientSession {
         transport: "paired",
         custom_forms: false,
         conversation_blocks: false,
+        conversation_delivery_links: false,
         scopes: ["read.projections".into()].into_iter().collect(),
     }
 }
