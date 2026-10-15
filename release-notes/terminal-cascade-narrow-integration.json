@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "summary": "Narrow the terminal-cascade correction to run/generation dates and add lifecycle and three-member preservation controls. This entry supersedes the earlier fragment’s step-refinement and recovery wording.",
+  "replay": {
+    "status": "changed",
+    "detail": "Cascade timestamps change only when run or generation status changes. Direct claim timestamps keep normal semantics. The earlier step-refinement statement does not apply: both step terminalizers remain unchanged. No automatic replay or stored-row repair is added."
+  },
+  "schema": {
+    "status": "none",
+    "detail": "No tables, indexes, triggers or migration changes."
+  },
+  "rules": {
+    "status": "none",
+    "detail": "No claim validation, authority or checkpoint rules changes; no version is reserved."
+  },
+  "compatibility": {
+    "status": "changed",
+    "detail": "Old binaries retain the timestamp defect. No pre-first-release mixed-build test condition is imposed; Operations owns moving every member onto the fixed build before separately scoped affected-tree reconstruction."
+  },
+  "downtime": {
+    "status": "unknown",
+    "detail": "Source correction adds no extra interruption. Any separate affected-tree reconstruction and its interruption remain Operations’ scope; no duration is claimed."
+  },
+  "manual": {
+    "status": "changed",
+    "detail": "Supersedes the earlier rebuild/heal recommendation: Operations owns all-fixed-members then reviewed affected-tree reconstruction. Existing rows are not rewritten on open. This change authorizes no production recovery action and does not use healing as the code fix."
+  },
+  "recovery": {
+    "status": "none",
+    "detail": "Format unchanged. A rollback binary may reintroduce disagreement; no production rollback or reconstruction operation is introduced."
+  }
+}
