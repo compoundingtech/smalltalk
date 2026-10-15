@@ -42,6 +42,7 @@ export type Agent = ResourceHeader & {
   delivery?: (AgentDelivery | null);
   down_since?: (Timestamp | null);
   driver?: string | null;
+  end_reason?: (AgentEndReason | null);
   fault?: string | null;
   handoff?: (AgentHandoff | null);
   harness_error_state?: string | null;
@@ -114,6 +115,16 @@ export type AgentDelivery = {
   reason?: string | null;
   state: "current" | "outdated" | "legacy" | "stale" | "unknown";
   transport?: string | null;
+};
+
+export type AgentEndReason = {
+  actor?: string;
+  diagnostic?: string;
+  ended_at: Timestamp;
+  exit_code?: number;
+  exit_signal?: string;
+  kind: "completed" | "stopped-by-person" | "stopped-by-agent" | "crashed" | "harness-exited" | "host-lost" | "retired";
+  reason?: string;
 };
 
 export type AgentHandoff = {

@@ -14,6 +14,20 @@
     { "$ref": "#/$defs/PairingAdvertisement" }
   ],
   "$defs": {
+    "AgentEndReason": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "ended_at"],
+      "properties": {
+        "kind": {"enum": ["completed", "stopped-by-person", "stopped-by-agent", "crashed", "harness-exited", "host-lost", "retired"]},
+        "actor": {"type": "string"},
+        "reason": {"type": "string"},
+        "exit_code": {"type": "integer"},
+        "exit_signal": {"type": "string"},
+        "diagnostic": {"type": "string"},
+        "ended_at": {"$ref": "#/$defs/Timestamp"}
+      }
+    },
     "DirectiveNote": {
       "description": "A person's current advisory note. It never assigns work, grants authority or satisfies a gate.",
       "type": "object", "additionalProperties": false,
@@ -1074,6 +1088,7 @@
             "since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }], "description": "When this observed state began in this runtime incarnation. Same-state observations never reset it." },
             "observation": { "enum": ["current", "stale", "missing"], "description": "Stale after 90 seconds without a new observation; missing when this runtime has no observation." },
             "harness_error_state": { "type": ["string", "null"], "description": "Known actionable harness error: needs-login. Login keeps the legacy unauthenticated harness_state for older clients; older daemons omit this optional detail." },
+            "end_reason": {"oneOf": [{"$ref": "#/$defs/AgentEndReason"}, {"type": "null"}], "description": "Derived terminal reason; absent when evidence is missing or stale. Never infer completion from absence."},
             "blocked_on": { "type": ["string", "null"], "description": "Current incarnation's harness blocking axis; human means a person must answer before it continues." },
             "ask": { "type": ["string", "null"], "description": "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." },
             "reason": { "type": ["string", "null"], "description": "Diagnostic harness reason, not a machine-readable verdict." },

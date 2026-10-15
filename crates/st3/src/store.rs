@@ -15215,7 +15215,17 @@ impl Store {
         launch_lineage_tx(&connection, subject)
     }
 
+    /// Suspension ancestry selected at a client snapshot; stopped declarations have none.
+    pub(crate) fn suspension_lineage_at(&self, subject: &str, at: Option<u64>) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        let Some(row) = desired_row_at(&connection, subject, at)?.filter(|row| row.kind == "agent") else {
+            return Ok(Vec::new());
+        };
+        desired_lineage_from_tx(&connection, row.claim_id, same_declared_launch)
+    }
+
     /// Suspension follows all non-launch edits, independently of process retry budgets.
+    #[cfg(test)]
     pub(crate) fn suspension_lineage(&self, subject: &str) -> Result<Vec<String>> {
         let connection = self.readers.get();
         let Some(row) = current_desired_row(&connection, subject)? else {
@@ -15224,8 +15234,25 @@ impl Store {
         desired_lineage_from_tx(&connection, row.claim_id, same_declared_launch)
     }
 
-    pub(crate) fn suspension_lineage_from(&self, token: &str) -> Result<Vec<String>> {
-        desired_lineage_from_tx(&self.readers.get(), token.to_owned(), same_declared_launch)
+    /// Suspension ancestry from `token`, over the claims accepted at or before `at`.
+    pub(crate) fn suspension_lineage_from_at(&self, token: &str, at: Option<u64>) -> Result<Vec<String>> {
+        desired_lineage_from_at_tx(&self.readers.get(), token.to_owned(), same_declared_launch, at)
+    }
+
+    /// The kind of the declaration selected at a client snapshot.
+    pub(crate) fn selected_desired_kind_at(&self, subject: &str, at: Option<u64>) -> Result<Option<String>> {
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        desired_row_at(&connection, subject, at).map(|row| row.map(|row| row.kind))
+    }
+
+    /// `latest_actual_value` at a client snapshot.
+    pub(crate) fn latest_actual_value_at(&self, subject: &str, at: Option<u64>) -> Result<Option<Value>> {
+        if at.is_none() {
+            return self.latest_actual_value(subject);
+        }
+        smallclaims::touched::note_read(|| subject.to_owned());
+        latest_actual_at(&self.readers.get(), subject, at)
     }
 
     /// Only seats whose durable resume requests name this host need transfer reconciliation.
@@ -18130,6 +18157,20 @@ impl Store {
         smallclaims::touched::note_read(|| format!("actor:{subject}"));
         let connection = self.readers.get();
         current_harness_at(&connection, subject, None)
+    }
+
+    /// Incarnation-bound terminal evidence at the same snapshot as the client projection.
+    pub fn terminal_harness_at(
+        &self,
+        subject: &str,
+        at_index: u64,
+    ) -> Result<Option<crate::model::CurrentHarnessView>> {
+        // The ended harness is read from the seat's own claims, so the evaluation that reads
+        // it must be revisited when one arrives.
+        smallclaims::touched::note_read(|| subject.to_owned());
+        let connection = self.readers.get();
+        Ok(harness_fold_at(&connection, subject, Some(at_index), true, false, true)?
+            .filter(|harness| harness.state == "ended"))
     }
 
     /// The seat's harness for the one question the login attention item asks: does it need a
@@ -21890,11 +21931,22 @@ fn launch_lineage_from_tx(connection: &Connection, current: String) -> Result<Ve
 
 fn desired_lineage_from_tx(
     connection: &Connection,
-    mut current: String,
+    current: String,
     equivalent: fn(&Value, &Value) -> bool,
 ) -> Result<Vec<String>> {
+    desired_lineage_from_at_tx(connection, current, equivalent, None)
+}
+
+/// `desired_lineage_from_tx` over the claims accepted at or before `at`.
+fn desired_lineage_from_at_tx(
+    connection: &Connection,
+    mut current: String,
+    equivalent: fn(&Value, &Value) -> bool,
+    at: Option<u64>,
+) -> Result<Vec<String>> {
+    let visible = |claim: &ClaimRecord| at.is_none_or(|index| claim.store_index <= index);
     let mut lineage = vec![current.clone()];
-    while let Some(claim) = claim_by_id_tx(connection, &current)? {
+    while let Some(claim) = claim_by_id_tx(connection, &current)?.filter(visible) {
         // A claim that merges concurrent revisions has one predecessor per fork; follow the
         // first one that is still the same launch.
         let mut next = None;
@@ -21902,7 +21954,7 @@ fn desired_lineage_from_tx(
             if lineage.contains(predecessor) {
                 continue;
             }
-            if let Some(previous) = claim_by_id_tx(connection, predecessor)?
+            if let Some(previous) = claim_by_id_tx(connection, predecessor)?.filter(visible)
                 && previous.kind == "intent.desired"
                 && previous.subject == claim.subject
                 && equivalent(&previous.body, &claim.body)
@@ -23745,6 +23797,19 @@ fn current_harness_fold_at(
     include_work_activity: bool,
     login_only: bool,
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
+    harness_fold_at(connection, subject, at_index, include_work_activity, login_only, false)
+}
+
+/// `terminal` reads the evidence of an incarnation that has exited or stopped instead of the
+/// live one: live prompt, login and attachment fences do not apply to it.
+fn harness_fold_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    include_work_activity: bool,
+    login_only: bool,
+    terminal: bool,
+) -> Result<Option<crate::model::CurrentHarnessView>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let runtime = connection
         .prepare_cached(&format!(
@@ -23770,9 +23835,15 @@ fn current_harness_fold_at(
         return Ok(None);
     }
 
+    let runtime_status = runtime_fields.get("status").and_then(Value::as_str);
+    if terminal && !matches!(runtime_status, Some("exited" | "stopped")) {
+        return Ok(None);
+    }
+
     // An admission refusal remains visible even after omp exits, and OpenCode's ready
     // observations cannot claim healthy delivery while its exact build failed the probe.
-    let admission = connection
+    // It is live evidence, not terminal evidence.
+    let admission = if terminal { None } else { connection
         .prepare_cached(&canonical_sql(
             "SELECT id, accepted_at_unix_ms, json_extract(body, '$.fields.reason') FROM claims
          WHERE subject=?1 AND kind='harness.diagnostic' AND store_index<=?2
@@ -23787,7 +23858,8 @@ fn current_harness_fold_at(
                 row.get::<_, String>(2)?,
             ))
         })
-        .optional()?;
+        .optional()?
+    };
     if let Some((claim, observed_at, reason)) = admission {
         return Ok(Some(crate::model::CurrentHarnessView {
             state: "indeterminate".into(),
@@ -23804,104 +23876,107 @@ fn current_harness_fold_at(
             observed_at_unix_ms: observed_at.parse()?,
         }));
     }
-    if runtime_fields.get("status").and_then(Value::as_str) != Some("running") {
+    if !terminal && runtime_status != Some("running") {
         return Ok(None);
     }
 
-    // A terminal modal holds even if a parallel native channel reports idle or work progress.
-    // Only a successful subsequent screen observation or a new runtime lifts this fence.
-    if let Some(harness) = update_prompt_fence(connection, subject, incarnation_id, at_index)? {
-        return Ok(Some(harness));
-    }
-
-    // A native credential refusal is independent of activity, and work claims cannot erase it.
-    let auth = connection.prepare_cached(&canonical_sql(
-        "SELECT id, accepted_at_unix_ms, body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
-         AND +store_index<=?2 AND json_extract(body, '$.fields.incarnation_id')=?3
-         AND json_type(body, '$.fields.provider_auth') IN ('true','false')
-         ORDER BY CANONICAL_DESC(claims) LIMIT 1"))?.query_row(params![subject, at_index, incarnation_id],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
-        .optional()?;
     let mut auth_restored = false;
-    if let Some((claim, time, body)) = auth {
-        let body: Value = serde_json::from_str(&body)?;
-        let fields = &body["fields"];
-        auth_restored = fields["provider_auth"] == true;
-        if fields["provider_auth"] == false {
+    // Live prompt fences are not terminal evidence.
+    if !terminal {
+        // A terminal modal holds even if a parallel native channel reports idle or work progress.
+        // Only a successful subsequent screen observation or a new runtime lifts this fence.
+        if let Some(harness) = update_prompt_fence(connection, subject, incarnation_id, at_index)? {
+            return Ok(Some(harness));
+        }
+
+        // A native credential refusal is independent of activity, and work claims cannot erase it.
+        let auth = connection.prepare_cached(&canonical_sql(
+            "SELECT id, accepted_at_unix_ms, body FROM claims INDEXED BY claims_harness_auth_incarnation_index WHERE subject=?1 AND kind='harness.observed'
+             AND +store_index<=?2 AND json_extract(body, '$.fields.incarnation_id')=?3
+             AND json_type(body, '$.fields.provider_auth') IN ('true','false')
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1"))?.query_row(params![subject, at_index, incarnation_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            .optional()?;
+        if let Some((claim, time, body)) = auth {
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = &body["fields"];
+            auth_restored = fields["provider_auth"] == true;
+            if fields["provider_auth"] == false {
+                return Ok(Some(crate::model::CurrentHarnessView {
+                    state: "needs-login".into(),
+                    driver: fields["driver"].as_str().map(str::to_owned),
+                    incarnation_id: incarnation_id.into(),
+                    transport: fields["transport"].as_str().map(str::to_owned),
+                    reason: Some("providerAuth".into()),
+                    blocked_on: Some("human".into()),
+                    ask: None,
+                    input_buffer: None,
+                    exit: None,
+                    claim,
+                    since_unix_ms: time.parse()?,
+                    observed_at_unix_ms: time.parse()?,
+                }));
+            }
+        }
+
+        // A login prompt or a workspace trust prompt is positive evidence that the current Claude
+        // incarnation cannot accept work. Neither has a hook edge, and channel initialization or work
+        // activity can otherwise overwrite a one-off blocked observation. Fence the entire incarnation
+        // instead.
+        let prompt_rejection = connection
+            .prepare_cached(&format!(
+                "SELECT claims.id, claims.accepted_at_unix_ms, json_extract(claims.body, '$.fields.code'), claims.body
+                 FROM claims JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=?1 AND claims.kind='harness.diagnostic'
+                   AND claims.store_index<=?2
+                   AND json_extract(claims.body, '$.fields.code')
+                       IN ('provider-auth-expired', 'provider-auth-restored', 'provider-trust-prompt')
+                   AND json_extract(claims.body, '$.fields.incarnation_id')=?3
+                 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+            ))?
+            .query_row(
+                params![subject, at_index, incarnation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        // A lifted login fence no longer holds the incarnation.
+        if let Some((claim, observed_at_unix_ms, code, body)) = prompt_rejection
+            && code != "provider-auth-restored"
+        {
+            let (state, reason) = if code == "provider-trust-prompt" {
+                ("blocked", "providerTrustPrompt")
+            } else {
+                ("needs-login", "providerAuth")
+            };
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = &body["fields"];
+            let driver = fields["driver"].as_str().unwrap_or("claude");
             return Ok(Some(crate::model::CurrentHarnessView {
-                state: "needs-login".into(),
-                driver: fields["driver"].as_str().map(str::to_owned),
-                incarnation_id: incarnation_id.into(),
-                transport: fields["transport"].as_str().map(str::to_owned),
-                reason: Some("providerAuth".into()),
+                state: state.into(),
+                driver: Some(driver.into()),
+                incarnation_id: incarnation_id.to_owned(),
+                transport: Some(if driver == "claude" { "claude-channel" } else { "native" }.into()),
+                reason: Some(reason.into()),
                 blocked_on: Some("human".into()),
                 ask: None,
                 input_buffer: None,
                 exit: None,
                 claim,
-                since_unix_ms: time.parse()?,
-                observed_at_unix_ms: time.parse()?,
+                since_unix_ms: observed_at_unix_ms.parse::<u128>()?,
+                observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
             }));
         }
-    }
 
-    // A login prompt or a workspace trust prompt is positive evidence that the current Claude
-    // incarnation cannot accept work. Neither has a hook edge, and channel initialization or work
-    // activity can otherwise overwrite a one-off blocked observation. Fence the entire incarnation
-    // instead.
-    let prompt_rejection = connection
-        .prepare_cached(&format!(
-            "SELECT claims.id, claims.accepted_at_unix_ms, json_extract(claims.body, '$.fields.code'), claims.body
-             FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE claims.subject=?1 AND claims.kind='harness.diagnostic'
-               AND claims.store_index<=?2
-               AND json_extract(claims.body, '$.fields.code')
-                   IN ('provider-auth-expired', 'provider-auth-restored', 'provider-trust-prompt')
-               AND json_extract(claims.body, '$.fields.incarnation_id')=?3
-             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
-        ))?
-        .query_row(
-            params![subject, at_index, incarnation_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()?;
-    // A lifted login fence no longer holds the incarnation.
-    if let Some((claim, observed_at_unix_ms, code, body)) = prompt_rejection
-        && code != "provider-auth-restored"
-    {
-        let (state, reason) = if code == "provider-trust-prompt" {
-            ("blocked", "providerTrustPrompt")
-        } else {
-            ("needs-login", "providerAuth")
-        };
-        let body: Value = serde_json::from_str(&body)?;
-        let fields = &body["fields"];
-        let driver = fields["driver"].as_str().unwrap_or("claude");
-        return Ok(Some(crate::model::CurrentHarnessView {
-            state: state.into(),
-            driver: Some(driver.into()),
-            incarnation_id: incarnation_id.to_owned(),
-            transport: Some(if driver == "claude" { "claude-channel" } else { "native" }.into()),
-            reason: Some(reason.into()),
-            blocked_on: Some("human".into()),
-            ask: None,
-            input_buffer: None,
-            exit: None,
-            claim,
-            since_unix_ms: observed_at_unix_ms.parse::<u128>()?,
-            observed_at_unix_ms: observed_at_unix_ms.parse::<u128>()?,
-        }));
-    }
-
-    if let Some(harness) = claude_attachment_fence(connection, subject, incarnation_id, at_index)? {
-        return Ok(Some(harness));
+        if let Some(harness) = claude_attachment_fence(connection, subject, incarnation_id, at_index)? {
+            return Ok(Some(harness));
+        }
     }
 
     // The observations of this runtime epoch, newest first in canonical order, so every node that
@@ -24072,7 +24147,7 @@ fn current_harness_fold_at(
         optional.insert("blocked_on", None);
         optional.insert("ask", None);
     }
-    if optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
+    if !terminal && optional.get("reason").and_then(|r| r.as_deref()) == Some("providerAuth") {
         if auth_restored {
             // Sparse successful reports must not inherit an older credential-refusal reason.
             optional.insert("reason", None);

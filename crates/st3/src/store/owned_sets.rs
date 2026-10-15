@@ -148,8 +148,16 @@ pub(super) struct Plan {
 }
 
 pub(super) fn manual_member(connection: &Connection, member: &Member) -> Result<bool, St3Error> {
+    manual_member_at(connection, member, None)
+}
+
+pub(super) fn manual_member_at(
+    connection: &Connection,
+    member: &Member,
+    at: Option<u64>,
+) -> Result<bool, St3Error> {
     Ok(member.manual_rollout
-        || claim(connection, &member.claim, None)?
+        || claim(connection, &member.claim, at)?
             .and_then(|c| serde_json::from_value::<DesiredSubject>(c.body).ok())
             .is_some_and(|desired| crate::rollout::manual(&desired)))
 }
@@ -1250,6 +1258,18 @@ impl Store {
 
     pub fn owned_sets(&self) -> Result<Vec<View>, St3Error> {
         selected(&self.readers.get(), None)
+    }
+    /// Snapshot-bound retirement authority for client agent terminal projections.
+    pub fn retired_owned_subjects_at(&self, at: u64) -> Result<BTreeSet<String>, St3Error> {
+        let connection = self.readers.get();
+        let mut retired = BTreeSet::new();
+        for view in selected(&connection, Some(at))? {
+            if !view.blockers.is_empty() { continue; }
+            for (subject, (_, is_retired, _)) in effective_members(&connection, &view, Some(at))? {
+                if is_retired { retired.insert(subject); }
+            }
+        }
+        Ok(retired)
     }
     /// Known replica names from graph membership, without sealing batches during a read.
     pub fn owned_set_replica_names(&self) -> Result<Vec<String>, St3Error> {
