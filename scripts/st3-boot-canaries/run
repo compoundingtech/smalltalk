@@ -728,14 +728,21 @@ def claude_channel_parked(node, seats):
         lambda: replacement_processes(node, seat_subject("a"), seats.incarnations["a"]),
         seats.bound, "the replacement generation never supplied fresh seat processes")
     check_boundary(node, processes=processes)
-    until(lambda: parked(node, seat_subject("a")), 180, "permanent channel failure never parked")
-    until(lambda: "claude-channel-unattached" in json.dumps(seats.view("a")[0]),
-          10, "parked channel failure lost its visible reason")
 
     def attempts():
         claims = (node.api("/v1/claims?subject=" + seat_subject("a") + "&limit=500") or {}).get("claims", [])
         return [row for row in claims if row.get("kind") == "runtime.action.requested"
                 and row.get("body", {}).get("fields", {}).get("operation") == "claude-channel-recovery"]
+
+    # Each incarnation needs the driver's 20 s detection window, then the reconciler's
+    # 10/20/40 s backoff, then a restart: about 170 s in all before any load. Bound each
+    # recovery step on its own event, not the whole schedule by one wall-clock budget.
+    for attempt in range(1, 4):
+        until(lambda: len(attempts()) >= attempt, seats.bound,
+              f"channel recovery attempt {attempt} was never requested")
+    until(lambda: parked(node, seat_subject("a")), seats.bound, "permanent channel failure never parked")
+    until(lambda: "claude-channel-unattached" in json.dumps(seats.view("a")[0]),
+          10, "parked channel failure lost its visible reason")
 
     if len(attempts()) != 3:
         fail(f"channel failure used {len(attempts())} recovery attempts, expected three")
