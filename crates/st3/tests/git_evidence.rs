@@ -510,10 +510,18 @@ fn protected_ci_cli_fetches_selectors_and_exports_verified_objects_without_a_key
     )
     .unwrap();
     let gh = tools.join("gh");
+    // The interpreter is the python3 the isolated harness put on PATH, by absolute path: a `#!/usr/bin/env` line
+    // needs /usr/bin/env, which the Nix build sandbox does not have (there the fake gh could not start).
+    let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join("python3"))
+        .find(|path| path.is_file())
+        .expect("the isolated harness supplies python3 on PATH");
     std::fs::write(
         &gh,
-        r#"#!/usr/bin/env python3
-import os, pathlib, sys
+        format!(
+            "#!{}\n{}",
+            python.display(),
+            r#"import os, pathlib, sys
 assert sys.argv[1:4] == ['api', '--hostname', 'github.com']
 suffix = sys.argv[4].removeprefix('repos/example/project/')
 files = {'actions/runs/123/attempts/2':'run.json',
@@ -525,7 +533,8 @@ files = {'actions/runs/123/attempts/2':'run.json',
          'actions/artifacts/789':'metadata3.json',
          'actions/artifacts/789/zip':'artifact3.zip'}
 sys.stdout.buffer.write((pathlib.Path(os.environ['FIXTURE_API']) / files[suffix]).read_bytes())
-"#,
+"#
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -534,15 +543,18 @@ sys.stdout.buffer.write((pathlib.Path(os.environ['FIXTURE_API']) / files[suffix]
     let installed_git = tools.join("git");
     std::fs::write(
         &installed_git,
-        r#"#!/usr/bin/env python3
-import os, sys
+        format!(
+            "#!{}\n{}",
+            python.display(),
+            r#"import os, sys
 args = sys.argv[1:]
 if 'fetch' in args:
     expected = 'https://github.com/example/project.git'
     assert expected in args and 'transfer.fsckObjects=true' in args
     args[args.index(expected)] = os.environ['FIXTURE_SOURCE']
 os.execv(os.environ['FIXTURE_REAL_GIT'],[os.environ['FIXTURE_REAL_GIT'],*args])
-"#,
+"#
+        ),
     )
     .unwrap();
     std::fs::set_permissions(&installed_git, std::fs::Permissions::from_mode(0o755)).unwrap();
