@@ -448,7 +448,7 @@ The implementation composes three existing patterns, not a pre-existing recorder
 `crates/st3/tests/terminal_binding.rs` supplies scratch ownership and teardown scaffolding;
 `crates/st3/tests/no_st2_seat.rs` and `scripts/st3-no-st2-eval/{run,claude}` supply native
 Claude transcripts and real driver hooks; `terminal_actions_survive_unrelated_writes_but_reject_changed_screens`
-in `crates/st3/src/api/client_v0.rs` supplies the real PTY/projector and terminal attach pattern.
+in `crates/st3-daemon/src/api/client_v0.rs` supplies the real PTY/projector and terminal attach pattern.
 `terminal_binding` alone produces neither native transcripts nor styled screens.
 
 ### Recording formats
