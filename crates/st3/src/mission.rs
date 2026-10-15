@@ -157,6 +157,32 @@ pub fn find_step<'a>(mission: &'a MissionSpec, path: &str) -> Option<&'a StepSpe
     None
 }
 
+/// Whether the step at `path` holds its run open while the mission watches, rather than doing
+/// work. A step declares `keep-open`; for revisions published before that flag, the names the
+/// fleet gave such steps still count. This is the only copy of that name rule.
+pub fn step_keeps_open(mission: Option<&MissionSpec>, path: &str) -> bool {
+    if mission
+        .and_then(|mission| find_step(mission, path))
+        .is_some_and(|step| step.keep_open)
+    {
+        return true;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    matches!(
+        name,
+        "keep-watch" | "retire" | "steward-intake" | "standing" | "keep-open"
+    ) || name.ends_with("-retirement")
+}
+
+/// Whether a mission is st's own plumbing or a standing observer, which clients fold away until a
+/// person asks. A mission declares `system`; st's own `mission/__st3/` missions always are, and
+/// for revisions published before that flag, a `ci` path segment still counts.
+pub fn is_system(subject: &str, mission: Option<&MissionSpec>) -> bool {
+    mission.is_some_and(|mission| mission.system)
+        || subject.starts_with("mission/__st3/")
+        || subject.split('/').any(|segment| segment == "ci")
+}
+
 pub fn parent_step_path<'a>(mission: &'a MissionSpec, path: &str) -> Option<&'a str> {
     fn find<'a>(mission: &'a MissionSpec, path: &str, parent: Option<&'a str>) -> Option<&'a str> {
         for id in &mission.display_order {
@@ -285,8 +311,19 @@ fn parse_mission(
     let mut gate_names = BTreeSet::new();
     let mut declarations = Vec::new();
     let mut revision_owners = Vec::new();
+    let mut system = false;
     for child in children.nodes() {
         match child.name().value() {
+            "system" => {
+                if system {
+                    return Err(St3Error::new(
+                        "duplicate-mission-field",
+                        format!("mission `{id}` repeats `system`"),
+                    ));
+                }
+                ensure_bare(child)?;
+                system = true;
+            }
             "provenance" if require_state => {
                 // Validated here, carried separately by NormalizedIntent: never hash metadata
                 // into MissionSpec, which older daemons must still project.
@@ -499,6 +536,7 @@ fn parse_mission(
         id,
         state,
         revision: String::new(),
+        system,
         inputs,
         max_active_runs,
         timeout_ms,
@@ -750,6 +788,7 @@ fn parse_loop_group(
         id,
         path,
         fresh_context: false,
+        keep_open: false,
         queue: None,
         queue_position: None,
         title: None,
@@ -1242,6 +1281,7 @@ fn parse_step(
     let revision_reviewer = parse_revision_reviewer(node, revisions_human_only)?;
     let mut title = None;
     let mut fresh_context = false;
+    let mut keep_open = false;
     let mut goals = Vec::new();
     let mut constraints = Vec::new();
     let mut agent_constraints = BTreeMap::new();
@@ -1288,6 +1328,10 @@ fn parse_step(
                 "fresh-context" => {
                     ensure_bare(child)?;
                     fresh_context = true;
+                }
+                "keep-open" => {
+                    ensure_bare(child)?;
+                    keep_open = true;
                 }
                 "goal" => goals.push(plain_string(child)?),
                 "constraint" => {
@@ -1424,6 +1468,7 @@ fn parse_step(
         id,
         path,
         fresh_context,
+        keep_open,
         queue: None,
         queue_position: None,
         title,
@@ -2184,6 +2229,7 @@ pub fn mission_after_run(mut mission: MissionSpec, run: &str) -> Result<MissionS
         id: AFTER_RUN_STEP.into(),
         path: AFTER_RUN_STEP.into(),
         fresh_context: false,
+        keep_open: false,
         queue: None,
         queue_position: None,
         title: None,
@@ -2914,6 +2960,47 @@ fn json_value(value: &KdlValue) -> Result<Value, St3Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keep_open_and_system_are_bare_flags() {
+        let source = r#"version 2
+mission "observer" state="ready" {
+  system
+  goal "Watch for work."
+  step "hold" { agentless; keep-open }
+  step "work" { agentless }
+}"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let mission = &intent.missions["observer"];
+        assert!(mission.system);
+        assert!(mission.steps["hold"].keep_open);
+        assert!(!mission.steps["work"].keep_open);
+        assert!(super::step_keeps_open(Some(mission), "hold"));
+        assert!(
+            super::step_keeps_open(None, "seat-retirement"),
+            "a fleet name, before the flag"
+        );
+        assert!(!super::step_keeps_open(Some(mission), "work"));
+        assert!(super::is_system("mission/observer", Some(mission)));
+        assert!(super::is_system("mission/fleet/example/ci/run", None));
+        assert!(!super::is_system("mission/fleet/example/build", None));
+        // An unflagged mission serializes as before, so its published revision is unchanged.
+        let plain = source.replace("  system\n", "").replace("; keep-open", "");
+        let plain = &crate::graph::parse_intent(&plain, "node").unwrap().missions["observer"];
+        let body = serde_json::to_value(plain).unwrap();
+        assert!(body.get("system").is_none() && body["steps"]["hold"].get("keep_open").is_none());
+        for invalid in [
+            source.replace("  system\n", "  system #true\n"),
+            source.replace("  system\n", "  system\n  system\n"),
+            source.replace("keep-open }", "keep-open \"yes\" }"),
+            source.replace("keep-open }", "keep-open; keep-open }"),
+        ] {
+            assert!(
+                crate::graph::parse_intent(&invalid, "node").is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
     #[test]
     fn fresh_context_is_opt_in_on_steps_and_seats() {
         let source = r#"version 2

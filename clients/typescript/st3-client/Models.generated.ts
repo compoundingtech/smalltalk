@@ -1158,6 +1158,7 @@ export type Mission = ResourceHeader & {
   runs: Array<MissionRunId>;
   runs_truncated?: boolean;
   state: MissionState;
+  system?: boolean;
   title: string;
   total_runs?: number;
   usage?: (UsageSummary | null);
@@ -1220,6 +1221,7 @@ export type MissionStep = {
   constraints?: Array<string>;
   goals?: Array<string>;
   id: Id;
+  keep_open?: boolean;
   last_progress?: string | null;
   loop_max_rounds?: number | null;
   loop_reason?: string | null;

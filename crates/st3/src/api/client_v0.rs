@@ -3227,6 +3227,7 @@ pub(super) fn mission_list_cards_with(
                 "id":step.subject,"path":step.step,"title":step.title,"state":client_work_state(&step.status),
                 "attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,
                 "agentless":step.agentless,"since":client_timestamp(step.updated_at_unix_ms),
+                "keep_open":crate::mission::step_keeps_open(definition.map(|d| &d.mission), &step.step),
                 "progress_at": null,
                 "blocked_reason":step.blocked_reason.as_deref().or_else(|| scheduler_fault.as_deref().filter(|_| step.status=="pending")),"blockers":step.blockers,
                 "goals":step.goals,"constraints":step.constraints
@@ -3250,6 +3251,7 @@ pub(super) fn mission_list_cards_with(
         let historical = matches!(state,"completed"|"failed"|"cancelled"|"retired");
         Ok(json!({"id":id,"kind":"mission","revision":revision,"updated_at":client_timestamp(updated),
             "title":id.trim_start_matches("mission/"),"state":state,"mission_revision":revision,
+            "system":crate::mission::is_system(id, definition.map(|d| &d.mission)),
             "runs":newest.iter().rev().map(|r| r["id"].clone()).collect::<Vec<_>>(),
             "run_details":details,"active_runs":active,"total_runs":overview["total_runs"],
             "run_counts":overview["counts"],"runs_truncated":overview["total_runs"].as_u64().unwrap_or(0)>newest.len() as u64,
@@ -3556,6 +3558,7 @@ fn mission_resources_filtered(
                                     "assignee": step.assigned_to,
                                     "claimant": step.claimant,
                                     "agentless": step.agentless,
+                                    "keep_open": crate::mission::step_keeps_open(definition.map(|(definition, _)| definition), &step.step),
                                     "since": client_timestamp(step.updated_at_unix_ms),
                                     "last_progress": step.progress_summary,
                                     "progress_at": step.progress_at_unix_ms.map(client_timestamp),
@@ -3627,6 +3630,7 @@ fn mission_resources_filtered(
                 "title": mission.strip_prefix("mission/").unwrap_or(&mission),
                 "state": state,
                 "mission_revision": revision,
+                "system": crate::mission::is_system(&mission, definition.map(|(definition, _)| definition)),
                 "runs": runs.into_iter().map(|run| run.subject).collect::<Vec<_>>(),
                 "run_details": run_details,
                 "must_act": must_act,

@@ -1692,6 +1692,8 @@ export const MissionStep = /*#__PURE__*/ (() => Schema.Struct({
   "constraints": optionalKey(Schema.Array(Schema.String)),
   "goals": optionalKey(Schema.Array(Schema.String)),
   "id": Id,
+  /** st's own step that holds its run open while the mission watches, not work: declared with `keep-open`, or (for revisions published before the flag) a step named keep-watch, retire, steward-intake, standing, keep-open or *-retirement. Absent on older daemons. */
+  "keep_open": optionalKey(Schema.Boolean).annotate({ description: "st's own step that holds its run open while the mission watches, not work: declared with `keep-open`, or (for revisions published before the flag) a step named keep-watch, retire, steward-intake, standing, keep-open or *-retirement. Absent on older daemons." }),
   "last_progress": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
   "loop_max_rounds": Schema.OptionFromOptionalNullOr(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)), NULL_NONE),
   "loop_reason": Schema.OptionFromOptionalNullOr(Schema.String, NULL_NONE),
@@ -1762,6 +1764,8 @@ export const Mission = /*#__PURE__*/ (() => Schema.Struct({
   "runs": Schema.Array(MissionRunId),
   "runs_truncated": optionalKey(Schema.Boolean),
   "state": MissionState,
+  /** st's own plumbing or a standing observer, which clients fold away until a person asks: declared with `system`, or st's own `mission/__st3/` missions, or (for revisions published before the flag) a `ci` path segment. Absent on older daemons. */
+  "system": optionalKey(Schema.Boolean).annotate({ description: "st's own plumbing or a standing observer, which clients fold away until a person asks: declared with `system`, or st's own `mission/__st3/` missions, or (for revisions published before the flag) a `ci` path segment. Absent on older daemons." }),
   "title": Schema.String,
   "total_runs": optionalKey(Schema.Int.check(Schema.isGreaterThanOrEqualTo(0))),
   "updated_at": Timestamp,

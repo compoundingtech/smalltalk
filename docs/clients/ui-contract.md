@@ -479,18 +479,18 @@ Today no client reads a declaration: the terminal UI shows one only in the demo,
 
 Two declared flags replace name heuristics:
 
-- **`keep-open #true` on a step** compiles to `StepSpec.keep_open`. It marks st's own steps that
-  stay open while a mission watches; the mission projection's `watching` word and its step rows'
-  `keep_open` read it.
-- **`system #true` on a mission** compiles to `MissionSpec.system`. Missions under
-  `mission/__st3/` are system without declaring it. The mission projection's `system` reads it.
+- **A bare `keep-open` node on a step** compiles to `StepSpec.keep_open`. It marks st's own steps
+  that stay open while a mission watches. Mission rows carry it on each step as `keep_open`, and
+  the `watching` word reads it.
+- **A bare `system` node in a mission** compiles to `MissionSpec.system`. Missions under
+  `mission/__st3/` are system without declaring it. Mission rows carry it as `system`.
 
 For revisions published before the flags existed, the refresher treats an unset flag with
 today's name rule: steps named `keep-watch`, `retire`, `steward-intake`, `standing`,
 `keep-open` or `*-retirement`, and missions with a `ci` path segment. That one copy lives in the
-daemon and goes once published missions declare their flags. Today the rule is copied in
-`crates/st3-ui-model/src/missions.rs` (`keeps_open`, `is_system_mission`) and
-`apps/ios/missionsView.ts`; Fractal has none.
+daemon (`crate::mission::step_keeps_open` and `is_system`) and goes once published missions
+declare their flags. The terminal UI, the phone and Fractal read the served flags and keep no name
+rule.
 
 ### Sidebar identity
 

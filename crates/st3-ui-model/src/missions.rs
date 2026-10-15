@@ -232,17 +232,6 @@ fn run_outcome(mission: &st3_client::Mission, now: &str, display: &Display<'_>) 
     ))
 }
 
-/// Whether an agentless step only holds its run open (so the run's observers keep watching).
-/// st does not say whether an agentless step waits on a flag or runs a command, so this goes
-/// by the names the fleet uses for keep-open steps; anything else counts as work.
-fn keeps_open(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    matches!(
-        name,
-        "keep-watch" | "retire" | "steward-intake" | "standing" | "keep-open"
-    ) || name.ends_with("-retirement")
-}
-
 /// The agent whose queue holds this work, if st says.
 fn queued_for<'a>(
     mut agents: impl Iterator<Item = &'a st3_client::Agent>,
@@ -334,7 +323,7 @@ pub fn adapt<'a>(
                             step.state.as_str(),
                             "claimed" | "working" | "running" | "verifying"
                         ) && step.agentless
-                            && keeps_open(&step.path))
+                            && step.keep_open)
                 })
                 && work.iter().any(|step| step.state != "completed")
             {
@@ -479,17 +468,10 @@ pub fn adapt<'a>(
                 decision,
                 worktree: None,
                 parent: None,
-                system: is_system_mission(&mission.header.id),
+                system: mission.system,
             }
         })
         .collect()
-}
-
-/// Plumbing the Missions tab folds away until `x` shows it: st's own loop rounds, and CI
-/// (a `ci` segment, as in `mission/fleet/smalltalk/ci/run`). The graph has no mark for this
-/// yet, so the name decides. What needs a person still reaches Home as attention.
-fn is_system_mission(id: &str) -> bool {
-    id.starts_with("mission/__st3/") || id.split('/').any(|segment| segment == "ci")
 }
 
 #[cfg(test)]

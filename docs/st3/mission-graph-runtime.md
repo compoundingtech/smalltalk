@@ -184,6 +184,7 @@ mission "MISSION_ID"
   goal "An optional second goal."
   goal "An optional third goal."
   constraint "A mission-specific rule for this work."
+  system
 
   input "message" kind="text"
   input "source" kind="resource"
@@ -225,6 +226,8 @@ When active revisions declare different limits, st uses the strictest limit. A l
 An exact idempotent retry returns its existing run before the capacity check. A direct start error lists the active run subjects.
 
 `report-to`, `report-stalls`, `stalled-after` and `report-completed` are optional and opt the mission's runs into [run reports](#run-reports).
+
+`system` is an optional bare node. It marks st's own plumbing or a standing observer, which clients fold away until a person asks. Mission rows carry it as `system`. Missions under `mission/__st3/` are always system. For revisions published before the flag existed, a `ci` path segment still counts.
 
 `revisions="human-only"` is optional and inherited by child steps. `revision-reviewer` requires that protection.
 
@@ -317,6 +320,7 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
   available-to "agent/${ST_MISSION_RUN}/worker-a"
   available-to "agent/${ST_MISSION_RUN}/worker-b"
   fresh-context
+  keep-open
   document "doc/project/request@SHA256"
 
   depends-on {
@@ -335,9 +339,11 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
 }
 ```
 
-`title`, `assigned-to`, `agentless`, `fresh-context`, `mission`, `retry`, `produces`, `produces-mission`, `uses-mission`, and `after-run` are single fields.
+`title`, `assigned-to`, `agentless`, `fresh-context`, `keep-open`, `mission`, `retry`, `produces`, `produces-mission`, `uses-mission`, and `after-run` are single fields.
 
 `fresh-context` is a bare node. Before the daemon wakes a seat for that step, it stops the old harness session and starts a new, idle one. The step's work message arrives in the new session. A claim from the old incarnation is refused while the reset is pending. Steps without this option keep the current session unless the seat opts in for every step. A retry is a new attempt and receives its own fresh session.
+
+`keep-open` is a bare node. It marks a step that only holds its run open while the mission's observers watch, such as an intake or a retirement step: the step is not work. A mission whose only running steps are agentless keep-open steps reads as watching. Mission rows carry it on each step as `keep_open`. For revisions published before the flag existed, steps named `keep-watch`, `retire`, `steward-intake`, `standing`, `keep-open` or `*-retirement` still count.
 
 A retry repeats one failed step attempt. It handles a bounded transient failure.
 
