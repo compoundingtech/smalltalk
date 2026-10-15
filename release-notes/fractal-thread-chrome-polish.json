@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "summary": "Fractal web: the sidebar roster scrolls below a gap under the search field, a running tool row shows Running beside its title instead of in the end column, and workspace tabs use sentence case (Missions, Usage).",
+  "replay": {"status": "none", "detail": "Presentation only; no claim replay or recovery behavior changes."},
+  "schema": {"status": "none", "detail": "No tables, indexes, schema-version changes or data rewrites."},
+  "rules": {"status": "none", "detail": "No checkpoint rules or digest changes; no coordinated member upgrade required."},
+  "compatibility": {"status": "none", "detail": "Web app and UI kit styling and labels only; no contract changes."},
+  "downtime": {"status": "none", "detail": "No startup work or interruption."},
+  "manual": {"status": "none", "detail": "No operator actions, re-pairing or configuration changes required."},
+  "recovery": {"status": "none", "detail": "No persistent state changes or swap-back restrictions."}
+}

@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { fixtureSource } from '../data/fixtureSource.ts'
 import { DataSourceProvider } from '../data/react.tsx'
 import { WorkspaceBody } from './LiveAgentWorkspace.tsx'
-import { retainPane, workspaceView, type RetainedPane } from './workspaceView.ts'
+import { paneTabLabel, retainPane, workspaceView, type RetainedPane } from './workspaceView.ts'
 
 vi.mock('@stylexjs/stylex', () => import('../testStylex.ts'))
 
@@ -58,3 +58,14 @@ describe('retained conversation panes', () => {
   })
 })
 
+
+describe('workspace tab labels', () => {
+  it('reads app screens in sentence case beside Thread', () => {
+    expect(paneTabLabel('missions', undefined)).toBe('Missions')
+    expect(paneTabLabel('monitor/quota', undefined)).toBe('Usage')
+    expect(paneTabLabel('doc/notes', undefined)).toBe('Notes')
+  })
+  it('keeps a subject title verbatim', () => {
+    expect(paneTabLabel('terminal/workstation-a/one', 'example agent SDK')).toBe('example agent SDK')
+  })
+})
