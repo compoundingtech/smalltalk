@@ -14,7 +14,7 @@ for test in \
   ci-namespace-usage-test ci-mail-redelivery-canaries-test ci-test-partitions-test \
   ci-test-archive-test ci-evidence-source-test check-ci-test-paths ci-queue-watch-test \
   check-main-ci-test ci-perf-cache-test ci-perf-slot-test ci-perf-scope-test \
-  ci-cache-audit-test ci-fractal-web-test ci-evidence-observe-test evidence-verify-test st-test-test evidence-prepush-test evidence-wrap-test ci-evidence-signing-test evidence-publish-test \
+  ci-cache-audit-test ci-fractal-web-test ci-evidence-observe-test evidence-verify-test evidence-keygen-test st-test-test evidence-prepush-test evidence-wrap-test ci-evidence-signing-test evidence-publish-test \
   ci-evidence-gate-test; do
   python3 "scripts/$test"
 done
